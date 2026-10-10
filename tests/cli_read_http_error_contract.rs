@@ -138,31 +138,39 @@ impl MockApi {
         } else {
             vec![command.as_str(), action, "--session-id", SESSION_ID]
         };
-        let output = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
-                .env_clear()
-                .env("HOME", self.root.join("home"))
-                .env("USERPROFILE", self.root.join("home"))
-                .env("CODEX_HOME", self.root.join("codex-home"))
-                .env("SNIPER_DATA_DIR", self.root.join("data"))
-                .current_dir(&self.root)
-                .args(["--output", "compact", "--api", &self.api])
-                .args(args)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .expect("metadata CLI timed out")
-        .unwrap();
+        let mut cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
+        cli.env_clear()
+            .env("HOME", self.root.join("home"))
+            .env("USERPROFILE", self.root.join("home"))
+            .env("CODEX_HOME", self.root.join("codex-home"))
+            .env("SNIPER_DATA_DIR", self.root.join("data"))
+            .current_dir(&self.root)
+            .args(["--output", "compact", "--api", &self.api])
+            .args(args)
+            .kill_on_drop(true);
+        // Windows socket-provider DLL paths can depend on SystemRoot. Preserve
+        // that OS dependency without inheriting user, API, or proxy settings.
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            cli.env("SystemRoot", system_root);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(5), cli.output())
+            .await
+            .expect("metadata CLI timed out")
+            .unwrap();
         assert!(output.stderr.is_empty(), "{output:?}");
         assert_eq!(
             output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
             1
         );
-        let value = serde_json::from_slice(&output.stdout).unwrap();
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let exit = output.status.code().unwrap();
         let requests = std::mem::take(&mut *self.requests.lock().unwrap());
-        assert_eq!(requests.len(), 2, "no fallback reads or retries");
+        assert_eq!(
+            requests.len(),
+            2,
+            "no fallback reads or retries: operation={operation}, call={call}, exit={exit}, envelope={value}"
+        );
         assert!(requests.iter().all(|(method, _)| method == "GET"));
         assert_eq!(requests[0].1, "/api/settings");
         let resource = match operation {
@@ -175,7 +183,7 @@ impl MockApi {
         for name in ["home", "codex-home", "data"] {
             assert!(!self.root.join(name).exists(), "CLI created {name}");
         }
-        (output.status.code().unwrap(), value)
+        (exit, value)
     }
 }
 
