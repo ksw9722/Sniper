@@ -997,16 +997,38 @@ impl SessionRegistry {
             format!("failed to create sessions directory {}", root_dir.display())
         })?;
         let registry_path = root_dir.join(REGISTRY_FILE);
+        // Inventory before registry recovery: rebuilding a missing/corrupt
+        // registry must not turn uncertain deletion evidence into orphan data.
+        let quarantines = inspect_quarantined_session_storage(&root_dir)?;
 
         let mut repair_registry = false;
         let mut registry = match fs::read(&registry_path) {
             Ok(bytes) => match serde_json::from_slice::<StoredSessionRegistrySnapshot>(&bytes) {
                 Ok(snapshot) => {
+                    if !quarantines.is_empty()
+                        && serde_json::from_slice::<serde_json::Value>(&bytes)?
+                            .get("sessions")
+                            .is_none()
+                    {
+                        return Err(quarantine_recovery_required(
+                            &root_dir,
+                            &quarantines[0],
+                            "the registry does not declare session membership",
+                        ));
+                    }
                     let (snapshot, repaired) = snapshot.into_snapshot();
+                    validate_quarantined_session_storage(&root_dir, &snapshot, &quarantines)?;
                     repair_registry |= repaired;
                     snapshot
                 }
                 Err(error) => {
+                    if let Some(path) = quarantines.first() {
+                        return Err(quarantine_recovery_required(
+                            &root_dir,
+                            path,
+                            "the registry is corrupt",
+                        ));
+                    }
                     warn!(
                         ?error,
                         path = %registry_path.display(),
@@ -1022,6 +1044,13 @@ impl SessionRegistry {
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(path) = quarantines.first() {
+                    return Err(quarantine_recovery_required(
+                        &root_dir,
+                        path,
+                        "the registry is missing",
+                    ));
+                }
                 let snapshot = rebuild_registry_from_session_dirs(
                     &root_dir,
                     max_entries,
@@ -1031,6 +1060,13 @@ impl SessionRegistry {
                 snapshot
             }
             Err(error) if registry_path.is_dir() => {
+                if let Some(path) = quarantines.first() {
+                    return Err(quarantine_recovery_required(
+                        &root_dir,
+                        path,
+                        "the registry path is not a file",
+                    ));
+                }
                 warn!(
                     ?error,
                     path = %registry_path.display(),
@@ -1879,6 +1915,82 @@ fn remove_quarantined_deleted_session_storage(root_dir: &Path, id: Uuid) -> bool
     still_exists
 }
 
+fn inspect_quarantined_session_storage(root_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut quarantines = Vec::new();
+    for entry in fs::read_dir(root_dir).with_context(|| {
+        format!(
+            "session recovery required: failed to inspect {}; startup stopped to preserve session data",
+            root_dir.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "session recovery required: failed to inspect an entry in {}; startup stopped to preserve session data",
+                root_dir.display()
+            )
+        })?;
+        // Names alone are evidence. Following a symlink or requiring a directory
+        // here would allow unusual storage paths to evade the preservation gate.
+        if entry.file_name().to_string_lossy().starts_with(".deleted-") {
+            quarantines.push(entry.path());
+        }
+    }
+    quarantines.sort();
+    Ok(quarantines)
+}
+
+fn quarantine_recovery_required(root_dir: &Path, path: &Path, reason: &str) -> anyhow::Error {
+    let owner = path
+        .file_name()
+        .and_then(|name| quarantined_session_owner_from_name(&name.to_string_lossy()));
+    let session = owner.map_or_else(String::new, |id| {
+        format!(
+            "session {id}, canonical storage {}; ",
+            session_dir(root_dir, id).display()
+        )
+    });
+    anyhow!(
+        "session recovery required: {session}{reason}; quarantined path {}; automatic startup stopped. Preserve the entire sessions directory {} for recovery; no automatic restore was performed",
+        path.display(),
+        root_dir.display()
+    )
+}
+
+fn validate_quarantined_session_storage(
+    root_dir: &Path,
+    registry: &SessionRegistrySnapshot,
+    quarantines: &[PathBuf],
+) -> Result<()> {
+    let live = registry
+        .sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<HashSet<_>>();
+    let deleted = registry
+        .deleted_session_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    for path in quarantines {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let Some(id) = quarantined_deleted_session_id_from_name(&name) else {
+            return Err(quarantine_recovery_required(
+                root_dir,
+                path,
+                "the quarantine name is not a complete generated deletion name",
+            ));
+        };
+        if live.contains(&id) && !deleted.contains(&id) {
+            return Err(quarantine_recovery_required(
+                root_dir,
+                path,
+                "the registry still lists this session without a deletion tombstone",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn remove_orphan_quarantined_deleted_session_storage(root_dir: &Path) -> bool {
     let entries = match fs::read_dir(root_dir) {
         Ok(entries) => entries,
@@ -1918,9 +2030,19 @@ fn remove_orphan_quarantined_deleted_session_storage(root_dir: &Path) -> bool {
 
 fn quarantined_deleted_session_id_from_name(name: &str) -> Option<Uuid> {
     let value = name.strip_prefix(".deleted-")?;
+    if value.len() != 73 {
+        return None;
+    }
+    let id = Uuid::parse_str(value.get(..36)?).ok()?;
+    let nonce = Uuid::parse_str(value.get(37..)?).ok()?;
+    (value == format!("{id}-{nonce}")).then_some(id)
+}
+
+fn quarantined_session_owner_from_name(name: &str) -> Option<Uuid> {
+    let value = name.strip_prefix(".deleted-")?;
     let id_text = value.get(..36)?;
     let suffix = value.get(36..)?;
-    if !suffix.starts_with('-') {
+    if !suffix.is_empty() && !suffix.starts_with('-') {
         return None;
     }
     Uuid::parse_str(id_text).ok()
@@ -5829,50 +5951,382 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    fn quarantine_fixture_tree(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            tree: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(path).unwrap();
+                tree.insert(
+                    relative,
+                    format!("symlink:{}", target.display()).into_bytes(),
+                );
+            } else if metadata.is_dir() {
+                tree.insert(relative, b"directory".to_vec());
+                for entry in std::fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), tree);
+                }
+            } else {
+                let mut bytes = b"file:".to_vec();
+                bytes.extend(std::fs::read(path).unwrap());
+                tree.insert(relative, bytes);
+            }
+        }
+        let mut tree = std::collections::BTreeMap::new();
+        visit(root, root, &mut tree);
+        tree
+    }
+
+    fn assert_quarantine_startup_refused_without_changes(data_dir: &std::path::Path) -> String {
+        let before = quarantine_fixture_tree(data_dir);
+        let mut last_error = String::new();
+        for _ in 0..2 {
+            let error = SessionRegistry::load_or_create(data_dir, 32, 32)
+                .err()
+                .expect("uncertain quarantine must stop startup");
+            last_error = format!("{error:#}");
+            assert!(
+                last_error.contains("session recovery required"),
+                "{last_error}"
+            );
+            assert!(last_error.contains("startup stopped"), "{last_error}");
+            assert!(
+                last_error.contains("Preserve the entire sessions directory"),
+                "{last_error}"
+            );
+            assert_eq!(quarantine_fixture_tree(data_dir), before);
+        }
+        last_error
+    }
+
     #[test]
-    fn registry_load_removes_crash_left_orphan_quarantined_storage() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "sniper-session-orphan-quarantine-load-{}",
-            uuid::Uuid::new_v4()
-        ));
+    fn registry_quarantine_live_session_requires_recovery_before_normalization() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-live-quarantine-{}", Uuid::new_v4()));
         let root_dir = data_dir.join(super::SESSIONS_DIR);
         let active = super::default_session_metadata("Active");
-        let orphan = super::default_session_metadata("Orphaned delete");
-        super::persist_session_snapshot(
-            &root_dir,
-            &active,
-            &super::StoredSessionSnapshot::default(),
+        let target = super::default_session_metadata("Interrupted deletion");
+        for metadata in [&active, &target] {
+            super::persist_session_snapshot(
+                &root_dir,
+                metadata,
+                &super::StoredSessionSnapshot::default(),
+            )
+            .unwrap();
+        }
+        let canonical = super::session_dir(&root_dir, target.id);
+        let quarantine = super::deleted_session_dir(&root_dir, target.id);
+        std::fs::write(
+            canonical.join("synthetic-original"),
+            b"preserve original bytes",
         )
-        .expect("active snapshot should be written");
-        super::persist_session_snapshot(
-            &root_dir,
-            &orphan,
-            &super::StoredSessionSnapshot::default(),
+        .unwrap();
+        crate::platform::rename(&canonical, &quarantine).unwrap();
+        // Eligible cleanup elsewhere must also wait until all evidence passes
+        // preflight; an error must not leave a partially cleaned session root.
+        let tombstoned = super::default_session_metadata("Committed deletion");
+        let orphan = super::default_session_metadata("Unreferenced deletion");
+        for metadata in [&tombstoned, &orphan] {
+            super::persist_session_snapshot(
+                &root_dir,
+                metadata,
+                &super::StoredSessionSnapshot::default(),
+            )
+            .unwrap();
+            crate::platform::rename(
+                &super::session_dir(&root_dir, metadata.id),
+                &super::deleted_session_dir(&root_dir, metadata.id),
+            )
+            .unwrap();
+        }
+        let tombstoned_canonical = super::session_dir(&root_dir, tombstoned.id);
+        std::fs::create_dir(&tombstoned_canonical).unwrap();
+        std::fs::write(
+            tombstoned_canonical.join("synthetic-stale"),
+            b"preserve before cleanup",
         )
-        .expect("orphan snapshot should be written before quarantine");
-        let orphan_storage = super::session_dir(&root_dir, orphan.id);
-        let quarantine_path = super::deleted_session_dir(&root_dir, orphan.id);
-        crate::platform::rename(&orphan_storage, &quarantine_path)
-            .expect("orphan session storage should be quarantined");
+        .unwrap();
+        // Missing active_session_id is supported legacy input. Refusal must
+        // precede the repaired-registry write as well as destructive cleanup.
         super::write_json(
             &root_dir.join(super::REGISTRY_FILE),
             &serde_json::json!({
-                "active_session_id": active.id,
-                "sessions": [active.clone(), orphan.clone()]
+                "sessions": [active, target.clone()],
+                "deleted_session_ids": [tombstoned.id]
             }),
         )
-        .expect("pre-crash registry should be written");
+        .unwrap();
+        let error = assert_quarantine_startup_refused_without_changes(&data_dir);
+        assert!(error.contains(&target.id.to_string()));
+        assert!(error.contains(&canonical.display().to_string()));
+        assert!(error.contains(&quarantine.display().to_string()));
+        assert!(!canonical.exists());
+        assert_eq!(
+            std::fs::read(quarantine.join("synthetic-original")).unwrap(),
+            b"preserve original bytes"
+        );
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
 
-        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
-            .expect("registry should repair orphaned quarantine");
+    #[tokio::test]
+    async fn registry_quarantine_preserves_cached_write_divergence_on_repeated_startup() {
+        for mode in ["none", "unrelated", "workspace", "state", "full"] {
+            let data_dir = std::env::temp_dir().join(format!(
+                "sniper-quarantine-cached-{mode}-{}",
+                Uuid::new_v4()
+            ));
+            let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+            let target = registry
+                .create_session(Some("Synthetic target".into()))
+                .unwrap();
+            let canonical = registry.session_storage_path(target.id).unwrap();
+            let record = deletion_test_record(37);
+            super::write_transactions_file_for_test(&canonical, &[record.clone()]).unwrap();
+            let cached = registry.load_context(target.id).unwrap();
+            let original_snapshot = std::fs::read(canonical.join("snapshot.json")).unwrap();
+            let original_transactions =
+                std::fs::read(canonical.join("transactions.ndjson")).unwrap();
+            let quarantine = super::deleted_session_dir(&registry.root_dir, target.id);
+            // This is the exact on-disk boundary after a precommit registry
+            // error and failed restore; no physical filesystem fault is needed.
+            crate::platform::rename(&canonical, &quarantine).unwrap();
+            match mode {
+                "none" => (),
+                "unrelated" => registry
+                    .update_metadata(active.metadata.read().unwrap().clone())
+                    .unwrap(),
+                "workspace" => {
+                    cached
+                        .persist_workspace_snapshot_locked(WorkspaceStateSnapshot::default())
+                        .await
+                        .unwrap();
+                }
+                "state" => cached.persist_state_only().await.unwrap(),
+                "full" => registry
+                    .update_metadata(cached.persist().await.unwrap())
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                canonical.exists(),
+                matches!(mode, "workspace" | "state" | "full")
+            );
+            assert_eq!(
+                std::fs::read(quarantine.join("snapshot.json")).unwrap(),
+                original_snapshot
+            );
+            assert_eq!(
+                std::fs::read(quarantine.join("transactions.ndjson")).unwrap(),
+                original_transactions
+            );
+            assert_eq!(
+                super::read_transactions_file_for_test(&quarantine).unwrap()[0]
+                    .0
+                    .request
+                    .body_preview,
+                record.request.body_preview
+            );
+            drop(cached);
+            drop(active);
+            drop(registry);
+            assert_quarantine_startup_refused_without_changes(&data_dir);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
 
-        assert_eq!(loaded_active.id(), active.id);
-        assert!(registry.contains_session(active.id));
-        assert!(!registry.contains_session(orphan.id));
-        assert!(!orphan_storage.exists());
-        assert!(!quarantine_path.exists());
+    #[test]
+    fn registry_quarantine_preserves_multiple_file_and_malformed_evidence() {
+        for kind in [
+            "multiple",
+            "file",
+            "bare",
+            "empty_nonce",
+            "bad_nonce",
+            "unknown_owner",
+            "partial_owner",
+            "malformed_tombstoned",
+        ] {
+            let data_dir = std::env::temp_dir().join(format!(
+                "sniper-quarantine-evidence-{kind}-{}",
+                Uuid::new_v4()
+            ));
+            let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+            let target = registry
+                .create_session(Some("Synthetic target".into()))
+                .unwrap();
+            let canonical = registry.session_storage_path(target.id).unwrap();
+            std::fs::write(canonical.join("synthetic-canonical"), b"keep canonical").unwrap();
+            let name = match kind {
+                "bare" => format!(".deleted-{}", target.id),
+                "empty_nonce" => format!(".deleted-{}-", target.id),
+                "bad_nonce" | "malformed_tombstoned" => {
+                    format!(".deleted-{}-not-a-uuid", target.id)
+                }
+                "unknown_owner" => ".deleted-not-a-session".into(),
+                "partial_owner" => format!(".deleted-{}x-{}", target.id, Uuid::new_v4()),
+                _ => format!(".deleted-{}-{}", target.id, Uuid::new_v4()),
+            };
+            let evidence = registry.root_dir.join(name);
+            if kind == "file" {
+                std::fs::write(&evidence, b"quarantine file bytes").unwrap();
+            } else {
+                std::fs::create_dir(&evidence).unwrap();
+                std::fs::write(
+                    evidence.join("synthetic-original"),
+                    b"quarantine original bytes",
+                )
+                .unwrap();
+            }
+            if kind == "multiple" {
+                let second = super::deleted_session_dir(&registry.root_dir, target.id);
+                std::fs::create_dir(&second).unwrap();
+                std::fs::write(second.join("synthetic-other"), b"keep second candidate").unwrap();
+            }
+            if kind == "malformed_tombstoned" {
+                let mut snapshot = registry.inner.read().unwrap().clone();
+                snapshot.deleted_session_ids.push(target.id);
+                super::write_json(&registry.registry_path, &snapshot).unwrap();
+            }
+            drop(active);
+            drop(registry);
+            let error = assert_quarantine_startup_refused_without_changes(&data_dir);
+            if matches!(kind, "unknown_owner" | "partial_owner") {
+                assert!(!error.contains("canonical storage"));
+            } else {
+                assert!(error.contains(&target.id.to_string()));
+            }
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
 
-        let _ = std::fs::remove_dir_all(&data_dir);
+    #[cfg(unix)]
+    #[test]
+    fn registry_quarantine_preserves_symlink_evidence_without_following_it() {
+        for dangling in [false, true] {
+            let data_dir =
+                std::env::temp_dir().join(format!("sniper-quarantine-symlink-{}", Uuid::new_v4()));
+            let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+            let target = registry
+                .create_session(Some("Synthetic target".into()))
+                .unwrap();
+            let link_target = data_dir.join("synthetic-link-target");
+            if !dangling {
+                std::fs::create_dir(&link_target).unwrap();
+                std::fs::write(link_target.join("marker"), b"do not follow or remove").unwrap();
+            }
+            let evidence = super::deleted_session_dir(&registry.root_dir, target.id);
+            std::os::unix::fs::symlink(&link_target, &evidence).unwrap();
+            drop(active);
+            drop(registry);
+            assert_quarantine_startup_refused_without_changes(&data_dir);
+            assert_eq!(std::fs::read_link(&evidence).unwrap(), link_target);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn registry_quarantine_refuses_missing_corrupt_and_incomplete_registry_before_repair() {
+        for kind in ["missing", "corrupt", "incomplete", "directory"] {
+            let data_dir = std::env::temp_dir().join(format!(
+                "sniper-quarantine-registry-{kind}-{}",
+                Uuid::new_v4()
+            ));
+            let root = data_dir.join(super::SESSIONS_DIR);
+            std::fs::create_dir_all(&root).unwrap();
+            let id = Uuid::new_v4();
+            let evidence = super::deleted_session_dir(&root, id);
+            std::fs::create_dir(&evidence).unwrap();
+            std::fs::write(evidence.join("synthetic-original"), b"recoverable bytes").unwrap();
+            let path = root.join(super::REGISTRY_FILE);
+            match kind {
+                "missing" => (),
+                "corrupt" => std::fs::write(&path, b"{not json").unwrap(),
+                "incomplete" => std::fs::write(&path, b"{}").unwrap(),
+                "directory" => {
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::write(path.join("marker"), b"keep invalid registry directory")
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_quarantine_startup_refused_without_changes(&data_dir);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn registry_quarantine_keeps_exact_unreferenced_and_tombstoned_cleanup() {
+        for kind in [
+            "unreferenced",
+            "tombstoned",
+            "live_tombstoned",
+            "empty_tombstoned",
+        ] {
+            let data_dir = std::env::temp_dir().join(format!(
+                "sniper-quarantine-cleanup-{kind}-{}",
+                Uuid::new_v4()
+            ));
+            let root = data_dir.join(super::SESSIONS_DIR);
+            let active = super::default_session_metadata("Active");
+            let target = super::default_session_metadata("Deleted");
+            super::persist_session_snapshot(
+                &root,
+                &active,
+                &super::StoredSessionSnapshot::default(),
+            )
+            .unwrap();
+            super::persist_session_snapshot(
+                &root,
+                &target,
+                &super::StoredSessionSnapshot::default(),
+            )
+            .unwrap();
+            let canonical = super::session_dir(&root, target.id);
+            let evidence = super::deleted_session_dir(&root, target.id);
+            crate::platform::rename(&canonical, &evidence).unwrap();
+            let mut sessions = if kind == "empty_tombstoned" {
+                vec![]
+            } else {
+                vec![active.clone()]
+            };
+            if kind == "live_tombstoned" {
+                sessions.push(target.clone());
+                std::fs::create_dir(&canonical).unwrap();
+                std::fs::write(canonical.join("synthetic-stale"), b"committed deletion").unwrap();
+            }
+            let deleted = if kind == "unreferenced" {
+                vec![]
+            } else {
+                vec![target.id]
+            };
+            super::write_json(&root.join(super::REGISTRY_FILE), &serde_json::json!({
+                "active_session_id": active.id, "sessions": sessions, "deleted_session_ids": deleted
+            })).unwrap();
+            let (registry, loaded) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+            assert!(registry.contains_session(active.id));
+            assert!(!registry.contains_session(target.id));
+            assert!(!canonical.exists());
+            assert!(!evidence.exists());
+            assert!(!registry
+                .inner
+                .read()
+                .unwrap()
+                .deleted_session_ids
+                .contains(&target.id));
+            drop(loaded);
+            drop(registry);
+            let (registry, loaded) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+            assert!(!registry.contains_session(target.id));
+            drop(loaded);
+            drop(registry);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
     }
 
     #[test]
@@ -6474,44 +6928,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    #[tokio::test]
-    async fn registry_corrupt_recovery_ignores_quarantined_deleted_session_dirs() {
+    #[test]
+    fn registry_quarantine_preserves_corrupt_registry_and_legacy_evidence() {
         let data_dir = std::env::temp_dir().join(format!(
-            "sniper-session-registry-corrupt-deleted-{}",
-            uuid::Uuid::new_v4()
+            "sniper-quarantine-corrupt-legacy-{}",
+            Uuid::new_v4()
         ));
-        let root_dir = data_dir.join(super::SESSIONS_DIR);
+        let root = data_dir.join(super::SESSIONS_DIR);
         let active = super::default_session_metadata("Active");
-        let deleted = super::default_session_metadata("Deleted");
-        super::persist_session_snapshot(
-            &root_dir,
-            &active,
-            &super::StoredSessionSnapshot::default(),
-        )
-        .expect("active snapshot should be written");
-        super::persist_session_snapshot(
-            &root_dir,
-            &deleted,
-            &super::StoredSessionSnapshot::default(),
-        )
-        .expect("deleted snapshot should be written before quarantine");
-        let deleted_storage = super::session_dir(&root_dir, deleted.id);
-        let quarantine_dir = root_dir.join(format!(".deleted-{}", deleted.id));
-        crate::platform::rename(&deleted_storage, &quarantine_dir)
-            .expect("deleted session storage should be quarantined");
-        std::fs::write(root_dir.join(super::REGISTRY_FILE), b"{not json")
-            .expect("corrupt registry should be written");
-
-        let (registry, loaded_active) = SessionRegistry::load_or_create(&data_dir, 32, 32)
-            .expect("corrupt registry should recover");
-
-        assert_eq!(loaded_active.id(), active.id);
-        assert!(registry.contains_session(active.id));
-        assert!(!registry.contains_session(deleted.id));
-        assert!(!deleted_storage.exists());
-        assert!(quarantine_dir.exists());
-
-        let _ = std::fs::remove_dir_all(&data_dir);
+        let target = super::default_session_metadata("Interrupted deletion");
+        for metadata in [&active, &target] {
+            super::persist_session_snapshot(
+                &root,
+                metadata,
+                &super::StoredSessionSnapshot::default(),
+            )
+            .unwrap();
+        }
+        let canonical = super::session_dir(&root, target.id);
+        let evidence = root.join(format!(".deleted-{}", target.id));
+        crate::platform::rename(&canonical, &evidence).unwrap();
+        std::fs::write(root.join(super::REGISTRY_FILE), b"{not json").unwrap();
+        assert_quarantine_startup_refused_without_changes(&data_dir);
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[tokio::test]
