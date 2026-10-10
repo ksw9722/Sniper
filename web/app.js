@@ -25273,7 +25273,12 @@ function flushAnnotationsOnUnload() {
 }
 
 async function flushAllPendingAnnotations(options = {}) {
+  const sessionId = options.sessionId || currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWorkspace = () => sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
   for (let attempt = 0; attempt < 40; attempt += 1) {
+    // A drain must not carry an old external-change bypass into newer notes.
+    if (!ownsWorkspace()) return;
     const pendingIds = state._pendingAnnotations ? Array.from(state._pendingAnnotations.keys()) : [];
     const inFlight = state._annotationInFlight || new Set();
     if (!pendingIds.length && !inFlight.size) {
@@ -25281,15 +25286,22 @@ async function flushAllPendingAnnotations(options = {}) {
     }
     const idleIds = pendingIds.filter((id) => !inFlight.has(id));
     if (idleIds.length) {
-      await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, {
-        ...options,
-        throwOnError: true,
-      })));
+      try {
+        await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, {
+          ...options,
+          throwOnError: true,
+        })));
+      } catch (error) {
+        if (!ownsWorkspace()) return;
+        throw error;
+      }
     }
+    if (!ownsWorkspace()) return;
     if ((!state._pendingAnnotations || state._pendingAnnotations.size === 0) && (!state._annotationInFlight || state._annotationInFlight.size === 0)) {
       return;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 50));
+    if (!ownsWorkspace()) return;
   }
   throw new Error("Timed out saving pending annotations.");
 }
