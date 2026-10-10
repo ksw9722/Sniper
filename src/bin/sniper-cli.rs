@@ -10657,6 +10657,21 @@ fn saved_uuid_field(value: &Value, field: &str) -> Option<Uuid> {
         .and_then(|text| Uuid::parse_str(text).ok())
 }
 
+fn saved_response_diagnostic(
+    operation: &str,
+    read_message: &'static str,
+    receipt_message: &'static str,
+) -> &'static str {
+    if sniper::saved_contract::OPERATIONS.contains(&operation)
+        && !sniper::saved_data::is_write(operation)
+        && operation != "saved.v1.operation.get"
+    {
+        read_message
+    } else {
+        receipt_message
+    }
+}
+
 fn validate_saved_response_binding(operation: &str, input: &Value, data: &Value) -> Result<()> {
     if sniper::saved_data::is_write(operation) {
         if saved_uuid_field(&data["receipt"], "operation_id")
@@ -10824,7 +10839,11 @@ async fn run_saved_call(
         .map_err(|_| {
             saved_cli_error(
                 "TRANSPORT_ERROR",
-                "Saved-data response unavailable; inspect the operation receipt",
+                saved_response_diagnostic(
+                    &operation,
+                    "Saved-data read response unavailable",
+                    "Saved-data response unavailable; inspect the operation receipt",
+                ),
                 uncertain_outcome,
                 &input,
             )
@@ -10833,7 +10852,11 @@ async fn run_saved_call(
     if status.is_redirection() {
         return Err(saved_cli_error(
             "REDIRECT_REFUSED",
-            "Saved-data redirects are not followed; inspect the original operation receipt",
+            saved_response_diagnostic(
+                &operation,
+                "Saved-data read redirects are not followed",
+                "Saved-data redirects are not followed; inspect the original operation receipt",
+            ),
             uncertain_outcome,
             &input,
         ));
@@ -10841,7 +10864,11 @@ async fn run_saved_call(
     let wire: Value = response.json().await.map_err(|_| {
         saved_cli_error(
             "INVALID_RESPONSE",
-            "Could not decode the saved-data response; inspect the operation receipt",
+            saved_response_diagnostic(
+                &operation,
+                "Could not decode the saved-data read response",
+                "Could not decode the saved-data response; inspect the operation receipt",
+            ),
             uncertain_outcome,
             &input,
         )
@@ -10851,17 +10878,41 @@ async fn run_saved_call(
     {
         return Err(saved_cli_error(
             "INVALID_RESPONSE",
-            "Server did not identify a saved.v1 response; inspect the operation receipt",
+            saved_response_diagnostic(
+                &operation,
+                "Server did not identify a saved.v1 read response",
+                "Server did not identify a saved.v1 response; inspect the operation receipt",
+            ),
             uncertain_outcome,
             &input,
         ));
     }
     if status.is_success() && wire.get("ok") == Some(&Value::Bool(true)) {
         if let Some(data) = wire.get("data") {
-            sniper::saved_contract::validate_output(&operation, data).map_err(|_| saved_cli_error(
-                "INVALID_RESPONSE", "Server data does not satisfy the saved.v1 output schema; inspect the operation receipt", uncertain_outcome, &input))?;
-            validate_saved_response_binding(&operation, &input, data).map_err(|_| saved_cli_error(
-                "INVALID_RESPONSE", "Saved-data response identifies a different request; inspect the original operation receipt", uncertain_outcome, &input))?;
+            sniper::saved_contract::validate_output(&operation, data).map_err(|_| {
+                saved_cli_error(
+                    "INVALID_RESPONSE",
+                    saved_response_diagnostic(
+                        &operation,
+                        "Server read data does not satisfy the saved.v1 output schema",
+                        "Server data does not satisfy the saved.v1 output schema; inspect the operation receipt",
+                    ),
+                    uncertain_outcome,
+                    &input,
+                )
+            })?;
+            validate_saved_response_binding(&operation, &input, data).map_err(|_| {
+                saved_cli_error(
+                    "INVALID_RESPONSE",
+                    saved_response_diagnostic(
+                        &operation,
+                        "Saved-data read response identifies a different request",
+                        "Saved-data response identifies a different request; inspect the original operation receipt",
+                    ),
+                    uncertain_outcome,
+                    &input,
+                )
+            })?;
             return print_json(data);
         }
     }
@@ -10877,7 +10928,16 @@ async fn run_saved_call(
             || error.operation_id != saved_uuid_field(&input, "operation_id")
             || error.session_id != sniper::saved_contract::input_session_id(&input)
         {
-            return Err(saved_cli_error("INVALID_RESPONSE", "Saved-data error does not match this request; inspect the original operation receipt", uncertain_outcome, &input));
+            return Err(saved_cli_error(
+                "INVALID_RESPONSE",
+                saved_response_diagnostic(
+                    &operation,
+                    "Saved-data read error does not match this request",
+                    "Saved-data error does not match this request; inspect the original operation receipt",
+                ),
+                uncertain_outcome,
+                &input,
+            ));
         }
         let outcome = match error.outcome {
             sniper::saved_operations::SavedOperationOutcome::Applied => "applied",
@@ -10891,7 +10951,16 @@ async fn run_saved_call(
             &input,
         ));
     }
-    Err(saved_cli_error("INVALID_RESPONSE", "Server did not return a saved.v1 response; inspect the operation receipt before any further action", uncertain_outcome, &input))
+    Err(saved_cli_error(
+        "INVALID_RESPONSE",
+        saved_response_diagnostic(
+            &operation,
+            "Server did not return a saved.v1 read response",
+            "Server did not return a saved.v1 response; inspect the operation receipt before any further action",
+        ),
+        uncertain_outcome,
+        &input,
+    ))
 }
 
 #[derive(Debug)]
@@ -11232,12 +11301,20 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
         };
     }
     if let Some(saved) = error.downcast_ref::<SavedCliError>() {
-        let hint = if saved.code == "INVALID_INPUT"
-            && saved.outcome == "not_applied"
+        let known_read = saved.outcome == "not_applied"
             && sniper::saved_contract::OPERATIONS.contains(&operation)
-            && !sniper::saved_data::is_write(operation)
-        {
+            && !sniper::saved_data::is_write(operation);
+        let hint = if known_read && saved.code == "INVALID_INPUT" {
             "Inspect sniper-cli schema input <operation> for this operation's accepted input, then correct the input."
+        } else if known_read && operation != "saved.v1.operation.get" {
+            // Summary/selection reads have no operation ID or mutation receipt.
+            match saved.code {
+                "STALE_CONTINUATION" if operation == "saved.v1.session.list" => "Discard the stale continuation and deliberately start a fresh session listing on the same selected API with the same page limit. Treat it as a new traversal, not a continuation of earlier results.",
+                "STALE_CONTINUATION" => "Discard the stale continuation and deliberately start a fresh listing with the same explicit session_id. Treat it as a new traversal, not a continuation of earlier results.",
+                "SESSION_NOT_FOUND" => "Use saved.v1.session.list to inspect available sessions, then deliberately select an existing session UUID. Do not silently switch sessions.",
+                "API_UNAVAILABLE" => "Check the selected API endpoint and that Sniper is running, then deliberately rerun this read.",
+                _ => "Inspect the error and selected API/session context before deliberately rerunning this read; never automatically retry a mutation.",
+            }
         } else {
             "Use saved.v1.operation.get with the original operation_id to inspect a receipt; never automatically retry a mutation."
         };
@@ -16556,6 +16633,40 @@ mod tests {
         assert_eq!(output["bypass_hosts"], json!(["localhost"]));
         let older_server = proxy_chain_output(&json!({"upstream_proxy": {"enabled": false}}));
         assert_eq!(older_server["bypass_hosts"], json!([]));
+    }
+
+    #[test]
+    fn saved_response_diagnostics_distinguish_metadata_reads_from_receipts() {
+        for operation in [
+            "saved.v1.http.list",
+            "saved.v1.http.select",
+            "saved.v1.session.list",
+        ] {
+            assert_eq!(
+                super::saved_response_diagnostic(
+                    operation,
+                    "read diagnostic",
+                    "receipt diagnostic"
+                ),
+                "read diagnostic"
+            );
+        }
+        for operation in [
+            "saved.v1.http.delete",
+            "saved.v1.http.clear",
+            "saved.v1.session.rename",
+            "saved.v1.operation.get",
+            "saved.v1.future",
+        ] {
+            assert_eq!(
+                super::saved_response_diagnostic(
+                    operation,
+                    "read diagnostic",
+                    "receipt diagnostic"
+                ),
+                "receipt diagnostic"
+            );
+        }
     }
 
     #[test]
