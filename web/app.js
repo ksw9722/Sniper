@@ -4768,6 +4768,8 @@ function hasPendingWorkspaceStateSave() {
 
 async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
   const sessionId = options.sessionId || null;
+  const workspaceSessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
   const tabs = (state.replayTabs || []).filter((tab) => (
     tab
     && tab.type === "websocket"
@@ -4781,6 +4783,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
     guardWorkspaceRevision: false,
     sessionId,
   })));
+  if (workspaceSessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
   for (const result of results) {
     if (result.status === "rejected") {
       console.warn("Failed to clean up WebSocket replay tab before session reset:", result.reason);
@@ -4983,13 +4986,21 @@ async function reloadSessionWorkspace({ cleanupBeforeReset = true } = {}) {
 
 async function handleExternalSessionChanged(previousSessionId = currentSessionId()) {
   const targetSessionId = previousSessionId || currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWorkspace = () => targetSessionId === currentSessionId()
+    && workspaceGeneration === workspaceStateGeneration;
+  // Bypassing the active-session guard is safe only for this original workspace.
+  // Another reload can finish while any of the draft preflights is awaiting I/O.
+  if (!ownsWorkspace()) return;
   const staleSessionWriteOptions = {
     bypassExpectedActiveSessionGuard: true,
     sessionId: targetSessionId,
   };
   let shouldReload = false;
   try {
-    if (!(await flushSequenceDraftBeforeExternalSessionReload(staleSessionWriteOptions))) {
+    const sequenceSaved = await flushSequenceDraftBeforeExternalSessionReload(staleSessionWriteOptions);
+    if (!ownsWorkspace()) return;
+    if (!sequenceSaved) {
       showToast(
         "Session changed before the Sequence draft finished saving. Save or discard the draft before reloading sessions.",
         "error",
@@ -4998,33 +5009,42 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
       return;
     }
   } catch (error) {
+    if (!ownsWorkspace()) return;
     handleSequenceActionError(error);
     return;
   }
   if (!(await flushTargetScopeDraft(staleSessionWriteOptions))) {
     return;
   }
+  if (!ownsWorkspace()) return;
   if (!(await flushMatchReplaceDraft(staleSessionWriteOptions))) {
     return;
   }
+  if (!ownsWorkspace()) return;
   try {
     await flushAllPendingAnnotations(staleSessionWriteOptions);
   } catch (error) {
+    if (!ownsWorkspace()) return;
     handleWorkspaceActionError(error);
     return;
   }
+  if (!ownsWorkspace()) return;
   if (hasPendingWorkspaceStateSave()) {
     try {
       await flushWorkspaceState(staleSessionWriteOptions);
     } catch (error) {
+      if (!ownsWorkspace()) return;
       handleWorkspaceActionError(error);
       return;
     }
+    if (!ownsWorkspace()) return;
   }
   try {
     await cleanupWsReplayTabsBeforeStateReset(staleSessionWriteOptions);
+    if (!ownsWorkspace()) return;
     shouldReload = true;
   } catch (error) {
+    if (!ownsWorkspace()) return;
     handleWorkspaceActionError(error);
     return;
   }
@@ -14951,6 +14971,8 @@ async function saveCurrentSequence({
   skipPostSaveStateSync = false,
 } = {}) {
   if (!state.editingSequence) return false;
+  const workspaceSessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
   syncSequenceStepFromDom({ allowInvalidRequests: true });
   const sessionId = targetSessionId || currentSequenceSessionId();
   const savedId = state.editingSequence.id;
@@ -14974,6 +14996,7 @@ async function saveCurrentSequence({
     return false;
   }
   if (skipPostSaveStateSync) {
+    if (workspaceSessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
     if ((state.sequenceDraftVersion || 0) !== draftVersion) {
       state.sequenceDirty = true;
       return false;
@@ -15010,9 +15033,16 @@ async function flushSequenceDraft(options = {}) {
 }
 
 async function flushSequenceDraftBeforeExternalSessionReload(options = {}) {
+  const sessionId = options.sessionId || currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWorkspace = () => sessionId === currentSessionId()
+    && workspaceGeneration === workspaceStateGeneration;
+  if (!ownsWorkspace()) return false;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     if (!state.sequenceDirty || !state.editingSequence) return true;
-    if (await flushSequenceDraft({ ...options, skipPostSaveStateSync: true })) {
+    const saved = await flushSequenceDraft({ ...options, skipPostSaveStateSync: true });
+    if (!ownsWorkspace()) return false;
+    if (saved) {
       return true;
     }
   }
