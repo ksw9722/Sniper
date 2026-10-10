@@ -121,6 +121,16 @@ from it. Codex can branch on those without parsing prose. The `2` an agent hits
 most is not a malformed argument but `CONFIRMATION_REQUIRED` — a write run with
 neither `--dry-run` nor `--yes`.
 
+After discovery, legacy JSON GET failures such as `session.list` report
+`HTTP_STATUS_ERROR` with the received `error.details.status`, regardless of
+server wording: 4xx means exit `5`, `retryable:false`; 5xx means exit `6`,
+`retryable:true` for reads. Their message now contains only the status; server
+error bodies are neither read nor echoed, including structured diagnostics that
+could contain private data. This adds no automatic retries. Confirmed writes
+remain non-retryable even when a preliminary GET fails. Discovery, successful
+response decoding, non-GET error handling, and the separate
+[`saved.v1` error contract](saved-data-v1.md) are unchanged.
+
 ## What to ask for
 
 Ask in terms of the workflow, not the flags. Each example below is a real run

@@ -1756,6 +1756,11 @@ impl ApiClient {
 
         let status = response.status();
         if !status.is_success() {
+            if method == Method::GET {
+                // Classify by headers alone: diagnostics can contain arbitrary
+                // prose or sensitive data, and an error body can be incomplete.
+                return Err(ReadHttpStatusError { status }.into());
+            }
             let message = response.text().await.unwrap_or_else(|_| String::new());
             let detail = api_failure_detail(status, message);
             bail!("request to {} failed ({}): {}", path, status, detail);
@@ -10890,6 +10895,19 @@ async fn run_saved_call(
 }
 
 #[derive(Debug)]
+struct ReadHttpStatusError {
+    status: StatusCode,
+}
+
+impl fmt::Display for ReadHttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "API read failed ({})", self.status)
+    }
+}
+
+impl std::error::Error for ReadHttpStatusError {}
+
+#[derive(Debug)]
 struct CallInputError(String);
 
 impl fmt::Display for CallInputError {
@@ -11253,7 +11271,19 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
     }
 
     let message = error.to_string();
-    let mut payload = if message.contains("requires --dry-run or --yes") {
+    // A read's server diagnostic must not turn its actual HTTP status into a
+    // local confirmation, input, discovery, or workspace-conflict error.
+    let mut payload = if let Some(read) = error.downcast_ref::<ReadHttpStatusError>() {
+        let status = read.status.as_u16();
+        CliErrorPayload {
+            code: "HTTP_STATUS_ERROR",
+            message: read.to_string(),
+            hint: None,
+            retryable: status >= 500,
+            details: json!({ "status": status }),
+            exit_code: if status < 500 { 5 } else { 6 },
+        }
+    } else if message.contains("requires --dry-run or --yes") {
         CliErrorPayload {
             code: "CONFIRMATION_REQUIRED",
             message,
@@ -14698,6 +14728,53 @@ mod tests {
         assert_eq!(payload.code, "CONFIRMATION_REQUIRED");
         assert_eq!(payload.exit_code, 2);
         assert!(!payload.retryable);
+    }
+
+    #[test]
+    fn read_http_status_errors_keep_write_retry_guards_and_safe_messages() {
+        let typed = anyhow::Error::new(super::ReadHttpStatusError {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        })
+        .context("synthetic diagnostic requires --dry-run or --yes");
+        let read = cli_error_payload("session.list", &typed);
+        assert_eq!(read.code, "HTTP_STATUS_ERROR");
+        assert_eq!(read.message, "API read failed (503 Service Unavailable)");
+        assert_eq!(read.details, json!({"status":503}));
+        assert_eq!(read.exit_code, 6);
+        assert!(read.retryable);
+
+        let legacy = anyhow::anyhow!(
+            "request to /api/sessions failed (503 Service Unavailable): synthetic failure"
+        );
+        for operation in manifest_operations()
+            .into_iter()
+            .filter(|spec| spec.side_effect == CliSideEffect::Write && spec.requires_confirmation)
+        {
+            for error in [&typed, &legacy] {
+                let payload = cli_error_payload(operation.operation, error);
+                assert_eq!(payload.code, "HTTP_STATUS_ERROR");
+                assert!(!payload.retryable, "{}", operation.operation);
+                assert_eq!(payload.details["status"], 503);
+                assert_eq!(payload.details["idempotent"], false);
+                assert!(payload.hint.unwrap().contains("partially applied"));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_workspace_conflict_classification_remains_unchanged() {
+        let error = anyhow::anyhow!(
+            "workspace state revision conflict: current revision 2; reload workspace state"
+        );
+        let payload = cli_error_payload("session.create", &error);
+        assert_eq!(payload.code, "WORKSPACE_CONFLICT");
+        assert_eq!(payload.exit_code, 5);
+        assert!(!payload.retryable);
+        assert_eq!(payload.details, json!({}));
+        assert_eq!(
+            payload.hint,
+            Some("Refresh workspace state and retry deliberately.")
+        );
     }
 
     #[test]
