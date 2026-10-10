@@ -151,7 +151,11 @@ and `details`, with `schema_version:"saved.v1"`. `details` includes mutation
 `retryable:false`; transport failure does not authorize destructive retry.
 Errors are typed at their source and never inferred from matching message text.
 The saved-only HTTP client disables both automatic protocol retries and redirects.
-Redirects return `REDIRECT_REFUSED`; the original request's receipt must be checked.
+Redirects return `REDIRECT_REFUSED`. For mutations or receipt lookup, inspect
+the receipt using the original operation ID. Ordinary metadata reads have no
+mutation receipt: inspect the selected API/session context before deliberately
+rerunning the read. A redirect does not authorize following an alternate endpoint
+or automatically retrying a mutation.
 Successful output and typed errors are checked against the original operation ID
 and explicit/pinned session before their outcomes are attributed to the request.
 
