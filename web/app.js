@@ -468,6 +468,8 @@ const state = {
   targetScopeDraft: "",
   targetScopeExcludeDraft: "",
   targetScopeDirty: false,
+  targetScopeDraftVersion: 0,
+  targetScopeSaveToken: 0,
   targetScopeEditorSessionId: null,
   targetExpandedHosts: new Set(),
   intercepts: [],
@@ -506,6 +508,8 @@ const state = {
   matchReplaceRules: [],
   selectedMatchReplaceRuleId: null,
   matchReplaceDirty: false,
+  matchReplaceDraftVersion: 0,
+  matchReplaceSaveToken: 0,
   matchReplaceEditorSessionId: null,
   targetSiteMap: [],
   oastCallbacks: [],
@@ -1895,7 +1899,7 @@ function bindEvents() {
     }
     syncMatchReplaceEditor();
     return saveMatchReplaceRules()
-      .then(() => showToast("Rule saved"))
+      .then((saved) => { if (saved !== false) showToast("Rule saved"); })
       .catch((error) => { console.error(error); showToast("Failed to save rule", "error"); });
   });
   els.addMatchReplaceRuleButton.addEventListener("click", () => {
@@ -1924,14 +1928,20 @@ function bindEvents() {
   });
   onClickWithProgress(els.saveTargetScopeButton, () =>
     saveTargetScope()
-      .then(() => showToast("Scope saved"))
+      .then((saved) => { if (saved !== false) showToast("Scope saved"); })
       .catch((error) => { console.error(error); showToast(error?.message || "Failed to save scope", "error"); }));
   els.targetScopeEditor.addEventListener("input", () => {
+    if (state.targetScopeDraft !== els.targetScopeEditor.value) {
+      state.targetScopeDraftVersion = (state.targetScopeDraftVersion || 0) + 1;
+    }
     state.targetScopeDraft = els.targetScopeEditor.value;
     state.targetScopeDirty = true;
     state.targetScopeEditorSessionId = currentSessionId();
   });
   els.targetScopeExcludeEditor?.addEventListener("input", () => {
+    if (state.targetScopeExcludeDraft !== els.targetScopeExcludeEditor.value) {
+      state.targetScopeDraftVersion = (state.targetScopeDraftVersion || 0) + 1;
+    }
     state.targetScopeExcludeDraft = els.targetScopeExcludeEditor.value;
     state.targetScopeDirty = true;
     state.targetScopeEditorSessionId = currentSessionId();
@@ -7247,21 +7257,27 @@ async function saveMatchReplaceRules(options = {}) {
   ) {
     throw new Error("Match/Replace editor changed sessions. Review the rule and save again.");
   }
+  const workspaceGeneration = workspaceStateGeneration;
+  const draftVersion = state.matchReplaceDraftVersion || 0;
+  const saveToken = state.matchReplaceSaveToken = (state.matchReplaceSaveToken || 0) + 1;
+  const submittedRules = JSON.stringify(state.matchReplaceRules);
   const response = await fetch(sessionWritePath("/api/match-replace", sessionId, options), {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({ session_id: sessionId, rules: state.matchReplaceRules }),
+    body: JSON.stringify({ session_id: sessionId, rules: JSON.parse(submittedRules) }),
   });
   await requireOkResponse(response, "Failed to save match-replace rules.");
   const rules = jsonArray(await response.json());
-  if (sessionId !== currentSessionId()) {
-    if (state.matchReplaceEditorSessionId === sessionId) {
-      state.matchReplaceDirty = false;
-      state.matchReplaceEditorSessionId = null;
-    }
-    return;
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
+  // An acknowledgement belongs to its dispatched draft, not to edits made
+  // while it was pending (including edit/revert and a newer save attempt).
+  if (draftVersion !== (state.matchReplaceDraftVersion || 0)
+    || saveToken !== state.matchReplaceSaveToken
+    || submittedRules !== JSON.stringify(state.matchReplaceRules)) {
+    showToast("An earlier save completed. Your current draft is unchanged; review it before continuing.", "error", 7000);
+    return false;
   }
   state.matchReplaceRules = rules;
   if (!state.matchReplaceRules.some((rule) => rule.id === state.selectedMatchReplaceRuleId)) {
@@ -7270,6 +7286,7 @@ async function saveMatchReplaceRules(options = {}) {
   state.matchReplaceDirty = false;
   state.matchReplaceEditorSessionId = sessionId;
   renderMatchReplaceRules();
+  return true;
 }
 
 async function flushMatchReplaceDraft(options = {}) {
@@ -7277,8 +7294,7 @@ async function flushMatchReplaceDraft(options = {}) {
     return true;
   }
   try {
-    await saveMatchReplaceRules(options);
-    return true;
+    return (await saveMatchReplaceRules(options)) !== false;
   } catch (error) {
     console.error(error);
     showToast(error?.message || "Failed to save match-replace rule", "error");
@@ -7309,11 +7325,10 @@ async function flushTargetScopeDraft(options = {}) {
     return true;
   }
   try {
-    await saveTargetScope({
+    return (await saveTargetScope({
       ...options,
       skipReload: true,
-    });
-    return true;
+    })) !== false;
   } catch (error) {
     console.error(error);
     showToast(error?.message || "Failed to save scope", "error");
@@ -7328,8 +7343,9 @@ async function reloadTargetSiteMapFromButton() {
   await loadTargetSiteMap(true);
 }
 
-async function loadTargetSiteMap(forceScopeSync = false) {
+async function loadTargetSiteMap(forceScopeSync = false, saveContext = null) {
   const sessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
   const [runtimeResponse, siteMapResponse] = await Promise.all([
     fetch(sessionQueryPath("/api/runtime", sessionId)),
     fetch(sessionQueryPath("/api/target/site-map", sessionId)),
@@ -7338,9 +7354,17 @@ async function loadTargetSiteMap(forceScopeSync = false) {
   await requireOkResponse(siteMapResponse, "Failed to load target site map.");
   const runtime = await runtimeResponse.json();
   const siteMap = jsonArray(await siteMapResponse.json());
-  if (sessionId !== currentSessionId()) {
-    return;
-  }
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
+  // A save's follow-up read must not overwrite a newer editor before the
+  // waiting save caller gets its chance to check ownership again.
+  if (saveContext && (saveContext.sessionId !== sessionId
+    || saveContext.workspaceGeneration !== workspaceGeneration
+    || saveContext.draftVersion !== (state.targetScopeDraftVersion || 0)
+    || saveContext.saveToken !== state.targetScopeSaveToken
+    || saveContext.scopeDraft !== state.targetScopeDraft
+    || saveContext.excludeDraft !== state.targetScopeExcludeDraft
+    || saveContext.scopeText !== els.targetScopeEditor.value
+    || saveContext.excludeText !== els.targetScopeExcludeEditor?.value)) return false;
   state.runtime = runtime;
   state.targetSiteMap = siteMap;
   syncTargetScopeDraft(forceScopeSync);
@@ -13674,6 +13698,9 @@ function renderMatchReplaceRules() {
       event.stopPropagation();
       const rule = state.matchReplaceRules.find((r) => r.id === toggle.dataset.ruleToggle);
       if (rule) {
+        if (rule.enabled !== toggle.checked) {
+          state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
+        }
         rule.enabled = toggle.checked;
         saveMatchReplaceRules().catch((error) => {
           console.error(error);
@@ -14224,6 +14251,7 @@ function createNewMatchReplaceRule() {
     case_sensitive: false,
   };
   state.matchReplaceRules = [rule, ...state.matchReplaceRules];
+  state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
   state.selectedMatchReplaceRuleId = rule.id;
   renderMatchReplaceRules();
 }
@@ -14256,6 +14284,7 @@ function syncMatchReplaceEditor() {
     || Boolean(rule.case_sensitive) !== next.case_sensitive;
   Object.assign(rule, next);
   if (changed) {
+    state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
     state.matchReplaceDirty = true;
     state.matchReplaceEditorSessionId = currentSessionId();
   }
@@ -14267,10 +14296,11 @@ async function deleteSelectedMatchReplaceRule() {
   }
 
   state.matchReplaceRules = state.matchReplaceRules.filter((rule) => rule.id !== state.selectedMatchReplaceRuleId);
+  state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
   state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
   renderMatchReplaceRules();
-  await saveMatchReplaceRules();
-  showToast("Rule deleted");
+  const saved = await saveMatchReplaceRules();
+  if (saved !== false) showToast("Rule deleted");
 }
 
 async function saveTargetScope(options = {}) {
@@ -14288,6 +14318,21 @@ async function saveTargetScope(options = {}) {
   const excludeText = state.targetScopeEditorSessionId === sessionId
     ? els.targetScopeExcludeEditor?.value
     : state.targetScopeExcludeDraft;
+  const workspaceGeneration = workspaceStateGeneration;
+  const draftVersion = state.targetScopeDraftVersion || 0;
+  const saveToken = state.targetScopeSaveToken = (state.targetScopeSaveToken || 0) + 1;
+  const submittedDraft = state.targetScopeDraft;
+  const submittedExcludeDraft = state.targetScopeExcludeDraft;
+  const ownsWorkspace = () => sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
+  const ownsDraft = () => ownsWorkspace()
+    && draftVersion === (state.targetScopeDraftVersion || 0)
+    && saveToken === state.targetScopeSaveToken;
+  const superseded = () => {
+    if (ownsWorkspace()) {
+      showToast("An earlier save completed. Your current draft is unchanged; review it before continuing.", "error", 7000);
+    }
+    return false;
+  };
   const toPatterns = (text) => String(text || "")
     .split("\n")
     .map((line) => line.trim())
@@ -14310,15 +14355,11 @@ async function saveTargetScope(options = {}) {
     throw new Error(`saveTargetScope failed: ${response.status}`);
   }
   const runtime = await response.json();
-  if (sessionId !== currentSessionId()) {
-    if (state.targetScopeEditorSessionId === sessionId) {
-      state.targetScopeDraft = formatScopePatternsText(runtime?.scope_patterns);
-      state.targetScopeExcludeDraft = formatScopePatternsText(runtime?.excluded_scope_patterns);
-      state.targetScopeDirty = false;
-      state.targetScopeEditorSessionId = null;
-    }
-    return;
-  }
+  if (!ownsDraft()
+    || submittedDraft !== state.targetScopeDraft
+    || submittedExcludeDraft !== state.targetScopeExcludeDraft
+    || scopeText !== (state.targetScopeEditorSessionId === sessionId ? els.targetScopeEditor.value : state.targetScopeDraft)
+    || excludeText !== (state.targetScopeEditorSessionId === sessionId ? els.targetScopeExcludeEditor?.value : state.targetScopeExcludeDraft)) return superseded();
   state.runtime = runtime;
   state.targetScopeDraft = formatScopePatternsText(state.runtime?.scope_patterns);
   state.targetScopeExcludeDraft = formatScopePatternsText(
@@ -14338,10 +14379,20 @@ async function saveTargetScope(options = {}) {
   renderInterceptStatus();
   renderProxySettings();
   if (!options.skipReload) {
-    await loadTargetSiteMap();
+    const loaded = await loadTargetSiteMap(false, {
+      sessionId, workspaceGeneration, draftVersion, saveToken,
+      // Compare against the canonical response now shown, not the raw text
+      // that was legitimately normalized by this successful save.
+      scopeText: els.targetScopeEditor.value,
+      excludeText: els.targetScopeExcludeEditor?.value,
+      scopeDraft: state.targetScopeDraft,
+      excludeDraft: state.targetScopeExcludeDraft,
+    });
+    if (loaded === false || !ownsDraft()) return superseded();
   }
   invalidateVisibleEntriesCache();
   scheduleRefresh();
+  return true;
 }
 
 async function openFuzzerFromReplay() {

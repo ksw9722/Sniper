@@ -676,3 +676,30 @@ test('force confirmation after a newer reload captures that current owner and ca
   await f.finishReload({ pending }, 1, 'session-c'); assert.equal(f.toasts.length, 0);
   assert.equal(f.state.activeSession.id, 'session-c');
 });
+
+// A preserved leaf draft must also stop its real create/open caller. Otherwise
+// the old unconditional flush success would authorize the following reset.
+for (const operation of ['create', 'activate']) for (const editor of ['scope', 'rules']) {
+  test(`${operation}: actual ${editor} preflight preserves an edit typed while its save waits`, async () => {
+    const f = setupCompletedAction(); let edit;
+    if (editor === 'scope') { edit = useActualScopePreflight(f); edit('example.com'); }
+    else {
+      for (const name of ['flushMatchReplaceDraft', 'saveMatchReplaceRules', 'getSelectedMatchReplaceRule', 'syncMatchReplaceEditor', 'sessionWritePath', 'jsonArray']) vm.runInContext(source(name), f.context);
+      f.context.URLSearchParams = URLSearchParams;
+      f.state.matchReplaceRules = [{ id: 'disabled-metadata', enabled: false, description: '', scope: 'request', target: 'any', search: '', replace: '', regex: false, case_sensitive: false }];
+      f.state.selectedMatchReplaceRuleId = 'disabled-metadata'; f.state.matchReplaceEditorSessionId = 'session-a'; f.state.matchReplaceDirty = true;
+      for (const [key, value] of Object.entries({ Scope: 'request', Target: 'any', Search: '', Replace: '' })) f.els[`matchReplace${key}`] = { value };
+      f.els.matchReplaceRegex = { checked: false }; f.els.matchReplaceCaseSensitive = { checked: false };
+      edit = () => { f.els.matchReplaceCaseSensitive.checked = true; f.context.syncMatchReplaceEditor(); };
+    }
+    const action = await f.start(operation), body = JSON.parse(f.requests[0].options.body);
+    assert.equal(body.session_id, 'session-a'); edit('new.example.com'); const before = f.retained();
+    f.succeed(0, editor === 'scope' ? { scope_patterns: ['example.com'], excluded_scope_patterns: [] } : body.rules);
+    await tick(); assert.equal(f.requests.length, 1, 'no session mutation, workspace save, or retry after superseded preflight');
+    assert.equal(await action.pending, undefined); f.assertRetained(before);
+    assert.equal(f.log.includes('cleanupWsReplayTabsBeforeStateReset'), false);
+    if (editor === 'scope') { assert.equal(f.state.targetScopeDraft, 'new.example.com'); assert.equal(f.state.targetScopeDirty, true); }
+    else { assert.equal(f.state.matchReplaceRules[0].case_sensitive, true); assert.equal(f.state.matchReplaceDirty, true); }
+    assert.equal(f.toasts.length, 1); assert.match(f.toasts[0][0], /earlier save completed/);
+  });
+}
