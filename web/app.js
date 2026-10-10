@@ -946,6 +946,7 @@ const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
 let workspaceStateGeneration = 0;
+let renderedHttpReplayDraftOwner = null;
 const workspacePendingReplayCloses = new Map();
 const workspaceReplayMetadataEdits = new WeakMap();
 let workspaceExternalLoadGeneration = 0;
@@ -4919,6 +4920,7 @@ function resetSessionScopedUiState() {
 }
 
 function renderReplayClearedState() {
+  renderedHttpReplayDraftOwner = null;
   if (els.replayTabStrip) {
     els.replayTabStrip.innerHTML = "";
   }
@@ -5032,6 +5034,7 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
 }
 
 async function createSession() {
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("creating a session")) return;
   if (!(await flushTargetScopeDraft())) {
     return;
   }
@@ -5067,6 +5070,7 @@ async function createSession() {
 }
 
 async function activateSessionById(id, { force = false } = {}) {
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("switching sessions")) return;
   if (!(await flushTargetScopeDraft())) {
     return;
   }
@@ -12903,11 +12907,13 @@ function renderReplay(options = {}) {
   if (els.wsReplayPanel) els.wsReplayPanel.classList.toggle("hidden", !isWsTab);
 
   if (isWsTab) {
+    renderedHttpReplayDraftOwner = null;
     renderWsReplay();
     return;
   }
 
   if (!tab) {
+    renderedHttpReplayDraftOwner = null;
     if (els.replayRequestCM) {
       updateCodePaneCM("replayReq", els.replayRequestCM, "", {
         mode: "http", readOnly: false,
@@ -12987,6 +12993,12 @@ function renderReplay(options = {}) {
     renderReplayRequestHighlight(tab.requestText);
     updateReplaySearchPane("request", tab.requestText);
   }
+
+  renderedHttpReplayDraftOwner = {
+    tab,
+    sessionId: currentSessionId(),
+    generation: workspaceStateGeneration,
+  };
 
   if (!tab.responseRecord) {
     renderReplayEmptyResponse(tab);
@@ -17491,6 +17503,16 @@ function scrollActiveReplayTabIntoView() {
   }
 }
 
+function preserveActiveHttpReplayDraftBeforeSessionChange(action) {
+  const tab = getActiveReplayTab();
+  const owner = renderedHttpReplayDraftOwner;
+  // Dashboard navigation hides a real editor, but a session reload leaves it
+  // cleared. Only read controls that were rendered for this exact workspace.
+  if (!workspaceLoaded || !owner || owner.tab !== tab
+    || owner.sessionId !== currentSessionId() || owner.generation !== workspaceStateGeneration) return true;
+  return preserveActiveHttpReplayDraftBeforeNavigation(tab, action);
+}
+
 function preserveActiveHttpReplayDraftBeforeNavigation(tab, action) {
   if (!tab || tab.type === "websocket" || tab.id !== state.activeReplayTabId) return true;
 
@@ -17569,6 +17591,7 @@ function preserveActiveHttpReplayDraftBeforeNavigation(tab, action) {
   if (textChanged || versionChanged || targetModelChanged) {
     tab.responseRecord = null;
     tab.notice = "";
+    scheduleWorkspaceStateSave();
   }
   return true;
 }
