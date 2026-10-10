@@ -3061,12 +3061,15 @@ async function reconcileSessionsAfterCompletedAction() {
   );
 }
 
-function canReloadWorkspaceAfterSessionAction(sessionId, workspaceGeneration, saveVersion) {
+function canReloadWorkspaceAfterSessionAction(sessionId, workspaceGeneration, saveVersion, scopeDraftVersion, matchReplaceDraftVersion, sequenceDraftVersion) {
   if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
   // Input stays available while the action awaits its response. Capture supported
   // DOM-only changes, and leave newer work with its owner instead of resetting it.
   if (!preserveActiveHttpReplayDraftBeforeSessionChange("reloading this workspace")) return false;
-  return saveVersion === workspaceSaveVersion;
+  return saveVersion === workspaceSaveVersion
+    && scopeDraftVersion === (state.targetScopeDraftVersion || 0)
+    && matchReplaceDraftVersion === (state.matchReplaceDraftVersion || 0)
+    && sequenceDraftVersion === (state.sequenceDraftVersion || 0);
 }
 
 async function loadWorkspaceState() {
@@ -5132,6 +5135,9 @@ async function createSession() {
   const actionSessionId = currentSessionId();
   const actionWorkspaceGeneration = workspaceStateGeneration;
   const actionWorkspaceSaveVersion = workspaceSaveVersion;
+  const actionScopeDraftVersion = state.targetScopeDraftVersion || 0;
+  const actionMatchReplaceDraftVersion = state.matchReplaceDraftVersion || 0;
+  const actionSequenceDraftVersion = state.sequenceDraftVersion || 0;
   try {
     const response = await fetch("/api/sessions", {
       method: "POST",
@@ -5147,7 +5153,10 @@ async function createSession() {
     await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
     throw error;
   }
-  if (!canReloadWorkspaceAfterSessionAction(actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion)) {
+  if (!canReloadWorkspaceAfterSessionAction(
+    actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion,
+    actionScopeDraftVersion, actionMatchReplaceDraftVersion, actionSequenceDraftVersion,
+  )) {
     await reconcileSessionsAfterCompletedAction();
     return;
   }
@@ -5190,6 +5199,9 @@ async function activateSessionById(id, { force = false } = {}) {
   const actionSessionId = currentSessionId();
   const actionWorkspaceGeneration = workspaceStateGeneration;
   const actionWorkspaceSaveVersion = workspaceSaveVersion;
+  const actionScopeDraftVersion = state.targetScopeDraftVersion || 0;
+  const actionMatchReplaceDraftVersion = state.matchReplaceDraftVersion || 0;
+  const actionSequenceDraftVersion = state.sequenceDraftVersion || 0;
   try {
     const response = await fetch(`/api/sessions/${id}/activate${force ? "?force=true" : ""}`, {
       method: "POST",
@@ -5215,7 +5227,10 @@ async function activateSessionById(id, { force = false } = {}) {
     await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
     throw error;
   }
-  if (!canReloadWorkspaceAfterSessionAction(actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion)) {
+  if (!canReloadWorkspaceAfterSessionAction(
+    actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion,
+    actionScopeDraftVersion, actionMatchReplaceDraftVersion, actionSequenceDraftVersion,
+  )) {
     await reconcileSessionsAfterCompletedAction();
     return;
   }

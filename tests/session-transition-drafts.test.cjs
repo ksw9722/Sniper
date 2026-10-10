@@ -5,7 +5,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 const { fixture, plain } = require('./replay-workspace-fixture.cjs');
 const { appSource } = require('./frontend-test-helpers.cjs');
-const source = name => appSource.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}`, 'm'))[0];
+const source = name => appSource.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}$`, 'm'))[0];
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function setup({ rendered = true } = {}) {
@@ -703,3 +703,76 @@ for (const operation of ['create', 'activate']) for (const editor of ['scope', '
     assert.equal(f.toasts.length, 1); assert.match(f.toasts[0][0], /earlier save completed/);
   });
 }
+
+function useLateMetadataEditor(f, editor) {
+  if (editor === 'definition') {
+    // Empty saved-definition metadata only. Use the actual existing draft marker
+    // and acknowledgement helper without loading any execution/run functions.
+    for (const name of ['markSequenceDraftDirty', 'bumpSequenceDraftVersion', 'flushSequenceDraft', 'saveCurrentSequence', 'currentSequenceSessionId']) vm.runInContext(source(name), f.context);
+    f.context.syncSequenceStepFromDom = () => {};
+    f.state.editingSequence = { id: 'empty-late-definition', name: 'Stored A', steps: [] };
+    f.state.sequenceDirty = false; f.state.sequenceDraftVersion = 1;
+    return { edit: value => { f.state.editingSequence.name = value ? 'Updated A' : 'Stored A'; f.context.markSequenceDraftDirty(); },
+      snapshot: () => ({ value: plain(f.state.editingSequence), dirty: f.state.sequenceDirty, version: f.state.sequenceDraftVersion }),
+      save: () => f.context.saveCurrentSequence({ skipPostSaveStateSync: true }), response: () => ({}) };
+  }
+  if (editor === 'scope') {
+    const input = useActualScopePreflight(f); input('example.com'); f.state.targetScopeDirty = false;
+    return { edit: value => input(value ? 'new.example.com' : 'example.com'),
+      snapshot: () => ({ value: f.state.targetScopeDraft, dirty: f.state.targetScopeDirty,
+        version: f.state.targetScopeDraftVersion, input: f.els.targetScopeEditor.value }),
+      save: () => f.context.saveTargetScope({ skipReload: true }),
+      response: () => ({ scope_patterns: [f.state.targetScopeDraft], excluded_scope_patterns: [] }) };
+  }
+  for (const name of ['flushMatchReplaceDraft', 'saveMatchReplaceRules', 'getSelectedMatchReplaceRule', 'syncMatchReplaceEditor', 'sessionWritePath', 'jsonArray']) vm.runInContext(source(name), f.context);
+  f.context.URLSearchParams = URLSearchParams;
+  f.state.matchReplaceRules = [{ id: 'disabled-late-metadata', enabled: false, description: '', scope: 'request', target: 'any', search: '', replace: '', regex: false, case_sensitive: false }];
+  f.state.selectedMatchReplaceRuleId = 'disabled-late-metadata'; f.state.matchReplaceEditorSessionId = 'session-a'; f.state.matchReplaceDirty = false;
+  for (const [key, value] of Object.entries({ Scope: 'request', Target: 'any', Search: '', Replace: '' })) f.els[`matchReplace${key}`] = { value };
+  f.els.matchReplaceRegex = { checked: false }; f.els.matchReplaceCaseSensitive = { checked: false };
+  for (const key of ['Scope', 'Target', 'Search', 'Replace', 'Regex', 'CaseSensitive']) {
+    const element = f.els[`matchReplace${key}`]; element.listeners = {};
+    element.addEventListener = (name, handler) => { element.listeners[name] = handler; };
+  }
+  const marker = '  [\n    els.matchReplaceScope,', binding = appSource.slice(appSource.indexOf(marker));
+  vm.runInContext(binding.slice(0, binding.indexOf('\n  });') + 6), f.context);
+  return { edit: value => { f.els.matchReplaceCaseSensitive.checked = value; f.els.matchReplaceCaseSensitive.listeners.change(); },
+    snapshot: () => ({ value: plain(f.state.matchReplaceRules), dirty: f.state.matchReplaceDirty,
+      version: f.state.matchReplaceDraftVersion, input: f.els.matchReplaceCaseSensitive.checked }),
+    save: () => f.context.saveMatchReplaceRules(), response: () => plain(f.state.matchReplaceRules) };
+}
+for (const operation of ['create', 'activate']) for (const editor of ['scope', 'rules', 'definition']) {
+  for (const mode of ['dirty edit', 'edit then revert', 'acknowledged clean edit']) {
+    test(`${operation}: ${editor} ${mode} made after dispatch survives action success`, async () => {
+      const f = setupCompletedAction(), field = useLateMetadataEditor(f, editor), action = await f.start(operation);
+      assert.equal(f.requests.length, 1); const workspaceVersion = f.context.workspaceSaveVersion;
+      field.edit(true); if (mode === 'edit then revert') field.edit(false);
+      if (mode === 'acknowledged clean edit') {
+        const saving = field.save(), body = JSON.parse(f.requests[1].options.body);
+        assert.equal(body.session_id, 'session-a');
+        if (editor === 'rules') assert.ok(body.rules.every(rule => !rule.enabled && !rule.search && !rule.replace));
+        if (editor === 'definition') assert.deepEqual(body.steps, []);
+        f.succeed(1, field.response()); assert.equal(await saving, true);
+      }
+      assert.equal(f.context.workspaceSaveVersion, workspaceVersion, 'metadata editing uses its own draft version');
+      const before = f.retained(), metadata = field.snapshot(), cleanup = f.log.filter(name => name === 'cleanupWsReplayTabsBeforeStateReset').length;
+      await f.finishRetained(action, 0, 'session-b'); f.assertRetained(before);
+      assert.deepEqual(field.snapshot(), metadata); assert.equal(f.state.activeSession.id, 'session-a');
+      assert.equal(f.log.filter(name => name === 'cleanupWsReplayTabsBeforeStateReset').length, cleanup);
+      assert.equal(metadata.dirty, mode !== 'acknowledged clean edit');
+    });
+  }
+  for (const sameValueEvent of editor === 'definition' ? [false] : [false, true]) test(`${operation}: ${editor} ${sameValueEvent ? 'same-value input' : 'unchanged editor'} still permits normal completion`, async () => {
+    const f = setupCompletedAction(), field = useLateMetadataEditor(f, editor), action = await f.start(operation);
+    if (sameValueEvent) field.edit(false);
+    await f.finishReload(action, 0, 'session-b'); assert.equal(f.toasts.length, 0);
+    assert.equal(f.state.activeSession.id, 'session-b');
+  });
+}
+for (const editor of ['scope', 'rules', 'definition']) test(`forced activation also retains a late ${editor} edit`, async () => {
+  const f = setupCompletedAction(), field = useLateMetadataEditor(f, editor);
+  const action = { pending: f.context.activateSessionById('session-b', { force: true }).catch(error => error) };
+  await tick(); assert.equal(f.requests[0].url, '/api/sessions/session-b/activate?force=true');
+  field.edit(true); const metadata = field.snapshot(), before = f.retained();
+  await f.finishRetained(action, 0, 'session-b'); f.assertRetained(before); assert.deepEqual(field.snapshot(), metadata);
+});
