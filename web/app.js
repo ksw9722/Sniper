@@ -2951,8 +2951,10 @@ async function performSelfUpdate() {
 let sessionsLoadGeneration = 0;
 let sessionsAppliedLoadGeneration = 0;
 
-async function loadSessions({ reloadOnActiveChange = false } = {}) {
+async function loadSessions({ reloadOnActiveChange = false, preserveWorkspaceOwner = false } = {}) {
   const generation = ++sessionsLoadGeneration;
+  const workspaceGeneration = preserveWorkspaceOwner ? workspaceStateGeneration : null;
+  const workspaceSessionId = preserveWorkspaceOwner ? currentSessionId() : null;
   let sessions;
   try {
     const response = await fetch("/api/sessions");
@@ -2971,7 +2973,16 @@ async function loadSessions({ reloadOnActiveChange = false } = {}) {
   // Awaited startup/workspace reads still supply data while a refresh is pending.
   // Only an already accepted newer list can supersede this read.
   if (generation < sessionsAppliedLoadGeneration) return;
+  // Error reconciliation refreshes rows only. A later workspace load owns its
+  // own session list, and must not be relabelled by this older action's read.
+  if (preserveWorkspaceOwner && (workspaceGeneration !== workspaceStateGeneration
+    || workspaceSessionId !== currentSessionId())) return;
   sessionsAppliedLoadGeneration = generation;
+  if (preserveWorkspaceOwner) {
+    state.sessions = sessions;
+    renderDashboard();
+    return;
+  }
   const previousActiveSessionId = currentSessionId();
   const nextActiveSession = sessions.find((session) => session.active) || sessions[0] || null;
   if (
@@ -2988,6 +2999,31 @@ async function loadSessions({ reloadOnActiveChange = false } = {}) {
   state.sessions = sessions;
   state.activeSession = nextActiveSession;
   renderDashboard();
+}
+
+async function reconcileSessionsAfterActionError(sessionId, workspaceGeneration) {
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
+  let readFailed = false;
+  try {
+    // An error can follow a committed registry write. Do not retry it or bind
+    // the existing workspace's drafts to the session reported by this read.
+    await loadSessions({ preserveWorkspaceOwner: true });
+  } catch (error) {
+    readFailed = true;
+    console.warn("Failed to refresh sessions after a session action:", error);
+  }
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
+  const listedActiveSession = state.sessions.find((session) => session.active);
+  const activeSessionChanged = listedActiveSession && listedActiveSession.id !== currentSessionId();
+  showToast(
+    readFailed
+      ? "The session action may have completed, but the session list could not be refreshed. Keep a copy of unsaved edits, then use Reload sessions before trying again."
+      : activeSessionChanged
+        ? "The active session changed. Your existing workspace is still open. Keep a copy of unsaved edits, then use Reload sessions to reconcile."
+        : "The session action may have completed. Check the session list before trying again.",
+    "error",
+    7000,
+  );
 }
 
 async function loadWorkspaceState() {
@@ -5009,15 +5045,22 @@ async function createSession() {
   await flushWorkspaceState();
   await cleanupWsReplayTabsBeforeStateReset();
   const name = els.dashboardCreateSessionName.value.trim();
-  const response = await fetch("/api/sessions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ name: name || null }),
-  });
-  if (!response.ok) {
-    throw new Error(await response.text());
+  const actionSessionId = currentSessionId();
+  const actionWorkspaceGeneration = workspaceStateGeneration;
+  try {
+    const response = await fetch("/api/sessions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ name: name || null }),
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+  } catch (error) {
+    await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
+    throw error;
   }
   els.dashboardCreateSessionName.value = "";
   await reloadSessionWorkspace({ cleanupBeforeReset: false });
@@ -5036,25 +5079,32 @@ async function activateSessionById(id, { force = false } = {}) {
   await flushAllPendingAnnotations();
   await flushWorkspaceState();
   await cleanupWsReplayTabsBeforeStateReset();
-  const response = await fetch(`/api/sessions/${id}/activate${force ? "?force=true" : ""}`, {
-    method: "POST",
-  });
-  if (!response.ok) {
-    const message = await response.text();
-    // The server already waited for work that was about to finish. What is left is
-    // a stream that does not end on its own — a server-sent event stream, a long
-    // poll — so offer to cut it rather than leaving the user stuck.
-    if (response.status === 409 && !force && message.includes("proxy activity is still running")) {
-      showConfirmDialog(
-        `${message}.\n\nSwitch anyway? Anything still in flight is cut and will not be recorded.`,
-        () => {
-          activateSessionById(id, { force: true }).catch(handleWorkspaceActionError);
-        },
-        { title: "Proxy is busy", confirmLabel: "Switch anyway" },
-      );
-      return;
+  const actionSessionId = currentSessionId();
+  const actionWorkspaceGeneration = workspaceStateGeneration;
+  try {
+    const response = await fetch(`/api/sessions/${id}/activate${force ? "?force=true" : ""}`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      const message = await response.text();
+      // The server already waited for work that was about to finish. What is left is
+      // a stream that does not end on its own — a server-sent event stream, a long
+      // poll — so offer to cut it rather than leaving the user stuck.
+      if (response.status === 409 && !force && message.includes("proxy activity is still running")) {
+        showConfirmDialog(
+          `${message}.\n\nSwitch anyway? Anything still in flight is cut and will not be recorded.`,
+          () => {
+            activateSessionById(id, { force: true }).catch(handleWorkspaceActionError);
+          },
+          { title: "Proxy is busy", confirmLabel: "Switch anyway" },
+        );
+        return;
+      }
+      throw new Error(message);
     }
-    throw new Error(message);
+  } catch (error) {
+    await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
+    throw error;
   }
   state.selectedSessionId = id;
   await reloadSessionWorkspace({ cleanupBeforeReset: false });
@@ -8554,6 +8604,8 @@ async function deleteSessionById(id) {
   const session = state.sessions.find((s) => s.id === id);
   const name = session ? session.name : id;
   showConfirmDialog(`Delete session "${name}"?\nThis will permanently remove all session data.`, async () => {
+    const actionSessionId = currentSessionId();
+    const actionWorkspaceGeneration = workspaceStateGeneration;
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!res.ok) throw new Error(await res.text());
@@ -8561,6 +8613,7 @@ async function deleteSessionById(id) {
       if (state.selectedSessionId === id) state.selectedSessionId = null;
       renderDashboard();
     } catch (error) {
+      await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
       console.error("Failed to delete session:", error);
       showToast(error?.message || "Failed to delete session.", "error");
     }
