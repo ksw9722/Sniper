@@ -315,3 +315,216 @@ test('force retry reads the newly rendered workspace owner after session reset',
   assert.equal(f.requests.length, 1); assert.deepEqual(take(f), before);
   assert.equal(f.context.renderedHttpReplayDraftOwner.tab, replacement);
 });
+
+// Completion races use the same production render/reset/input fixture, with real
+// session/workspace readers so list-only reconciliation cannot secretly reload.
+function setupCompletedAction() {
+  const f = setup(); f.dashboard(); f.warnings = [];
+  f.rows = active => ['session-a', 'session-b', 'session-c'].map(id => ({ id, name: id, active: id === active }));
+  f.state.sessions = f.rows('session-a'); f.state.selectedSessionId = 'session-a';
+  Object.assign(f.context, {
+    sessionsLoadGeneration: 0, sessionsAppliedLoadGeneration: 0,
+    requireOkResponse: async response => { if (!response.ok) throw new Error('Synthetic session read failure'); },
+    console: { error() {}, warn: (...args) => f.warnings.push(args) },
+  });
+  for (const name of ['loadSessions', 'loadWorkspaceState', 'reconcileSessionsAfterActionError', 'expectedActiveSessionIdForWrite']) {
+    vm.runInContext(source(name), f.context);
+  }
+  f.snapshots = new Map();
+  for (const id of ['session-a', 'session-b', 'session-c']) {
+    const snapshot = f.remote([f.tab(`stored-${id}`)], 20); snapshot.session_id = id;
+    f.snapshots.set(id, snapshot);
+  }
+  f.edit = (kind = 'model') => {
+    f.state.activeTool = 'replay'; f.context.renderToolPanels();
+    if (kind === 'invalid target') {
+      f.document.activeElement = f.els.replayPortInput; f.els.replayPortInput.value = '8x';
+      f.els.replayPortInput.listeners.input();
+    } else {
+      const text = kind === 'empty' ? '' : 'GET /pending-action-draft HTT';
+      f.els.replayRequestHighlight.innerText = text;
+      if (kind === 'model') f.context.syncReplayRequestTextFromEditor(text);
+    }
+  };
+  f.retained = () => ({ owner: f.state.activeSession, generation: f.context.workspaceStateGeneration,
+    tabs: f.state.replayTabs, selected: f.state.selectedSessionId, active: f.state.activeReplayTabId,
+    baseline: f.context.workspaceSaveCommittedSnapshot, text: f.els.replayRequestHighlight.innerText,
+    port: f.els.replayPortInput.value, name: f.els.dashboardCreateSessionName.value });
+  f.assertRetained = before => {
+    const after = f.retained();
+    for (const key of Object.keys(before)) assert.equal(after[key], before[key], key);
+  };
+  f.finishReload = async (action, index, owner = 'session-b') => {
+    const next = f.requests.length; f.succeed(index, {}); await tick();
+    assert.equal(f.requests[next]?.url, '/api/sessions'); f.succeed(next, f.rows(owner)); await tick();
+    assert.equal(f.requests[next + 1]?.url, '/api/workspace-state');
+    f.succeed(next + 1, f.snapshots.get(owner)); assert.equal(await action.pending, undefined);
+  };
+  f.finishRetained = async (action, index, owner = 'session-b') => {
+    const next = f.requests.length; f.succeed(index, {}); await tick();
+    assert.equal(f.requests[next]?.url, '/api/sessions'); assert.equal(f.requests[next].options, undefined);
+    f.succeed(next, f.rows(owner)); await tick();
+    assert.equal(f.requests.length, next + 1, 'completed action may only refresh rows, never reload or retry');
+    assert.equal(await action.pending, undefined);
+    assert.match(f.toasts.at(-1)[0], /action completed.*current workspace is still open/);
+  };
+  return f;
+}
+for (const operation of ['create', 'activate']) {
+  for (const active of ['session-b', 'session-c']) test(`${operation}: old success preserves newer B workspace when listed active is ${active}`, async () => {
+    const f = setupCompletedAction(), older = await f.start(operation, 'session-c');
+    const newer = await f.start('activate', 'session-b'); await f.finishReload(newer, 1);
+    f.edit(); const before = f.retained(), tab = f.context.getActiveReplayTab(), cleanup = f.log.filter(name => name === 'cleanupWsReplayTabsBeforeStateReset').length;
+    await f.finishRetained(older, 0, active); f.assertRetained(before);
+    assert.equal(tab.requestText, 'GET /pending-action-draft HTT'); assert.equal(f.context.workspaceSaveDirty, true);
+    assert.equal(f.state.sessions.find(row => row.active).id, active);
+    assert.equal(f.log.filter(name => name === 'cleanupWsReplayTabsBeforeStateReset').length, cleanup);
+    if (active === 'session-c') assert.match(f.toasts.at(-1)[0], /active session changed.*Keep a copy.*Reload sessions/);
+  });
+  test(`${operation}: old failure after newer success preserves the original exception and B draft`, async () => {
+    const f = setupCompletedAction(), older = await f.start(operation, 'session-c');
+    const newer = await f.start('activate', 'session-b'); await f.finishReload(newer, 1);
+    f.edit(); const before = f.retained(), count = f.requests.length, error = new Error('old action failed');
+    f.requests[0].reject(error); assert.equal(await older.pending, error);
+    f.assertRetained(before); assert.equal(f.requests.length, count);
+  });
+  test(`${operation}: old success after newer failure still follows its ordinary reload path`, async () => {
+    const f = setupCompletedAction(), older = await f.start(operation, 'session-c');
+    const newer = await f.start('activate', 'session-b');
+    const error = new Error('new action failed'); f.requests[1].reject(error); await tick();
+    assert.equal(f.requests[2].url, '/api/sessions'); f.succeed(2, f.rows('session-a'));
+    assert.equal(await newer.pending, error); assert.equal(f.context.workspaceStateGeneration, 0);
+    await f.finishReload(older, 0, 'session-c'); assert.equal(f.state.activeSession.id, 'session-c');
+  });
+  for (const kind of ['model', 'partial', 'empty', 'invalid target']) test(`${operation}: same-generation ${kind} entered while pending survives completion`, async () => {
+    const f = setupCompletedAction(), action = await f.start(operation); f.edit(kind);
+    const before = f.retained(), tab = f.context.getActiveReplayTab();
+    await f.finishRetained(action, 0); f.assertRetained(before);
+    if (kind === 'invalid target') {
+      assert.equal(tab.targetPort, '443'); assert.ok(f.els.replayPortInput.validationMessage);
+    } else {
+      assert.equal(tab.requestText, kind === 'empty' ? '' : 'GET /pending-action-draft HTT');
+      assert.equal(f.context.workspaceSaveDirty, true);
+    }
+    assert.equal(f.context.workspaceStateGeneration, 0);
+  });
+  test(`${operation}: an already autosaved edit still prevents the old completion from resetting`, async () => {
+    const f = setupCompletedAction(), action = await f.start(operation); f.edit();
+    const saving = f.context.flushQueuedWorkspaceStateSave();
+    assert.equal(f.requests[1].url, '/api/workspace-state');
+    f.succeed(1, { session_id: 'session-a', revision: 11 }); await saving;
+    assert.equal(f.context.workspaceSaveDirty, false); const before = f.retained();
+    await f.finishRetained(action, 0); f.assertRetained(before); assert.equal(f.context.workspaceSaveDirty, false);
+  });
+  test(`${operation}: retained autosave remains pinned and conflicts if the backend changed sessions`, async () => {
+    const f = setupCompletedAction(), action = await f.start(operation); f.edit();
+    await f.finishRetained(action, 0, 'session-b'); const before = f.retained();
+    const saving = f.context.flushQueuedWorkspaceStateSave(), body = JSON.parse(f.requests[2].options.body);
+    assert.equal(body.session_id, 'session-a'); assert.equal(body.expected_active_session_id, 'session-a');
+    f.requests[2].resolve({ ok: false, status: 409, json: async () => ({ error: 'active session changed', session_id: 'session-b' }) });
+    await saving; f.assertRetained(before);
+    assert.equal(f.context.workspaceSaveConflictPending, true); assert.equal(f.context.workspaceSaveDirty, true);
+    assert.equal(f.requests.length, 3);
+  });
+  test(`${operation}: equal-text input notification still conservatively retains its newer save generation`, async () => {
+    const f = setupCompletedAction(), action = await f.start(operation);
+    f.context.syncReplayRequestTextFromEditor(f.old.requestText); const before = f.retained();
+    await f.finishRetained(action, 0); f.assertRetained(before);
+  });
+  for (const unchanged of ['untouched', 'same value']) test(`${operation}: ${unchanged} editor retains ordinary success behavior`, async () => {
+    const f = setupCompletedAction(), action = await f.start(operation);
+    if (unchanged === 'same value') f.els.replayRequestHighlight.innerText = f.old.requestText;
+    await f.finishReload(action, 0); assert.equal(f.state.activeSession.id, 'session-b');
+    assert.equal(f.toasts.length, 0);
+  });
+}
+for (const failure of ['network', 'HTTP', 'shape']) test(`completed action list-only ${failure} failure retains newer edits and gives recovery guidance`, async () => {
+  const f = setupCompletedAction(), action = await f.start('activate'); f.edit(); const before = f.retained();
+  f.succeed(0, {}); await tick(); assert.equal(f.requests[1].url, '/api/sessions');
+  if (failure === 'network') f.requests[1].reject(new Error('synthetic read loss'));
+  else if (failure === 'HTTP') f.requests[1].resolve({ ok: false });
+  else f.succeed(1, { invalid: true });
+  assert.equal(await action.pending, undefined); f.assertRetained(before);
+  assert.match(f.toasts.at(-1)[0], /action completed.*could not be refreshed.*Keep a copy.*Reload sessions/);
+  assert.equal(f.warnings.length, 1); assert.equal(f.requests.length, 2);
+});
+test('a newer workspace supersedes completed-action row refresh without stale feedback', async () => {
+  const f = setupCompletedAction(), action = await f.start('activate'); f.edit();
+  f.succeed(0, {}); await tick(); assert.equal(f.requests[1].url, '/api/sessions');
+  f.context.resetSessionScopedUiState(); f.state.activeSession = { id: 'session-c' };
+  f.context.applyWorkspaceState(f.snapshots.get('session-c')); f.context.workspaceLoaded = true;
+  f.edit(); const before = f.retained(), toasts = f.toasts.length;
+  f.succeed(1, f.rows('session-b')); await tick();
+  assert.equal(f.requests.length, 2);
+  assert.equal(await action.pending, undefined);
+  f.assertRetained(before); assert.equal(f.toasts.length, toasts); assert.equal(f.requests.length, 2);
+});
+for (const changedName of [false, true]) test(`create completion ${changedName ? 'preserves a newer' : 'clears only its submitted'} name field`, async () => {
+  const f = setupCompletedAction(); f.els.dashboardCreateSessionName.value = '  Original name  ';
+  const action = await f.start('create'); assert.equal(JSON.parse(f.requests[0].options.body).name, 'Original name');
+  if (changedName) f.els.dashboardCreateSessionName.value = 'New name draft';
+  await f.finishReload(action, 0);
+  assert.equal(f.els.dashboardCreateSessionName.value, changedName ? 'New name draft' : '');
+});
+for (const changed of [false, true]) test(`forced activation ${changed ? 'retains edits made while pending' : 'keeps ordinary completion'}`, async () => {
+  const f = setupCompletedAction();
+  const action = { pending: f.context.activateSessionById('session-b', { force: true }).catch(error => error) };
+  await tick(); assert.equal(f.requests[0].url, '/api/sessions/session-b/activate?force=true');
+  if (changed) { f.edit(); const before = f.retained(); await f.finishRetained(action, 0); f.assertRetained(before); }
+  else await f.finishReload(action, 0);
+});
+
+for (const operation of ['create', 'activate']) {
+  test(`${operation}: older success can reload first, but later overlapping success retains that workspace`, async () => {
+    const f = setupCompletedAction(), older = await f.start(operation, 'session-c');
+    const newer = await f.start('activate', 'session-b'); await f.finishReload(older, 0, 'session-c');
+    f.edit(); const before = f.retained();
+    await f.finishRetained(newer, 1, 'session-b'); f.assertRetained(before);
+    assert.equal(f.state.activeSession.id, 'session-c'); assert.equal(f.state.sessions.find(row => row.active).id, 'session-b');
+  });
+  test(`${operation}: pending legacy byte entered after dispatch remains in its input on success`, async () => {
+    const f = setupCompletedAction(), action = await f.start(operation), hex = f.pendingHex();
+    const before = f.retained(); await f.finishRetained(action, 0); f.assertRetained(before);
+    assert.equal(hex.current(), hex.input); assert.equal(hex.input.value, 'f');
+    assert.equal(f.old.requestBytes[0], 255); assert.equal(f.context.workspaceStateGeneration, 0);
+  });
+  test(`${operation}: clean binary editor still follows ordinary completion`, async () => {
+    const f = setupCompletedAction(); f.state.replayMessageViews.request = 'hex';
+    const bytes = f.old.requestBytes = new Uint8Array([255, 128]);
+    const original = f.old.requestOriginalBytes = new Uint8Array([0, 128]);
+    f.context.renderReplay(); const action = await f.start(operation);
+    await f.finishReload(action, 0); assert.equal(f.toasts.length, 0);
+    assert.equal(f.old.requestBytes, bytes); assert.equal(f.old.requestOriginalBytes, original);
+  });
+}
+test('completed-action reconciliation cannot overwrite a newer accepted session list', async () => {
+  const f = setupCompletedAction(), action = await f.start('activate'); f.edit(); const before = f.retained();
+  f.succeed(0, {}); await tick(); assert.equal(f.requests[1].url, '/api/sessions');
+  const newest = f.context.loadSessions({ preserveWorkspaceOwner: true });
+  f.succeed(2, f.rows('session-c')); await newest;
+  f.succeed(1, f.rows('session-b')); await tick();
+  assert.equal(f.requests.length, 3);
+  assert.equal(await action.pending, undefined);
+  f.assertRetained(before); assert.equal(f.state.sessions.find(row => row.active).id, 'session-c');
+  assert.equal(f.requests.length, 3); assert.match(f.toasts.at(-1)[0], /action completed and the active session changed/);
+});
+test('forced activation success is still owner-fenced after another activation reloads', async () => {
+  const f = setupCompletedAction();
+  const forced = { pending: f.context.activateSessionById('session-c', { force: true }).catch(error => error) };
+  await tick(); const newer = await f.start('activate', 'session-b');
+  await f.finishReload(newer, 1); f.edit(); const before = f.retained();
+  await f.finishRetained(forced, 0, 'session-c'); f.assertRetained(before);
+  assert.equal(f.requests[0].url, '/api/sessions/session-c/activate?force=true');
+});
+
+for (const operation of ['create', 'activate']) test(`${operation}: a real post-dispatch pin save prevents the action from resetting its workspace`, async () => {
+  const f = setupCompletedAction(), action = await f.start(operation);
+  vm.runInContext(source('toggleReplayTabPin'), f.context); f.context.toggleReplayTabPin(f.old.id);
+  assert.equal(f.requests[1].url, '/api/workspace-state'); assert.equal(f.old.pinned, true);
+  const before = f.retained(); await f.finishRetained(action, 0, 'session-b'); f.assertRetained(before);
+  assert.equal(f.old.pinned, true); assert.equal(f.context.workspaceStateGeneration, 0);
+  f.requests[1].resolve({ ok: false, status: 409, json: async () => ({ error: 'active session changed', session_id: 'session-b' }) });
+  await tick(); assert.equal(f.context.workspaceSaveConflictPending, true);
+  assert.equal(f.state.activeSession.id, 'session-a'); assert.equal(f.state.replayTabs, before.tabs);
+  assert.equal(f.requests.length, 3);
+});

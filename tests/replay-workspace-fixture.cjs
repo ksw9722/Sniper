@@ -16,6 +16,7 @@ const functions = [
   "getRepeaterTargetConfig", "getActiveReplayTab", "getReplayTabVisualOrder", "isReplayTabSending", "sessionQueryPath",
   "createReplayTab", "ensureRepeaterTab", "currentSessionId", "workspaceSnapshotMatchesActiveSession",
   "closeRepeaterTab", "preserveActiveHttpReplayDraftBeforeNavigation", "preserveActiveHttpReplayDraftBeforeSessionChange",
+  "canReloadWorkspaceAfterSessionAction", "reconcileSessionsAfterCompletedAction",
   "validateManualRepeaterTargetInput", "isLikelyIpv6Literal",
   "persistReplayTabMetadataEdit",
   "snapshotReplayTabsState", "cloneReplayTabState", "cloneRepeaterHistoryEntry", "restoreReplayTabsState",

@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const vm = require('node:vm');
-const { fixture } = require('./replay-workspace-fixture.cjs');
+const { fixture, deferred } = require('./replay-workspace-fixture.cjs');
 const { appSource } = require('./frontend-test-helpers.cjs');
 const settled = () => new Promise(resolve => setImmediate(resolve));
 
@@ -12,7 +12,7 @@ function setup() {
   f.old = f.tab('old'); f.b = f.tab('B'); f.otherB = f.tab('other B');
   f.seed([f.old]);
   f.sessionB = f.remote([f.b, f.otherB], 3); f.sessionB.session_id = 'session-b';
-  for (const name of ['activateSessionById', 'reloadSessionWorkspace', 'loadSessions',
+  for (const name of ['reloadSessionWorkspace', 'loadSessions',
     'loadWorkspaceState', 'applyWorkspaceState', 'toggleReplayTabPin', 'commitReplayTabRename']) {
     vm.runInContext(appSource.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}`, 'm'))[0], f.context);
   }
@@ -41,21 +41,23 @@ function setup() {
   return f;
 }
 
-async function startSwitch(f, id = 'session-b') {
-  const index = f.requests.length, switching = f.context.activateSessionById(id);
-  await settled();
-  assert.equal(f.requests[index].url, `/api/sessions/${id}/activate`);
-  return { index, switching };
+// Force accepted hydration boundaries independently of session-action preflight.
+// Real actions now retain post-dispatch edits instead of resetting them; these
+// fixtures isolate the save loop if a reload is already accepted for other reasons.
+function startReload(f) {
+  const gate = deferred();
+  const reloading = gate.promise.then(() => f.context.reloadSessionWorkspace({ cleanupBeforeReset: false }));
+  return { gate, reloading };
 }
 
-async function finishSwitch(f, pending, snapshot = f.sessionB) {
+async function finishReload(f, pending, snapshot = f.sessionB) {
   const index = f.requests.length;
-  f.succeed(pending.index, {}); await settled();
+  pending.gate.resolve(); await settled();
   assert.equal(f.requests[index].url, '/api/sessions');
   f.succeed(index, [{ id: snapshot.session_id, name: snapshot.session_id, active: true }]);
   await settled();
   assert.equal(f.requests[index + 1].url, '/api/workspace-state');
-  f.succeed(index + 1, snapshot); await pending.switching;
+  f.succeed(index + 1, snapshot); await pending.reloading;
   assert.equal(f.state.activeSession.id, snapshot.session_id);
 }
 
@@ -67,12 +69,12 @@ function settleOldSave(f, index, outcome) {
 for (const oldOutcome of ['success', 'failure']) {
   for (const currentOutcome of ['success', 'failure']) {
     test(`new session pin, rename and close await their own ${currentOutcome} after old ${oldOutcome}`, async () => {
-      const f = setup(), switching = await startSwitch(f);
-      // The session activation has passed preflight but its response is pending.
-      // The old UI can still accept metadata edits during this real await.
+      const f = setup(), switching = await startReload(f);
+      // The accepted reload is held at a synthetic boundary while old workspace
+      // metadata begins its real save. No session-action safety guard is bypassed.
       f.context.toggleReplayTabPin(f.old.id);
-      assert.equal(JSON.parse(f.requests[1].options.body).session_id, 'session-a');
-      await finishSwitch(f, switching);
+      assert.equal(JSON.parse(f.requests[0].options.body).session_id, 'session-a');
+      await finishReload(f, switching);
       assert.equal(f.context.workspaceStateGeneration, 2);
       const closingTab = f.state.replayTabs.find(tab => tab.id === f.b.id);
       const other = f.state.replayTabs.find(tab => tab.id === f.otherB.id);
@@ -84,22 +86,22 @@ for (const oldOutcome of ['success', 'failure']) {
       const closing = f.context.closeRepeaterTab(closingTab.id);
       let closeSettled = false; closing.then(() => { closeSettled = true; });
       assert.equal(closingTab.requestText, draft);
-      assert.equal(f.requests.length, 4, 'all three new actions join the old loop');
+      assert.equal(f.requests.length, 3, 'all three new actions join the old loop');
       const renders = f.renders.length;
-      settleOldSave(f, 1, oldOutcome); await settled();
+      settleOldSave(f, 0, oldOutcome); await settled();
       assert.equal(closeSettled, false, 'the old response cannot confirm the new close');
-      assert.equal(f.requests.length, 5, 'new waiters share one serialized current POST');
+      assert.equal(f.requests.length, 4, 'new waiters share one serialized current POST');
       assert.equal(f.renders.length, renders, 'old metadata callbacks cannot redraw this session');
       assert.equal(f.errors.length, 0);
       assert.equal(f.state.workspaceRevision, 3);
       assert.equal(f.context.workspacePendingReplayCloses.has(closingTab.id), true);
-      const snapshot = JSON.parse(f.requests[4].options.body);
+      const snapshot = JSON.parse(f.requests[3].options.body);
       assert.equal(snapshot.session_id, 'session-b');
       assert.equal(snapshot.replay.tabs.some(tab => tab.id === closingTab.id), false);
       assert.equal(snapshot.replay.tabs[0].pinned, true);
       assert.equal(snapshot.replay.tabs[0].custom_label, 'new label');
-      if (currentOutcome === 'success') f.succeed(4, { session_id: 'session-b', revision: 4 });
-      else f.requests[4].reject(new Error('current session save failed'));
+      if (currentOutcome === 'success') f.succeed(3, { session_id: 'session-b', revision: 4 });
+      else f.requests[3].reject(new Error('current session save failed'));
       await closing; await settled();
       assert.equal(f.context.workspacePendingReplayCloses.size, 0);
       assert.equal(f.state.replayTabs.includes(closingTab), currentOutcome === 'failure');
@@ -114,15 +116,15 @@ for (const oldOutcome of ['success', 'failure']) {
     });
   }
 
-  test(`repeated actual switches preserve only the current close after old ${oldOutcome}`, async () => {
+  test(`repeated forced hydrations preserve only the current close after old ${oldOutcome}`, async () => {
     const f = setup(), c = f.tab('C'), otherC = f.tab('other C');
     const sessionC = f.remote([c, otherC], 7); sessionC.session_id = 'session-c';
-    const switchB = await startSwitch(f), switchC = await startSwitch(f, 'session-c');
+    const switchB = await startReload(f), switchC = await startReload(f);
     f.context.toggleReplayTabPin(f.old.id);
-    await finishSwitch(f, switchB);
+    await finishReload(f, switchB);
     f.els.replayRequestHighlight.innerText = 'GET /B-draft HTTP/1.1';
     const closeB = f.context.closeRepeaterTab(f.b.id);
-    await finishSwitch(f, switchC, sessionC);
+    await finishReload(f, switchC, sessionC);
     assert.equal(f.context.workspaceStateGeneration, 4);
     const closingTab = f.state.replayTabs.find(tab => tab.id === c.id);
     f.els.replayRequestHighlight.innerText = 'GET /C-draft HTTP/1.1';
@@ -130,12 +132,12 @@ for (const oldOutcome of ['success', 'failure']) {
     const closeC = f.context.closeRepeaterTab(c.id);
     let closeSettled = false; closeC.then(() => { closeSettled = true; });
     const renders = f.renders.length;
-    settleOldSave(f, 2, oldOutcome); await settled(); await closeB;
-    assert.equal(closeSettled, false); assert.equal(f.requests.length, 8);
+    settleOldSave(f, 0, oldOutcome); await settled(); await closeB;
+    assert.equal(closeSettled, false); assert.equal(f.requests.length, 6);
     assert.equal(f.renders.length, renders); assert.equal(f.errors.length, 0);
     assert.equal(f.state.workspaceRevision, 7);
-    assert.equal(JSON.parse(f.requests[7].options.body).session_id, 'session-c');
-    f.requests[7].reject(new Error('current close failed')); await closeC;
+    assert.equal(JSON.parse(f.requests[5].options.body).session_id, 'session-c');
+    f.requests[5].reject(new Error('current close failed')); await closeC;
     assert.equal(f.state.replayTabs.includes(closingTab), true);
     assert.equal(closingTab.requestText, 'GET /C-draft HTTP/1.1');
     assert.equal(f.state.replayTabs.some(tab => tab.id === f.b.id), false);
@@ -145,18 +147,18 @@ for (const oldOutcome of ['success', 'failure']) {
 
   for (const waitingOn of ['first save', 'bypassed retry']) {
     test(`old bypass options cannot touch a newer conflict after ${waitingOn} ${oldOutcome}`, async () => {
-      const f = setup(), switching = await startSwitch(f);
+      const f = setup(), switching = await startReload(f);
       f.context.scheduleWorkspaceStateSave();
       const flushing = f.context.flushWorkspaceState({ sessionId: 'session-a', bypassExpectedActiveSessionGuard: true });
       const result = flushing.then(() => null, error => error);
-      let oldIndex = 1;
+      let oldIndex = 0;
       if (waitingOn === 'bypassed retry') {
-        f.requests[1].resolve({ ok: false, status: 409, json: async () => ({ error: 'active session changed' }) });
-        await settled(); oldIndex = 2;
-        assert.equal(f.requests.length, 3);
-        assert.equal(JSON.parse(f.requests[2].options.body).session_id, 'session-a');
+        f.requests[0].resolve({ ok: false, status: 409, json: async () => ({ error: 'active session changed' }) });
+        await settled(); oldIndex = 1;
+        assert.equal(f.requests.length, 2);
+        assert.equal(JSON.parse(f.requests[1].options.body).session_id, 'session-a');
       }
-      await finishSwitch(f, switching);
+      await finishReload(f, switching);
       const latest = { error: 'active session changed', current_session_id: 'session-c' };
       f.context.workspaceSaveConflictPending = true;
       f.context.workspaceSaveConflictLatest = latest;

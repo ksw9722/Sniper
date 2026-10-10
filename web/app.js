@@ -3027,6 +3027,38 @@ async function reconcileSessionsAfterActionError(sessionId, workspaceGeneration)
   );
 }
 
+async function reconcileSessionsAfterCompletedAction() {
+  const sessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  let readFailed = false;
+  try {
+    await loadSessions({ preserveWorkspaceOwner: true });
+  } catch (error) {
+    readFailed = true;
+    console.warn("Failed to refresh sessions after a completed session action:", error);
+  }
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
+  const listedActiveSession = state.sessions.find((session) => session.active);
+  const activeSessionChanged = listedActiveSession && listedActiveSession.id !== sessionId;
+  showToast(
+    readFailed
+      ? "The session action completed, but the session list could not be refreshed. Your current workspace is still open. Keep a copy of unsaved edits, then use Reload sessions to reconcile."
+      : activeSessionChanged
+        ? "The session action completed and the active session changed. Your current workspace is still open. Keep a copy of unsaved edits, then use Reload sessions to reconcile."
+        : "The session action completed. Your current workspace is still open. Check the session list before continuing.",
+    "error",
+    7000,
+  );
+}
+
+function canReloadWorkspaceAfterSessionAction(sessionId, workspaceGeneration, saveVersion) {
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
+  // Input stays available while the action awaits its response. Capture supported
+  // DOM-only changes, and leave newer work with its owner instead of resetting it.
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("reloading this workspace")) return false;
+  return saveVersion === workspaceSaveVersion;
+}
+
 async function loadWorkspaceState() {
   const response = await fetch("/api/workspace-state");
   if (!response.ok) {
@@ -5067,9 +5099,11 @@ async function createSession() {
   await flushAllPendingAnnotations();
   await flushWorkspaceState();
   await cleanupWsReplayTabsBeforeStateReset();
-  const name = els.dashboardCreateSessionName.value.trim();
+  const submittedName = els.dashboardCreateSessionName.value;
+  const name = submittedName.trim();
   const actionSessionId = currentSessionId();
   const actionWorkspaceGeneration = workspaceStateGeneration;
+  const actionWorkspaceSaveVersion = workspaceSaveVersion;
   try {
     const response = await fetch("/api/sessions", {
       method: "POST",
@@ -5085,7 +5119,11 @@ async function createSession() {
     await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
     throw error;
   }
-  els.dashboardCreateSessionName.value = "";
+  if (!canReloadWorkspaceAfterSessionAction(actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion)) {
+    await reconcileSessionsAfterCompletedAction();
+    return;
+  }
+  if (els.dashboardCreateSessionName.value === submittedName) els.dashboardCreateSessionName.value = "";
   await reloadSessionWorkspace({ cleanupBeforeReset: false });
 }
 
@@ -5105,6 +5143,7 @@ async function activateSessionById(id, { force = false } = {}) {
   await cleanupWsReplayTabsBeforeStateReset();
   const actionSessionId = currentSessionId();
   const actionWorkspaceGeneration = workspaceStateGeneration;
+  const actionWorkspaceSaveVersion = workspaceSaveVersion;
   try {
     const response = await fetch(`/api/sessions/${id}/activate${force ? "?force=true" : ""}`, {
       method: "POST",
@@ -5129,6 +5168,10 @@ async function activateSessionById(id, { force = false } = {}) {
   } catch (error) {
     await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
     throw error;
+  }
+  if (!canReloadWorkspaceAfterSessionAction(actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion)) {
+    await reconcileSessionsAfterCompletedAction();
+    return;
   }
   state.selectedSessionId = id;
   await reloadSessionWorkspace({ cleanupBeforeReset: false });
