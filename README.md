@@ -215,6 +215,9 @@ HTTP history.
 
 ## CLI
 
+For the current development branch, see the
+[unreleased CLI and saved-workspace maintenance overview](docs/guides/maintenance-0.3.1.md).
+
 `sniper-cli` is already bundled with the macOS app and Windows packages. The
 first desktop launch offers **Add to PATH** or **Later** when registration is
 available and needed. Later dismisses the prompt without changing PATH; use

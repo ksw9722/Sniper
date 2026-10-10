@@ -48,6 +48,12 @@ putting the skill at `~/.claude/skills/sniper-operator/SKILL.md` — byte-identi
 [`packaging/skills/claude/sniper-operator/SKILL.md`](../../packaging/skills/claude/sniper-operator/SKILL.md).
 Use `--claude-dir` to install into a project's `.claude/skills` instead.
 
+Before replacing an existing copy, use `skills status --claude` or
+`skills update-preview --claude` to inspect it without writing. See
+[safe skill maintenance](skill-maintenance.md) for explicit enrollment,
+experimental candidate staging, and preservation limits. Staging does not
+activate an update or enable unattended startup replacement.
+
 Two things `skills install` does not do. It never touches `PATH` — put `sniper-cli`
 there yourself, as the [CLI section of the README](../../README.md#cli) describes. And
 it needs no running Sniper: `"api": {"local": true}` means the whole operation is a
