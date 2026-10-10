@@ -5087,18 +5087,36 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
 
 async function createSession() {
   if (!preserveActiveHttpReplayDraftBeforeSessionChange("creating a session")) return;
-  if (!(await flushTargetScopeDraft())) {
-    return;
+  const entrySessionId = currentSessionId();
+  const entryWorkspaceGeneration = workspaceStateGeneration;
+  const canContinuePreflight = () => {
+    if (entrySessionId === currentSessionId() && entryWorkspaceGeneration === workspaceStateGeneration) return true;
+    showToast(
+      "Session action stopped before its request was sent because the workspace changed. Review the current workspace before trying again.",
+      "error",
+      7000,
+    );
+    return false;
+  };
+  // Another action may reload the workspace while these draft saves settle.
+  // Stop before the next phase can consume that workspace's inputs or drafts.
+  try {
+    const scopeSaved = await flushTargetScopeDraft();
+    if (!canContinuePreflight() || !scopeSaved) return;
+    const matchReplaceSaved = await flushMatchReplaceDraft();
+    if (!canContinuePreflight() || !matchReplaceSaved) return;
+    const sequenceSaved = await flushSequenceDraft();
+    if (!canContinuePreflight() || !sequenceSaved) return;
+    await flushAllPendingAnnotations();
+    if (!canContinuePreflight()) return;
+    await flushWorkspaceState();
+    if (!canContinuePreflight()) return;
+    await cleanupWsReplayTabsBeforeStateReset();
+    if (!canContinuePreflight()) return;
+  } catch (error) {
+    if (!canContinuePreflight()) return;
+    throw error;
   }
-  if (!(await flushMatchReplaceDraft())) {
-    return;
-  }
-  if (!(await flushSequenceDraft())) {
-    return;
-  }
-  await flushAllPendingAnnotations();
-  await flushWorkspaceState();
-  await cleanupWsReplayTabsBeforeStateReset();
   const submittedName = els.dashboardCreateSessionName.value;
   const name = submittedName.trim();
   const actionSessionId = currentSessionId();
@@ -5129,18 +5147,36 @@ async function createSession() {
 
 async function activateSessionById(id, { force = false } = {}) {
   if (!preserveActiveHttpReplayDraftBeforeSessionChange("switching sessions")) return;
-  if (!(await flushTargetScopeDraft())) {
-    return;
+  const entrySessionId = currentSessionId();
+  const entryWorkspaceGeneration = workspaceStateGeneration;
+  const canContinuePreflight = () => {
+    if (entrySessionId === currentSessionId() && entryWorkspaceGeneration === workspaceStateGeneration) return true;
+    showToast(
+      "Session action stopped before its request was sent because the workspace changed. Review the current workspace before trying again.",
+      "error",
+      7000,
+    );
+    return false;
+  };
+  // Another action may reload the workspace while these draft saves settle.
+  // Stop before the next phase can consume that workspace's inputs or drafts.
+  try {
+    const scopeSaved = await flushTargetScopeDraft();
+    if (!canContinuePreflight() || !scopeSaved) return;
+    const matchReplaceSaved = await flushMatchReplaceDraft();
+    if (!canContinuePreflight() || !matchReplaceSaved) return;
+    const sequenceSaved = await flushSequenceDraft();
+    if (!canContinuePreflight() || !sequenceSaved) return;
+    await flushAllPendingAnnotations();
+    if (!canContinuePreflight()) return;
+    await flushWorkspaceState();
+    if (!canContinuePreflight()) return;
+    await cleanupWsReplayTabsBeforeStateReset();
+    if (!canContinuePreflight()) return;
+  } catch (error) {
+    if (!canContinuePreflight()) return;
+    throw error;
   }
-  if (!(await flushMatchReplaceDraft())) {
-    return;
-  }
-  if (!(await flushSequenceDraft())) {
-    return;
-  }
-  await flushAllPendingAnnotations();
-  await flushWorkspaceState();
-  await cleanupWsReplayTabsBeforeStateReset();
   const actionSessionId = currentSessionId();
   const actionWorkspaceGeneration = workspaceStateGeneration;
   const actionWorkspaceSaveVersion = workspaceSaveVersion;

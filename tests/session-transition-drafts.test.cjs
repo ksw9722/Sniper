@@ -528,3 +528,151 @@ for (const operation of ['create', 'activate']) test(`${operation}: a real post-
   assert.equal(f.state.activeSession.id, 'session-a'); assert.equal(f.state.replayTabs, before.tabs);
   assert.equal(f.requests.length, 3);
 });
+
+// Entry/preflight races are separate from post-dispatch completion races. Each
+// phase is held synthetically; the replacement uses production reset/hydration.
+const preflightPhases = ['flushTargetScopeDraft', 'flushMatchReplaceDraft', 'flushSequenceDraft',
+  'flushAllPendingAnnotations', 'flushWorkspaceState', 'cleanupWsReplayTabsBeforeStateReset'];
+const stoppedPreflightMessage = 'Session action stopped before its request was sent because the workspace changed. Review the current workspace before trying again.';
+function replacePreflightWorkspace(f, sameId = false) {
+  const id = sameId ? 'session-a' : 'session-b';
+  f.context.resetSessionScopedUiState(); f.state.activeSession = { id };
+  f.context.applyWorkspaceState(f.snapshots.get(id)); f.context.workspaceLoaded = true;
+  f.edit(); f.els.dashboardCreateSessionName.value = 'New workspace name';
+  f.state.targetScopeDraft = 'new.example.com'; f.state.targetScopeDirty = true;
+  f.state.targetScopeEditorSessionId = id;
+}
+function pausePreflight(f, phase) {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  const calls = [];
+  for (const name of preflightPhases) f.context[name] = async () => {
+    calls.push(name); return name === phase ? promise : true;
+  };
+  return { resolve, reject, calls };
+}
+for (const operation of ['create', 'activate']) {
+  for (const phase of preflightPhases) for (const sameId of [false, true]) for (const outcome of ['success', 'false', 'rejection']) {
+    test(`${operation}: ${phase} ${outcome} cannot continue across ${sameId ? 'same-ID reset' : 'new owner'}`, async () => {
+      const f = setupCompletedAction(), gate = pausePreflight(f, phase);
+      const action = await f.start(operation, 'session-c');
+      assert.equal(gate.calls.at(-1), phase); assert.equal(f.requests.length, 0);
+      replacePreflightWorkspace(f, sameId); const before = f.retained(), calls = [...gate.calls];
+      if (outcome === 'rejection') gate.reject(new Error('Synthetic stale preflight failure'));
+      else gate.resolve(outcome === 'success');
+      await tick(); assert.equal(f.requests.length, 0, 'no session mutation or reconciliation before dispatch');
+      assert.equal(await action.pending, undefined); assert.deepEqual(gate.calls, calls, 'no next preflight or cleanup');
+      f.assertRetained(before); assert.equal(f.state.targetScopeDraft, 'new.example.com');
+      assert.equal(f.state.targetScopeDirty, true); assert.equal(f.toasts.length, 1);
+      assert.equal(f.toasts[0][0], stoppedPreflightMessage); assert.equal(f.confirms.length, 0);
+    });
+  }
+  for (const phase of preflightPhases) test(`${operation}: current-owner ${phase} rejection propagates the identical error`, async () => {
+    const f = setupCompletedAction(), gate = pausePreflight(f, phase), error = new Error('Synthetic current preflight error');
+    const action = await f.start(operation); const calls = [...gate.calls]; gate.reject(error);
+    assert.equal(await action.pending, error); assert.deepEqual(gate.calls, calls);
+    assert.equal(f.requests.length, 0); assert.equal(f.toasts.length, 0); assert.equal(f.confirms.length, 0);
+  });
+  for (const phase of preflightPhases.slice(0, 3)) test(`${operation}: current-owner ${phase} refusal stays a quiet stop`, async () => {
+    const f = setupCompletedAction(), gate = pausePreflight(f, phase), action = await f.start(operation);
+    const calls = [...gate.calls]; gate.resolve(false); assert.equal(await action.pending, undefined);
+    assert.deepEqual(gate.calls, calls); assert.equal(f.requests.length, 0); assert.equal(f.toasts.length, 0);
+  });
+  test(`${operation}: changed owner without a generation increment still cancels the preflight`, async () => {
+    const f = setupCompletedAction(), gate = pausePreflight(f, preflightPhases[0]), action = await f.start(operation);
+    f.state.activeSession = { id: 'session-b' }; gate.resolve(true); await tick();
+    assert.equal(f.requests.length, 0); assert.equal(await action.pending, undefined);
+    assert.equal(f.context.workspaceStateGeneration, 0); assert.equal(f.toasts[0][0], stoppedPreflightMessage);
+  });
+  test(`${operation}: a fresh action after cancellation can complete normally`, async () => {
+    const f = setupCompletedAction(), gate = pausePreflight(f, preflightPhases[0]), stale = await f.start(operation);
+    replacePreflightWorkspace(f); gate.resolve(true); await tick();
+    assert.equal(f.requests.length, 0); assert.equal(await stale.pending, undefined);
+    const fresh = await f.start(operation, 'session-c');
+    assert.equal(f.requests.length, 1); assert.equal(f.toasts.length, 1);
+    await f.finishReload(fresh, 0, 'session-c');
+    assert.equal(f.state.activeSession.id, 'session-c'); assert.equal(f.toasts.length, 1);
+  });
+}
+
+function useActualScopePreflight(f) {
+  for (const name of ['flushTargetScopeDraft', 'saveTargetScope', 'formatScopePatternsText']) {
+    vm.runInContext(source(name), f.context);
+  }
+  Object.assign(f.context, { renderInterceptStatus() {}, renderProxySettings() {}, scheduleRefresh() {} });
+  let input;
+  f.els.targetScopeEditor = { value: '', addEventListener: (name, callback) => { input = callback; } };
+  const marker = '  els.targetScopeEditor.addEventListener("input", () => {';
+  const binding = appSource.slice(appSource.indexOf(marker));
+  vm.runInContext(binding.slice(0, binding.indexOf('\n  });') + 6), f.context);
+  return value => { f.els.targetScopeEditor.value = value; input(); };
+}
+for (const operation of ['create', 'activate']) {
+  test(`${operation}: actual older scope save cannot dispatch after newer Open B and consume B drafts`, async () => {
+    const f = setupCompletedAction(), input = useActualScopePreflight(f); input('example.com');
+    const older = await f.start(operation, 'session-c'), newer = await f.start('activate', 'session-b');
+    for (const index of [0, 1]) {
+      assert.equal(f.requests[index].url, '/api/runtime');
+      assert.equal(JSON.parse(f.requests[index].options.body).session_id, 'session-a');
+    }
+    f.succeed(1, { scope_patterns: ['example.com'], excluded_scope_patterns: [] }); await tick();
+    assert.equal(f.requests[2].url, '/api/sessions/session-b/activate'); await f.finishReload(newer, 2);
+    f.state.activeTool = 'target'; f.context.renderToolPanels(); input('new.example.com');
+    f.els.dashboardCreateSessionName.value = 'New B name draft';
+    const before = f.retained(), cleanup = f.log.filter(name => name === 'cleanupWsReplayTabsBeforeStateReset').length;
+    f.succeed(0, { scope_patterns: ['example.com'], excluded_scope_patterns: [] }); await tick();
+    assert.equal(f.requests.length, 5, 'old action must stop before a mutation or B draft save');
+    assert.equal(await older.pending, undefined); f.assertRetained(before);
+    assert.equal(f.state.targetScopeDraft, 'new.example.com'); assert.equal(f.state.targetScopeDirty, true);
+    assert.equal(f.state.targetScopeEditorSessionId, 'session-b');
+    assert.equal(f.log.filter(name => name === 'cleanupWsReplayTabsBeforeStateReset').length, cleanup);
+    assert.equal(f.toasts.at(-1)[0], stoppedPreflightMessage);
+  });
+  test(`${operation}: real same-owner preflight saves and a waiting name edit still permit ordinary dispatch`, async () => {
+    const f = setupCompletedAction(), input = useActualScopePreflight(f); input('example.com');
+    const action = await f.start(operation); f.els.dashboardCreateSessionName.value = '  Same owner new name  ';
+    f.succeed(0, { scope_patterns: ['example.com'], excluded_scope_patterns: [] }); await tick();
+    assert.equal(f.requests[1].url, operation === 'create' ? '/api/sessions' : '/api/sessions/session-b/activate');
+    if (operation === 'create') assert.equal(JSON.parse(f.requests[1].options.body).name, 'Same owner new name');
+    await f.finishReload(action, 1); assert.equal(f.toasts.length, 0);
+    assert.equal(f.state.activeSession.id, 'session-b');
+  });
+}
+test('force confirmation starts a fresh preflight owner, and a later reset cancels it before forced dispatch', async () => {
+  const f = setupCompletedAction(), initial = await f.start('activate', 'session-c');
+  f.requests[0].resolve({ ok: false, status: 409, text: async () => 'proxy activity is still running' });
+  await initial.pending; assert.equal(f.confirms.length, 1);
+  replacePreflightWorkspace(f);
+  const gate = pausePreflight(f, preflightPhases[0]); f.confirms[0].callback(); await tick();
+  assert.equal(gate.calls.length, 1, 'force retry must take a fresh entry owner');
+  replacePreflightWorkspace(f, true); const before = f.retained(); gate.resolve(true); await tick();
+  assert.equal(f.requests.length, 1); f.assertRetained(before);
+  assert.equal(f.toasts.at(-1)[0], stoppedPreflightMessage); assert.equal(f.error, undefined);
+});
+for (const operation of ['create', 'activate']) test(`${operation}: an edit saved during same-owner preflight does not invalidate the dispatch version`, async () => {
+  const f = setupCompletedAction(), input = useActualScopePreflight(f); input('example.com');
+  const action = await f.start(operation), initialVersion = f.context.workspaceSaveVersion;
+  f.edit(); assert.ok(f.context.workspaceSaveVersion > initialVersion);
+  f.succeed(0, { scope_patterns: ['example.com'], excluded_scope_patterns: [] }); await tick();
+  assert.equal(f.requests[1].url, '/api/workspace-state');
+  const body = JSON.parse(f.requests[1].options.body);
+  assert.equal(body.session_id, 'session-a'); assert.equal(body.expected_active_session_id, 'session-a');
+  assert.equal(body.replay.tabs[0].request_text, 'GET /pending-action-draft HTT');
+  f.succeed(1, { session_id: 'session-a', revision: 11 }); await tick();
+  assert.equal(f.requests[2].url, operation === 'create' ? '/api/sessions' : '/api/sessions/session-b/activate');
+  await f.finishReload(action, 2); assert.equal(f.toasts.length, 0);
+  assert.equal(f.state.activeSession.id, 'session-b');
+});
+test('force confirmation after a newer reload captures that current owner and can complete normally', async () => {
+  const f = setupCompletedAction(), initial = await f.start('activate', 'session-c');
+  f.requests[0].resolve({ ok: false, status: 409, text: async () => 'proxy activity is still running' });
+  await initial.pending;
+  f.context.resetSessionScopedUiState(); f.state.activeSession = { id: 'session-b' };
+  f.context.applyWorkspaceState(f.snapshots.get('session-b')); f.context.workspaceLoaded = true;
+  const activate = f.context.activateSessionById; let pending;
+  f.context.activateSessionById = (...args) => (pending = activate(...args));
+  f.confirms[0].callback(); await tick();
+  assert.equal(f.requests[1].url, '/api/sessions/session-c/activate?force=true');
+  await f.finishReload({ pending }, 1, 'session-c'); assert.equal(f.toasts.length, 0);
+  assert.equal(f.state.activeSession.id, 'session-c');
+});
