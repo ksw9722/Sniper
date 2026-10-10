@@ -3,14 +3,14 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
 
 use axum::{
     body::Body,
-    http::StatusCode,
+    http::{Method, StatusCode, Uri},
     routing::{get, post},
     Json, Router,
 };
@@ -277,10 +277,36 @@ async fn saved_input_and_unavailable_read_hints_are_local_and_actionable() {
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
-    drop(listener);
+    // Refused-connect timing varies by OS and can outlast the harness deadline
+    // across discovery probes. Reject a complete, promptly served settings
+    // response instead, retaining the bound port and the same discovery path.
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed_requests = requests.clone();
+    let app = Router::new().fallback(move |method: Method, uri: Uri| async move {
+        observed_requests
+            .lock()
+            .unwrap()
+            .push((method, uri.to_string()));
+        Json(json!({"fixture":"not a Sniper settings response"}))
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let unavailable = f
         .call(&api, "saved.v1.session.list", json!({"limit":1}), 5)
         .await;
+    server.abort();
+    let _ = server.await;
+    let requests = requests.lock().unwrap();
+    assert!(
+        !requests.is_empty(),
+        "the fixture must exercise API discovery"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(method, path)| *method == Method::GET && path == "/api/settings"),
+        "rejected discovery must not send a saved-data call: {requests:?}"
+    );
     assert_eq!(unavailable["error"]["code"], "API_UNAVAILABLE");
     assert!(unavailable["error"]["hint"]
         .as_str()
