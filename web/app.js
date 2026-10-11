@@ -8889,6 +8889,9 @@ let findingsLoadPromise = null;
 let findingsLoadSessionId = null;
 let findingsStateGeneration = 0;
 let findingsLoadGeneration = 0;
+let findingsCountReadGeneration = 0;
+let findingsCountAcceptedGeneration = 0;
+let findingsEventEpoch = 0;
 let findingsBadgeRefreshTimer = 0;
 let findingsListRefreshTimer = 0;
 let lastFindingsBadgePollAt = 0;
@@ -8930,6 +8933,12 @@ async function loadFindings() {
   }
   const stateGeneration = findingsStateGeneration;
   const loadGeneration = ++findingsLoadGeneration;
+  const countRead = {
+    sessionId,
+    stateGeneration,
+    generation: ++findingsCountReadGeneration,
+    eventEpoch: findingsEventEpoch,
+  };
   findingsLoadSessionId = sessionId;
   let loadPromise;
   loadPromise = (async () => {
@@ -8947,9 +8956,12 @@ async function loadFindings() {
         return;
       }
       findingsData = findings;
-      findingsBadgeCount = fullCount == null ? findings.length : Math.max(fullCount, findings.length);
+      const badgeAccepted = commitFindingsBadgeCount(
+        fullCount == null ? findings.length : Math.max(fullCount, findings.length),
+        countRead,
+      );
       renderFindings();
-      updateFindingsBadge();
+      if (badgeAccepted) updateFindingsBadge();
     } catch (error) {
       console.error("Failed to load findings:", error);
     } finally {
@@ -8969,14 +8981,33 @@ async function loadFindings() {
 
 async function updateFindingsBadgeOnly() {
   const sessionId = currentSessionId();
-  const stateGeneration = findingsStateGeneration;
+  const countRead = {
+    sessionId,
+    stateGeneration: findingsStateGeneration,
+    generation: ++findingsCountReadGeneration,
+    eventEpoch: findingsEventEpoch,
+  };
   try {
     const count = await fetchFindingsCount(sessionId);
-    if (sessionId !== currentSessionId() || stateGeneration !== findingsStateGeneration) return;
-    if (count == null) return;
-    findingsBadgeCount = count;
-    updateFindingsBadge();
+    if (commitFindingsBadgeCount(count, countRead)) updateFindingsBadge();
   } catch (e) { /* silent */ }
+}
+
+function commitFindingsBadgeCount(count, read) {
+  // Pending or failed newer reads must not suppress a usable count. Events
+  // invalidate earlier snapshots without blocking authoritative decreases.
+  if (
+    count == null
+    || read.sessionId !== currentSessionId()
+    || read.stateGeneration !== findingsStateGeneration
+    || read.eventEpoch !== findingsEventEpoch
+    || read.generation < findingsCountAcceptedGeneration
+  ) {
+    return false;
+  }
+  findingsCountAcceptedGeneration = read.generation;
+  findingsBadgeCount = count;
+  return true;
 }
 
 async function fetchFindingsCount(sessionId) {
@@ -9046,6 +9077,7 @@ function handleFindingEvent(event) {
   try {
     const summary = JSON.parse(event.data || "null");
     if (summary?.id) {
+      findingsEventEpoch += 1;
       findingsBadgeCount += 1;
       updateFindingsBadge();
     }
