@@ -1005,7 +1005,7 @@
             <div class="ws-replay-left">
               <div class="ws-connection-section">
                 <div class="ws-connection-bar">
-                  <select id="wsSchemeSelect" class="compact-field-inline">
+                  <select id="wsSchemeSelect" class="compact-field-inline" aria-label="WebSocket scheme">
                     <option value="wss">WSS</option>
                     <option value="ws">WS</option>
                   </select>
@@ -1027,14 +1027,14 @@
                 </div>
               </div>
               <div class="ws-editor-section">
-                <label class="ws-editor-label">MESSAGE</label>
+                <label id="wsMessageLabel" class="ws-editor-label">MESSAGE</label>
                 <div class="ws-message-highlight-shell">
                   <textarea id="wsMessageEditor" class="ws-message-editor-hidden" rows="6" spellcheck="false"></textarea>
-                  <pre id="wsMessageHighlight" class="ws-message-highlight" contenteditable="plaintext-only" spellcheck="false" data-placeholder="Type a message..."></pre>
+                  <pre id="wsMessageHighlight" class="ws-message-highlight" contenteditable="plaintext-only" role="textbox" aria-multiline="true" aria-labelledby="wsMessageLabel" spellcheck="false" data-placeholder="Type a message..."></pre>
                 </div>
                 <div class="ws-editor-actions">
                   <button class="primary-action ws-send-button" id="wsSendButton" type="button" disabled>Send</button>
-                  <select id="wsMessageType" class="compact-field-inline ws-type-field">
+                  <select id="wsMessageType" class="compact-field-inline ws-type-field" aria-label="WebSocket message type">
                     <option value="text">Text</option>
                     <option value="binary">Binary</option>
                     <option value="ping">Ping</option>
