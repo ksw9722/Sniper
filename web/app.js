@@ -25182,6 +25182,8 @@ function contextMenuSessionIsCurrent() {
 // Editing a note happens in the cell itself: double-click it, type, Enter or
 // click away to save, Escape to abandon. It used to live in the right-click
 // menu, which meant aiming at a menu to write one word.
+let pendingHistoryNoteRead = null;
+
 async function beginNoteEdit(cell, transactionId) {
   if (!cell || cell.dataset.noteLoading === "true" || cell.querySelector("input.note-inline-input")) return;
   if (cell.dataset.noteFilteredOut === "true") {
@@ -25189,9 +25191,47 @@ async function beginNoteEdit(cell, transactionId) {
     delete cell.dataset.noteFilteredOut;
   }
   const sessionId = currentSessionId();
+  const focusOwner = document.activeElement;
+  const canEdit = () => currentSessionId() === sessionId && cell.isConnected
+    && isHttpHistoryVisible() && document.activeElement === focusOwner
+    && document.visibilityState !== "hidden"
+    && !isModalVisible(els.displaySettingsModal) && !isModalVisible(els.filterModal);
+  if (!canEdit()) return;
   closeContextMenu();
 
   let current = "";
+  let mayOpen = false;
+  // Only the latest uninterrupted intent may create an editor. Record focus
+  // changes as they happen: closing a modal can restore the original focus
+  // owner before the read finishes, but must not revive the abandoned edit.
+  pendingHistoryNoteRead?.cancel();
+  const cleanup = () => {
+    document.removeEventListener("pointerdown", onPointerDown, true);
+    document.removeEventListener("contextmenu", cleanup, true);
+    document.removeEventListener("focusin", onFocusIn, true);
+    document.removeEventListener("keydown", cleanup, true);
+    document.removeEventListener("visibilitychange", onVisibilityChange, true);
+    window.removeEventListener("blur", cleanup);
+    // A cancelled read can finish after the same cell starts a new read.
+    if (pendingHistoryNoteRead === pendingRead) {
+      pendingHistoryNoteRead = null;
+      delete cell.dataset.noteLoading;
+    }
+  };
+  const onPointerDown = (event) => {
+    if (event.button !== 0 || !cell.contains(event.target)) cleanup();
+  };
+  const onFocusIn = (event) => { if (event.target !== focusOwner) cleanup(); };
+  const onVisibilityChange = () => { if (document.visibilityState === "hidden") cleanup(); };
+  const pendingRead = { cancel: cleanup };
+  const isCurrent = () => pendingHistoryNoteRead === pendingRead && canEdit();
+  pendingHistoryNoteRead = pendingRead;
+  document.addEventListener("pointerdown", onPointerDown, true);
+  document.addEventListener("contextmenu", cleanup, true);
+  document.addEventListener("focusin", onFocusIn, true);
+  document.addEventListener("keydown", cleanup, true);
+  document.addEventListener("visibilitychange", onVisibilityChange, true);
+  window.addEventListener("blur", cleanup);
   // Repeated opens must not let a late read replace a draft already being typed.
   cell.dataset.noteLoading = "true";
   try {
@@ -25203,16 +25243,17 @@ async function beginNoteEdit(cell, transactionId) {
       throw new Error("Failed to load note: invalid response.");
     }
     current = record.user_note || "";
+    mayOpen = isCurrent();
   } catch (error) {
     // A failed read is not an empty note: editing it could overwrite saved text.
-    if (currentSessionId() === sessionId && cell.isConnected) {
+    if (isCurrent()) {
       showToast(error?.message || "Failed to load note.", "error");
     }
     return;
   } finally {
-    delete cell.dataset.noteLoading;
+    cleanup();
   }
-  if (currentSessionId() !== sessionId || !cell.isConnected) return;
+  if (!mayOpen) return;
   // Its last pending save may have released this cell while the read was pending.
   if (cell.dataset.noteFilteredOut === "true") {
     if (getHistoryItemIndex(transactionId) === -1) return;

@@ -1,7 +1,8 @@
 // Offline passive note editing checks. No app startup, API, or captured data.
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { loadFunctions } = require("./frontend-test-helpers.cjs");
+const vm = require("node:vm");
+const { appSource, loadFunctions } = require("./frontend-test-helpers.cjs");
 
 function deferred() {
   let resolve, reject;
@@ -18,7 +19,39 @@ function noteCell() {
     set innerHTML(value) { html = value; input = null; },
     querySelector() { return input; },
     appendChild(value) { input = value; },
+    contains(value) { return value === this || value === input; },
   };
+}
+
+function eventTarget() {
+  const listeners = new Map();
+  return {
+    listeners,
+    addEventListener(type, callback, capture = false) {
+      const entries = listeners.get(type) || new Map();
+      entries.set(callback, capture);
+      listeners.set(type, entries);
+    },
+    removeEventListener(type, callback, capture = false) {
+      const entries = listeners.get(type);
+      if (entries?.get(callback) === capture) entries.delete(callback);
+      if (!entries?.size) listeners.delete(type);
+    },
+    dispatch(type, fields = {}) {
+      const event = { type, target: this, defaultPrevented: false,
+        preventDefault() { this.defaultPrevented = true; }, ...fields };
+      for (const callback of Array.from(listeners.get(type)?.keys() || [])) callback(event);
+      return event;
+    },
+  };
+}
+
+function modal() {
+  const classes = new Set(["hidden"]);
+  return { classList: {
+    add: (name) => classes.add(name), remove: (name) => classes.delete(name),
+    contains: (name) => classes.has(name),
+  } };
 }
 
 function fixture({ joinAnnotations = false } = {}) {
@@ -26,6 +59,7 @@ function fixture({ joinAnnotations = false } = {}) {
   const historyWrites = [], detailWrites = [];
   const item = { id: "fixture-record", sequence: 1, has_user_note: true, note_preview: "Saved note" };
   const state = {
+    activeTool: "proxy", activeProxyTab: "http-history",
     items: [item], _itemById: new Map([[item.id, item]]), _itemsVersion: 0,
     historyPaging: { fullyLoaded: true, total: 1, filteredTotal: 1 },
     historyColumnOrder: ["notes"], filterSettings: {}, sortKey: "index", sortDirection: "desc",
@@ -35,9 +69,25 @@ function fixture({ joinAnnotations = false } = {}) {
   let nextTimer = 0;
   const cell = noteCell();
   const cells = [cell];
+  const document = { ...eventTarget(), visibilityState: "visible" };
+  const focusable = () => ({
+    isConnected: true, tabIndex: 0, getClientRects: () => [{}],
+    focus() {
+      if (document.activeElement === this) return;
+      document.activeElement = this;
+      document.dispatch("focusin", { target: this });
+    },
+  });
+  const focusOwner = focusable();
+  document.activeElement = focusOwner;
   const functions = [
     "beginNoteEdit", "releaseHistoryNoteEdit", "inheritPendingHistoryNoteEdit", "requireOkResponse", "readApiErrorMessage", "formatStructuredApiErrorMessage",
     "truncateUtf8", "truncateUtf8Preview", "utf8ByteLength",
+    "isHttpHistoryVisible", "isModalVisible", "restoreModalFocus",
+    "openDisplaySettingsModal", "closeDisplaySettingsModal", "openFilterModal", "closeFilterModal",
+    "setActiveTool", "setActiveProxyTab", "sanitizeActiveTool", "sanitizeActiveProxyTab",
+    "openContextMenu", "closeContextMenu", "positionContextMenu", "renderContextMenuNotes",
+    "createTransactionRecordMenuTarget", "getHistoryItem",
   ];
   if (joinAnnotations) functions.push(
     "updateAnnotations", "flushPendingAnnotations", "currentHistoryNoteEditWindow", "syncHistoryNoteEditWindow",
@@ -56,7 +106,15 @@ function fixture({ joinAnnotations = false } = {}) {
   );
   const context = loadFunctions(functions, {
     session: "fixture-session", MAX_ANNOTATION_NOTE_BYTES: 32 * 1024, TextEncoder,
-    closeContextMenu() {},
+    pendingHistoryNoteRead: null,
+    IMPLEMENTED_TOOLS: new Set(["proxy", "replay"]),
+    IMPLEMENTED_PROXY_TABS: new Set(["http-history", "websockets-history"]),
+    displaySettingsReturnFocus: null, displaySettingsPreviewActive: false, filterSettingsReturnFocus: null,
+    filterSettingsEditedControls: new Set(),
+    hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {}, selectSettingsTab() {},
+    hydrateFilterForm() {},
+    contextMenuTargetId: null, contextMenuSessionId: null, contextMenuRecordTarget: null, contextMenuAnchor: { x: 0, y: 0 },
+    async selectHistoryTransaction() {}, loadUserNote() {},
     transactionPath: (id, session) => `fixture-only:${session}/${id}`,
     fetch(url, options) { const request = { url, options, ...deferred() }; requests.push(request); return request.promise; },
     showToast(...args) { toasts.push(args); },
@@ -79,8 +137,12 @@ function fixture({ joinAnnotations = false } = {}) {
     async fetchTransactionPage() { return null; },
     renderDetail(record) { detailWrites.push({ ...record }); },
     els: {
+      contextMenu: { ...modal(), style: {}, offsetWidth: 180, offsetHeight: 200, querySelectorAll: () => [] },
+      displaySettingsModal: modal(), closeDisplaySettingsButton: focusable(), openDisplaySettingsButton: focusable(),
+      filterModal: modal(), closeFilterModalButton: focusable(), openFilterSettingsButton: focusable(),
       historyMeta: {}, historyTable: { closest: () => shell },
       historyTableBody: {
+        ...eventTarget(),
         querySelector(selector) {
           return cells.find((entry) => entry.isConnected && entry.querySelector(selector))?.querySelector(selector) || null;
         },
@@ -88,17 +150,21 @@ function fixture({ joinAnnotations = false } = {}) {
       },
     },
     window: {
+      innerWidth: 1000, innerHeight: 800,
+      ...eventTarget(), getComputedStyle: () => ({ visibility: "visible" }),
       setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
       clearTimeout(id) { timers.delete(id); },
     },
     document: {
+      ...document,
       createElement(tag) {
         assert.equal(tag, "input");
         const listeners = {};
         const created = {
+          ...focusable(),
           dataset: {},
           addEventListener(type, callback) { listeners[type] = callback; },
-          focus() {}, select() {},
+          select() { this.selected = true; },
           dispatch(type, key, fields = {}) {
             const event = { key, defaultPrevented: false, stopPropagation() {},
               preventDefault() { this.defaultPrevented = true; }, ...fields };
@@ -111,6 +177,10 @@ function fixture({ joinAnnotations = false } = {}) {
       },
     },
   });
+  // Production focus calls update the same document seen by the loaded handlers.
+  Object.defineProperty(context.document, "activeElement", {
+    get: () => document.activeElement, set: (value) => { document.activeElement = value; },
+  });
   context.currentSessionId = () => context.session;
   if (joinAnnotations) {
     state.filterSettings = context.createDefaultFilterSettings();
@@ -118,7 +188,10 @@ function fixture({ joinAnnotations = false } = {}) {
     state.historyPaging.beforeSequence = item.sequence;
   }
   context.rebuildHistoryItemIndex();
-  return { context, cell, cells, requests, inputs, saves, toasts, timers, state, item, historyWrites, detailWrites };
+  const listenerCount = () => [context.document, context.window].reduce((sum, target) =>
+    sum + Array.from(target.listeners.values()).reduce((count, entries) => count + entries.size, 0), 0);
+  return { context, cell, cells, requests, inputs, saves, toasts, timers, state, item, historyWrites, detailWrites,
+    focusOwner, focusable, listenerCount };
 }
 
 const notes = (f) => f.saves.map((save) => save[1].user_note);
@@ -953,6 +1026,239 @@ test("closing a composing editor transfers its pending repaint to another live e
   assert.equal(annotationRequests(f).length, 1);
 });
 
+async function pendingNoteRead(f, stage = "fetch", cell = f.cell, id = "fixture-record") {
+  const loading = f.context.beginNoteEdit(cell, id);
+  const request = f.requests.at(-1);
+  if (stage === "fetch") return { loading, finish: (body) => request.resolve(response(body)) };
+  const json = deferred();
+  const parsing = deferred();
+  request.resolve({ ok: true, json() { parsing.resolve(); return json.promise; } });
+  await parsing.promise;
+  return { loading, finish: (body) => json.resolve(body) };
+}
+
+for (const stage of ["fetch", "JSON"]) {
+  for (const settings of [true, false]) {
+    for (const close of [false, true]) {
+      test(`a pending note ${stage} read cannot take focus after ${settings ? "Settings" : "Filter"} ${close ? "opens and closes" : "opens"}`, async () => {
+        const f = fixture();
+        const before = f.cell.innerHTML;
+        const pending = await pendingNoteRead(f, stage);
+        const open = settings ? "openDisplaySettingsModal" : "openFilterModal";
+        const dismiss = settings ? "closeDisplaySettingsModal" : "closeFilterModal";
+        f.context[open]();
+        if (close) f.context[dismiss]();
+        const intendedFocus = f.context.document.activeElement;
+        if (close) assert.equal(intendedFocus, f.focusOwner, "the real close handler restores the original focus owner");
+        pending.finish({ user_note: "Saved note" });
+        await pending.loading;
+        assert.equal(f.inputs.length, 0, "obsolete reads must not create background editors");
+        assert.equal(f.context.document.activeElement, intendedFocus);
+        assert.equal(f.cell.innerHTML, before);
+        assert.equal(f.saves.length, 0);
+        assert.equal(f.toasts.length, 0);
+        assert.equal(f.cell.dataset.noteLoading, undefined);
+        assert.equal(f.listenerCount(), 0);
+      });
+    }
+  }
+}
+
+const abandonNoteIntent = {
+  "outside pointer": (f) => f.context.document.dispatch("pointerdown", { target: {} }),
+  "focus move": (f) => f.focusable().focus(),
+  "focus move and return": (f) => { f.focusable().focus(); f.focusOwner.focus(); },
+  "keyboard Escape": (f) => f.context.document.dispatch("keydown", { key: "Escape" }),
+  "keyboard Tab": (f) => f.context.document.dispatch("keydown", { key: "Tab" }),
+  "keyboard row navigation": (f) => f.context.document.dispatch("keydown", { key: "ArrowDown" }),
+  "tool change": (f) => f.context.setActiveTool("replay", { persist: false }),
+  "proxy tab change": (f) => f.context.setActiveProxyTab("websockets-history", { persist: false }),
+  "session change": (f) => { f.context.session = "another-session"; },
+  "cell detach": (f) => { f.cell.isConnected = false; },
+  "window blur": (f) => f.context.window.dispatch("blur"),
+  "page hidden and shown": (f) => {
+    f.context.document.visibilityState = "hidden";
+    f.context.document.dispatch("visibilitychange");
+    f.context.document.visibilityState = "visible";
+  },
+};
+
+for (const [intent, abandon] of Object.entries(abandonNoteIntent)) {
+  for (const stage of ["fetch", "JSON"]) {
+    test(`a delayed note ${stage} read yields to ${intent}`, async () => {
+      const f = fixture();
+      const pending = await pendingNoteRead(f, stage);
+      abandon(f);
+      const intendedFocus = f.context.document.activeElement;
+      pending.finish({ user_note: "Saved note" });
+      await pending.loading;
+      assert.equal(f.inputs.length, 0);
+      assert.equal(f.context.document.activeElement, intendedFocus);
+      assert.equal(f.saves.length, 0);
+      assert.equal(f.toasts.length, 0);
+      assert.equal(f.cell.dataset.noteLoading, undefined);
+      assert.equal(f.listenerCount(), 0);
+    });
+  }
+}
+
+test("capture listeners cancel pending intent without intercepting the new action", async () => {
+  const f = fixture();
+  const pending = await pendingNoteRead(f);
+  for (const type of ["pointerdown", "contextmenu", "focusin", "keydown"]) {
+    const listeners = f.context.document.listeners.get(type);
+    assert.ok(listeners?.size, `missing ${type} listener`);
+    assert.ok(Array.from(listeners.values()).every((capture) => capture === true));
+  }
+  const event = f.context.document.dispatch("pointerdown", { target: {} });
+  assert.equal(event.defaultPrevented, false);
+  assert.equal(f.listenerCount(), 0, "cancel cleans up even if the read never settles");
+  assert.equal(f.cell.dataset.noteLoading, undefined);
+  pending.finish({ user_note: "Saved note" });
+  await pending.loading;
+  assert.equal(f.listenerCount(), 0);
+});
+
+test("an unchanged note intent opens normally after both asynchronous read stages", async () => {
+  const f = fixture();
+  const pending = await pendingNoteRead(f, "JSON");
+  f.context.document.dispatch("pointerdown", { target: f.cell, button: 0 });
+  f.focusOwner.focus();
+  pending.finish({ user_note: "Full saved note" });
+  await pending.loading;
+  assert.equal(f.inputs.length, 1);
+  assert.equal(f.inputs[0].value, "Full saved note");
+  assert.equal(f.context.document.activeElement, f.inputs[0]);
+  assert.equal(f.inputs[0].selected, true);
+  assert.equal(f.listenerCount(), 0);
+  assert.equal(f.cell.dataset.noteLoading, undefined);
+  f.inputs[0].value = "New draft";
+  f.inputs[0].dispatch("input");
+  runTimers(f);
+  assert.deepEqual(notes(f), ["New draft"]);
+});
+
+for (const stage of ["fetch", "JSON"]) {
+  test(`a pending note ${stage} read yields to the same cell's production context menu handler`, async () => {
+    const f = fixture();
+    f.state.selectedRecord = f.item;
+    const handler = appSource.match(/  els\.historyTableBody\.addEventListener\("contextmenu", \(event\) => \{[^]*?\n  \}\);/);
+    assert.ok(handler, "the production history contextmenu handler must be used");
+    vm.runInContext(handler[0], f.context);
+    f.cell.closest = () => ({ dataset: { id: f.item.id } });
+    const pending = await pendingNoteRead(f, stage);
+    // A context menu can arrive without a secondary pointerdown (for example,
+    // a long press). Dispatch capture before the real table handler as the DOM does.
+    const event = { target: f.cell, clientX: 20, clientY: 30 };
+    assert.equal(f.context.document.dispatch("contextmenu", event).defaultPrevented, false);
+    assert.equal(f.context.els.historyTableBody.dispatch("contextmenu", event).defaultPrevented, true);
+    assert.equal(f.context.els.contextMenu.classList.contains("hidden"), false);
+    assert.equal(f.context.contextMenuTargetId, f.item.id);
+    assert.equal(f.context.document.activeElement, f.focusOwner, "opening this menu does not move focus");
+    pending.finish({ user_note: "Saved note" });
+    await pending.loading;
+    assert.equal(f.inputs.length, 0);
+    assert.equal(f.context.document.activeElement, f.focusOwner);
+    assert.equal(f.context.els.contextMenu.classList.contains("hidden"), false);
+    assert.equal(f.saves.length, 0);
+    assert.equal(f.toasts.length, 0);
+    assert.equal(f.cell.dataset.noteLoading, undefined);
+    assert.equal(f.listenerCount(), 0);
+  });
+}
+
+for (const button of [1, 2]) {
+  test(`a same-cell pointer button ${button} cancels before any later context menu event`, async () => {
+    const f = fixture();
+    const pending = await pendingNoteRead(f, "JSON");
+    const event = f.context.document.dispatch("pointerdown", { target: f.cell, button });
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(f.listenerCount(), 0);
+    pending.finish({ user_note: "Saved note" });
+    await pending.loading;
+    assert.equal(f.inputs.length, 0);
+    assert.equal(f.cell.dataset.noteLoading, undefined);
+    assert.equal(f.context.document.activeElement, f.focusOwner);
+  });
+}
+
+for (const finishOldFirst of [true, false]) {
+  test(`superseded note reads preserve the newer editor when the older read finishes ${finishOldFirst ? "first" : "last"}`, async () => {
+    const f = fixture();
+    const first = await pendingNoteRead(f, "JSON");
+    const secondCell = noteCell();
+    f.cells.push(secondCell);
+    const second = await pendingNoteRead(f, "JSON", secondCell, "second-record");
+    const finishFirst = async () => { first.finish({ user_note: "Old note" }); await first.loading; };
+    const finishSecond = async () => { second.finish({ user_note: "Second note" }); await second.loading; };
+    if (finishOldFirst) {
+      await finishFirst();
+      assert.equal(f.inputs.length, 0);
+      assert.equal(secondCell.dataset.noteLoading, "true");
+      await finishSecond();
+    } else {
+      await finishSecond();
+      f.inputs[0].value = "Current unsaved draft";
+      await finishFirst();
+      assert.equal(f.inputs[0].value, "Current unsaved draft");
+    }
+    assert.equal(f.inputs.length, 1);
+    assert.equal(f.context.document.activeElement, secondCell.querySelector());
+    assert.equal(f.cell.querySelector(), null);
+    assert.equal(f.saves.length, 0);
+    assert.equal(f.listenerCount(), 0);
+  });
+}
+
+test("a cancelled same-cell read cannot clear a newer loading marker or duplicate its listeners", async () => {
+  const f = fixture();
+  const first = await pendingNoteRead(f, "JSON");
+  f.context.document.dispatch("keydown", { key: "Escape" });
+  assert.equal(f.cell.dataset.noteLoading, undefined);
+  assert.equal(f.listenerCount(), 0);
+  const second = await pendingNoteRead(f, "JSON");
+  const listenerCount = f.listenerCount();
+  assert.ok(listenerCount > 0);
+  first.finish({ user_note: "Obsolete note" });
+  await first.loading;
+  assert.equal(f.cell.dataset.noteLoading, "true");
+  assert.equal(f.listenerCount(), listenerCount);
+  assert.equal(f.inputs.length, 0);
+  await f.context.beginNoteEdit(f.cell, "fixture-record");
+  assert.equal(f.requests.length, 2, "the newer pending read still blocks duplicate opens");
+  second.finish({ user_note: "Current note" });
+  await second.loading;
+  assert.equal(f.inputs.length, 1);
+  assert.equal(f.inputs[0].value, "Current note");
+  assert.equal(f.cell.dataset.noteLoading, undefined);
+  assert.equal(f.listenerCount(), 0);
+});
+
+for (const stage of ["fetch", "JSON", "error text"]) {
+  test(`obsolete note ${stage} failures do not replace the current UI with a toast`, async () => {
+    const f = fixture();
+    const loading = f.context.beginNoteEdit(f.cell, "fixture-record");
+    let fail = () => f.requests[0].reject(new Error("Obsolete read failure"));
+    if (stage !== "fetch") {
+      const parsing = deferred();
+      const body = deferred();
+      f.requests[0].resolve(stage === "JSON"
+        ? { ok: true, json() { parsing.resolve(); return body.promise; } }
+        : { ...failedResponse(), text() { parsing.resolve(); return body.promise; } });
+      await parsing.promise;
+      fail = stage === "JSON" ? () => body.reject(new Error("Invalid JSON")) : () => body.resolve("Old error");
+    }
+    f.context.openDisplaySettingsModal();
+    f.context.closeDisplaySettingsModal();
+    fail();
+    await loading;
+    assert.equal(f.toasts.length, 0);
+    assert.equal(f.inputs.length, 0);
+    assert.equal(f.cell.dataset.noteLoading, undefined);
+    assert.equal(f.listenerCount(), 0);
+  });
+}
+
 for (const failure of ["server", "missing record", "network", "invalid JSON"]) {
   test(`note ${failure} read failure preserves the cell and does not open an empty editor`, async () => {
     const f = fixture();
@@ -967,6 +1273,7 @@ for (const failure of ["server", "missing record", "network", "invalid JSON"]) {
     assert.equal(f.saves.length, 0);
     assert.equal(f.toasts.length, 1, "read failure must be visible");
     assert.equal(f.toasts[0][1], "error");
+    assert.equal(f.listenerCount(), 0);
   });
 }
 
