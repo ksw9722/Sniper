@@ -19257,18 +19257,24 @@ async function installCliPath() {
   try {
     const response = await fetch("/api/cli-path", { method: "POST", signal: controller.signal });
     await requireOkResponse(response, "Could not add sniper-cli to PATH.");
-    const result = await response.json();
+    const result = await response.json().catch(() => {
+      // JSON parser errors can include raw response text.
+      throw new Error("Invalid PATH setup response.");
+    });
     if (!current()) return;
-    if (![result?.updated, result?.unchanged, result?.warnings].every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))) {
+    // Successful backend results always name an updated or unchanged target.
+    // Validate the acknowledgement before hiding retry or displaying its message.
+    if (![result?.updated, result?.unchanged, result?.warnings].every((items) =>
+      Array.isArray(items) && items.every((item) => typeof item === "string" && item.trim()))
+      || !(result.updated.length || result.unchanged.length)
+      || typeof result.message !== "string" || !result.message.trim()) {
       throw new Error("Invalid PATH setup response.");
     }
     cliPathState.status.should_prompt = false;
     cliPathState.status.registered = result.warnings.length === 0;
     cliPathState.error = result.warnings.length > 0;
-    const message = typeof result.message === "string" && result.message.trim()
-      ? result.message : "PATH setup finished. Open a new terminal and run sniper-cli.";
     cliPathState.message = result.warnings.length
-      ? `${message} ${result.warnings.join(" ")} You can retry from Settings → Runtime.` : message;
+      ? `${result.message} ${result.warnings.join(" ")} You can retry from Settings → Runtime.` : result.message;
   } catch (error) {
     if (!current()) return;
     cliPathState.error = true;

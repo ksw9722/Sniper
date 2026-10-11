@@ -68,6 +68,20 @@ access.
 See [safe skill maintenance](../integrations/skill-maintenance.md) for exact
 commands, refusal states, and activation and backup limitations.
 
+## CLI PATH setup
+
+Incomplete installation acknowledgements keep the error and recovery controls
+visible instead of claiming successful registration. On macOS, Unicode padding
+outside a managed command no longer gives that line automatic-edit ownership.
+If appending would convert a final lone carriage return into a CRLF ending,
+setup leaves that profile unchanged and asks for manual review.
+
+macOS automatic PATH setup recognizes managed command lines without parsing shell
+context. A managed-command example inside a here-document can be mistaken for
+an existing registration or modified when the app path changes. This limitation
+remains unresolved. If a profile contains such examples, use the bundled CLI by
+its full path and review the profile manually before choosing automatic setup.
+
 ## UI reliability (2026-10-11)
 
 - Display settings can be edited and previewed while their saved baseline loads,

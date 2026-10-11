@@ -299,6 +299,129 @@ test("malformed availability and install replies never claim success", async () 
   assert.match(f.nodes.installCliPathStatus.textContent, /Invalid PATH setup response.*retry/);
 });
 
+const UNTRUSTED_INSTALL_TEXT = "UNTRUSTED_PATH_SETUP_REPLY";
+const INVALID_INSTALL_RESULTS = [
+  ["null result", null],
+  ["array result", []],
+  ["string result", UNTRUSTED_INSTALL_TEXT],
+  ["empty object", {}],
+  ["no registration entries", { updated: [], unchanged: [], warnings: [], message: UNTRUSTED_INSTALL_TEXT }],
+  ["warnings without registration", { updated: [], unchanged: [], warnings: [UNTRUSTED_INSTALL_TEXT], message: UNTRUSTED_INSTALL_TEXT }],
+];
+for (const field of ["updated", "unchanged", "warnings"]) {
+  for (const [name, value] of [
+    ["missing", undefined], ["non-array", UNTRUSTED_INSTALL_TEXT],
+    ["non-string entry", [42]], ["empty entry", [""]], ["blank entry", [" \t\n "]],
+  ]) {
+    INVALID_INSTALL_RESULTS.push([`${name} ${field}`, { ...SUCCESS, message: UNTRUSTED_INSTALL_TEXT, [field]: value }]);
+  }
+}
+for (const [name, message] of [
+  ["missing", undefined], ["null", null], ["non-string", 42], ["empty", ""], ["blank", " \t\n "],
+]) {
+  INVALID_INSTALL_RESULTS.push([`${name} message`, { ...SUCCESS, message, additional_detail: UNTRUSTED_INSTALL_TEXT }]);
+}
+
+for (const [name, result] of INVALID_INSTALL_RESULTS) {
+  test(`invalid install reply with ${name} preserves error recovery without showing its payload`, async () => {
+    const f = fixture(); await f.ready();
+    f.nodes.cliPathAddButton.click(); f.json(1, result); await nextTurn();
+    assert.equal(f.state.status.registered, false);
+    assert.equal(f.state.status.should_prompt, true);
+    assert.equal(f.state.error, true);
+    assert.equal(f.state.action, null);
+    assert.equal(f.nodes.installCliPathButton.disabled, false);
+    assert.equal(f.nodes.refreshCliPathButton.disabled, false);
+    assert.equal(hidden(f.nodes.cliPathSettingsButton), false);
+    assert.equal(hidden(f.nodes.cliPathDismissButton), false);
+    for (const id of ["installCliPathStatus", "cliPathBannerStatus"]) {
+      assert.equal(f.nodes[id].textContent, "Invalid PATH setup response. You can retry from Settings → Runtime.");
+      assert.equal(f.nodes[id].classList.contains("error"), true);
+      assert.doesNotMatch(f.nodes[id].textContent, /UNTRUSTED_PATH_SETUP_REPLY|PATH setup finished/);
+    }
+    assert.equal(f.requests.length, 2);
+  });
+}
+
+for (const body of ["", UNTRUSTED_INSTALL_TEXT, `{"message":"${UNTRUSTED_INSTALL_TEXT}"`]) {
+  test(`non-JSON install reply ${JSON.stringify(body)} uses a fixed recovery error`, async () => {
+    const f = fixture(); await f.ready();
+    f.nodes.cliPathAddButton.click();
+    f.requests[1].resolve(new Response(body, { status: 200 })); await nextTurn();
+    assert.equal(f.state.status.registered, false);
+    assert.equal(f.state.error, true);
+    assert.equal(f.nodes.installCliPathButton.disabled, false);
+    assert.equal(hidden(f.nodes.cliPathSettingsButton), false);
+    assert.equal(f.nodes.installCliPathStatus.textContent,
+      "Invalid PATH setup response. You can retry from Settings → Runtime.");
+    assert.doesNotMatch(f.nodes.cliPathBannerStatus.textContent, /UNTRUSTED_PATH_SETUP_REPLY/);
+    assert.equal(f.requests.length, 2);
+  });
+}
+
+test("invalid install replies can be retried explicitly through Settings", async () => {
+  const f = fixture(); await f.ready();
+  f.nodes.cliPathAddButton.click();
+  f.json(1, { updated: [], unchanged: [], warnings: [], message: UNTRUSTED_INSTALL_TEXT });
+  await nextTurn();
+  assert.equal(f.nodes.installCliPathButton.disabled, false);
+  assert.equal(hidden(f.nodes.cliPathSettingsButton), false);
+  f.nodes.cliPathSettingsButton.click();
+  assert.equal(f.settingsOpened(), 1);
+  f.nodes.installCliPathButton.click();
+  assert.equal(f.requests.length, 3);
+  assert.equal(f.nodes.installCliPathStatus.textContent, "Adding bundled sniper-cli to PATH...");
+  f.json(2, SUCCESS); await nextTurn();
+  assert.equal(f.state.status.registered, true);
+  assert.equal(f.state.error, false);
+  assert.equal(f.nodes.installCliPathStatus.textContent, SUCCESS.message);
+});
+
+for (const [name, result] of [
+  ["unchanged macOS registration", {
+    updated: [], unchanged: ["Existing CLI PATH registration"], warnings: [],
+    message: "sniper-cli is already registered. Open a new terminal to use it.",
+  }],
+  ["unchanged Windows registration", {
+    updated: [], unchanged: ["User PATH (HKCU\\Environment)"], warnings: [],
+    message: "The bundled sniper-cli directory is already on PATH. Open a new terminal to use it.",
+  }],
+  ["updated registration with additive fields", {
+    ...SUCCESS, updated: ["/fixture/A  B & <C>/.zshrc"],
+    message: "Registered sniper-cli in /fixture/A  B & <C>/.zshrc. Open a new terminal to use it.",
+    additional_detail: UNTRUSTED_INSTALL_TEXT,
+  }],
+]) {
+  test(`valid install reply accepts ${name}`, async () => {
+    const f = fixture(); await f.ready();
+    f.nodes.cliPathAddButton.click(); f.json(1, result); await nextTurn();
+    assert.equal(f.state.status.registered, true);
+    assert.equal(f.state.error, false);
+    assert.equal(f.nodes.installCliPathButton.disabled, true);
+    assert.equal(f.nodes.installCliPathStatus.textContent, result.message);
+    assert.equal(f.nodes.cliPathBannerStatus.textContent, result.message);
+    assert.doesNotMatch(f.nodes.installCliPathStatus.textContent, /UNTRUSTED_PATH_SETUP_REPLY/);
+  });
+}
+
+test("valid partial results preserve their message and warnings with recovery available", async () => {
+  const f = fixture(); await f.ready();
+  const result = {
+    updated: [], unchanged: ["/fixture/.zshrc"],
+    warnings: ["/fixture/A  B & <C>/.bashrc: fixture write failed"],
+    message: "CLI PATH setup only partially completed. Review the warnings and retry from Settings.",
+    additional_detail: UNTRUSTED_INSTALL_TEXT,
+  };
+  f.nodes.cliPathAddButton.click(); f.json(1, result); await nextTurn();
+  assert.equal(f.state.status.registered, false);
+  assert.equal(f.state.error, true);
+  assert.equal(f.nodes.installCliPathButton.disabled, false);
+  assert.equal(hidden(f.nodes.cliPathSettingsButton), false);
+  assert.equal(f.nodes.installCliPathStatus.textContent,
+    `${result.message} ${result.warnings[0]} You can retry from Settings → Runtime.`);
+  assert.doesNotMatch(f.nodes.installCliPathStatus.textContent, /UNTRUSTED_PATH_SETUP_REPLY/);
+});
+
 test("pagehide aborts pending read and rejects its late result after a back/forward restore", async () => {
   const f = fixture(); f.context.initCliPathOnboarding(); await nextTurn();
   f.emit("pagehide");
