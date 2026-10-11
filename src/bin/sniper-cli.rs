@@ -10206,12 +10206,9 @@ async fn discover_api_base_url_from_data_dir(
     client: &reqwest::Client,
     data_dir: PathBuf,
 ) -> Result<String> {
-    let runtime_state = load_runtime_state(&data_dir).with_context(|| {
-        format!(
-            "failed to read Sniper runtime-state; it may be mid-update or stale at {}",
-            data_dir.display()
-        )
-    })?;
+    // Drop path-bearing causes as well as their display text: output failures
+    // print the original error chain to stderr instead of the JSON envelope.
+    let runtime_state = load_runtime_state(&data_dir).map_err(|_| LocalRuntimeStateReadError)?;
     if let Some(runtime_state) = runtime_state {
         let url = runtime_state.api_base_url();
         let expected = SniperApiProbeExpectation {
@@ -11474,6 +11471,17 @@ async fn run_saved_call(
 }
 
 #[derive(Debug)]
+struct LocalRuntimeStateReadError;
+
+impl fmt::Display for LocalRuntimeStateReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Could not read local Sniper runtime-state; no API call was sent")
+    }
+}
+
+impl std::error::Error for LocalRuntimeStateReadError {}
+
+#[derive(Debug)]
 struct ReadHttpStatusError {
     status: StatusCode,
 }
@@ -11801,6 +11809,16 @@ fn clap_error_payload(error: &clap::Error) -> CliErrorPayload {
 }
 
 fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload {
+    if let Some(discovery) = error.downcast_ref::<LocalRuntimeStateReadError>() {
+        return CliErrorPayload {
+            code: "API_UNAVAILABLE",
+            message: discovery.to_string(),
+            hint: Some("Check Sniper's local data directory (SNIPER_DATA_DIR if set) and its runtime-state files, or pass --api http://HOST:PORT for the intended running instance. Preserve existing runtime-state files."),
+            retryable: false,
+            details: json!({}),
+            exit_code: 6,
+        };
+    }
     if let Some(input) = error.downcast_ref::<CallInputError>() {
         let saved = operation.starts_with("saved.v1.");
         // Preserve the failure phase without exposing saved input paths,

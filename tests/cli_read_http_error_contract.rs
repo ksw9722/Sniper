@@ -1,7 +1,7 @@
 //! Read-only metadata fixtures: no runtime, captured traffic, or real user paths.
 use serde_json::{json, Value};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -185,12 +185,231 @@ impl MockApi {
         }
         (exit, value)
     }
+
+    fn blocked_discovery_data(&self, name: &str) -> (PathBuf, Vec<u8>) {
+        let data = self.root.join(format!("{PRIVATE_MARKER}-{name}"));
+        let lock = data.join(".runtime-state.lock");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("fixture"), b"preserve this directory").unwrap();
+        let state = json!({
+            "instance_id":Uuid::new_v4(), "proxy_addr":"127.0.0.1:0",
+            "ui_addr":self.api.strip_prefix("http://").unwrap(),
+            "proxy_online":false, "updated_at":"2026-10-11T00:00:00Z"
+        })
+        .to_string()
+        .into_bytes();
+        std::fs::write(data.join("runtime-state.json"), &state).unwrap();
+        (data, state)
+    }
+
+    fn discovery_command(
+        &self,
+        data: &Path,
+        call_operation: Option<&str>,
+        explicit_api: bool,
+    ) -> tokio::process::Command {
+        let mut cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
+        cli.env_clear()
+            .env("HOME", self.root.join("home"))
+            .env("USERPROFILE", self.root.join("home"))
+            .env("CODEX_HOME", self.root.join("codex-home"))
+            .env("SNIPER_DATA_DIR", data)
+            .current_dir(&self.root)
+            .args(["--output", "compact"])
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            cli.env("SystemRoot", system_root);
+        }
+        if explicit_api {
+            cli.args(["--api", &self.api]);
+        }
+        if let Some(operation) = call_operation {
+            cli.args(["call", operation, "--input", "{}"]);
+        } else {
+            cli.args(["session", "list"]);
+        }
+        cli
+    }
 }
 
 impl Drop for MockApi {
     fn drop(&mut self) {
         self.server.abort();
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn assert_discovery_data_unchanged(data: &Path, state: &[u8]) {
+    assert_eq!(
+        std::fs::read(data.join("runtime-state.json")).unwrap(),
+        state
+    );
+    assert_eq!(
+        std::fs::read(data.join(".runtime-state.lock/fixture")).unwrap(),
+        b"preserve this directory"
+    );
+    let mut entries: Vec<_> = std::fs::read_dir(data)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, [".runtime-state.lock", "runtime-state.json"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_discovery_failures_have_path_independent_recovery_guidance() {
+    let mock = MockApi::new().await;
+    for name in [
+        "plain",
+        "invalid",
+        "unknown operation",
+        "requires --dry-run or --yes",
+        "workspace state revision conflict",
+        "failed (503 Synthetic)",
+    ] {
+        let (data, state) = mock.blocked_discovery_data(name);
+        for call in [None, Some("session.list")] {
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                mock.discovery_command(&data, call, false).output(),
+            )
+            .await
+            .expect("local discovery timed out")
+            .unwrap();
+            assert_eq!(output.status.code(), Some(6), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["ok"], false);
+            assert_eq!(value["operation"], "session.list");
+            assert_eq!(value["schema_version"], "2026-06-22");
+            assert_eq!(value["error"]["code"], "API_UNAVAILABLE");
+            assert_eq!(value["error"]["retryable"], false);
+            assert_eq!(value["error"]["details"], json!({}));
+            assert_eq!(
+                value["error"]["message"],
+                "Could not read local Sniper runtime-state; no API call was sent"
+            );
+            let hint = value["error"]["hint"].as_str().unwrap();
+            assert!(hint.contains("SNIPER_DATA_DIR"), "{value}");
+            assert!(hint.contains("--api"), "{value}");
+            assert!(hint.contains("Preserve"), "{value}");
+            assert!(!value.to_string().contains(PRIVATE_MARKER));
+            assert!(mock.requests.lock().unwrap().is_empty());
+            assert_discovery_data_unchanged(&data, &state);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_api_bypasses_local_discovery_failure_without_changing_state() {
+    let mock = MockApi::new().await;
+    mock.respond(200, "[]".to_string(), false);
+    let (data, state) = mock.blocked_discovery_data("invalid");
+    for call in [None, Some("session.list")] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            mock.discovery_command(&data, call, true).output(),
+        )
+        .await
+        .expect("explicit API metadata read timed out")
+        .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if call.is_some() {
+            assert_eq!(value["ok"], true);
+            assert_eq!(value["operation"], "session.list");
+            assert_eq!(value["data"], json!([]));
+        } else {
+            assert_eq!(value, json!([]));
+        }
+        assert_eq!(
+            std::mem::take(&mut *mock.requests.lock().unwrap()),
+            [
+                ("GET".into(), "/api/settings".into()),
+                ("GET".into(), "/api/sessions".into())
+            ]
+        );
+        assert_discovery_data_unchanged(&data, &state);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_reads_keep_their_existing_local_discovery_error_contract() {
+    let mock = MockApi::new().await;
+    for name in ["plain", "invalid"] {
+        let (data, state) = mock.blocked_discovery_data(name);
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            mock.discovery_command(&data, Some("saved.v1.session.list"), false)
+                .output(),
+        )
+        .await
+        .expect("saved read local discovery timed out")
+        .unwrap();
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["operation"], "saved.v1.session.list");
+        assert_eq!(value["schema_version"], "saved.v1");
+        assert_eq!(value["error"]["code"], "API_UNAVAILABLE");
+        assert_eq!(value["error"]["retryable"], false);
+        assert_eq!(
+            value["error"]["message"],
+            "Could not reach a Sniper API; no saved-data call was sent"
+        );
+        assert_eq!(
+            value["error"]["hint"],
+            "Check the selected API endpoint and that Sniper is running, then deliberately rerun this read."
+        );
+        assert_eq!(
+            value["error"]["details"],
+            json!({"outcome":"not_applied", "operation_id":null, "session_id":null})
+        );
+        assert!(!value.to_string().contains(PRIVATE_MARKER));
+        assert!(mock.requests.lock().unwrap().is_empty());
+        assert_discovery_data_unchanged(&data, &state);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_discovery_output_failure_does_not_reveal_source_paths() {
+    let mock = MockApi::new().await;
+    let (data, state) = mock.blocked_discovery_data("invalid");
+    for call in [None, Some("session.list")] {
+        let mut cli = mock.discovery_command(&data, call, false);
+        cli.stdout(std::process::Stdio::from(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        ))
+        .stderr(std::process::Stdio::piped());
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            cli.spawn().unwrap().wait_with_output(),
+        )
+        .await
+        .expect("local discovery output failure timed out")
+        .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("failed to write JSON error output"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("original error"), "{stderr}");
+        assert!(
+            stderr.contains("Could not read local Sniper runtime-state"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(PRIVATE_MARKER), "{stderr}");
+        assert!(!stderr.contains(".runtime-state.lock"), "{stderr}");
+        assert!(mock.requests.lock().unwrap().is_empty());
+        assert_discovery_data_unchanged(&data, &state);
     }
 }
 
