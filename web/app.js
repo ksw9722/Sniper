@@ -2431,6 +2431,7 @@ function bindEvents() {
     }
 
     if (
+      !event.defaultPrevented &&
       !event.metaKey &&
       !event.ctrlKey &&
       !event.altKey &&
@@ -2506,6 +2507,7 @@ function bindEvents() {
 
     // Arrow keys in WS Replay: navigate frames
     if (
+      !event.defaultPrevented &&
       (event.key === "ArrowUp" || event.key === "ArrowDown") &&
       !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey &&
       state.activeTool === "replay" &&
@@ -10617,9 +10619,12 @@ function bindFindingsEvents() {
       if (e.key === "Enter" && !e.target.matches("input, textarea, select")) { e.preventDefault(); saveScannerSettingsFromModal(); }
       return;
     }
-    // Only handle when findings tab is active and not focused on input
+    // Only handle when findings tab is active and owns unmodified arrow keys
     if (state.activeTool !== "proxy" || state.activeProxyTab !== "findings") return;
-    if (e.target.matches("input, textarea, select")) return;
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    if (e.defaultPrevented || getActiveModalAction()) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+    if (isEditableTarget(e.target)) return;
     if (e.key === "ArrowDown") { e.preventDefault(); findingsArrowNav(1); }
     if (e.key === "ArrowUp") { e.preventDefault(); findingsArrowNav(-1); }
   });
