@@ -22,8 +22,10 @@ function fixture(kind) {
   const context = loadFunctions(['currentSessionId', 'expectedActiveSessionIdForWrite', 'sessionWritePath',
     'sessionQueryPath', 'saveTargetScope', 'saveMatchReplaceRules', 'formatScopePatternsText', 'jsonArray',
     'syncMatchReplaceEditor', 'getSelectedMatchReplaceRule', 'flushTargetScopeDraft', 'flushMatchReplaceDraft',
-    'loadTargetSiteMap', 'syncTargetScopeDraft', 'deleteSelectedMatchReplaceRule', 'canLeaveSessionAfterDraftPreflight'], {
+    'loadTargetSiteMap', 'syncTargetScopeDraft', 'deleteSelectedMatchReplaceRule', 'canLeaveSessionAfterDraftPreflight',
+    'preserveActiveHttpReplayDraftBeforeSessionChange', 'getRenderedHttpReplayDraftOwner'], {
     state, els, workspaceStateGeneration: 0, workspaceSaveConflictPending: false, URLSearchParams,
+    workspaceLoaded: false, renderedHttpReplayDraftOwner: null, getActiveReplayTab: () => null,
     requireOkResponse: async response => { if (!response.ok) throw response.error; },
     showToast: (...args) => toasts.push(args), console: { error() {} },
     renderMatchReplaceRules: () => renders.push('rules'), renderTarget: () => renders.push('scope'),

@@ -2077,6 +2077,7 @@ function bindEvents() {
       els.replayRequestEditor.value = restored;
       const tab = getActiveReplayTab();
       if (tab) {
+        if (renderedHttpReplayDraftOwner?.tab === tab) renderedHttpReplayDraftOwner.preservedVersionDraft = null;
         tab.requestText = restored;
         clearReplayResponseForDraftChange(tab);
       }
@@ -2172,6 +2173,7 @@ function bindEvents() {
     const ver = e.target.value;
     const tab = getActiveReplayTab();
     if (!tab || tab.type === "websocket") return;
+    if (renderedHttpReplayDraftOwner?.tab === tab) renderedHttpReplayDraftOwner.preservedVersionDraft = null;
     tab.httpVersionMode = ver || "";
     const cv = getCMView("replayReq");
     const text = tab.requestBytes
@@ -4366,8 +4368,17 @@ function syncActiveHttpReplayDraftFromDom() {
       ? cv.getContent()
       : (els.replayRequestEditor?.value ?? els.replayRequestHighlight?.innerText ?? null);
     if (typeof requestText === "string" && !replayRequestTextsEquivalent(requestText, tab.requestText)) {
-      syncReplayRequestTextFromEditor(requestText);
-      changed = true;
+      // The hidden legacy mirror can differ from the visible editor. Only skip
+      // this passive read when both still show the exact captured source.
+      const visibleText = cv ? requestText : (els.replayRequestCM ? null
+        : (els.replayRequestHighlight?.innerText ?? els.replayRequestEditor?.value ?? null));
+      const editorIdentity = cv || (els.replayRequestCM ? els.replayRequestCM : els.replayRequestHighlight || els.replayRequestEditor);
+      const versionControl = document.getElementById("replayHttpVersionSelect");
+      if (!isPreservedHttpReplayVersionSource(tab, visibleText, editorIdentity, versionControl)
+        || requestText !== visibleText) {
+        syncReplayRequestTextFromEditor(requestText);
+        changed = true;
+      }
     }
   }
   if (els.replayHostInput && els.replayPortInput) {
@@ -4838,7 +4849,7 @@ function hasPendingWorkspaceStateSave() {
   return !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer || workspaceSaveInFlight || workspaceSaveLoopPromise);
 }
 
-function canLeaveSessionAfterDraftPreflight() {
+function canLeaveSessionAfterDraftPreflight({ externalSessionChanged = false } = {}) {
   // An editor whose save already finished can become dirty while a later phase
   // waits. Only outstanding work blocks the transition; edits acknowledged by a
   // later save are safe, even when their draft versions changed during preflight.
@@ -4847,7 +4858,7 @@ function canLeaveSessionAfterDraftPreflight() {
     && !hasPendingWorkspaceStateSave() && !workspaceSaveConflictPending
     && !state._pendingAnnotations?.size && !state._annotationInFlight?.size) return true;
   showToast(
-    "Unsaved drafts arrived while preparing the session change. Your current workspace is still open. Save or discard the drafts before trying again.",
+    `${externalSessionChanged ? "The active session changed. " : ""}Unsaved drafts arrived while preparing the session change. Your current workspace is still open. Save or discard the drafts before trying again.`,
     "error",
     7000,
   );
@@ -5080,6 +5091,7 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
   // Bypassing the active-session guard is safe only for this original workspace.
   // Another reload can finish while any of the draft preflights is awaiting I/O.
   if (!ownsWorkspace()) return;
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("reloading this workspace after the active session changed")) return;
   const staleSessionWriteOptions = {
     bypassExpectedActiveSessionGuard: true,
     sessionId: targetSessionId,
@@ -5137,7 +5149,8 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
     return;
   }
   if (shouldReload) {
-    if (!canLeaveSessionAfterDraftPreflight()) return;
+    if (!preserveActiveHttpReplayDraftBeforeSessionChange("reloading this workspace after the active session changed")
+      || !canLeaveSessionAfterDraftPreflight({ externalSessionChanged: true })) return;
     await reloadSessionWorkspace({ cleanupBeforeReset: false });
   }
 }
@@ -5174,7 +5187,8 @@ async function createSession() {
     if (!canContinuePreflight()) return;
     throw error;
   }
-  if (!canLeaveSessionAfterDraftPreflight()) return;
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("creating a session")
+    || !canLeaveSessionAfterDraftPreflight()) return;
   const submittedName = els.dashboardCreateSessionName.value;
   const name = submittedName.trim();
   const actionSessionId = currentSessionId();
@@ -5241,7 +5255,8 @@ async function activateSessionById(id, { force = false } = {}) {
     if (!canContinuePreflight()) return;
     throw error;
   }
-  if (!canLeaveSessionAfterDraftPreflight()) return;
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("switching sessions")
+    || !canLeaveSessionAfterDraftPreflight()) return;
   const actionSessionId = currentSessionId();
   const actionWorkspaceGeneration = workspaceStateGeneration;
   const actionWorkspaceSaveVersion = workspaceSaveVersion;
@@ -13310,6 +13325,8 @@ function syncReplayRequestTextFromEditor(newText) {
   if (!activeTab || activeTab.type === "websocket") {
     return;
   }
+  // Input synchronization invalidates an earlier capture even after edit-and-revert.
+  if (renderedHttpReplayDraftOwner?.tab === activeTab) renderedHttpReplayDraftOwner.preservedVersionDraft = null;
   const previousText = activeTab.requestText;
   let nextText = newText;
   let parsed = null;
@@ -17725,18 +17742,43 @@ function scrollActiveReplayTabIntoView() {
   }
 }
 
-function preserveActiveHttpReplayDraftBeforeSessionChange(action) {
-  const tab = getActiveReplayTab();
+function getRenderedHttpReplayDraftOwner(tab) {
   const owner = renderedHttpReplayDraftOwner;
   // Dashboard navigation hides a real editor, but a session reload leaves it
   // cleared. Only read controls that were rendered for this exact workspace.
   if (!workspaceLoaded || !owner || owner.tab !== tab
-    || owner.sessionId !== currentSessionId() || owner.generation !== workspaceStateGeneration) return true;
+    || owner.sessionId !== currentSessionId() || owner.generation !== workspaceStateGeneration) {
+    if (owner) owner.preservedVersionDraft = null;
+    return null;
+  }
+  return owner;
+}
+
+function preserveActiveHttpReplayDraftBeforeSessionChange(action) {
+  const tab = getActiveReplayTab();
+  if (!getRenderedHttpReplayDraftOwner(tab)) return true;
   return preserveActiveHttpReplayDraftBeforeNavigation(tab, action);
+}
+
+function isPreservedHttpReplayVersionSource(tab, sourceText, editorIdentity, versionControl) {
+  const owner = getRenderedHttpReplayDraftOwner(tab);
+  const preserved = owner?.preservedVersionDraft;
+  if (!preserved) return false;
+  const version = versionControl?.value ?? normalizeReplayHttpVersionMode(tab.httpVersionMode);
+  // A capture can normalize only the model's request line. Its untouched source
+  // is not another edit, but only for the exact rendered owner and this tuple.
+  // Observed input invalidates the capture even when it later returns to A.
+  if (preserved.sourceText === sourceText && preserved.modelText === tab.requestText
+    && preserved.version === version && preserved.version === tab.httpVersionMode
+    && preserved.view === state.replayMessageViews.request && preserved.editor === editorIdentity
+    && preserved.versionControl === versionControl && !tab.requestBytes) return true;
+  owner.preservedVersionDraft = null;
+  return false;
 }
 
 function preserveActiveHttpReplayDraftBeforeNavigation(tab, action) {
   if (!tab || tab.type === "websocket" || tab.id !== state.activeReplayTabId) return true;
+  const draftOwner = getRenderedHttpReplayDraftOwner(tab);
 
   // Read every control before touching the model: normal editor synchronization
   // also refreshes the toolbar and can erase a different, still-invalid draft.
@@ -17757,6 +17799,11 @@ function preserveActiveHttpReplayDraftBeforeNavigation(tab, action) {
   const versionSelect = document.getElementById("replayHttpVersionSelect");
   const version = versionSelect?.value ?? normalizeReplayHttpVersionMode(tab.httpVersionMode);
   const versionChanged = version !== normalizeReplayHttpVersionMode(tab.httpVersionMode);
+  const editorIdentity = editor || (els.replayRequestCM ? els.replayRequestCM : els.replayRequestHighlight || els.replayRequestEditor);
+  if (isPreservedHttpReplayVersionSource(tab, visibleText, editorIdentity, versionSelect)) {
+    textChanged = false;
+    requestText = tab.requestText;
+  }
   const hexInput = hexMode && !editor && !els.replayRequestCM
     ? els.replayRequestHighlight?.querySelector?.(".hex-byte-input") : null;
 
@@ -17814,6 +17861,12 @@ function preserveActiveHttpReplayDraftBeforeNavigation(tab, action) {
     tab.responseRecord = null;
     tab.notice = "";
     scheduleWorkspaceStateSave();
+  }
+  if (draftOwner && versionChanged && typeof visibleText === "string" && visibleText !== tab.requestText) {
+    draftOwner.preservedVersionDraft = {
+      sourceText: visibleText, modelText: tab.requestText, version,
+      view: state.replayMessageViews.request, editor: editorIdentity, versionControl: versionSelect,
+    };
   }
   return true;
 }

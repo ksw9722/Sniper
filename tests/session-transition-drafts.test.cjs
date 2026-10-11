@@ -953,3 +953,374 @@ for (const operation of ['create', 'activate', 'external']) {
     assert.equal(f.requests.length, 1, 'save settlement never retries the refused transition');
   });
 }
+for (const operation of ['create', 'activate']) {
+  for (const phase of preflightPhases) for (const draft of ['partial text', 'invalid target']) {
+    test(`${operation}: ${draft} entered during ${phase} is rechecked before dispatch`, async () => {
+      const f = setupCompletedAction(), gate = holdDraftPreflight(f, phase), action = await f.start(operation);
+      assert.equal(gate.reached(), true); f.edit(draft === 'partial text' ? 'partial' : draft);
+      const before = f.retained(); gate.release(); await tick();
+      assert.equal(f.requests.length, 0, 'new DOM-only work must not reach session dispatch');
+      assert.equal(await action.pending, undefined); f.assertRetained(before);
+      if (draft === 'partial text') {
+        assert.equal(f.old.requestText, 'GET /pending-action-draft HTT'); assert.equal(f.context.workspaceSaveDirty, true);
+        assert.match(f.toasts.at(-1)[0], /unsaved.*draft/i);
+      } else {
+        assert.equal(f.old.targetPort, '443'); assert.equal(f.els.replayPortInput.value, '8x');
+        assert.match(f.toasts.at(-1)[0], /draft is still here/);
+      }
+    });
+  }
+  for (const draft of ['empty', 'valid target', 'delayed hex']) test(`${operation}: late ${draft} during cleanup is retained before dispatch`, async () => {
+    const f = setupCompletedAction(), gate = holdDraftPreflight(f, 'cleanupWsReplayTabsBeforeStateReset'), action = await f.start(operation);
+    let hex;
+    if (draft === 'delayed hex') { f.state.activeTool = 'replay'; f.context.renderToolPanels(); hex = f.pendingHex(); }
+    else if (draft === 'valid target') f.els.replayPortInput.value = '8080';
+    else f.edit('empty');
+    gate.release(); await tick(); assert.equal(f.requests.length, 0); assert.equal(await action.pending, undefined);
+    if (draft === 'empty') { assert.equal(f.old.requestText, ''); assert.equal(f.context.workspaceSaveDirty, true); }
+    if (draft === 'valid target') { assert.equal(f.old.targetPort, '8080'); assert.equal(f.context.workspaceSaveDirty, true); }
+    if (hex) { assert.equal(hex.current(), hex.input); assert.equal(hex.input.value, 'f'); }
+  });
+}
+
+
+function useOwnedDomEditor(f, kind) {
+  if (kind === 'CodeMirror') {
+    let listener;
+    const view = { dispatch: update => { listener = update.effects; } };
+    const editor = { text: f.old.requestText, getContent() { return this.text; }, setContent(text) { this.text = text; } };
+    f.els.replayRequestCM = {}; f.context.getCMView = () => editor;
+    f.context.updateCodePaneCM = (_, __, text) => { editor.text = text; };
+    f.context.CM = { EditorView: { updateListener: { of: callback => callback } },
+      StateEffect: { appendConfig: { of: callback => callback } } };
+    f.context.cmProgrammaticViews = new WeakSet();
+    vm.runInContext(source('addCMUpdateListener'), f.context);
+    f.context.addCMUpdateListener(view, f.context.syncReplayRequestTextFromEditor);
+    f.context.renderReplay();
+    return { get: () => editor.text, set: text => { editor.text = text; },
+      input: text => { editor.text = text; listener({ docChanged: true, view, state: { doc: { toString: () => text } } }); } };
+  }
+  if (kind === 'textarea') {
+    delete f.els.replayRequestHighlight; f.context.renderReplay();
+    return { get: () => f.els.replayRequestEditor.value, set: text => { f.els.replayRequestEditor.value = text; } };
+  }
+  f.els.replayRequestHighlight.listeners = {};
+  f.els.replayRequestHighlight.addEventListener = (name, callback) => { f.els.replayRequestHighlight.listeners[name] = callback; };
+  Object.assign(f.state, { _replayUndoStack: [], _replayRedoStack: [], _replayLastSnapshot: null });
+  f.context.clearTimeout = () => {};
+  for (const marker of ['  els.replayRequestHighlight?.addEventListener("input", () => {',
+    '  els.replayRequestHighlight?.addEventListener("keydown", (e) => {']) {
+    const binding = appSource.slice(appSource.indexOf(marker));
+    vm.runInContext(binding.slice(0, binding.indexOf('\n  });') + 6), f.context);
+  }
+  return { get: () => f.els.replayRequestHighlight.innerText, set: text => { f.els.replayRequestHighlight.innerText = text; },
+    input: text => { f.els.replayRequestHighlight.innerText = text; f.els.replayRequestHighlight.listeners.input(); } };
+}
+for (const kind of ['legacy', 'CodeMirror', 'textarea']) for (const version of ['HTTP/2', 'HTTP/1.0', '']) {
+  test(`${kind}: repeat session preservation leaves acknowledged ${version || 'automatic'} normalization unchanged`, async () => {
+    const f = setupCompletedAction(), editor = useOwnedDomEditor(f, kind), original = editor.get();
+    f.versionSelect.value = version;
+    assert.equal(f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts'), true);
+    const accepted = f.old.requestText; assert.notEqual(accepted, original); assert.equal(f.old.httpVersionMode, version);
+    const saving = f.context.flushWorkspaceState(); f.succeed(0, { session_id: 'session-a', revision: 11 }); await saving;
+    const saveVersion = f.context.workspaceSaveVersion, owner = f.context.renderedHttpReplayDraftOwner;
+    for (let check = 0; check < 3; check++) {
+      assert.equal(f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts'), true);
+      assert.equal(f.old.requestText, accepted); assert.equal(f.old.httpVersionMode, version);
+      assert.equal(f.context.workspaceSaveDirty, false); assert.equal(f.context.workspaceSaveVersion, saveVersion);
+      assert.equal(editor.get(), original, 'preservation must not rewrite DOM or move its caret');
+      assert.equal(f.context.renderedHttpReplayDraftOwner, owner);
+    }
+    assert.equal(f.requests.length, 1); assert.equal(f.toasts.length, 0);
+  });
+}
+for (const kind of ['legacy', 'CodeMirror']) {
+  for (const changed of ['DOM request line', 'observed edit-back']) test(`${kind}: ${changed} cannot reuse an old version-normalization capture`, async () => {
+    const f = setupCompletedAction(), editor = useOwnedDomEditor(f, kind), original = editor.get();
+    f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+    const accepted = f.old.requestText;
+    if (changed === 'observed edit-back') {
+      editor.input(accepted.replace('/old ', '/edited ')); editor.input(accepted);
+      assert.equal(f.old.requestText, accepted); assert.equal(f.versionSelect.value, 'HTTP/2');
+      editor.set(original);
+    } else editor.set(original.replace('/old ', '/genuine '));
+    const before = f.context.workspaceSaveVersion;
+    f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+    assert.equal(f.old.requestText, editor.get()); assert.equal(f.old.httpVersionMode, 'HTTP/1.1');
+    assert.ok(f.context.workspaceSaveVersion > before); assert.equal(f.context.workspaceSaveDirty, true);
+  });
+}
+
+for (const visibility of ['visible', 'dashboard-hidden']) for (const kind of ['invalid target', 'delayed hex']) {
+  test(`external: ${visibility} ${kind} stops before any preflight or reset`, async () => {
+    const f = setupCompletedAction(); f.state.activeTool = 'replay'; f.context.renderToolPanels();
+    let hex; if (kind === 'invalid target') f.invalid(); else hex = f.pendingHex();
+    if (visibility === 'dashboard-hidden') f.dashboard(); useExternalDraftTransition(f);
+    const before = f.retained(), action = await startDraftTransition(f, 'external');
+    assert.equal(await action.pending, undefined); assert.equal(f.requests.length, 0); assert.equal(f.reloads.length, 0);
+    assert.deepEqual(f.log, []); f.assertRetained(before); assert.match(f.toasts.at(-1)?.[0] || '', /draft is still here/);
+    assert.match(f.toasts.at(-1)[0], /active session changed/i);
+    if (hex) { assert.equal(hex.current(), hex.input); assert.equal(hex.input.value, 'f'); }
+  });
+}
+for (const kind of ['partial', 'empty', 'target', 'version']) test(`external: initial ${kind} DOM draft is saved under its original owner before reset`, async () => {
+  const f = setupCompletedAction(); useExternalDraftTransition(f);
+  if (kind === 'partial') f.els.replayRequestHighlight.innerText = 'GET /external-partial HTT';
+  if (kind === 'empty') f.els.replayRequestHighlight.innerText = '';
+  if (kind === 'target') f.els.replayPortInput.value = '8080';
+  if (kind === 'version') f.versionSelect.value = 'HTTP/2';
+  const action = await startDraftTransition(f, 'external'); assert.equal(f.requests[0]?.url, '/api/workspace-state');
+  const body = JSON.parse(f.requests[0].options.body);
+  assert.equal(body.session_id, 'session-a'); assert.equal(body.expected_active_session_id, null);
+  if (kind === 'partial' || kind === 'empty') assert.equal(body.replay.tabs[0].request_text, kind === 'empty' ? '' : 'GET /external-partial HTT');
+  if (kind === 'target') assert.equal(body.replay.tabs[0].target_port, '8080');
+  if (kind === 'version') { assert.equal(body.replay.tabs[0].http_version_mode, 'HTTP/2'); assert.match(body.replay.tabs[0].request_text, /^GET \/old HTTP\/2/); }
+  f.succeed(0, { session_id: 'session-a', revision: 11 }); assert.equal(await action.pending, undefined);
+  assert.equal(f.reloads.length, 1); assert.equal(f.requests.length, 1); assert.equal(f.toasts.length, 0);
+});
+for (const phase of ['flushSequenceDraftBeforeExternalSessionReload', 'flushTargetScopeDraft', 'flushMatchReplaceDraft',
+  'flushAllPendingAnnotations', 'flushWorkspaceState', 'cleanupWsReplayTabsBeforeStateReset']) {
+  for (const kind of ['partial', 'invalid target', 'delayed hex']) test(`external: ${kind} arriving during ${phase} survives its final reset boundary`, async () => {
+    const f = setupCompletedAction(); useExternalDraftTransition(f);
+    if (phase === 'flushWorkspaceState') f.context.scheduleWorkspaceStateSave();
+    const gate = holdDraftPreflight(f, phase), action = await startDraftTransition(f, 'external'); assert.equal(gate.reached(), true);
+    let hex;
+    if (kind === 'delayed hex') hex = f.pendingHex();
+    else f.edit(kind);
+    const before = f.retained(); gate.release(); await tick();
+    if (phase === 'flushWorkspaceState') {
+      assert.equal(f.requests[0]?.url, '/api/workspace-state'); f.succeed(0, { session_id: 'session-a', revision: 11 }); await tick();
+      before.baseline = f.context.workspaceSaveCommittedSnapshot;
+    }
+    assert.equal(await action.pending, undefined); assert.equal(f.reloads.length, 0); f.assertRetained(before);
+    assert.equal(f.requests.length, phase === 'flushWorkspaceState' ? 1 : 0);
+    if (kind === 'partial') { assert.equal(f.old.requestText, 'GET /pending-action-draft HTT'); assert.equal(f.context.workspaceSaveDirty, true); }
+    if (hex) { assert.equal(hex.current(), hex.input); assert.equal(hex.input.value, 'f'); }
+  });
+}
+for (const mode of ['cleared', 'unloaded', 'no tab', 'same id new generation', 'same id new object', 'different owner', 'WebSocket']) {
+  test(`external: ${mode} controls cannot be mistaken for current HTTP edits`, async () => {
+    const f = setupCompletedAction(); useExternalDraftTransition(f);
+    f.els.replayRequestHighlight.innerText = 'Stale controls'; f.els.replayPortInput.value = '8x';
+    if (mode === 'cleared') f.context.renderReplayClearedState();
+    if (mode === 'unloaded') f.context.workspaceLoaded = false;
+    if (mode === 'no tab') { f.state.replayTabs = []; f.state.activeReplayTabId = null; }
+    if (mode === 'same id new generation') f.context.workspaceStateGeneration++;
+    if (mode === 'same id new object') f.state.replayTabs = [{ ...f.old }];
+    if (mode === 'different owner') f.state.activeSession = { id: 'session-b' };
+    if (mode === 'WebSocket') { f.state.replayTabs = [{ id: f.old.id, type: 'websocket' }]; f.context.renderReplay(); }
+    const action = await startDraftTransition(f, 'external'); assert.equal(await action.pending, undefined);
+    assert.equal(f.requests.length, 0); assert.equal(f.reloads.length, mode === 'different owner' ? 0 : 1);
+    assert.equal(f.toasts.length, 0);
+  });
+}
+test('manual session reload shows new rows but retains the old owner and invalid draft', async () => {
+  const f = setupCompletedAction(); useExternalDraftTransition(f); f.invalid(); const before = f.retained();
+  const reading = f.context.loadSessions({ reloadOnActiveChange: true }); f.succeed(0, f.rows('session-b')); await reading;
+  assert.equal(f.state.sessions.find(row => row.active).id, 'session-b'); f.assertRetained(before);
+  assert.equal(f.requests.length, 1); assert.equal(f.reloads.length, 0); assert.match(f.toasts.at(-1)[0], /active session changed/i);
+});
+test('real session-changed event retains an invalid draft and explains the external change', async () => {
+  const f = setupCompletedAction(); useExternalDraftTransition(f); f.invalid(); const before = f.retained();
+  let callback, pending;
+  f.context.eventSource = { addEventListener: (_, handler) => { callback = handler; } }; f.context.eventSessionId = 'session-a';
+  const original = f.context.handleExternalSessionChanged;
+  f.context.handleExternalSessionChanged = (...args) => (pending = original(...args));
+  const marker = '  eventSource.addEventListener("session_changed", () => {', binding = appSource.slice(appSource.indexOf(marker));
+  vm.runInContext(binding.slice(0, binding.indexOf('\n  });') + 6), f.context); callback(); await pending;
+  f.assertRetained(before); assert.equal(f.requests.length, 0); assert.equal(f.reloads.length, 0);
+  assert.match(f.toasts.at(-1)[0], /active session changed.*draft is still here/i);
+});
+
+for (const mismatch of ['source line endings', 'model text', 'model version', 'chosen version', 'request view', 'editor identity', 'version control']) {
+  test(`session version capture is invalidated by ${mismatch}`, () => {
+    const f = setupCompletedAction(), editor = useOwnedDomEditor(f, 'legacy'), original = editor.get();
+    f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+    const owner = f.context.renderedHttpReplayDraftOwner, capture = owner.preservedVersionDraft;
+    assert.ok(capture); const before = f.context.workspaceSaveVersion;
+    if (mismatch === 'source line endings') editor.set(original.replace(/\r\n/g, '\n'));
+    if (mismatch === 'model text') f.old.requestText = f.old.requestText.replace('/old ', '/model ');
+    if (mismatch === 'model version') f.old.httpVersionMode = 'HTTP/1.0';
+    if (mismatch === 'chosen version') f.versionSelect.value = 'HTTP/1.0';
+    if (mismatch === 'request view') f.state.replayMessageViews.request = 'pretty';
+    if (mismatch === 'editor identity') f.els.replayRequestHighlight = { ...f.els.replayRequestHighlight, innerText: original };
+    if (mismatch === 'version control') f.document.getElementById = () => ({ value: 'HTTP/2' });
+    f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+    assert.notEqual(owner.preservedVersionDraft, capture); assert.ok(f.context.workspaceSaveVersion > before);
+    assert.equal(f.old.httpVersionMode, mismatch === 'model version' ? 'HTTP/2' : mismatch === 'chosen version' ? 'HTTP/1.0' : 'HTTP/1.1');
+  });
+}
+for (const mismatch of ['tab object', 'session', 'generation', 'workspace unloaded']) test(`stale ${mismatch} invalidates only its owner capture without reading controls`, () => {
+  const f = setupCompletedAction(), editor = useOwnedDomEditor(f, 'legacy');
+  f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  const owner = f.context.renderedHttpReplayDraftOwner, accepted = f.old.requestText, before = f.context.workspaceSaveVersion;
+  if (mismatch === 'tab object') f.state.replayTabs = [{ ...f.old }];
+  if (mismatch === 'session') f.state.activeSession = { id: 'session-b' };
+  if (mismatch === 'generation') f.context.workspaceStateGeneration++;
+  if (mismatch === 'workspace unloaded') f.context.workspaceLoaded = false;
+  editor.set('Unowned input'); f.els.replayPortInput.value = '8x';
+  assert.equal(f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts'), true);
+  assert.equal(owner.preservedVersionDraft, null); assert.equal(f.old.requestText, accepted);
+  assert.equal(f.context.getActiveReplayTab().requestText, accepted); assert.equal(f.context.workspaceSaveVersion, before);
+  assert.equal(f.toasts.length, 0);
+});
+test('re-render gives the same tab a fresh owner and no prior normalization capture', () => {
+  const f = setupCompletedAction(), editor = useOwnedDomEditor(f, 'legacy'), original = editor.get();
+  f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  const owner = f.context.renderedHttpReplayDraftOwner; f.context.renderReplay();
+  assert.notEqual(f.context.renderedHttpReplayDraftOwner, owner); editor.set(original);
+  f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  assert.equal(f.old.requestText, original); assert.equal(f.old.httpVersionMode, 'HTTP/1.1');
+});
+test('an unrelated workspace save does not invalidate the acknowledged version capture', async () => {
+  const f = setupCompletedAction(), editor = useOwnedDomEditor(f, 'legacy');
+  f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  const accepted = f.old.requestText, displayed = editor.get();
+  f.old.customLabel = 'Renamed saved tab'; f.context.scheduleWorkspaceStateSave();
+  const saving = f.context.flushWorkspaceState(); f.succeed(0, { session_id: 'session-a', revision: 11 }); await saving;
+  const before = f.context.workspaceSaveVersion; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  assert.equal(f.old.requestText, accepted); assert.equal(editor.get(), displayed); assert.equal(f.context.workspaceSaveVersion, before);
+  assert.equal(f.context.workspaceSaveDirty, false);
+});
+for (const callback of ['version change', 'legacy undo']) test(`${callback}: real callback invalidates a captured version through edit-back`, () => {
+  const f = setupCompletedAction(), editor = useOwnedDomEditor(f, 'legacy');
+  editor.input(editor.get().replace(/\r\n/g, '\n'));
+  const original = editor.get();
+  f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  const accepted = f.old.requestText, owner = f.context.renderedHttpReplayDraftOwner;
+  if (callback === 'version change') {
+    let change; f.versionSelect.addEventListener = (_, handler) => { change = handler; };
+    vm.runInContext(source('renderReplayViewContent'), f.context);
+    const marker = '  document.getElementById("replayHttpVersionSelect")?.addEventListener("change", (e) => {', binding = appSource.slice(appSource.indexOf(marker));
+    vm.runInContext(binding.slice(0, binding.indexOf('\n  });') + 6), f.context);
+    for (const version of ['HTTP/1.0', 'HTTP/2']) { f.versionSelect.value = version; change({ target: f.versionSelect }); }
+  } else {
+    f.context.saveContentEditableCaret = () => ({ start: 0, end: 0 }); f.context.restoreContentEditableCaret = () => {};
+    f.state._replayUndoStack = [accepted, accepted.replace('/old ', '/undo ')];
+    for (let edit = 0; edit < 2; edit++) f.els.replayRequestHighlight.listeners.keydown({ key: 'z', ctrlKey: true, preventDefault() {} });
+  }
+  assert.equal(f.old.requestText, accepted); assert.equal(f.versionSelect.value, 'HTTP/2'); assert.equal(owner.preservedVersionDraft, null);
+  editor.set(original); f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  assert.equal(f.old.requestText, original); assert.equal(f.old.httpVersionMode, 'HTTP/1.1');
+});
+for (const kind of ['legacy', 'CodeMirror', 'textarea']) for (const operation of ['create', 'activate']) {
+  test(`${operation}: ${kind} version normalization survives all checks and finishes its normal reload`, async () => {
+    const f = setupCompletedAction(), editor = useOwnedDomEditor(f, kind), displayed = editor.get();
+    f.versionSelect.value = 'HTTP/2'; const action = await f.start(operation);
+    assert.equal(f.requests[0]?.url, '/api/workspace-state'); const body = JSON.parse(f.requests[0].options.body);
+    assert.equal(body.replay.tabs[0].http_version_mode, 'HTTP/2');
+    f.succeed(0, { session_id: 'session-a', revision: 11 }); await tick();
+    assert.equal(f.requests[1]?.url, operation === 'create' ? '/api/sessions' : '/api/sessions/session-b/activate');
+    assert.equal(editor.get(), displayed); await f.finishReload(action, 1);
+    assert.equal(f.state.activeSession.id, 'session-b'); assert.equal(f.toasts.length, 0);
+  });
+}
+for (const kind of ['CodeMirror', 'textarea']) for (const arrival of ['initial', 'late']) test(`external: ${arrival} ${kind} draft keeps its correct save/reset boundary`, async () => {
+  const f = setupCompletedAction(), editor = useOwnedDomEditor(f, kind); useExternalDraftTransition(f);
+  const gate = arrival === 'late' ? holdDraftPreflight(f, 'cleanupWsReplayTabsBeforeStateReset') : null;
+  if (!gate) editor.set('GET /external-editor HTT');
+  const action = await startDraftTransition(f, 'external');
+  if (gate) { editor.set('GET /external-editor HTT'); gate.release(); await tick(); }
+  else {
+    assert.equal(f.requests[0]?.url, '/api/workspace-state');
+    const body = JSON.parse(f.requests[0].options.body); assert.equal(body.session_id, 'session-a'); assert.equal(body.expected_active_session_id, null);
+    assert.equal(body.replay.tabs[0].request_text, 'GET /external-editor HTT'); f.succeed(0, { session_id: 'session-a', revision: 11 });
+  }
+  assert.equal(await action.pending, undefined); assert.equal(f.reloads.length, gate ? 0 : 1);
+  if (gate) { assert.equal(f.old.requestText, 'GET /external-editor HTT'); assert.equal(f.context.workspaceSaveDirty, true); assert.equal(editor.get(), 'GET /external-editor HTT'); }
+});
+test('refused final preservation keeps every simultaneous invalid control and text draft intact', async () => {
+  const f = setupCompletedAction(), editor = useOwnedDomEditor(f, 'legacy');
+  f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  const accepted = f.old.requestText; editor.set('GET /genuine HTT'); f.els.replayPortInput.value = '8x'; f.versionSelect.value = 'invalid';
+  const before = f.context.workspaceSaveVersion;
+  assert.equal(f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts'), false);
+  assert.equal(f.old.requestText, accepted); assert.equal(f.old.httpVersionMode, 'HTTP/2'); assert.equal(f.context.workspaceSaveVersion, before);
+  assert.equal(editor.get(), 'GET /genuine HTT'); assert.equal(f.els.replayPortInput.value, '8x'); assert.equal(f.versionSelect.value, 'invalid');
+});
+
+for (const operation of ['create', 'activate']) test(`${operation}: ordinary new-tab navigation preserves a normalized draft after session preflight stops`, async () => {
+  const f = setupCompletedAction(), scope = useLateMetadataEditor(f, 'scope');
+  const original = f.old.requestText; f.versionSelect.value = 'HTTP/2';
+  const gate = holdDraftPreflight(f, 'cleanupWsReplayTabsBeforeStateReset'), action = await f.start(operation);
+  assert.equal(f.requests[0]?.url, '/api/workspace-state'); f.succeed(0, { session_id: 'session-a', revision: 11 }); await tick();
+  assert.equal(gate.reached(), true); scope.edit(true); gate.release(); assert.equal(await action.pending, undefined);
+  assert.equal(f.requests.length, 1); const accepted = f.old.requestText;
+  assert.notEqual(accepted, original); assert.equal(f.els.replayRequestHighlight.innerText, original);
+  vm.runInContext(source('openBlankReplayTab'), f.context); f.context.setActiveTool = value => { f.state.activeTool = value; };
+  f.context.openBlankReplayTab();
+  assert.notEqual(f.state.activeReplayTabId, f.old.id); assert.equal(f.state.replayTabs.includes(f.old), true);
+  assert.equal(f.old.requestText, accepted); assert.equal(f.old.httpVersionMode, 'HTTP/2');
+  assert.equal(f.state.targetScopeDirty, true); assert.equal(f.requests.length, 1);
+});
+
+for (const operation of ['create', 'activate', 'external']) test(`${operation}: a valid normalization captured by the common navigation helper also survives session checks`, async () => {
+  const f = setupCompletedAction(), original = f.old.requestText; if (operation === 'external') useExternalDraftTransition(f);
+  f.versionSelect.value = 'HTTP/2';
+  assert.equal(f.context.preserveActiveHttpReplayDraftBeforeNavigation(f.old, 'testing saved navigation'), true);
+  const accepted = f.old.requestText; assert.notEqual(accepted, original);
+  const action = await startDraftTransition(f, operation); assert.equal(f.requests[0]?.url, '/api/workspace-state');
+  assert.equal(JSON.parse(f.requests[0].options.body).replay.tabs[0].request_text, accepted);
+  f.succeed(0, { session_id: 'session-a', revision: 11 }); await tick();
+  if (operation === 'external') { assert.equal(await action.pending, undefined); assert.equal(f.reloads.length, 1); }
+  else await f.finishReload(action, 1);
+  assert.equal(f.toasts.length, 0);
+});
+for (const invalid of [false, true]) test(`ordinary navigation with a stale owner keeps its ${invalid ? 'invalid control refusal' : 'ordinary text capture'}`, () => {
+  const f = setupCompletedAction(), original = f.old.requestText;
+  f.versionSelect.value = 'HTTP/2'; f.context.preserveActiveHttpReplayDraftBeforeSessionChange('testing saved drafts');
+  const owner = f.context.renderedHttpReplayDraftOwner, replacement = { ...f.old };
+  f.state.replayTabs = [replacement]; if (invalid) f.els.replayPortInput.value = '8x';
+  assert.equal(f.context.preserveActiveHttpReplayDraftBeforeNavigation(replacement, 'switching tabs'), !invalid);
+  assert.equal(owner.preservedVersionDraft, null);
+  assert.equal(replacement.requestText, invalid ? f.old.requestText : original);
+  assert.equal(f.toasts.length, invalid ? 1 : 0);
+});
+
+async function stoppedVersionTransition(operation, kind) {
+  const f = setupCompletedAction(), editor = useOwnedDomEditor(f, kind), scope = useLateMetadataEditor(f, 'scope');
+  const original = editor.get(); f.versionSelect.value = 'HTTP/2';
+  const gate = holdDraftPreflight(f, 'cleanupWsReplayTabsBeforeStateReset'), action = await f.start(operation);
+  assert.equal(f.requests[0]?.url, '/api/workspace-state'); f.succeed(0, { session_id: 'session-a', revision: 11 }); await tick();
+  assert.equal(gate.reached(), true); scope.edit(true); gate.release(); assert.equal(await action.pending, undefined);
+  assert.equal(f.requests.length, 1); const accepted = f.old.requestText; assert.notEqual(accepted, original);
+  vm.runInContext(source('syncActiveHttpReplayDraftFromDom'), f.context);
+  return { f, editor, original, accepted };
+}
+for (const operation of ['create', 'activate']) for (const kind of ['legacy', 'CodeMirror', 'textarea']) {
+  test(`${operation}: passive ${kind} sync retains an unchanged normalized source after preflight stops`, async () => {
+    const { f, editor, original, accepted } = await stoppedVersionTransition(operation, kind);
+    const before = f.context.workspaceSaveVersion;
+    for (let check = 0; check < 3; check++) {
+      assert.equal(f.context.syncActiveHttpReplayDraftFromDom(), false);
+      assert.equal(f.old.requestText, accepted); assert.equal(f.old.httpVersionMode, 'HTTP/2');
+      assert.equal(f.context.workspaceSaveVersion, before); assert.equal(f.context.workspaceSaveDirty, false);
+      assert.equal(editor.get(), original);
+    }
+    assert.equal(f.requests.length, 1); assert.equal(f.state.targetScopeDirty, true);
+  });
+  test(`${operation}: passive ${kind} sync still captures a genuinely changed source after preflight stops`, async () => {
+    const { f, editor } = await stoppedVersionTransition(operation, kind), next = 'GET /passive-genuine HTT';
+    editor.set(next); if (kind === 'legacy') f.els.replayRequestEditor.value = next;
+    assert.equal(f.context.syncActiveHttpReplayDraftFromDom(), true);
+    assert.equal(f.old.requestText, next); assert.equal(editor.get(), next); assert.equal(f.context.workspaceSaveDirty, true);
+    assert.equal(f.context.renderedHttpReplayDraftOwner.preservedVersionDraft, null); assert.equal(f.requests.length, 1);
+  });
+}
+for (const differingReader of ['highlight', 'textarea']) test(`passive sync does not suppress a differing legacy ${differingReader}`, async () => {
+  const { f, editor, original } = await stoppedVersionTransition('create', 'legacy');
+  if (differingReader === 'highlight') editor.set('GET /visible-genuine HTT');
+  else f.els.replayRequestEditor.value = 'GET /stored-genuine HTT';
+  const visible = editor.get(), stored = f.els.replayRequestEditor.value;
+  assert.notEqual(visible, stored); assert.equal(f.context.syncActiveHttpReplayDraftFromDom(), true);
+  assert.equal(f.old.requestText, stored, 'keep the existing passive reader priority'); assert.equal(editor.get(), visible);
+  assert.equal(f.context.renderedHttpReplayDraftOwner.preservedVersionDraft, null);
+  assert.equal(f.context.workspaceSaveDirty, true); assert.equal(f.requests.length, 1);
+});
+for (const kind of ['legacy', 'CodeMirror']) test(`passive ${kind} sync cannot restore a capture after real callback edit-back`, async () => {
+  const { f, editor, original, accepted } = await stoppedVersionTransition('activate', kind);
+  editor.input(accepted.replace('/old ', '/edited ')); editor.input(accepted); editor.set(original);
+  if (kind === 'legacy') f.els.replayRequestEditor.value = original;
+  assert.equal(f.context.syncActiveHttpReplayDraftFromDom(), true);
+  assert.equal(f.old.requestText, original); assert.equal(f.old.httpVersionMode, 'HTTP/1.1'); assert.equal(f.requests.length, 1);
+});
