@@ -70,6 +70,17 @@ commands, refusal states, and activation and backup limitations.
 
 ## Preserve saved work across failures
 
+Successfully loaded UI settings files with an omitted or zero `server_revision`
+receive revision 1 in memory. Loading does not rewrite the valid file. This
+protects saved preferences from an uninitialized page's revision-0 snapshot;
+clients should fetch the current settings and preserve the returned revision
+when saving. A rejected stale write returns HTTP 200 with the existing snapshot,
+so HTTP success alone does not prove that the requested changes were applied. Older
+clients that never send the revision can now have their first write rejected
+against such a file. Existing same-client version ordering remains unchanged.
+Fresh-file creation and corrupt-file recovery retain revision 0 for that load;
+their resulting valid files receive the same protection on a later restart.
+
 Session metadata operations reconcile in-memory state with a visible registry
 replacement even if a later finalization step fails. The original error still
 matters: visibility is not proof of crash durability, and callers must not infer

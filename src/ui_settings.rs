@@ -558,7 +558,13 @@ fn load_ui_settings_snapshot(data_dir: &Path) -> Result<AppUiSettingsSnapshot> {
 
     match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice::<AppUiSettingsSnapshot>(&bytes)
-            .map(AppUiSettingsSnapshot::sanitized)
+            .map(|snapshot| {
+                let mut snapshot = snapshot.sanitized();
+                // Loaded preferences must reject revision-zero defaults from a page
+                // that has not fetched them yet, including files predating revisions.
+                snapshot.server_revision = snapshot.server_revision.max(1);
+                snapshot
+            })
             .or_else(|error| {
                 warn!(
                     ?error,
@@ -808,6 +814,318 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    fn saved_settings_fixture(metadata: serde_json::Value) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "display_settings": {
+                "theme": "paper", "size_px": 16, "ui_font": "system",
+                "mono_font": "sfmono", "render_resources": true
+            },
+            "active_tool": "replay",
+            "active_proxy_tab": "websockets-history",
+            "history_column_widths": {"host": 444},
+            "ws_column_widths": {"frame_count": 123},
+            "history_column_order": ["path", "host"],
+            "http_query": "saved query",
+            "http_method": "POST",
+            "http_sort_key": "edited",
+            "http_sort_direction": "asc",
+            "http_filter_settings": {"only_notes": true, "color_tags": ["blue"]},
+            "workbench_height": 777,
+            "workbench_pane_widths": {
+                "request_percent": 34, "response_percent": 41, "inspector_width": 390
+            },
+            "websocket_pane_width": 444,
+            "websocket_query": "saved frames",
+            "websocket_sort_key": "host",
+            "websocket_sort_direction": "asc",
+            "websocket_in_scope_only": true,
+            "websocket_live_only": true,
+            "websocket_stack_height": 345,
+            "ws_replay_left_width": 555,
+            "ws_replay_frame_detail_height": 222,
+            "browser": {"preferred": "chrome"}
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        serde_json::to_vec_pretty(&value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_legacy_snapshot_rejects_early_defaults_without_writes() {
+        for metadata in [
+            serde_json::json!({}),
+            serde_json::json!({"server_revision": 0, "client_id": "", "client_version": 0}),
+            serde_json::json!({"server_revision": 0, "client_id": "old-page", "client_version": 5}),
+        ] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let original = saved_settings_fixture(metadata);
+            std::fs::write(&path, &original).unwrap();
+            let mut expected = serde_json::from_slice::<AppUiSettingsSnapshot>(&original)
+                .unwrap()
+                .sanitized();
+            expected.server_revision = 1;
+            let expected_json = serde_json::to_value(&expected).unwrap();
+
+            // Each restart must protect the unchanged legacy file without migrating it.
+            for _ in 0..2 {
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                for client_id in ["fresh-page", ""] {
+                    let early = AppUiSettingsSnapshot {
+                        client_id: client_id.to_string(),
+                        client_version: 1,
+                        ..AppUiSettingsSnapshot::default()
+                    };
+                    let rejected = store.replace_snapshot(early).await.unwrap();
+                    assert_eq!(rejected.display_settings.theme, "paper");
+                    assert_eq!(serde_json::to_value(rejected).unwrap(), expected_json);
+                    assert_eq!(
+                        serde_json::to_value(store.snapshot().await).unwrap(),
+                        expected_json
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                assert_eq!(
+                    directory_entries(&data_dir.0),
+                    vec![super::UI_SETTINGS_FILE]
+                );
+            }
+
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            let mut fetched = store.snapshot().await;
+            fetched.client_id = "fresh-page".to_string();
+            fetched.client_version = 1;
+            fetched.http_query = "intentional edit".to_string();
+            // A whole-snapshot save still cannot change the server-owned browser.
+            fetched.browser.preferred = Some("ego".to_string());
+            let saved = store.replace_snapshot(fetched).await.unwrap();
+            expected.client_id = "fresh-page".to_string();
+            expected.client_version = 1;
+            expected.server_revision = 2;
+            expected.http_query = "intentional edit".to_string();
+            let expected_json = serde_json::to_value(expected).unwrap();
+            assert_eq!(serde_json::to_value(&saved).unwrap(), expected_json);
+            let saved_bytes = std::fs::read(&path).unwrap();
+            assert_ne!(saved_bytes, original);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&saved_bytes).unwrap(),
+                expected_json
+            );
+            drop(store);
+            let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.snapshot().await).unwrap(),
+                expected_json
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_browser_change_keeps_fetched_revision_saves_valid() {
+        for client_id in ["fresh-page", ""] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            std::fs::write(&path, saved_settings_fixture(serde_json::json!({}))).unwrap();
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            let mut fetched = store.snapshot().await;
+            assert_eq!(fetched.server_revision, 1);
+            fetched.client_id = client_id.to_string();
+            fetched.client_version = 1;
+            fetched.http_query = "intentional edit".to_string();
+
+            store
+                .set_browser_preferred(Some("ego".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(store.snapshot().await.server_revision, 1);
+            let saved = store.replace_snapshot(fetched.clone()).await.unwrap();
+            fetched.server_revision = 2;
+            fetched.browser.preferred = Some("ego".to_string());
+            let expected_json = serde_json::to_value(fetched).unwrap();
+            assert_eq!(serde_json::to_value(saved).unwrap(), expected_json);
+            drop(store);
+            let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.snapshot().await).unwrap(),
+                expected_json
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_positive_revision_and_identity_are_unchanged() {
+        for revision in [1, 7, u64::MAX] {
+            for metadata in [
+                serde_json::json!({"server_revision": revision}),
+                serde_json::json!({"server_revision": revision, "client_id": "old-page", "client_version": 5}),
+            ] {
+                let data_dir = TestDataDir::new();
+                let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+                let original = saved_settings_fixture(metadata);
+                std::fs::write(&path, &original).unwrap();
+                let expected = serde_json::from_slice::<AppUiSettingsSnapshot>(&original)
+                    .unwrap()
+                    .sanitized();
+                let expected_json = serde_json::to_value(expected).unwrap();
+                for _ in 0..2 {
+                    let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                    assert_eq!(
+                        serde_json::to_value(store.snapshot().await).unwrap(),
+                        expected_json
+                    );
+                    let rejected = store
+                        .replace_snapshot(AppUiSettingsSnapshot::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(serde_json::to_value(rejected).unwrap(), expected_json);
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                assert_eq!(
+                    directory_entries(&data_dir.0),
+                    vec![super::UI_SETTINGS_FILE]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_same_client_keeps_version_ordering() {
+        for stored_revision in [0, 7] {
+            for (incoming_version, incoming_revision, accepted) in
+                [(6, 0, true), (5, 7, false), (4, 999, false)]
+            {
+                let data_dir = TestDataDir::new();
+                let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+                let original = saved_settings_fixture(serde_json::json!({
+                    "server_revision": stored_revision, "client_id": "old-page", "client_version": 5
+                }));
+                std::fs::write(&path, &original).unwrap();
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                let mut expected = store.snapshot().await;
+                assert_eq!(expected.server_revision, stored_revision.max(1));
+                let mut incoming = expected.clone();
+                incoming.server_revision = incoming_revision;
+                incoming.client_version = incoming_version;
+                incoming.http_query = "intentional edit".to_string();
+                let saved = store.replace_snapshot(incoming).await.unwrap();
+                if accepted {
+                    expected.server_revision += 1;
+                    expected.client_version = incoming_version;
+                    expected.http_query = "intentional edit".to_string();
+                } else {
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                let expected_json = serde_json::to_value(expected).unwrap();
+                assert_eq!(serde_json::to_value(saved).unwrap(), expected_json);
+                let saved_bytes = std::fs::read(&path).unwrap();
+                drop(store);
+                let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                assert_eq!(
+                    serde_json::to_value(restarted.snapshot().await).unwrap(),
+                    expected_json
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_missing_file_starts_at_zero_until_saved_or_reloaded() {
+        assert_eq!(AppUiSettingsSnapshot::default().server_revision, 0);
+        assert_eq!(
+            AppUiSettingsSnapshot::default().sanitized().server_revision,
+            0
+        );
+        for save_before_restart in [false, true] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            assert_eq!(store.snapshot().await.server_revision, 0);
+            let mut expected = AppUiSettingsSnapshot::default();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap())
+                    .unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            if save_before_restart {
+                expected.client_id = "fresh-page".to_string();
+                expected.client_version = 1;
+                expected.display_settings.theme = "paper".to_string();
+                expected = store.replace_snapshot(expected).await.unwrap();
+                assert_eq!(expected.server_revision, 1);
+                assert_eq!(expected.display_settings.theme, "paper");
+            }
+            let original = std::fs::read(&path).unwrap();
+            drop(store);
+            let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            expected.server_revision = 1;
+            let expected_json = serde_json::to_value(expected).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.snapshot().await).unwrap(),
+                expected_json
+            );
+            let rejected = restarted
+                .replace_snapshot(AppUiSettingsSnapshot::default())
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_value(rejected).unwrap(), expected_json);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                directory_entries(&data_dir.0),
+                vec![super::UI_SETTINGS_FILE]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_invalid_metadata_still_recovers_with_zero_revision_defaults() {
+        for (field, invalid) in [
+            ("server_revision", serde_json::json!(null)),
+            ("server_revision", serde_json::json!("0")),
+            ("server_revision", serde_json::json!(-1)),
+            ("server_revision", serde_json::json!(1.5)),
+            ("server_revision", serde_json::json!(true)),
+            ("client_id", serde_json::json!(null)),
+            ("client_id", serde_json::json!(42)),
+            ("client_id", serde_json::json!([])),
+            ("client_version", serde_json::json!(null)),
+            ("client_version", serde_json::json!("0")),
+            ("client_version", serde_json::json!(-1)),
+            ("client_version", serde_json::json!(1.5)),
+            ("client_version", serde_json::json!(false)),
+        ] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let mut metadata = serde_json::json!({});
+            metadata[field] = invalid;
+            let original = saved_settings_fixture(metadata);
+            assert!(serde_json::from_slice::<AppUiSettingsSnapshot>(&original).is_err());
+            std::fs::write(&path, &original).unwrap();
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            let defaults = serde_json::to_value(AppUiSettingsSnapshot::default()).unwrap();
+            assert_eq!(
+                serde_json::to_value(store.snapshot().await).unwrap(),
+                defaults
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap())
+                    .unwrap(),
+                defaults
+            );
+            let names = directory_entries(&data_dir.0);
+            assert_eq!(names.len(), 2);
+            let backup = names
+                .iter()
+                .find(|name| name.starts_with(".ui-settings.corrupt-"))
+                .unwrap();
+            assert_eq!(std::fs::read(data_dir.0.join(backup)).unwrap(), original);
+        }
     }
 
     #[test]

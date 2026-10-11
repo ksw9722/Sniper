@@ -7913,6 +7913,7 @@ mod tests {
     use axum::{
         extract::{Path, Query, State},
         http::{HeaderMap, HeaderValue, Request, StatusCode, Uri},
+        response::IntoResponse,
         Json,
     };
     use chrono::Utc;
@@ -8110,6 +8111,83 @@ mod tests {
             max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4())),
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_handlers_preserve_loaded_zero_revision_baselines() {
+        for explicit_zero in [false, true] {
+            let config = test_app_config("sniper-ui-settings-loaded-baseline");
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            let path = config.data_dir.join("ui-settings.json");
+            let mut legacy = serde_json::json!({
+                "display_settings": { "theme": "paper", "size_px": 16 },
+                "http_query": "saved query", "workbench_height": 777,
+                "http_filter_settings": { "only_notes": true },
+                "browser": { "preferred": "chrome" }
+            });
+            if explicit_zero {
+                legacy["server_revision"] = serde_json::json!(0);
+            }
+            let original = serde_json::to_vec_pretty(&legacy).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let state = Arc::new(AppState::new(config.clone()).unwrap());
+            let response = super::get_ui_settings(State(state.clone()))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let baseline: serde_json::Value = response_json(response).await;
+            assert_eq!(baseline["server_revision"], 1);
+            assert_eq!(baseline["display_settings"]["theme"], "paper");
+            assert_eq!(baseline["http_query"], "saved query");
+            assert_eq!(baseline["http_filter_settings"]["only_notes"], true);
+            assert_eq!(baseline["workbench_height"], 777);
+            assert_eq!(baseline["browser"]["preferred"], "chrome");
+            assert!(baseline.get("client_id").is_none());
+            assert!(baseline.get("client_version").is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            // Both an uninitialized current page and a revision-unaware anonymous
+            // client must receive the saved winner rather than overwrite it.
+            for client_id in ["fresh-page", ""] {
+                let incoming = super::AppUiSettingsSnapshot {
+                    client_id: client_id.to_string(),
+                    client_version: 1,
+                    ..Default::default()
+                };
+                let response =
+                    super::update_ui_settings(State(state.clone()), Json(incoming)).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let winner: serde_json::Value = response_json(response).await;
+                assert_eq!(winner, baseline);
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+
+            let mut edit = baseline.clone();
+            edit["client_id"] = serde_json::json!("loaded-page");
+            edit["client_version"] = serde_json::json!(1);
+            edit["display_settings"]["size_px"] = serde_json::json!(18);
+            let response = super::update_ui_settings(
+                State(state.clone()),
+                Json(serde_json::from_value(edit.clone()).unwrap()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let saved: serde_json::Value = response_json(response).await;
+            edit["server_revision"] = serde_json::json!(2);
+            assert_eq!(saved, edit);
+            drop(state);
+
+            let restarted = Arc::new(AppState::new(config.clone()).unwrap());
+            let restored: serde_json::Value = response_json(
+                super::get_ui_settings(State(restarted.clone()))
+                    .await
+                    .into_response(),
+            )
+            .await;
+            assert_eq!(restored, saved);
+            drop(restarted);
+            std::fs::remove_dir_all(config.data_dir).unwrap();
         }
     }
 
