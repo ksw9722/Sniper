@@ -791,6 +791,28 @@ mod tests {
     }
 
     #[test]
+    fn profile_whitespace_recognizer_preserves_non_horizontal_padding() {
+        let directory = Path::new("/Applications/Sniper '\u{00a0}\u{2002}\u{3000}'.app");
+        for line in unowned_whitespace_lines(directory) {
+            assert!(!is_managed_path_line(&line), "Incorrectly owned: {line:?}");
+        }
+        for line in managed_path_line_variants(directory) {
+            for ending in ["", "\n", "\r\n"] {
+                assert!(is_managed_path_line(&format!(" \t{line}\t {ending}")));
+            }
+            let terminal_cr = format!("{line}\r");
+            let replacement = managed_path_line(Path::new("/new/Sniper.app")).unwrap();
+            assert_eq!(
+                upsert_managed_path_line(&terminal_cr, &replacement)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn profile_whitespace_status_rejects_unowned_padding() {
         let root = TempRoot::new();
         let directory = root.0.join("bundle");
@@ -816,6 +838,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn profile_whitespace_install_preserves_unowned_padding() {
         let root = TempRoot::new();
         let directory = root.0.join("bundle");
@@ -867,6 +890,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn profile_whitespace_accepts_ascii_padding_and_physical_line_endings() {
         let root = TempRoot::new();
         let directory = root.0.join("Sniper 'quoted'\u{00a0}\u{2002}\u{3000}.app");
@@ -907,6 +931,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn profile_whitespace_terminal_cr_append_is_refused_without_mutation() {
         let root = TempRoot::new();
         let current = root.0.join("current bundle");
@@ -939,6 +964,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn profile_whitespace_terminal_cr_append_refusal_is_profile_local() {
         let root = TempRoot::new();
         let directory = root.0.join("bundle");
