@@ -4207,6 +4207,13 @@ async function flushBeforeNativeClose() {
   if (uiSettingsDirty || uiSettingsInFlight) {
     await persistUiSettings();
   }
+  // A live editor may still own text that its debounce has not queued yet.
+  // Inspect it without interrupting composition or forcing another save.
+  for (const input of document.querySelectorAll("input.note-inline-input")) {
+    if (input.hasPendingNoteEdit?.()) {
+      throw new Error("Finish or cancel the note edit before closing again.");
+    }
+  }
   // A note can be queued after the first drain while a later save is pending.
   // Keep the window and that edit alive; the next close can retry the drain.
   if (state._pendingAnnotations?.size || state._annotationInFlight?.size) {
@@ -25498,6 +25505,8 @@ async function beginNoteEdit(cell, transactionId) {
   // Then compare against each queued save, so reverting after autosave still
   // writes the changed value (including clearing the field back to empty).
   let lastSaved = input.value.trim();
+  input.hasPendingNoteEdit = () => !settled && (composing || compositionFinishing
+    || truncateUtf8(input.value, MAX_ANNOTATION_NOTE_BYTES).trim() !== lastSaved);
   const noteEdit = { cell, sessionId, closed: false, removed: null };
   inheritPendingHistoryNoteEdit(transactionId, noteEdit);
   const save = (value) => {
