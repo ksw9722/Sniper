@@ -26,8 +26,9 @@ impl Fixture {
         Self { root, listener }
     }
 
-    fn cli(&self, args: &[&str], exit_code: i32) -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
+        command
             .args([
                 "--output",
                 "compact",
@@ -39,11 +40,19 @@ impl Fixture {
             .env("USERPROFILE", self.root.join("home"))
             .env("CODEX_HOME", self.root.join("codex-home"))
             .env("CLAUDE_HOME", self.root.join("claude-home"))
-            .env("SNIPER_DATA_DIR", self.root.join("data"))
-            .output()
-            .unwrap();
+            .env("SNIPER_DATA_DIR", self.root.join("data"));
+        command
+    }
+
+    fn cli(&self, args: &[&str], exit_code: i32) -> Value {
+        let output = self.command(args).output().unwrap();
         assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
+        self.assert_local_only();
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn assert_local_only(&self) {
         assert_eq!(
             self.listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,
@@ -51,7 +60,6 @@ impl Fixture {
         );
         assert!(!self.root.join("data").exists());
         assert!(!self.root.join("home").exists());
-        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     fn call(&self, operation: &str, input: &Value, flag: Option<&str>, exit_code: i32) -> Value {
@@ -537,6 +545,175 @@ fn stage_lifecycle_writes_only_candidate_and_receipt_and_never_activates() {
     assert_eq!(
         fs::read(&enrollment.receipt_path).unwrap(),
         original_receipt
+    );
+}
+
+#[cfg(unix)]
+fn assert_completed_skill_writes_survive_output_loss(
+    stdout: impl Fn() -> std::process::Stdio,
+    exit_code: i32,
+) {
+    for staging in [false, true] {
+        let f = Fixture::new();
+        let root = f.root_for("codex");
+        let old = "Synthetic earlier bundle for output-loss fixture.\n";
+        let contents = if staging {
+            old
+        } else {
+            skills::CODEX_SKILL_TEMPLATE
+        };
+        let active = f.put("codex", contents);
+        let active_modified = fs::metadata(&active).unwrap().modified().unwrap();
+        let receipt = active
+            .parent()
+            .unwrap()
+            .join(skill_managed::ENROLLMENT_FILE);
+        let baseline = staging.then(|| {
+            skill_managed::enroll_skill("codex", &root, old, "0.0.0").unwrap();
+            (
+                fs::read(&receipt).unwrap(),
+                fs::metadata(&receipt).unwrap().modified().unwrap(),
+            )
+        });
+        let candidate_dir = f.root.join("candidate");
+        let mut input = f.input();
+        let operation = if staging {
+            "skills.stage_update"
+        } else {
+            "skills.enroll"
+        };
+        if staging {
+            input["staging_dir"] = json!(candidate_dir);
+        }
+        let encoded = input.to_string();
+        // Cover raw direct output and the call envelope without duplicating the matrix.
+        let mut command = if staging {
+            f.command(&["call", operation, "--input", &encoded, "--yes"])
+        } else {
+            f.command(&[
+                "skills",
+                "enroll",
+                "--codex",
+                "--codex-dir",
+                root.to_str().unwrap(),
+                "--yes",
+            ])
+        };
+        let output = command.stdout(stdout()).output().unwrap();
+        assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        if exit_code == 0 {
+            assert!(output.stderr.is_empty(), "{output:?}");
+        } else {
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                error.contains("failed to write JSON error output"),
+                "{error}"
+            );
+            assert!(
+                error.contains("original error: failed to write stdout"),
+                "{error}"
+            );
+        }
+        f.assert_local_only();
+        let preview = f.preview();
+        let row = &preview["entries"][0];
+        assert_eq!(
+            row["state"],
+            if staging {
+                "update_available"
+            } else {
+                "current"
+            }
+        );
+        assert_eq!(row["stage_eligible"], staging);
+        let status = f.call("skills.status", &f.input(), None, 0);
+        assert_eq!(
+            status["data"]["entries"][0]["status"],
+            if staging {
+                "modified_or_outdated"
+            } else {
+                "current"
+            }
+        );
+        let enrollment: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(enrollment["enrolled_sha256"], row["installed_sha256"]);
+        assert_eq!(enrollment["allows_automatic_updates"], false);
+        let mut paths = vec![active.clone(), receipt.clone()];
+        if let Some((bytes, modified)) = baseline {
+            assert_eq!(fs::read(&receipt).unwrap(), bytes);
+            assert_eq!(
+                fs::metadata(&receipt).unwrap().modified().unwrap(),
+                modified
+            );
+            let candidate = candidate_dir.join("SKILL.md");
+            let staged_receipt = candidate_dir.join(skill_managed::STAGED_RECEIPT_FILE);
+            assert_eq!(
+                fs::read_to_string(&candidate).unwrap(),
+                skills::CODEX_SKILL_TEMPLATE
+            );
+            let staged: Value =
+                serde_json::from_slice(&fs::read(&staged_receipt).unwrap()).unwrap();
+            assert_eq!(staged["activated"], false);
+            assert_eq!(staged["allows_automatic_updates"], false);
+            assert_eq!(staged["installed_sha256"], row["installed_sha256"]);
+            assert_eq!(staged["bundled_sha256"], row["bundled_sha256"]);
+            assert_eq!(fs::read_dir(&candidate_dir).unwrap().count(), 2);
+            paths.extend([candidate, staged_receipt]);
+        }
+        let snapshots: Vec<_> = paths
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                let modified = fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, modified)
+            })
+            .collect();
+        let retry = f.call(operation, &input, Some("--yes"), 5);
+        assert_eq!(retry["error"]["code"], "MANAGED_SKILL_ERROR");
+        assert_eq!(retry["error"]["details"]["reason"], "already_exists");
+        for (path, bytes, modified) in snapshots {
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        }
+        assert_eq!(fs::read_to_string(&active).unwrap(), contents);
+        assert_eq!(
+            fs::metadata(&active).unwrap().modified().unwrap(),
+            active_modified
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn completed_skill_writes_survive_stdout_failure() {
+    let sink = match fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(sink) => sink,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            eprintln!("Skipping stdout failure fixture: /dev/full unavailable: {error}");
+            return;
+        }
+        Err(error) => panic!("Could not open /dev/full fixture: {error}"),
+    };
+    assert_completed_skill_writes_survive_output_loss(|| sink.try_clone().unwrap().into(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_skill_writes_survive_closed_stdout_consumer() {
+    assert_completed_skill_writes_survive_output_loss(
+        || {
+            let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            // Closing before spawn guarantees BrokenPipe without a scheduling race.
+            drop(reader);
+            std::os::fd::OwnedFd::from(writer).into()
+        },
+        0,
     );
 }
 

@@ -153,6 +153,13 @@ leave a valid visible receipt that preview recognizes as a baseline even when
 the command reports a write or sync error. Preserve existing receipts and staged
 files; do not overwrite them or reuse a staging path to force a retry.
 
+Local writes happen before the JSON result is printed. An output-delivery failure
+does not prove that no files were written: stdout errors can exit 1 after the local
+write completed, while this CLI exits 0 on `BrokenPipe` when an output consumer
+closes. Neither behavior automatically replaces the active skill. If the result
+is lost, inspect `skills status`, `skills update-preview`, and the existing
+receipt/candidate files before deciding whether to retry; preserve those files.
+
 The receipt and version fields describe the recorded baseline; differing version
 strings alone do not prove an upgrade or downgrade. Candidate eligibility is based
 on byte hashes.
