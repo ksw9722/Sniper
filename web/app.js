@@ -11581,11 +11581,13 @@ async function copyTextToClipboard(text) {
   textarea.style.opacity = "0";
   textarea.style.pointerEvents = "none";
   document.body.appendChild(textarea);
-  textarea.select();
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  if (!copied) {
-    throw new Error("Clipboard copy failed");
+  try {
+    textarea.select();
+    if (!document.execCommand("copy")) {
+      throw new Error("Clipboard copy failed");
+    }
+  } finally {
+    textarea.remove();
   }
 }
 
