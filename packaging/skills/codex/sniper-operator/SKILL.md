@@ -77,6 +77,8 @@ These operations manage local saved data. Start with `session list` and use the 
 
 `session switch --id <session-uuid>` respects busy-session checks. `session delete --id <session-uuid>` refuses to delete the active session; deliberately switch to another session first. Do not bypass live-capture, proxy-work, or pending-persistence safeguards. Deleting a session removes its saved data.
 
+Session create, rename, switch, and delete send one mutation request without following redirects or retrying it. Rename and switch reject a returned UUID that differs from the requested UUID. A mismatch, lost response, or invalid acknowledgement leaves the outcome uncertain: inspect `session list` and current state before deliberately issuing another write. These commands have no `saved.v1` mutation receipts.
+
 For saved HTTP records:
 
 - Single or multiple records: `capture http delete --session-id <session-uuid> --id <record-uuid>`; repeat `--id` or comma-separate UUIDs. In `call` JSON, use the `ids` array. Missing IDs, including IDs belonging to another session, reject the entire selection

@@ -6579,7 +6579,16 @@ fn proxy_chain_output(runtime: &Value) -> Value {
     chain
 }
 
-async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
+async fn handle_session(mut api: ApiClient, command: SessionCommand) -> Result<()> {
+    if matches!(
+        &command,
+        SessionCommand::Create(_)
+            | SessionCommand::Switch(_)
+            | SessionCommand::Delete(_)
+            | SessionCommand::Rename(_)
+    ) {
+        api.client = saved_configuration_write_client()?;
+    }
     match command {
         SessionCommand::List => {
             let sessions: Vec<SessionSummary> = api.get_json("/api/sessions").await?;
@@ -6595,6 +6604,7 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
             let session: SessionSummary = api
                 .post_json(&format!("/api/sessions/{}/activate", args.id), &json!({}))
                 .await?;
+            validate_session_metadata_response_id(&session, args.id)?;
             print_json(&session)
         }
         SessionCommand::Delete(args) => {
@@ -6613,6 +6623,7 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
                     Some(json!({"name": args.name})),
                 )
                 .await?;
+            validate_session_metadata_response_id(&session, args.id)?;
             print_json(&session)
         }
         SessionCommand::Reveal(args) => {
@@ -6622,6 +6633,16 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
             print_json(&result)
         }
     }
+}
+
+fn validate_session_metadata_response_id(
+    session: &SessionSummary,
+    requested_id: Uuid,
+) -> Result<()> {
+    if session.id != requested_id {
+        bail!("session metadata response did not match the requested session; mutation outcome is unknown; inspect current state before retrying");
+    }
+    Ok(())
 }
 
 async fn active_session_id(api: &ApiClient) -> Result<Option<Uuid>> {
