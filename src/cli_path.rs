@@ -268,9 +268,10 @@ fn inspect_macos(
     for target in targets {
         let contents =
             load_shell_rc_contents(target).map_err(|e| format!("{}: {e}", target.display()))?;
-        registered &= contents
-            .lines()
-            .any(|line| line.trim() == expected || line.trim() == legacy);
+        registered &= contents.split_inclusive('\n').any(|line| {
+            let line = normalize_managed_path_line(line);
+            line == expected || line == legacy
+        });
     }
     Ok((registered, None))
 }
@@ -297,7 +298,7 @@ fn install_macos(
     for rc_path in targets {
         let update = (|| {
             let contents = load_shell_rc_contents(rc_path)?;
-            let Some(updated) = upsert_managed_path_line(&contents, &export_line) else {
+            let Some(updated) = upsert_managed_path_line(&contents, &export_line)? else {
                 return Ok(false);
             };
             // Do not knowingly overwrite an edit made while the setup was preparing.
@@ -520,8 +521,19 @@ fn decode_shell_single_quote(value: &str) -> Option<String> {
 }
 
 #[cfg(any(not(windows), test))]
+fn normalize_managed_path_line(line: &str) -> &str {
+    // Only horizontal ASCII padding is ignored for ownership. A bare CR,
+    // vertical whitespace, and Unicode whitespace remain meaningful bytes.
+    let line = line
+        .strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(line);
+    line.trim_matches([' ', '\t'])
+}
+
+#[cfg(any(not(windows), test))]
 fn is_managed_path_line(line: &str) -> bool {
-    let line = line.trim();
+    let line = normalize_managed_path_line(line);
     if let Some(quoted) = line
         .strip_prefix("export PATH=")
         .and_then(|s| s.strip_suffix(":$PATH # Added by Sniper.app"))
@@ -542,7 +554,10 @@ fn is_managed_path_line(line: &str) -> bool {
 }
 
 #[cfg(any(not(windows), test))]
-pub(crate) fn upsert_managed_path_line(contents: &str, export_line: &str) -> Option<String> {
+pub(crate) fn upsert_managed_path_line(
+    contents: &str,
+    export_line: &str,
+) -> std::io::Result<Option<String>> {
     let mut changed = false;
     let mut found_managed = false;
     let mut updated = String::new();
@@ -553,7 +568,7 @@ pub(crate) fn upsert_managed_path_line(contents: &str, export_line: &str) -> Opt
                 continue;
             }
             found_managed = true;
-            changed |= line.trim() != export_line;
+            changed |= normalize_managed_path_line(line) != export_line;
             updated.push_str(export_line);
             updated.push('\n');
         } else {
@@ -562,6 +577,14 @@ pub(crate) fn upsert_managed_path_line(contents: &str, export_line: &str) -> Opt
         }
     }
     if !found_managed {
+        // Appending LF would turn a previously unowned terminal CR into CRLF,
+        // allowing a later update to claim and replace that original line.
+        if updated.ends_with('\r') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "The profile was left unchanged because its final line ends with a lone carriage return. Review that line manually before retrying PATH setup.",
+            ));
+        }
         if !updated.is_empty() {
             if !updated.ends_with('\n') {
                 updated.push('\n');
@@ -572,7 +595,7 @@ pub(crate) fn upsert_managed_path_line(contents: &str, export_line: &str) -> Opt
         updated.push('\n');
         changed = true;
     }
-    changed.then_some(updated)
+    Ok(changed.then_some(updated))
 }
 
 #[cfg(any(not(windows), test))]
@@ -735,9 +758,252 @@ mod tests {
     fn unrelated_marker_comments_and_modified_commands_are_preserved() {
         let line = managed_path_line(Path::new("/Applications/Sniper.app/Contents/MacOS")).unwrap();
         let original = "# Added by Sniper.app is just a note\nexport PATH='x'; echo example # Added by Sniper.app\n";
-        let updated = upsert_managed_path_line(original, &line).unwrap();
+        let updated = upsert_managed_path_line(original, &line).unwrap().unwrap();
         assert!(updated.starts_with(original));
-        assert!(upsert_managed_path_line(&updated, &line).is_none());
+        assert!(upsert_managed_path_line(&updated, &line).unwrap().is_none());
+    }
+
+    fn managed_path_line_variants(directory: &Path) -> [String; 2] {
+        [
+            managed_path_line(directory).unwrap(),
+            format!(
+                "export PATH={}:$PATH # Added by Sniper.app",
+                shell_single_quote(directory.to_str().unwrap())
+            ),
+        ]
+    }
+
+    fn unowned_whitespace_lines(directory: &Path) -> Vec<String> {
+        let mut lines = Vec::new();
+        for line in managed_path_line_variants(directory) {
+            for padding in ['\u{00a0}', '\u{2002}', '\u{3000}', '\u{000b}', '\u{000c}'] {
+                lines.push(format!("{padding}{line}\n"));
+                lines.push(format!("{line}{padding}\r\n"));
+            }
+            lines.extend([
+                format!("\r{line}\n"),
+                format!("{line}\r"),
+                format!("{line}\r \n"),
+                format!("{line}\r\r\n"),
+            ]);
+        }
+        lines
+    }
+
+    #[test]
+    fn profile_whitespace_status_rejects_unowned_padding() {
+        let root = TempRoot::new();
+        let directory = root.0.join("bundle");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("sniper-cli"),
+            "inert fixture, never executed",
+        )
+        .unwrap();
+        let target = root.0.join(".zshrc");
+        let mut failures = Vec::new();
+        for original in unowned_whitespace_lines(&directory) {
+            std::fs::write(&target, &original).unwrap();
+            let (registered, conflict) =
+                inspect_macos(&directory, &[target.clone()], vec![]).unwrap();
+            assert!(conflict.is_none());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+            if registered || is_managed_path_line(&original) {
+                failures.push(format!("{original:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "Incorrectly owned: {failures:#?}");
+    }
+
+    #[test]
+    fn profile_whitespace_install_preserves_unowned_padding() {
+        let root = TempRoot::new();
+        let directory = root.0.join("bundle");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("sniper-cli"),
+            "inert fixture, never executed",
+        )
+        .unwrap();
+        let target = root.0.join(".zshrc");
+        let expected_line = managed_path_line(&directory).unwrap();
+        let mut failures = Vec::new();
+        for original in unowned_whitespace_lines(&root.0.join("old bundle"))
+            .into_iter()
+            .filter(|line| !line.ends_with('\r'))
+        {
+            std::fs::write(&target, &original).unwrap();
+            let separator = if original.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            };
+            let expected = format!("{original}{separator}{expected_line}\n");
+            let updated = upsert_managed_path_line(&original, &expected_line)
+                .unwrap()
+                .unwrap();
+            let installed = install_macos(&directory, &[target.clone()], vec![]).unwrap();
+            assert_eq!(installed.updated.len(), 1);
+            assert!(installed.warnings.is_empty());
+            let after = std::fs::read_to_string(&target).unwrap();
+            if updated != expected || after != expected {
+                failures.push(format!("{original:?}"));
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    inspect_macos(&directory, &[target.clone()], vec![]).unwrap(),
+                    (true, None)
+                );
+                let repeated = install_macos(&directory, &[target.clone()], vec![]).unwrap();
+                assert!(repeated.updated.is_empty());
+                assert!(repeated.warnings.is_empty());
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), after);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Rewritten unowned lines: {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn profile_whitespace_accepts_ascii_padding_and_physical_line_endings() {
+        let root = TempRoot::new();
+        let directory = root.0.join("Sniper 'quoted'\u{00a0}\u{2002}\u{3000}.app");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("sniper-cli"),
+            "inert fixture, never executed",
+        )
+        .unwrap();
+        let target = root.0.join(".zshrc");
+        for line in managed_path_line_variants(&directory) {
+            for (prefix, suffix) in [
+                ("", ""),
+                ("", "\n"),
+                ("", "\r\n"),
+                (" \t", "\t "),
+                (" \t", "\t \n"),
+                (" \t", "\t \r\n"),
+            ] {
+                let original = format!("{prefix}{line}{suffix}");
+                assert!(is_managed_path_line(&original));
+                assert!(upsert_managed_path_line(&original, &line)
+                    .unwrap()
+                    .is_none());
+                std::fs::write(&target, &original).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        inspect_macos(&directory, &[target.clone()], vec![]).unwrap(),
+                        (true, None)
+                    );
+                    let result = install_macos(&directory, &[target.clone()], vec![]).unwrap();
+                    assert!(result.updated.is_empty());
+                    assert!(result.warnings.is_empty());
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn profile_whitespace_terminal_cr_append_is_refused_without_mutation() {
+        let root = TempRoot::new();
+        let current = root.0.join("current bundle");
+        let next = root.0.join("next bundle");
+        for directory in [&current, &next] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("sniper-cli"), "inert fixture").unwrap();
+        }
+        let target = root.0.join(".zshrc");
+        let mut originals: Vec<_> = managed_path_line_variants(&root.0.join("old bundle"))
+            .into_iter()
+            .map(|line| format!("{line}\r"))
+            .collect();
+        originals.push("# unrelated terminal CR\r".to_string());
+        for original in originals {
+            std::fs::write(&target, &original).unwrap();
+            for directory in [&current, &current, &next] {
+                assert_eq!(
+                    inspect_macos(directory, &[target.clone()], vec![]).unwrap(),
+                    (false, None)
+                );
+                let line = managed_path_line(directory).unwrap();
+                let error = upsert_managed_path_line(&original, &line).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                let error = install_macos(directory, &[target.clone()], vec![]).unwrap_err();
+                assert!(error.contains("lone carriage return"));
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn profile_whitespace_terminal_cr_append_refusal_is_profile_local() {
+        let root = TempRoot::new();
+        let directory = root.0.join("bundle");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("sniper-cli"), "inert fixture").unwrap();
+        let supported = root.0.join(".zshrc");
+        let refused = root.0.join(".bashrc");
+        let original = "# unrelated terminal CR\r";
+        std::fs::write(&refused, original).unwrap();
+        let targets = [supported.clone(), refused.clone()];
+        let installed = install_macos(&directory, &targets, vec![]).unwrap();
+        assert_eq!(installed.updated, [supported.display().to_string()]);
+        assert_eq!(installed.warnings.len(), 1);
+        assert!(installed.warnings[0].contains("lone carriage return"));
+        assert_eq!(std::fs::read_to_string(&refused).unwrap(), original);
+        let supported_contents = std::fs::read_to_string(&supported).unwrap();
+        let repeated = install_macos(&directory, &targets, vec![]).unwrap();
+        assert!(repeated.updated.is_empty());
+        assert_eq!(repeated.unchanged, [supported.display().to_string()]);
+        assert_eq!(repeated.warnings.len(), 1);
+        assert_eq!(std::fs::read_to_string(&refused).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(&supported).unwrap(),
+            supported_contents
+        );
+    }
+
+    #[test]
+    fn profile_whitespace_terminal_cr_does_not_block_owned_line_updates() {
+        let current = managed_path_line(Path::new("/current/Sniper.app")).unwrap();
+        let tail = "# unrelated terminal CR\r";
+        let unchanged = format!("{current}\n{tail}");
+        assert!(upsert_managed_path_line(&unchanged, &current)
+            .unwrap()
+            .is_none());
+        for old in managed_path_line_variants(Path::new("/old/Sniper.app")) {
+            let original = format!("{old}\n{tail}");
+            let updated = upsert_managed_path_line(&original, &current)
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated, unchanged);
+            assert!(upsert_managed_path_line(&updated, &current)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn profile_whitespace_mixed_forms_only_replace_owned_lines() {
+        let [old_canonical, old_legacy] =
+            managed_path_line_variants(Path::new("/old/Sniper '\u{00a0}\u{2002}\u{3000}'.app"));
+        let line =
+            managed_path_line(Path::new("/new/Sniper '\u{00a0}\u{2002}\u{3000}'.app")).unwrap();
+        let unowned = format!("\u{00a0}{old_canonical}\r\n\u{2002}{old_legacy}\n");
+        let original = format!(
+            "# keep Unicode\u{3000}comment\r\n{unowned} \t{old_canonical}\t \r\n# middle\r\n\t{old_legacy} \n# no final newline\u{00a0}"
+        );
+        let updated = upsert_managed_path_line(&original, &line).unwrap().unwrap();
+        assert_eq!(
+            updated,
+            format!(
+                "# keep Unicode\u{3000}comment\r\n{unowned}{line}\n# middle\r\n# no final newline\u{00a0}"
+            )
+        );
+        assert!(upsert_managed_path_line(&updated, &line).unwrap().is_none());
     }
 
     #[test]
@@ -825,6 +1091,7 @@ mod tests {
             "export PATH='/old/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app\n",
             "export PATH='/new/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app",
         )
+        .unwrap()
         .unwrap();
         assert!(updated.contains("/new/Sniper.app"));
         assert!(!updated.contains("/old/Sniper.app"));
@@ -836,6 +1103,7 @@ mod tests {
             "before\nexport PATH='/old/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app\nmiddle\nexport PATH='/older/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app\nafter\n",
             "export PATH='/new/Sniper.app/Contents/MacOS':$PATH # Added by Sniper.app",
         )
+        .unwrap()
         .unwrap();
 
         assert_eq!(updated.matches("# Added by Sniper.app").count(), 1);
