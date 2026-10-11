@@ -876,6 +876,22 @@ mod saved_http_tab_tests {
         serde_json::to_value(snapshot).unwrap()
     }
 
+    const COMPLETENESS_FIELDS: [&str; 4] = [
+        "response_record_complete",
+        "history_entries_complete",
+        "ws_setup_queue_complete",
+        "ws_frames_complete",
+    ];
+
+    fn completeness_flags(tab: &ReplayTabState) -> [Option<bool>; 4] {
+        [
+            tab.response_record_complete,
+            tab.history_entries_complete,
+            tab.ws_setup_queue_complete,
+            tab.ws_frames_complete,
+        ]
+    }
+
     #[test]
     fn saved_http_close_uses_stable_visual_order_and_retains_monotonic_sequence() {
         let current = fixture();
@@ -962,36 +978,160 @@ mod saved_http_tab_tests {
     }
 
     #[test]
-    fn saved_label_transform_changes_only_label_and_preserves_completeness_flags() {
+    fn saved_metadata_transforms_preserve_durable_state_and_all_completeness_combinations() {
+        let mut source = value(&fixture());
+        let tab = &mut source["replay"]["tabs"][1];
+        tab["base_request"] = json!({
+            "scheme":"https", "host":"example.com", "method":"GET", "path":"/saved",
+            "headers":[{"name":"X-Synthetic", "value":"exact whitespace  "}]
+        });
+        tab["response_record"] = json!({
+            "id":"22222222-2222-4222-8222-222222222222", "started_at":"2026-01-01T00:00:00Z",
+            "method":"GET", "scheme":"https", "host":"example.com", "path":"/saved",
+            "status":204, "request":{}, "response":{"body_preview":"saved response"},
+            "user_note":"保存", "annotation_revision":4
+        });
+        tab["history_entries"][0]["request"] = tab["base_request"].clone();
+        tab["history_entries"][0]["response_record"] = tab["response_record"].clone();
+        tab["ws_editor_text"] = json!("AAEC");
+        tab["ws_editor_body_encoded"] = json!(true);
+        tab["ws_setup_queue"] = json!([{
+            "kind":"binary", "body":"AAEC", "bodyEncoded":true,
+            "extra_saved_metadata":{"label":"retained"}
+        }]);
+        tab["ws_frames"] = json!([{
+            "index":7, "captured_at":"2026-01-01T00:00:00Z", "direction":"server_to_client",
+            "kind":"binary", "body":"", "body_encoding":"base64", "body_size":8,
+            "preview_truncated":true
+        }]);
+        tab["ws_frames_truncated"] = json!(true);
+        tab["ws_selected_frame_index"] = json!(7);
+        tab["ws_frame_window_start"] = json!(7);
+        source["replay"]["tabs"][0]["history_entries_complete"] = json!(false);
+
         for kind in ["", "http", "websocket"] {
-            let mut current = fixture();
-            let tab = &mut current.replay.tabs[1];
-            tab.tab_type = kind.into();
-            tab.ws_editor_text = "AAEC".into();
-            tab.ws_editor_body_encoded = true;
-            tab.ws_setup_queue = vec![json!({"type":"binary","body":"AAEC"})];
-            tab.ws_setup_queue_complete = Some(false);
-            tab.ws_frames_complete = Some(false);
-            tab.ws_frames_truncated = true;
-            tab.response_record_complete = Some(false);
-            tab.history_entries_complete = Some(false);
-            for label in ["renamed", ""] {
-                let next = transform_saved_replay_tab(
-                    &current,
-                    "middle",
-                    SavedReplayTabOperation::SetLabel(label.into()),
-                )
-                .unwrap();
-                let mut expected = current.clone();
-                expected.replay.tabs[1].custom_label = label.into();
-                assert_eq!(value(&next), value(&expected));
-                let changed = &next.replay.tabs[1];
-                assert_eq!(changed.ws_setup_queue_complete, Some(false));
-                assert_eq!(changed.ws_frames_complete, Some(false));
-                assert_eq!(changed.response_record_complete, Some(false));
-                assert_eq!(changed.history_entries_complete, Some(false));
+            // Base three covers independent None/false/true values, including
+            // mixed completeness, rather than only all-clear or all-complete.
+            for combination in 0..3usize.pow(COMPLETENESS_FIELDS.len() as u32) {
+                let mut input = source.clone();
+                input["replay"]["tabs"][1]["type"] = json!(kind);
+                let mut digits = combination;
+                let flags = std::array::from_fn::<_, 4, _>(|_| {
+                    let flag = [None, Some(false), Some(true)][digits % 3];
+                    digits /= 3;
+                    flag
+                });
+                for (field, flag) in COMPLETENESS_FIELDS.iter().zip(flags) {
+                    input["replay"]["tabs"][1][*field] = json!(flag);
+                }
+                let current: WorkspaceStateSnapshot = serde_json::from_value(input).unwrap();
+                assert_eq!(completeness_flags(&current.replay.tabs[1]), flags);
+                let durable = value(&current);
+                let reloaded: WorkspaceStateSnapshot =
+                    serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+                assert_eq!(value(&reloaded), durable, "kind={kind:?}, flags={flags:?}");
+                for (index, tab) in reloaded.replay.tabs.iter().enumerate() {
+                    // Completeness belongs to an incoming update, not the saved
+                    // projection. A reload must not resurrect those hints.
+                    assert_eq!(completeness_flags(tab), [None; 4]);
+                    for field in COMPLETENESS_FIELDS {
+                        assert!(durable["replay"]["tabs"][index].get(field).is_none());
+                    }
+                }
+                for operation in [
+                    SavedReplayTabOperation::SetLabel("Saved é".into()),
+                    SavedReplayTabOperation::SetLabel(String::new()),
+                    SavedReplayTabOperation::SetPinned(false),
+                    SavedReplayTabOperation::SetPinned(true),
+                ] {
+                    let mut expected = durable.clone();
+                    match &operation {
+                        SavedReplayTabOperation::SetLabel(label) => {
+                            expected["replay"]["tabs"][1]["custom_label"] = json!(label);
+                        }
+                        SavedReplayTabOperation::SetPinned(pinned) if kind != "websocket" => {
+                            expected["replay"]["tabs"][1]["pinned"] = json!(pinned);
+                        }
+                        _ => continue,
+                    }
+                    let next =
+                        transform_saved_replay_tab(&current, "middle", operation.clone()).unwrap();
+                    let repeated =
+                        transform_saved_replay_tab(&next, "middle", operation.clone()).unwrap();
+                    for transformed in [&next, &repeated] {
+                        assert_eq!(
+                            value(transformed),
+                            expected,
+                            "kind={kind:?}, flags={flags:?}, operation={operation:?}"
+                        );
+                        for (actual, original) in
+                            transformed.replay.tabs.iter().zip(&current.replay.tabs)
+                        {
+                            assert_eq!(completeness_flags(actual), completeness_flags(original));
+                        }
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    fn saved_workspace_legacy_aliases_and_null_optionals_keep_the_canonical_projection() {
+        let omitted = json!({
+            "repeater": {"tabs":[{"id":"legacy", "history_entries":[{"request_text":"draft"}]}]},
+            "intruder": {"request_text":"unrelated draft"}
+        });
+        let mut explicit_null = omitted.clone();
+        for field in ["session_id", "expected_active_session_id", "client_id"] {
+            explicit_null[field] = Value::Null;
+        }
+        explicit_null["repeater"]["active_tab_id"] = Value::Null;
+        for field in [
+            "base_request",
+            "source_transaction_id",
+            "response_record",
+            "history_index",
+            "ws_port",
+            "ws_selected_frame_index",
+            "ws_frame_window_start",
+        ]
+        .into_iter()
+        .chain(COMPLETENESS_FIELDS)
+        {
+            explicit_null["repeater"]["tabs"][0][field] = Value::Null;
+        }
+        for field in ["request", "response_record"] {
+            explicit_null["repeater"]["tabs"][0]["history_entries"][0][field] = Value::Null;
+        }
+        for field in [
+            "base_request",
+            "source_transaction_id",
+            "target",
+            "target_request_authority",
+            "attack_record_id",
+            "attack_record",
+        ] {
+            explicit_null["intruder"][field] = Value::Null;
+        }
+        let omitted: WorkspaceStateSnapshot = serde_json::from_value(omitted).unwrap();
+        let explicit_null: WorkspaceStateSnapshot = serde_json::from_value(explicit_null).unwrap();
+        let canonical = value(&omitted);
+        assert_eq!(value(&explicit_null), canonical);
+        assert!(canonical.get("repeater").is_none());
+        assert!(canonical.get("intruder").is_none());
+        assert_eq!(canonical["replay"]["tabs"][0]["id"], "legacy");
+        assert_eq!(canonical["replay"]["tabs"][0]["type"], "");
+        assert_eq!(canonical["fuzzer"]["request_text"], "unrelated draft");
+        assert!(canonical["replay"]["tabs"][0]["history_entries"][0]
+            .get("request")
+            .is_none());
+        assert_eq!(completeness_flags(&explicit_null.replay.tabs[0]), [None; 4]);
+        let reloaded: WorkspaceStateSnapshot = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(value(&reloaded), canonical);
+    }
+
+    #[test]
+    fn saved_label_transform_rejects_missing_or_unknown_tabs() {
         let mut current = fixture();
         current.replay.tabs[1].tab_type = "unknown".into();
         assert!(transform_saved_replay_tab(
