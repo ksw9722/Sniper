@@ -588,9 +588,15 @@ for (const operation of ['create', 'activate']) {
     const f = setupCompletedAction(), gate = pausePreflight(f, preflightPhases[0]), stale = await f.start(operation);
     replacePreflightWorkspace(f); gate.resolve(true); await tick();
     assert.equal(f.requests.length, 0); assert.equal(await stale.pending, undefined);
+    // The replacement's Scope draft has been saved before this fresh attempt.
+    f.state.targetScopeDirty = false;
+    vm.runInContext(source('flushWorkspaceState'), f.context);
+    const saving = f.context.flushWorkspaceState();
+    assert.equal(f.requests[0].url, '/api/workspace-state');
+    f.succeed(0, { session_id: 'session-b', revision: 21 }); await saving;
     const fresh = await f.start(operation, 'session-c');
-    assert.equal(f.requests.length, 1); assert.equal(f.toasts.length, 1);
-    await f.finishReload(fresh, 0, 'session-c');
+    assert.equal(f.requests.length, 2); assert.equal(f.toasts.length, 1);
+    await f.finishReload(fresh, 1, 'session-c');
     assert.equal(f.state.activeSession.id, 'session-c'); assert.equal(f.toasts.length, 1);
   });
 }
@@ -776,3 +782,174 @@ for (const editor of ['scope', 'rules', 'definition']) test(`forced activation a
   field.edit(true); const metadata = field.snapshot(), before = f.retained();
   await f.finishRetained(action, 0, 'session-b'); f.assertRetained(before); assert.deepEqual(field.snapshot(), metadata);
 });
+
+// Ordered preflights are not a lock: an earlier editor can become dirty while a
+// later phase waits. Exercise the real transition handlers and metadata inputs.
+function holdDraftPreflight(f, phase) {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const original = f.context[phase];
+  let reached = false;
+  f.context[phase] = async (...args) => { reached = true; await gate; return original(...args); };
+  return { release, reached: () => reached };
+}
+function useExternalDraftTransition(f) {
+  for (const name of ['handleExternalSessionChanged', 'flushSequenceDraftBeforeExternalSessionReload', 'hasPendingWorkspaceStateSave']) {
+    vm.runInContext(source(name), f.context);
+  }
+  f.reloads = [];
+  f.context.handleSequenceActionError = error => { f.error = error; };
+  f.context.reloadSessionWorkspace = async options => { f.reloads.push(options); f.context.resetSessionScopedUiState(); };
+}
+async function startDraftTransition(f, operation) {
+  if (operation !== 'external') return f.start(operation);
+  const pending = f.context.handleExternalSessionChanged('session-a').catch(error => error);
+  await tick(); return { pending };
+}
+const lateDraftPhases = {
+  scope: ['flushMatchReplaceDraft', 'flushSequenceDraft', 'flushAllPendingAnnotations', 'flushWorkspaceState', 'cleanupWsReplayTabsBeforeStateReset'],
+  rules: ['flushSequenceDraft', 'flushAllPendingAnnotations', 'flushWorkspaceState', 'cleanupWsReplayTabsBeforeStateReset'],
+  definition: ['flushAllPendingAnnotations', 'flushWorkspaceState', 'cleanupWsReplayTabsBeforeStateReset'],
+};
+for (const operation of ['create', 'activate', 'external']) for (const editor of ['scope', 'rules', 'definition']) {
+  const phases = operation === 'external'
+    ? (editor === 'definition' ? ['flushTargetScopeDraft', 'flushMatchReplaceDraft', 'flushAllPendingAnnotations', 'flushWorkspaceState', 'cleanupWsReplayTabsBeforeStateReset']
+      : lateDraftPhases[editor].filter(phase => phase !== 'flushSequenceDraft'))
+    : lateDraftPhases[editor];
+  for (const phase of phases) test(`${operation}: ${editor} edited after its preflight during ${phase} keeps its draft`, async () => {
+    const f = setupCompletedAction(), field = useLateMetadataEditor(f, editor);
+    if (operation === 'external') useExternalDraftTransition(f);
+    // External reload only awaits workspace persistence when it has queued work.
+    if (operation === 'external' && phase === 'flushWorkspaceState') f.context.scheduleWorkspaceStateSave();
+    const gate = holdDraftPreflight(f, phase), action = await startDraftTransition(f, operation);
+    assert.equal(gate.reached(), true); assert.equal(f.requests.length, 0);
+    field.edit(true); const metadata = field.snapshot(), before = f.retained();
+    gate.release(); await tick();
+    if (operation === 'external' && phase === 'flushWorkspaceState') {
+      assert.equal(f.requests[0]?.url, '/api/workspace-state');
+      f.succeed(0, { session_id: 'session-a', revision: 11 }); await tick();
+      // Acknowledging the independent workspace save may replace its baseline.
+      before.baseline = f.context.workspaceSaveCommittedSnapshot;
+    }
+    assert.equal(f.requests.filter(request => request.url.startsWith('/api/sessions')).length, 0,
+      'unsaved metadata must stop before session mutation or reconciliation');
+    assert.equal(await action.pending, undefined); f.assertRetained(before);
+    assert.deepEqual(field.snapshot(), metadata); assert.equal(metadata.dirty, true);
+    assert.equal(f.reloads?.length || 0, 0); assert.match(f.toasts.at(-1)?.[0] || '', /unsaved.*draft|draft.*unsaved/i);
+  });
+}
+
+function useLateAnnotationEditor(f) {
+  for (const name of ['updateAnnotations', 'flushPendingAnnotations', 'flushAllPendingAnnotations', 'sessionWritePath']) {
+    vm.runInContext(source(name), f.context);
+  }
+  Object.assign(f.context, { URLSearchParams, annotationClientId: 'synthetic-client',
+    nextAnnotationClientVersion: () => 1, observeAnnotationRevision() {}, currentHistoryNoteEditWindow: () => null,
+    getHistoryItemIndex: () => -1, releaseHistoryNoteEdit() {} });
+  f.state.historyPaging = {}; f.state.items = []; f.state.selectedRecord = null;
+  return () => f.context.updateAnnotations('synthetic-note', { user_note: 'Synthetic unsaved note' });
+}
+for (const operation of ['create', 'activate', 'external']) for (const draft of ['workspace', 'annotation']) {
+  for (const phase of draft === 'workspace' ? ['cleanupWsReplayTabsBeforeStateReset'] : ['flushWorkspaceState', 'cleanupWsReplayTabsBeforeStateReset']) {
+    test(`${operation}: late ${draft} during ${phase} stops at the final draft gate`, async () => {
+      const f = setupCompletedAction(); if (operation === 'external') useExternalDraftTransition(f);
+      const edit = draft === 'annotation' ? useLateAnnotationEditor(f) : () => f.edit();
+      if (operation === 'external' && phase === 'flushWorkspaceState') f.context.scheduleWorkspaceStateSave();
+      const gate = holdDraftPreflight(f, phase), action = await startDraftTransition(f, operation);
+      assert.equal(gate.reached(), true); await edit(); const before = f.retained();
+      gate.release(); await tick();
+      const save = f.requests.findIndex(request => request.url === '/api/workspace-state');
+      if (save !== -1) {
+        f.succeed(save, { session_id: 'session-a', revision: 11 }); await tick();
+        before.baseline = f.context.workspaceSaveCommittedSnapshot;
+      }
+      assert.equal(f.requests.some(request => request.url.startsWith('/api/sessions')), false);
+      assert.equal(await action.pending, undefined); f.assertRetained(before);
+      assert.equal(f.reloads?.length || 0, 0); assert.match(f.toasts.at(-1)?.[0] || '', /unsaved.*draft|draft.*unsaved/i);
+      if (draft === 'workspace') assert.equal(f.context.workspaceSaveDirty, true);
+      else {
+        assert.equal(f.state._pendingAnnotations.get('synthetic-note').payload.user_note, 'Synthetic unsaved note');
+        assert.equal(f.state._annotationInFlight.has('synthetic-note'), true);
+        const index = f.requests.findIndex(request => request.options.method === 'PATCH');
+        f.succeed(index, { id: 'synthetic-note' }); await tick();
+        assert.equal(f.requests.some(request => request.url.startsWith('/api/sessions')), false, 'settlement does not retry the refused transition');
+      }
+    });
+  }
+}
+for (const operation of ['create', 'activate', 'external']) {
+  for (const editor of ['scope', 'rules', 'definition']) test(`${operation}: a late ${editor} explicitly saved before the final gate can finish`, async () => {
+    const f = setupCompletedAction(), field = useLateMetadataEditor(f, editor);
+    if (operation === 'external') useExternalDraftTransition(f);
+    const gate = holdDraftPreflight(f, 'cleanupWsReplayTabsBeforeStateReset'), action = await startDraftTransition(f, operation);
+    field.edit(true); const saving = field.save();
+    assert.equal(JSON.parse(f.requests[0].options.body).session_id, 'session-a');
+    f.succeed(0, field.response()); assert.equal(await saving, true); assert.equal(field.snapshot().dirty, false);
+    gate.release(); await tick();
+    if (operation === 'external') { assert.equal(await action.pending, undefined); assert.equal(f.reloads.length, 1); }
+    else { assert.equal(f.requests[1]?.url, operation === 'create' ? '/api/sessions' : '/api/sessions/session-b/activate'); await f.finishReload(action, 1); }
+    assert.equal(f.toasts.length, 0);
+  });
+  for (const editor of ['rules', 'definition']) test(`${operation}: ${editor} edited before its own later phase is saved and permits completion`, async () => {
+    const f = setupCompletedAction(), field = useLateMetadataEditor(f, editor);
+    if (operation === 'external') useExternalDraftTransition(f);
+    // External saved-definition persistence precedes Scope; hold its own entry.
+    const phase = operation === 'external' && editor === 'definition' ? 'flushSequenceDraftBeforeExternalSessionReload' : 'flushTargetScopeDraft';
+    if (editor === 'definition') {
+      vm.runInContext(source('isCurrentSequenceSession'), f.context);
+      f.context.loadSequences = async () => { f.state.sequenceDefinitions = [plain(f.state.editingSequence)]; return true; };
+    }
+    const gate = holdDraftPreflight(f, phase), action = await startDraftTransition(f, operation);
+    field.edit(true); gate.release(); await tick();
+    assert.equal(f.requests.length, 1); assert.equal(JSON.parse(f.requests[0].options.body).session_id, 'session-a');
+    f.succeed(0, field.response()); await tick(); assert.equal(field.snapshot().dirty, false);
+    if (operation === 'external') { assert.equal(await action.pending, undefined); assert.equal(f.reloads.length, 1); }
+    else { assert.equal(f.requests[1]?.url, operation === 'create' ? '/api/sessions' : '/api/sessions/session-b/activate'); await f.finishReload(action, 1); }
+    assert.equal(f.toasts.length, 0);
+  });
+}
+
+for (const operation of ['create', 'activate', 'external']) {
+  for (const editor of ['scope', 'rules', 'definition']) test(`${operation}: ${editor} saved by its real preflight is not cleared after a second edit`, async () => {
+    const f = setupCompletedAction(), field = useLateMetadataEditor(f, editor);
+    if (operation === 'external') useExternalDraftTransition(f);
+    if (editor === 'definition') {
+      vm.runInContext(source('isCurrentSequenceSession'), f.context);
+      f.context.loadSequences = async () => { f.state.sequenceDefinitions = [plain(f.state.editingSequence)]; return true; };
+    }
+    const gate = holdDraftPreflight(f, 'cleanupWsReplayTabsBeforeStateReset'); field.edit(true);
+    const action = await startDraftTransition(f, operation); assert.equal(f.requests.length, 1);
+    f.succeed(0, field.response()); await tick(); assert.equal(gate.reached(), true); assert.equal(field.snapshot().dirty, false);
+    field.edit(false); const metadata = field.snapshot(), before = f.retained(); gate.release(); await tick();
+    assert.equal(f.requests.length, 1, 'no retry or session action after the second edit');
+    assert.equal(await action.pending, undefined); f.assertRetained(before); assert.deepEqual(field.snapshot(), metadata);
+    assert.equal(f.reloads?.length || 0, 0);
+  });
+  test(`${operation}: a queued annotation saved by its later production drain permits completion`, async () => {
+    const f = setupCompletedAction(); if (operation === 'external') useExternalDraftTransition(f);
+    const edit = useLateAnnotationEditor(f);
+    const gate = holdDraftPreflight(f, operation === 'external' ? 'flushSequenceDraftBeforeExternalSessionReload' : 'flushTargetScopeDraft');
+    const action = await startDraftTransition(f, operation);
+    f.state._annotationInFlight = new Set(['synthetic-note']); await edit();
+    assert.equal(f.requests.length, 0); f.state._annotationInFlight.clear(); gate.release(); await tick();
+    assert.equal(f.requests[0]?.options.method, 'PATCH');
+    f.succeed(0, { id: 'synthetic-note' }); await tick(); assert.equal(f.state._pendingAnnotations.size, 0);
+    if (operation === 'external') { assert.equal(await action.pending, undefined); assert.equal(f.reloads.length, 1); }
+    else { assert.equal(f.requests[1]?.url, operation === 'create' ? '/api/sessions' : '/api/sessions/session-b/activate'); await f.finishReload(action, 1); }
+    assert.equal(f.toasts.length, 0);
+  });
+  for (const stateAtGate of ['in-flight save', 'save conflict']) test(`${operation}: a late workspace ${stateAtGate} blocks the final gate`, async () => {
+    const f = setupCompletedAction(); if (operation === 'external') useExternalDraftTransition(f);
+    const gate = holdDraftPreflight(f, 'cleanupWsReplayTabsBeforeStateReset'), action = await startDraftTransition(f, operation);
+    f.edit(); const saving = f.context.flushQueuedWorkspaceStateSave();
+    assert.equal(f.requests[0]?.url, '/api/workspace-state');
+    if (stateAtGate === 'save conflict') {
+      f.requests[0].resolve({ ok: false, status: 409, json: async () => ({ error: 'synthetic conflict' }) }); await saving;
+      assert.equal(f.context.workspaceSaveConflictPending, true);
+    } else { assert.equal(f.context.workspaceSaveInFlight, true); assert.equal(f.context.workspaceSaveDirty, false); }
+    const before = f.retained(); gate.release(); await tick(); assert.equal(f.requests.length, 1);
+    assert.equal(await action.pending, undefined); f.assertRetained(before); assert.equal(f.reloads?.length || 0, 0);
+    if (stateAtGate === 'in-flight save') { f.succeed(0, { session_id: 'session-a', revision: 11 }); await saving; }
+    assert.equal(f.requests.length, 1, 'save settlement never retries the refused transition');
+  });
+}

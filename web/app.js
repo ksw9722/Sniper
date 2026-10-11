@@ -4838,6 +4838,22 @@ function hasPendingWorkspaceStateSave() {
   return !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer || workspaceSaveInFlight || workspaceSaveLoopPromise);
 }
 
+function canLeaveSessionAfterDraftPreflight() {
+  // An editor whose save already finished can become dirty while a later phase
+  // waits. Only outstanding work blocks the transition; edits acknowledged by a
+  // later save are safe, even when their draft versions changed during preflight.
+  if (!state.targetScopeDirty && !state.matchReplaceDirty
+    && !(state.sequenceDirty && state.editingSequence)
+    && !hasPendingWorkspaceStateSave() && !workspaceSaveConflictPending
+    && !state._pendingAnnotations?.size && !state._annotationInFlight?.size) return true;
+  showToast(
+    "Unsaved drafts arrived while preparing the session change. Your current workspace is still open. Save or discard the drafts before trying again.",
+    "error",
+    7000,
+  );
+  return false;
+}
+
 async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
   const sessionId = options.sessionId || null;
   const workspaceSessionId = currentSessionId();
@@ -5121,6 +5137,7 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
     return;
   }
   if (shouldReload) {
+    if (!canLeaveSessionAfterDraftPreflight()) return;
     await reloadSessionWorkspace({ cleanupBeforeReset: false });
   }
 }
@@ -5157,6 +5174,7 @@ async function createSession() {
     if (!canContinuePreflight()) return;
     throw error;
   }
+  if (!canLeaveSessionAfterDraftPreflight()) return;
   const submittedName = els.dashboardCreateSessionName.value;
   const name = submittedName.trim();
   const actionSessionId = currentSessionId();
@@ -5223,6 +5241,7 @@ async function activateSessionById(id, { force = false } = {}) {
     if (!canContinuePreflight()) return;
     throw error;
   }
+  if (!canLeaveSessionAfterDraftPreflight()) return;
   const actionSessionId = currentSessionId();
   const actionWorkspaceGeneration = workspaceStateGeneration;
   const actionWorkspaceSaveVersion = workspaceSaveVersion;

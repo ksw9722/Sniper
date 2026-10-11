@@ -22,8 +22,8 @@ function fixture(kind) {
   const context = loadFunctions(['currentSessionId', 'expectedActiveSessionIdForWrite', 'sessionWritePath',
     'sessionQueryPath', 'saveTargetScope', 'saveMatchReplaceRules', 'formatScopePatternsText', 'jsonArray',
     'syncMatchReplaceEditor', 'getSelectedMatchReplaceRule', 'flushTargetScopeDraft', 'flushMatchReplaceDraft',
-    'loadTargetSiteMap', 'syncTargetScopeDraft', 'deleteSelectedMatchReplaceRule'], {
-    state, els, workspaceStateGeneration: 0, URLSearchParams,
+    'loadTargetSiteMap', 'syncTargetScopeDraft', 'deleteSelectedMatchReplaceRule', 'canLeaveSessionAfterDraftPreflight'], {
+    state, els, workspaceStateGeneration: 0, workspaceSaveConflictPending: false, URLSearchParams,
     requireOkResponse: async response => { if (!response.ok) throw response.error; },
     showToast: (...args) => toasts.push(args), console: { error() {} },
     renderMatchReplaceRules: () => renders.push('rules'), renderTarget: () => renders.push('scope'),
@@ -192,6 +192,7 @@ for (const changed of [false, true]) test(`rules: Delete ${changed ? 'preserves 
 for (const kind of ['scope', 'rules']) for (const changed of [false, true]) {
   test(`${kind}: external reload ${changed ? 'stops on a retained newer edit' : 'keeps a rightful unchanged bypass save'}`, async () => {
     const f = fixture(kind), later = [];
+    f.state[kind === 'scope' ? 'matchReplaceDirty' : 'targetScopeDirty'] = false;
     vm.runInContext(appSource.match(/^async function handleExternalSessionChanged\([^]*?^\}/m)[0], f.context);
     Object.assign(f.context, { flushSequenceDraftBeforeExternalSessionReload: async () => true,
       flushAllPendingAnnotations: async () => later.push('annotations'), hasPendingWorkspaceStateSave: () => false,
