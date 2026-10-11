@@ -2921,6 +2921,7 @@ async function performSelfUpdate() {
     button.classList.remove("is-busy");
     button.classList.add("is-failed");
     button.removeAttribute("aria-busy");
+    button.removeAttribute("aria-label");
     button.textContent = "Failed";
     button.title = reason;
     button.removeAttribute("aria-disabled");

@@ -187,6 +187,33 @@ function assertIdle(fixture) {
   }
 }
 
+for (const percent of [null, 42]) {
+  test(`failure clears the ${percent === null ? "busy" : "percentage"} accessible name before retry`, async () => {
+    const f = fixture();
+    const first = await f.start();
+    if (percent !== null) {
+      first.stream.event({ step: "Downloading update...", percent });
+      await nextTurn();
+    }
+    assert.equal(f.button.getAttribute("aria-label"), percent === null
+      ? "Updating" : "Updating, 42 percent");
+    await f.fail(first);
+    assert.equal(f.button.textContent, "Failed");
+    assert.equal(f.button.getAttribute("aria-label"), null,
+      "The visible failure text must not be overridden by stale progress");
+    const retry = await f.start();
+    assert.equal(f.button.getAttribute("aria-label"), "Updating");
+    retry.stream.event({ step: "Downloading update...", percent: 17 });
+    await nextTurn();
+    assert.equal(f.button.getAttribute("aria-label"), "Updating, 17 percent");
+    await f.fail(retry);
+    assert.equal(f.button.getAttribute("aria-label"), null);
+    f.advance(4000);
+    assertIdle(f);
+    assert.equal(f.requests.length, 2);
+  });
+}
+
 test("version metadata reveals the update button and preserves its release tooltip", async () => {
   const f = fixture();
   const pending = f.context.loadAppVersionInfo();
