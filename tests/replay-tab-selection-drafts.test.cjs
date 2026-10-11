@@ -38,7 +38,7 @@ function setup() {
     focus() { f.document.activeElement = this; }
     select() {}
   }
-  let rows = [];
+  let rows = [], markup = "";
   const strip = f.els.replayTabStrip = {
     scrollLeft: 0,
     querySelectorAll: selector => selector === '.replay-tab' ? rows : [],
@@ -49,7 +49,8 @@ function setup() {
       return null;
     },
   };
-  Object.defineProperty(strip, 'innerHTML', { set() {
+  Object.defineProperty(strip, 'innerHTML', { get() { return markup; }, set(value) {
+    markup = value;
     rows = f.context.getReplayTabVisualOrder().map(tab => {
       const row = new Element('.replay-tab'); row.dataset.replayTabId = tab.id;
       row.button = f.state.replayRenamingTabId === tab.id ? null : new Element('.replay-tab-button', row);
@@ -394,3 +395,63 @@ test('saved-tab label blur still commits its current metadata once', () => {
   assert.equal(f.a.customLabel, 'Synthetic label'); assert.equal(f.flushes, 1);
   input.listeners.blur(); assert.equal(f.flushes, 1);
 });
+
+const scalarLabelCases = [
+  ['ASCII at limit', 'a'.repeat(80), 'a'.repeat(80)],
+  ['ASCII over limit', 'a'.repeat(81), 'a'.repeat(80)],
+  ['emoji at boundary', 'a'.repeat(79) + '😀', 'a'.repeat(79) + '😀'],
+  ['emoji at limit', '😀'.repeat(80), '😀'.repeat(80)],
+  ['emoji over limit', '😀'.repeat(81), '😀'.repeat(80)],
+  ['content after boundary emoji', 'a'.repeat(79) + '😀z', 'a'.repeat(79) + '😀'],
+  ['combining marks at limit', 'e\u0301'.repeat(40), 'e\u0301'.repeat(40)],
+  ['combining mark beyond limit', 'a'.repeat(79) + 'e\u0301', 'a'.repeat(79) + 'e'],
+  ['normalized whitespace', ' \t label\n 😀  ', 'label 😀'],
+  ['whitespace at truncated boundary', 'a'.repeat(79) + ' z', 'a'.repeat(79) + ' '],
+];
+for (const [name, input, expected] of scalarLabelCases) test(`saved label normalization preserves scalar characters: ${name}`, () => {
+  const f = fixture(), actual = f.context.normalizeReplayTabCustomLabel(input);
+  assert.equal(actual, expected);
+  assert.ok(Array.from(actual).length <= 80);
+  assert.equal(Buffer.from(actual, 'utf8').toString('utf8'), actual, 'the label must not contain a lone surrogate');
+});
+
+function addSavedWebsocketLabelHelpers(f) {
+  vm.runInContext(appSource.match(/^const UUID_PATTERN = .*$/m)[0], f.context);
+  for (const name of ['isUuidString', 'defaultWsPortForScheme', 'normalizeWebsocketFrames',
+    'normalizeWebsocketFrame', 'normalizeWsMessageType', 'websocketFramesAreTruncated',
+    'normalizeWsReplaySavedFrameIndex', 'normalizeWsReplaySavedFrameWindowStart',
+    'rebuildWsReplayFrameTracking', 'getRawWsReplayFrames', 'getWsReplayFrames', 'wsFrameIndexValue']) {
+    vm.runInContext(source(name), f.context);
+  }
+}
+const savedUnicodeLabels = ['a'.repeat(79) + '😀', '😀'.repeat(80)];
+for (const [index, label] of savedUnicodeLabels.entries()) {
+  for (const type of ['http', 'websocket']) test(`${type} saved label ${index} survives hydration and copying`, () => {
+    const f = fixture(); if (type === 'websocket') addSavedWebsocketLabelHelpers(f);
+    const tab = f.context.hydrateReplayTab({ id: '00000000-0000-4000-8000-000000000001',
+      type, custom_label: label, sequence: 1 });
+    assert.equal(tab.customLabel, label);
+    assert.equal(f.context.cloneReplayTabState(tab).customLabel, label);
+    assert.equal(f.requests.length, 0);
+  });
+  test(`external saved label ${index} keeps its full value and committed baseline`, () => {
+    const f = fixture(), tab = f.tab('before'); f.seed([tab]);
+    assert.equal(f.context.adoptExternalReplayLabel(tab, { custom_label: label }), true);
+    assert.equal(tab.customLabel, label);
+    assert.equal(f.context.workspaceReplayTabsById(f.context.workspaceSaveCommittedSnapshot).get(tab.id).custom_label, label);
+    assert.equal(f.requests.length, 0);
+  });
+  for (const action of ['Enter', 'blur']) test(`existing saved label ${index} survives rename ${action} without truncation`, () => {
+    const f = setup(); f.a.customLabel = label; f.seed([f.a, f.b]); f.context.renderReplayTabs();
+    f.click(f.a.id); const input = f.row(f.a.id).name;
+    assert.equal(input.value, label);
+    assert.ok(f.els.replayTabStrip.innerHTML.includes(`value="${label}"`), 'rendered input preserves the full saved label');
+    assert.match(f.els.replayTabStrip.innerHTML, /maxlength="80"/, 'existing user typing limit remains unchanged');
+    if (action === 'blur') input.listeners.blur();
+    else input.listeners.keydown({ key: 'Enter', isComposing: false, preventDefault() {} });
+    assert.equal(f.state.replayRenamingTabId, null);
+    assert.equal(f.a.customLabel, label);
+    assert.equal(f.context.snapshotHttpReplayTab(f.a).custom_label, label);
+    assert.equal(f.flushes, 1);
+  });
+}

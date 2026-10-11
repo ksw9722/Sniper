@@ -62,13 +62,18 @@ A label-only update uses `POST /api/replay/tabs/set-label` with required
 fields, missing IDs and unsupported tab types fail. Only HTTP (including legacy
 empty types) and WebSocket tabs are accepted.
 
-The server collapses whitespace and takes the first 80 Unicode characters. Empty
+The server collapses whitespace and takes the first 80 Unicode scalar values
+(combining marks count separately). Empty
 labels clear the custom label. It changes only the label in its saved workspace,
 then performs the existing revision-checked atomic workspace persistence. Requests,
 responses, frames, queues, editor state, ordering, pinning, selection, and other
 tools are preserved. Revision/client bookkeeping follows the existing saved-tab
 metadata update convention. Repeating a label leaves the same label but advances
 the revision and requires a fresh revision.
+
+The desktop UI preserves existing saved labels up to this scalar limit when
+loading, copying, or renaming tabs. Its inline name input retains the existing
+80 UTF-16-code-unit typing limit, which can allow fewer than 80 emoji.
 
 The API responds with `session_id`, the new `revision`, and the full saved `tab`.
 The CLI preserves `replay.update` output: the full selected tab plus `session_id`.
