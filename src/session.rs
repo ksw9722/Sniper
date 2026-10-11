@@ -40,7 +40,7 @@ use crate::{
     websocket::{sessions_with_live_preserved, trim_frame_overflow, WebSocketStore},
     workspace::{
         transform_saved_replay_tab, validate_workspace_serialized_size, SavedReplayTabOperation,
-        WorkspaceReplaceError, WorkspaceTransformError,
+        WorkspacePersistCommit, WorkspaceReplaceError, WorkspaceTransformError,
     },
     workspace::{WorkspaceStateSnapshot, WorkspaceStateStore},
 };
@@ -269,6 +269,19 @@ where
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum WorkspaceWriteFault {
+    BeforeReplacement,
+    AfterReplacement,
+}
+
+#[cfg(test)]
+struct WorkspaceCommitGate {
+    entered: oneshot::Sender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
 pub struct SessionContext {
     id: Uuid,
     storage_dir: PathBuf,
@@ -294,6 +307,10 @@ pub struct SessionContext {
     /// Set while a state-only persist is already queued, so a burst of small
     /// changes costs one write instead of one write each.
     state_persist_scheduled: AtomicBool,
+    #[cfg(test)]
+    workspace_write_fault: std::sync::Mutex<Option<WorkspaceWriteFault>>,
+    #[cfg(test)]
+    workspace_commit_gate: std::sync::Mutex<Option<WorkspaceCommitGate>>,
 }
 
 impl SessionContext {
@@ -441,6 +458,10 @@ impl SessionContext {
             mutation_lock: Arc::new(AsyncMutex::new(())),
             persist_lock: AsyncMutex::new(()),
             state_persist_scheduled: AtomicBool::new(false),
+            #[cfg(test)]
+            workspace_write_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            workspace_commit_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -658,7 +679,7 @@ impl SessionContext {
     async fn persist_workspace_snapshot_locked(
         &self,
         workspace: WorkspaceStateSnapshot,
-    ) -> Result<Option<SessionMetadata>> {
+    ) -> Result<WorkspacePersistCommit<Option<SessionMetadata>, anyhow::Error>> {
         self.persist_workspace_snapshot_locked_inner(workspace)
             .await
     }
@@ -666,7 +687,7 @@ impl SessionContext {
     async fn persist_workspace_snapshot_locked_inner(
         &self,
         workspace: WorkspaceStateSnapshot,
-    ) -> Result<Option<SessionMetadata>> {
+    ) -> Result<WorkspacePersistCommit<Option<SessionMetadata>, anyhow::Error>> {
         validate_workspace_serialized_size(&workspace)
             .map_err(anyhow::Error::msg)
             .with_context(|| "workspace snapshot is too large to persist")?;
@@ -679,8 +700,73 @@ impl SessionContext {
         // 1 MB payload. snapshot.json is left untouched; its embedded workspace
         // copy stays as the load-time fallback, and a corrupt snapshot.json is
         // repaired on the next load rather than here.
-        write_json(&workspace_path(&self.storage_dir), &workspace)?;
-        Ok(None)
+        // Keep replacement and the caller's in-memory publication in one poll:
+        // yielding here would let cancellation leave memory behind disk.
+        let finalization_error = match self.write_workspace_snapshot(&workspace) {
+            Ok(()) => None,
+            Err(failure) if failure.committed => Some(failure.error),
+            Err(failure) => return Err(failure.error),
+        };
+        Ok(WorkspacePersistCommit {
+            value: None,
+            finalization_error,
+        })
+    }
+
+    fn write_workspace_snapshot(
+        &self,
+        workspace: &WorkspaceStateSnapshot,
+    ) -> std::result::Result<(), JsonWriteFailure> {
+        let path = workspace_path(&self.storage_dir);
+        #[cfg(test)]
+        {
+            let fault = self.workspace_write_fault.lock().unwrap().take();
+            let gate = self.workspace_commit_gate.lock().unwrap().take();
+            if fault.is_some() || gate.is_some() {
+                // Hooks affect only this context's workspace.json, once.
+                let result = match fault {
+                    Some(WorkspaceWriteFault::BeforeReplacement) => Err(JsonWriteFailure {
+                        error: anyhow!("synthetic workspace failure before replacement"),
+                        committed: false,
+                    }),
+                    Some(WorkspaceWriteFault::AfterReplacement) => {
+                        write_json_finalizing(&path, workspace, |_| {
+                            bail!("synthetic workspace finalization failure")
+                        })
+                    }
+                    None => write_json_with_commit_status(&path, workspace),
+                };
+                if result
+                    .as_ref()
+                    .map_or_else(|failure| failure.committed, |_| true)
+                {
+                    if let Some(gate) = gate {
+                        let _ = gate.entered.send(());
+                        gate.resume
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("workspace commit test gate must be released");
+                    }
+                }
+                return result;
+            }
+        }
+        write_json_with_commit_status(&path, workspace)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_workspace_write(&self, fault: WorkspaceWriteFault) {
+        *self.workspace_write_fault.lock().unwrap() = Some(fault);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_workspace_commit(&self) -> (oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, ready) = oneshot::channel();
+        let (resume, release) = mpsc::channel();
+        *self.workspace_commit_gate.lock().unwrap() = Some(WorkspaceCommitGate {
+            entered,
+            resume: release,
+        });
+        (ready, resume)
     }
 
     /// Everything in the session document except the two big journal-backed

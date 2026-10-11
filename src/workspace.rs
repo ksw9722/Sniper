@@ -201,6 +201,13 @@ pub struct WorkspaceStateEvent {
 pub enum WorkspaceReplaceError<E> {
     Conflict(Box<WorkspaceStateSnapshot>),
     Persist(E),
+    CommittedButUncertain(E),
+}
+
+#[derive(Debug)]
+pub struct WorkspacePersistCommit<T, E> {
+    pub value: T,
+    pub finalization_error: Option<E>,
 }
 
 #[derive(Clone, Debug)]
@@ -374,7 +381,7 @@ impl WorkspaceStateStore {
     ) -> Result<(WorkspaceStateSnapshot, T), WorkspaceReplaceError<E>>
     where
         F: FnOnce(WorkspaceStateSnapshot) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        Fut: Future<Output = Result<WorkspacePersistCommit<T, E>, E>>,
     {
         let mut current = self.inner.write().await;
         if !can_replace_snapshot(&snapshot, &current) {
@@ -390,7 +397,12 @@ impl WorkspaceStateStore {
         *current = next.clone();
         drop(current);
         self.announce(&next);
-        Ok((next, persist_result))
+        if let Some(error) = persist_result.finalization_error {
+            // Replacement already made this revision visible on disk. Keep
+            // memory and subscribers current even when durability is uncertain.
+            return Err(WorkspaceReplaceError::CommittedButUncertain(error));
+        }
+        Ok((next, persist_result.value))
     }
 
     pub(crate) async fn transform_snapshot_checked_persisting<F, P, Fut, E>(
@@ -675,6 +687,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(current.revision, 1);
+        let mut events = store.subscribe();
 
         let result = store
             .replace_snapshot_checked_persisting(
@@ -688,7 +701,9 @@ mod tests {
                     },
                     ..WorkspaceStateSnapshot::default()
                 },
-                |_candidate| async { Err::<(), _>("disk failed") },
+                |_candidate| async {
+                    Err::<super::WorkspacePersistCommit<(), _>, _>("disk failed")
+                },
             )
             .await;
 
@@ -700,6 +715,41 @@ mod tests {
         assert_eq!(after.revision, 1);
         assert_eq!(after.client_version, 1);
         assert!(after.replay.active_tab_id.is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_replace_persisting_publishes_committed_uncertainty() {
+        let store = WorkspaceStateStore::new();
+        let mut events = store.subscribe();
+        let result = store
+            .replace_snapshot_checked_persisting(
+                WorkspaceStateSnapshot {
+                    client_id: Some("client-a".to_string()),
+                    client_version: 1,
+                    ..WorkspaceStateSnapshot::default()
+                },
+                |candidate| async move {
+                    assert_eq!(candidate.revision, 1);
+                    Ok::<_, &str>(super::WorkspacePersistCommit {
+                        value: (),
+                        finalization_error: Some("directory sync failed"),
+                    })
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::WorkspaceReplaceError::CommittedButUncertain(
+                "directory sync failed"
+            ))
+        ));
+        let current = store.snapshot().await;
+        assert_eq!(current.revision, 1);
+        assert_eq!(current.client_id.as_deref(), Some("client-a"));
+        assert_eq!(current.client_version, 1);
+        assert_eq!(events.try_recv().unwrap().revision, 1);
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -726,7 +776,12 @@ mod tests {
                     },
                     ..WorkspaceStateSnapshot::default()
                 },
-                |candidate| async move { Ok::<_, ()>(candidate.revision) },
+                |candidate| async move {
+                    Ok::<_, ()>(super::WorkspacePersistCommit {
+                        value: candidate.revision,
+                        finalization_error: None,
+                    })
+                },
             )
             .await
             .unwrap();

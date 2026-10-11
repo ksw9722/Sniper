@@ -3853,8 +3853,9 @@ async function flushQueuedWorkspaceStateSave(options = {}) {
 
 async function runQueuedWorkspaceStateSaves(options = {}) {
   const stateGeneration = workspaceStateGeneration;
+  const sessionId = currentSessionId();
   while (state.activeSession && workspaceSaveDirty && !workspaceSaveConflictPending
-    && stateGeneration === workspaceStateGeneration) {
+    && stateGeneration === workspaceStateGeneration && sessionId === currentSessionId()) {
     workspaceSaveDirty = false;
     const version = workspaceSaveVersion;
     const snapshot = snapshotWorkspaceState(options);
@@ -3863,7 +3864,8 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
     try {
       await saveWorkspaceState(snapshot, options);
     } catch (error) {
-      if (stateGeneration !== workspaceStateGeneration || workspaceSaveConflictPending) return;
+      if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()
+        || workspaceSaveConflictPending) return;
       if (isTooManyReplayTabsError(error)) {
         // The server rejects every save while over the limit. Re-sending the
         // same over-limit snapshot on a 1s timer just spams toasts and never
@@ -3898,8 +3900,15 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
       workspaceSaveDirty = true;
       window.clearTimeout(workspaceSaveTimer);
       workspaceSaveTimer = null;
+      if (error.commitUncertain) {
+        window.clearTimeout(wsTranscriptSaveTimer);
+        wsTranscriptSaveTimer = null;
+        wsTranscriptFirstDirtyAt = 0;
+        workspaceSaveLastSnapshot = null;
+      }
       showToast(
-        "Workspace changed elsewhere; local workspace edits were not saved. Reload the workspace to reconcile.",
+        error.commitUncertain ? error.message
+          : "Workspace changed elsewhere; local workspace edits were not saved. Reload the workspace to reconcile.",
         "error",
         6000,
       );
@@ -3907,7 +3916,8 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
     } finally {
       workspaceSaveInFlight = false;
     }
-    if (stateGeneration !== workspaceStateGeneration || workspaceSaveConflictPending) return;
+    if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()
+      || workspaceSaveConflictPending) return;
     if (workspaceSaveVersion !== version) {
       workspaceSaveDirty = true;
     }
@@ -4001,6 +4011,7 @@ async function saveWorkspaceState(snapshot = null, options = {}) {
   }
   if (workspaceSaveConflictPending) throw new WorkspaceStateConflictError(workspaceSaveConflictLatest);
   const stateGeneration = workspaceStateGeneration;
+  const sessionId = currentSessionId();
   if (!snapshot) {
     snapshot = snapshotWorkspaceState(options);
   }
@@ -4014,22 +4025,33 @@ async function saveWorkspaceState(snapshot = null, options = {}) {
     body: JSON.stringify(snapshot),
   });
 
-  if (stateGeneration !== workspaceStateGeneration) return;
+  if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
   if (!response.ok) {
     if (response.status === 409) {
       const latest = await response.json().catch(() => null);
-      if (stateGeneration !== workspaceStateGeneration) return;
+      if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
       throw new WorkspaceStateConflictError(latest);
     }
-    throw new Error(await response.text());
+    const message = await response.text();
+    if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
+    if (response.status === 500) {
+      let latest = null;
+      try { latest = JSON.parse(message); } catch (_error) {}
+      // The file may already be replaced. Retrying this stale revision could
+      // overwrite a visible commit, so require the existing reload barrier.
+      if (latest?.code === "WORKSPACE_COMMIT_UNCERTAIN") {
+        throw new WorkspaceStateConflictError(latest);
+      }
+    }
+    throw new Error(message);
   }
   const saved = await response.json();
-  const currentSessionId = state.activeSession?.id || null;
+  const activeSessionId = currentSessionId();
   if (
-    stateGeneration !== workspaceStateGeneration || workspaceSaveConflictPending
+    stateGeneration !== workspaceStateGeneration || sessionId !== activeSessionId || workspaceSaveConflictPending
     || (Number.isFinite(saved?.revision) && saved.revision <= state.workspaceRevision)
-    || (snapshot?.session_id && snapshot.session_id !== currentSessionId)
-    || (saved?.session_id && saved.session_id !== currentSessionId)
+    || (snapshot?.session_id && snapshot.session_id !== activeSessionId)
+    || (saved?.session_id && saved.session_id !== activeSessionId)
   ) {
     return;
   }
@@ -4041,9 +4063,13 @@ async function saveWorkspaceState(snapshot = null, options = {}) {
 
 class WorkspaceStateConflictError extends Error {
   constructor(latest) {
-    super("Workspace state revision conflict");
+    const commitUncertain = latest?.code === "WORKSPACE_COMMIT_UNCERTAIN";
+    super(commitUncertain
+      ? "Workspace save could not be confirmed. Keep a copy of newer edits, then reload the app before retrying."
+      : "Workspace state revision conflict");
     this.name = "WorkspaceStateConflictError";
     this.latest = latest;
+    this.commitUncertain = commitUncertain;
   }
 }
 
@@ -4051,7 +4077,8 @@ function handleWorkspaceActionError(error) {
   console.error(error);
   if (error instanceof WorkspaceStateConflictError) {
     showToast(
-      "Workspace changed elsewhere. Reload the workspace before switching sessions.",
+      error.commitUncertain ? error.message
+        : "Workspace changed elsewhere. Reload the workspace before switching sessions.",
       "error",
       7000,
     );
@@ -4075,7 +4102,7 @@ async function flushWorkspaceState(options = {}) {
     return;
   }
   if (hasPendingConflict && !clearBypassableWorkspaceConflict(options)) {
-    throw new WorkspaceStateConflictError(null);
+    throw new WorkspaceStateConflictError(workspaceSaveConflictLatest);
   }
   if (hasQueuedChanges) {
     workspaceSaveDirty = true;
@@ -4091,7 +4118,7 @@ async function flushWorkspaceState(options = {}) {
     }
   }
   if (workspaceSaveConflictPending) {
-    throw new WorkspaceStateConflictError(null);
+    throw new WorkspaceStateConflictError(workspaceSaveConflictLatest);
   }
 }
 
@@ -16590,7 +16617,7 @@ async function sendReplay() {
     }
     _replaySendControllers.delete(sendingTabId);
     setReplaySending(false);
-    if (error instanceof WorkspaceStateConflictError) {
+    if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
       restoreReplayTabConflictState(tab, conflictSnapshot);
     }
     handleWorkspaceActionError(error);
@@ -17026,7 +17053,7 @@ async function followRedirect() {
   try {
     expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
   } catch (error) {
-    if (error instanceof WorkspaceStateConflictError) {
+    if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
       restoreReplayTabConflictState(tab, conflictSnapshot);
     }
     handleWorkspaceActionError(error);
@@ -17649,7 +17676,8 @@ function persistReplayTabMetadataEdit(tab, field, previousValue) {
     // A later snapshot may have confirmed this value while the old POST was
     // still awaiting its response. Rolling it back would let the retry overwrite
     // that committed metadata. Tokens also distinguish repeated/ABA local edits.
-    if (owners[field] === owner && tab[field] === attemptedValue
+    // A typed postcommit failure cannot prove the previous value is correct either.
+    if (!error.commitUncertain && owners[field] === owner && tab[field] === attemptedValue
       && state.workspaceRevision === revision && committedValue() === baselineValue) {
       tab[field] = previousValue;
       if (!state.replayRenamingTabId) renderReplayTabs();
@@ -23429,7 +23457,7 @@ async function wsConnect() {
       return;
     }
     if (e instanceof WorkspaceStateConflictError) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
+      if (!e.commitUncertain) restoreReplayTabConflictState(tab, conflictSnapshot);
       handleWorkspaceActionError(e);
       return;
     }

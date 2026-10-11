@@ -54,6 +54,14 @@ replacement even if a later finalization step fails. The original error still
 matters: visibility is not proof of crash durability, and callers must not infer
 that every failed operation was unapplied.
 
+Ordinary and keepalive workspace saves also retain the visible committed revision
+when finalization fails. They return HTTP 500 with
+`code: "WORKSPACE_COMMIT_UNCERTAIN"`; callers must reload before retrying. When
+the open GUI receives this response, it preserves local edits and pauses saves.
+Copy newer edits before reloading the app. An unload-only keepalive response is
+not observed by the closing page, so no recovery message is guaranteed there.
+Pre-commit failures retain the prior workspace and existing error behavior.
+
 Startup refuses ambiguous deletion quarantines before destructive cleanup or
 registry repair. Preserve the entire sessions directory for recovery. This
 startup safeguard does not automatically restore data or fence subsequent

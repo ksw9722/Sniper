@@ -961,6 +961,11 @@ impl AppState {
                 crate::workspace::WorkspaceReplaceError::Persist(error) => {
                     crate::workspace::WorkspaceReplaceError::Persist(error.to_string())
                 }
+                crate::workspace::WorkspaceReplaceError::CommittedButUncertain(error) => {
+                    crate::workspace::WorkspaceReplaceError::CommittedButUncertain(
+                        error.to_string(),
+                    )
+                }
             })?;
         if let Some(metadata) = fallback_metadata {
             self.finalize_session_persist(session, metadata)
@@ -3665,6 +3670,9 @@ mod tests {
                 assert!(message.contains("workspace snapshot is invalid"));
             }
             WorkspaceReplaceError::Conflict(_) => panic!("invalid snapshot should fail validation"),
+            WorkspaceReplaceError::CommittedButUncertain(_) => {
+                panic!("invalid snapshot must not be committed")
+            }
         }
 
         let current = session.workspace.snapshot().await;

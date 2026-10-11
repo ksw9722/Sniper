@@ -3288,6 +3288,17 @@ async fn mutate_saved_replay_tab_inner(
     }
 }
 
+fn workspace_commit_uncertain_response() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "code": "WORKSPACE_COMMIT_UNCERTAIN",
+            "error": "Workspace was saved, but durability could not be confirmed. Reload the selected session before retrying.",
+        })),
+    )
+        .into_response()
+}
+
 async fn update_workspace_state(
     State(state): State<Arc<AppState>>,
     Json(snapshot): Json<WorkspaceStateSnapshot>,
@@ -3380,6 +3391,10 @@ async fn update_workspace_state(
             tracing::warn!(%error, "failed to persist workspace state update");
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
+        Err(WorkspaceReplaceError::CommittedButUncertain(error)) => {
+            tracing::warn!(%error, "workspace state update committed with uncertain durability");
+            workspace_commit_uncertain_response()
+        }
     }
 }
 
@@ -3464,6 +3479,10 @@ async fn update_workspace_state_keepalive(
         Err(WorkspaceReplaceError::Persist(error)) => {
             tracing::warn!(%error, "failed to persist workspace keepalive update");
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(WorkspaceReplaceError::CommittedButUncertain(error)) => {
+            tracing::warn!(%error, "workspace keepalive update committed with uncertain durability");
+            workspace_commit_uncertain_response()
         }
     }
 }
@@ -15590,6 +15609,322 @@ mod tests {
         assert_eq!(durable.user_note.as_deref(), Some("durable snapshot"));
 
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    async fn workspace_commit_test_fixture(
+        name: &str,
+    ) -> (
+        Arc<AppState>,
+        PathBuf,
+        Arc<crate::session::SessionContext>,
+        WorkspaceStateSnapshot,
+    ) {
+        let (state, data_dir) = test_state(name);
+        let session = state.session().await;
+        let initial: WorkspaceStateSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id": session.id(),
+            "replay": {"tab_sequence": 1, "active_tab_id": "synthetic-tab", "tabs": [{
+                "id": "synthetic-tab", "type": "http", "sequence": 1,
+                "custom_label": "old label", "request_text": "old saved draft"
+            }]}
+        }))
+        .unwrap();
+        let initial = state
+            .replace_workspace_state_and_persist(&session, initial)
+            .await
+            .unwrap();
+        (state, data_dir, session, initial)
+    }
+
+    async fn submit_workspace_commit_test_update(
+        state: Arc<AppState>,
+        snapshot: WorkspaceStateSnapshot,
+        keepalive: bool,
+    ) -> axum::response::Response {
+        if keepalive {
+            super::update_workspace_state_keepalive(
+                State(state),
+                Json(super::WorkspaceKeepaliveUpdate {
+                    snapshot,
+                    keepalive: super::WorkspaceKeepaliveMetadata {
+                        replay_tabs_complete: true,
+                        fuzzer_complete: true,
+                        ..super::WorkspaceKeepaliveMetadata::default()
+                    },
+                }),
+            )
+            .await
+        } else {
+            super::update_workspace_state(State(state), Json(snapshot)).await
+        }
+    }
+
+    async fn assert_workspace_commit_failure_recovery(keepalive: bool, committed: bool) {
+        use crate::session::WorkspaceWriteFault;
+
+        let (state, data_dir, session, initial) =
+            workspace_commit_test_fixture("sniper-workspace-commit-recovery").await;
+        let config = state.config.clone();
+        let disk_path = session.storage_dir().join("workspace.json");
+        let initial_bytes = std::fs::read(&disk_path).unwrap();
+        let snapshot_path = session.storage_dir().join("snapshot.json");
+        let session_snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+        let mut events = session.workspace.subscribe();
+        let mut candidate = initial.clone();
+        candidate.replay.tabs[0].request_text = "new unrelated saved draft".into();
+        session.fail_next_workspace_write(if committed {
+            WorkspaceWriteFault::AfterReplacement
+        } else {
+            WorkspaceWriteFault::BeforeReplacement
+        });
+        let mut payload = serde_json::to_value(candidate).unwrap();
+        let endpoint = if keepalive {
+            payload["keepalive"] = serde_json::json!({
+                "replay_tabs_complete": true,
+                "fuzzer_complete": true,
+            });
+            "/api/workspace-state/keepalive"
+        } else {
+            "/api/workspace-state"
+        };
+        let (status, body) =
+            api_route_json(state.clone(), reqwest::Method::POST, endpoint, payload).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body.into_bytes();
+        let memory = session.workspace.snapshot().await;
+        let saved_bytes = std::fs::read(&disk_path).unwrap();
+        let durable: WorkspaceStateSnapshot = serde_json::from_slice(&saved_bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&snapshot_path).unwrap(),
+            session_snapshot_bytes
+        );
+        let expected = if committed {
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["code"], "WORKSPACE_COMMIT_UNCERTAIN");
+            assert!(error["error"]
+                .as_str()
+                .unwrap()
+                .contains("Reload the selected session before retrying"));
+            assert_ne!(saved_bytes, initial_bytes);
+            assert_eq!(memory.revision, initial.revision + 1);
+            assert_eq!(
+                memory.replay.tabs[0].request_text,
+                "new unrelated saved draft"
+            );
+            assert_eq!(events.try_recv().unwrap().revision, memory.revision);
+            assert!(events.try_recv().is_err());
+
+            // A stale label CAS must not reuse the committed revision or erase
+            // the unrelated draft that became visible despite the error.
+            let stale = super::set_saved_replay_tab_label(
+                State(state.clone()),
+                Json(super::SetSavedReplayTabLabelPayload {
+                    session_id: session.id(),
+                    tab_id: "synthetic-tab".into(),
+                    expected_workspace_revision: initial.revision,
+                    expected_active_session_id: None,
+                    label: "new label".into(),
+                }),
+            )
+            .await;
+            assert_eq!(stale.status(), StatusCode::CONFLICT);
+            let conflict: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(stale.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(conflict["revision"], memory.revision);
+            assert_eq!(std::fs::read(&disk_path).unwrap(), saved_bytes);
+            assert!(events.try_recv().is_err());
+
+            let refreshed: WorkspaceStateSnapshot = response_json(
+                super::get_workspace_state(
+                    State(state.clone()),
+                    Query(super::WorkspaceStateQuery {
+                        session_id: Some(session.id()),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(refreshed.revision, memory.revision);
+            let response = super::set_saved_replay_tab_label(
+                State(state.clone()),
+                Json(super::SetSavedReplayTabLabelPayload {
+                    session_id: session.id(),
+                    tab_id: "synthetic-tab".into(),
+                    expected_workspace_revision: refreshed.revision,
+                    expected_active_session_id: None,
+                    label: "new label".into(),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let updated: serde_json::Value = response_json(response).await;
+            assert_eq!(updated["revision"], initial.revision + 2);
+            assert_eq!(updated["tab"]["custom_label"], "new label");
+            assert_eq!(updated["tab"]["request_text"], "new unrelated saved draft");
+            assert_eq!(events.try_recv().unwrap().revision, initial.revision + 2);
+            assert!(events.try_recv().is_err());
+            session.workspace.snapshot().await
+        } else {
+            let error = std::str::from_utf8(&body).unwrap();
+            assert!(error.contains("before replacement"));
+            assert!(!error.contains("WORKSPACE_COMMIT_UNCERTAIN"));
+            assert_eq!(saved_bytes, initial_bytes);
+            assert_eq!(
+                serde_json::to_value(&memory).unwrap(),
+                serde_json::to_value(&initial).unwrap()
+            );
+            assert!(events.try_recv().is_err());
+            initial
+        };
+        drop(session);
+        drop(state);
+        let restarted = AppState::new(config).unwrap();
+        let reloaded = restarted.session().await.workspace.snapshot().await;
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_ordinary_precommit_failure_preserves_state() {
+        assert_workspace_commit_failure_recovery(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_keepalive_precommit_failure_preserves_state() {
+        assert_workspace_commit_failure_recovery(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_ordinary_uncertainty_rejects_stale_label_and_preserves_draft() {
+        assert_workspace_commit_failure_recovery(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_keepalive_uncertainty_rejects_stale_label_and_preserves_draft() {
+        assert_workspace_commit_failure_recovery(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_cancellation_before_write_preserves_state() {
+        for keepalive in [false, true] {
+            let (state, data_dir, session, initial) =
+                workspace_commit_test_fixture("sniper-workspace-precommit-cancel").await;
+            let config = state.config.clone();
+            let path = session.storage_dir().join("workspace.json");
+            let before = std::fs::read(&path).unwrap();
+            let mut events = session.workspace.subscribe();
+            let guard = session.mutation_guard().await;
+            let mut candidate = initial.clone();
+            candidate.replay.tabs[0].request_text = "cancelled draft".into();
+            let mut request = tokio::spawn(submit_workspace_commit_test_update(
+                state.clone(),
+                candidate,
+                keepalive,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut request)
+                    .await
+                    .is_err()
+            );
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            drop(guard);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(session.workspace.snapshot().await).unwrap(),
+                serde_json::to_value(&initial).unwrap()
+            );
+            assert!(events.try_recv().is_err());
+            drop(session);
+            drop(state);
+            let restarted = AppState::new(config).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.session().await.workspace.snapshot().await).unwrap(),
+                serde_json::to_value(&initial).unwrap()
+            );
+            drop(restarted);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_commit_cancellation_after_replacement_publishes_state() {
+        for keepalive in [false, true] {
+            for uncertain in [false, true] {
+                let (state, data_dir, session, initial) =
+                    workspace_commit_test_fixture("sniper-workspace-postcommit-cancel").await;
+                let config = state.config.clone();
+                let path = session.storage_dir().join("workspace.json");
+                let mut events = session.workspace.subscribe();
+                let mut candidate = initial;
+                candidate.replay.tabs[0].request_text = "committed before cancellation".into();
+                if uncertain {
+                    session.fail_next_workspace_write(
+                        crate::session::WorkspaceWriteFault::AfterReplacement,
+                    );
+                }
+                let (entered, release) = session.pause_next_workspace_commit();
+                let request = tokio::spawn(submit_workspace_commit_test_update(
+                    state.clone(),
+                    candidate,
+                    keepalive,
+                ));
+                tokio::time::timeout(Duration::from_secs(2), entered)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let committed: WorkspaceStateSnapshot =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                request.abort();
+                release.send(()).unwrap();
+                match tokio::time::timeout(Duration::from_secs(2), request)
+                    .await
+                    .unwrap()
+                {
+                    Ok(response) => assert_eq!(
+                        response.status(),
+                        if uncertain {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::OK
+                        }
+                    ),
+                    Err(error) => assert!(error.is_cancelled()),
+                }
+                assert_eq!(
+                    serde_json::to_value(session.workspace.snapshot().await).unwrap(),
+                    serde_json::to_value(&committed).unwrap()
+                );
+                assert_eq!(
+                    committed.replay.tabs[0].request_text,
+                    "committed before cancellation"
+                );
+                assert_eq!(events.try_recv().unwrap().revision, committed.revision);
+                assert!(events.try_recv().is_err());
+                drop(session);
+                drop(state);
+                let restarted = AppState::new(config).unwrap();
+                assert_eq!(
+                    serde_json::to_value(restarted.session().await.workspace.snapshot().await)
+                        .unwrap(),
+                    serde_json::to_value(&committed).unwrap()
+                );
+                drop(restarted);
+                std::fs::remove_dir_all(data_dir).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
