@@ -770,3 +770,48 @@ fn invalid_saved_reads_point_to_input_schemas_not_mutation_receipts() {
         assert_eq!(output["error"]["details"]["outcome"], "not_applied");
     }
 }
+
+#[test]
+fn session_creation_discloses_activation_in_discovery_and_offline_previews() {
+    let f = Fixture::new();
+    let direct = f.cli(
+        &["--dry-run", "session", "create", "--name", "Offline review"],
+        0,
+    );
+    let called = f.call("session.create", json!({"name":"Offline review"}), 0);
+    assert_eq!(direct, called["data"]);
+    assert_eq!(direct["api"]["method"], "POST");
+    assert_eq!(direct["api"]["path"], "/api/sessions");
+    let notes = direct["notes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("new session becomes the active session")),
+        "{direct}"
+    );
+    assert!(notes.iter().any(|note| note
+        .as_str()
+        .unwrap()
+        .contains("does not create or activate")));
+    assert!(notes
+        .iter()
+        .any(|note| note.as_str().unwrap().contains("Use --yes")));
+    for manifest in [
+        f.cli(&["manifest"], 0),
+        f.cli(&["call", "manifest"], 0)["data"].clone(),
+    ] {
+        let create = manifest["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|spec| spec["operation"] == "session.create")
+            .unwrap();
+        assert!(create["description"]
+            .as_str()
+            .unwrap()
+            .contains("Create and activate"));
+        assert_eq!(create["side_effect"], "write");
+        assert_eq!(create["requires_confirmation"], true);
+    }
+}

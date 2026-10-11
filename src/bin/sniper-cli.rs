@@ -525,6 +525,7 @@ struct ProxyChainArgs {
 #[derive(Subcommand, Debug)]
 enum SessionCommand {
     List,
+    /// Create and activate a new Sniper session.
     Create(CreateSessionArgs),
     Switch(SessionSwitchArgs),
     Delete(SessionDeleteArgs),
@@ -534,6 +535,7 @@ enum SessionCommand {
 
 #[derive(Args, Debug)]
 struct CreateSessionArgs {
+    /// Optional name for the new session.
     #[arg(long)]
     name: Option<String>,
 }
@@ -2475,7 +2477,7 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         op(
             "session.create",
             "session create",
-            "Create a Sniper session.",
+            "Create and activate a new Sniper session.",
             Write,
             false,
             &[],
@@ -4824,6 +4826,14 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
     let mut notes = Vec::new();
     if command.requires_confirmation() {
         notes.push("Use --yes to apply this side-effecting operation after reviewing the dry-run.");
+    }
+    if matches!(
+        command,
+        Command::Session {
+            command: SessionCommand::Create(_)
+        }
+    ) {
+        notes.push("On success, the new session becomes the active session; this preview does not create or activate a session.");
     }
     if matches!(
         command.operation_name(),

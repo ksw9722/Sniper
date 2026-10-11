@@ -391,6 +391,10 @@ fn saved_discovery_and_skill_help_explain_read_only_workflows_offline() {
             ],
         ),
         (
+            vec!["session", "create", "--help"],
+            vec!["Create and activate", "new Sniper session", "Optional name"],
+        ),
+        (
             vec!["skills", "status", "--help"],
             vec![
                 "this CLI host",
