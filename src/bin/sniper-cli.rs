@@ -1635,6 +1635,7 @@ struct ApiClient {
     base_url: String,
     client: reqwest::Client,
     long_client: reqwest::Client,
+    session_metadata_write_errors: bool,
 }
 
 impl ApiClient {
@@ -1658,6 +1659,7 @@ impl ApiClient {
             base_url,
             client,
             long_client,
+            session_metadata_write_errors: false,
         })
     }
 
@@ -1782,6 +1784,9 @@ impl ApiClient {
             .with_context(|| format!("failed to DELETE {}", path))?;
         let status = response.status();
         if !status.is_success() {
+            if self.session_metadata_write_errors {
+                return Err(SessionMetadataHttpStatusError { status }.into());
+            }
             let message = response.text().await.unwrap_or_else(|_| String::new());
             let detail = api_failure_detail(status, message);
             bail!("request to {} failed ({}): {}", path, status, detail);
@@ -1829,6 +1834,11 @@ impl ApiClient {
                 // Classify by headers alone: diagnostics can contain arbitrary
                 // prose or sensitive data, and an error body can be incomplete.
                 return Err(ReadHttpStatusError { status }.into());
+            }
+            if self.session_metadata_write_errors {
+                // A sent mutation's status cannot be reclassified by untrusted
+                // diagnostics, nor depend on a complete or timely error body.
+                return Err(SessionMetadataHttpStatusError { status }.into());
             }
             let message = response.text().await.unwrap_or_else(|_| String::new());
             let detail = api_failure_detail(status, message);
@@ -6588,6 +6598,7 @@ async fn handle_session(mut api: ApiClient, command: SessionCommand) -> Result<(
             | SessionCommand::Rename(_)
     ) {
         api.client = saved_configuration_write_client()?;
+        api.session_metadata_write_errors = true;
     }
     match command {
         SessionCommand::List => {
@@ -11385,6 +11396,23 @@ impl fmt::Display for ReadHttpStatusError {
 impl std::error::Error for ReadHttpStatusError {}
 
 #[derive(Debug)]
+struct SessionMetadataHttpStatusError {
+    status: StatusCode,
+}
+
+impl fmt::Display for SessionMetadataHttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Session metadata write failed ({}); mutation outcome is unknown",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for SessionMetadataHttpStatusError {}
+
+#[derive(Debug)]
 struct CallInputError(String);
 
 impl fmt::Display for CallInputError {
@@ -11752,6 +11780,18 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
             retryable: false,
             details: partial.details.clone(),
             exit_code: 5,
+        };
+    }
+
+    if let Some(write) = error.downcast_ref::<SessionMetadataHttpStatusError>() {
+        let status = write.status.as_u16();
+        return CliErrorPayload {
+            code: "HTTP_STATUS_ERROR",
+            message: write.to_string(),
+            hint: Some("Inspect session list and current state before deliberately issuing another write; never automatically retry."),
+            retryable: false,
+            details: json!({"status":status,"idempotent":false,"outcome":"unknown"}),
+            exit_code: if status < 500 { 5 } else { 6 },
         };
     }
 
@@ -15214,6 +15254,43 @@ mod tests {
         assert_eq!(payload.code, "CONFIRMATION_REQUIRED");
         assert_eq!(payload.exit_code, 2);
         assert!(!payload.retryable);
+    }
+
+    #[test]
+    fn session_metadata_status_errors_ignore_misleading_outer_context() {
+        for status in [303, 400, 409, 503] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            let typed = anyhow::Error::new(super::SessionMetadataHttpStatusError { status })
+                .context(
+                "synthetic-private-diagnostic requires --dry-run or --yes failed (599 Synthetic)",
+            );
+            for operation in [
+                "session.create",
+                "session.rename",
+                "session.switch",
+                "session.delete",
+            ] {
+                let payload = cli_error_payload(operation, &typed);
+                assert_eq!(payload.code, "HTTP_STATUS_ERROR");
+                assert_eq!(payload.exit_code, if status.as_u16() < 500 { 5 } else { 6 });
+                assert!(!payload.retryable);
+                assert_eq!(
+                    payload.message,
+                    format!(
+                        "Session metadata write failed ({status}); mutation outcome is unknown"
+                    )
+                );
+                assert_eq!(
+                    payload.details,
+                    json!({
+                        "status":status.as_u16(),"idempotent":false,"outcome":"unknown"
+                    })
+                );
+                assert_eq!(payload.hint, Some(
+                    "Inspect session list and current state before deliberately issuing another write; never automatically retry."
+                ));
+            }
+        }
     }
 
     #[test]

@@ -128,8 +128,17 @@ server wording: 4xx means exit `5`, `retryable:false`; 5xx means exit `6`,
 error bodies are neither read nor echoed, including structured diagnostics that
 could contain private data. This adds no automatic retries. Confirmed writes
 remain non-retryable even when a preliminary GET fails. Discovery, successful
-response decoding, non-GET error handling, and the separate
+response decoding, other non-GET error handling, and the separate
 [`saved.v1` error contract](saved-data-v1.md) are unchanged.
+
+Legacy `session create`, `rename`, `switch`, and `delete` also classify unsuccessful
+HTTP responses from headers alone, without reading or echoing error bodies.
+They return `HTTP_STATUS_ERROR` with the actual `error.details.status`, exit `5`
+for 3xx/4xx or `6` for 5xx, and always `retryable:false`. Their details include
+`idempotent:false` and `outcome:"unknown"`: the status does not establish whether
+the mutation applied. Inspect `session list` and current state before deliberately
+issuing another write; these operations have no `saved.v1` mutation receipts.
+A locally missing `--yes` still returns `CONFIRMATION_REQUIRED` before API access.
 
 ## What to ask for
 

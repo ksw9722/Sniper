@@ -21,7 +21,9 @@ announcement. The package version remains `0.3.0` until release preparation.
 - Legacy session create, rename, switch, and delete send the mutation once without
   following redirects or retrying it. Rename and switch also require the returned
   session UUID to match the requested UUID; equivalent spellings remain accepted.
-  A mismatched acknowledgement leaves the mutation outcome unknown.
+  A mismatched acknowledgement leaves the mutation outcome unknown. Unsuccessful
+  HTTP responses use the received status without reading or echoing error bodies;
+  these failures report an unknown outcome and remain non-retryable.
 - Inspect `saved.v1` mutation receipts after uncertain outcomes. Legacy session
   and saved-tab metadata operations do not provide these receipts. Do not
   automatically repeat a mutation just because its response was lost or invalid.
