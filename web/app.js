@@ -617,6 +617,7 @@ const els = {
   proxyShell: document.getElementById("proxyShell"),
   replayShell: document.getElementById("replayShell"),
   toolsShell: document.getElementById("toolsShell"),
+  toolsLoadError: document.getElementById("toolsLoadError"),
   toolsActiveToolTitle: document.getElementById("toolsActiveToolTitle"),
   replayTabStrip: document.getElementById("replayTabStrip"),
   newReplayTabButton: document.getElementById("newReplayTabButton"),
@@ -8446,7 +8447,10 @@ function renderToolPanels() {
   if (decoderVisible) {
     ensureDecoderWorkbench().catch((error) => {
       console.error(error);
-      // Tools load failed
+      // Keep late failures on this panel and avoid re-announcing a cached failure.
+      if (state.activeTool === "tools" && els.toolsLoadError.classList.contains("hidden")) {
+        els.toolsLoadError.classList.remove("hidden");
+      }
     });
     els.footerMode.textContent = "Tools active";
     return;
