@@ -429,6 +429,7 @@ const state = {
   sessions: [],
   activeSession: null,
   selectedSessionId: null,
+  dashboardStorageSessionId: null,
   sessionSortKey: "created_at",
   sessionSortDir: "desc",
   activeTool: "proxy",
@@ -1675,7 +1676,7 @@ function bindEvents() {
   onClickWithProgress(els.dashboardCreateSessionButton, () =>
     createSession().catch(handleWorkspaceActionError));
   onClickWithProgress(els.dashboardOpenStorageBtn, () => {
-    const sessionId = state.selectedSessionId || state.activeSession?.id || state.sessions.find((s) => s.active)?.id;
+    const sessionId = state.dashboardStorageSessionId;
     if (!sessionId) return undefined;
     return revealSessionFolder(sessionId).catch((error) => {
       console.error(error);
@@ -8626,6 +8627,9 @@ function renderDashboard() {
     state.selectedSessionId = activeSession.id;
   }
   const current = state.sessions.find((s) => s.id === state.selectedSessionId) || activeSession;
+  // Activation changes selection before its reload finishes. Keep folder opens
+  // bound to the path still on screen if that reload is delayed or fails.
+  state.dashboardStorageSessionId = current?.id || null;
   els.dashboardCurrentSessionName.textContent = current?.name || "No active session";
   const isActive = Boolean(current && (current.active || current.id === activeSession?.id));
   els.dashboardCurrentSessionStatus.textContent = current ? (isActive ? "Active" : "Stored") : "No session";
@@ -8782,7 +8786,11 @@ async function revealSessionFolder(sessionId) {
   });
   await requireOkResponse(response, "Failed to open session folder.");
   const result = await response.json().catch(() => null);
-  showToast(result?.path ? `Opened ${result.path}` : "Session folder opened.");
+  if (!result || typeof result !== "object" || Array.isArray(result)
+    || result.ok !== true || typeof result.path !== "string" || !result.path.trim()) {
+    throw new Error("Could not confirm the session folder opened. Reload sessions before trying again.");
+  }
+  showToast(`Opened ${result.path}`);
 }
 
 function closeSessionContextMenu() {
