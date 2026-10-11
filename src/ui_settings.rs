@@ -707,7 +707,7 @@ fn default_history_column_widths() -> BTreeMap<String, u16> {
         ("length".to_string(), 104),
         ("method".to_string(), 110),
         ("mime".to_string(), 128),
-        ("notes".to_string(), 90),
+        ("notes".to_string(), 220),
         ("path".to_string(), 420),
         ("started_at".to_string(), 176),
         ("status".to_string(), 110),
@@ -1031,6 +1031,93 @@ mod tests {
                     expected_json
                 );
                 assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_fresh_notes_width_matches_frontend_default_after_reload() {
+        let data_dir = TestDataDir::new();
+        let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+        let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+        assert_eq!(store.snapshot().await.history_column_widths["notes"], 220);
+        let bytes = std::fs::read(&path).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(disk["history_column_widths"]["notes"], 220);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        drop(store);
+        let reloaded = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+        assert_eq!(
+            reloaded.snapshot().await.history_column_widths["notes"],
+            220
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_settings_omitted_notes_width_uses_default_without_rewriting_saved_bytes() {
+        for omit_map in [false, true] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let mut value: serde_json::Value = serde_json::from_slice(&saved_settings_fixture(
+                serde_json::json!({"server_revision": 7}),
+            ))
+            .unwrap();
+            if omit_map {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("history_column_widths");
+            }
+            let bytes = serde_json::to_vec_pretty(&value).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            for _ in 0..2 {
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                let snapshot = store.snapshot().await;
+                assert_eq!(snapshot.history_column_widths["notes"], 220);
+                assert_eq!(
+                    snapshot.history_column_widths["host"],
+                    if omit_map { 320 } else { 444 }
+                );
+                assert_eq!(snapshot.http_query, "saved query");
+                assert_eq!(snapshot.server_revision, 7);
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    modified
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_explicit_notes_width_survives_reload_without_migration() {
+        for width in [90, 310, 640] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let bytes = saved_settings_fixture(serde_json::json!({
+                "server_revision": 9,
+                "history_column_widths": {"notes": width, "host": 444}
+            }));
+            std::fs::write(&path, &bytes).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            for _ in 0..2 {
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                let snapshot = store.snapshot().await;
+                assert_eq!(snapshot.history_column_widths["notes"], width);
+                assert_eq!(snapshot.history_column_widths["host"], 444);
+                assert_eq!(snapshot.http_query, "saved query");
+                assert_eq!(snapshot.server_revision, 9);
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    modified
+                );
             }
         }
     }
