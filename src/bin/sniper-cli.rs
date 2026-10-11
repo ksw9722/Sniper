@@ -4881,20 +4881,23 @@ fn command_from_call_args(args: CallArgs) -> Result<Command> {
 fn parse_call_input(source: Option<String>) -> Result<Value> {
     // Local paths may contain words used by the legacy error classifier. Keep
     // input failures typed so those words cannot change the code or retry hint.
-    load_call_input(source).map_err(|error| anyhow!(CallInputError(error.to_string())))
+    load_call_input(source).map_err(Into::into)
 }
 
-fn load_call_input(source: Option<String>) -> Result<Value> {
+fn load_call_input(source: Option<String>) -> std::result::Result<Value, CallInputError> {
     let Some(source) = source else {
         return Ok(json!({}));
     };
     let raw = if source == "-" {
-        read_text_input(None, true)?
+        read_text_input(None, true).map_err(|error| CallInputError::Source(error.to_string()))?
     } else if let Some(path) = source.strip_prefix('@') {
         if path.is_empty() {
-            bail!("call --input @ requires a file path");
+            return Err(CallInputError::Source(
+                "call --input @ requires a file path".into(),
+            ));
         }
-        read_text_input(Some(PathBuf::from(path)), false)?
+        read_text_input(Some(PathBuf::from(path)), false)
+            .map_err(|error| CallInputError::Source(error.to_string()))?
     } else {
         source
     };
@@ -4902,7 +4905,7 @@ fn load_call_input(source: Option<String>) -> Result<Value> {
     if trimmed.is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(trimmed).context("failed to parse call input JSON")
+    serde_json::from_str(trimmed).map_err(|_| CallInputError::JsonSyntax)
 }
 
 fn command_from_operation_input(operation: &str, input: &Value) -> Result<Command> {
@@ -11264,14 +11267,9 @@ async fn run_saved_call(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    let input = parse_call_input(args.input).map_err(|_| {
-        saved_cli_error(
-            "INVALID_INPUT",
-            "Could not parse saved-data input JSON",
-            "not_applied",
-            &Value::Null,
-        )
-    })?;
+    // Sanitize before propagation too: stdout failures can print the original
+    // error chain rather than the JSON payload.
+    let input = load_call_input(args.input).map_err(CallInputError::for_saved_input)?;
     let operation = args.operation;
     if saved_operation_name(&operation).is_none() {
         return Err(saved_cli_error(
@@ -11507,11 +11505,28 @@ impl fmt::Display for MetadataAcknowledgementError {
 impl std::error::Error for MetadataAcknowledgementError {}
 
 #[derive(Debug)]
-struct CallInputError(String);
+enum CallInputError {
+    Source(String),
+    SavedSource,
+    JsonSyntax,
+}
+
+impl CallInputError {
+    fn for_saved_input(self) -> Self {
+        match self {
+            Self::Source(_) => Self::SavedSource,
+            other => other,
+        }
+    }
+}
 
 impl fmt::Display for CallInputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        match self {
+            Self::Source(message) => formatter.write_str(message),
+            Self::SavedSource => formatter.write_str("Could not read saved-data input source"),
+            Self::JsonSyntax => formatter.write_str("failed to parse call input JSON"),
+        }
     }
 }
 
@@ -11777,14 +11792,36 @@ fn clap_error_payload(error: &clap::Error) -> CliErrorPayload {
 
 fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload {
     if let Some(input) = error.downcast_ref::<CallInputError>() {
+        let saved = operation.starts_with("saved.v1.");
+        // Preserve the failure phase without exposing saved input paths,
+        // contents, or parser excerpts in diagnostics.
+        let (message, hint) = if saved {
+            match input {
+                CallInputError::Source(_) | CallInputError::SavedSource => (
+                    "Could not read saved-data input source".to_owned(),
+                    "Check a readable regular UTF-8 @file or UTF-8 stdin within the input size limit; then inspect `sniper-cli schema input <operation>`.",
+                ),
+                CallInputError::JsonSyntax => (
+                    "Could not parse saved-data input JSON".to_owned(),
+                    "Correct the JSON syntax in --input, @file, or stdin; see `sniper-cli examples <operation>` and `sniper-cli schema input <operation>`.",
+                ),
+            }
+        } else {
+            (
+                input.to_string(),
+                "Check `sniper-cli schema input <operation>` or run the command with --help.",
+            )
+        };
         return CliErrorPayload {
             code: "INVALID_INPUT",
-            message: input.to_string(),
-            hint: Some(
-                "Check `sniper-cli schema input <operation>` or run the command with --help.",
-            ),
+            message,
+            hint: Some(hint),
             retryable: false,
-            details: json!({ "operation": operation }),
+            details: if saved {
+                json!({"outcome":"not_applied","operation_id":null,"session_id":null})
+            } else {
+                json!({ "operation": operation })
+            },
             exit_code: 2,
         };
     }
@@ -12801,6 +12838,19 @@ mod tests {
             active_session_id_from_summaries(&sessions).unwrap(),
             Some(active)
         );
+    }
+
+    #[test]
+    fn saved_call_input_errors_discard_source_details_before_propagation() {
+        let private = "SYNTHETIC_PRIVATE_SOURCE_PATH";
+        let legacy = super::CallInputError::Source(private.into());
+        assert_eq!(legacy.to_string(), private);
+        let saved: anyhow::Error = legacy.for_saved_input().into();
+        assert_eq!(saved.to_string(), "Could not read saved-data input source");
+        assert!(!format!("{saved:#}").contains(private));
+        assert!(!format!("{saved:?}").contains(private));
+        let syntax = super::CallInputError::JsonSyntax.for_saved_input();
+        assert_eq!(syntax.to_string(), "failed to parse call input JSON");
     }
 
     #[test]

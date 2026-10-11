@@ -145,6 +145,12 @@ Session rename accepts already trimmed names of at most 256 UTF-8 bytes with no
 control characters. An ordinary JSON Schema validator alone does not implement
 these annotated checks; the shared runtime validator does.
 
+Input errors are diagnosed before contacting an API. An unreadable, non-regular,
+oversized, or non-UTF-8 file/stdin source gets source-read guidance; malformed
+JSON gets syntax guidance. Valid JSON that violates the operation contract gets
+schema guidance. These remain `INVALID_INPUT`, exit status `2`, and
+`outcome: "not_applied"`; diagnostics do not echo paths or input contents.
+
 The v1 CLI error envelope retains `error.code`, `message`, `hint`, `retryable`,
 and `details`, with `schema_version:"saved.v1"`. `details` includes mutation
 `outcome`, `operation_id`, and `session_id` when parseable. All v1 errors set

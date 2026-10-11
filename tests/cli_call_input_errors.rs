@@ -184,3 +184,108 @@ fn unreadable_input_is_invalid_when_permissions_are_enforced() {
     }
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 }
+
+#[test]
+fn saved_input_guidance_distinguishes_source_json_and_schema_errors() {
+    let f = Fixture::new();
+    let operation = "saved.v1.session.list";
+    let invalid_utf8 = f.root.join("SYNTHETIC_PRIVATE_SOURCE.json");
+    fs::write(&invalid_utf8, b"\xff SYNTHETIC_PRIVATE_CONTENT").unwrap();
+    for (source, stdin) in [
+        (
+            Fixture::source(&f.root.join("SYNTHETIC_PRIVATE_MISSING.json")),
+            b"".as_slice(),
+        ),
+        (Fixture::source(&f.root), b"".as_slice()),
+        (Fixture::source(&invalid_utf8), b"".as_slice()),
+        ("-".into(), b"\xff SYNTHETIC_PRIVATE_CONTENT".as_slice()),
+        ("@".into(), b"".as_slice()),
+    ] {
+        let result = f.invalid(operation, &source, stdin);
+        assert_eq!(
+            result["error"]["message"],
+            "Could not read saved-data input source"
+        );
+        let hint = result["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("readable regular UTF-8"));
+        assert!(hint.contains("stdin"));
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE"));
+    }
+    let malformed = b"{\"SYNTHETIC_PRIVATE_CONTENT\":";
+    let path = f.root.join("SYNTHETIC_PRIVATE_JSON.json");
+    fs::write(&path, malformed).unwrap();
+    for (source, stdin) in [
+        (
+            String::from_utf8(malformed.to_vec()).unwrap(),
+            b"".as_slice(),
+        ),
+        (Fixture::source(&path), b"".as_slice()),
+        ("-".into(), malformed.as_slice()),
+    ] {
+        let result = f.invalid(operation, &source, stdin);
+        assert_eq!(
+            result["error"]["message"],
+            "Could not parse saved-data input JSON"
+        );
+        assert!(result["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("Correct the JSON syntax"));
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE"));
+    }
+    let schema = f.invalid(operation, "{\"limit\":0}", b"");
+    assert_eq!(
+        schema["error"]["message"],
+        "Input does not satisfy the saved-data schema"
+    );
+    assert!(!schema["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("Correct the JSON syntax"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn saved_input_stderr_fallback_never_exposes_source_or_content() {
+    let f = Fixture::new();
+    for source in [
+        Fixture::source(&f.root.join("SYNTHETIC_PRIVATE_PATH.json")),
+        "{\"SYNTHETIC_PRIVATE_CONTENT\":".to_owned(),
+    ] {
+        // /dev/full reliably fails writes; read-only stdout handles may be ignored
+        // by Rust instead of reaching the stderr fallback.
+        let output = Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
+            .env_clear()
+            .env("HOME", f.root.join("home"))
+            .env("USERPROFILE", f.root.join("home"))
+            .env("SNIPER_DATA_DIR", f.root.join("data"))
+            .args([
+                "--api",
+                &format!("http://{}", f.listener.local_addr().unwrap()),
+                "call",
+                "saved.v1.session.list",
+                "--input",
+                &source,
+            ])
+            .stdout(Stdio::from(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap(),
+            ))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("original error"), "{error}");
+        assert!(!error.contains("SYNTHETIC_PRIVATE"), "{error}");
+        assert!(!error.contains(f.root.to_str().unwrap()), "{error}");
+        assert_eq!(
+            f.listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!f.root.join("data").exists());
+        assert!(!f.root.join("home").exists());
+    }
+}
