@@ -8921,6 +8921,7 @@ const BUILTIN_RULE_LABELS = {
 const BUILTIN_FINDING_CATEGORIES = new Set(Object.keys(BUILTIN_RULE_LABELS));
 
 let selectedFindingId = null;
+let findingsDetailGeneration = 0;
 
 async function loadFindings() {
   const sessionId = currentSessionId();
@@ -9059,6 +9060,7 @@ function handleFindingEvent(event) {
 }
 
 function clearFindingDetail() {
+  findingsDetailGeneration += 1;
   selectedFindingId = null;
   if (els.findingsDetailJump) {
     delete els.findingsDetailJump.dataset.recordId;
@@ -9374,34 +9376,41 @@ function renderFindingsVirtual() {
 
 async function loadFindingDetail(id) {
   const sessionId = currentSessionId();
+  const generation = ++findingsDetailGeneration;
+  // Returning to the same finding or session must not revive an earlier read.
+  const isCurrent = () => generation === findingsDetailGeneration
+    && sessionId === currentSessionId()
+    && selectedFindingId === id;
   if (selectedFindingId === id && els.findingsDetailJump) {
     delete els.findingsDetailJump.dataset.recordId;
     renderFindingDetailLoading();
   }
   try {
     const res = await fetch(sessionQueryPath(`/api/findings/${encodeURIComponent(id)}`, sessionId));
-    if (currentSessionId() !== sessionId || selectedFindingId !== id) return;
+    if (!isCurrent()) return;
     if (!res.ok) {
       clearFindingDetail();
       return;
     }
     const finding = await res.json();
-    if (currentSessionId() !== sessionId) return;
-    if (selectedFindingId !== id) return;
+    if (!isCurrent()) return;
     // Also fetch the transaction record for request/response
     let record = null;
     try {
       const tRes = await fetch(transactionPath(finding.record_id, sessionId));
-      if (tRes.ok) record = await tRes.json();
-    } catch (_) { /* silent */ }
-    if (currentSessionId() !== sessionId) return;
-    if (selectedFindingId !== id) return;
+      if (!isCurrent()) return;
+      if (tRes.ok) {
+        record = await tRes.json();
+        if (!isCurrent()) return;
+      }
+    } catch (_) {
+      if (!isCurrent()) return;
+    }
     showFindingDetail(finding, record);
   } catch (error) {
+    if (!isCurrent()) return;
     console.error("Failed to load finding detail:", error);
-    if (selectedFindingId === id && sessionId === currentSessionId()) {
-      clearFindingDetail();
-    }
+    clearFindingDetail();
   }
 }
 
