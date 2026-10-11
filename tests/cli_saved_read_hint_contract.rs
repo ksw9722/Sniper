@@ -80,6 +80,18 @@ impl Fixture {
         status: StatusCode,
         body: String,
     ) -> Value {
+        self.served_response_exit(operation, input, status, body, 5)
+            .await
+    }
+
+    async fn served_response_exit(
+        &self,
+        operation: &str,
+        input: Value,
+        status: StatusCode,
+        body: String,
+        exit: i32,
+    ) -> Value {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -111,7 +123,7 @@ impl Fixture {
             );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let result = self
-            .call(&format!("http://{addr}"), operation, input, 5)
+            .call(&format!("http://{addr}"), operation, input, exit)
             .await;
         server.abort();
         let _ = server.await;
@@ -442,4 +454,111 @@ async fn receipt_lookup_mutation_unknown_operation_and_unknown_outcome_keep_rece
         .await;
     assert_eq!(unknown["error"]["details"]["outcome"], "unknown");
     assert_eq!(unknown["error"]["hint"], RECEIPT_HINT);
+}
+
+#[tokio::test]
+async fn known_reads_rejected_by_the_server_explain_api_compatibility() {
+    let f = Fixture::new();
+    for (operation, input, session_id) in [
+        ("saved.v1.session.list", json!({"limit":1}), Value::Null),
+        (
+            "saved.v1.http.list",
+            json!({"session_id":SESSION_ID}),
+            json!(SESSION_ID),
+        ),
+    ] {
+        let result = f
+            .served_response_exit(
+                operation,
+                input,
+                StatusCode::BAD_REQUEST,
+                wire_error(
+                    "UNKNOWN_OPERATION",
+                    "not_applied",
+                    Value::Null,
+                    session_id.clone(),
+                )
+                .to_string(),
+                2,
+            )
+            .await;
+        assert_eq!(result["error"]["code"], "UNKNOWN_OPERATION");
+        assert_eq!(result["error"]["message"], "Synthetic metadata error");
+        assert_eq!(
+            result["error"]["details"],
+            json!({"outcome":"not_applied","operation_id":null,"session_id":session_id})
+        );
+        assert_eq!(result["warnings"], json!([]));
+        let hint = result["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("selected API does not recognize"), "{result}");
+        assert!(
+            hint.contains("compatibility of the CLI and running Sniper app"),
+            "{result}"
+        );
+        assert!(
+            hint.contains("never automatically retry a mutation"),
+            "{result}"
+        );
+        assert!(!hint.contains("outdated"), "{result}");
+    }
+}
+
+#[tokio::test]
+async fn compatibility_guidance_requires_a_validated_ordinary_read_error() {
+    let f = Fixture::new();
+    let lookup = f
+        .served_response_exit(
+            "saved.v1.operation.get",
+            json!({"operation_id":OPERATION_ID}),
+            StatusCode::BAD_REQUEST,
+            wire_error(
+                "UNKNOWN_OPERATION",
+                "not_applied",
+                json!(OPERATION_ID),
+                Value::Null,
+            )
+            .to_string(),
+            2,
+        )
+        .await;
+    assert_eq!(lookup["error"]["hint"], RECEIPT_HINT);
+    for body in [
+        "API endpoint not found".to_owned(),
+        "Synthetic private response".to_owned(),
+        wire_error(
+            "UNKNOWN_OPERATION",
+            "not_applied",
+            Value::Null,
+            json!(SESSION_ID),
+        )
+        .to_string(),
+    ] {
+        let result = f
+            .served_response(
+                "saved.v1.session.list",
+                json!({}),
+                StatusCode::NOT_FOUND,
+                body,
+            )
+            .await;
+        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+        assert!(
+            !result["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("compatibility"),
+            "{result}"
+        );
+        assert!(!result.to_string().contains("Synthetic private response"));
+    }
+    let uncertain = f
+        .served_response_exit(
+            "saved.v1.session.list",
+            json!({}),
+            StatusCode::BAD_REQUEST,
+            wire_error("UNKNOWN_OPERATION", "unknown", Value::Null, Value::Null).to_string(),
+            2,
+        )
+        .await;
+    assert_eq!(uncertain["error"]["hint"], RECEIPT_HINT);
 }

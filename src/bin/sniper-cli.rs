@@ -11894,6 +11894,7 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
                 "STALE_CONTINUATION" => "Discard the stale continuation and deliberately start a fresh listing with the same explicit session_id. Treat it as a new traversal, not a continuation of earlier results.",
                 "SESSION_NOT_FOUND" => "Use saved.v1.session.list to inspect available sessions, then deliberately select an existing session UUID. Do not silently switch sessions.",
                 "API_UNAVAILABLE" => "Check the selected API endpoint and that Sniper is running, then deliberately rerun this read.",
+                "UNKNOWN_OPERATION" => "The selected API does not recognize this saved-data operation. Check the intended API and compatibility of the CLI and running Sniper app before deliberately rerunning this read; never automatically retry a mutation.",
                 _ => "Inspect the error and selected API/session context before deliberately rerunning this read; never automatically retry a mutation.",
             }
         } else {
