@@ -39,7 +39,7 @@ use crate::{
     },
     websocket::{sessions_with_live_preserved, trim_frame_overflow, WebSocketStore},
     workspace::{
-        transform_saved_http_tab, validate_workspace_serialized_size, SavedHttpTabOperation,
+        transform_saved_replay_tab, validate_workspace_serialized_size, SavedReplayTabOperation,
         WorkspaceReplaceError, WorkspaceTransformError,
     },
     workspace::{WorkspaceStateSnapshot, WorkspaceStateStore},
@@ -616,11 +616,11 @@ impl SessionContext {
             .await
     }
 
-    pub(crate) async fn mutate_saved_http_tab_and_persist(
+    pub(crate) async fn mutate_saved_replay_tab_and_persist(
         &self,
         tab_id: &str,
         expected_revision: u64,
-        operation: SavedHttpTabOperation,
+        operation: SavedReplayTabOperation,
     ) -> std::result::Result<WorkspaceStateSnapshot, WorkspaceTransformError<anyhow::Error>> {
         let _mutation_guard = self.mutation_lock.lock().await;
         let _persist_guard = self.persist_lock.lock().await;
@@ -629,7 +629,7 @@ impl SessionContext {
             .transform_snapshot_checked_persisting(
                 expected_revision,
                 |current| {
-                    let mut next = transform_saved_http_tab(current, tab_id, operation)?;
+                    let mut next = transform_saved_replay_tab(current, tab_id, operation)?;
                     next.session_id = Some(self.id());
                     next.revision = expected_revision + 1;
                     next.expected_active_session_id = None;

@@ -1294,6 +1294,10 @@ struct ResponseInterceptDropArgs {
 enum InterceptRuleCommand {
     List(InterceptRuleSessionArgs),
     Create(InterceptRuleCreateArgs),
+    /// Change explicitly supplied fields on an existing saved rule.
+    Update(InterceptRuleUpdateArgs),
+    /// Assign an existing rule's enabled state; never toggles or creates it.
+    SetEnabled(InterceptRuleSetEnabledArgs),
     Delete(InterceptRuleDeleteArgs),
 }
 
@@ -1326,6 +1330,71 @@ struct InterceptRuleCreateArgs {
     method_filter: Vec<String>,
     #[arg(long)]
     enabled: Option<bool>,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("rule_update")
+        .args(["scope", "host_pattern", "path_pattern", "method_filter", "clear_methods", "enabled"])
+        .multiple(true)
+        .required(true)
+))]
+struct InterceptRuleUpdateArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    #[arg(long)]
+    id: Uuid,
+    #[arg(long, value_parser = ["request", "response", "both"])]
+    scope: Option<String>,
+    /// Replace the host pattern; an empty string clears it.
+    #[arg(long)]
+    host_pattern: Option<String>,
+    /// Replace the path pattern; an empty string clears it.
+    #[arg(long)]
+    path_pattern: Option<String>,
+    /// Replace the method list; repeat for multiple methods.
+    #[arg(long = "method", action = ArgAction::Append, conflicts_with = "clear_methods")]
+    method_filter: Option<Vec<String>>,
+    /// Clear the method list, preserving host and path patterns.
+    #[arg(long)]
+    clear_methods: bool,
+    #[arg(long)]
+    enabled: Option<bool>,
+}
+
+impl InterceptRuleUpdateArgs {
+    fn patch(&self) -> Value {
+        let mut patch = serde_json::Map::new();
+        for (key, value) in [
+            ("scope", self.scope.as_ref()),
+            ("host_pattern", self.host_pattern.as_ref()),
+            ("path_pattern", self.path_pattern.as_ref()),
+        ] {
+            if let Some(value) = value {
+                patch.insert(key.into(), json!(value));
+            }
+        }
+        if let Some(methods) = &self.method_filter {
+            patch.insert("method_filter".into(), json!(methods));
+        } else if self.clear_methods {
+            patch.insert("method_filter".into(), json!([]));
+        }
+        if let Some(enabled) = self.enabled {
+            patch.insert("enabled".into(), json!(enabled));
+        }
+        Value::Object(patch)
+    }
+}
+
+#[derive(Args, Debug)]
+struct InterceptRuleSetEnabledArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    #[arg(long)]
+    id: Uuid,
+    /// Desired state; the explicit true or false value is required.
+    #[arg(long, required = true, action = ArgAction::Set)]
+    enabled: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2247,6 +2316,8 @@ impl InterceptRuleCommand {
         match self {
             InterceptRuleCommand::List(_) => "capture.intercept_rule.list",
             InterceptRuleCommand::Create(_) => "capture.intercept_rule.create",
+            InterceptRuleCommand::Update(_) => "capture.intercept_rule.update",
+            InterceptRuleCommand::SetEnabled(_) => "capture.intercept_rule.set_enabled",
             InterceptRuleCommand::Delete(_) => "capture.intercept_rule.delete",
         }
     }
@@ -2571,11 +2642,11 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         op(
             "replay.update",
             "replay update --tab-id <id>",
-            "Update a Replay tab request or connection target.",
+            "Update an HTTP Replay request or target, or change only the saved label of an HTTP or WebSocket tab. Label-only updates preserve all other saved tab fields and use workspace revision checks.",
             Write,
             false,
             &["tab_id"],
-            vec![json!({"tab_id":"tab-1","host":"example.com"})],
+            vec![json!({"tab_id":"tab-1","host":"example.com"}), json!({"tab_id":"11111111-1111-4111-8111-111111111111","label":"Saved conversation"})],
         ),
         op(
             "replay.close",
@@ -2821,6 +2892,24 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             vec![json!({"all":true})],
         ),
         op(
+            "capture.intercept_rule.update",
+            "capture intercept-rule update --id <uuid>",
+            "Patch explicit fields of an existing saved intercept rule. Omitted fields are preserved; empty patterns or method lists clear them. Missing IDs never create rules.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000","path_pattern":"/saved","method_filter":[]})],
+        ),
+        op(
+            "capture.intercept_rule.set_enabled",
+            "capture intercept-rule set-enabled --id <uuid> --enabled <true|false>",
+            "Assign an existing saved rule's enabled boolean, preserving its matchers and scope. Repeated values never toggle or create it.",
+            Write,
+            true,
+            &["id", "enabled"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000","enabled":false})],
+        ),
+        op(
             "capture.intercept_rule.delete",
             "capture intercept-rule delete --id <uuid>",
             "Delete an intercept rule.",
@@ -3017,6 +3106,21 @@ fn saved_manifest_operations() -> Vec<CliOperationSpec> {
     }).collect()
 }
 
+fn intercept_rule_update_output_schema(operation: &str) -> Option<Value> {
+    matches!(operation, "capture.intercept_rule.update" | "capture.intercept_rule.set_enabled").then(|| json!({
+        "type":"object", "additionalProperties":false,
+        "required":["id","session_id","enabled","scope","host_pattern","path_pattern","method_filter"],
+        "properties":{
+            "id":{"type":"string","format":"uuid"},
+            "session_id":{"type":"string","format":"uuid"},
+            "enabled":{"type":"boolean"},
+            "scope":{"type":"string","enum":["request","response","both"]},
+            "host_pattern":{"type":"string"}, "path_pattern":{"type":"string"},
+            "method_filter":{"type":"array","items":{"type":"string"}}
+        }
+    }))
+}
+
 fn op(
     operation: &'static str,
     command: &'static str,
@@ -3033,7 +3137,8 @@ fn op(
         side_effect,
         requires_confirmation: requires_confirmation || side_effect == CliSideEffect::Write,
         input_schema: input_schema(operation, required_fields),
-        output_schema: replay_saved_tab_output_schema(operation)
+        output_schema: intercept_rule_update_output_schema(operation)
+            .or_else(|| replay_saved_tab_output_schema(operation))
             .or_else(|| scanner_output_schema(operation))
             .or_else(|| session_list_output_schema(operation))
             .or_else(|| session_read_output_schema(operation))
@@ -3413,6 +3518,52 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
         }
         return schema;
     }
+    if matches!(
+        operation,
+        "capture.intercept_rule.update" | "capture.intercept_rule.set_enabled"
+    ) {
+        let mut schema = json!({
+            "type":"object", "additionalProperties":false, "required":required_fields,
+            "properties":{
+                "id":legacy_uuid_input_schema(false, "Existing rule UUID; missing IDs never create a rule."),
+                "session_id":legacy_uuid_input_schema(false, "Select a saved session without switching it; omission pins the active session."),
+                "enabled":{"type":"boolean","description":"Desired enabled state, never a toggle."}
+            }
+        });
+        if operation == "capture.intercept_rule.update" {
+            for (key, value) in [
+                (
+                    "scope",
+                    json!({"type":"string","enum":["request","response","both"]}),
+                ),
+                (
+                    "host_pattern",
+                    json!({"type":"string","description":"Replacement host pattern. Empty string clears; omission preserves."}),
+                ),
+                (
+                    "path_pattern",
+                    json!({"type":"string","description":"Replacement path pattern. Empty string clears; omission preserves."}),
+                ),
+                (
+                    "method_filter",
+                    json!({"type":"array","items":{"type":"string"},"description":"Replacement method list. Empty array clears; omission preserves."}),
+                ),
+                (
+                    "clear_methods",
+                    json!({"type":"boolean","default":false,"description":"Clear the method list; conflicts with method_filter even when empty."}),
+                ),
+            ] {
+                schema["properties"][key] = value;
+            }
+            schema["anyOf"] = json!([
+                {"required":["scope"]}, {"required":["host_pattern"]}, {"required":["path_pattern"]},
+                {"required":["method_filter"]}, {"required":["enabled"]},
+                {"required":["clear_methods"],"properties":{"clear_methods":{"const":true}}}
+            ]);
+            schema["not"] = json!({"required":["method_filter","clear_methods"],"properties":{"clear_methods":{"const":true}}});
+        }
+        return schema;
+    }
     if let Some(schema) = scanner_input_schema(operation, required_fields) {
         return schema;
     }
@@ -3720,6 +3871,17 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "capture.websocket.get" => &["id", "session_id", "frame_limit", "before_index"],
         "capture.auto_replace.set" => &["session_id", "file", "stdin"],
         "capture.response_intercept.forward" => &["id", "session_id", "response_file", "stdin"],
+        "capture.intercept_rule.set_enabled" => &["id", "session_id", "enabled"],
+        "capture.intercept_rule.update" => &[
+            "id",
+            "session_id",
+            "scope",
+            "host_pattern",
+            "path_pattern",
+            "method_filter",
+            "clear_methods",
+            "enabled",
+        ],
         "capture.intercept_rule.create" => &[
             "session_id",
             "scope",
@@ -4065,6 +4227,21 @@ fn intercept_rule_input_preview(command: &InterceptRuleCommand) -> Value {
             "method_filter": args.method_filter,
             "enabled": args.enabled,
         }),
+        InterceptRuleCommand::Update(args) => {
+            let mut input = args.patch();
+            input["id"] = json!(args.id);
+            if let Some(session_id) = args.session_id {
+                input["session_id"] = json!(session_id);
+            }
+            input
+        }
+        InterceptRuleCommand::SetEnabled(args) => {
+            let mut input = json!({"id":args.id,"enabled":args.enabled});
+            if let Some(session_id) = args.session_id {
+                input["session_id"] = json!(session_id);
+            }
+            input
+        }
         InterceptRuleCommand::Delete(args) => {
             json!({ "id": args.id, "session_id": args.session_id })
         }
@@ -4263,6 +4440,17 @@ fn replay_api_preview(command: &ReplayCommand) -> Value {
             "GET",
             session_query_path("/api/workspace-state", args.session_id),
             None,
+        ),
+        ReplayCommand::Update(args) if replay_update_is_label_only(args) => api_preview(
+            "POST",
+            "/api/replay/tabs/set-label",
+            Some(json!({
+                "tab_id":args.tab_id,
+                "label":normalize_replay_tab_label(args.label.as_deref().unwrap()),
+                "session_id":args.session_id.map(|id| json!(id)).unwrap_or_else(|| json!("<resolved active session ID>")),
+                "expected_workspace_revision":"<loaded workspace revision>",
+                "note":"changes only the saved label on an existing HTTP or WebSocket tab; no traffic is sent"
+            })),
         ),
         ReplayCommand::Open(_) | ReplayCommand::Update(_) => api_preview(
             "POST",
@@ -4476,6 +4664,22 @@ fn intercept_rule_api_preview(command: &InterceptRuleCommand) -> Value {
             "POST",
             session_query_path("/api/intercept-rules", args.session_id),
             Some(json!({ "scope": args.scope, "all": args.all })),
+        ),
+        InterceptRuleCommand::Update(args) => api_preview(
+            "PATCH",
+            session_query_path(
+                &format!("/api/intercept-rules/{}", args.id),
+                args.session_id,
+            ),
+            Some(args.patch()),
+        ),
+        InterceptRuleCommand::SetEnabled(args) => api_preview(
+            "PATCH",
+            session_query_path(
+                &format!("/api/intercept-rules/{}", args.id),
+                args.session_id,
+            ),
+            Some(json!({"enabled": args.enabled})),
         ),
         InterceptRuleCommand::Delete(args) => api_preview(
             "DELETE",
@@ -5410,6 +5614,33 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 },
             }
         }
+        "capture.intercept_rule.update" => {
+            let args = InterceptRuleUpdateArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_present(operation, input, "session_id")?,
+                scope: call_present(operation, input, "scope")?,
+                host_pattern: call_present(operation, input, "host_pattern")?,
+                path_pattern: call_present(operation, input, "path_pattern")?,
+                method_filter: call_present(operation, input, "method_filter")?,
+                clear_methods: call_present(operation, input, "clear_methods")?.unwrap_or(false),
+                enabled: call_present(operation, input, "enabled")?,
+            };
+            validate_intercept_rule_update(&args)?;
+            Command::Capture {
+                command: CaptureCommand::InterceptRule {
+                    command: InterceptRuleCommand::Update(args),
+                },
+            }
+        }
+        "capture.intercept_rule.set_enabled" => Command::Capture {
+            command: CaptureCommand::InterceptRule {
+                command: InterceptRuleCommand::SetEnabled(InterceptRuleSetEnabledArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_present(operation, input, "session_id")?,
+                    enabled: call_required(operation, input, "enabled")?,
+                }),
+            },
+        },
         "capture.intercept_rule.delete" => Command::Capture {
             command: CaptureCommand::InterceptRule {
                 command: InterceptRuleCommand::Delete(InterceptRuleDeleteArgs {
@@ -5580,6 +5811,18 @@ fn call_required<T: DeserializeOwned>(operation: &str, input: &Value, field: &st
         .ok_or_else(|| anyhow!("missing required field `{field}` for `{operation}`"))?;
     serde_json::from_value(value.clone())
         .with_context(|| format!("invalid field `{field}` for `{operation}`"))
+}
+
+fn call_present<T: DeserializeOwned>(
+    operation: &str,
+    input: &Value,
+    field: &str,
+) -> Result<Option<T>> {
+    if input.get(field).is_some() {
+        call_required(operation, input, field).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn call_optional<T: DeserializeOwned>(
@@ -6090,6 +6333,15 @@ fn validate_skill_root_selection(
 }
 
 fn validate_command_preflight(command: &Command) -> Result<()> {
+    if let Command::Capture {
+        command:
+            CaptureCommand::InterceptRule {
+                command: InterceptRuleCommand::Update(args),
+            },
+    } = command
+    {
+        validate_intercept_rule_update(args)?;
+    }
     if let Command::Schema { operation, .. }
     | Command::Examples {
         operation: Some(operation),
@@ -6671,6 +6923,77 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayLabelUpdateResult {
+    session_id: Uuid,
+    revision: u64,
+    tab: ReplayTabState,
+}
+
+fn replay_update_is_label_only(args: &ReplayUpdateArgs) -> bool {
+    args.label.is_some()
+        && args.request_file.is_none()
+        && !args.stdin
+        && args.scheme.is_none()
+        && args.host.is_none()
+        && args.port.is_none()
+}
+
+fn saved_configuration_write_client() -> Result<reqwest::Client> {
+    // A metadata write must not be replayed automatically or sent to a redirect target.
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(CLI_API_TIMEOUT)
+        .build()
+        .context("failed to prepare saved configuration client; no mutation was sent")
+}
+
+async fn update_saved_replay_label(api: &ApiClient, args: ReplayUpdateArgs) -> Result<()> {
+    let (session_id, expected_active_session_id) =
+        runtime_write_session_ids(api, args.session_id).await?;
+    let session_id = session_id
+        .ok_or_else(|| anyhow!("no active session was found; select an explicit --session-id"))?;
+    let workspace: WorkspaceStateSnapshot = api
+        .get_json(&session_query_path(
+            "/api/workspace-state",
+            Some(session_id),
+        ))
+        .await?;
+    if workspace.session_id != Some(session_id) {
+        bail!("workspace response did not match the selected session; no mutation was sent");
+    }
+    find_replay_tab(&workspace.replay, &args.tab_id)?;
+    let mut payload = json!({
+        "session_id":session_id,
+        "tab_id":args.tab_id,
+        "expected_workspace_revision":workspace.revision,
+        "label":normalize_replay_tab_label(args.label.as_deref().unwrap()),
+    });
+    if let Some(expected_active_session_id) = expected_active_session_id {
+        payload["expected_active_session_id"] = json!(expected_active_session_id);
+    }
+    let client = saved_configuration_write_client()?;
+    let result: ReplayLabelUpdateResult = api
+        .request_json_with_client(
+            &client,
+            Method::POST,
+            "/api/replay/tabs/set-label",
+            Some(&payload),
+        )
+        .await?;
+    if result.session_id != session_id
+        || Some(result.revision) != workspace.revision.checked_add(1)
+        || result.tab.id != args.tab_id
+        || result.tab.custom_label != payload["label"].as_str().unwrap()
+    {
+        bail!("saved Replay label update response did not match; inspect current state before retrying");
+    }
+    print_json_with_session(&result.tab, Some(result.session_id))
+}
+
 async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
     match command {
         ReplayCommand::List(args) => {
@@ -6702,6 +7025,9 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             print_json_with_session(&tab, session_id)
         }
         ReplayCommand::Update(args) => {
+            if replay_update_is_label_only(&args) {
+                return update_saved_replay_label(&api, args).await;
+            }
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
             let tab = find_replay_tab_mut(&mut workspace.replay, &args.tab_id)?;
             ensure_http_replay_tab(tab, &args.tab_id)?;
@@ -7843,6 +8169,55 @@ async fn handle_response_intercept(
     }
 }
 
+fn validate_intercept_rule_update(args: &InterceptRuleUpdateArgs) -> Result<()> {
+    if args
+        .scope
+        .as_deref()
+        .is_some_and(|scope| !matches!(scope, "request" | "response" | "both"))
+    {
+        bail!("invalid field `scope`: expected request, response, or both");
+    }
+    if args.clear_methods && args.method_filter.is_some() {
+        bail!("fields `clear_methods` and `method_filter` have conflicts");
+    }
+    if args.patch().as_object().unwrap().is_empty() {
+        bail!("provide at least one rule update field");
+    }
+    Ok(())
+}
+
+async fn patch_intercept_rule(
+    api: &ApiClient,
+    id: Uuid,
+    session_id: Option<Uuid>,
+    patch: Value,
+) -> Result<()> {
+    let (session_id, expected_active_session_id) =
+        runtime_write_session_ids(api, session_id).await?;
+    let session_id = session_id
+        .ok_or_else(|| anyhow!("no active session was found; select an explicit --session-id"))?;
+    let path = session_query_path_with_expected_active(
+        &format!("/api/intercept-rules/{id}"),
+        Some(session_id),
+        expected_active_session_id,
+    );
+    let client = saved_configuration_write_client()?;
+    let rule: InterceptRule = api
+        .request_json_with_client(&client, Method::PATCH, &path, Some(&patch))
+        .await?;
+    let returned = serde_json::to_value(&rule)?;
+    if rule.id != id
+        || patch
+            .as_object()
+            .unwrap()
+            .iter()
+            .any(|(key, value)| returned.get(key) != Some(value))
+    {
+        bail!("saved intercept rule update response did not match; inspect current state before retrying");
+    }
+    print_json_with_session(&rule, Some(session_id))
+}
+
 async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) -> Result<()> {
     match command {
         InterceptRuleCommand::List(args) => {
@@ -7870,6 +8245,18 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
             );
             api.post_status(&path, &rule).await?;
             print_json_with_session(&rule, session_id)
+        }
+        InterceptRuleCommand::Update(args) => {
+            patch_intercept_rule(&api, args.id, args.session_id, args.patch()).await
+        }
+        InterceptRuleCommand::SetEnabled(args) => {
+            patch_intercept_rule(
+                &api,
+                args.id,
+                args.session_id,
+                json!({"enabled":args.enabled}),
+            )
+            .await
         }
         InterceptRuleCommand::Delete(args) => {
             let (session_id, expected_active_session_id) =
@@ -11453,6 +11840,7 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
     let write_may_have_been_sent = payload.code == "HTTP_STATUS_ERROR"
         || (payload.code == "CLI_ERROR"
             && (payload.message.contains("failed to POST")
+                || payload.message.contains("failed to PATCH")
                 || payload.message.contains("failed to DELETE")));
     if operation_spec(operation)
         .is_some_and(|spec| spec.side_effect == CliSideEffect::Write && spec.requires_confirmation)

@@ -300,6 +300,26 @@ can also be sensitive. These reads do not add redaction: review the output befor
 sharing it with an agent or saving it to a transcript. No scanner execution,
 configuration, or clear operation is exposed by these commands.
 
+### Existing rule settings and saved tab labels
+
+```bash
+sniper-cli capture intercept-rule update --id <rule-uuid> --path-pattern /saved --dry-run
+sniper-cli capture intercept-rule update --id <rule-uuid> --clear-methods --yes
+sniper-cli capture intercept-rule set-enabled --id <rule-uuid> --enabled false --yes
+sniper-cli call capture.intercept_rule.update --input '{"id":"<rule-uuid>","host_pattern":"","method_filter":[]}' --dry-run
+sniper-cli replay update --tab-id '11111111-1111-4111-8111-111111111111' --label "Saved conversation" --yes
+```
+
+Rule updates patch only supplied fields of an existing rule. Omission preserves
+current values; empty host/path strings and an empty method list clear those
+matchers. `set-enabled` assigns an explicit boolean and never toggles or creates
+a rule. Label-only `replay.update` supports saved HTTP and WebSocket tabs and
+preserves every other saved tab field. Request and target edits remain HTTP-only.
+These writes require `--yes`; `--dry-run` is offline. Prefer an explicit
+`--session-id` to select an inactive session without changing the active session.
+See [saved configuration edits](docs/integrations/saved-configuration-edits.md)
+for partial-update, session, concurrency and failure semantics.
+
 ### Saved HTTP Replay tab housekeeping
 
 ```bash

@@ -203,11 +203,12 @@ pub enum WorkspaceReplaceError<E> {
     Persist(E),
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum SavedHttpTabOperation {
+#[derive(Clone, Debug)]
+pub(crate) enum SavedReplayTabOperation {
     Close,
     Duplicate,
     SetPinned(bool),
+    SetLabel(String),
 }
 
 #[derive(Debug)]
@@ -220,10 +221,10 @@ pub(crate) enum WorkspaceTransformError<E> {
 
 /// Transform saved state only: draft text, embedded bodies and transaction
 /// references must never pass through the request parser or body hydrator here.
-pub(crate) fn transform_saved_http_tab(
+pub(crate) fn transform_saved_replay_tab(
     current: &WorkspaceStateSnapshot,
     tab_id: &str,
-    operation: SavedHttpTabOperation,
+    operation: SavedReplayTabOperation,
 ) -> Result<WorkspaceStateSnapshot, String> {
     let index = current
         .replay
@@ -232,16 +233,27 @@ pub(crate) fn transform_saved_http_tab(
         .position(|tab| tab.id == tab_id)
         .ok_or_else(|| "saved Replay tab was not found".to_string())?;
     let source = &current.replay.tabs[index];
-    if !matches!(source.tab_type.as_str(), "" | "http") {
-        return Err("saved Replay tab must be an HTTP tab".to_string());
+    let label_only = matches!(&operation, SavedReplayTabOperation::SetLabel(_));
+    if !matches!(source.tab_type.as_str(), "" | "http")
+        && !(label_only && source.tab_type == "websocket")
+    {
+        return Err(if label_only {
+            "saved Replay tab must be an HTTP or WebSocket tab"
+        } else {
+            "saved Replay tab must be an HTTP tab"
+        }
+        .to_string());
     }
     let mut next = current.clone();
     match operation {
-        SavedHttpTabOperation::SetPinned(pinned) => {
+        SavedReplayTabOperation::SetLabel(label) => {
+            next.replay.tabs[index].custom_label = label;
+        }
+        SavedReplayTabOperation::SetPinned(pinned) => {
             // This is desired-state assignment, never a toggle or reorder.
             next.replay.tabs[index].pinned = pinned;
         }
-        SavedHttpTabOperation::Close => {
+        SavedReplayTabOperation::Close => {
             // Legacy counters can lag the saved tabs. Closing the last/highest
             // tab must not make its sequence available for reuse.
             next.replay.tab_sequence = current
@@ -265,7 +277,7 @@ pub(crate) fn transform_saved_http_tab(
                 next.replay.active_tab_id = None;
             }
         }
-        SavedHttpTabOperation::Duplicate => {
+        SavedReplayTabOperation::Duplicate => {
             if current.replay.tabs.len() >= MAX_WORKSPACE_REPLAY_TABS {
                 return Err("workspace has reached the saved Replay tab limit".to_string());
             }
@@ -813,7 +825,7 @@ mod saved_http_tab_tests {
     fn saved_http_close_uses_stable_visual_order_and_retains_monotonic_sequence() {
         let current = fixture();
         let next =
-            transform_saved_http_tab(&current, "middle", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&current, "middle", SavedReplayTabOperation::Close).unwrap();
         assert_eq!(next.replay.active_tab_id.as_deref(), Some("pinned"));
         assert_eq!(next.replay.tab_sequence, 20);
         assert_eq!(
@@ -828,13 +840,16 @@ mod saved_http_tab_tests {
         for (selected, expected) in [("first", "pinned"), ("last", "first"), ("pinned", "middle")] {
             let mut selected_state = current.clone();
             selected_state.replay.active_tab_id = Some(selected.into());
-            let closed =
-                transform_saved_http_tab(&selected_state, selected, SavedHttpTabOperation::Close)
-                    .unwrap();
+            let closed = transform_saved_replay_tab(
+                &selected_state,
+                selected,
+                SavedReplayTabOperation::Close,
+            )
+            .unwrap();
             assert_eq!(closed.replay.active_tab_id.as_deref(), Some(expected));
         }
         let nonselected =
-            transform_saved_http_tab(&current, "last", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&current, "last", SavedReplayTabOperation::Close).unwrap();
         assert_eq!(
             nonselected.replay.active_tab_id,
             current.replay.active_tab_id
@@ -842,13 +857,13 @@ mod saved_http_tab_tests {
         let mut single = current.clone();
         single.replay.tabs.retain(|tab| tab.id == "middle");
         let empty =
-            transform_saved_http_tab(&single, "middle", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&single, "middle", SavedReplayTabOperation::Close).unwrap();
         assert!(empty.replay.tabs.is_empty());
         assert!(empty.replay.active_tab_id.is_none());
         assert_eq!(empty.replay.tab_sequence, 20);
         single.replay.tab_sequence = 0;
         let empty =
-            transform_saved_http_tab(&single, "middle", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&single, "middle", SavedReplayTabOperation::Close).unwrap();
         assert_eq!(empty.replay.tab_sequence, 5);
     }
 
@@ -856,7 +871,8 @@ mod saved_http_tab_tests {
     fn saved_http_duplicate_keeps_raw_saved_state_and_focus_with_fresh_unpinned_identity() {
         let current = fixture();
         let next =
-            transform_saved_http_tab(&current, "middle", SavedHttpTabOperation::Duplicate).unwrap();
+            transform_saved_replay_tab(&current, "middle", SavedReplayTabOperation::Duplicate)
+                .unwrap();
         assert_eq!(next.replay.active_tab_id, current.replay.active_tab_id);
         assert_eq!(next.replay.tab_sequence, 21);
         let mut duplicate = next.replay.tabs.last().unwrap().clone();
@@ -882,7 +898,7 @@ mod saved_http_tab_tests {
         let mut behind = current.clone();
         behind.replay.tab_sequence = 0;
         assert_eq!(
-            transform_saved_http_tab(&behind, "middle", SavedHttpTabOperation::Duplicate)
+            transform_saved_replay_tab(&behind, "middle", SavedReplayTabOperation::Duplicate)
                 .unwrap()
                 .replay
                 .tab_sequence,
@@ -891,19 +907,66 @@ mod saved_http_tab_tests {
     }
 
     #[test]
+    fn saved_label_transform_changes_only_label_and_preserves_completeness_flags() {
+        for kind in ["", "http", "websocket"] {
+            let mut current = fixture();
+            let tab = &mut current.replay.tabs[1];
+            tab.tab_type = kind.into();
+            tab.ws_editor_text = "AAEC".into();
+            tab.ws_editor_body_encoded = true;
+            tab.ws_setup_queue = vec![json!({"type":"binary","body":"AAEC"})];
+            tab.ws_setup_queue_complete = Some(false);
+            tab.ws_frames_complete = Some(false);
+            tab.ws_frames_truncated = true;
+            tab.response_record_complete = Some(false);
+            tab.history_entries_complete = Some(false);
+            for label in ["renamed", ""] {
+                let next = transform_saved_replay_tab(
+                    &current,
+                    "middle",
+                    SavedReplayTabOperation::SetLabel(label.into()),
+                )
+                .unwrap();
+                let mut expected = current.clone();
+                expected.replay.tabs[1].custom_label = label.into();
+                assert_eq!(value(&next), value(&expected));
+                let changed = &next.replay.tabs[1];
+                assert_eq!(changed.ws_setup_queue_complete, Some(false));
+                assert_eq!(changed.ws_frames_complete, Some(false));
+                assert_eq!(changed.response_record_complete, Some(false));
+                assert_eq!(changed.history_entries_complete, Some(false));
+            }
+        }
+        let mut current = fixture();
+        current.replay.tabs[1].tab_type = "unknown".into();
+        assert!(transform_saved_replay_tab(
+            &current,
+            "middle",
+            SavedReplayTabOperation::SetLabel("name".into())
+        )
+        .is_err());
+        assert!(transform_saved_replay_tab(
+            &current,
+            "missing",
+            SavedReplayTabOperation::SetLabel("name".into())
+        )
+        .is_err());
+    }
+
+    #[test]
     fn saved_http_transform_rejects_missing_wrong_kind_cap_and_sequence_overflow() {
         let current = fixture();
         for operation in [
-            SavedHttpTabOperation::Close,
-            SavedHttpTabOperation::Duplicate,
-            SavedHttpTabOperation::SetPinned(true),
-            SavedHttpTabOperation::SetPinned(false),
+            SavedReplayTabOperation::Close,
+            SavedReplayTabOperation::Duplicate,
+            SavedReplayTabOperation::SetPinned(true),
+            SavedReplayTabOperation::SetPinned(false),
         ] {
-            assert!(transform_saved_http_tab(&current, " middle ", operation).is_err());
+            assert!(transform_saved_replay_tab(&current, " middle ", operation.clone()).is_err());
             for kind in ["websocket", "unknown", "HTTP"] {
                 let mut wrong = current.clone();
                 wrong.replay.tabs[1].tab_type = kind.into();
-                assert!(transform_saved_http_tab(&wrong, "middle", operation).is_err());
+                assert!(transform_saved_replay_tab(&wrong, "middle", operation.clone()).is_err());
             }
         }
         let mut full = current.clone();
@@ -911,23 +974,24 @@ mod saved_http_tab_tests {
             .tabs
             .resize(MAX_WORKSPACE_REPLAY_TABS, current.replay.tabs[0].clone());
         assert!(
-            transform_saved_http_tab(&full, "middle", SavedHttpTabOperation::Duplicate).is_err()
+            transform_saved_replay_tab(&full, "middle", SavedReplayTabOperation::Duplicate)
+                .is_err()
         );
         for sequence in [usize::MAX, usize::MAX - 1] {
             let mut exhausted = current.clone();
             exhausted.replay.tab_sequence = sequence;
-            assert!(transform_saved_http_tab(
+            assert!(transform_saved_replay_tab(
                 &exhausted,
                 "middle",
-                SavedHttpTabOperation::Duplicate
+                SavedReplayTabOperation::Duplicate
             )
             .is_err());
             exhausted.replay.tab_sequence = 0;
             exhausted.replay.tabs[0].sequence = sequence;
-            assert!(transform_saved_http_tab(
+            assert!(transform_saved_replay_tab(
                 &exhausted,
                 "middle",
-                SavedHttpTabOperation::Duplicate
+                SavedReplayTabOperation::Duplicate
             )
             .is_err());
         }
@@ -941,7 +1005,9 @@ mod saved_http_tab_tests {
         let committed = store
             .transform_snapshot_checked_persisting(
                 8,
-                |current| transform_saved_http_tab(current, "middle", SavedHttpTabOperation::Close),
+                |current| {
+                    transform_saved_replay_tab(current, "middle", SavedReplayTabOperation::Close)
+                },
                 |_| async { Ok::<_, String>(None) },
             )
             .await
@@ -974,8 +1040,9 @@ mod saved_http_tab_tests {
     #[tokio::test]
     async fn saved_http_failed_persistence_is_not_published_but_postrename_uncertainty_is() {
         for operation in [
-            SavedHttpTabOperation::Close,
-            SavedHttpTabOperation::SetPinned(false),
+            SavedReplayTabOperation::Close,
+            SavedReplayTabOperation::SetPinned(false),
+            SavedReplayTabOperation::SetLabel("saved name".into()),
         ] {
             let current = fixture();
             let store = WorkspaceStateStore::from_snapshot(current.clone());
@@ -983,7 +1050,7 @@ mod saved_http_tab_tests {
             let failure = store
                 .transform_snapshot_checked_persisting(
                     8,
-                    |current| transform_saved_http_tab(current, "middle", operation),
+                    |current| transform_saved_replay_tab(current, "middle", operation.clone()),
                     |_| async { Err::<Option<String>, _>("before rename".into()) },
                 )
                 .await;
@@ -993,7 +1060,7 @@ mod saved_http_tab_tests {
             let uncertainty = store
                 .transform_snapshot_checked_persisting(
                     8,
-                    |current| transform_saved_http_tab(current, "middle", operation),
+                    |current| transform_saved_replay_tab(current, "middle", operation.clone()),
                     |_| async {
                         Ok::<_, String>(Some("directory sync failed after rename".into()))
                     },
@@ -1003,7 +1070,7 @@ mod saved_http_tab_tests {
                 uncertainty,
                 Err(WorkspaceTransformError::CommittedButUncertain(_))
             ));
-            let mut expected = transform_saved_http_tab(&current, "middle", operation).unwrap();
+            let mut expected = transform_saved_replay_tab(&current, "middle", operation).unwrap();
             expected.revision = 9;
             expected.client_id = None;
             expected.client_version = 0;

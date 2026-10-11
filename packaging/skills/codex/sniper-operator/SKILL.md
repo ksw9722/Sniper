@@ -103,6 +103,28 @@ sniper-cli call capture.http.clear --input '{"session_id":"<session-uuid>"}' --d
 sniper-cli call capture.http.clear --input '{"session_id":"<session-uuid>"}' --yes
 ```
 
+### Existing intercept rules and saved labels
+
+Use `capture.intercept_rule.update` to patch an existing rule by UUID and
+`capture.intercept_rule.set_enabled` to assign its explicit `enabled` boolean.
+Both require `--yes`, accept `session_id`, and support offline `--dry-run`.
+Omitted update fields preserve current values. Empty `host_pattern` or
+`path_pattern` clears that matcher; `method_filter: []` or direct
+`--clear-methods` clears the method list. Direct `--method` may be repeated to
+replace the entire list. A missing rule ID fails without creating a rule; the
+server merges the patch atomically so unrelated concurrent edits survive.
+`set-enabled --enabled false` remains false if repeated. Neither command changes
+the runtime intercept switch or forwards queued traffic.
+
+A label-only `replay.update` supports saved HTTP and WebSocket tabs. The server
+changes only `custom_label` under workspace revision checks; all other saved
+fields are preserved. `label: ""` clears it; whitespace is collapsed and the
+label is limited to 80 characters. Request/target inputs remain HTTP-only,
+including when combined with a label. These operations send no replay traffic.
+Prefer an explicit session UUID, inspect the result, and reread saved state after
+a conflict or uncertain response rather than automatically retrying. They do not
+use `saved.v1` receipts. See `schema` and `examples` for the installed contract.
+
 ## Common commands
 
 ```bash

@@ -55,7 +55,7 @@ use crate::{
     websocket::WebSocketListFilters,
     workspace::{
         can_replace_snapshot, validate_workspace_serialized_size, FuzzerWorkspaceState,
-        ReplayTabState, SavedHttpTabOperation, WorkspaceReplaceError, WorkspaceStateSnapshot,
+        ReplayTabState, SavedReplayTabOperation, WorkspaceReplaceError, WorkspaceStateSnapshot,
         WorkspaceTransformError, MAX_WORKSPACE_SERIALIZED_BYTES,
     },
 };
@@ -388,6 +388,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             "/api/workspace-state/keepalive",
             post(update_workspace_state_keepalive),
         )
+        .route(
+            "/api/replay/tabs/set-label",
+            post(set_saved_replay_tab_label),
+        )
         .route("/api/replay/tabs/close", post(close_saved_http_tab))
         .route("/api/replay/tabs/duplicate", post(duplicate_saved_http_tab))
         .route(
@@ -462,7 +466,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             "/api/intercept-rules",
             get(list_intercept_rules).post(upsert_intercept_rule),
         )
-        .route("/api/intercept-rules/:id", delete(delete_intercept_rule))
+        .route(
+            "/api/intercept-rules/:id",
+            delete(delete_intercept_rule).patch(update_intercept_rule),
+        )
         .route("/api/response-intercepts", get(list_response_intercepts))
         .route(
             "/api/response-intercepts/forward-all",
@@ -2687,6 +2694,60 @@ impl From<crate::intercept::InterceptRule> for InterceptRulePayload {
     }
 }
 
+// Supplied patch fields must have their actual type; null is not a clearing value.
+fn deserialize_intercept_rule_patch_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterceptRuleUpdatePayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    scope: Option<crate::intercept::InterceptScope>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    host_pattern: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    path_pattern: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    method_filter: Option<Vec<String>>,
+}
+
+impl InterceptRuleUpdatePayload {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.scope.is_none()
+            && self.host_pattern.is_none()
+            && self.path_pattern.is_none()
+            && self.method_filter.is_none()
+    }
+
+    fn apply(self, rule: &mut crate::intercept::InterceptRule) {
+        if let Some(enabled) = self.enabled {
+            rule.enabled = enabled;
+        }
+        if let Some(scope) = self.scope {
+            rule.scope = scope;
+        }
+        if let Some(host_pattern) = self.host_pattern {
+            rule.host_pattern = host_pattern;
+        }
+        if let Some(path_pattern) = self.path_pattern {
+            rule.path_pattern = path_pattern;
+        }
+        if let Some(method_filter) = self.method_filter {
+            rule.method_filter = method_filter;
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct InterceptForwardPayload {
     #[serde(default)]
@@ -3024,11 +3085,30 @@ struct SetSavedHttpTabPinnedPayload {
     pinned: bool,
 }
 
-async fn set_saved_http_tab_pinned(
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSavedReplayTabLabelPayload {
+    session_id: Uuid,
+    tab_id: String,
+    expected_workspace_revision: u64,
+    expected_active_session_id: Option<Uuid>,
+    label: String,
+}
+
+async fn set_saved_replay_tab_label(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<SetSavedHttpTabPinnedPayload>,
+    Json(payload): Json<SetSavedReplayTabLabelPayload>,
 ) -> Response {
-    mutate_saved_http_tab(
+    // Apply the same normalization as the tab strip without parsing any draft.
+    let label = payload
+        .label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect();
+    mutate_saved_replay_tab(
         state,
         SavedHttpTabPayload {
             session_id: payload.session_id,
@@ -3036,7 +3116,24 @@ async fn set_saved_http_tab_pinned(
             expected_workspace_revision: payload.expected_workspace_revision,
             expected_active_session_id: payload.expected_active_session_id,
         },
-        SavedHttpTabOperation::SetPinned(payload.pinned),
+        SavedReplayTabOperation::SetLabel(label),
+    )
+    .await
+}
+
+async fn set_saved_http_tab_pinned(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SetSavedHttpTabPinnedPayload>,
+) -> Response {
+    mutate_saved_replay_tab(
+        state,
+        SavedHttpTabPayload {
+            session_id: payload.session_id,
+            tab_id: payload.tab_id,
+            expected_workspace_revision: payload.expected_workspace_revision,
+            expected_active_session_id: payload.expected_active_session_id,
+        },
+        SavedReplayTabOperation::SetPinned(payload.pinned),
     )
     .await
 }
@@ -3045,24 +3142,24 @@ async fn close_saved_http_tab(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SavedHttpTabPayload>,
 ) -> Response {
-    mutate_saved_http_tab(state, payload, SavedHttpTabOperation::Close).await
+    mutate_saved_replay_tab(state, payload, SavedReplayTabOperation::Close).await
 }
 
 async fn duplicate_saved_http_tab(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SavedHttpTabPayload>,
 ) -> Response {
-    mutate_saved_http_tab(state, payload, SavedHttpTabOperation::Duplicate).await
+    mutate_saved_replay_tab(state, payload, SavedReplayTabOperation::Duplicate).await
 }
 
-async fn mutate_saved_http_tab(
+async fn mutate_saved_replay_tab(
     state: Arc<AppState>,
     payload: SavedHttpTabPayload,
-    operation: SavedHttpTabOperation,
+    operation: SavedReplayTabOperation,
 ) -> Response {
     // Keep the operation/persistence locks alive through disk commit and memory
     // publication even when the requester disconnects during spawn_blocking.
-    tokio::spawn(mutate_saved_http_tab_inner(state, payload, operation))
+    tokio::spawn(mutate_saved_replay_tab_inner(state, payload, operation))
         .await
         .unwrap_or_else(|_| saved_http_tab_uncertain_response())
 }
@@ -3075,10 +3172,10 @@ fn saved_http_tab_uncertain_response() -> Response {
         .into_response()
 }
 
-async fn mutate_saved_http_tab_inner(
+async fn mutate_saved_replay_tab_inner(
     state: Arc<AppState>,
     payload: SavedHttpTabPayload,
-    operation: SavedHttpTabOperation,
+    operation: SavedReplayTabOperation,
 ) -> Response {
     if payload.tab_id.trim().is_empty() || payload.tab_id.len() > MAX_WORKSPACE_REPLAY_TAB_ID_BYTES
     {
@@ -3123,10 +3220,10 @@ async fn mutate_saved_http_tab_inner(
     // This narrow operation writes only workspace.json. A cached read-only
     // inactive context is sufficient; promotion could repair unrelated files.
     match session
-        .mutate_saved_http_tab_and_persist(
+        .mutate_saved_replay_tab_and_persist(
             &payload.tab_id,
             payload.expected_workspace_revision,
-            operation,
+            operation.clone(),
         )
         .await
     {
@@ -3137,12 +3234,27 @@ async fn mutate_saved_http_tab_inner(
                 "active_tab_id": snapshot.replay.active_tab_id,
             });
             match operation {
-                SavedHttpTabOperation::Close => result["closed_tab_id"] = payload.tab_id.into(),
-                SavedHttpTabOperation::SetPinned(pinned) => {
+                SavedReplayTabOperation::SetLabel(_) => {
+                    // Preserve replay.update's full-tab result without accepting tab payloads.
+                    let tab = snapshot
+                        .replay
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == payload.tab_id)
+                        .unwrap();
+                    return Json(serde_json::json!({
+                        "session_id": session.id(),
+                        "revision": snapshot.revision,
+                        "tab": tab,
+                    }))
+                    .into_response();
+                }
+                SavedReplayTabOperation::Close => result["closed_tab_id"] = payload.tab_id.into(),
+                SavedReplayTabOperation::SetPinned(pinned) => {
                     result["tab_id"] = payload.tab_id.into();
                     result["pinned"] = pinned.into();
                 }
-                SavedHttpTabOperation::Duplicate => {
+                SavedReplayTabOperation::Duplicate => {
                     result["source_tab_id"] = payload.tab_id.into();
                     result["new_tab_id"] = snapshot.replay.tabs.last().unwrap().id.clone().into();
                 }
@@ -5725,6 +5837,108 @@ async fn upsert_intercept_rule(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn update_intercept_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<SessionWriteQuery>,
+    Json(payload): Json<InterceptRuleUpdatePayload>,
+) -> Response {
+    if payload.is_empty() {
+        return (StatusCode::BAD_REQUEST, "provide at least one rule field").into_response();
+    }
+    // Keep persistence and rollback inside the owned transaction if the caller disconnects.
+    tokio::spawn(async move {
+        let (target_session_id, session_id_is_explicit) =
+            match reconcile_write_session_id(query.session_id, payload.session_id) {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+            };
+        if let Some(response) = expected_active_session_conflict_response(
+            &state,
+            query.expected_active_session_id,
+            target_session_id,
+        ) {
+            return response;
+        }
+        let session = match resolve_read_session_for_optional_id(&state, target_session_id).await {
+            Ok(session) => session,
+            Err(response) => return response,
+        };
+        let _operation_guard = match guard_session_write_operation(
+            &state,
+            &session,
+            !session_id_is_explicit || query.expected_active_session_id.is_some(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        if let Some(response) = expected_active_session_conflict_response(
+            &state,
+            query.expected_active_session_id,
+            Some(session.id()),
+        ) {
+            return response;
+        }
+        if !state.is_current_session_context(&session).await {
+            return (
+                StatusCode::CONFLICT,
+                "Intercept rule context changed; reload before saving.",
+            )
+                .into_response();
+        }
+        let read_guard = session.mutation_guard().await;
+        if !session
+            .intercept_rules
+            .snapshot()
+            .await
+            .iter()
+            .any(|rule| rule.id == id)
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        drop(read_guard);
+        // Do not repair inactive session files for a missing-ID request.
+        let session = if state.sessions.active_session_id() == session.id() {
+            session
+        } else {
+            match state
+                .session_context_for_id_operation_locked(session.id())
+                .await
+            {
+                Ok(session) => session,
+                Err(error) => return session_load_failure_response(session.id(), error),
+            }
+        };
+        let _mutation_guard = session.mutation_guard().await;
+        let previous = session.intercept_rules.snapshot().await;
+        let Some(mut rule) = previous.iter().find(|rule| rule.id == id).cloned() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        // Merge on the server under the mutation lock, never from a stale CLI snapshot.
+        payload.apply(&mut rule);
+        session.intercept_rules.upsert(rule.clone()).await;
+        if persist_session_mutation_locked_or_status(&state, &session)
+            .await
+            .is_err()
+        {
+            session.intercept_rules.replace_all(previous).await;
+            persist_rolled_back_session_snapshot(&state, &session, "intercept rule update").await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Json(rule).into_response()
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rule update outcome unavailable; inspect current state before retrying",
+        )
+            .into_response()
+    })
 }
 
 async fn delete_intercept_rule(
@@ -10031,6 +10245,367 @@ mod tests {
             serde_json::to_value(saved).unwrap(),
             serde_json::to_value(reloaded.workspace.snapshot().await).unwrap()
         );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn saved_rule_patch_and_label_payloads_reject_null_and_unknown_fields() {
+        for value in [
+            serde_json::json!({"enabled":null}),
+            serde_json::json!({"enabled":"false"}),
+            serde_json::json!({"scope":"unknown"}),
+            serde_json::json!({"host_pattern":null}),
+            serde_json::json!({"path_pattern":false}),
+            serde_json::json!({"method_filter":null}),
+            serde_json::json!({"method_filter":[1]}),
+            serde_json::json!({"id":Uuid::new_v4(),"enabled":false}),
+            serde_json::json!({"unknown":true}),
+        ] {
+            assert!(serde_json::from_value::<super::InterceptRuleUpdatePayload>(value).is_err());
+        }
+        let payload: super::InterceptRuleUpdatePayload =
+            serde_json::from_value(serde_json::json!({
+                "enabled":false,"host_pattern":"","path_pattern":"","method_filter":[]
+            }))
+            .unwrap();
+        assert!(!payload.is_empty());
+        assert!(super::InterceptRuleUpdatePayload::default().is_empty());
+        let good = serde_json::json!({
+            "session_id":Uuid::new_v4(),"tab_id":"saved","expected_workspace_revision":0,"label":""
+        });
+        assert!(
+            serde_json::from_value::<super::SetSavedReplayTabLabelPayload>(good.clone()).is_ok()
+        );
+        for (field, value) in [
+            ("label", serde_json::Value::Null),
+            ("request_text", serde_json::json!("draft")),
+            ("ws_editor_text", serde_json::json!("draft")),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            assert!(serde_json::from_value::<super::SetSavedReplayTabLabelPayload>(bad).is_err());
+        }
+    }
+
+    async fn patch_saved_rule_fixture(
+        state: Arc<AppState>,
+        session_id: Uuid,
+        id: Uuid,
+        value: serde_json::Value,
+    ) -> axum::response::Response {
+        super::update_intercept_rule(
+            State(state),
+            Path(id),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+            }),
+            Json(serde_json::from_value(value).unwrap()),
+        )
+        .await
+    }
+
+    fn saved_rule_fixture() -> InterceptRule {
+        InterceptRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            scope: InterceptScope::Both,
+            host_pattern: "example.com".into(),
+            path_pattern: "/saved".into(),
+            method_filter: vec!["GET".into(), "POST".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_merges_concurrent_fields_preserves_identity_and_reloads() {
+        let (state, path) = test_state("sniper-saved-rule-patch");
+        let session = state.session().await;
+        let original = saved_rule_fixture();
+        let untouched = saved_rule_fixture();
+        session
+            .intercept_rules
+            .replace_all(vec![original.clone(), untouched.clone()])
+            .await;
+        session.persist().await.unwrap();
+        let (host, disabled) = tokio::join!(
+            patch_saved_rule_fixture(
+                state.clone(),
+                session.id(),
+                original.id,
+                serde_json::json!({"host_pattern":""})
+            ),
+            patch_saved_rule_fixture(
+                state.clone(),
+                session.id(),
+                original.id,
+                serde_json::json!({"enabled":false})
+            ),
+        );
+        assert_eq!(host.status(), StatusCode::OK);
+        assert_eq!(disabled.status(), StatusCode::OK);
+        for _ in 0..2 {
+            assert_eq!(
+                patch_saved_rule_fixture(
+                    state.clone(),
+                    session.id(),
+                    original.id,
+                    serde_json::json!({"enabled":false})
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        let current = session.intercept_rules.list().await;
+        let mut expected = original.clone();
+        expected.enabled = false;
+        expected.host_pattern.clear();
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::to_value(vec![expected.clone(), untouched.clone()]).unwrap()
+        );
+        let (status, body) = api_route_response(
+            state.clone(),
+            reqwest::Method::PATCH,
+            &format!(
+                "/api/intercept-rules/{}?session_id={}",
+                original.id,
+                session.id()
+            ),
+            Some(serde_json::json!({"scope":"response","path_pattern":"","method_filter":[]})),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        expected.scope = InterceptScope::Response;
+        expected.path_pattern.clear();
+        expected.method_filter.clear();
+        let returned: InterceptRule = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![expected, untouched]).unwrap()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_rejects_empty_missing_and_stale_session_without_mutation() {
+        let (state, path) = test_state("sniper-saved-rule-rejection");
+        let session = state.session().await;
+        let rule = saved_rule_fixture();
+        session.intercept_rules.upsert(rule.clone()).await;
+        session.persist().await.unwrap();
+        for (id, patch, expected) in [
+            (rule.id, serde_json::json!({}), StatusCode::BAD_REQUEST),
+            (
+                Uuid::new_v4(),
+                serde_json::json!({"enabled":false}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            assert_eq!(
+                patch_saved_rule_fixture(state.clone(), session.id(), id, patch)
+                    .await
+                    .status(),
+                expected
+            );
+        }
+        let next = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let response = super::update_intercept_rule(
+            State(state.clone()),
+            Path(rule.id),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session.id()),
+                expected_active_session_id: Some(next.id),
+            }),
+            Json(serde_json::from_value(serde_json::json!({"enabled":false})).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::to_value(session.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![rule]).unwrap()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_missing_inactive_id_does_not_repair_storage() {
+        let (state, path) = test_state("sniper-saved-rule-inactive-missing");
+        let active_id = state.session().await.id();
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let storage = state.sessions.session_storage_path(inactive.id).unwrap();
+        std::fs::write(storage.join("snapshot.json"), b"{not-json").unwrap();
+        std::fs::write(storage.join("transactions.journal"), b"{not-json}\n").unwrap();
+        let files = || {
+            std::fs::read_dir(&storage)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (path.clone(), std::fs::read(path).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = files();
+        assert_eq!(
+            patch_saved_rule_fixture(
+                state.clone(),
+                inactive.id,
+                Uuid::new_v4(),
+                serde_json::json!({"enabled":false})
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(files(), before);
+        assert_eq!(state.sessions.active_session_id(), active_id);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_updates_inactive_session_without_switching_active() {
+        let (state, path) = test_state("sniper-saved-rule-inactive");
+        let active = state.session().await;
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let context = state.sessions.load_context(inactive.id).unwrap();
+        let mut rule = saved_rule_fixture();
+        context.intercept_rules.upsert(rule.clone()).await;
+        context.persist().await.unwrap();
+        drop(context);
+        let response = patch_saved_rule_fixture(
+            state.clone(),
+            inactive.id,
+            rule.id,
+            serde_json::json!({"enabled":false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        rule.enabled = false;
+        assert_eq!(state.sessions.active_session_id(), active.id());
+        assert!(active.intercept_rules.list().await.is_empty());
+        let reloaded = state.sessions.load_context_read_only(inactive.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![rule]).unwrap()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_rolls_back_when_persistence_fails() {
+        let (state, path) = test_state("sniper-saved-rule-rollback");
+        let session = state.session().await;
+        let rule = saved_rule_fixture();
+        session.intercept_rules.upsert(rule.clone()).await;
+        session.persist().await.unwrap();
+        let storage = session.storage_dir().to_path_buf();
+        std::fs::remove_dir_all(&storage).unwrap();
+        std::fs::write(&storage, b"not a directory").unwrap();
+        let response = patch_saved_rule_fixture(
+            state,
+            session.id(),
+            rule.id,
+            serde_json::json!({"enabled":false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            serde_json::to_value(session.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![rule]).unwrap()
+        );
+        std::fs::remove_file(storage).unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_replay_label_only_route_preserves_state_with_cas_and_restart() {
+        let (state, path) = test_state("sniper-saved-replay-label");
+        let session = state.session().await;
+        let ws_id = Uuid::new_v4();
+        let mut workspace: WorkspaceStateSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id":session.id(), "replay":{"active_tab_id":ws_id, "tab_sequence":8,
+                "tabs":[{"id":ws_id,"type":"websocket","sequence":8,"pinned":true,
+                    "custom_label":"old","ws_host":"example.com","ws_scheme":"wss","ws_port":"443","ws_path":"/saved",
+                    "ws_headers":[{"name":"X-Synthetic","value":"saved"}],"ws_handshake_text":"unfinished saved draft",
+                    "ws_handshake_edited":true,"ws_editor_text":"AAEC","ws_message_type":"binary","ws_editor_body_encoded":true,
+                    "ws_setup_notice":"saved notice","ws_setup_queue":[{"kind":"binary","body":"AAEC","body_encoded":true}],
+                    "ws_frames":[{"index":4,"captured_at":"2026-01-01T00:00:00Z","direction":"server_to_client","kind":"binary","body":"AAEC","body_encoding":"base64","body_size":99,"preview_truncated":true}],
+                    "ws_frames_truncated":true,"ws_selected_frame_index":4,"ws_frame_window_start":4},
+                    {"id":"http","type":"http","request_text":"unfinished http draft"}]},
+            "fuzzer":{"request_text":"other saved draft","payloads_text":"unchanged"}
+        })).unwrap();
+        super::validate_workspace_state(&workspace).unwrap();
+        workspace = state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        let payload = serde_json::json!({"session_id":session.id(),"tab_id":ws_id,"expected_workspace_revision":workspace.revision,"label":"  Saved\n conversation  "});
+        let (status, body) = api_route_response(
+            state.clone(),
+            reqwest::Method::POST,
+            "/api/replay/tabs/set-label",
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["tab"]["custom_label"], "Saved conversation");
+        let actual = session.workspace.snapshot().await;
+        let mut expected = workspace.clone();
+        expected.revision += 1;
+        expected.client_id = None;
+        expected.client_version = 0;
+        expected.expected_active_session_id = None;
+        expected.replay.tabs[0].custom_label = "Saved conversation".into();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            api_route_response(
+                state.clone(),
+                reqwest::Method::POST,
+                "/api/replay/tabs/set-label",
+                Some(payload)
+            )
+            .await
+            .0,
+            reqwest::StatusCode::CONFLICT
+        );
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.workspace.snapshot().await).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let clear = serde_json::json!({"session_id":session.id(),"tab_id":ws_id,"expected_workspace_revision":actual.revision,"label":""});
+        assert_eq!(
+            api_route_response(
+                state.clone(),
+                reqwest::Method::POST,
+                "/api/replay/tabs/set-label",
+                Some(clear)
+            )
+            .await
+            .0,
+            reqwest::StatusCode::OK
+        );
+        assert!(session.workspace.snapshot().await.replay.tabs[0]
+            .custom_label
+            .is_empty());
         std::fs::remove_dir_all(path).unwrap();
     }
 

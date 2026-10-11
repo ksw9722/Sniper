@@ -309,6 +309,21 @@ mod tests {
     fn packaged_saved_data_guidance_stays_in_sync_and_covers_the_contract() {
         let section = saved_data_guidance(super::CODEX_SKILL_TEMPLATE);
         assert_eq!(section, saved_data_guidance(super::CLAUDE_SKILL_TEMPLATE));
+        let configuration = section
+            .split_once("### Existing intercept rules and saved labels")
+            .expect("packaged skills must cover existing saved configuration edits")
+            .1;
+        for term in [
+            "capture.intercept_rule.update",
+            "capture.intercept_rule.set_enabled",
+            "label-only `replay.update`",
+            "They do not\nuse `saved.v1` receipts.",
+        ] {
+            assert!(
+                configuration.contains(term),
+                "missing saved configuration guidance: {term}"
+            );
+        }
         for operation in crate::saved_contract::OPERATIONS {
             assert!(
                 section.contains(operation),

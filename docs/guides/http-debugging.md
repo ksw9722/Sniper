@@ -549,6 +549,12 @@ each tab tests, and an empty `--label ""` clears the name:
   replay update --tab-id <tab-id> --label "closed orders" --yes
 ```
 
+A label-only `replay update` also works on a saved WebSocket tab. It updates
+only saved label metadata through a revision-checked server transform, preserving
+frames, queued drafts, targets and other tools. Labels collapse whitespace and
+are limited to 80 characters. Combining `--label` with request or target inputs
+still requires an HTTP tab. No request is sent by a label update.
+
 ## Where sessions live on disk
 
 A session is a workspace: its own captured traffic, scope, replay tabs and
