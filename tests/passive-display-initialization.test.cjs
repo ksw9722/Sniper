@@ -37,7 +37,7 @@ function snapshot(revision, display = {}) {
 const nondefault = { size_px: 16, theme: "paper", ui_font: "notokr", mono_font: "plexmono", render_resources: true };
 
 function fixture() {
-  const requests = [], timers = new Map(), errors = [], styles = new Map();
+  const requests = [], timers = new Map(), errors = [], notices = [], styles = new Map();
   let timerId = 0, redraws = 0;
   const document = {
     activeElement: null, getElementById: () => null,
@@ -79,13 +79,14 @@ function fixture() {
   };
   const globals = {
     state, els, document, displaySettingsPreviewActive: false, displaySettingsReturnFocus: null,
-    displaySettingsEditedControls: new Set(), displaySettingsReady: false,
+    displaySettingsEditedControls: new Set(), displaySettingsReady: false, pendingDisplaySettingsApply: null,
     uiSettingsLoadState: "loading", uiSettingsLoadPromise: null,
     uiSettingsInitialPostGeneration: 0, uiSettingsInitialPostRevision: 0,
     uiSettingsClientId: "fixture-local", uiSettingsSaveVersion: 0, uiSettingsServerRevision: 0,
     uiSettingsSaveTimer: null, uiSettingsDirty: false, uiSettingsInFlight: false,
     uiSettingsSavePromise: null, lastUiSettingsPayload: null, activeConfirmDialog: null,
     WS_COLUMN_RULES: {}, console: { error: error => errors.push(error) },
+    showToast: (...notice) => notices.push(notice),
     DISPLAY_THEME_OPTIONS: new Set(["charcoal", "paper", "ivory"]),
     DISPLAY_UI_FONT_OPTIONS: new Set(["plex", "system", "notokr"]),
     DISPLAY_MONO_FONT_OPTIONS: new Set(["jetbrains", "sfmono", "plexmono"]),
@@ -112,6 +113,7 @@ function fixture() {
     "sanitizeWebsocketSortKey", "sanitizeWebsocketSortDirection", "sanitizeWebsocketStackHeight",
     "sanitizeWsReplayLeftWidth", "sanitizeWsReplayFrameDetailHeight",
   ]) globals[name] = value => value;
+  globals.sanitizeHistoryColumnOrder = value => value || [];
   for (const name of [
     "hydrateFilterForm", "syncColorTagFilterUI", "syncHttpInScopePill", "syncHttpCapturePill",
     "renderHistoryHeader", "applyHistoryColumnWidths", "applyWsColumnWidths", "updateWebsocketSortIndicators",
@@ -147,7 +149,7 @@ function fixture() {
   }
   function runTimers() { for (const [id, timer] of [...timers]) { timers.delete(id); timer.callback(); } }
   async function ready(body = snapshot(7, nondefault)) { const loading = context.loadUiSettings(); respond(requests.length - 1, body); await loading; }
-  return { context, state, els, document, requests, timers, errors, styles, key, payload, respond, succeed, edit, runTimers, ready, get redraws() { return redraws; } };
+  return { context, state, els, document, requests, timers, errors, notices, styles, key, payload, respond, succeed, edit, runTimers, ready, get redraws() { return redraws; } };
 }
 
 for (const [label, initial] of [
@@ -453,3 +455,207 @@ test("Display loading and Retry are accessible, and Apply starts disabled in mar
   assert.match(html, /<button[^>]+id="retryDisplaySettingsButton"[^>]+type="button"/);
   assert.match(html, /<button[^>]+id="applyDisplaySettingsButton"[^>]+disabled/);
 });
+
+// Explicit Apply feedback must follow each acknowledged Display payload rather
+// than the whole settings loop, which can also contain unrelated layout saves.
+const displaySaveWarning = "Could not confirm saving display settings. Automatic retries will continue.";
+function applyDisplay(f, theme = "ivory") {
+  f.context.openDisplaySettingsModal();
+  f.edit("displayThemeSelect", theme);
+  f.context.saveDisplaySettingsFromForm();
+}
+function failDisplaySave(f, index, failure = "network") {
+  const privateDetail = "synthetic private /example/settings.json response detail";
+  if (failure === "network") f.requests[index].reject(new Error(privateDetail));
+  if (failure === "HTTP") f.requests[index].resolve({ ok: false, text: async () => privateDetail });
+  if (failure === "malformed JSON") f.requests[index].resolve({ ok: true, json: async () => { throw new Error(privateDetail); } });
+  if (failure === "invalid shape") f.respond(index, []);
+  if (failure === "invalid metadata") f.respond(index, { server_revision: "8" });
+}
+function assertDisplayWarning(f, count = 1) {
+  assert.equal(f.notices.length, count);
+  for (const [message, type] of f.notices) {
+    assert.equal(message, displaySaveWarning, "Only static text may reach the warning");
+    assert.equal(type, "warning");
+  }
+}
+
+for (const failure of ["network", "HTTP", "malformed JSON", "invalid shape", "invalid metadata"]) {
+  test(`explicit Display Apply warns after ${failure} failure without undoing appearance or retry`, async () => {
+    const f = fixture(); await f.ready(); applyDisplay(f);
+    assert.equal(f.context.isModalVisible(f.els.displaySettingsModal), false, "Apply closes normally before its response");
+    failDisplaySave(f, 1, failure); await nextTurn();
+    assertDisplayWarning(f);
+    assert.equal(f.state.displaySettings.theme, "ivory");
+    assert.equal(f.document.body.dataset.theme, "ivory");
+    assert.equal(f.context.uiSettingsDirty, true);
+    assert.equal(f.context.uiSettingsSavePromise, null);
+    assert.equal(f.timers.size, 1);
+    assert.equal([...f.timers.values()][0].delay, 1000, "Keep the existing retry cadence");
+    assert.equal(f.context.isModalVisible(f.els.displaySettingsModal), false);
+  });
+}
+
+test("late acknowledged Display Apply stays silent and does not disturb a reopened draft", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f);
+  f.context.openDisplaySettingsModal(); f.edit("displayThemeSelect", "charcoal");
+  f.succeed(1); await nextTurn();
+  assert.equal(f.notices.length, 0);
+  assert.equal(f.els.displayThemeSelect.value, "charcoal");
+  assert.equal(f.document.body.dataset.theme, "charcoal");
+  assert.equal(f.state.displaySettings.theme, "ivory");
+  assert.equal(f.context.isModalVisible(f.els.displaySettingsModal), true);
+  assert.equal(f.context.pendingDisplaySettingsApply, null);
+});
+
+test("late Display failure preserves a reopened preview and cannot reopen a dismissed dialog", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f);
+  f.context.openDisplaySettingsModal(); f.edit("displayThemeSelect", "charcoal");
+  failDisplaySave(f, 1); await nextTurn();
+  assertDisplayWarning(f);
+  assert.equal(f.els.displayThemeSelect.value, "charcoal");
+  assert.equal(f.document.body.dataset.theme, "charcoal");
+  assert.equal(f.context.isModalVisible(f.els.displaySettingsModal), true);
+  f.context.closeDisplaySettingsModal();
+  assert.equal(f.document.body.dataset.theme, "ivory");
+  f.runTimers(); failDisplaySave(f, 2); await nextTurn();
+  assertDisplayWarning(f);
+  assert.equal(f.context.isModalVisible(f.els.displaySettingsModal), false);
+});
+
+test("repeated Display Apply sharing a failed in-flight request warns once", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f); applyDisplay(f); applyDisplay(f);
+  assert.equal(f.requests.length, 2, "Repeated Apply shares the first POST");
+  failDisplaySave(f, 1); await nextTurn();
+  assertDisplayWarning(f);
+  assert.equal(f.context.pendingDisplaySettingsApply, null);
+});
+
+test("automatic retries stay silent through repeated failures and recovery", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f);
+  failDisplaySave(f, 1); await nextTurn(); assertDisplayWarning(f);
+  for (const index of [2, 3]) {
+    f.runTimers(); failDisplaySave(f, index); await nextTurn(); assertDisplayWarning(f);
+  }
+  f.runTimers(); f.succeed(4); await nextTurn();
+  assertDisplayWarning(f);
+  assert.equal(f.context.uiSettingsDirty, false);
+  assert.equal(f.timers.size, 0);
+});
+
+test("a later distinct failed Apply warns again, even during an automatic retry", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f);
+  failDisplaySave(f, 1); await nextTurn(); assertDisplayWarning(f);
+  f.runTimers(); applyDisplay(f, "charcoal");
+  failDisplaySave(f, 2); await nextTurn();
+  assertDisplayWarning(f, 2);
+  assert.equal(f.state.displaySettings.theme, "charcoal");
+  assert.equal(f.document.body.dataset.theme, "charcoal");
+  assert.equal(f.timers.size, 1);
+});
+
+test("a background settings failure without explicit Apply never warns", async () => {
+  const f = fixture(); await f.ready();
+  f.context.scheduleUiSettingsSave(); f.runTimers();
+  failDisplaySave(f, 1); await nextTurn();
+  assert.equal(f.notices.length, 0);
+  assert.equal(f.timers.size, 1);
+});
+
+test("an acknowledged Display payload cannot be blamed for a later unrelated failure in the same loop", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f);
+  f.state.workbenchHeight = 600; f.context.scheduleUiSettingsSave();
+  f.succeed(1); await nextTurn();
+  assert.equal(f.payload(2).workbench_height, 600);
+  failDisplaySave(f, 2); await nextTurn();
+  assert.equal(f.notices.length, 0);
+  assert.equal(f.context.pendingDisplaySettingsApply, null);
+  assert.equal(f.state.displaySettings.theme, "ivory");
+});
+
+test("an older acknowledged payload cannot suppress a newer unacknowledged Display Apply", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f); applyDisplay(f, "charcoal");
+  f.succeed(1); await nextTurn();
+  assert.equal(f.payload(2).display_settings.theme, "charcoal");
+  assert.equal(f.payload(2).client_version, 2);
+  failDisplaySave(f, 2); await nextTurn();
+  assertDisplayWarning(f);
+  assert.equal(f.state.displaySettings.theme, "charcoal");
+  assert.equal(f.document.body.dataset.theme, "charcoal");
+});
+
+test("identical newer Apply values are confirmed by the first acknowledgement", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f); applyDisplay(f);
+  f.succeed(1); await nextTurn();
+  assert.equal(f.requests.length, 3);
+  failDisplaySave(f, 2); await nextTurn();
+  assert.equal(f.notices.length, 0, "The desired appearance was already acknowledged");
+});
+
+test("Display Apply queued behind an unrelated request waits for its own values", async () => {
+  const f = fixture(); await f.ready();
+  f.context.scheduleUiSettingsSave(); f.runTimers(); applyDisplay(f);
+  f.succeed(1); await nextTurn();
+  assert.equal(f.payload(2).display_settings.theme, "ivory");
+  failDisplaySave(f, 2); await nextTurn(); assertDisplayWarning(f);
+});
+
+test("newer Display acknowledgement clears its warning before later unrelated loop failure", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f); applyDisplay(f, "charcoal");
+  f.succeed(1); await nextTurn();
+  f.state.workbenchHeight = 600; f.context.scheduleUiSettingsSave();
+  f.succeed(2, 9); await nextTurn();
+  failDisplaySave(f, 3); await nextTurn();
+  assert.equal(f.notices.length, 0);
+  assert.equal(f.state.displaySettings.theme, "charcoal");
+});
+
+test("server-wins conflict settles Display feedback without changing existing conflict behavior", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f); applyDisplay(f, "charcoal");
+  f.respond(1, { ...snapshot(9, nondefault), client_id: "fixture-other", client_version: 4 }); await nextTurn();
+  assert.equal(f.state.displaySettings.theme, "paper");
+  assert.equal(f.payload(2).display_settings.theme, "paper");
+  failDisplaySave(f, 2); await nextTurn();
+  assert.equal(f.notices.length, 0, "A settled server winner is not an uncertain Display save");
+  assert.equal(f.state.displaySettings.theme, "paper");
+});
+
+for (const acknowledgement of ["matching sparse", "legacy sparse conflict"]) {
+  test(`${acknowledgement} acknowledgement retains normal validation and settles Display feedback`, async () => {
+    const f = fixture(); await f.ready(); applyDisplay(f);
+    f.state.workbenchHeight = 600; f.context.scheduleUiSettingsSave();
+    const body = { server_revision: 8 };
+    if (acknowledgement === "matching sparse") {
+      body.client_id = f.payload(1).client_id;
+      body.client_version = f.payload(1).client_version;
+    }
+    f.respond(1, body); await nextTurn();
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.context.pendingDisplaySettingsApply, null);
+    assert.equal(f.requests.length, 3);
+    failDisplaySave(f, 2); await nextTurn();
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.state.displaySettings.theme, acknowledgement === "matching sparse" ? "ivory" : "charcoal");
+  });
+}
+
+test("a later explicit Apply with identical values receives its own failure warning", async () => {
+  const f = fixture(); await f.ready(); applyDisplay(f);
+  failDisplaySave(f, 1); await nextTurn(); assertDisplayWarning(f);
+  applyDisplay(f);
+  failDisplaySave(f, 2); await nextTurn(); assertDisplayWarning(f, 2);
+  assert.equal(f.timers.size, 1);
+});
+
+for (const [field, value, payloadField] of [
+  ["displaySizeInput", "18", "size_px"], ["displayUiFontSelect", "system", "ui_font"],
+  ["displayMonoFontSelect", "sfmono", "mono_font"], ["displayRenderResourcesInput", false, "render_resources"],
+]) {
+  test(`newer ${field} Apply remains pending after an older appearance acknowledgement`, async () => {
+    const f = fixture(); await f.ready(); applyDisplay(f);
+    f.context.openDisplaySettingsModal(); f.edit(field, value); f.context.saveDisplaySettingsFromForm();
+    f.succeed(1); await nextTurn();
+    assert.equal(f.payload(2).display_settings[payloadField], field === "displaySizeInput" ? 18 : value);
+    failDisplaySave(f, 2); await nextTurn(); assertDisplayWarning(f);
+  });
+}

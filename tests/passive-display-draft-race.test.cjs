@@ -32,7 +32,7 @@ function fixture() {
   };
   const globals = {
     state, els, document, displaySettingsPreviewActive: false, displaySettingsReturnFocus: null,
-    displaySettingsReady: true, displaySettingsEditedControls: new Set(),
+    displaySettingsReady: true, pendingDisplaySettingsApply: null, displaySettingsEditedControls: new Set(),
     uiSettingsServerRevision: 0, uiSettingsDirty: false, uiSettingsSaveTimer: null,
     window: { clearTimeout() {} }, WS_COLUMN_RULES: {},
     DISPLAY_THEME_OPTIONS: new Set(["charcoal", "paper", "ivory"]),

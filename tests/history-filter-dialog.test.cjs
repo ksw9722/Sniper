@@ -67,7 +67,7 @@ function fixture() {
     "isUiSettingsLoadSnapshot", "loadUiSettings", "applyUiSettingsSnapshot", "updateUiSettingsServerRevision", "snapshotUiSettings", "nextUiSettingsSnapshot", "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "persistUiSettings",
   ], {
     state, els, document, activeConfirmDialog: null, filterSettingsReturnFocus: null, filterSettingsEditedControls: new Set(),
-    uiSettingsLoadState: "loading", uiSettingsLoadPromise: null, displaySettingsReady: true,
+    uiSettingsLoadState: "loading", uiSettingsLoadPromise: null, displaySettingsReady: true, pendingDisplaySettingsApply: null,
     uiSettingsInitialPostGeneration: 0, uiSettingsInitialPostRevision: 0,
     updateDisplaySettingsReadiness() {}, hydrateDisplaySettingsForm() {},
     uiSettingsClientId: "fixture-client", uiSettingsSaveVersion: 0, uiSettingsServerRevision: 0,

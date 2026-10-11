@@ -24,7 +24,7 @@ function fixture() {
     "persistUiSettings", "snapshotUiSettings", "nextUiSettingsSnapshot",
     "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "updateUiSettingsServerRevision",
   ], {
-    state, displaySettingsReady: true, uiSettingsClientId: "fixture-local", uiSettingsSaveVersion: 0,
+    state, displaySettingsReady: true, pendingDisplaySettingsApply: null, uiSettingsClientId: "fixture-local", uiSettingsSaveVersion: 0,
     uiSettingsServerRevision: 3, uiSettingsSaveTimer: null, uiSettingsDirty: false,
     uiSettingsInFlight: false, uiSettingsSavePromise: null, lastUiSettingsPayload: null,
     console: { error(error) { errors.push(error); } },

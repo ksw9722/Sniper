@@ -981,6 +981,7 @@ let uiSettingsLoadState = "loading";
 let uiSettingsInitialPostGeneration = 0;
 let uiSettingsInitialPostRevision = 0;
 let displaySettingsReady = false;
+let pendingDisplaySettingsApply = null;
 const displaySettingsEditedControls = new Set();
 let lastUiSettingsPayload = null;
 let proxySettingsSaveInFlight = false;
@@ -19774,6 +19775,7 @@ function saveDisplaySettingsFromForm() {
   if (!displaySettingsReady) return;
   const renderResourcesBefore = state.displaySettings.renderResources;
   state.displaySettings = collectDisplaySettingsFormValues();
+  pendingDisplaySettingsApply = { ...state.displaySettings };
   applyDisplaySettingsState();
   if (state.displaySettings.renderResources !== renderResourcesBefore) {
     redrawResponsePreviews();
@@ -20017,6 +20019,7 @@ async function persistUiSettings() {
       while (uiSettingsDirty) {
         uiSettingsDirty = false;
         const payloadSnapshot = nextUiSettingsSnapshot();
+        const displaySettingsSnapshot = { ...state.displaySettings };
         const payload = JSON.stringify(payloadSnapshot);
         lastUiSettingsPayload = payload;
         let savedSnapshot;
@@ -20044,6 +20047,10 @@ async function persistUiSettings() {
           // Wait for the response body too, so a slow failure cannot consume the
           // retry timer while this attempt still owns the in-flight promise.
           scheduleUiSettingsRetry();
+          if (pendingDisplaySettingsApply) {
+            pendingDisplaySettingsApply = null;
+            showToast("Could not confirm saving display settings. Automatic retries will continue.", "warning", 6000);
+          }
           throw error;
         } finally {
           if (!displaySettingsReady) uiSettingsInitialPostGeneration += 1;
@@ -20056,7 +20063,14 @@ async function persistUiSettings() {
           const savedClientId = String(savedSnapshot.client_id || "");
           const savedClientVersion = Math.max(0, Number(savedSnapshot.client_version || 0) || 0);
           if (savedClientId !== payloadSnapshot.client_id || savedClientVersion !== payloadSnapshot.client_version) {
+            // The server winner also replaces any pending local appearance.
+            pendingDisplaySettingsApply = null;
             applyUiSettingsSnapshot(savedSnapshot);
+          } else if (pendingDisplaySettingsApply && Object.entries(pendingDisplaySettingsApply)
+            .every(([key, value]) => displaySettingsSnapshot[key] === value)) {
+            // Confirm the Display values here: a later unrelated save in this
+            // same loop may fail, while a newer Apply may still be pending.
+            pendingDisplaySettingsApply = null;
           }
         }
       }
