@@ -68,6 +68,31 @@ access.
 See [safe skill maintenance](../integrations/skill-maintenance.md) for exact
 commands, refusal states, and activation and backup limitations.
 
+## UI reliability (2026-10-11)
+
+- Display settings can be edited and previewed while their saved baseline loads,
+  but Apply waits for a usable baseline. A failed or superseded initial read
+  offers Retry without automatically applying the draft. If an explicit Apply
+  cannot be confirmed, a warning explains that automatic save retries continue.
+- Settings and Filter dialogs keep composition-marked Escape events within the
+  text input. Saved-tab renaming likewise ignores composition-marked Enter and
+  Escape. Stored labels are normalized to 80 Unicode scalar values without
+  splitting supplementary characters; the existing inline typing cap is unchanged.
+- A delayed note read no longer opens an editor after the user moves to another
+  interaction. Status toasts expose polite announcements without moving focus.
+  Clipboard fallback fields are removed even when selection or copying throws.
+- Returning to the same finding or session does not revive an older detail
+  read. Older list/count reads cannot replace a newer accepted badge count or
+  undo an observed finding event; later valid lower counts still apply.
+- Arrow keys already handled by the browser chooser no longer also move the
+  session, history, finding, or frame selection underneath it. Findings row
+  navigation also leaves arrow keys to focused text controls, modifier shortcuts,
+  and open dialogs.
+
+These changes have synthetic production-handler regression coverage. Native
+desktop IME behavior, screen-reader announcements, and system clipboard
+permission interactions still require manual verification.
+
 ## Preserve saved work across failures
 
 Successfully loaded UI settings files with an omitted or zero `server_revision`
