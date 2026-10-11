@@ -13888,6 +13888,18 @@ function renderMatchReplaceRules() {
 
 function renderTarget() {
   const sessionId = currentSessionId();
+  const targetTree = els.targetTree;
+  const focusedElement = document.activeElement;
+  const focusedButton = focusedElement?.closest(".target-host-toggle");
+  const canRestoreHostFocus = () => sessionId && currentSessionId() === sessionId
+    && els.targetTree === targetTree && targetTree.isConnected
+    && state.activeTool === "target" && !els.targetShell.classList.contains("hidden")
+    && targetTree.getClientRects().length && window.getComputedStyle(targetTree).visibility !== "hidden"
+    && !document.querySelector(".modal-backdrop:not(.hidden), dialog[open]");
+  // Scope-draft sync can reset the editor owner without changing this tree.
+  const focusedHost = focusedButton && targetTree.contains(focusedButton)
+    && targetTree.dataset.renderedSessionId === sessionId && canRestoreHostFocus()
+    ? focusedButton.dataset.targetHost : null;
   if (!state.targetScopeDirty) {
     state.targetScopeDraft = formatScopePatternsText(state.runtime?.scope_patterns);
     state.targetScopeExcludeDraft = formatScopePatternsText(
@@ -13919,7 +13931,7 @@ function renderTarget() {
     Array.from(state.targetExpandedHosts).filter((host) => liveHosts.has(host)),
   );
 
-  els.targetTree.innerHTML = siteMap.length
+  targetTree.innerHTML = siteMap.length
     ? siteMap
         .map((host) => {
           const hostName = String(host.host || "");
@@ -13964,7 +13976,8 @@ function renderTarget() {
         .join("")
     : "<p class=\"empty-copy\">No captured targets yet. Send traffic through the proxy to build a site map.</p>";
 
-  Array.from(els.targetTree.querySelectorAll(".target-host-toggle")).forEach((button) => {
+  const hostButtons = Array.from(targetTree.querySelectorAll(".target-host-toggle"));
+  hostButtons.forEach((button) => {
     button.addEventListener("click", () => {
       const host = button.dataset.targetHost;
       if (!host) {
@@ -13980,6 +13993,19 @@ function renderTarget() {
       renderTarget();
     });
   });
+  targetTree.dataset.renderedSessionId = sessionId || "";
+
+  // Replacing the buttons drops focus to body. A newer focus owner always wins.
+  const activeElement = document.activeElement;
+  if (focusedHost !== null && canRestoreHostFocus()
+    && (!activeElement || activeElement === document.body
+      || (activeElement === focusedElement && !focusedElement.isConnected))) {
+    const button = hostButtons.find((candidate) => candidate.dataset.targetHost === focusedHost);
+    if (button?.isConnected && !button.disabled && button.tabIndex >= 0
+      && button.getClientRects().length && window.getComputedStyle(button).visibility !== "hidden") {
+      button.focus({ preventScroll: true });
+    }
+  }
 }
 
 function renderFuzzer() {
