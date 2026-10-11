@@ -11135,6 +11135,22 @@ fn saved_response_diagnostic(
     }
 }
 
+// Call only after output schema and request binding validation: ok:true means
+// the receipt was read successfully, not that its mutation was applied.
+fn saved_receipt_warnings(operation: &str, data: &Value) -> Vec<&'static str> {
+    if operation == "saved.v1.operation.get" && data["found"] == false {
+        return vec!["No receipt was found. This does not prove the mutation was not applied. Inspect current saved state; do not automatically retry or issue a new operation_id to repeat the mutation."];
+    }
+    if operation != "saved.v1.operation.get" && !sniper::saved_data::is_write(operation) {
+        return Vec::new();
+    }
+    match data["receipt"]["outcome"].as_str() {
+        Some("unknown") => vec!["The mutation outcome is unknown. Inspect saved.v1.operation.get with the original operation_id and current saved state; do not automatically retry or issue a new operation_id to repeat the mutation."],
+        Some("not_applied") => vec!["This mutation attempt was not applied. Review the receipt's code and current saved state before deciding on a new attempt. Repeating the same request with the original operation_id returns its receipt, not a fresh attempt."],
+        _ => Vec::new(),
+    }
+}
+
 fn validate_saved_response_binding(operation: &str, input: &Value, data: &Value) -> Result<()> {
     if sniper::saved_data::is_write(operation) {
         if saved_uuid_field(&data["receipt"], "operation_id")
@@ -11376,7 +11392,7 @@ async fn run_saved_call(
                     &input,
                 )
             })?;
-            return print_json(data);
+            return print_json_with_warnings(data, &saved_receipt_warnings(&operation, data));
         }
     }
     if let Some(error) = wire.get("error").and_then(|value| {
@@ -11654,6 +11670,10 @@ fn cli_partial_apply_error(message: impl Into<String>, mut details: Value) -> an
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    print_json_with_warnings(value, &[])
+}
+
+fn print_json_with_warnings<T: Serialize>(value: &T, warnings: &[&str]) -> Result<()> {
     let data = serde_json::to_value(value).context("failed to encode JSON output")?;
     let context = output_context();
     if !context.success_envelope {
@@ -11665,7 +11685,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
         "schema_version": output_schema_version(&context.operation),
         "data": data,
         "meta": {},
-        "warnings": [],
+        "warnings": warnings,
     });
     write_json_envelope(&envelope, context.format)
 }

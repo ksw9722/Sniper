@@ -158,6 +158,13 @@ rerunning the read. A redirect does not authorize following an alternate endpoin
 or automatically retrying a mutation.
 Successful output and typed errors are checked against the original operation ID
 and explicit/pinned session before their outcomes are attributed to the request.
+A successful receipt response keeps `ok:true` and exit status zero even when the
+mutation outcome is `unknown` or `not_applied`: success describes reading the
+receipt. The CLI also adds a static `warnings` entry for those outcomes and for
+an absent receipt, without changing `data`. An absent receipt does not prove a
+mutation failed. Inspect the original receipt and current saved state; never
+repeat an uncertain mutation automatically or use a new operation ID to bypass
+that uncertainty. Applied receipts and ordinary reads have no outcome warning.
 
 The local API endpoint is `POST /api/saved/v1/call` with body
 `{"operation":"saved.v1.http.list","input":{}}`. It returns the versioned wire

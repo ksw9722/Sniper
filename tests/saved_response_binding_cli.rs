@@ -1,4 +1,4 @@
-//! Read-only saved-data calls against synthetic loopback responses only.
+//! Saved metadata calls against synthetic loopback responses only; no real writes or runtime.
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -56,7 +56,7 @@ fn selection(ids: Value) -> Value {
         "ids":ids,"selection_token":"a".repeat(64)})
 }
 
-async fn check(operation: &str, input: Value, data: Value, valid: bool) {
+async fn check(operation: &str, input: Value, data: Value, valid: bool) -> Value {
     sniper::saved_contract::validate_input(operation, &input).unwrap();
     let dir = std::env::temp_dir().join(format!("sniper-response-binding-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -92,6 +92,7 @@ async fn check(operation: &str, input: Value, data: Value, valid: bool) {
             "--input",
             &input.to_string(),
         ])
+        .args(sniper::saved_data::is_write(operation).then_some("--yes"))
         .output()
         .await
         .unwrap();
@@ -101,7 +102,7 @@ async fn check(operation: &str, input: Value, data: Value, valid: bool) {
     assert_eq!(
         *requests.lock().unwrap(),
         vec![json!({"operation":operation,"input":input})],
-        "the read-only request must be sent exactly once"
+        "the synthetic metadata request must be sent exactly once"
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
@@ -120,7 +121,12 @@ async fn check(operation: &str, input: Value, data: Value, valid: bool) {
     } else {
         assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{result}");
         assert_eq!(
-            result["error"]["details"]["outcome"], "not_applied",
+            result["error"]["details"]["outcome"],
+            if sniper::saved_data::is_write(operation) {
+                "unknown"
+            } else {
+                "not_applied"
+            },
             "{result}"
         );
         assert_eq!(result["error"]["retryable"], false, "{result}");
@@ -128,7 +134,9 @@ async fn check(operation: &str, input: Value, data: Value, valid: bool) {
             result.get("data").is_none(),
             "invalid rows must not be presented as data"
         );
+        assert_eq!(result["warnings"], json!([]));
     }
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -363,4 +371,92 @@ async fn operation_lookup_matches_receipt_uuid_identity() {
         false,
     )
     .await;
+}
+
+fn mutation_receipt(outcome: &str) -> Value {
+    let mut receipt = json!({"contract_version":"saved.v1","operation_id":id(4),
+        "session_id":id(1),"operation":"saved.v1.session.rename","outcome":outcome,
+        "code":"pending","message":"synthetic receipt diagnostic",
+        "created_at":"2026-10-10T00:00:00Z"});
+    if outcome != "unknown" {
+        receipt["completed_at"] = json!("2026-10-10T00:00:01Z");
+        receipt["code"] = json!(if outcome == "applied" {
+            "applied"
+        } else {
+            "session_conflict"
+        });
+    }
+    if outcome == "applied" {
+        receipt["result"] = json!({"kind":"session_renamed","session":session_item(1)});
+    }
+    receipt
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_outcome_warnings_preserve_data_success_and_single_request() {
+    for outcome in ["applied", "not_applied", "unknown"] {
+        for (lookup, replayed) in [(false, false), (false, true), (true, false)] {
+            let receipt = mutation_receipt(outcome);
+            let (operation, input, data) = if lookup {
+                (
+                    "saved.v1.operation.get",
+                    json!({"operation_id":id(4)}),
+                    json!({"contract_version":"saved.v1","operation_id":id(4),
+                        "found":true,"outcome":outcome,"receipt":receipt}),
+                )
+            } else {
+                (
+                    "saved.v1.session.rename",
+                    json!({"operation_id":id(4),"session_id":id(1),"name":"Synthetic saved session"}),
+                    json!({"contract_version":"saved.v1","receipt":receipt,"replayed":replayed}),
+                )
+            };
+            let result = check(operation, input, data, true).await;
+            assert_eq!(result["ok"], true);
+            let warnings = result["warnings"].as_array().unwrap();
+            if outcome == "applied" {
+                assert!(warnings.is_empty());
+            } else {
+                assert_eq!(warnings.len(), 1, "{result}");
+                let warning = warnings[0].as_str().unwrap();
+                assert!(!warning.contains("synthetic receipt diagnostic"));
+                if outcome == "unknown" {
+                    assert!(warning.contains("unknown"));
+                    assert!(warning.contains("original operation_id"));
+                    assert!(warning.contains("do not automatically retry"));
+                    assert!(warning.contains("new operation_id"));
+                } else {
+                    assert!(warning.contains("attempt was not applied"));
+                }
+            }
+        }
+    }
+    let absent = check("saved.v1.operation.get", json!({"operation_id":id(4)}),
+        json!({"contract_version":"saved.v1","operation_id":id(4),"found":false,"outcome":"unknown","receipt":null}), true).await;
+    assert_eq!(absent["warnings"].as_array().unwrap().len(), 1);
+    assert!(absent["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("does not prove"));
+    assert!(absent["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("new operation_id"));
+    let mut mismatched = mutation_receipt("unknown");
+    mismatched["operation_id"] = json!(id(5));
+    check(
+        "saved.v1.session.rename",
+        json!({"operation_id":id(4),"session_id":id(1),"name":"Synthetic saved session"}),
+        json!({"contract_version":"saved.v1","receipt":mismatched,"replayed":false}),
+        false,
+    )
+    .await;
+    let ordinary = check(
+        "saved.v1.session.list",
+        json!({"limit":1}),
+        session_page(vec![], 1, false),
+        true,
+    )
+    .await;
+    assert_eq!(ordinary["warnings"], json!([]));
 }
