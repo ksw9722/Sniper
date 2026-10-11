@@ -66,7 +66,7 @@ function fixture(overrides = {}) {
   ], {
     state, els, document, HTMLElement,
     activeConfirmDialog: null, displaySettingsReturnFocus: null, filterSettingsReturnFocus: null, filterSettingsEditedControls: new Set(),
-    displaySettingsPreviewActive: false, wsFrameContextMenuTarget: null, browserMenu: null,
+    displaySettingsPreviewActive: false, displaySettingsEditedControls: new Set(), wsFrameContextMenuTarget: null, browserMenu: null,
     window: { getComputedStyle: () => ({ visibility: "visible" }) },
     hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {}, selectSettingsTab() {},
     hydrateFilterForm() {}, saveDisplaySettingsFromForm() {}, applyFilterSettings() {}, closeCurlImportModal() {},

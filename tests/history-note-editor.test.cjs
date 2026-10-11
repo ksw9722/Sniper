@@ -109,7 +109,7 @@ function fixture({ joinAnnotations = false } = {}) {
     pendingHistoryNoteRead: null,
     IMPLEMENTED_TOOLS: new Set(["proxy", "replay"]),
     IMPLEMENTED_PROXY_TABS: new Set(["http-history", "websockets-history"]),
-    displaySettingsReturnFocus: null, displaySettingsPreviewActive: false, filterSettingsReturnFocus: null,
+    displaySettingsReturnFocus: null, displaySettingsPreviewActive: false, displaySettingsEditedControls: new Set(), filterSettingsReturnFocus: null,
     filterSettingsEditedControls: new Set(),
     hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {}, selectSettingsTab() {},
     hydrateFilterForm() {},

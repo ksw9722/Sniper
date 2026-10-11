@@ -32,6 +32,7 @@ function fixture() {
   };
   const globals = {
     state, els, document, displaySettingsPreviewActive: false, displaySettingsReturnFocus: null,
+    displaySettingsReady: true, displaySettingsEditedControls: new Set(),
     uiSettingsServerRevision: 0, uiSettingsDirty: false, uiSettingsSaveTimer: null,
     window: { clearTimeout() {} }, WS_COLUMN_RULES: {},
     DISPLAY_THEME_OPTIONS: new Set(["charcoal", "paper", "ivory"]),
@@ -58,7 +59,7 @@ function fixture() {
   ]) globals[name] = () => {};
   const context = loadFunctions([
     "createDefaultDisplaySettings", "sanitizeDisplaySettings", "openDisplaySettingsModal", "closeDisplaySettingsModal",
-    "hydrateDisplaySettingsForm", "collectDisplaySettingsFormValues", "previewDisplaySettingsFromForm",
+    "displaySettingsFormControls", "hydrateDisplaySettingsForm", "collectDisplaySettingsFormValues", "previewDisplaySettingsFromForm",
     "saveDisplaySettingsFromForm", "applyDisplaySettingsState", "applyUiSettingsSnapshot",
     "updateUiSettingsServerRevision", "isModalVisible",
   ], globals);
@@ -72,6 +73,9 @@ function fixture() {
     els.displaySizeInput.value = "18";
     els.displayUiFontSelect.value = "system";
     els.displayMonoFontSelect.value = "sfmono";
+    for (const control of [els.displayThemeSelect, els.displaySizeInput, els.displayUiFontSelect, els.displayMonoFontSelect]) {
+      context.displaySettingsEditedControls.add(control);
+    }
     if (preview) context.previewDisplaySettingsFromForm();
   }
   const values = () => [els.displayThemeSelect.value, els.displaySizeInput.value, els.displayUiFontSelect.value, els.displayMonoFontSelect.value];
@@ -105,7 +109,7 @@ test("a background settings snapshot preserves the open appearance preview", () 
 
 for (const preview of [false, true]) {
   test(`late startup hydration preserves an open ${preview ? "preview" : "unpreviewed"} appearance draft`, async () => {
-    const f = fixture(); f.draft(preview);
+    const f = fixture(); f.context.displaySettingsReady = false; f.draft(preview);
     f.context.loadUiSettings = async () => f.context.applyUiSettingsSnapshot(f.remote);
     const start = appSource.indexOf("  await loadUiSettings();");
     const end = appSource.indexOf("  await loadSessions();", start);

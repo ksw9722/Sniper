@@ -722,6 +722,8 @@ const els = {
   closeDisplaySettingsButton: document.getElementById("closeDisplaySettingsButton"),
   applyDisplaySettingsButton: document.getElementById("applyDisplaySettingsButton"),
   resetDisplaySettingsButton: document.getElementById("resetDisplaySettingsButton"),
+  displaySettingsLoadStatus: document.getElementById("displaySettingsLoadStatus"),
+  retryDisplaySettingsButton: document.getElementById("retryDisplaySettingsButton"),
   displayThemeSelect: document.getElementById("displayThemeSelect"),
   displaySizeInput: document.getElementById("displaySizeInput"),
   displayUiFontSelect: document.getElementById("displayUiFontSelect"),
@@ -974,6 +976,12 @@ let uiSettingsSaveTimer = null;
 let uiSettingsDirty = false;
 let uiSettingsInFlight = false;
 let uiSettingsSavePromise = null;
+let uiSettingsLoadPromise = null;
+let uiSettingsLoadState = "loading";
+let uiSettingsInitialPostGeneration = 0;
+let uiSettingsInitialPostRevision = 0;
+let displaySettingsReady = false;
+const displaySettingsEditedControls = new Set();
 let lastUiSettingsPayload = null;
 let proxySettingsSaveInFlight = false;
 let proxySettingsSavePromise = null;
@@ -1630,6 +1638,12 @@ function bindEvents() {
   });
 
   els.applyDisplaySettingsButton.addEventListener("click", saveDisplaySettingsFromForm);
+  els.retryDisplaySettingsButton.addEventListener("click", loadUiSettings);
+  displaySettingsFormControls().forEach((control) => {
+    const markEdited = () => displaySettingsEditedControls.add(control);
+    control.addEventListener("input", markEdited);
+    control.addEventListener("change", markEdited);
+  });
   els.resetDisplaySettingsButton.addEventListener("click", () => {
     const defaults = createDefaultDisplaySettings();
     els.displayThemeSelect.value = defaults.theme;
@@ -1637,6 +1651,7 @@ function bindEvents() {
     els.displayUiFontSelect.value = defaults.uiFont;
     els.displayMonoFontSelect.value = defaults.monoFont;
     els.displayRenderResourcesInput.checked = defaults.renderResources;
+    displaySettingsFormControls().forEach((control) => displaySettingsEditedControls.add(control));
     previewDisplaySettingsFromForm();
   });
   [els.displayThemeSelect, els.displayUiFontSelect, els.displayMonoFontSelect].forEach((element) => {
@@ -19250,6 +19265,7 @@ function closeDisplaySettingsModal() {
   }
   els.displaySettingsModal.classList.add("hidden");
   if (wasVisible) {
+    displaySettingsEditedControls.clear();
     restoreModalFocus(displaySettingsReturnFocus, els.openDisplaySettingsButton);
     displaySettingsReturnFocus = null;
   }
@@ -19699,12 +19715,37 @@ function persistWorkbenchLayout(height) {
   scheduleUiSettingsSave();
 }
 
-function hydrateDisplaySettingsForm() {
-  els.displayThemeSelect.value = state.displaySettings.theme;
-  els.displaySizeInput.value = String(state.displaySettings.sizePx);
-  els.displayUiFontSelect.value = state.displaySettings.uiFont;
-  els.displayMonoFontSelect.value = state.displaySettings.monoFont;
-  els.displayRenderResourcesInput.checked = state.displaySettings.renderResources;
+function displaySettingsFormControls() {
+  return [els.displayThemeSelect, els.displaySizeInput, els.displayUiFontSelect,
+    els.displayMonoFontSelect, els.displayRenderResourcesInput];
+}
+
+function hydrateDisplaySettingsForm({ preserveDraft = false } = {}) {
+  const values = [state.displaySettings.theme, String(state.displaySettings.sizePx),
+    state.displaySettings.uiFont, state.displaySettings.monoFont, state.displaySettings.renderResources];
+  displaySettingsFormControls().forEach((control, index) => {
+    if (preserveDraft && displaySettingsEditedControls.has(control)) return;
+    if (control === els.displayRenderResourcesInput) control.checked = values[index];
+    else control.value = values[index];
+  });
+}
+
+function updateDisplaySettingsReadiness() {
+  // An earlier save may still return a conflicting snapshot after the GET.
+  // Wait for that whole loop, but keep normal repeated Apply behavior once ready.
+  if (uiSettingsLoadState === "loaded" && !uiSettingsSavePromise && !uiSettingsInFlight) {
+    displaySettingsReady = true;
+  }
+  els.applyDisplaySettingsButton.disabled = !displaySettingsReady;
+  const message = displaySettingsReady ? "" : uiSettingsLoadState === "failed"
+    ? "Could not load saved display settings. Your draft is kept. Retry before applying."
+    : uiSettingsLoadState === "waiting" ? "Finishing an earlier settings save. You can keep editing."
+      : "Loading saved display settings. You can edit while they load.";
+  if (els.displaySettingsLoadStatus.textContent !== message) {
+    els.displaySettingsLoadStatus.textContent = message;
+  }
+  els.retryDisplaySettingsButton.disabled = uiSettingsLoadState !== "failed";
+  els.retryDisplaySettingsButton.classList.toggle("hidden", uiSettingsLoadState === "loaded");
 }
 
 function collectDisplaySettingsFormValues() {
@@ -19730,6 +19771,7 @@ function previewDisplaySettingsFromForm() {
 }
 
 function saveDisplaySettingsFromForm() {
+  if (!displaySettingsReady) return;
   const renderResourcesBefore = state.displaySettings.renderResources;
   state.displaySettings = collectDisplaySettingsFormValues();
   applyDisplaySettingsState();
@@ -19751,15 +19793,65 @@ function applyDisplaySettingsState(settings = state.displaySettings) {
   document.body.dataset.monoFont = settings.monoFont;
 }
 
+function isUiSettingsLoadSnapshot(snapshot) {
+  // Legacy/default files are expanded by Rust before GET serialization. Zero
+  // metadata may be omitted, but the Display object itself is always present.
+  return snapshot !== null && typeof snapshot === "object" && !Array.isArray(snapshot)
+    && snapshot.display_settings !== null && typeof snapshot.display_settings === "object"
+    && !Array.isArray(snapshot.display_settings)
+    && (snapshot.server_revision === undefined
+      || (Number.isSafeInteger(snapshot.server_revision) && snapshot.server_revision >= 0))
+    && (snapshot.client_id === undefined || typeof snapshot.client_id === "string")
+    && (snapshot.client_version === undefined
+      || (Number.isSafeInteger(snapshot.client_version) && snapshot.client_version >= 0));
+}
+
 async function loadUiSettings() {
-  try {
-    const response = await fetch("/api/ui-settings");
-    if (!response.ok) {
-      throw new Error(await response.text());
+  if (uiSettingsLoadPromise) return uiSettingsLoadPromise;
+  if (uiSettingsLoadState === "loaded") return;
+  const postGeneration = uiSettingsInitialPostGeneration;
+  uiSettingsLoadState = "loading";
+  updateDisplaySettingsReadiness();
+  const loadPromise = (async () => {
+    try {
+      const response = await fetch("/api/ui-settings");
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const snapshot = await response.json();
+      if (!isUiSettingsLoadSnapshot(snapshot)) {
+        throw new Error("Invalid UI settings response. Please try again.");
+      }
+      if (uiSettingsSavePromise) {
+        uiSettingsLoadState = "waiting";
+        updateDisplaySettingsReadiness();
+        while (uiSettingsSavePromise) {
+          // Persistence keeps its own failure/retry policy. A failed response
+          // can still follow a server commit, so it also invalidates this read.
+          await uiSettingsSavePromise.catch(() => {});
+        }
+      }
+      // A concurrent POST may have superseded this GET, including at the same
+      // revision. Do not choose a partial acknowledgement as a new baseline or
+      // relabel old values with its revision; require a fresh read instead.
+      if (postGeneration !== uiSettingsInitialPostGeneration
+        || (snapshot.server_revision ?? 0) < uiSettingsInitialPostRevision) {
+        throw new Error("Saved settings changed while loading. Please retry.");
+      }
+      applyUiSettingsSnapshot(snapshot, { mergeFilterDraft: true });
+      uiSettingsLoadState = "loaded";
+      updateDisplaySettingsReadiness();
+    } catch (error) {
+      uiSettingsLoadState = "failed";
+      console.error(error);
     }
-    applyUiSettingsSnapshot(await response.json(), { mergeFilterDraft: true });
-  } catch (error) {
-    console.error(error);
+  })();
+  uiSettingsLoadPromise = loadPromise;
+  try {
+    return await loadPromise;
+  } finally {
+    uiSettingsLoadPromise = null;
+    updateDisplaySettingsReadiness();
   }
 }
 
@@ -19826,7 +19918,11 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   syncHttpCapturePill();
   document.getElementById("wsInScopeOnly")?.classList.toggle("active", state.websocketInScopeOnly);
   document.getElementById("wsHideClosed")?.classList.toggle("active", state.websocketLiveOnly);
-  if (isModalVisible(els.displaySettingsModal) && displaySettingsPreviewActive) {
+  const displayOpen = isModalVisible(els.displaySettingsModal);
+  if (!displayOpen || !displaySettingsReady) {
+    hydrateDisplaySettingsForm({ preserveDraft: displayOpen });
+  }
+  if (displayOpen && displaySettingsPreviewActive) {
     previewDisplaySettingsFromForm();
   } else {
     applyDisplaySettingsState();
@@ -19949,8 +20045,13 @@ async function persistUiSettings() {
           // retry timer while this attempt still owns the in-flight promise.
           scheduleUiSettingsRetry();
           throw error;
+        } finally {
+          if (!displaySettingsReady) uiSettingsInitialPostGeneration += 1;
         }
         if (savedSnapshot && typeof savedSnapshot === "object") {
+          if (!displaySettingsReady && Number.isSafeInteger(savedSnapshot.server_revision)) {
+            uiSettingsInitialPostRevision = Math.max(uiSettingsInitialPostRevision, savedSnapshot.server_revision);
+          }
           updateUiSettingsServerRevision(savedSnapshot);
           const savedClientId = String(savedSnapshot.client_id || "");
           const savedClientVersion = Math.max(0, Number(savedSnapshot.client_version || 0) || 0);
@@ -19970,6 +20071,7 @@ async function persistUiSettings() {
     if (uiSettingsSavePromise === savePromise) {
       uiSettingsSavePromise = null;
     }
+    updateDisplaySettingsReadiness();
   }
 }
 

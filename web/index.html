@@ -1586,6 +1586,9 @@
                 <small>Lower numbers make the whole workbench denser. The default is 12 px.</small>
               </label>
 
+              <p class="modal-copy" id="displaySettingsLoadStatus" role="status" aria-live="polite">Loading saved display settings. You can edit while they load.</p>
+              <button class="secondary-action" id="retryDisplaySettingsButton" type="button" disabled>Retry</button>
+
             </section>
 
             <section class="filter-group">
@@ -1633,7 +1636,7 @@
 
         <div class="modal-actions">
           <button class="secondary-action" id="resetDisplaySettingsButton" type="button">Reset</button>
-          <button class="primary-action" id="applyDisplaySettingsButton" type="button">Apply</button>
+          <button class="primary-action" id="applyDisplaySettingsButton" type="button" aria-describedby="displaySettingsLoadStatus" disabled>Apply</button>
         </div>
       </div>
     </div>

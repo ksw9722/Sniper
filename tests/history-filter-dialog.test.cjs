@@ -64,9 +64,12 @@ function fixture() {
   const context = loadFunctions([
     "createDefaultFilterSettings", "openFilterModal", "closeFilterModal", "isModalVisible", "restoreModalFocus", "trapModalFocus", "getActiveModalAction",
     "hydrateFilterForm", "applyFilterSettings", "syncColorTagFilterUI", "truncateUiSettingsText", "sanitizeHttpFilterSettings", "sanitizeHttpBooleanMap", "sanitizeHttpColorTags", "serializeHttpFilterSettings",
-    "loadUiSettings", "applyUiSettingsSnapshot", "updateUiSettingsServerRevision", "snapshotUiSettings", "nextUiSettingsSnapshot", "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "persistUiSettings",
+    "isUiSettingsLoadSnapshot", "loadUiSettings", "applyUiSettingsSnapshot", "updateUiSettingsServerRevision", "snapshotUiSettings", "nextUiSettingsSnapshot", "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "persistUiSettings",
   ], {
     state, els, document, activeConfirmDialog: null, filterSettingsReturnFocus: null, filterSettingsEditedControls: new Set(),
+    uiSettingsLoadState: "loading", uiSettingsLoadPromise: null, displaySettingsReady: true,
+    uiSettingsInitialPostGeneration: 0, uiSettingsInitialPostRevision: 0,
+    updateDisplaySettingsReadiness() {}, hydrateDisplaySettingsForm() {},
     uiSettingsClientId: "fixture-client", uiSettingsSaveVersion: 0, uiSettingsServerRevision: 0,
     uiSettingsDirty: false, uiSettingsInFlight: false, uiSettingsSavePromise: null, uiSettingsSaveTimer: null, lastUiSettingsPayload: null,
     HTTP_COLOR_TAG_OPTIONS: new Set(["red", "orange", "yellow", "green", "blue", "purple"]), WS_COLUMN_RULES: {},
@@ -280,13 +283,14 @@ function startInitialSettingsLoad(f, filters = savedInitialFilters) {
   f.context.fetch = (url, options) => options?.method === "POST" ? post(url, options) : response;
   const pending = f.context.loadUiSettings();
   return async () => {
-    resolveResponse({ ok: true, json: async () => ({ server_revision: 7, http_filter_settings: filters }) });
+    resolveResponse({ ok: true, json: async () => ({ server_revision: 7, display_settings: {}, http_filter_settings: filters }) });
     await pending;
   };
 }
 
 function startupFixture() {
   const f = fixture();
+  f.context.displaySettingsReady = false;
   f.state.filterSettings = f.context.createDefaultFilterSettings();
   return f;
 }
@@ -446,13 +450,17 @@ test("retrying a failed initial settings GET merges untouched controls and prese
   assert.deepEqual(f.writes[0].http_filter_settings, { ...savedInitialFilters, search_term: "typed before retry" });
 });
 
-test("Apply before the initial GET keeps its existing save and late-snapshot behavior", async () => {
+test("Filter Apply before the initial GET still saves, while the ambiguous GET requires a fresh read", async () => {
   const f = startupFixture(), finishLoad = startInitialSettingsLoad(f);
   f.context.openFilterModal(); editControl(f, "filterSearchTerm", "early apply");
   f.context.applyFilterSettings(); await f.context.persistUiSettings();
   assert.equal(f.writes.length, 1); assert.equal(f.writes[0].http_filter_settings.search_term, "early apply");
   assert.equal(f.writes[0].server_revision, 0);
+  f.context.console = { error() {} };
   await finishLoad();
+  assert.equal(f.context.uiSettingsLoadState, "failed");
+  assert.equal(f.state.filterSettings.searchTerm, "early apply");
+  const retry = startInitialSettingsLoad(f); await retry();
   assert.equal(f.state.filterSettings.searchTerm, "saved search");
   assert.equal(f.els.filterSearchTerm.value, "saved search");
   assert.equal(f.writes.length, 1); assert.equal(f.context.uiSettingsDirty, false);
