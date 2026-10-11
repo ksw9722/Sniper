@@ -460,3 +460,42 @@ async fn receipt_outcome_warnings_preserve_data_success_and_single_request() {
     .await;
     assert_eq!(ordinary["warnings"], json!([]));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn applied_rename_receipts_bind_nested_session_identity_and_requested_name() {
+    for replayed in [false, true] {
+        for fault in ["session", "name", "matched", "uppercase"] {
+            let mut receipt = mutation_receipt("applied");
+            receipt["result"]["session"]["name"] = json!("Archive é");
+            match fault {
+                "session" => receipt["result"]["session"]["id"] = json!(id(2)),
+                "name" => receipt["result"]["session"]["name"] = json!("Elsewhere"),
+                "uppercase" => {
+                    receipt["result"]["session"]["id"] = json!(id(1).to_string().to_uppercase())
+                }
+                "matched" => (),
+                _ => unreachable!(),
+            }
+            check(
+                "saved.v1.session.rename",
+                json!({"operation_id":id(4),"session_id":id(1),"name":"Archive é"}),
+                json!({"contract_version":"saved.v1","receipt":receipt,"replayed":replayed}),
+                matches!(fault, "matched" | "uppercase"),
+            )
+            .await;
+        }
+    }
+    for (nested_id, valid) in [(id(2), false), (id(1), true)] {
+        let mut receipt = mutation_receipt("applied");
+        receipt["result"]["session"]["id"] = json!(nested_id);
+        receipt["result"]["session"]["name"] = json!("Historical name");
+        check(
+            "saved.v1.operation.get",
+            json!({"operation_id":id(4)}),
+            json!({"contract_version":"saved.v1","operation_id":id(4),"found":true,
+                "outcome":"applied","receipt":receipt}),
+            valid,
+        )
+        .await;
+    }
+}

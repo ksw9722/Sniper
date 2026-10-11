@@ -387,6 +387,15 @@ pub fn validate_output(name: &str, value: &Value) -> Result<(), String> {
         }
         _ => {}
     }
+    if let Some(receipt) = value.get("receipt").filter(|receipt| {
+        receipt["operation"] == "saved.v1.session.rename" && receipt["outcome"] == "applied"
+    }) {
+        if validated_uuid(&receipt["result"]["session"]["id"])
+            != validated_uuid(&receipt["session_id"])
+        {
+            return Err("output renamed session does not match its receipt".into());
+        }
+    }
     Ok(())
 }
 
@@ -653,6 +662,9 @@ pub fn receipt_schema(operation: Option<&str>) -> Value {
             {"properties":{"operation":{"const":"saved.v1.session.rename"},"result":{"properties":{"kind":{"const":"session_renamed"}}}}}
         ]}
     ]);
+    schema["x-sniper-semantic"] = json!("renamed-session-identity");
+    schema["description"] =
+        json!("An applied session rename result identifies the same session UUID as its receipt.");
     schema
 }
 
@@ -1280,6 +1292,49 @@ mod tests {
             validate_output("saved.v1.operation.get", &wrong_outcome),
             Err("output lookup does not match its receipt".into())
         );
+    }
+
+    #[test]
+    fn serialized_rename_receipts_bind_nested_session_uuid_for_mutations_and_lookups() {
+        let session_id = Uuid::parse_str("abcdef00-1234-5678-9abc-def012345678").unwrap();
+        let mut summary = session();
+        summary.id = session_id;
+        let receipt = SavedOperationReceipt {
+            contract_version: CONTRACT_VERSION.into(),
+            operation_id: id(),
+            session_id,
+            operation: SavedOperationKind::SessionRename,
+            outcome: SavedOperationOutcome::Applied,
+            code: SavedOperationCode::Applied,
+            message: SavedOperationCode::Applied.message().into(),
+            result: Some(SavedOperationResult::SessionRenamed { session: summary }),
+            created_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+        };
+        for (nested_id, valid) in [
+            (session_id.to_string(), true),
+            (session_id.to_string().to_uppercase(), true),
+            (Uuid::from_u128(1).to_string(), false),
+        ] {
+            let mut receipt = serde_json::to_value(&receipt).unwrap();
+            receipt["result"]["session"]["id"] = json!(nested_id);
+            for (operation, value) in [
+                (
+                    "saved.v1.session.rename",
+                    json!({"contract_version":CONTRACT_VERSION,"receipt":receipt,"replayed":false}),
+                ),
+                (
+                    "saved.v1.operation.get",
+                    json!({"contract_version":CONTRACT_VERSION,"operation_id":id(),"found":true,"outcome":"applied","receipt":receipt}),
+                ),
+            ] {
+                assert_eq!(
+                    validate_output(operation, &value).is_ok(),
+                    valid,
+                    "{operation}: {value}"
+                );
+            }
+        }
     }
 
     #[test]

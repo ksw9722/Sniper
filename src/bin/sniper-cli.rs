@@ -11187,6 +11187,13 @@ fn validate_saved_response_binding(operation: &str, input: &Value, data: &Value)
         }
     }
     match operation {
+        "saved.v1.session.rename" if data["receipt"]["outcome"] == "applied" => {
+            // Replayed receipts retain the original result and are bound to the
+            // same input fingerprint; do not compare with newer session state.
+            if data["receipt"]["result"]["session"]["name"] != input["name"] {
+                bail!("saved rename result is not bound to the requested name");
+            }
+        }
         "saved.v1.http.select" => {
             if let Some(requested) = input.get("ids").and_then(Value::as_array) {
                 // Selection resolves every requested ID, but sorts and deduplicates
