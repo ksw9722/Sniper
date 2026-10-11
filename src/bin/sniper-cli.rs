@@ -61,6 +61,15 @@ const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const SNIPER_DATA_DIR_ENV: &str = "SNIPER_DATA_DIR";
 const CLI_SCHEMA_VERSION: &str = "2026-06-22";
 
+const SAVED_READ_QUICK_START: &str = r#"Saved-data quick start (read-only):
+  sniper-cli schema input saved.v1.session.list
+  sniper-cli examples saved.v1.session.list
+  sniper-cli call saved.v1.session.list --input '{"limit":20}'
+
+Schema and examples are offline. The call reads a bounded page from a running local API;
+it does not switch the active session. Use --api to select another known instance.
+Saved-data operations are available through call; use manifest to discover them."#;
+
 static CLI_OUTPUT_CONTEXT: OnceLock<CliOutputContext> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -91,7 +100,7 @@ struct CliOutputContext {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.")]
+#[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.", after_help = SAVED_READ_QUICK_START)]
 struct Cli {
     #[arg(long, global = true)]
     api: Option<String>,
@@ -138,17 +147,18 @@ fn parse_oast_polling_interval(value: &str) -> std::result::Result<u64, String> 
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// List operation names and their contracts without contacting an API.
     Manifest,
+    /// Show one operation's input or output JSON Schema offline.
     Schema {
         #[arg(value_enum)]
         kind: SchemaKind,
         operation: String,
     },
     /// Example inputs for one operation, or for every operation when none is named.
-    Examples {
-        operation: Option<String>,
-    },
+    Examples { operation: Option<String> },
     /// Invoke an operation by canonical manifest name.
+    #[command(after_help = SAVED_READ_QUICK_START)]
     Call(CallArgs),
     Session {
         #[command(subcommand)]
@@ -1179,10 +1189,16 @@ struct WebSocketGetArgs {
 enum SkillsCommand {
     Install(SkillsInstallArgs),
     /// Inspect installed skill hashes on this CLI host without changing files.
+    #[command(
+        after_help = "Reads files on this CLI host, even when --api points elsewhere; no network or file changes.\ncurrent means installed bytes match the current bundle. modified_or_outdated means they differ;\nthis alone cannot distinguish personal edits from an older bundle.\nExit status 0 means inspection completed. Check each entries[].status and error_code;\nit does not mean every installation is current. Preserve edits before any manual update."
+    )]
     Status(SkillsInstallArgs),
     /// Experimental: record local enrollment for one installed, exact bundled skill.
     Enroll(SingleSkillArgs),
     /// Compare local files and enrollment with this CLI's bundle; never writes.
+    #[command(
+        after_help = "Reads files on this CLI host without network or file changes.\nmodified compares installed bytes with the enrollment baseline, not the current bundle.\nupdate_available means the enrolled baseline is unchanged and a different bundle is available.\nAfter a manual update, status may be current while update-preview remains modified.\nExit status 0 means inspection completed. Check each entries[].state, stage_eligible and error_code;\nit does not mean every installation is current or safe to replace. Preserve edited files."
+    )]
     UpdatePreview(SkillsInstallArgs),
     /// Experimental: stage a bundled candidate in a new directory without activating it.
     StageUpdate(SkillsStageArgs),

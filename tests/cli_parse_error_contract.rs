@@ -364,3 +364,99 @@ mod non_unicode {
         }
     }
 }
+
+#[test]
+fn saved_discovery_and_skill_help_explain_read_only_workflows_offline() {
+    let root = std::env::temp_dir().join(format!("sniper-offline-help-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    for (args, expected) in [
+        (
+            vec!["--help"],
+            vec![
+                "schema input saved.v1.session.list",
+                "examples saved.v1.session.list",
+                "call saved.v1.session.list",
+                "offline",
+                "read-only",
+            ],
+        ),
+        (
+            vec!["call", "--help"],
+            vec![
+                "schema input saved.v1.session.list",
+                "limit",
+                "running local API",
+            ],
+        ),
+        (
+            vec!["skills", "status", "--help"],
+            vec![
+                "this CLI host",
+                "modified_or_outdated",
+                "current bundle",
+                "Exit status 0",
+                "entries[].status",
+                "Preserve edits",
+            ],
+        ),
+        (
+            vec!["skills", "update-preview", "--help"],
+            vec![
+                "this CLI host",
+                "enrollment baseline",
+                "modified",
+                "update_available",
+                "Exit status 0",
+                "entries[].state",
+                "status may be current while update-preview remains modified",
+                "Preserve edited files",
+            ],
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
+            .env("HOME", root.join("home"))
+            .env("USERPROFILE", root.join("home"))
+            .env("CODEX_HOME", root.join("codex"))
+            .env("SNIPER_DATA_DIR", root.join("data"))
+            .current_dir(&root)
+            .args([
+                "--api",
+                &format!("http://{}", listener.local_addr().unwrap()),
+            ])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty());
+        let help = String::from_utf8(output.stdout).unwrap();
+        let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some((_, quick_start)) = help.split_once("Saved-data quick start") {
+            assert!(!quick_start.contains("--yes"));
+            let input = quick_start
+                .split("--input '")
+                .nth(1)
+                .unwrap()
+                .split('\'')
+                .next()
+                .unwrap();
+            let input: Value = serde_json::from_str(input).unwrap();
+            assert_eq!(input["limit"], 20);
+            sniper::saved_contract::validate_input("saved.v1.session.list", &input).unwrap();
+        }
+        for text in expected {
+            assert!(normalized.contains(text), "{args:?} missing {text}: {help}");
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "help created files"
+        );
+    }
+    std::fs::remove_dir(root).unwrap();
+}
