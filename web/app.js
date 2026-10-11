@@ -4207,6 +4207,11 @@ async function flushBeforeNativeClose() {
   if (uiSettingsDirty || uiSettingsInFlight) {
     await persistUiSettings();
   }
+  // A note can be queued after the first drain while a later save is pending.
+  // Keep the window and that edit alive; the next close can retry the drain.
+  if (state._pendingAnnotations?.size || state._annotationInFlight?.size) {
+    throw new Error("Annotations are still unsaved. Close again to retry saving them.");
+  }
 }
 
 window.__sniperFlushBeforeNativeClose = flushBeforeNativeClose;
