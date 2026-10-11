@@ -457,3 +457,24 @@ test("Apply before the initial GET keeps its existing save and late-snapshot beh
   assert.equal(f.els.filterSearchTerm.value, "saved search");
   assert.equal(f.writes.length, 1); assert.equal(f.context.uiSettingsDirty, false);
 });
+
+test("composing Escape retains the unapplied Filter draft and normal Escape still cancels", () => {
+  const f = fixture(); f.context.openFilterModal();
+  const draft = "보존할 검색어";
+  f.els.filterSearchTerm.value = draft; f.els.filterSearchTerm.dispatch("input");
+  f.els.filterSearchTerm.focus();
+  const composing = f.key("Escape", f.els.filterSearchTerm, { isComposing: true });
+  assert.equal(composing.defaultPrevented, false, "the IME keeps its Escape event");
+  assert.equal(f.els.filterModal.classList.contains("hidden"), false);
+  assert.equal(f.els.filterSearchTerm.value, draft);
+  assert.equal(f.document.activeElement, f.els.filterSearchTerm);
+  assert.equal(f.state.filterSettings.searchTerm, "saved");
+  assert.equal(f.context.uiSettingsDirty, false);
+  assert.equal(f.writes.length, 0); assert.equal(f.refreshes.length, 0);
+  const ended = f.key("Escape", f.els.filterSearchTerm, { isComposing: false });
+  assert.equal(ended.defaultPrevented, true);
+  assert.equal(f.els.filterModal.classList.contains("hidden"), true);
+  assert.equal(f.document.activeElement, f.els.openFilterSettingsButton);
+  f.context.openFilterModal(); assert.equal(f.els.filterSearchTerm.value, "saved");
+  assert.equal(f.writes.length, 0); assert.equal(f.refreshes.length, 0);
+});

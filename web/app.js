@@ -2279,6 +2279,8 @@ function bindEvents() {
         return;
       }
       if (event.key === "Escape") {
+        // Let the IME cancel composition without discarding the dialog's draft.
+        if (event.isComposing) return;
         event.preventDefault();
         activeModalAction.close();
         return;
