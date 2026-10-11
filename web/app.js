@@ -9343,7 +9343,10 @@ function renderFindings() {
   }
 
   if (!state._findingsEntries.length) {
-    els.findingsBody.innerHTML = `<tr class="empty-row"><td colspan="6">No findings yet. Browse with the proxy to start scanning.</td></tr>`;
+    const message = findingsData.length
+      ? "No findings match your filters."
+      : "No findings yet. Browse with the proxy to start scanning.";
+    els.findingsBody.innerHTML = `<tr class="empty-row"><td colspan="6">${message}</td></tr>`;
     return;
   }
 
