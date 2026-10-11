@@ -25546,12 +25546,20 @@ async function beginNoteEdit(cell, transactionId) {
 
 async function loadUserNote(transactionId) {
   const sessionId = currentSessionId();
+  const target = contextMenuRecordTarget;
+  const menu = els.contextMenu;
+  // Each open creates a new target, so returning to the same row/session must
+  // not revive a read from a closed or superseded menu.
+  const isCurrent = () => target === contextMenuRecordTarget
+    && contextMenuTargetId === transactionId && contextMenuSessionId === sessionId
+    && currentSessionId() === sessionId && menu === els.contextMenu
+    && menu.isConnected && !menu.classList.contains("hidden");
   try {
     const response = await fetch(transactionPath(transactionId, sessionId));
-    if (currentSessionId() !== sessionId) return;
+    if (!isCurrent()) return;
     if (response.ok) {
       const record = await response.json();
-      if (currentSessionId() === sessionId && contextMenuTargetId === transactionId) {
+      if (isCurrent()) {
         renderContextMenuNotes(record.notes);
         positionContextMenu();
       }

@@ -81,6 +81,7 @@ commands, refusal states, and activation and backup limitations.
 - A delayed note read no longer opens an editor after the user moves to another
   interaction. Opening and closing an unchanged saved note preserves its original
   line breaks; genuine inline edits still use the existing single-line editor.
+  Reopening a row's context menu ignores older diagnostic-note reads.
   Status toasts expose polite announcements without moving focus.
   Clipboard fallback fields are removed even when selection or copying throws.
 - Returning to the same finding or session does not revive an older detail
