@@ -105,6 +105,8 @@ its full path and review the profile manually before choosing automatic setup.
   session, history, finding, or frame selection underneath it. Findings row
   navigation also leaves arrow keys to focused text controls, modifier shortcuts,
   and open dialogs.
+- App-update failure resets no longer overwrite a retry's progress or click guard.
+- New or missing Notes widths default to 220px; explicit saved widths stay unchanged.
 
 These changes have synthetic production-handler regression coverage. Native
 desktop IME behavior, screen-reader announcements, and system clipboard
@@ -113,8 +115,9 @@ permission interactions still require manual verification.
 Native close also waits for queued or in-flight note saves and refuses to finish
 while a currently attached note editor has unqueued text or unfinished IME
 composition. Finish or cancel the note edit before closing again. This does not
-protect an unqueued draft whose editor has already been detached: virtual scrolling can
-replace its row, and session or query resets have a separate editor lifecycle.
+protect an unqueued draft whose editor has already been detached: virtual
+scrolling can replace its row, and session or query resets have a separate editor
+lifecycle.
 In particular, a blurred composition can have neither a pending save nor a
 visible editor after replacement. Finish note edits before these transitions;
 recoverable detached-editor handling remains follow-up work. Native close/IME
@@ -154,11 +157,11 @@ writes by an already-running process. See
 
 Workspace synchronization now preserves confirmed metadata and concurrent
 edits when an older save fails. Tab navigation and session create/open preserve
-supported rendered editor drafts and ask the user to finish unsupported pending
-edits before leaving. A session transition also stops if an earlier saved editor
+supported rendered workspace-editor drafts and ask the user to finish unsupported
+workspace edits before leaving. A session transition also stops if an earlier saved editor
 becomes dirty during a later preflight save; edits actually acknowledged by later
 saves remain eligible to proceed. External active-session changes preserve
-unsupported editor drafts with their original workspace owner instead of
+unsupported workspace-editor drafts with their original workspace owner instead of
 silently resetting them. Repeated preservation and passive synchronization do
 not undo an unchanged HTTP-version selection; genuine edits still take priority.
 Uncertain session-action failures refresh session rows without silently
