@@ -17590,6 +17590,8 @@ function renderReplayTabs(options = {}) {
     if (nameInput) {
       nameInput.addEventListener("click", (event) => event.stopPropagation());
       nameInput.addEventListener("keydown", (event) => {
+        // Composition keys edit the label, rather than commit or cancel it.
+        if (event.isComposing) return;
         if (event.key === "Enter") {
           event.preventDefault();
           commitReplayTabRename(id, nameInput.value);

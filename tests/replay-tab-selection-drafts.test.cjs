@@ -360,3 +360,37 @@ for (const field of ['host', 'port', 'scheme', 'version']) for (const route of r
     assert.equal(f.document.activeElement, focus);
   });
 }
+
+for (const key of ['Enter', 'Escape']) test(`composing ${key} keeps the saved-tab label draft open`, () => {
+  const f = setup(), input = f.rename(), previousLabel = f.a.customLabel;
+  input.value = '한글 이름';
+  const composing = { key, isComposing: true, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; } };
+  input.listeners.keydown(composing);
+  assert.equal(composing.defaultPrevented, false, 'the IME retains its key event');
+  assert.equal(f.state.replayRenamingTabId, f.a.id);
+  assert.equal(f.row(f.a.id).name, input, 'composition must not replace the input');
+  assert.equal(f.document.activeElement, input);
+  assert.equal(input.value, '한글 이름');
+  assert.equal(f.a.customLabel, previousLabel);
+  assert.equal(f.flushes, 0, 'composition must not save label metadata');
+  const ended = { key, isComposing: false, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; } };
+  input.listeners.keydown(ended);
+  assert.equal(ended.defaultPrevented, true);
+  assert.equal(f.state.replayRenamingTabId, null);
+  assert.equal(f.a.customLabel, key === 'Enter' ? '한글 이름' : previousLabel);
+  assert.equal(f.flushes, key === 'Enter' ? 1 : 0);
+  if (key === 'Enter') {
+    input.listeners.keydown(ended);
+    assert.equal(f.flushes, 1, 'the completed label is committed once');
+  }
+});
+
+test('saved-tab label blur still commits its current metadata once', () => {
+  const f = setup(), input = f.rename(); input.value = 'Synthetic label';
+  input.listeners.blur();
+  assert.equal(f.state.replayRenamingTabId, null);
+  assert.equal(f.a.customLabel, 'Synthetic label'); assert.equal(f.flushes, 1);
+  input.listeners.blur(); assert.equal(f.flushes, 1);
+});
