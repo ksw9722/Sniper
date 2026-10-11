@@ -2872,6 +2872,8 @@ const UPDATE_RING_MARKUP = `
     </svg>
   </span>`;
 
+let pendingSelfUpdateFailureReset = null;
+
 async function performSelfUpdate() {
   if (state.appVersion?.self_update_supported === false) {
     window.open(state.appVersion.latest_release_url || state.appVersion.releases_url, "_blank", "noopener,noreferrer");
@@ -2881,6 +2883,8 @@ async function performSelfUpdate() {
   // aria-disabled and not `disabled`: a disabled button may show no tooltip, and the
   // tooltip is where the percentage is.
   if (button.getAttribute("aria-disabled") === "true") return;
+  // Retire the previous failure before a retry captures its clean idle state.
+  pendingSelfUpdateFailureReset?.();
   button.setAttribute("aria-disabled", "true");
   const idleTitle = button.title;
   // Pinned before the content changes, so turning "Update" into a ring moves nothing.
@@ -2899,7 +2903,12 @@ async function performSelfUpdate() {
     button.title = measured ? `${percent}%` : "";
     button.setAttribute("aria-label", measured ? `Updating, ${percent} percent` : "Updating");
   };
+  let resetTimer = null;
   const reset = () => {
+    if (pendingSelfUpdateFailureReset !== reset) return;
+    pendingSelfUpdateFailureReset = null;
+    clearTimeout(resetTimer);
+    resetTimer = null;
     button.classList.remove("is-updating", "is-busy", "is-failed");
     button.removeAttribute("aria-busy");
     button.removeAttribute("aria-disabled");
@@ -2915,7 +2924,8 @@ async function performSelfUpdate() {
     button.textContent = "Failed";
     button.title = reason;
     button.removeAttribute("aria-disabled");
-    setTimeout(reset, 4000);
+    pendingSelfUpdateFailureReset = reset;
+    resetTimer = setTimeout(reset, 4000);
   };
 
   const handleProgress = (data) => {
