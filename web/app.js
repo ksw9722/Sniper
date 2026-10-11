@@ -25441,10 +25441,11 @@ async function beginNoteEdit(cell, transactionId) {
   let composing = false;
   let compositionFinishing = false;
   let commitAfterComposition = false;
-  // Compared against what was last written, not against what the note said when
-  // the edit began: typing saves after a pause, so clearing the field back to
-  // empty is still a change the server has to be told about.
-  let lastSaved = current.trim();
+  // Start from the input's sanitized value: text inputs strip CR/LF, but opening
+  // and closing an unchanged saved note must not overwrite its original text.
+  // Then compare against each queued save, so reverting after autosave still
+  // writes the changed value (including clearing the field back to empty).
+  let lastSaved = input.value.trim();
   const noteEdit = { cell, sessionId, closed: false, removed: null };
   inheritPendingHistoryNoteEdit(transactionId, noteEdit);
   const save = (value) => {

@@ -160,9 +160,16 @@ function fixture({ joinAnnotations = false } = {}) {
       createElement(tag) {
         assert.equal(tag, "input");
         const listeners = {};
+        let inputValue = "";
         const created = {
           ...focusable(),
-          dataset: {},
+          dataset: {}, type: "text",
+          get value() { return inputValue; },
+          set value(value) {
+            // Model the HTML text-input value sanitizer, including assignment of
+            // a saved note. A plain property would hide CR/LF loss on editor open.
+            inputValue = this.type === "text" ? String(value).replace(/[\r\n]/g, "") : String(value);
+          },
           addEventListener(type, callback) { listeners[type] = callback; },
           select() { this.selected = true; },
           dispatch(type, key, fields = {}) {
@@ -224,6 +231,188 @@ async function acknowledgeAnnotation(f, request, overrides = {}) {
   }));
   await new Promise(setImmediate);
 }
+
+const savedMultilineNotes = [
+  ["LF", "Saved\nnote"],
+  ["CR", "Saved\rnote"],
+  ["CRLF", "Saved\r\nnote"],
+  ["edge-only line breaks", "\r\nSaved note\r\n"],
+  ["newline-only", "\r\n\n\r"],
+  ["Korean and emoji", "한글\r\n😀\n로그인\r🔒"],
+  ["near the UTF-8 limit", "가".repeat(10920) + "\r\n😀"],
+  ["at the UTF-8 limit", "가".repeat(10920) + "ab\r\n😀"],
+];
+
+for (const [label, savedNote] of savedMultilineNotes) {
+  for (const close of ["blur", "Enter", "Escape"]) {
+    test(`unchanged ${label} note survives ${close} and repeated close events without a write`, async () => {
+      const f = fixture();
+      const before = f.cell.innerHTML;
+      assert.ok(Buffer.byteLength(savedNote) <= 32768, "the saved fixture is backend-valid UTF-8");
+      const input = await openSavedNote(f, savedNote);
+      assert.equal(input.type, "text");
+      assert.equal(input.value, savedNote.replace(/[\r\n]/g, ""));
+      assert.notEqual(input.value, savedNote, "the fixture must model the single-line input's sanitizer");
+      input.dispatch(close === "blur" ? "blur" : "keydown", close);
+      input.dispatch("blur");
+      input.dispatch("keydown", "Enter");
+      input.dispatch("keydown", "Escape");
+      input.dispatch("compositionend");
+      runTimers(f);
+      assert.equal(f.saves.length, 0, "opening and closing must preserve the raw saved note");
+      assert.equal(f.cell.innerHTML, before);
+      assert.equal(f.cell.querySelector(), null);
+      assert.equal(f.timers.size, 0);
+    });
+  }
+
+  test(`editing and reverting the ${label} note before autosave preserves the raw saved note`, async () => {
+    const f = fixture();
+    const input = await openSavedNote(f, savedNote);
+    input.value = "Temporary edit 한국어 😀";
+    input.dispatch("input");
+    input.value = savedNote;
+    input.dispatch("input");
+    runTimers(f);
+    assert.equal(f.saves.length, 0, "reverting to the initial visible value is a no-op");
+    input.dispatch("keydown", "Enter");
+    input.dispatch("blur");
+    assert.equal(f.saves.length, 0);
+  });
+}
+
+test("unchanged input events and their debounce preserve the raw saved note", async () => {
+  const f = fixture();
+  const input = await openSavedNote(f, "한글\r\n😀\nSaved note");
+  input.dispatch("input");
+  input.dispatch("input");
+  assert.equal(f.timers.size, 1);
+  runTimers(f);
+  assert.equal(f.saves.length, 0);
+  input.dispatch("input");
+  runTimers(f);
+  assert.equal(f.saves.length, 0);
+  input.dispatch("blur");
+  assert.equal(f.saves.length, 0);
+  assert.equal(f.timers.size, 0);
+});
+
+test("reverting after an explicit autosave saves the current single-line text", async () => {
+  const f = fixture({ joinAnnotations: true });
+  const savedNote = "  한글\r\n😀\nSaved note  ";
+  const input = await openSavedNote(f, savedNote);
+  input.value = "  Explicit edit 한국어 😀  ";
+  input.dispatch("input");
+  runTimers(f);
+  assert.equal(annotationRequests(f).length, 1);
+  assert.equal(JSON.parse(annotationRequests(f)[0].options.body).user_note, "Explicit edit 한국어 😀");
+  await acknowledgeAnnotation(f, annotationRequests(f)[0]);
+  input.value = savedNote;
+  input.dispatch("input");
+  runTimers(f);
+  assert.equal(annotationRequests(f).length, 2, "reverting after a save is a new explicit change");
+  assert.equal(JSON.parse(annotationRequests(f)[1].options.body).user_note, "한글😀Saved note");
+  await acknowledgeAnnotation(f, annotationRequests(f)[1]);
+  input.dispatch("keydown", "Enter");
+  input.dispatch("blur");
+  assert.equal(annotationRequests(f).length, 2);
+  assert.equal(f.item.note_preview, "한글😀Saved note");
+});
+
+test("reverting during the first in-flight autosave queues the single-line text exactly once", async () => {
+  const f = fixture({ joinAnnotations: true });
+  const savedNote = "  한글\r\n😀\nSaved note  ";
+  const input = await openSavedNote(f, savedNote);
+  input.value = "  Explicit edit 한국어 😀  ";
+  input.dispatch("input");
+  runTimers(f);
+  const first = annotationRequests(f)[0];
+  assert.equal(JSON.parse(first.options.body).user_note, "Explicit edit 한국어 😀");
+  input.value = savedNote;
+  input.dispatch("input");
+  runTimers(f);
+  assert.equal(annotationRequests(f).length, 1, "the revert waits for the first in-flight request");
+  const queuedRevert = f.state._pendingAnnotations.get(f.item.id);
+  assert.equal(queuedRevert.payload.user_note, "한글😀Saved note");
+  input.dispatch("keydown", "Enter");
+  input.dispatch("blur");
+  assert.equal(annotationRequests(f).length, 1, "close must not start a duplicate request");
+  assert.equal(f.state._pendingAnnotations.get(f.item.id), queuedRevert);
+  await acknowledgeAnnotation(f, first);
+  assert.equal(annotationRequests(f).length, 2);
+  assert.equal(f.item.note_preview, "Saved note", "the superseded first save cannot repaint its text");
+  assert.equal(f.state._itemsVersion, 0);
+  const revert = annotationRequests(f)[1];
+  assert.equal(JSON.parse(revert.options.body).user_note, "한글😀Saved note");
+  assert.match(revert.url, /^fixture-only:fixture-session\//);
+  await acknowledgeAnnotation(f, revert, { annotation_revision: 3 });
+  assert.equal(f.item.note_preview, "한글😀Saved note");
+  assert.equal(f.state._pendingAnnotations.size, 0);
+  assert.equal(f.state._annotationInFlight.size, 0);
+  input.dispatch("blur");
+  input.dispatch("keydown", "Enter");
+  runTimers(f);
+  assert.equal(annotationRequests(f).length, 2);
+});
+
+for (const savedNote of [" \t한글 😀 \u00a0", " \t\r\n \u00a0"]) {
+  test(`note trimming still ignores padding-only changes for ${JSON.stringify(savedNote)}`, async () => {
+    const f = fixture();
+    const input = await openSavedNote(f, savedNote);
+    input.value = `  ${input.value.trim()}\t`;
+    input.dispatch("input");
+    runTimers(f);
+    assert.equal(f.saves.length, 0);
+    input.value = " \tUpdated 한국어 😀 \u00a0";
+    input.dispatch("input");
+    runTimers(f);
+    assert.deepEqual(notes(f), ["Updated 한국어 😀"]);
+    input.value = " \t\r\n \u00a0";
+    input.dispatch("keydown", "Enter");
+    input.dispatch("blur");
+    assert.deepEqual(notes(f), ["Updated 한국어 😀", null]);
+  });
+}
+
+test("a failed explicit edit remains queued through unchanged close and retries in its original session", async () => {
+  const f = fixture({ joinAnnotations: true });
+  const errors = [], reloads = [];
+  f.context.console = { error: (...args) => errors.push(args) };
+  f.context.loadTransactions = async (...args) => { reloads.push(args); };
+  const input = await openSavedNote(f, "한글\r\n😀\nSaved note");
+  input.value = "  Changed\r\n한국어 😀  ";
+  input.dispatch("input");
+  runTimers(f);
+  const first = annotationRequests(f)[0];
+  assert.equal(JSON.parse(first.options.body).user_note, "Changed한국어 😀");
+  first.resolve(failedResponse());
+  await new Promise(setImmediate);
+  assert.equal(errors.length, 1);
+  assert.equal(reloads.length, 1);
+  assert.equal(f.toasts.length, 1);
+  assert.equal(f.state._annotationInFlight.size, 0);
+  const pending = f.state._pendingAnnotations.get(f.item.id);
+  assert.equal(pending.payload.user_note, "Changed한국어 😀");
+  assert.equal(pending.sessionId, "fixture-session");
+  assert.equal(pending.noteEdit.sessionId, "fixture-session");
+  input.dispatch("input");
+  runTimers(f);
+  input.dispatch("blur");
+  input.dispatch("keydown", "Enter");
+  assert.equal(annotationRequests(f).length, 1, "the existing pending edit owns retry, not unchanged close");
+  assert.equal(f.state._pendingAnnotations.get(f.item.id), pending);
+  f.context.session = "another-session";
+  const retry = f.context.flushPendingAnnotations(f.item.id);
+  const retried = annotationRequests(f)[1];
+  assert.match(retried.url, /^fixture-only:fixture-session\//);
+  assert.equal(retried.options.body, first.options.body);
+  await acknowledgeAnnotation(f, retried);
+  assert.equal(await retry, true);
+  assert.equal(f.state._pendingAnnotations.size, 0);
+  assert.equal(f.state._annotationInFlight.size, 0);
+  assert.equal(f.item.note_preview, "Saved note", "a late retry cannot repaint a different session");
+  assert.equal(f.historyWrites.length, 0);
+});
 
 test("a real candidate autosave acknowledgement keeps the composing editor connected", async () => {
   const f = fixture({ joinAnnotations: true });

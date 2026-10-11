@@ -79,7 +79,9 @@ commands, refusal states, and activation and backup limitations.
   Escape. Stored labels are normalized to 80 Unicode scalar values without
   splitting supplementary characters; the existing inline typing cap is unchanged.
 - A delayed note read no longer opens an editor after the user moves to another
-  interaction. Status toasts expose polite announcements without moving focus.
+  interaction. Opening and closing an unchanged saved note preserves its original
+  line breaks; genuine inline edits still use the existing single-line editor.
+  Status toasts expose polite announcements without moving focus.
   Clipboard fallback fields are removed even when selection or copying throws.
 - Returning to the same finding or session does not revive an older detail
   read. Older list/count reads cannot replace a newer accepted badge count or
