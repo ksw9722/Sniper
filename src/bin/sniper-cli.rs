@@ -6955,12 +6955,52 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Serialize, Deserialize)]
 struct ReplayLabelUpdateResult {
     session_id: Uuid,
     revision: u64,
     tab: ReplayTabState,
+}
+
+// Persistence defaults support old saved inputs, but cannot prove a complete
+// acknowledgement. Check the fields the current serializer actually emits,
+// allowing absent nullable fields and additive fields from newer servers.
+fn metadata_acknowledgement_has_fields(raw: &Value, serialized: &Value) -> bool {
+    match serialized {
+        Value::Object(fields) => fields.iter().all(|(key, value)| match raw.get(key) {
+            Some(actual) => metadata_acknowledgement_has_fields(actual, value),
+            None => value.is_null(),
+        }),
+        Value::Array(values) => raw.as_array().is_some_and(|actual| {
+            actual.len() == values.len()
+                && actual
+                    .iter()
+                    .zip(values)
+                    .all(|(raw, value)| metadata_acknowledgement_has_fields(raw, value))
+        }),
+        _ => true,
+    }
+}
+
+fn decode_metadata_acknowledgement<T: DeserializeOwned + Serialize>(raw: Value) -> Result<T> {
+    let result: T =
+        serde_json::from_value(raw.clone()).map_err(|_| MetadataAcknowledgementError)?;
+    let serialized = serde_json::to_value(&result).map_err(|_| MetadataAcknowledgementError)?;
+    if !metadata_acknowledgement_has_fields(&raw, &serialized) {
+        return Err(MetadataAcknowledgementError.into());
+    }
+    Ok(result)
+}
+
+fn metadata_acknowledgement_decode_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_decode() || error.is_body() || error.is_timeout())
+    {
+        MetadataAcknowledgementError.into()
+    } else {
+        error
+    }
 }
 
 fn replay_update_is_label_only(args: &ReplayUpdateArgs) -> bool {
@@ -7008,20 +7048,22 @@ async fn update_saved_replay_label(api: &ApiClient, args: ReplayUpdateArgs) -> R
         payload["expected_active_session_id"] = json!(expected_active_session_id);
     }
     let client = saved_configuration_write_client()?;
-    let result: ReplayLabelUpdateResult = api
+    let raw: Value = api
         .request_json_with_client(
             &client,
             Method::POST,
             "/api/replay/tabs/set-label",
             Some(&payload),
         )
-        .await?;
+        .await
+        .map_err(metadata_acknowledgement_decode_error)?;
+    let result: ReplayLabelUpdateResult = decode_metadata_acknowledgement(raw)?;
     if result.session_id != session_id
         || Some(result.revision) != workspace.revision.checked_add(1)
         || result.tab.id != args.tab_id
         || result.tab.custom_label != payload["label"].as_str().unwrap()
     {
-        bail!("saved Replay label update response did not match; inspect current state before retrying");
+        return Err(MetadataAcknowledgementError.into());
     }
     print_json_with_session(&result.tab, Some(result.session_id))
 }
@@ -8234,9 +8276,11 @@ async fn patch_intercept_rule(
         expected_active_session_id,
     );
     let client = saved_configuration_write_client()?;
-    let rule: InterceptRule = api
+    let raw: Value = api
         .request_json_with_client(&client, Method::PATCH, &path, Some(&patch))
-        .await?;
+        .await
+        .map_err(metadata_acknowledgement_decode_error)?;
+    let rule: InterceptRule = decode_metadata_acknowledgement(raw)?;
     let returned = serde_json::to_value(&rule)?;
     if rule.id != id
         || patch
@@ -8245,7 +8289,7 @@ async fn patch_intercept_rule(
             .iter()
             .any(|(key, value)| returned.get(key) != Some(value))
     {
-        bail!("saved intercept rule update response did not match; inspect current state before retrying");
+        return Err(MetadataAcknowledgementError.into());
     }
     print_json_with_session(&rule, Some(session_id))
 }
@@ -11413,6 +11457,17 @@ impl fmt::Display for SessionMetadataHttpStatusError {
 impl std::error::Error for SessionMetadataHttpStatusError {}
 
 #[derive(Debug)]
+struct MetadataAcknowledgementError;
+
+impl fmt::Display for MetadataAcknowledgementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Saved metadata acknowledgement was incomplete or did not match; mutation outcome is unknown")
+    }
+}
+
+impl std::error::Error for MetadataAcknowledgementError {}
+
+#[derive(Debug)]
 struct CallInputError(String);
 
 impl fmt::Display for CallInputError {
@@ -11779,6 +11834,20 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
             ),
             retryable: false,
             details: partial.details.clone(),
+            exit_code: 5,
+        };
+    }
+
+    if error
+        .downcast_ref::<MetadataAcknowledgementError>()
+        .is_some()
+    {
+        return CliErrorPayload {
+            code: "INVALID_RESPONSE",
+            message: MetadataAcknowledgementError.to_string(),
+            hint: Some("Inspect current state before deliberately issuing another write; never automatically retry."),
+            retryable: false,
+            details: json!({"idempotent":false,"outcome":"unknown"}),
             exit_code: 5,
         };
     }

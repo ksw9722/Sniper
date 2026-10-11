@@ -86,3 +86,11 @@ CLI path automatically retries or falls back to creation. A lost response may
 mean the write committed: reread the selected session and review current state
 before deciding on another write. These operations have no `saved.v1` receipt or
 exactly-once retry contract.
+
+A malformed, incomplete, or mismatched success acknowledgement produces
+`INVALID_RESPONSE` with `retryable: false` and `details.outcome: "unknown"` rather
+than a fabricated rule or tab. The CLI checks fields emitted by the response
+serializer, including nested saved history, while accepting additive fields and
+omitted nullable or serializer-skipped fields. Inspect current state before any
+deliberate retry; acknowledgement validation does not establish that a write
+was rolled back.

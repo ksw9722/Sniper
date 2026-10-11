@@ -41,6 +41,7 @@ struct Faults {
     stale_revision: bool,
     get_body: Option<Value>,
     write_response: Option<(StatusCode, Value)>,
+    write_body: Option<String>,
     redirect: Option<StatusCode>,
 }
 
@@ -343,6 +344,9 @@ async fn mock_request(State(state): State<Arc<MockState>>, request: Request<Body
                 )
                     .into_response();
             }
+            if let Some(body) = &faults.write_body {
+                return (StatusCode::OK, body.clone()).into_response();
+            }
             if let Some((status, response)) = &faults.write_response {
                 return (*status, Json(response.clone())).into_response();
             }
@@ -394,6 +398,9 @@ async fn mock_request(State(state): State<Arc<MockState>>, request: Request<Body
                     Json(json!({"error":"synthetic redirect"})),
                 )
                     .into_response();
+            }
+            if let Some(body) = &faults.write_body {
+                return (StatusCode::OK, body.clone()).into_response();
             }
             if let Some((status, response)) = &faults.write_response {
                 return (*status, Json(response.clone())).into_response();
@@ -1069,6 +1076,223 @@ async fn metadata_writes_refuse_redirects_without_following_or_retrying() {
             );
             assert_eq!(*api.state.rules.lock().unwrap(), before_rules);
             assert_eq!(*api.state.workspaces.lock().unwrap(), before_workspaces);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_acknowledgements_reject_missing_fields_without_fabricating_state() {
+    for operation in [UPDATE, ENABLE, LABEL] {
+        let api = MockApi::new().await;
+        let id = api.state.ids[0];
+        let full = if operation == LABEL {
+            let mut tab = workspace(id)["replay"]["tabs"][1].clone();
+            tab["custom_label"] = json!("New label");
+            json!({"session_id":id,"revision":18,"tab":tab})
+        } else {
+            let mut rule = saved_rule(api.state.rule_id);
+            rule["enabled"] = json!(false);
+            rule
+        };
+        let mut fields: Vec<String> = if operation == LABEL {
+            &full["tab"]
+        } else {
+            &full
+        }
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(key, value)| {
+            !value.is_null()
+                && !matches!(
+                    key.as_str(),
+                    "ws_selected_frame_index"
+                        | "ws_frame_window_start"
+                        | "history_index"
+                        | "source_transaction_id"
+                        | "ws_port"
+                )
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+        fields.sort_by_key(|field| field != "host_pattern");
+        for field in fields {
+            let mut response = full.clone();
+            let object = if operation == LABEL {
+                &mut response["tab"]
+            } else {
+                &mut response
+            };
+            object.as_object_mut().unwrap().remove(&field);
+            api.state.faults.lock().unwrap().write_response = Some((StatusCode::OK, response));
+            let input = if operation == LABEL {
+                json!({"session_id":id,"tab_id":TAB,"label":"New label"})
+            } else {
+                json!({"session_id":id,"id":api.state.rule_id,"enabled":false})
+            };
+            let (code, result) = api.call(operation, input, Some("--yes")).await;
+            assert_ne!(code, 0, "{operation} missing {field}: {result}");
+            assert_eq!(
+                result["error"]["code"], "INVALID_RESPONSE",
+                "{field}: {result}"
+            );
+            assert_eq!(result["error"]["retryable"], false);
+            assert_eq!(result["error"]["details"]["outcome"], "unknown");
+            assert!(result.get("data").is_none_or(Value::is_null));
+            api.assert_requests(
+                id,
+                false,
+                operation == LABEL,
+                Some(if operation == LABEL {
+                    label_payload(id, false, 17, "New label")
+                } else {
+                    json!({"enabled":false})
+                }),
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_acknowledgements_accept_serialized_legacy_inputs_and_future_fields() {
+    for operation in [UPDATE, ENABLE, LABEL] {
+        for legacy in [false, true] {
+            let api = MockApi::new().await;
+            let id = api.state.ids[0];
+            let response = if operation == LABEL {
+                let mut tab = if legacy {
+                    serde_json::to_value(
+                        serde_json::from_value::<ReplayTabState>(
+                            json!({"id":TAB,"custom_label":"New label"}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    workspace(id)["replay"]["tabs"][1].clone()
+                };
+                tab["custom_label"] = json!("New label");
+                tab.as_object_mut().unwrap().retain(|key, value| {
+                    !value.is_null()
+                        && !matches!(
+                            key.as_str(),
+                            "ws_selected_frame_index"
+                                | "ws_frame_window_start"
+                                | "history_index"
+                                | "source_transaction_id"
+                                | "ws_port"
+                        )
+                });
+                tab["future_tab_metadata"] = json!({"future":true});
+                json!({"session_id":id.to_string().to_uppercase(),"revision":18,
+                    "tab":tab,"future_ack_metadata":true})
+            } else {
+                let mut rule = if legacy {
+                    serde_json::to_value(
+                        serde_json::from_value::<sniper::intercept::InterceptRule>(
+                            json!({"id":api.state.rule_id,"enabled":false}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    saved_rule(api.state.rule_id)
+                };
+                rule["enabled"] = json!(false);
+                rule["id"] = json!(api.state.rule_id.to_string().to_uppercase());
+                rule["future_rule_metadata"] = json!({"future":true});
+                rule
+            };
+            api.state.faults.lock().unwrap().write_response = Some((StatusCode::OK, response));
+            let input = if operation == LABEL {
+                json!({"session_id":id,"tab_id":TAB,"label":"New label"})
+            } else {
+                json!({"session_id":id,"id":api.state.rule_id,"enabled":false})
+            };
+            let (code, result) = api.call(operation, input, Some("--yes")).await;
+            assert_eq!(code, 0, "{operation} legacy={legacy}: {result}");
+            api.assert_requests(
+                id,
+                false,
+                operation == LABEL,
+                Some(if operation == LABEL {
+                    label_payload(id, false, 17, "New label")
+                } else {
+                    json!({"enabled":false})
+                }),
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_acknowledgements_reject_sparse_malformed_and_nested_defaults() {
+    for operation in [UPDATE, ENABLE, LABEL] {
+        for fault in [
+            "sparse",
+            "wrong_type",
+            "nested",
+            "invalid_json",
+            "empty_body",
+        ] {
+            if operation != LABEL && fault == "nested" {
+                continue;
+            }
+            let api = MockApi::new().await;
+            let id = api.state.ids[0];
+            let response = if operation == LABEL {
+                let mut tab = workspace(id)["replay"]["tabs"][1].clone();
+                tab["custom_label"] = json!("New label");
+                match fault {
+                    "sparse" => tab = json!({"id":TAB,"custom_label":"New label"}),
+                    "wrong_type" => tab["pinned"] = json!("synthetic-private-diagnostic"),
+                    "invalid_json" | "empty_body" => (),
+                    "nested" => {
+                        tab["history_entries"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("request_text");
+                    }
+                    _ => unreachable!(),
+                }
+                json!({"session_id":id,"revision":18,"tab":tab})
+            } else if fault == "sparse" {
+                json!({"id":api.state.rule_id,"enabled":false})
+            } else {
+                let mut rule = saved_rule(api.state.rule_id);
+                rule["enabled"] = json!(false);
+                rule["scope"] = json!("synthetic-private-diagnostic");
+                rule
+            };
+            api.state.faults.lock().unwrap().write_response = Some((StatusCode::OK, response));
+            if fault == "invalid_json" {
+                api.state.faults.lock().unwrap().write_body =
+                    Some("{synthetic-private-diagnostic".into());
+            }
+            if fault == "empty_body" {
+                api.state.faults.lock().unwrap().write_body = Some(String::new());
+            }
+            let input = if operation == LABEL {
+                json!({"session_id":id,"tab_id":TAB,"label":"New label"})
+            } else {
+                json!({"session_id":id,"id":api.state.rule_id,"enabled":false})
+            };
+            let (code, result) = api.call(operation, input, Some("--yes")).await;
+            assert_eq!(code, 5, "{operation}/{fault}: {result}");
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            assert_eq!(result["error"]["retryable"], false);
+            assert_eq!(result["error"]["details"]["outcome"], "unknown");
+            assert!(!result.to_string().contains("synthetic-private-diagnostic"));
+            api.assert_requests(
+                id,
+                false,
+                operation == LABEL,
+                Some(if operation == LABEL {
+                    label_payload(id, false, 17, "New label")
+                } else {
+                    json!({"enabled":false})
+                }),
+            );
         }
     }
 }
