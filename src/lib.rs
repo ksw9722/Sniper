@@ -29,6 +29,8 @@ pub mod service_map;
 pub mod service_map_body;
 pub mod service_map_html;
 mod service_map_html_parser;
+mod service_map_link_parser;
+pub mod service_map_links;
 pub mod service_map_technology;
 pub mod session;
 pub mod skill_managed;

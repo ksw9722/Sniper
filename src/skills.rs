@@ -286,6 +286,10 @@ mod tests {
         for term in [
             "scope service-map html-generators",
             "target.service_map.html_generators.get",
+            "target.service_map.link_declarations.get",
+            "only response headers, never body files or linked resources",
+            "Show explicitly replaces the one",
+            "not original wire ordering",
             "same exact-row and active-session restrictions apply",
             "separate\nbounded retained-preview read",
             "never retry with body\nhydration",

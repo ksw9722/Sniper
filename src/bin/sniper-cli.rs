@@ -41,6 +41,7 @@ use sniper::{
     service_map::{ServiceMap, ServiceMapEvidence, ServiceMapSocketPeerStatus},
     service_map_body::ServiceMapBodyReferences,
     service_map_html::ServiceMapHtmlGenerators,
+    service_map_links::ServiceMapLinkDeclarations,
     service_map_technology::CatalogVersion,
     session::{validate_session_creation_name, SessionSummary},
     skills,
@@ -908,6 +909,21 @@ enum ServiceMapCommand {
         after_help = "Requires the current active session UUID and exact-row evidence token. Reads one retained UTF-8 text/html preview only; no inactive-session loading, target requests, automatic reads, batch reads, retries, or fallback. Fixed generator catalog 1 recognizes WordPress and Drupal declarations in an explicit HTML head. Partial or unsupported inspection does not mean no generator was found. Reported products and numeric versions are literal declarations, not verified software installations. Spans address retained UTF-8 bytes; the parser stop is a raw byte cursor, not a slicing boundary."
     )]
     HtmlGenerators(ServiceMapHtmlGeneratorsArgs),
+    /// Explicitly inspect literal declarations in one retained response's Link headers.
+    #[command(
+        after_help = "Requires the current active session UUID and exact-row evidence token. Reads bounded retained response headers for GET or HEAD status 200 only; no bodies, inactive-session loading, target requests, automatic/batch reads, retries, redirects, or fallback. Fixed relation catalog 1 recognizes service-doc, service-desc, describedby, and preconnect. Partial or unsupported inspection does not mean no declarations exist. Origins and retained-header UTF-8 spans describe literal declarations, not verified calls, ownership, or connections."
+    )]
+    LinkDeclarations(ServiceMapLinkDeclarationsArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapLinkDeclarationsArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained row.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
 }
 
 #[derive(Args, Debug)]
@@ -2500,6 +2516,9 @@ impl TargetCommand {
                 Some(ServiceMapCommand::HtmlGenerators(_)) => {
                     "target.service_map.html_generators.get"
                 }
+                Some(ServiceMapCommand::LinkDeclarations(_)) => {
+                    "target.service_map.link_declarations.get"
+                }
                 None => "target.service_map.get",
             },
             TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
@@ -3572,6 +3591,98 @@ fn service_map_html_generators_output_schema() -> Value {
     schema
 }
 
+const LINK_ACQUISITION_REASONS: &[&str] = sniper::service_map_links::ACQUISITION_REASONS;
+const LINK_SCAN_REASONS: &[&str] = sniper::service_map_links::PARSER_REASONS;
+
+fn service_map_link_declarations_output_schema() -> Value {
+    let span = service_map_object(json!({
+        "start":{"type":"integer","minimum":0,"maximum":4095},
+        "end":{"type":"integer","minimum":1,"maximum":4096}
+    }));
+    let mut observation = service_map_object(json!({
+        "relation":{"type":"string","enum":["service-doc","service-desc","describedby","preconnect"]},
+        "target_origin":{"type":"string"},
+        "source":{"type":"string","enum":["response_link_header"]},
+        "strength":{"type":"string","enum":["literal_declaration"]},
+        "header_name":{"type":"string","enum":["link"]},
+        "header_index":{"type":"integer","minimum":0,"maximum":127},
+        "header_value_bytes":{"type":"integer","minimum":1,"maximum":4096},
+        "link_value_span":span,"target_span":span,"relation_span":span,
+        "rule_id":{"type":"string","enum":["response_link.service_doc.v1","response_link.service_desc.v1","response_link.describedby.v1","response_link.preconnect.v1"]},
+        "offset_basis":{"type":"string","enum":["retained_header_value_utf8"]}
+    }));
+    observation["oneOf"] = json!([
+        {"properties":{"relation":{"enum":["service-doc"]},"rule_id":{"enum":["response_link.service_doc.v1"]}}},
+        {"properties":{"relation":{"enum":["service-desc"]},"rule_id":{"enum":["response_link.service_desc.v1"]}}},
+        {"properties":{"relation":{"enum":["describedby"]},"rule_id":{"enum":["response_link.describedby.v1"]}}},
+        {"properties":{"relation":{"enum":["preconnect"]},"rule_id":{"enum":["response_link.preconnect.v1"]}}}
+    ]);
+    observation["description"] = json!("Canonical origin only, at most 268 ASCII bytes. Half-open original retained-header UTF-8 spans: member starts at '<', target excludes brackets, relation follows target and has its literal relation-name length. Relations may share identical member/target spans with ordered distinct relation spans; separate members and headers remain ordered and disjoint. Same-header value lengths must agree. No raw header, rejected/unknown value, URL suffix, or parser diagnostic.");
+    let count = |max| json!({"type":"integer","minimum":0,"maximum":max});
+    let counts = service_map_object(json!({
+        "headers_inspected":count(128),"header_bytes_admitted":count(32768),
+        "link_fields_inspected":count(128),"candidates_inspected":count(128),
+        "members_framed":count(128),"parameters_inspected":count(4096),
+        "relation_tokens_inspected":count(4096),"unknown_relation_tokens_inspected":count(4096)
+    }));
+    let zero_counts = service_map_object(json!({
+        "headers_inspected":{"enum":[0]},"header_bytes_admitted":{"enum":[0]},
+        "link_fields_inspected":{"enum":[0]},"candidates_inspected":{"enum":[0]},
+        "members_framed":{"enum":[0]},"parameters_inspected":{"enum":[0]},
+        "relation_tokens_inspected":{"enum":[0]},"unknown_relation_tokens_inspected":{"enum":[0]}
+    }));
+    let reasons: Vec<_> = LINK_ACQUISITION_REASONS
+        .iter()
+        .chain(LINK_SCAN_REASONS)
+        .copied()
+        .collect();
+    let mut schema = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},
+        "relation_catalog_version":{"type":"integer","enum":[1]},
+        "session_id":{"type":"string","format":"uuid"},
+        "evidence_id":{"type":"string","pattern":"^v1\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}\\.(0|[1-9][0-9]{0,19})\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}$"},
+        "available":{"type":"boolean"},"status":{"type":"string","enum":["scanned","unsupported","unavailable"]},
+        "complete":{"type":"boolean"},"reasons":{"type":"array","maxItems":12,"items":{"type":"string","enum":reasons}},
+        "source_origin":{"type":["string","null"]},
+        "source_sequence":{"type":["string","null"],"pattern":"^(0|[1-9][0-9]{0,19})$"},
+        "source_started_at":{"type":["string","null"],"format":"date-time"},
+        "source_method":{"type":["string","null"],"enum":["GET","HEAD",null]},
+        "source_status":{"type":["integer","null"],"enum":[200,null]},
+        "retained_header_count":{"type":["integer","null"],"minimum":0,"maximum":9007199254740991u64},
+        "coverage":{"type":"string","enum":["absolute_http_link_declarations"]},
+        "offset_basis":{"type":"string","enum":["retained_header_value_utf8"]},
+        "counts":counts,"observations":{"type":"array","maxItems":32,"items":observation},
+        "limits":service_map_object(json!({
+            "headers":{"type":"integer","enum":[128]},"header_bytes":{"type":"integer","enum":[32768]},
+            "link_field_bytes":{"type":"integer","enum":[4096]},"target_bytes":{"type":"integer","enum":[4096]},
+            "candidates":{"type":"integer","enum":[128]},"parameters_per_member":{"type":"integer","enum":[32]},
+            "relation_tokens_per_member":{"type":"integer","enum":[32]},"observations":{"type":"integer","enum":[32]},
+            "target_origin_bytes":{"type":"integer","enum":[268]}
+        }))
+    }));
+    schema["oneOf"] = json!([
+        {"properties":{
+            "available":{"enum":[true]},"status":{"enum":["scanned"]},
+            "source_origin":{"type":"string"},"source_sequence":{"type":"string"},
+            "source_started_at":{"type":"string"},"source_method":{"type":"string"},
+            "source_status":{"type":"integer"},"retained_header_count":{"type":"integer"},
+            "reasons":{"items":{"enum":LINK_SCAN_REASONS}}
+        },"oneOf":[
+            {"properties":{"complete":{"enum":[true]},"reasons":{"enum":[[]]}}},
+            {"properties":{"complete":{"enum":[false]},"reasons":{"minItems":1}}}
+        ]},
+        {"properties":{
+            "available":{"enum":[false]},"status":{"enum":["unsupported","unavailable"]},
+            "complete":{"enum":[false]},"reasons":{"minItems":1,"maxItems":1,"items":{"enum":LINK_ACQUISITION_REASONS}},
+            "source_origin":{"type":"null"},"source_sequence":{"type":"null"},"source_started_at":{"type":"null"},
+            "source_method":{"type":"null"},"source_status":{"type":"null"},"retained_header_count":{"type":"null"},
+            "counts":zero_counts,"observations":{"enum":[[]]}
+        }}
+    ]);
+    schema["description"] = json!("Fixed relation catalog 1, exact requested session/token and canonical decimal uint64 source sequence binding. Required nullable fields are explicit null. Reasons are sorted unique fixed codes; complete means no reasons within this bounded fixed grammar, never all relationships. Partial scans remain available. Runtime additionally validates canonical origins, ordered/contained spans, inspected counters and actual-cap consistency. Unknown-only complete coverage is valid. Unavailable/unsupported results contain exactly one acquisition reason and no source metadata or observations.");
+    schema
+}
+
 fn service_map_output_schema(operation: &str) -> Option<Value> {
     if !matches!(
         operation,
@@ -3579,8 +3690,12 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             | "target.service_map.evidence.get"
             | "target.service_map.body_references.get"
             | "target.service_map.html_generators.get"
+            | "target.service_map.link_declarations.get"
     ) {
         return None;
+    }
+    if operation == "target.service_map.link_declarations.get" {
+        return Some(service_map_link_declarations_output_schema());
     }
     if operation == "target.service_map.html_generators.get" {
         return Some(service_map_html_generators_output_schema());
@@ -3785,15 +3900,15 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."}
             }
         })),
-        "target.service_map.body_references.get" | "target.service_map.html_generators.get" => {
-            Some(json!({
-                "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
-                "properties":{
-                    "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
-                    "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged v1 evidence token for one retained row. Explicit one-row preview inspection only; no batch reads or target requests."}
-                }
-            }))
-        }
+        "target.service_map.body_references.get"
+        | "target.service_map.html_generators.get"
+        | "target.service_map.link_declarations.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
+                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged v1 evidence token for one retained row. Explicit one-row retained inspection only; no batch reads or target requests."}
+            }
+        })),
         "target.service_map.evidence.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
             "properties":{
@@ -3847,6 +3962,14 @@ fn service_map_html_generators_path(args: &ServiceMapHtmlGeneratorsArgs) -> Stri
     )
 }
 
+fn service_map_link_declarations_path(args: &ServiceMapLinkDeclarationsArgs) -> String {
+    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/link-declarations?{query}"),
+        Some(args.session_id),
+    )
+}
+
 fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
     vec![
         op(
@@ -3871,6 +3994,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             "target.service_map.html_generators.get",
             "scope service-map html-generators --session-id <uuid> --evidence-id <token>",
             "Explicitly inspect one retained UTF-8 text/html response preview for literal WordPress or Drupal meta generator declarations. Active session only; no loading or activation. Fixed generator catalog 1, independent of response-header catalogs and URL references. One inspection GET after existing identity checks, with no target requests, automatic/batch reads, retries, or fallback. Returns safe products, numeric versions, bounded counters and original preview byte spans, never raw content. Inspect completeness, head closure, truncation and parser stop; partial/unsupported never means no generator found. Declarations do not prove installed software or ownership.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "target.service_map.link_declarations.get",
+            "scope service-map link-declarations --session-id <uuid> --evidence-id <token>",
+            "Explicitly inspect bounded retained response Link headers for one exact active-session GET or HEAD status 200 row. Fixed relation catalog 1 recognizes service-doc, service-desc, describedby, and preconnect, independently of technology catalogs and body inspectors. One inspection GET after identity checks; no bodies, inactive loading, target requests, automatic/batch reads, retries, redirects, or fallback. Returns origin-only literal declarations and original retained-header UTF-8 spans. Partial/unsupported never means no declarations exist; completeness is within the fixed grammar only. Declarations do not prove calls, ownership, or connections.",
             CliSideEffect::Read,
             false,
             &["session_id", "evidence_id"],
@@ -4647,9 +4779,9 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "include_socket_peer",
             "technology_catalog_version",
         ],
-        "target.service_map.body_references.get" | "target.service_map.html_generators.get" => {
-            &["session_id", "evidence_id"]
-        }
+        "target.service_map.body_references.get"
+        | "target.service_map.html_generators.get"
+        | "target.service_map.link_declarations.get" => &["session_id", "evidence_id"],
         "scope.get" => &["session_id"],
         "scope.set" => &[
             "session_id",
@@ -4834,6 +4966,9 @@ fn command_input_preview(command: &Command) -> Value {
                     "session_id": args.session_id,"evidence_id":args.evidence_id,
                 }),
                 Some(ServiceMapCommand::HtmlGenerators(args)) => json!({
+                    "session_id": args.session_id,"evidence_id":args.evidence_id,
+                }),
+                Some(ServiceMapCommand::LinkDeclarations(args)) => json!({
                     "session_id": args.session_id,"evidence_id":args.evidence_id,
                 }),
                 None => json!({
@@ -5231,6 +5366,9 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 }
                 Some(ServiceMapCommand::HtmlGenerators(args)) => {
                     api_preview("GET", service_map_html_generators_path(args), None)
+                }
+                Some(ServiceMapCommand::LinkDeclarations(args)) => {
+                    api_preview("GET", service_map_link_declarations_path(args), None)
                 }
                 None => service_map_catalog_api_preview(
                     service_map_path(args, args.session_id),
@@ -5726,8 +5864,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             | "target.service_map.evidence.get"
             | "target.service_map.body_references.get"
             | "target.service_map.html_generators.get"
+            | "target.service_map.link_declarations.get"
     ) {
-        if command.operation_name() == "target.service_map.html_generators.get" {
+        if command.operation_name() == "target.service_map.link_declarations.get" {
+            notes.push("Explicit one-row retained response-header inspection only, with fixed relation catalog 1. Requires an already active session and retained GET/HEAD status 200 metadata. One inspection GET after identity checks, with no body reads, inactive loading, target requests, automatic/batch reads, retries, redirects, fallback, or technology-catalog selector.");
+            notes.push("Only canonical origins, fixed relation names, bounded counters and original retained-header UTF-8 spans are returned. Multiple relations may share a member. Partial/unsupported does not mean no declarations exist; completeness applies only to the fixed literal grammar. Declarations do not establish calls, ownership, availability, or connections.");
+        } else if command.operation_name() == "target.service_map.html_generators.get" {
             notes.push("Explicit one-row retained UTF-8 text/html preview read only, with fixed generator catalog 1. The session must already be active. One inspection GET after identity checks, with no target requests, inactive-session loading, automatic/batch reads, retries, fallback, or technology-catalog selector.");
             notes.push("Products and numeric versions are literal generator declarations, not proven software installations or ownership. Partial/unsupported never means no generator found. Inspect head_closed, complete, reasons, truncation and bounds. scan_prefix_bytes describes the offered prefix, not bytes fully parsed; parser_stop.byte_cursor may split UTF-8 and must not be used to slice text. No raw HTML or rejected declaration text is exposed.");
         } else if command.operation_name() == "target.service_map.body_references.get" {
@@ -6240,6 +6382,26 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 command: TargetCommand::ServiceMap(ServiceMapArgs {
                     command: Some(ServiceMapCommand::HtmlGenerators(
                         ServiceMapHtmlGeneratorsArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    technology_catalog_version: 2,
+                }),
+            }
+        }
+        "target.service_map.link_declarations.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::LinkDeclarations(
+                        ServiceMapLinkDeclarationsArgs {
                             session_id: call_required(operation, input, "session_id")?,
                             evidence_id,
                         },
@@ -7346,6 +7508,7 @@ async fn run(cli: Cli) -> Result<()> {
                     | "target.service_map.evidence.get"
                     | "target.service_map.body_references.get"
                     | "target.service_map.html_generators.get"
+                    | "target.service_map.link_declarations.get"
                     | "capture.http.upstream_peer.get"
                     | "capture.http.upstream_peer.set"
             ) {
@@ -8143,6 +8306,15 @@ async fn service_map_get_with_catalog<T: DeserializeOwned>(
                 status: Some(404),
             }.into());
         }
+        if status == StatusCode::NOT_FOUND
+            && path.starts_with("/api/target/service-map/link-declarations?")
+        {
+            return Err(ServiceMapCliError {
+                code: "UNSUPPORTED_FEATURE",
+                message: "The selected API does not support retained Link declaration inspection; update the app to use this feature",
+                status: Some(404),
+            }.into());
+        }
         return Err(ServiceMapCliError {
             code: if status.is_redirection() {
                 "REDIRECT_REFUSED"
@@ -8872,6 +9044,224 @@ fn validate_service_map_html_generators_response(
     Ok(())
 }
 
+fn validate_service_map_link_declarations_response(
+    result: &ServiceMapLinkDeclarations,
+    args: &ServiceMapLinkDeclarationsArgs,
+) -> Result<()> {
+    let invalid = || {
+        service_map_error("INVALID_RESPONSE", "Link declaration inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract")
+    };
+    let fields: Vec<_> = args.evidence_id.split('.').collect();
+    let c = &result.counts;
+    if parse_service_map_evidence_id(&args.evidence_id).is_err()
+        || result.schema_version != 1
+        || result.relation_catalog_version != 1
+        || result.session_id != args.session_id
+        || result.evidence_id != args.evidence_id
+        || result.coverage != "absolute_http_link_declarations"
+        || result.offset_basis != "retained_header_value_utf8"
+        || serde_json::to_value(&result.limits).ok()
+            != Some(json!({
+                "headers":128,"header_bytes":32768,"link_field_bytes":4096,"target_bytes":4096,
+                "candidates":128,"parameters_per_member":32,"relation_tokens_per_member":32,
+                "observations":32,"target_origin_bytes":268
+            }))
+    {
+        return Err(invalid());
+    }
+    if !result.available {
+        let valid = matches!(result.status.as_str(), "unsupported" | "unavailable")
+            && !result.complete
+            && result.reasons.len() == 1
+            && LINK_ACQUISITION_REASONS.contains(&result.reasons[0].as_str())
+            && result.source_origin.is_none()
+            && result.source_sequence.is_none()
+            && result.source_started_at.is_none()
+            && result.source_method.is_none()
+            && result.source_status.is_none()
+            && result.retained_header_count.is_none()
+            && c.headers_inspected == 0
+            && c.header_bytes_admitted == 0
+            && c.link_fields_inspected == 0
+            && c.candidates_inspected == 0
+            && c.members_framed == 0
+            && c.parameters_inspected == 0
+            && c.relation_tokens_inspected == 0
+            && c.unknown_relation_tokens_inspected == 0
+            && result.observations.is_empty();
+        return if valid { Ok(()) } else { Err(invalid()) };
+    }
+    let Some(retained) = result.retained_header_count else {
+        return Err(invalid());
+    };
+    let has = |reason: &str| result.reasons.iter().any(|value| value == reason);
+    if result.status != "scanned"
+        || fields[1] != args.session_id.to_string()
+        || result.source_sequence.as_deref() != Some(fields[3])
+        || !result
+            .source_origin
+            .as_deref()
+            .is_some_and(service_map_safe_origin)
+        || result.source_started_at.is_none()
+        || !matches!(result.source_method.as_deref(), Some("GET" | "HEAD"))
+        || result.source_status != Some(200)
+        || retained as u128 > 9_007_199_254_740_991
+        || result.complete != result.reasons.is_empty()
+        || !result
+            .reasons
+            .iter()
+            .all(|reason| LINK_SCAN_REASONS.contains(&reason.as_str()))
+        || !result.reasons.windows(2).all(|pair| pair[0] < pair[1])
+        || c.headers_inspected > 128
+        || c.headers_inspected > retained
+        || c.header_bytes_admitted > 32768
+        || (c.headers_inspected == 0 && c.header_bytes_admitted != 0)
+        || c.link_fields_inspected > c.headers_inspected
+        || c.header_bytes_admitted < c.link_fields_inspected * 4
+        || c.candidates_inspected > 128
+        || (c.link_fields_inspected == 0 && c.candidates_inspected != 0)
+        || c.members_framed > c.candidates_inspected
+        || c.parameters_inspected > c.candidates_inspected * 32
+        || c.relation_tokens_inspected > c.members_framed * 32
+        || c.unknown_relation_tokens_inspected > c.relation_tokens_inspected
+        || result.observations.len() > 32
+        || result.observations.len()
+            > c.relation_tokens_inspected
+                .saturating_sub(c.unknown_relation_tokens_inspected)
+        || (c.headers_inspected < retained
+            && !has("header_count_limit")
+            && !has("header_byte_limit")
+            && !has("candidate_limit"))
+        || (has("header_count_limit") && (c.headers_inspected != 128 || retained <= 128))
+        || (has("header_byte_limit") && c.headers_inspected >= retained)
+        || (has("candidate_limit") && c.candidates_inspected != 128)
+        || (has("parameter_limit") && c.parameters_inspected < 32)
+        || (has("relation_token_limit") && c.relation_tokens_inspected < 32)
+        || (has("link_field_byte_limit")
+            && (c.link_fields_inspected == 0 || c.header_bytes_admitted < 4101))
+        || (has("observation_limit")
+            && (result.observations.len() != 32
+                || c.relation_tokens_inspected
+                    .saturating_sub(c.unknown_relation_tokens_inspected)
+                    <= 32))
+        || (result.complete
+            && (c.headers_inspected != retained
+                || c.candidates_inspected != c.members_framed
+                || result.observations.len()
+                    != c.relation_tokens_inspected
+                        .saturating_sub(c.unknown_relation_tokens_inspected)))
+    {
+        return Err(invalid());
+    }
+    let mut previous: Option<&sniper::service_map_links::LinkDeclarationObservation> = None;
+    let mut emitted_headers = 0;
+    let mut emitted_members = 0;
+    let mut observed_header_bytes = 0;
+    for observation in &result.observations {
+        let rule = match observation.relation.as_str() {
+            "service-doc" => "response_link.service_doc.v1",
+            "service-desc" => "response_link.service_desc.v1",
+            "describedby" => "response_link.describedby.v1",
+            "preconnect" => "response_link.preconnect.v1",
+            _ => return Err(invalid()),
+        };
+        let member = (
+            observation.link_value_span.start,
+            observation.link_value_span.end,
+        );
+        let target = (observation.target_span.start, observation.target_span.end);
+        let relation = (
+            observation.relation_span.start,
+            observation.relation_span.end,
+        );
+        let bytes = observation.header_value_bytes;
+        if observation.rule_id != rule
+            || observation.source != "response_link_header"
+            || observation.strength != "literal_declaration"
+            || observation.header_name != "link"
+            || observation.offset_basis != "retained_header_value_utf8"
+            || !sniper::service_map_links::is_canonical_target_origin(&observation.target_origin)
+            || observation.header_index >= c.headers_inspected
+            || bytes > 4096
+            || ![member, target, relation]
+                .iter()
+                .all(|&(start, end)| start < end && end <= bytes)
+            || target.0 != member.0 + 1
+            || target.1 >= relation.0
+            || relation.1 > member.1
+            || relation.1 - relation.0 != observation.relation.len()
+        {
+            return Err(invalid());
+        }
+        // A rel list emits several ordered tokens from one fully framed member.
+        // It must not be mistaken for overlapping distinct members or deduplicated.
+        let mut new_header = true;
+        let mut new_member = true;
+        if let Some(last) = previous {
+            if observation.header_index < last.header_index {
+                return Err(invalid());
+            }
+            if observation.header_index == last.header_index {
+                new_header = false;
+                if bytes != last.header_value_bytes {
+                    return Err(invalid());
+                }
+                if observation.link_value_span == last.link_value_span {
+                    new_member = false;
+                    if observation.target_span != last.target_span
+                        || observation.target_origin != last.target_origin
+                        || relation.0 <= last.relation_span.end
+                    {
+                        return Err(invalid());
+                    }
+                } else if member.0 <= last.link_value_span.end {
+                    return Err(invalid());
+                }
+            }
+        }
+        emitted_headers += usize::from(new_header);
+        emitted_members += usize::from(new_member);
+        if new_header {
+            observed_header_bytes += bytes + 4;
+        }
+        previous = Some(observation);
+    }
+    if emitted_headers > c.link_fields_inspected
+        || emitted_members > c.members_framed
+        || emitted_members > c.parameters_inspected
+        || observed_header_bytes > c.header_bytes_admitted
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+async fn read_service_map_link_declarations(
+    api: &ApiClient,
+    args: &ServiceMapLinkDeclarationsArgs,
+) -> Result<ServiceMapLinkDeclarations> {
+    let client = service_map_read_client()?;
+    let raw: Value =
+        service_map_get(api, &client, &service_map_link_declarations_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid Link declaration inspection envelope",
+        )
+    };
+    let result: ServiceMapLinkDeclarations =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    let typed = serde_json::to_value(&result).map_err(|_| invalid())?;
+    if !service_map_html_response_shape(&raw, &typed)
+        || raw["session_id"] != args.session_id.to_string()
+        || raw["evidence_id"] != args.evidence_id
+    {
+        return Err(invalid());
+    }
+    validate_service_map_link_declarations_response(&result, args)?;
+    Ok(result)
+}
+
 async fn read_service_map_html_generators(
     api: &ApiClient,
     args: &ServiceMapHtmlGeneratorsArgs,
@@ -8953,6 +9343,10 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             }
             Some(ServiceMapCommand::HtmlGenerators(args)) => {
                 let result = read_service_map_html_generators(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::LinkDeclarations(args)) => {
+                let result = read_service_map_link_declarations(&api, args).await?;
                 print_session_read_json(&result, args.session_id)
             }
             None => {

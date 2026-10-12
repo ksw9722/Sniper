@@ -763,7 +763,7 @@ mod history_fixture {
             "/api/transactions" | "/api/transactions-page" => {
                 Json(state.payload.lock().unwrap().clone()).into_response()
             }
-            "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" | "/api/target/service-map/html-generators" => {
+            "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" | "/api/target/service-map/html-generators" | "/api/target/service-map/link-declarations" => {
                 let status = StatusCode::from_u16(*state.read_status.lock().unwrap()).unwrap();
                 let mut response =
                     (status, Json(state.payload.lock().unwrap().clone())).into_response();
@@ -2658,6 +2658,495 @@ mod history_fixture {
         }
     }
 
+    fn link_declarations_payload(status: &str) -> Value {
+        let available = matches!(status, "scanned" | "partial");
+        let observation = |relation: &str, rule: &str, start, end| {
+            json!({
+                "relation":relation,"target_origin":"https://example.com",
+                "source":"response_link_header","strength":"literal_declaration","header_name":"link",
+                "header_index":0,"header_value_bytes":77,
+                "link_value_span":{"start":0,"end":77},"target_span":{"start":1,"end":46},
+                "relation_span":{"start":start,"end":end},"rule_id":rule,"offset_basis":"retained_header_value_utf8"
+            })
+        };
+        json!({
+            "schema_version":1,"relation_catalog_version":1,"session_id":Uuid::nil(),"evidence_id":BODY_REFERENCE_TOKEN,
+            "available":available,"status":if available {"scanned"} else {status},"complete":status=="scanned",
+            "reasons":match status {"scanned"=>json!([]),"partial"=>json!(["malformed_field"]),"unsupported"=>json!(["unsupported_source_context"]),_=>json!(["inactive_session"])},
+            "source_origin":if available {json!("https://example.com")} else {Value::Null},
+            "source_sequence":if available {json!("9007199254740993")} else {Value::Null},
+            "source_started_at":if available {json!("2026-10-12T00:00:00Z")} else {Value::Null},
+            "source_method":if available {json!("GET")} else {Value::Null},
+            "source_status":if available {json!(200)} else {Value::Null},
+            "retained_header_count":if available {json!(1)} else {Value::Null},
+            "coverage":"absolute_http_link_declarations","offset_basis":"retained_header_value_utf8",
+            "counts":{"headers_inspected":if available {1} else {0},"header_bytes_admitted":if available {81} else {0},
+                "link_fields_inspected":if available {1} else {0},"candidates_inspected":if available {1} else {0},
+                "members_framed":if available {1} else {0},"parameters_inspected":if available {1} else {0},
+                "relation_tokens_inspected":if available {2} else {0},"unknown_relation_tokens_inspected":0},
+            "observations":if available {json!([
+                observation("service-doc","response_link.service_doc.v1",54,65),
+                observation("preconnect","response_link.preconnect.v1",66,76)
+            ])} else {json!([])},
+            "limits":{"headers":128,"header_bytes":32768,"link_field_bytes":4096,"target_bytes":4096,
+                "candidates":128,"parameters_per_member":32,"relation_tokens_per_member":32,"observations":32,"target_origin_bytes":268}
+        })
+    }
+
+    fn link_observation_cap_payload() -> Value {
+        let mut payload = link_declarations_payload("partial");
+        let value = "<https://example.com>; rel=preconnect";
+        let start = value.find("preconnect").unwrap();
+        payload["reasons"] = json!(["observation_limit"]);
+        payload["retained_header_count"] = json!(33);
+        payload["counts"] = json!({"headers_inspected":33,"header_bytes_admitted":(value.len()+4)*33,
+            "link_fields_inspected":33,"candidates_inspected":33,"members_framed":33,
+            "parameters_inspected":33,"relation_tokens_inspected":33,"unknown_relation_tokens_inspected":0});
+        payload["observations"] = Value::Array((0..32).map(|index| json!({
+            "relation":"preconnect","target_origin":"https://example.com","source":"response_link_header",
+            "strength":"literal_declaration","header_name":"link","header_index":index,"header_value_bytes":value.len(),
+            "link_value_span":{"start":0,"end":value.len()},"target_span":{"start":1,"end":20},
+            "relation_span":{"start":start,"end":value.len()},"rule_id":"response_link.preconnect.v1",
+            "offset_basis":"retained_header_value_utf8"
+        })).collect());
+        payload
+    }
+
+    async fn check_link_payload(
+        mock: &MockApi,
+        payload: Value,
+        token: &str,
+        expected_code: i32,
+    ) -> Value {
+        *mock.state.payload.lock().unwrap() = payload.clone();
+        let session = Uuid::nil().to_string();
+        let result = mock
+            .command_with_code(
+                &[
+                    "scope",
+                    "service-map",
+                    "link-declarations",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    token,
+                ],
+                expected_code,
+            )
+            .await;
+        mock.assert_reads(
+            "/api/target/service-map/link-declarations",
+            &[("evidence_id", token)],
+        );
+        if expected_code == 0 {
+            assert_eq!(result, payload);
+        } else {
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_link_declarations_states_shared_spans_and_uint64_binding() {
+        let mock = MockApi::new().await;
+        let operation = "target.service_map.link_declarations.get";
+        let schema = output_schema(operation);
+        for status in ["scanned", "partial", "unsupported", "unavailable"] {
+            let payload = link_declarations_payload(status);
+            assert_schema(&payload, &schema);
+            check_link_payload(&mock, payload.clone(), BODY_REFERENCE_TOKEN, 0).await;
+            let input =
+                json!({"session_id":Uuid::nil(),"evidence_id":BODY_REFERENCE_TOKEN}).to_string();
+            let called = mock.command(&["call", operation, "--input", &input]).await;
+            assert_eq!(called["data"], payload);
+            assert_eq!(called["meta"]["session_id"], Uuid::nil().to_string());
+            mock.assert_reads(
+                "/api/target/service-map/link-declarations",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        for sequence in ["0", "18446744073709551615"] {
+            let token = BODY_REFERENCE_TOKEN.replace("9007199254740993", sequence);
+            let mut payload = link_declarations_payload("scanned");
+            payload["evidence_id"] = json!(token);
+            payload["source_sequence"] = json!(sequence);
+            payload["source_method"] = json!("HEAD");
+            check_link_payload(&mock, payload, &token, 0).await;
+        }
+        let mut empty = link_declarations_payload("scanned");
+        empty["retained_header_count"] = json!(0);
+        empty["observations"] = json!([]);
+        for count in empty["counts"].as_object_mut().unwrap().values_mut() {
+            *count = json!(0);
+        }
+        check_link_payload(&mock, empty, BODY_REFERENCE_TOKEN, 0).await;
+        let mut unknown = link_declarations_payload("scanned");
+        unknown["observations"] = json!([]);
+        unknown["counts"]["unknown_relation_tokens_inspected"] = json!(2);
+        check_link_payload(&mock, unknown, BODY_REFERENCE_TOKEN, 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_link_declarations_preserve_distinct_members_and_repeated_relations() {
+        let mock = MockApi::new().await;
+        let mut payload = link_declarations_payload("scanned");
+        let mut observations = Vec::new();
+        let mut value = String::new();
+        for relations in [
+            vec![
+                "service-doc",
+                "service-desc",
+                "describedby",
+                "preconnect",
+                "preconnect",
+            ],
+            vec!["service-desc"],
+        ] {
+            if !value.is_empty() {
+                value.push_str(", ");
+            }
+            let start = value.len();
+            let member = format!("<https://example.com>; rel=\"{}\"", relations.join(" "));
+            let mut cursor = start + member.find('"').unwrap() + 1;
+            value.push_str(&member);
+            for relation in relations {
+                let rule = match relation {
+                    "service-doc" => "response_link.service_doc.v1",
+                    "service-desc" => "response_link.service_desc.v1",
+                    "describedby" => "response_link.describedby.v1",
+                    _ => "response_link.preconnect.v1",
+                };
+                observations.push(json!({"relation":relation,"target_origin":"https://example.com",
+                    "source":"response_link_header","strength":"literal_declaration","header_name":"link","header_index":0,
+                    "header_value_bytes":0,"link_value_span":{"start":start,"end":value.len()},
+                    "target_span":{"start":start+1,"end":start+20},"relation_span":{"start":cursor,"end":cursor+relation.len()},
+                    "rule_id":rule,"offset_basis":"retained_header_value_utf8"}));
+                cursor += relation.len() + 1;
+            }
+        }
+        for observation in &mut observations {
+            observation["header_value_bytes"] = json!(value.len());
+        }
+        payload["observations"] = json!(observations);
+        payload["counts"]["header_bytes_admitted"] = json!(value.len() + 4);
+        payload["counts"]["candidates_inspected"] = json!(2);
+        payload["counts"]["members_framed"] = json!(2);
+        payload["counts"]["parameters_inspected"] = json!(2);
+        payload["counts"]["relation_tokens_inspected"] = json!(6);
+        assert_schema(
+            &payload,
+            &output_schema("target.service_map.link_declarations.get"),
+        );
+        check_link_payload(&mock, payload.clone(), BODY_REFERENCE_TOKEN, 0).await;
+        payload["observations"].as_array_mut().unwrap().swap(4, 5);
+        check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+        let mut headers = link_observation_cap_payload();
+        headers["observations"].as_array_mut().unwrap().swap(0, 1);
+        check_link_payload(&mock, headers, BODY_REFERENCE_TOKEN, 5).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_link_declarations_all_fixed_reasons_and_actual_caps() {
+        let mock = MockApi::new().await;
+        let schema = output_schema("target.service_map.link_declarations.get");
+        for reason in [
+            "invalid_evidence_id",
+            "session_mismatch",
+            "stale_generation",
+            "record_missing",
+            "record_changed",
+            "response_unavailable",
+            "unsupported_source_context",
+            "inactive_session",
+            "session_source_changed",
+            "metadata_unavailable",
+            "link_inspection_failed",
+        ] {
+            let mut payload =
+                link_declarations_payload(if reason == "unsupported_source_context" {
+                    "unsupported"
+                } else {
+                    "unavailable"
+                });
+            payload["reasons"] = json!([reason]);
+            assert_schema(&payload, &schema);
+            check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 0).await;
+        }
+        for reason in [
+            "header_count_limit",
+            "header_byte_limit",
+            "link_field_byte_limit",
+            "candidate_limit",
+            "parameter_limit",
+            "relation_token_limit",
+            "observation_limit",
+            "malformed_field",
+            "unsupported_target",
+            "anchor_present",
+            "missing_relation",
+            "unsupported_relation_syntax",
+        ] {
+            let mut payload = link_declarations_payload("partial");
+            payload["reasons"] = json!([reason]);
+            match reason {
+                "header_count_limit" => {
+                    payload["retained_header_count"] = json!(129);
+                    payload["counts"]["headers_inspected"] = json!(128);
+                }
+                "header_byte_limit" => payload["retained_header_count"] = json!(2),
+                "link_field_byte_limit" => {
+                    payload["retained_header_count"] = json!(2);
+                    payload["counts"]["headers_inspected"] = json!(2);
+                    payload["counts"]["link_fields_inspected"] = json!(2);
+                    payload["counts"]["header_bytes_admitted"] = json!(4182);
+                }
+                "candidate_limit" => {
+                    payload["counts"]["candidates_inspected"] = json!(128);
+                    payload["counts"]["members_framed"] = json!(128);
+                }
+                "parameter_limit" => {
+                    payload["counts"]["parameters_inspected"] = json!(33);
+                    payload["counts"]["candidates_inspected"] = json!(2);
+                }
+                "relation_token_limit" => {
+                    payload["counts"]["candidates_inspected"] = json!(2);
+                    payload["counts"]["members_framed"] = json!(2);
+                    payload["counts"]["parameters_inspected"] = json!(2);
+                    payload["counts"]["relation_tokens_inspected"] = json!(34);
+                }
+                "observation_limit" => payload = link_observation_cap_payload(),
+                _ => {}
+            }
+            assert_schema(&payload, &schema);
+            check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 0).await;
+        }
+        // Reaching a cap without an omitted supported result can remain complete.
+        let mut exact = link_observation_cap_payload();
+        exact["complete"] = json!(true);
+        exact["reasons"] = json!([]);
+        exact["retained_header_count"] = json!(32);
+        for key in [
+            "headers_inspected",
+            "link_fields_inspected",
+            "candidates_inspected",
+            "members_framed",
+            "parameters_inspected",
+            "relation_tokens_inspected",
+        ] {
+            exact["counts"][key] = json!(32);
+        }
+        check_link_payload(&mock, exact, BODY_REFERENCE_TOKEN, 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_link_declarations_reject_malformed_private_or_misbound_responses() {
+        let mock = MockApi::new().await;
+        for (pointer, value) in [
+            ("/schema_version", json!(2)),
+            ("/relation_catalog_version", json!(2)),
+            ("/session_id", json!(Uuid::new_v4())),
+            ("/evidence_id", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/source_sequence", json!("9007199254740992")),
+            ("/source_sequence", json!("18446744073709551616")),
+            ("/source_sequence", json!("09007199254740993")),
+            (
+                "/source_origin",
+                json!("https://example.com/?SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            (
+                "/source_origin",
+                json!("https://user:SYNTHETIC_PRIVATE_VALUE@example.com"),
+            ),
+            ("/source_started_at", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/source_method", json!("POST")),
+            ("/source_status", json!(201)),
+            ("/retained_header_count", json!(9007199254740992u64)),
+            ("/retained_header_count", json!(0)),
+            ("/status", json!("unsupported")),
+            ("/complete", json!(false)),
+            ("/reasons", json!(["SYNTHETIC_PRIVATE_VALUE"])),
+            ("/coverage", json!("all_dependencies")),
+            ("/offset_basis", json!("wire_bytes")),
+            ("/limits/headers", json!(129)),
+            ("/counts/headers_inspected", json!(129)),
+            ("/counts/header_bytes_admitted", json!(32769)),
+            ("/counts/header_bytes_admitted", json!(80)),
+            ("/counts/link_fields_inspected", json!(0)),
+            ("/counts/candidates_inspected", json!(129)),
+            ("/counts/members_framed", json!(2)),
+            ("/counts/parameters_inspected", json!(33)),
+            ("/counts/relation_tokens_inspected", json!(33)),
+            ("/counts/unknown_relation_tokens_inspected", json!(3)),
+            (
+                "/observations/0/target_origin",
+                json!("https://user:SYNTHETIC_PRIVATE_VALUE@example.com"),
+            ),
+            (
+                "/observations/0/target_origin",
+                json!("https://example.com/?SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            (
+                "/observations/0/target_origin",
+                json!("https://bad_host.example.com"),
+            ),
+            (
+                "/observations/0/target_origin",
+                json!("https://EXAMPLE.com"),
+            ),
+            ("/observations/0/relation", json!("SYNTHETIC_PRIVATE_VALUE")),
+            (
+                "/observations/0/rule_id",
+                json!("response_link.preconnect.v1"),
+            ),
+            ("/observations/0/source", json!("request_link_header")),
+            ("/observations/0/strength", json!("verified_call")),
+            (
+                "/observations/0/header_name",
+                json!("SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            ("/observations/0/header_index", json!(1)),
+            ("/observations/0/header_value_bytes", json!(4097)),
+            ("/observations/1/header_value_bytes", json!(78)),
+            ("/observations/0/link_value_span/start", json!(1)),
+            ("/observations/0/link_value_span/end", json!(78)),
+            ("/observations/0/target_span/start", json!(0)),
+            ("/observations/0/target_span/end", json!(55)),
+            ("/observations/0/relation_span/end", json!(64)),
+            ("/observations/0/relation_span/start", json!(-1)),
+            ("/observations/1/relation_span/start", json!(65)),
+            ("/observations/1/target_span/end", json!(45)),
+            ("/observations/1/link_value_span/start", json!(2)),
+            (
+                "/observations/1/target_origin",
+                json!("https://other.example.com"),
+            ),
+            ("/observations/0/offset_basis", json!("wire_bytes")),
+        ] {
+            let mut payload = link_declarations_payload("scanned");
+            *payload.pointer_mut(pointer).unwrap() = value;
+            check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+        }
+        for reason in [
+            "candidate_limit",
+            "observation_limit",
+            "header_count_limit",
+            "header_byte_limit",
+            "parameter_limit",
+            "relation_token_limit",
+            "link_field_byte_limit",
+        ] {
+            let mut payload = link_declarations_payload("partial");
+            payload["reasons"] = json!([reason]);
+            check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+        }
+        for reasons in [
+            json!(["malformed_field", "anchor_present"]),
+            json!(["malformed_field", "malformed_field"]),
+            json!(["inactive_session"]),
+        ] {
+            let mut payload = link_declarations_payload("partial");
+            payload["reasons"] = reasons;
+            check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+        }
+        let mut cap = link_observation_cap_payload();
+        cap["counts"]["unknown_relation_tokens_inspected"] = json!(1);
+        check_link_payload(&mock, cap, BODY_REFERENCE_TOKEN, 5).await;
+        let mut duplicate = link_declarations_payload("scanned");
+        duplicate["observations"][1] = duplicate["observations"][0].clone();
+        check_link_payload(&mock, duplicate, BODY_REFERENCE_TOKEN, 5).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_link_declarations_require_exact_keys_and_nulls() {
+        let mock = MockApi::new().await;
+        let schema = output_schema("target.service_map.link_declarations.get");
+        for status in ["scanned", "unsupported", "unavailable"] {
+            let valid = link_declarations_payload(status);
+            for key in valid.as_object().unwrap().keys() {
+                let mut payload = valid.clone();
+                payload.as_object_mut().unwrap().remove(key);
+                assert!(!super::matches_schema(&payload, &schema), "missing {key}");
+                check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+            }
+            for path in ["", "/counts", "/limits"] {
+                let mut payload = valid.clone();
+                payload.pointer_mut(path).unwrap()["private_field"] =
+                    json!("SYNTHETIC_PRIVATE_VALUE");
+                assert!(!super::matches_schema(&payload, &schema));
+                check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+            }
+        }
+        for path in [
+            "/observations/0",
+            "/observations/0/link_value_span",
+            "/observations/0/target_span",
+            "/observations/0/relation_span",
+        ] {
+            let mut payload = link_declarations_payload("scanned");
+            payload.pointer_mut(path).unwrap()["private_field"] = json!("SYNTHETIC_PRIVATE_VALUE");
+            assert!(!super::matches_schema(&payload, &schema));
+            check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+        }
+        for (path, value) in [
+            ("/source_origin", json!("https://example.com")),
+            ("/source_sequence", json!("1")),
+            ("/source_started_at", json!("2026-10-12T00:00:00Z")),
+            ("/source_method", json!("GET")),
+            ("/source_status", json!(200)),
+            ("/retained_header_count", json!(0)),
+            ("/counts/headers_inspected", json!(1)),
+            ("/reasons", json!([])),
+            ("/reasons", json!(["inactive_session", "record_changed"])),
+            ("/reasons", json!(["malformed_field"])),
+            ("/complete", json!(true)),
+        ] {
+            let mut payload = link_declarations_payload("unavailable");
+            *payload.pointer_mut(path).unwrap() = value;
+            check_link_payload(&mock, payload, BODY_REFERENCE_TOKEN, 5).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_link_declarations_http_errors_do_not_retry_redirect_or_echo() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "target",
+            "service-map",
+            "link-declarations",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        for (status, code, exit) in [
+            (404, "UNSUPPORTED_FEATURE", 5),
+            (301, "REDIRECT_REFUSED", 5),
+            (302, "REDIRECT_REFUSED", 5),
+            (307, "REDIRECT_REFUSED", 5),
+            (401, "HTTP_STATUS_ERROR", 5),
+            (503, "HTTP_STATUS_ERROR", 6),
+        ] {
+            *mock.state.read_status.lock().unwrap() = status;
+            *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+            let result = mock.command_with_code(&args, exit).await;
+            assert_eq!(result["error"]["code"], code);
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/link-declarations",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        *mock.state.settings_status.lock().unwrap() = 302;
+        let result = mock.command_with_code(&args, 5).await;
+        assert_eq!(result["error"]["code"], "REDIRECT_REFUSED");
+        let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/settings");
+    }
+
     fn html_generators_payload(status: &str) -> Value {
         let available = matches!(status, "scanned" | "partial");
         json!({
@@ -2853,6 +3342,228 @@ mod history_fixture {
                 2,
             );
             assert_eq!(error["error"]["code"], "INVALID_INPUT");
+        }
+        for example in spec["examples"].as_array().unwrap() {
+            let result = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    operation,
+                    "--input",
+                    &example.to_string(),
+                ],
+                0,
+            );
+            assert!(result["data"]["api"].get("headers").is_none());
+        }
+        assert_eq!(
+            super::cli(&["examples", operation], 0)["examples"],
+            spec["examples"]
+        );
+    }
+
+    #[test]
+    fn service_map_link_declaration_discovery_and_preview_are_explicit_and_offline() {
+        let operation = "target.service_map.link_declarations.get";
+        let spec = super::spec(operation);
+        let session = Uuid::nil().to_string();
+        let input = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN});
+        assert_eq!(spec["side_effect"], "read");
+        assert_eq!(spec["requires_confirmation"], false);
+        assert_eq!(
+            spec["input_schema"]["required"],
+            json!(["session_id", "evidence_id"])
+        );
+        assert_eq!(spec["input_schema"]["additionalProperties"], false);
+        assert_eq!(
+            spec["input_schema"]["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        let schema = super::cli(&["schema", "input", operation], 0);
+        assert_eq!(schema["schema"], spec["input_schema"]);
+        let called = super::cli(
+            &[
+                "--dry-run",
+                "call",
+                operation,
+                "--input",
+                &input.to_string(),
+            ],
+            0,
+        );
+        for noun in ["scope", "target"] {
+            let direct = super::cli(
+                &[
+                    "--dry-run",
+                    noun,
+                    "service-map",
+                    "link-declarations",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ],
+                0,
+            );
+            assert_eq!(direct, called["data"]);
+            assert_eq!(direct["input"], input);
+            assert_eq!(direct["api"]["method"], "GET");
+            assert_eq!(direct["api"]["body"], Value::Null);
+            assert!(direct["api"].get("headers").is_none());
+            let path = direct["api"]["path"].as_str().unwrap();
+            assert!(path.starts_with("/api/target/service-map/link-declarations?"));
+            let params: BTreeMap<_, _> =
+                url::form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+                    .into_owned()
+                    .collect();
+            assert_eq!(
+                params,
+                BTreeMap::from([
+                    ("session_id".into(), session.clone()),
+                    ("evidence_id".into(), BODY_REFERENCE_TOKEN.into())
+                ])
+            );
+            for forbidden in ["--technology-catalog-version", "--origin", "--max-records"] {
+                let error = super::cli(
+                    &[
+                        "--dry-run",
+                        noun,
+                        "service-map",
+                        "link-declarations",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        BODY_REFERENCE_TOKEN,
+                        forbidden,
+                        "SYNTHETIC_PRIVATE_VALUE",
+                    ],
+                    2,
+                );
+                assert_eq!(error["error"]["code"], "INVALID_INPUT");
+                assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            }
+            for required in [
+                vec!["--session-id", session.as_str()],
+                vec!["--evidence-id", BODY_REFERENCE_TOKEN],
+            ] {
+                let mut args = vec!["--dry-run", noun, "service-map", "link-declarations"];
+                args.extend(required);
+                assert_eq!(super::cli(&args, 2)["error"]["code"], "INVALID_INPUT");
+            }
+            for parent_flags in [
+                vec!["--technology-catalog-version", "2"],
+                vec!["--origin", "https://example.com"],
+                vec!["--max-records", "10"],
+                vec!["--session-id", session.as_str()],
+                vec!["--in-scope-only"],
+            ] {
+                let mut args = vec!["--dry-run", noun, "service-map"];
+                args.extend(parent_flags);
+                args.extend([
+                    "link-declarations",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ]);
+                assert_eq!(super::cli(&args, 2)["error"]["code"], "INVALID_INPUT");
+            }
+            let help = std::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
+                .args([noun, "service-map", "link-declarations", "--help"])
+                .output()
+                .unwrap();
+            assert!(help.status.success());
+            let text = String::from_utf8(help.stdout).unwrap();
+            assert!(text.contains("Partial or unsupported"));
+            assert!(text.contains("--session-id") && text.contains("--evidence-id"));
+        }
+        for field in ["session_id", "evidence_id"] {
+            for value in [
+                None,
+                Some(Value::Null),
+                Some(json!("SYNTHETIC_PRIVATE_VALUE")),
+            ] {
+                let mut invalid = input.clone();
+                if let Some(value) = value {
+                    invalid[field] = value;
+                } else {
+                    invalid.as_object_mut().unwrap().remove(field);
+                }
+                let error = super::cli(
+                    &[
+                        "--dry-run",
+                        "call",
+                        operation,
+                        "--input",
+                        &invalid.to_string(),
+                    ],
+                    2,
+                );
+                assert_eq!(error["error"]["code"], "INVALID_INPUT");
+                assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            }
+        }
+        for field in [
+            "technology_catalog_version",
+            "relation_catalog_version",
+            "generator_catalog_version",
+            "origin",
+            "in_scope_only",
+            "max_records",
+            "batch",
+        ] {
+            let mut invalid = input.clone();
+            invalid[field] = json!(true);
+            let error = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    operation,
+                    "--input",
+                    &invalid.to_string(),
+                ],
+                2,
+            );
+            assert_eq!(error["error"]["code"], "INVALID_INPUT");
+        }
+        for token in [
+            "https://user:SYNTHETIC_PRIVATE_VALUE@example.com/?token=SYNTHETIC_PRIVATE_VALUE"
+                .to_string(),
+            BODY_REFERENCE_TOKEN.replace("9007199254740993", "18446744073709551616"),
+            BODY_REFERENCE_TOKEN.replace("9007199254740993", "09007199254740993"),
+            Uuid::nil().to_string(),
+        ] {
+            let error = super::cli(
+                &[
+                    "--dry-run",
+                    "scope",
+                    "service-map",
+                    "link-declarations",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    &token,
+                ],
+                2,
+            );
+            assert_eq!(error["error"]["code"], "INVALID_INPUT");
+            assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            let input = json!({"session_id":session,"evidence_id":token});
+            let error = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    operation,
+                    "--input",
+                    &input.to_string(),
+                ],
+                2,
+            );
+            assert_eq!(error["error"]["code"], "INVALID_INPUT");
+            assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
         }
         for example in spec["examples"].as_array().unwrap() {
             let result = super::cli(

@@ -7542,3 +7542,12 @@ button.utility-button.replay-tab-add {
 .upstream-peer-error:empty { display: none; }
 .service-map-socket-peer { border-top: 1px solid var(--line); padding-top: 12px; }
 .service-map-socket-peer p { overflow-wrap: anywhere; }
+
+/* Retained relationship selection stays in the existing exact-source pane. */
+.service-map-relationship-kind { display: grid; gap: 6px; color: var(--text-dim); font-size: var(--font-xs); margin: 10px 0; }
+.service-map-relationship-kind select { width: 100%; min-width: 0; padding: 7px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; font: inherit; }
+.service-map-retained-relationships > div > button { width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.service-map-edge.link-declaration, .service-map-line.link-declaration { stroke-dasharray: 10 3 2 3; }
+.service-map-edge.preconnect-hint, .service-map-line.preconnect-hint { stroke-dasharray: 3 3; }
+.service-map-line.link-declaration { border-top-style: double; }
+.service-map-line.preconnect-hint { border-top-style: dashed; opacity: 0.65; }

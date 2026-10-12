@@ -104,6 +104,30 @@ Offsets are not full-body or wire offsets. Literal references do not prove calls
 followed links, ownership, or service dependencies; never add them to observed
 traffic counts or silently infer an architecture.
 
+For explicitly requested retained response-header relationships, use
+`scope service-map link-declarations --session-id <active-session-uuid>
+--evidence-id <returned-token>` (`target.service_map.link_declarations.get`).
+This independent read requires the already-active session and exact row; it reads
+only response headers, never body files or linked resources. Version 1 accepts
+GET/HEAD 200 responses and literal absolute HTTP(S) declarations with
+`service-doc`, `service-desc`, `describedby`, or `preconnect`. Unsupported source
+contexts are not empty successful scans. Check `available`, `status`, `complete`,
+`reasons`, `retained_header_count`, inspected counters, and every fixed limit.
+Accepted partial results remain `status: "scanned"`, `complete: false`.
+
+These are declarations or connection hints from one retained response, not
+confirmed calls, API descriptions, installed products, or service ownership.
+Output contains canonical target origins and original retained-header UTF-8 byte
+spans; it omits target paths, queries, credentials, raw headers and unknown rel
+text. Header indices refer to the retained array, not original wire ordering.
+An older server may lack this endpoint; no fallback or automatic retry is safe.
+In the GUI, Retained relationships selects body or Link evidence without reading
+it. Inspect reads only the chosen source; Show explicitly replaces the one
+session-local temporary overlay. Choosing another kind or an unrelated failed
+inspection does not discard a still-valid shown overlay. Source/session changes,
+retention or unavailable freshness clear it. Never count reference-only targets
+as captured traffic, infer a physical infrastructure chain, or fetch declarations.
+
 For a separately requested HTML generator inspection, use
 `scope service-map html-generators --session-id <active-session-uuid>
 --evidence-id <returned-token>` (`target.service_map.html_generators.get`). The

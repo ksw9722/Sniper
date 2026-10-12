@@ -439,7 +439,7 @@ pub fn canonical_origin(value: &str) -> Option<String> {
     Some(url.origin().ascii_serialization())
 }
 
-fn request_target(record: &TransactionRecord) -> Option<(Url, String)> {
+pub(crate) fn request_target(record: &TransactionRecord) -> Option<(Url, String)> {
     if record.scheme.len() > 8
         || record.host.len() > MAX_HOST_BYTES
         || record.path.len() > MAX_PATH_BYTES + MAX_HEADER_VALUE_BYTES

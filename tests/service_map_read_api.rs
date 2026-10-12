@@ -936,3 +936,258 @@ async fn observed_socket_peer_survives_journal_restart_compaction_and_metadata_r
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_link_declarations_api_and_cli_are_metadata_only_and_exact() {
+    let dir = std::env::temp_dir().join(format!("sniper-link-declarations-{}", Uuid::new_v4()));
+    let state = Arc::new(
+        AppState::new(AppConfig {
+            data_dir: dir.clone(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 1024,
+        })
+        .unwrap(),
+    );
+    let session = state.session().await;
+    let session_id = session.id();
+    let first_link = "<https://docs.example.com/private?key=SYNTHETIC_PRIVATE#fragment>; title=\"é, retained\"; rel=\"service-doc describedby\"";
+    let make_record = |path: &str, method: &str, status: u16, values: &[(&str, &str)]| {
+        let mut record = row(path);
+        record.method = method.into();
+        record.status = Some(status);
+        let response = record.response.as_mut().unwrap();
+        response.content_type = Some("application/octet-stream".into());
+        response.body_encoding = sniper::model::BodyEncoding::Base64;
+        response.body_preview = "U1lOVEhFVElDX1BSSVZBVEU=".into();
+        response.headers = values
+            .iter()
+            .map(|(name, value)| sniper::model::HeaderRecord {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect();
+        record
+    };
+    let first = make_record(
+        "/links/a?secret=SYNTHETIC_PRIVATE",
+        "GET",
+        200,
+        &[("Link", first_link)],
+    );
+    let duplicate_id = first.id;
+    let mut second = make_record(
+        "/links/b",
+        "HEAD",
+        200,
+        &[("Link", "<https://[2001:db8::20]:443/asset>; rel=preconnect")],
+    );
+    second.id = duplicate_id;
+    let wrong_status = make_record("/links/status", "GET", 404, &[("Link", first_link)]);
+    let wrong_method = make_record("/links/method", "POST", 200, &[("Link", first_link)]);
+    let mut absent = make_record("/links/absent", "GET", 200, &[]);
+    absent.response = None;
+    let large_unknown = "x".repeat(32760);
+    let bounded = make_record(
+        "/links/bounded",
+        "GET",
+        200,
+        &[("X", &large_unknown), ("Link", first_link)],
+    );
+    let partial = make_record("/links/partial", "GET", 200, &[
+        ("Link", "<https://other.example.com/private>; rel=service-doc; anchor=\"https://hidden.example.com/SYNTHETIC_PRIVATE\""),
+        ("LINK", "<https://schema.example.com/spec?key=SYNTHETIC_PRIVATE>; rel=service-desc"),
+    ]);
+    for record in [
+        first,
+        second,
+        wrong_status,
+        wrong_method,
+        absent,
+        bounded,
+        partial,
+    ] {
+        session.store.insert(record).await;
+    }
+    session.persist().await.unwrap();
+    let mut events = session.store.subscribe();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let app = sniper::api::router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let map = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id":session_id}),
+    )
+    .await;
+    assert_eq!(map["snapshot"]["retained_rows"], 7);
+    assert!(!map.to_string().contains("docs.example.com"));
+    let token_for = |path: &str| {
+        map["origins"][0]["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|endpoint| endpoint["path"] == path)
+            .unwrap()["evidence"][0]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let first_token = token_for("/links/a");
+    let second_token = token_for("/links/b");
+    let inspect = |token: &str| {
+        format!("{api}/api/target/service-map/link-declarations?session_id={session_id}&evidence_id={token}")
+    };
+
+    // Both retained duplicate rows remain inspectable with body storage absent.
+    // This endpoint must neither hydrate the latest UUID nor consult its locator.
+    let storage = session.storage_dir().join("transactions.ndjson");
+    let held = session.storage_dir().join("synthetic-body-file-held");
+    std::fs::rename(&storage, &held).unwrap();
+    let first_result = read(
+        &dir,
+        &api,
+        "target.service_map.link_declarations.get",
+        json!({"session_id":session_id,"evidence_id":first_token}),
+    )
+    .await;
+    assert_eq!(first_result["status"], "scanned");
+    assert_eq!(first_result["complete"], true);
+    assert_eq!(first_result["source_method"], "GET");
+    assert_eq!(first_result["source_status"], 200);
+    assert_eq!(first_result["retained_header_count"], 1);
+    assert_eq!(first_result["counts"]["headers_inspected"], 1);
+    assert_eq!(first_result["observations"].as_array().unwrap().len(), 2);
+    let observations = first_result["observations"].as_array().unwrap();
+    for (observation, relation) in observations.iter().zip(["service-doc", "describedby"]) {
+        assert_eq!(observation["target_origin"], "https://docs.example.com");
+        assert_eq!(observation["header_index"], 0);
+        assert_eq!(observation["header_value_bytes"], first_link.len());
+        assert_eq!(observation["offset_basis"], "retained_header_value_utf8");
+        let span = &observation["relation_span"];
+        assert_eq!(
+            &first_link
+                [span["start"].as_u64().unwrap() as usize..span["end"].as_u64().unwrap() as usize],
+            relation
+        );
+    }
+    assert_eq!(
+        observations[0]["target_span"],
+        observations[1]["target_span"]
+    );
+    assert_eq!(
+        observations[0]["link_value_span"],
+        observations[1]["link_value_span"]
+    );
+    for forbidden in ["private", "fragment", "é", "SYNTHETIC_PRIVATE"] {
+        assert!(!first_result.to_string().contains(forbidden));
+    }
+    let second_result = read(
+        &dir,
+        &api,
+        "target.service_map.link_declarations.get",
+        json!({"session_id":session_id,"evidence_id":second_token}),
+    )
+    .await;
+    assert_eq!(second_result["source_method"], "HEAD");
+    assert_eq!(
+        second_result["observations"][0]["target_origin"],
+        "https://[2001:db8::20]"
+    );
+    assert_eq!(second_result["observations"][0]["relation"], "preconnect");
+    assert_ne!(
+        first_result["source_sequence"],
+        second_result["source_sequence"]
+    );
+    assert!(!storage.exists());
+    assert!(held.exists());
+    std::fs::rename(&held, &storage).unwrap();
+
+    for path in ["/links/status", "/links/method"] {
+        let result = read(
+            &dir,
+            &api,
+            "target.service_map.link_declarations.get",
+            json!({"session_id":session_id,"evidence_id":token_for(path)}),
+        )
+        .await;
+        assert_eq!(result["status"], "unsupported");
+        assert_eq!(result["reasons"], json!(["unsupported_source_context"]));
+        assert!(result["source_method"].is_null());
+        assert!(result["retained_header_count"].is_null());
+        assert!(result["observations"].as_array().unwrap().is_empty());
+    }
+    let absent = read(
+        &dir,
+        &api,
+        "target.service_map.link_declarations.get",
+        json!({"session_id":session_id,"evidence_id":token_for("/links/absent")}),
+    )
+    .await;
+    assert_eq!(absent["available"], false);
+    assert_eq!(absent["reasons"], json!(["response_unavailable"]));
+    let bounded = read(
+        &dir,
+        &api,
+        "target.service_map.link_declarations.get",
+        json!({"session_id":session_id,"evidence_id":token_for("/links/bounded")}),
+    )
+    .await;
+    assert_eq!(bounded["status"], "scanned");
+    assert_eq!(bounded["complete"], false);
+    assert_eq!(bounded["retained_header_count"], 2);
+    assert_eq!(bounded["counts"]["headers_inspected"], 1);
+    assert_eq!(bounded["counts"]["header_bytes_admitted"], 32761);
+    assert_eq!(bounded["reasons"], json!(["header_byte_limit"]));
+    let partial = read(
+        &dir,
+        &api,
+        "target.service_map.link_declarations.get",
+        json!({"session_id":session_id,"evidence_id":token_for("/links/partial")}),
+    )
+    .await;
+    assert_eq!(partial["complete"], false);
+    assert_eq!(partial["reasons"], json!(["anchor_present"]));
+    assert_eq!(partial["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(partial["observations"][0]["header_index"], 1);
+    assert_eq!(
+        partial["observations"][0]["target_origin"],
+        "https://schema.example.com"
+    );
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(state.session().await.id(), session_id);
+    let unknown = client
+        .get(format!(
+            "{}&unexpected=SYNTHETIC_PRIVATE",
+            inspect(&first_token)
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(!unknown.text().await.unwrap().contains("SYNTHETIC_PRIVATE"));
+    assert_eq!(session.store.delete_ids(&[duplicate_id]).await.unwrap(), 1);
+    let removed = read(
+        &dir,
+        &api,
+        "target.service_map.link_declarations.get",
+        json!({"session_id":session_id,"evidence_id":first_token}),
+    )
+    .await;
+    assert_eq!(removed["available"], false);
+    assert!(removed["source_sequence"].is_null());
+    assert!(removed["observations"].as_array().unwrap().is_empty());
+    server.abort();
+    let _ = server.await;
+    drop(session);
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}

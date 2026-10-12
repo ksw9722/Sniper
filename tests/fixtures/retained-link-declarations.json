@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "relation_catalog_version": 1,
+  "session_id": "00000000-0000-0000-0000-000000000001",
+  "evidence_id": "v1.00000000-0000-0000-0000-000000000001.00000000-0000-0000-0000-000000000002.42.00000000-0000-0000-0000-000000000003.00000000-0000-0000-0000-000000000004",
+  "available": true,
+  "status": "scanned",
+  "complete": true,
+  "reasons": [],
+  "source_origin": "https://example.com",
+  "source_sequence": "42",
+  "source_started_at": "2026-10-12T00:00:00Z",
+  "source_method": "GET",
+  "source_status": 200,
+  "retained_header_count": 2,
+  "coverage": "absolute_http_link_declarations",
+  "offset_basis": "retained_header_value_utf8",
+  "counts": {
+    "headers_inspected": 2,
+    "header_bytes_admitted": 140,
+    "link_fields_inspected": 1,
+    "candidates_inspected": 1,
+    "members_framed": 1,
+    "parameters_inspected": 2,
+    "relation_tokens_inspected": 2,
+    "unknown_relation_tokens_inspected": 0
+  },
+  "observations": [
+    {
+      "relation": "service-doc",
+      "target_origin": "https://docs.example.com",
+      "source": "response_link_header",
+      "strength": "literal_declaration",
+      "header_name": "link",
+      "header_index": 1,
+      "header_value_bytes": 100,
+      "link_value_span": {
+        "start": 0,
+        "end": 100
+      },
+      "target_span": {
+        "start": 1,
+        "end": 46
+      },
+      "relation_span": {
+        "start": 54,
+        "end": 65
+      },
+      "rule_id": "response_link.service_doc.v1",
+      "offset_basis": "retained_header_value_utf8"
+    },
+    {
+      "relation": "preconnect",
+      "target_origin": "https://docs.example.com",
+      "source": "response_link_header",
+      "strength": "literal_declaration",
+      "header_name": "link",
+      "header_index": 1,
+      "header_value_bytes": 100,
+      "link_value_span": {
+        "start": 0,
+        "end": 100
+      },
+      "target_span": {
+        "start": 1,
+        "end": 46
+      },
+      "relation_span": {
+        "start": 66,
+        "end": 76
+      },
+      "rule_id": "response_link.preconnect.v1",
+      "offset_basis": "retained_header_value_utf8"
+    }
+  ],
+  "limits": {
+    "headers": 128,
+    "header_bytes": 32768,
+    "link_field_bytes": 4096,
+    "target_bytes": 4096,
+    "candidates": 128,
+    "parameters_per_member": 32,
+    "relation_tokens_per_member": 32,
+    "observations": 32,
+    "target_origin_bytes": 268
+  }
+}

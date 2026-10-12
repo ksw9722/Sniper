@@ -570,7 +570,7 @@ fn rehydrate_checked(
 
 // Resolve the full row token rather than UUID: older retained duplicates can
 // only use their own resident preview, never the newest row's disk locator.
-fn service_map_body_row_index(
+fn service_map_row_index(
     inner: &StoreInner,
     key: &crate::service_map::EvidenceKey,
 ) -> Result<usize, &'static str> {
@@ -584,6 +584,14 @@ fn service_map_body_row_index(
     if inner.body_generations[index] != key.revision {
         return Err("record_changed");
     }
+    Ok(index)
+}
+
+fn service_map_body_row_index(
+    inner: &StoreInner,
+    key: &crate::service_map::EvidenceKey,
+) -> Result<usize, &'static str> {
+    let index = service_map_row_index(inner, key)?;
     if inner.unresolved_body_generations.contains(&key.revision) {
         return Err("body_identity_unverifiable");
     }
@@ -1492,6 +1500,95 @@ impl TransactionStore {
             }
             None => missing("metadata_unavailable"),
         }
+    }
+
+    /// Metadata-only exact-row inspection. Body storage is deliberately absent
+    /// from both acquisition and publication checks, even for duplicate UUIDs.
+    pub async fn service_map_link_declarations(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map_links::ServiceMapLinkDeclarations {
+        self.service_map_link_declarations_impl(
+            session_id,
+            id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn service_map_link_source_status(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> Result<(), &'static str> {
+        let key = crate::service_map::EvidenceKey::parse(id).ok_or("invalid_evidence_id")?;
+        if key.session_id != session_id {
+            return Err("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return Err("stale_generation");
+        }
+        let inner = self.inner.read().await;
+        service_map_row_index(&inner, &key).map(|_| ())
+    }
+
+    async fn service_map_link_declarations_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_links::ServiceMapLinkDeclarations {
+        use crate::{
+            service_map::EvidenceKey,
+            service_map_links::{self, LinkSource, ServiceMapLinkDeclarations},
+        };
+        let missing = |reason| ServiceMapLinkDeclarations::missing(session_id, id.into(), reason);
+        let Some(key) = EvidenceKey::parse(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        let source = {
+            let inner = self.inner.read().await;
+            let index = match service_map_row_index(&inner, &key) {
+                Ok(index) => index,
+                Err(reason) => return missing(reason),
+            };
+            match LinkSource::from_record(&inner.entries[index]) {
+                Ok(source) => source,
+                Err("unsupported_source_context") => {
+                    return ServiceMapLinkDeclarations::unsupported(session_id, id.into())
+                }
+                Err(reason) => return missing(reason),
+            }
+        };
+        let inner = Arc::clone(&self.inner);
+        let evidence_id = id.to_owned();
+        let task = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("before_scan");
+            }
+            let result = service_map_links::inspect_source(session_id, evidence_id.clone(), source);
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("after_scan");
+            }
+            // Revisions change for full record mutations; annotation-only edits
+            // remain valid. No body locator ambiguity can invalidate headers.
+            match service_map_row_index(&inner.blocking_read(), &key) {
+                Ok(_) => result,
+                Err(reason) => ServiceMapLinkDeclarations::missing(session_id, evidence_id, reason),
+            }
+        });
+        task.await
+            .unwrap_or_else(|_| missing("link_inspection_failed"))
     }
 
     /// Opt-in, exact-token reads of a retained response preview. No generic
@@ -4216,6 +4313,276 @@ pub(crate) mod tests {
                     .service_map_html_generators_impl(session, &token, Some(hook))
                     .await
             })
+        }
+
+        fn link_record(origin: &str, sequence: u64) -> TransactionRecord {
+            let mut record = body_record("SYNTHETIC_PRIVATE_BODY", sequence);
+            record.response.as_mut().unwrap().headers = vec![crate::model::HeaderRecord {
+                name: "Link".into(),
+                value: format!("<{origin}/private?token=HIDDEN>; rel=service-doc"),
+            }];
+            record
+        }
+
+        fn paused_link_read(
+            store: Arc<TransactionStore>,
+            session: Uuid,
+            token: String,
+            hook: ServiceMapBodyReadHook,
+        ) -> tokio::task::JoinHandle<crate::service_map_links::ServiceMapLinkDeclarations> {
+            tokio::spawn(async move {
+                store
+                    .service_map_link_declarations_impl(session, &token, Some(hook))
+                    .await
+            })
+        }
+
+        #[tokio::test]
+        async fn link_declarations_distinguish_resident_lazy_and_ambiguous_duplicate_metadata() {
+            for lazy in [false, true] {
+                let first = link_record("https://older.example.com", 1);
+                let mut second = link_record("https://newer.example.com", 2);
+                second.id = first.id;
+                second.method = "HEAD".into();
+                let (store, dir) = fixture_store(&[first, second], lazy).await;
+                let session = Uuid::new_v4();
+                let first_token = token(&store, session, 1).await;
+                let second_token = token(&store, session, 2).await;
+                // Header identity survives both absent body files and known
+                // ambiguous UUID-only body locators for either exact row.
+                if lazy {
+                    fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                }
+                {
+                    let mut inner = store.inner.write().await;
+                    for id in [&first_token, &second_token] {
+                        inner
+                            .unresolved_body_generations
+                            .insert(EvidenceKey::parse(id).unwrap().revision);
+                    }
+                }
+                for (id, origin, method) in [
+                    (&first_token, "https://older.example.com", "GET"),
+                    (&second_token, "https://newer.example.com", "HEAD"),
+                ] {
+                    let result = store.service_map_link_declarations(session, id).await;
+                    assert!(result.available && result.complete, "lazy={lazy}");
+                    assert_eq!(result.observations[0].target_origin, origin);
+                    assert_eq!(result.source_method.as_deref(), Some(method));
+                    assert_eq!(result.retained_header_count, Some(1));
+                    assert!(store
+                        .service_map_link_source_status(session, id)
+                        .await
+                        .is_ok());
+                }
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn link_declarations_reject_invalid_session_generation_row_and_revision_tokens() {
+            let first = link_record("https://example.com", 1);
+            let (store, dir) = fixture_store(&[first.clone()], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_link_declarations(session, "bad")
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            assert_eq!(
+                store
+                    .service_map_link_declarations(Uuid::new_v4(), &id)
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            let replacement = TransactionStore::from_records(vec![first.clone()]);
+            assert_eq!(
+                replacement
+                    .service_map_link_declarations(session, &id)
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            let key = EvidenceKey::parse(&id).unwrap();
+            let wrong_id = format!(
+                "v1.{}.{}.{}.{}.{}",
+                session,
+                key.generation,
+                key.sequence,
+                key.revision,
+                Uuid::new_v4()
+            );
+            assert_eq!(
+                store
+                    .service_map_link_declarations(session, &wrong_id)
+                    .await
+                    .reasons,
+                ["record_missing"]
+            );
+            store
+                .update_record(first.id, |row| {
+                    row.response.as_mut().unwrap().headers.clear()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .service_map_link_declarations(session, &id)
+                    .await
+                    .reasons,
+                ["record_changed"]
+            );
+            assert_eq!(
+                store.service_map_link_source_status(session, &id).await,
+                Err("record_changed")
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn link_declarations_fence_mutation_deletion_and_retention_before_and_after_scan() {
+            for lazy in [false, true] {
+                for stage in ["before_scan", "after_scan"] {
+                    for mutation in ["delete", "retention", "headers", "body"] {
+                        let first = link_record("https://example.com", 1);
+                        let (store, dir) = fixture_store(&[first.clone()], lazy).await;
+                        let session = Uuid::new_v4();
+                        let id = token(&store, session, 1).await;
+                        let before = store.service_map_link_declarations(session, &id).await;
+                        assert!(before.complete && before.observations.len() == 1);
+                        let (hook, started, release) = barrier(stage);
+                        let reading = paused_link_read(store.clone(), session, id, hook);
+                        tokio::time::timeout(WaitDuration::from_secs(10), started)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let expected = match mutation {
+                            "delete" => {
+                                assert_eq!(store.delete_ids(&[first.id]).await.unwrap(), 1);
+                                "record_missing"
+                            }
+                            "retention" => {
+                                assert_eq!(
+                                    store
+                                        .trim_retention(0, &HashSet::new(), 10)
+                                        .await
+                                        .unwrap()
+                                        .deleted_ids,
+                                    [first.id]
+                                );
+                                "record_missing"
+                            }
+                            "headers" => {
+                                store
+                                    .update_record(first.id, |row| {
+                                        row.response.as_mut().unwrap().headers.clear()
+                                    })
+                                    .await
+                                    .unwrap();
+                                "record_changed"
+                            }
+                            _ => {
+                                store
+                                    .update_record(first.id, |row| {
+                                        row.response.as_mut().unwrap().body_preview =
+                                            "changed".into()
+                                    })
+                                    .await
+                                    .unwrap();
+                                "record_changed"
+                            }
+                        };
+                        release.send(()).unwrap();
+                        let result = reading.await.unwrap();
+                        assert!(
+                            !result.available && !result.complete,
+                            "{lazy} {stage} {mutation}"
+                        );
+                        assert_eq!(result.reasons, [expected]);
+                        assert!(result.observations.is_empty());
+                        assert_eq!(
+                            result.counts,
+                            crate::service_map_links::ServiceMapLinkCounts::default()
+                        );
+                        assert!(
+                            result.source_origin.is_none()
+                                && result.retained_header_count.is_none()
+                        );
+                        drop(store);
+                        fs::remove_dir_all(dir).unwrap();
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn link_declarations_ignore_annotation_and_body_file_generation_changes() {
+            for stage in ["before_scan", "after_scan"] {
+                let first = link_record("https://example.com", 1);
+                let (store, dir) = fixture_store(&[first.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier(stage);
+                let reading = paused_link_read(store.clone(), session, id, hook);
+                started.await.unwrap();
+                store
+                    .update_annotations(first.id, None, Some(Some("note".into())))
+                    .await
+                    .unwrap();
+                // The retained metadata row does not change during body-file
+                // publication. No file/locator state belongs in this read fence.
+                let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+                let staged = dir.join("replacement");
+                fs::create_dir_all(&staged).unwrap();
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &staged,
+                    &[first],
+                )
+                .unwrap();
+                let publisher = store.clone();
+                let destination = dir.join("transactions.ndjson");
+                tokio::task::spawn_blocking(move || {
+                    publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                        crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert!(result.complete && result.available);
+                assert_eq!(result.observations.len(), 1);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn link_declarations_worker_failure_has_fixed_empty_envelope() {
+            let record = link_record("https://example.com", 1);
+            let (store, dir) = fixture_store(&[record], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let hook: ServiceMapBodyReadHook = Arc::new(|_| panic!("synthetic worker failure"));
+            let result = store
+                .service_map_link_declarations_impl(session, &id, Some(hook))
+                .await;
+            assert_eq!(result.reasons, ["link_inspection_failed"]);
+            assert!(!result.available && result.observations.is_empty());
+            assert_eq!(
+                result.counts,
+                crate::service_map_links::ServiceMapLinkCounts::default()
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
         }
 
         #[tokio::test]

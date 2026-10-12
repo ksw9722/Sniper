@@ -19,7 +19,7 @@ normal size. Fit is a one-shot action for the displayed cards, bounded by those
 scale limits. Polling and resizing never refit or change the chosen zoom. Plus
 and minus preserve the viewport center where scroll bounds allow. With the map
 viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. Zooming is
-local and preserves selection, exact-source reads, and temporary body overlays.
+local and preserves selection, exact-source reads, and temporary relationship overlays.
 There is no force layout or drag editing in this version. The renderer is separate from metadata normalization and
 layout calculation so it can be replaced without changing the read contract.
 The navigation strip follows the existing compact Capture-tab sizing. Long
@@ -52,8 +52,8 @@ local view of the origins directly connected to a chosen anchor by loaded
 Origin/Referer declarations or redirect instructions. It does not traverse
 multiple hops or infer service calls. Selecting a different card changes the
 inspector; an explicit Focus selection action changes the pinned anchor.
-An explicit temporary body-reference overlay can add references from one
-already-inspected response, as described below. Returning to All origins clears
+An explicit temporary body-or-Link overlay can add literal relationships from
+one already-inspected response, as described below. Returning to All origins clears
 that overlay and keeps the inspector selection only if it still belongs to the
 metadata inventory.
 
@@ -92,7 +92,7 @@ sniper-cli call target.service_map.get --input '{"session_id":"00000000-0000-000
 
 The UUID in the JSON example is synthetic. Select a real session deliberately
 from session discovery. `target` remains an alias for the `scope` command group.
-All four Service Map operations have `side_effect: "read"` and need no `--yes`.
+All five Service Map operations have `side_effect: "read"` and need no `--yes`.
 `--dry-run` describes the local API request without contacting it.
 
 `session_id` is optional for the map: omission or null resolves the active session
@@ -422,6 +422,120 @@ Reasons name each applicable cap or unsupported/unavailable state. No automatic
 larger read follows a partial result. Even `complete: true` describes only this
 supported literal grammar within one retained preview, never all runtime calls.
 
+## Explicit retained response Link declarations
+
+This separate opt-in read inspects one exact retained response's Link headers:
+
+```bash
+sniper-cli schema input target.service_map.link_declarations.get
+sniper-cli schema output target.service_map.link_declarations.get
+sniper-cli examples target.service_map.link_declarations.get
+sniper-cli scope service-map link-declarations --session-id <active-session-uuid> --evidence-id <returned-evidence-token>
+sniper-cli call target.service_map.link_declarations.get --input '{"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"<returned-evidence-token>"}'
+```
+
+Both fields are required; unknown query fields are rejected. The session must
+already be active. The operation never activates or loads an inactive session,
+creates a session worker, reads a body or body locator, persists a result, or
+uses a UUID-only transaction fallback. It makes no target request, redirect
+follow, DNS lookup, TLS connection, probe, URL resolution, or OpenAPI read. The
+CLI makes one explicit inspection GET after ordinary local identity checks; it
+sends no technology-catalog header and never retries or hydrates another source.
+An older server's 404 is an explicit unsupported-feature result, not permission
+to generate traffic.
+
+Eligible sources are ordinary retained HTTP(S) GET or HEAD responses with status
+200 and response metadata. Other methods, statuses (including 101, 204, 206,
+304, and redirects), tunnels, and other schemes return `unsupported` with
+`unsupported_source_context`. Missing response metadata is `unavailable` with
+`response_unavailable`; invalid canonical source metadata is
+`metadata_unavailable`. MIME, compression, preview encoding, preview truncation,
+body presence, missing body files, and ambiguous duplicate-UUID body locators do
+not change valid retained-header eligibility.
+
+Acquisition resolves the exact session/store generation/sequence/UUID/revision
+and copies at most 128 retained headers or 32,768 name-plus-value bytes, in
+original order, under the metadata lock. Original header count is retained as
+constant-time metadata. Parsing happens outside the lock. Both the row revision
+and active session context are revalidated before publication; a mutation,
+removal, retention event, generation replacement, or session switch discards
+stale results. Annotation-only edits and body-file replacement alone do not
+change the exact metadata identity.
+The result is a revalidated snapshot; it does not atomically freeze history or
+the active session through response delivery.
+
+The fixed grammar recognizes `service-doc`, `service-desc`, `describedby`, and
+`preconnect`. The first three are declarations; preconnect is a hint. All use
+`source: "response_link_header"` and `strength: "literal_declaration"`. Nothing
+here establishes ownership, actual network calls, deployment, or that a target
+was contacted. Unknown relation tokens are counted but their text is not
+returned. Relation tokens are ASCII case-insensitive. The first `rel` parameter
+wins, escaped relation syntax is unsupported, and any `anchor` rejects its whole
+member. Complete member framing precedes emission. Malformed framing stops that
+field with no search-ahead recovery; independent later header fields can still
+be inspected.
+
+Targets must be literal absolute ASCII HTTP(S) URLs. Relative/non-HTTP targets,
+userinfo (including empty `@`), controls, backslashes, malformed percent escapes,
+ambiguous authorities, and nonstandard numeric-host repairs are rejected before
+canonicalization. Output contains only canonical target origins, never raw
+headers, paths, queries, fragments, titles, credentials, unknown relation text,
+rejected values, or parser diagnostics.
+
+### Link declaration result contract
+
+The strict envelope includes `schema_version: 1`, `relation_catalog_version: 1`,
+exact requested `session_id` and `evidence_id`, `available`, `status`, `complete`,
+and sorted unique fixed `reasons`. Status is `scanned`, `unsupported`, or
+`unavailable`. Accepted partial inspection remains `available: true`,
+`status: "scanned"`, `complete: false`; it never claims a complete empty result.
+Completeness means no omissions within this bounded literal grammar, not all
+resource relationships or service dependencies.
+
+`source_origin`, `source_sequence` (canonical decimal u64 string),
+`source_started_at`, `source_method`, `source_status`, and
+`retained_header_count` are required nullable fields. Unsupported/unavailable
+results have exactly one acquisition reason, all six source fields explicitly
+null, zero counts, and no observations. `coverage` is
+`absolute_http_link_declarations`; `offset_basis` is
+`retained_header_value_utf8`.
+
+The required counts are `headers_inspected`, `header_bytes_admitted`,
+`link_fields_inspected`, `candidates_inspected`, `members_framed`,
+`parameters_inspected`, `relation_tokens_inspected`, and
+`unknown_relation_tokens_inspected`. These count inspected input only. Copied but
+uninspected suffixes and skipped tails are not estimated. In particular, a
+candidate limit reached before a later header-admission limit does not claim the
+later limit was encountered.
+
+Each observation contains relation, canonical target origin, fixed source and
+strength, `header_name: "link"`, original zero-based `header_index`, original
+`header_value_bytes`, half-open `link_value_span`, `target_span`, and
+`relation_span`, fixed `rule_id`, and offset basis. Spans are UTF-8 byte offsets
+into the original retained header value, not wire offsets. Target spans exclude
+angle brackets. Multiple relations from one member share member/target spans
+and preserve their distinct ordered relation spans. Separate members retain
+separate provenance even when their origin-only targets coincide. Rules are
+`response_link.service_doc.v1`, `response_link.service_desc.v1`,
+`response_link.describedby.v1`, and `response_link.preconnect.v1` respectively.
+
+The fixed limits are 128 headers; 32,768 header name/value bytes; 4,096 bytes per
+Link field and target; 128 candidates; 32 parameters and 32 relation tokens per
+member; 32 observations; and 268 bytes per target origin. A field exceeding its
+individual limit is skipped without inspection; no header or field is truncated
+and then treated as a complete value.
+
+Acquisition/lifetime reasons are `invalid_evidence_id`, `session_mismatch`,
+`stale_generation`, `record_missing`, `record_changed`, `response_unavailable`,
+`unsupported_source_context`, `inactive_session`, `session_source_changed`,
+`metadata_unavailable`, and `link_inspection_failed`. Admission/parser reasons
+are `header_count_limit`, `header_byte_limit`, `link_field_byte_limit`,
+`candidate_limit`, `parameter_limit`, `relation_token_limit`, `observation_limit`,
+`malformed_field`, `unsupported_target`, `anchor_present`, `missing_relation`,
+and `unsupported_relation_syntax`. Neither errors nor unavailable results echo
+captured values or underlying diagnostics. Malformed query/exact-token syntax
+receives HTTP 400 with a fixed message.
+
 ## Explicit retained HTML generator declarations
 
 **Inspect retained HTML generators** is a separate explicit inspection of one
@@ -537,48 +651,64 @@ source/session or retained history is invalidated and is never saved in workspac
 state. An unchanged valid metadata poll may preserve it; delayed responses cannot
 restore stale evidence. No larger inspection runs automatically after a limit.
 
-## Temporary body-reference overlay (GUI only)
+## Temporary retained-relationship overlay (GUI only)
 
-After **View source** has verified one exact retained row, use **Inspect retained
-body references** to inspect that response's supported preview. A successful
-`scanned` or `partial` result with at least one other origin enables **Show
-references on map**. A zero-reference or self-only result remains visible in the
-inspector but cannot create an overlay; unsupported, unavailable, or unverified
-results cannot be mapped.
+After **View source** has verified one exact retained row, the **Retained
+relationships** section offers **Body URL references** or **Response Link
+headers**. Use its source-specific **Inspect** action, then separately choose
+**Show references on map** (or **Replace shown references**) for a supported
+result containing another origin. Body eligibility and scan behavior are
+unchanged; Link inspection requires a fresh visible verified GET/HEAD 200 source.
+A zero-reference or self-only result remains inspectable but cannot create an
+overlay. Unsupported, unavailable, or unverified results cannot be mapped.
+
+There is one pending relationship inspection and one selected-kind result.
+Changing the source selector makes no request, cancels the pending inspection,
+and discards that result. A valid already-shown overlay remains until an explicit
+Show/Replace or ordinary lifetime invalidation. A Link 404 or unrelated inspection
+failure does not discard a still-valid body overlay. The separate HTML generator
+inspector is unchanged.
 
 **Show references on map** opens Direct relations, pins the inspected response's
 source origin, and adds its references to the loaded metadata neighbors. It uses
 only the already-returned, bounded result: showing, selecting, searching, and
-clearing the overlay perform no further body read or target request. Nothing is
-scanned automatically. Only one overlay exists at a time, in memory for the
-current session; it is not written to saved workspace or session data.
+clearing the overlay perform no further inspection or target request. Nothing is
+scanned automatically. Only one body-or-Link overlay exists at a time, from one exact source and in
+memory for the current session; it is not written to saved workspace or session data.
 
 The source method and query-free path, exact retained-row provenance, and
-complete or partial retained-preview coverage remain visible. A partial scan
+complete or partial source-specific coverage remain visible. A partial scan
 stays labeled partial even when the metadata inventory is complete. Dotted
 **body URL reference** arrows point from that response's origin to referenced
 origins. Repeated literal occurrences are reference counts, never request counts.
+Link arrows likewise point from the retained response origin to the declared
+target, using `link_service_doc`, `link_service_desc`, `link_describedby`, or
+`link_preconnect`. The legend distinguishes metadata declarations, redirect
+instructions, body URL references, Link declarations, and preconnect hints.
+Graph arrows deduplicate by source/target/type while evidence retains every
+declaration and span. Self declarations remain inspectable without an arrow.
 These arrows do not prove a request, runtime call, followed link, service
 ownership, or dependency. Target origins remain text and are never fetched.
 
 A target already present as a captured origin keeps its actual metadata and
-sampled traffic count. A target present only in the inspected preview is
+sampled traffic count. A target present only in the inspected preview or Link declaration is
 reference-only: no captured traffic, endpoint, or scope membership is invented.
 That label does not establish that the origin has never been captured. The
 overlay does not enrich All origins, the API catalog, header-derived links, or
 the metadata/CLI result. The existing body-reference CLI output is unchanged;
 there is no additional command or API endpoint for this GUI action.
 
-The overlay keeps at most 100 referenced origins from the bounded scan. Self
-references are excluded from the graph. The pinned source counts toward the
-existing 24-card limit, and body arrows share the 40-arrow limit with metadata
-arrows. Search can hide neighbors while retaining the source. Read the reported
+The body overlay keeps at most 100 referenced origins from its bounded scan;
+Link results contain at most 32 declarations. Self references are excluded from
+the graph. The pinned source counts toward the existing 24-card limit, and all
+relationship arrows share the 40-arrow limit with metadata arrows. Deterministic
+pair lanes separate up to ten distinct metadata and Link arrow types. Search can hide neighbors while retaining the source. Read the reported
 query-hidden, card-cap, and arrow omissions; graph omissions are separate from
 the scanner's omitted reference occurrences and unknown coverage beyond its
 limits. Selecting a referenced target changes the inspector without moving or
 reassigning the pinned source.
 
-Use **Clear body references** to return to metadata-only Direct relations. The
+Use **Clear body references** or **Clear Link references** to return to metadata-only Direct relations. The
 overlay also clears on returning to All origins, focusing a different anchor,
 hiding/leaving Service Map, a forced refresh, scope or session changes, source
 loss or revision, snapshot generation changes, refresh failure, or disconnect.
@@ -610,6 +740,7 @@ for you.
 - `GET /api/target/service-map/evidence?session_id=<uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/body-references?session_id=<active-uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/html-generators?session_id=<active-uuid>&evidence_id=<opaque-token>`
+- `GET /api/target/service-map/link-declarations?session_id=<active-uuid>&evidence_id=<opaque-token>`
 
 ### Technology catalog negotiation
 
@@ -652,11 +783,12 @@ send no catalog header and gain no catalog option.
 
 URL-encode the opaque token as a query parameter. These endpoints use the existing
 local API access control. Service Map discovery and reads do not follow API
-redirects or add automatic retries. The GUI enforces redirect refusal on all four
-reads: metadata, exact-row evidence, URL-body references, and HTML generators.
+redirects or add automatic retries. The GUI enforces redirect refusal on all five
+reads: metadata, exact-row evidence, URL-body references, HTML generators, and
+response Link declarations.
 A redirect fails through the existing fixed error message without following its
 destination or reading its response body. Normal metadata polling is unchanged;
-it never repeats either supplementary inspection. Refresh and inspection buttons
+it never repeats a supplementary inspection. Refresh and inspection buttons
 remain explicit ways to request another read. Discovery validates the usual
 Sniper identity; when it reads local runtime-state, it preserves that file even if it is stale or
 invalid and does not create lock or recovery files. A CLI schema describes the installed CLI; an older

@@ -463,6 +463,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_html_generators),
         )
         .route(
+            "/api/target/service-map/link-declarations",
+            get(get_target_service_map_link_declarations),
+        )
+        .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
         )
@@ -5594,6 +5598,79 @@ async fn get_target_service_map_html_generators_impl(
             query.session_id,
             query.evidence_id,
             &reason,
+        ))
+        .into_response();
+    }
+    Json(result).into_response()
+}
+
+async fn get_target_service_map_link_declarations(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<ServiceMapBodyEvidenceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid link-declarations query").into_response()
+        }
+    };
+    get_target_service_map_link_declarations_impl(
+        State(state),
+        Query(query),
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_link_declarations_impl(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> Response {
+    use crate::service_map_links::ServiceMapLinkDeclarations;
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    // This supplementary read never activates or loads a saved session, creates
+    // a session worker, or persists anything, including for inactive requests.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(ServiceMapLinkDeclarations::missing(
+            query.session_id,
+            query.evidence_id,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    let result = session
+        .store
+        .service_map_link_declarations(session.id(), &query.evidence_id)
+        .await;
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    let row_status = session
+        .store
+        .service_map_link_source_status(session.id(), &query.evidence_id)
+        .await;
+    let active = state.active_session_for_read().await;
+    let reason =
+        if !Arc::ptr_eq(&active, &session) || !state.sessions.contains_session(session.id()) {
+            Some("session_source_changed")
+        } else {
+            row_status.err()
+        };
+    if let Some(reason) = reason {
+        return Json(ServiceMapLinkDeclarations::missing(
+            query.session_id,
+            query.evidence_id,
+            reason,
         ))
         .into_response();
     }
@@ -15514,6 +15591,300 @@ mod tests {
             assert!(result.parser_stop.is_none());
             assert_eq!(result.scan_prefix_bytes, 0);
             assert_eq!(result.tag_candidates_inspected, 0);
+            drop(active);
+            drop(state);
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_rejects_inactive_without_loading_saved_data() {
+        let (state, data_dir) = test_state("sniper-service-map-link-inactive");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive body fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        // If this endpoint accidentally starts resolving saved contexts, the
+        // intentionally invalid saved snapshot cannot be loaded successfully.
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let response: serde_json::Value = response_json(
+            super::get_target_service_map_link_declarations(
+                State(state.clone()),
+                Ok(Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["available"], false);
+        assert_eq!(response["reasons"], serde_json::json!(["inactive_session"]));
+        assert!(response["observations"].as_array().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "inactive body read changed saved files");
+        let invalid = super::get_target_service_map_link_declarations(
+            State(state.clone()),
+            Ok(Query(super::ServiceMapBodyEvidenceQuery {
+                session_id: active.id(),
+                evidence_id: "invalid".into(),
+            })),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_requires_both_exact_selection_fields() {
+        let (state, data_dir) = test_state("sniper-service-map-link-query");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        let body = "<html><head><meta name='generator' content='WordPress 6.8.1'></head>";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "link",
+            "<https://docs.example.com/private?token=HIDDEN>; rel=service-doc"
+                .parse()
+                .unwrap(),
+        );
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            body.as_bytes(),
+            body.len(),
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        for query in [
+            String::new(),
+            format!("?session_id={}", active.id()),
+            format!("?evidence_id={token}"),
+            format!("?session_id=SYNTHETIC_PRIVATE_QUERY&evidence_id={token}"),
+            format!(
+                "?session_id={}&evidence_id={token}&SYNTHETIC_PRIVATE_QUERY=1",
+                active.id()
+            ),
+            format!("?session_id={}&evidence_id=invalid", active.id()),
+            format!(
+                "?session_id={}&evidence_id={token}&url=https://example.com",
+                active.id()
+            ),
+        ] {
+            let (status, response_text) = api_route_response(
+                state.clone(),
+                reqwest::Method::GET,
+                &format!("/api/target/service-map/link-declarations{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{query}");
+            assert!(!response_text.contains("SYNTHETIC_PRIVATE_QUERY"));
+        }
+        let (status, text) = api_route_response(
+            state.clone(),
+            reqwest::Method::GET,
+            &format!(
+                "/api/target/service-map/link-declarations?session_id={}&evidence_id={token}",
+                active.id()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let result: crate::service_map_links::ServiceMapLinkDeclarations =
+            serde_json::from_str(&text).unwrap();
+        assert!(result.available && result.complete);
+        assert_eq!(result.evidence_id, token);
+        assert_eq!(result.session_id, active.id());
+        assert_eq!(result.observations[0].relation, "service-doc");
+        assert_eq!(
+            result.observations[0].target_origin,
+            "https://docs.example.com"
+        );
+        assert_eq!(result.source_status, Some(200));
+        assert!(!text.contains("HIDDEN"));
+        assert!(!text.contains("<meta"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_reports_unsupported_without_a_body_read() {
+        let (state, data_dir) = test_state("sniper-service-map-link-unsupported");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        record.method = "POST".into();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/xhtml+xml".parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            b"SYNTHETIC_PRIVATE_BODY",
+            100,
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let result: serde_json::Value = response_json(
+            super::get_target_service_map_link_declarations(
+                State(state.clone()),
+                Ok(Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: active.id(),
+                    evidence_id: token,
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result["status"], "unsupported");
+        assert_eq!(result["available"], false);
+        assert_eq!(
+            result["reasons"],
+            serde_json::json!(["unsupported_source_context"])
+        );
+        assert_eq!(result["retained_header_count"], serde_json::Value::Null);
+        assert_eq!(result["source_origin"], serde_json::Value::Null);
+        assert_eq!(
+            result["counts"],
+            serde_json::to_value(crate::service_map_links::ServiceMapLinkCounts::default())
+                .unwrap()
+        );
+        assert_eq!(result["observations"], serde_json::json!([]));
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_BODY"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_discards_scanned_result_after_session_or_source_change() {
+        for change in ["session", "mutation", "deletion"] {
+            let (state, data_dir) = test_state("sniper-service-map-link-publication");
+            let active = state.active_session_for_read().await;
+            let mut record = test_replay_response_record("/html", 200);
+            record.host = "example.com".into();
+            let body = "<html><head><meta name='generator' content='Drupal 11'></head>";
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "link",
+                "<https://docs.example.com/private?token=HIDDEN>; rel=service-doc"
+                    .parse()
+                    .unwrap(),
+            );
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                body.as_bytes(),
+                body.len(),
+            ));
+            let id = record.id;
+            active.store.insert(record).await;
+            let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+                .evidence_id
+                .clone();
+            // Establish that the exact input is a successful nonempty scan.
+            let before = active
+                .store
+                .service_map_link_declarations(active.id(), &token)
+                .await;
+            assert!(before.complete);
+            assert_eq!(before.observations.len(), 1);
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = active.id();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_link_declarations_impl(
+                    State(read_state),
+                    Query(super::ServiceMapBodyEvidenceQuery {
+                        session_id,
+                        evidence_id: token,
+                    }),
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match change {
+                "session" => {
+                    state
+                        .create_session(Some("New HTML fixture".into()))
+                        .await
+                        .unwrap();
+                    "session_source_changed"
+                }
+                "mutation" => {
+                    active
+                        .store
+                        .update_record(id, |row| row.path = "/changed".into())
+                        .await
+                        .unwrap();
+                    "record_changed"
+                }
+                _ => {
+                    assert_eq!(active.store.delete_ids(&[id]).await.unwrap(), 1);
+                    "record_missing"
+                }
+            };
+            resume.send(()).unwrap();
+            let result: crate::service_map_links::ServiceMapLinkDeclarations =
+                response_json(reading.await.unwrap()).await;
+            assert!(!result.available && !result.complete, "{change}");
+            assert_eq!(result.reasons, [expected], "{change}");
+            assert!(result.observations.is_empty());
+            assert!(result.source_origin.is_none());
+            assert!(result.source_sequence.is_none());
+            assert!(result.source_started_at.is_none());
+            assert!(result.retained_header_count.is_none());
+            assert!(result.source_method.is_none() && result.source_status.is_none());
+            assert_eq!(
+                result.counts,
+                crate::service_map_links::ServiceMapLinkCounts::default()
+            );
             drop(active);
             drop(state);
             let _ = std::fs::remove_dir_all(data_dir);
