@@ -99,6 +99,11 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
             include_str!("../web/service-map.js"),
         ),
         (
+            "/app.js",
+            "application/javascript; charset=utf-8",
+            include_str!("../web/app.js"),
+        ),
+        (
             "/styles.css",
             "text/css; charset=utf-8",
             include_str!("../web/styles.css"),

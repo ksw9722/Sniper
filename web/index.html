@@ -1386,16 +1386,20 @@
           </section>
           <section class="service-map-workspace" id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab">
             <div class="service-map-toolbar">
-              <span class="service-map-mode">Origins &amp; references</span>
+              <div class="service-map-view-controls" id="serviceMapViewControls" role="group" aria-label="Service map view">
+                <button class="service-map-mode" id="serviceMapAllOrigins" type="button" aria-pressed="true">All origins</button>
+                <button class="service-map-mode" id="serviceMapDirectRelations" type="button" aria-pressed="false" title="Pin the selected origin and show only its direct metadata neighbors">Direct relations</button>
+                <button class="secondary-action hidden" id="serviceMapFocusSelection" type="button">Focus selection</button>
+              </div>
               <label class="service-map-scope"><input id="serviceMapScopeOnly" type="checkbox" /> In scope only</label>
-              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter captured origins" />
+              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
               <button class="secondary-action" id="serviceMapRefresh" type="button">Refresh</button>
             </div>
             <div class="service-map-status" id="serviceMapStatus" role="status" aria-live="polite"></div>
             <div class="service-map-content" id="serviceMapContent">
               <section class="service-map-graph" aria-label="Captured service origins">
                 <div class="service-map-viewport" id="serviceMapViewport"><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
-                <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect instruction <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer header declaration · no confirmed calls<span id="serviceMapGraphBounds"></span></div>
+                <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect instruction <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer header declaration · no confirmed calls<span id="serviceMapGraphBounds"></span><details class="service-map-bounds-details hidden" id="serviceMapBoundsDetails"><summary>Relation details</summary><p id="serviceMapGraphDiagnostics"></p></details></div>
               </section>
               <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
             </div>

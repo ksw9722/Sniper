@@ -54,14 +54,14 @@
     const previousIds = new Set(previous);
     return [...previous.filter((id) => ids.has(id)), ...[...ids].filter((id) => !previousIds.has(id)).sort()];
   }
-  function graphLayout(origins, order, previousSlots = new Map()) {
+  function graphLayout(origins, order, previousSlots = new Map(), anchor = null) {
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
     const connections = visibleOrigins.flatMap((origin) => [
       ...origin.redirects.map((redirect) => [origin.origin, redirect.target_origin]),
       ...origin.header_links.map((link) => [link.source_origin, origin.origin]),
-    ]).filter(([source, target]) => source !== target && visibleIds.has(source) && visibleIds.has(target));
+    ]).filter(([source, target]) => source !== target && visibleIds.has(source) && visibleIds.has(target) && (!anchor || source === anchor || target === anchor));
     const incoming = new Set(connections.map(([, target]) => target));
     const outgoing = new Set(connections.map(([source]) => source));
     let left = visibleOrigins.filter((origin) => outgoing.has(origin.origin) && !incoming.has(origin.origin));
@@ -77,6 +77,10 @@
         return ranks.length ? ranks.reduce((sum, rank) => sum + rank, 0) / ranks.length : 0;
       };
       left.sort((a, b) => averageTarget(a) - averageTarget(b) || a.origin.localeCompare(b.origin));
+    }
+    if (anchor) {
+      const pin = (items) => [...items.filter((origin) => origin.origin === anchor), ...items.filter((origin) => origin.origin !== anchor)];
+      left = pin(left); right = pin(right);
     }
     const preferred = new Map([...left.map((origin, row) => [origin.origin, { column: 0, row }]), ...right.map((origin, row) => [origin.origin, { column: 1, row }])]);
     const slots = new Map(visibleOrigins.filter((origin) => previousSlots.has(origin.origin)).map((origin) => [origin.origin, previousSlots.get(origin.origin)]));
@@ -100,7 +104,7 @@
       const source = positions.get(edge.source);
       const target = positions.get(edge.target);
       const key = JSON.stringify([edge.source, edge.target, edge.relationship]);
-      if (!source || !target || target === source || seen.has(key)) continue;
+      if (!source || !target || target === source || seen.has(key) || anchor && edge.source !== anchor && edge.target !== anchor) continue;
       seen.add(key);
       edgeCount += 1;
       if (edges.length >= MAX_EDGES) continue;
@@ -115,13 +119,26 @@
     }
     return { nodes: visible, edges, edgeCount, slots, width: 720, height: Math.max(400, ...visible.map((origin) => origin.y + 174)) };
   }
+  function* metadataRelations(origins) {
+    for (const origin of origins) {
+      for (const link of origin.header_links) yield {
+        sourceOrigin: link.source_origin, targetOrigin: origin.origin, capturedOrigin: origin.origin,
+        relationship: link.relationship, label: `${link.relationship === "origin_header" ? "Origin" : "Referer"} header declaration`, evidence: link.evidence[0] || "",
+      };
+      for (const redirect of origin.redirects) yield {
+        sourceOrigin: origin.origin, targetOrigin: redirect.target_origin, targetPath: redirect.target_path, capturedOrigin: origin.origin,
+        relationship: "redirect_instruction", label: "Redirect instruction", evidence: redirect.evidence[0] || "",
+      };
+    }
+  }
+  const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], redirects: [], header_links: [], references: [], referencesOmitted: 0 });
   function createController({ elements: els, getSessionId, request, document: doc = root.document }) {
     const state = {
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, page: 0, detailPage: 0,
-      historyVersion: 0, stale: false,
+      historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "",
     };
     let abort = null;
     let evidenceAbort = null;
@@ -151,7 +168,7 @@
         if (!origins.has(id)) {
           if (referenceCards >= MAX_REFERENCE_CARDS) { state.omittedGraphReferences += 1; return; }
           referenceCards += 1;
-          origins.set(id, { origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], redirects: [], header_links: [], references: [], referencesOmitted: 0 });
+          origins.set(id, referenceOrigin(id));
         }
         const item = origins.get(id);
         if (!item.captured && !item.references.some((ref) => ref.origin === source.origin && ref.label === label)) {
@@ -186,8 +203,74 @@
       const query = state.query.trim().toLowerCase();
       return graphOrigins().filter((origin) => (!state.scopeOnly || origin.in_scope || !origin.captured) && (!query || origin.origin.toLowerCase().includes(query)));
     }
+    function findOrigin(id) {
+      if (!id) return null;
+      const existing = graphOrigins().find((origin) => origin.origin === id);
+      if (existing) return existing;
+      if (state.extraOriginSnapshot === state.snapshot && state.extraOriginId === id) return state.extraOrigin;
+      // A direct neighbor can be outside the All origins reference-card budget.
+      // Its inspector still uses only loaded declarations and the usual pane caps.
+      const item = referenceOrigin(id), group = { items: [], omitted: 0 }, seen = new Set();
+      for (const relation of metadataRelations(state.snapshot?.origins || [])) {
+        if (relation.sourceOrigin !== id && relation.targetOrigin !== id) continue;
+        if (group.items.length < MAX_REFERENCE_SOURCES) group.items.push(relation); else group.omitted += 1;
+        const label = relation.relationship === "redirect_instruction" ? "Redirect instruction from" : `${relation.relationship === "origin_header" ? "Origin" : "Referer"} header on`;
+        const key = JSON.stringify([relation.capturedOrigin, label]);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (item.references.length < MAX_REFERENCE_SOURCES) item.references.push({ origin: relation.capturedOrigin, label }); else item.referencesOmitted += 1;
+      }
+      state.extraOriginSnapshot = state.snapshot; state.extraOriginId = id;
+      state.extraOrigin = group.items.length ? item : null;
+      if (group.items.length) state.relationsByOrigin.set(id, group);
+      return state.extraOrigin;
+    }
     function selectedOrigin() {
-      return graphOrigins().find((origin) => origin.origin === state.selectedOrigin) || null;
+      return findOrigin(state.selectedOrigin);
+    }
+    function directNeighborhood() {
+      if (!state.anchorOrigin || !state.snapshot) {
+        state.neighborhoodSnapshot = null; state.neighborhoodAnchor = null; state.neighborhood = null;
+        return null;
+      }
+      if (state.neighborhoodSnapshot === state.snapshot && state.neighborhoodAnchor === state.anchorOrigin) return state.neighborhood;
+      const anchor = findOrigin(state.anchorOrigin);
+      if (!anchor) return null;
+      const ids = new Set(), seen = new Set();
+      const counts = { incoming: 0, outgoing: 0, redirect_instruction: 0, origin_header: 0, referer_header: 0 };
+      for (const relation of metadataRelations(state.snapshot.origins)) {
+        const { sourceOrigin, targetOrigin, relationship } = relation;
+        if (sourceOrigin === targetOrigin || sourceOrigin !== anchor.origin && targetOrigin !== anchor.origin) continue;
+        ids.add(sourceOrigin === anchor.origin ? targetOrigin : sourceOrigin);
+        const key = JSON.stringify([sourceOrigin, targetOrigin, relationship]);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        counts[sourceOrigin === anchor.origin ? "outgoing" : "incoming"] += 1;
+        counts[relationship] += 1;
+      }
+      // Count the full loaded snapshot, not the capped relationship inspector or
+      // All origins reference cache. Only rendering is clipped to 24 cards/40 arrows.
+      const byOrigin = new Map(graphOrigins().map((origin) => [origin.origin, origin]));
+      const neighbors = [...ids].sort().map((id) => byOrigin.get(id) || referenceOrigin(id));
+      state.neighborhoodSnapshot = state.snapshot; state.neighborhoodAnchor = state.anchorOrigin;
+      state.neighborhood = { anchor, neighbors, counts, edgeCount: seen.size };
+      return state.neighborhood;
+    }
+    function setMapMode(direct) {
+      if (state.sessionId !== getSessionId()) { reset(); return; }
+      if (direct) {
+        if (state.anchorOrigin || !selectedOrigin()) return;
+        state.anchorOrigin = state.selectedOrigin;
+      } else state.anchorOrigin = null;
+      state.modeNotice = "";
+      render();
+    }
+    function focusSelection() {
+      if (state.sessionId !== getSessionId()) { reset(); return; }
+      if (!state.anchorOrigin || !selectedOrigin()) return;
+      state.anchorOrigin = state.selectedOrigin;
+      state.modeNotice = "";
+      render();
     }
     function cancelEvidence() {
       state.evidenceRequestId += 1;
@@ -204,11 +287,11 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        selectionInitialized: false, endpointIndex: null, endpointSelection: null, loading: false, error: "", page: 0, detailPage: 0, stale: false });
+        selectionInitialized: false, endpointIndex: null, endpointSelection: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "" });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
-      const item = graphOrigins().find((item) => item.origin === origin);
+      const item = findOrigin(origin);
       if (!item || endpointIndex !== null && (!Number.isSafeInteger(endpointIndex) || !item.endpoints[endpointIndex])) return;
       if (state.selectedOrigin !== origin || state.endpointIndex !== endpointIndex) cancelEvidence();
       state.selectedOrigin = origin;
@@ -249,7 +332,11 @@
           ...snapshot.origins.map((origin) => origin.origin).sort(),
           ...allOrigins.filter((origin) => !origin.captured).map((origin) => origin.origin).sort(),
         ];
-        if (!allOrigins.some((origin) => origin.origin === state.selectedOrigin)) {
+        if (state.anchorOrigin && !findOrigin(state.anchorOrigin)) {
+          state.anchorOrigin = null;
+          state.modeNotice = "Direct relations cleared: the pinned origin is absent from this snapshot.";
+        }
+        if (!findOrigin(state.selectedOrigin)) {
           cancelEvidence();
           state.selectedOrigin = state.selectionInitialized ? null : state.order[0] || null;
           state.endpointIndex = null;
@@ -341,7 +428,7 @@
         if (state.scopeOnly) status += " · In scope only";
         if (state.stale) status += " · History changed: counts are from the previous snapshot";
         if (state.loading) status += " · Refreshing…";
-        if (state.snapshot.warningCount) status += ` · ${state.snapshot.warningCount} projection warning(s)`;
+        if (state.snapshot.warningCount) status += ` · ${state.snapshot.warningCount} metadata notice(s)`;
       }
       els.status.textContent = state.error ? `${state.error}${snapshot ? ` ${status}` : ""}` : status;
       els.status.classList.toggle("service-map-error", !!state.error);
@@ -350,31 +437,79 @@
       els.panel.setAttribute("aria-busy", String(state.loading));
     }
     function renderGraph() {
-      const origins = filteredOrigins();
-      const filterKey = JSON.stringify([state.query.trim().toLowerCase(), state.scopeOnly, state.sessionId]);
-      if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
-      const layout = graphLayout(origins, state.order, state.layoutSlots);
-      state.layoutSlots = layout.slots;
       const selected = selectedOrigin();
-      const selectionNotice = !selected || layout.nodes.some((origin) => origin.origin === selected.origin) ? "" : origins.some((origin) => origin.origin === selected.origin)
+      const direct = directNeighborhood();
+      const query = state.query.trim().toLowerCase();
+      const matchingNeighbors = direct?.neighbors.filter((origin) => !query || origin.origin.toLowerCase().includes(query)) || [];
+      const origins = direct ? [direct.anchor, ...matchingNeighbors] : filteredOrigins();
+      const order = direct ? [direct.anchor.origin, ...stableOrder(state.order, matchingNeighbors)] : state.order;
+      const filterKey = JSON.stringify([query, state.scopeOnly, state.sessionId, state.anchorOrigin]);
+      if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
+      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin);
+      state.layoutSlots = layout.slots;
+      els.boundsDetails?.classList.toggle("hidden", !direct);
+      if (!direct && els.graphDiagnostics) els.graphDiagnostics.textContent = "";
+      els.mapControls?.classList.toggle("hidden", state.view === "apis");
+      els.allOrigins?.setAttribute("aria-pressed", String(!state.anchorOrigin));
+      els.directRelations?.setAttribute("aria-pressed", String(!!state.anchorOrigin));
+      if (els.directRelations) els.directRelations.disabled = !state.snapshot || !state.anchorOrigin && !selected;
+      if (els.focusSelection) {
+        els.focusSelection.classList.toggle("hidden", !state.anchorOrigin);
+        els.focusSelection.disabled = !selected || selected.origin === state.anchorOrigin;
+        els.focusSelection.title = selected ? `Pin ${selected.origin} without changing its inspector` : "Select an origin to pin it";
+      }
+      const selectionNotice = !selected || layout.nodes.some((origin) => origin.origin === selected.origin) ? ""
+        : direct && !direct.neighbors.some((origin) => origin.origin === selected.origin) ? "Selected origin is outside this direct neighborhood; inspector retained."
+        : origins.some((origin) => origin.origin === selected.origin)
         ? `Selected origin is outside the ${MAX_CARDS}-card display; inspector retained.`
-        : "Selected origin is outside this filter; inspector retained.";
+        : !direct && !graphOrigins().some((origin) => origin.origin === selected.origin) && (!query || selected.origin.toLowerCase().includes(query))
+          ? `Selected origin is outside the ${MAX_REFERENCE_CARDS}-reference-card limit; inspector retained.`
+          : "Selected origin is outside this filter; inspector retained.";
       if (!origins.length) {
         replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly ? "Change the origin filter or turn off In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
-        els.graphBounds.textContent = selectionNotice;
+        els.graphBounds.textContent = [state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
       }
       const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.relationship !== "redirect_instruction" ? "header-declaration" : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" d="${edge.path}" marker-end="url(#service-map-arrow)"><title>${escape(edge.source)} → ${escape(edge.target)} · ${escape(edge.label)} declaration</title></path>`).join("");
       const cards = layout.nodes.map((origin) => {
         const selected = origin.origin === state.selectedOrigin;
         const url = new URL(origin.origin);
-        return `<button class="service-map-card ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""}" type="button" data-service-origin="${escape(origin.origin)}" data-service-focus="origin:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
-          <span class="service-map-card-symbol" aria-hidden="true">◎</span><span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong><span class="service-map-card-scheme">${escape(url.protocol.slice(0, -1))} · ${origin.captured ? "captured origin" : "referenced origin"}</span><span class="service-map-clues">${origin.technology_clues.slice(0, 2).map((clue) => `<span title="Observed response header; not verified architecture">${escape(clue.name)} · header clue</span>`).join("")}</span><span class="service-map-card-meta">${origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : "Referenced only in this snapshot"}</span></span>
+        const pinned = origin.origin === state.anchorOrigin;
+        return `<button class="service-map-card ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""} ${pinned ? "pinned" : ""}" type="button" data-service-origin="${escape(origin.origin)}" data-service-focus="origin:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
+          <span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong><span class="service-map-card-scheme">${escape(url.protocol.slice(0, -1))} · ${pinned ? "pinned anchor" : origin.captured ? "captured origin" : "referenced origin"}</span><span class="service-map-clues">${origin.technology_clues.slice(0, 2).map((clue) => `<span title="Observed response header; not verified architecture">${escape(clue.name)} · header clue</span>`).join("")}</span><span class="service-map-card-meta">${origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : "Referenced only in this snapshot"}</span></span>
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
       }).join("");
       replace(els.canvas, `<div class="service-map-layout" style="width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}</svg>${cards}</div>`);
-      els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}`;
+      if (direct) {
+        const counts = direct.counts;
+        const queryHidden = direct.neighbors.length - matchingNeighbors.length;
+        const capOmitted = Math.max(0, matchingNeighbors.length - (MAX_CARDS - 1));
+        const incomplete = state.snapshot.snapshot.complete !== true || array(state.snapshot.snapshot.stopped_by).length > 0;
+        const outsideQuery = query && !direct.anchor.origin.toLowerCase().includes(query);
+        const summary = [
+          `${layout.nodes.length - 1} / ${direct.neighbors.length} known direct neighbors shown`,
+          `${counts.incoming} incoming / ${counts.outgoing} outgoing links`,
+          queryHidden ? `${queryHidden} hidden by query` : "",
+          capOmitted ? `${capOmitted} omitted by ${MAX_CARDS}-card cap` : "",
+          layout.edgeCount > MAX_EDGES ? `${layout.edgeCount - MAX_EDGES} arrows omitted by ${MAX_EDGES}-arrow cap` : "",
+          outsideQuery ? "Pinned anchor is outside the search query and remains visible." : "",
+          !direct.anchor.captured ? "Reference-only anchor; no captured rows shown." : "",
+          !direct.neighbors.length ? "No direct neighbors appear in loaded metadata; others may exist." : "",
+          incomplete ? "Known neighborhood is incomplete; see snapshot bounds above." : "",
+          selectionNotice,
+        ];
+        const diagnostics = [
+          `Direct relations · ${direct.neighbors.length} known direct neighbors in loaded metadata`,
+          `${layout.nodes.length - 1} shown · ${queryHidden} query-hidden · ${capOmitted} omitted by ${MAX_CARDS}-card cap (anchor included)`,
+          `Non-self distinct typed links: ${counts.incoming} incoming / ${counts.outgoing} outgoing · ${counts.redirect_instruction} redirect / ${counts.origin_header} Origin / ${counts.referer_header} Referer`,
+          `${layout.edges.length} / ${layout.edgeCount} arrows between displayed cards (cap ${MAX_EDGES}) · ${direct.edgeCount - layout.edgeCount} links outside displayed cards`,
+          "Links count distinct origin pairs and metadata types, not requests or redirect paths. Incoming and outgoing are relative to the pinned anchor; self-links are excluded.",
+          "Loaded metadata only; no transitive links or confirmed calls.",
+        ];
+        els.graphBounds.textContent = summary.filter(Boolean).join(" · ");
+        if (els.graphDiagnostics) els.graphDiagnostics.textContent = diagnostics.join(" · ");
+      } else els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
     }
     function endpointButton(endpoint, origin, index, catalog = false) {
       const method = endpoint.method;
@@ -458,6 +593,9 @@
       next?.focus();
     });
     els.refresh.addEventListener("click", () => refresh({ force: true }));
+    els.allOrigins?.addEventListener("click", () => setMapMode(false));
+    els.directRelations?.addEventListener("click", () => setMapMode(true));
+    els.focusSelection?.addEventListener("click", focusSelection);
     els.search.addEventListener("input", () => { state.query = els.search.value; state.page = 0; render(); });
     els.scope.addEventListener("change", () => {
       state.scopeOnly = els.scope.checked;

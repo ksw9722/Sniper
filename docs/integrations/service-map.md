@@ -18,9 +18,9 @@ origin, method, and path previews stay bounded; their full text remains availabl
 in accessible text and hover titles, and selected endpoint evidence shows the
 complete query-free path.
 
-The graph displays at most 24 cards and 40 arrows. It keeps at most 100 additional
-reference-only candidate cards; those cards mean no captured rows are shown in
-this snapshot, not that the origin has never been captured. Relationship and
+The graph displays at most 24 cards and 40 arrows. All origins keeps at most 100
+additional reference-only candidate cards; those cards mean no captured rows are
+shown in this snapshot, not that the origin has never been captured. Relationship and
 source lists show at most 30 rows per pane, and API lists page through 50 exact
 method/path entries at a time. These display caps are separate from server
 projection limits, and the UI reports omitted or incomplete data explicitly.
@@ -35,6 +35,35 @@ cleared when its snapshot is invalidated. Local origin search keeps the inspecto
 and labels a selected origin outside the filter or card limit. Redirect
 relationship rows include the query-free target path so different destinations
 on the same origin remain distinguishable.
+
+## Direct relations view
+
+All origins remains the default graph view. Direct relations is an optional,
+local view of the origins directly connected to a chosen anchor by loaded
+Origin/Referer declarations or redirect instructions. It does not traverse
+multiple hops or infer service calls. Selecting a different card changes the
+inspector; an explicit Focus selection action changes the pinned anchor.
+Returning to All origins keeps the inspector selection.
+
+The anchor is included before the 24-card display cap. Local origin search
+filters its neighbors while keeping the anchor visible; the view labels an
+anchor outside the search. Counts distinguish all unique loaded neighbors,
+query-hidden neighbors, card-cap omissions, and typed arrows among displayed
+cards. Multiple captured redirect paths can share one typed origin-to-origin
+arrow; their exact paths remain separate in the inspector. The compact summary
+keeps nonzero omissions visible; Relation details exposes complete typed-link
+counts, direction definitions, and display limits.
+
+Neighborhood discovery uses the full bounded metadata response, independently
+of the All origins view's reference-card cap. It cannot recover metadata omitted
+by server projection limits or retention. A reference-only anchor remains a
+metadata reference, with no observed traffic count. No loaded neighbors means
+only that this snapshot has no directly related other origins for the anchor.
+
+Mode changes, focusing, and card selection send no requests. Scope filtering
+still reads fresh retained metadata. Temporary invalidation clears displayed
+data, and a fresh result that no longer contains the anchor returns to All
+origins. A session change resets the mode and evidence immediately.
 
 ## Read through the CLI
 
