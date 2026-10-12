@@ -155,6 +155,45 @@ pub(crate) struct RetentionEnvironment {
     pub persistence_uncertain: Weak<WorkspaceDurabilityGate>,
 }
 impl RetentionEnvironment {
+    async fn operation_lock_for_current(
+        &self,
+        session: &Arc<SessionContext>,
+    ) -> Option<Arc<AsyncMutex<()>>> {
+        let (Some(registry), Some(active), Some(contexts), Some(operations)) = (
+            self.sessions.upgrade(),
+            self.active.upgrade(),
+            self.contexts.upgrade(),
+            self.operations.upgrade(),
+        ) else {
+            return None;
+        };
+        // Match activation's active -> contexts order, and release these guards
+        // before waiting for the per-session operation lock. A replaced context
+        // must not register a lock for work it no longer owns.
+        let active = active.read().await;
+        let contexts = contexts.lock().await;
+        let mut operations = operations.lock().await;
+        let current = if active.id() == session.id() {
+            Arc::ptr_eq(&active, session)
+        } else {
+            contexts
+                .get(&session.id())
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+        };
+        // Deletion publishes registry removal before pruning this same map.
+        // Checking membership under the map guard prevents a late wake from
+        // recreating the entry after teardown has already pruned it.
+        if !current || !registry.contains_session(session.id()) {
+            return None;
+        }
+        Some(
+            operations
+                .entry(session.id())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone(),
+        )
+    }
+
     async fn is_current(&self, session: &Arc<SessionContext>) -> bool {
         let (Some(registry), Some(active), Some(contexts)) = (
             self.sessions.upgrade(),
@@ -223,9 +262,16 @@ pub(crate) fn start_worker(session: &Arc<SessionContext>, environment: Retention
                 tokio::select! { _ = notify.notified() => (), _ = tokio::time::sleep_until(deadline) => () }
             } else { notify.notified().await; }
             let Some(session) = weak.upgrade() else { return; };
-            let Some(operations) = environment.operations.upgrade() else { return; };
-            let operation_lock = operations.lock().await.entry(session.id()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone();
-            drop(operations);
+            if !environment.is_current(&session).await { return; }
+            // Off is the default and must not change session-operation state.
+            // Previously trimmed records still need disk cleanup after disable.
+            if session.runtime.history_retention_policy().await.target().is_none()
+                && !session.store.retention_compaction_pending()
+            {
+                compact_after = None;
+                continue;
+            }
+            let Some(operation_lock) = environment.operation_lock_for_current(&session).await else { return; };
             loop {
                 let operation_guard = operation_lock.lock().await;
                 if !environment.is_current(&session).await { return; }
@@ -359,6 +405,228 @@ fn compaction_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestEnvironment {
+        data_dir: std::path::PathBuf,
+        sessions: Arc<SessionRegistry>,
+        active: Arc<RwLock<Arc<SessionContext>>>,
+        contexts: Arc<Contexts>,
+        operations: Arc<OperationLocks>,
+        workspace_uncertain: Arc<WorkspaceDurabilityGate>,
+        persistence_uncertain: Arc<WorkspaceDurabilityGate>,
+    }
+
+    impl TestEnvironment {
+        fn new() -> Self {
+            let data_dir = std::env::temp_dir()
+                .join(format!("sniper-retention-worker-locks-{}", Uuid::new_v4()));
+            let (sessions, active) = SessionRegistry::load_or_create(&data_dir, 100, 100).unwrap();
+            Self {
+                data_dir,
+                sessions: Arc::new(sessions),
+                active: Arc::new(RwLock::new(active)),
+                contexts: Arc::new(AsyncMutex::new(HashMap::new())),
+                operations: Arc::new(AsyncMutex::new(HashMap::new())),
+                workspace_uncertain: Arc::new(Mutex::new(HashSet::new())),
+                persistence_uncertain: Arc::new(Mutex::new(HashSet::new())),
+            }
+        }
+
+        fn environment(&self) -> RetentionEnvironment {
+            RetentionEnvironment {
+                sessions: Arc::downgrade(&self.sessions),
+                active: Arc::downgrade(&self.active),
+                contexts: Arc::downgrade(&self.contexts),
+                operations: Arc::downgrade(&self.operations),
+                workspace_uncertain: Arc::downgrade(&self.workspace_uncertain),
+                persistence_uncertain: Arc::downgrade(&self.persistence_uncertain),
+            }
+        }
+
+        async fn inactive(&self) -> Arc<SessionContext> {
+            let metadata = self
+                .sessions
+                .create_session(Some("Synthetic retention context".into()))
+                .unwrap();
+            let session = self.sessions.load_context(metadata.id).unwrap();
+            self.contexts
+                .lock()
+                .await
+                .insert(metadata.id, session.clone());
+            session
+        }
+
+        async fn cleanup(self) {
+            let data_dir = self.data_dir.clone();
+            let mut contexts = vec![Arc::downgrade(&*self.active.read().await)];
+            contexts.extend(self.contexts.lock().await.values().map(Arc::downgrade));
+            drop(self);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while contexts.iter().any(|context| context.upgrade().is_some()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn history_retention_off_wakes_leave_operation_map_untouched_until_enabled() {
+        let fixture = TestEnvironment::new();
+        let session = fixture.active.read().await.clone();
+        start_worker(&session, fixture.environment());
+        for _ in 0..8 {
+            session.store.notify_retention_work();
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture.operations.lock().await.is_empty());
+        assert_eq!(
+            session
+                .history_retention
+                .compactions_started
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        session
+            .runtime
+            .set_history_retention_policy(
+                HistoryRetentionPolicy::KeepNewest {
+                    max_entries: NonZeroU32::new(1).unwrap(),
+                },
+                1,
+            )
+            .await;
+        session.store.notify_retention_work();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.operations.lock().await.contains_key(&session.id()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(session);
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn history_retention_registration_rechecks_deletion_after_waiting_for_map() {
+        let fixture = TestEnvironment::new();
+        let session = fixture.inactive().await;
+        let environment = fixture.environment();
+        {
+            let operations = fixture.operations.lock().await;
+            let registration = environment.operation_lock_for_current(&session);
+            tokio::pin!(registration);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut registration)
+                    .await
+                    .is_err()
+            );
+            // Keep the cached Arc in place: membership must be checked again
+            // after the map wait, not only by an earlier ownership precheck.
+            fixture.sessions.delete_session(session.id()).unwrap();
+            drop(operations);
+            assert!(registration.await.is_none());
+        }
+        assert!(fixture.operations.lock().await.is_empty());
+        drop(session);
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn history_retention_stale_context_cannot_register_or_prune_replacement_lock() {
+        for existing_lock in [false, true] {
+            let fixture = TestEnvironment::new();
+            let original = fixture.inactive().await;
+            let environment = fixture.environment();
+            let previous = if existing_lock {
+                environment.operation_lock_for_current(&original).await
+            } else {
+                None
+            };
+            let replacement = fixture.sessions.load_context(original.id()).unwrap();
+            fixture
+                .contexts
+                .lock()
+                .await
+                .insert(original.id(), replacement.clone());
+            assert!(environment
+                .operation_lock_for_current(&original)
+                .await
+                .is_none());
+            assert_eq!(
+                fixture.operations.lock().await.len(),
+                usize::from(existing_lock)
+            );
+            let current = environment
+                .operation_lock_for_current(&replacement)
+                .await
+                .unwrap();
+            if let Some(previous) = previous {
+                assert!(Arc::ptr_eq(&previous, &current));
+            }
+            assert!(environment
+                .operation_lock_for_current(&original)
+                .await
+                .is_none());
+            assert!(Arc::ptr_eq(
+                &current,
+                fixture.operations.lock().await.get(&original.id()).unwrap()
+            ));
+            fixture.contexts.lock().await.remove(&original.id());
+            assert!(environment
+                .operation_lock_for_current(&replacement)
+                .await
+                .is_none());
+            assert!(Arc::ptr_eq(
+                &current,
+                fixture.operations.lock().await.get(&original.id()).unwrap()
+            ));
+            drop(original);
+            drop(replacement);
+            fixture.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn history_retention_deleted_enabled_context_wake_does_not_recreate_lock() {
+        let fixture = TestEnvironment::new();
+        let session = fixture.inactive().await;
+        session
+            .runtime
+            .set_history_retention_policy(
+                HistoryRetentionPolicy::KeepNewest {
+                    max_entries: NonZeroU32::new(1).unwrap(),
+                },
+                1,
+            )
+            .await;
+        fixture.sessions.delete_session(session.id()).unwrap();
+        fixture.contexts.lock().await.remove(&session.id());
+        start_worker(&session, fixture.environment());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session
+                .history_retention
+                .worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(fixture.operations.lock().await.is_empty());
+        drop(session);
+        fixture.cleanup().await;
+    }
+
     #[test]
     fn history_retention_compaction_coalesces_sustained_inserts() {
         let start = tokio::time::Instant::now();
