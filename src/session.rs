@@ -4,7 +4,7 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, RwLock,
     },
     thread,
@@ -282,6 +282,32 @@ struct WorkspaceCommitGate {
     resume: mpsc::Receiver<()>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotTestPhase {
+    Prepared,
+    BeforeRename,
+    Published,
+    BeforeCleanup,
+}
+
+#[cfg(test)]
+struct SnapshotTestGate {
+    phase: SnapshotTestPhase,
+    gate: WorkspaceCommitGate,
+}
+
+#[cfg(test)]
+fn wait_snapshot_gate(gate: &mut Option<SnapshotTestGate>, phase: SnapshotTestPhase) {
+    if gate.as_ref().is_some_and(|gate| gate.phase == phase) {
+        let gate = gate.take().unwrap().gate;
+        let _ = gate.entered.send(());
+        gate.resume
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("snapshot test gate must be released");
+    }
+}
+
 pub struct SessionContext {
     id: Uuid,
     storage_dir: PathBuf,
@@ -300,9 +326,10 @@ pub struct SessionContext {
     pub oast: Arc<crate::oast::OastStore>,
     pub workspace: Arc<WorkspaceStateStore>,
     websocket_journal_tx: Option<mpsc::Sender<WebSocketJournalCommand>>,
-    metadata: RwLock<SessionMetadata>,
+    metadata: Arc<RwLock<SessionMetadata>>,
     mutation_lock: Arc<AsyncMutex<()>>,
-    persist_lock: AsyncMutex<()>,
+    persist_lock: Arc<AsyncMutex<()>>,
+    confirmed_transaction_compaction_sequence: Arc<AtomicU64>,
     /// Set while a state-only persist is already queued, so a burst of small
     /// changes costs one write instead of one write each.
     state_persist_scheduled: AtomicBool,
@@ -310,6 +337,10 @@ pub struct SessionContext {
     workspace_write_fault: std::sync::Mutex<Option<WorkspaceWriteFault>>,
     #[cfg(test)]
     workspace_commit_gate: std::sync::Mutex<Option<WorkspaceCommitGate>>,
+    #[cfg(test)]
+    snapshot_gate: std::sync::Mutex<Option<SnapshotTestGate>>,
+    #[cfg(test)]
+    snapshot_capture_gate: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl SessionContext {
@@ -452,14 +483,19 @@ impl SessionContext {
             },
             workspace: Arc::new(WorkspaceStateStore::from_snapshot(snapshot.workspace)),
             websocket_journal_tx,
-            metadata: RwLock::new(metadata),
+            metadata: Arc::new(RwLock::new(metadata)),
             mutation_lock: Arc::new(AsyncMutex::new(())),
-            persist_lock: AsyncMutex::new(()),
+            persist_lock: Arc::new(AsyncMutex::new(())),
+            confirmed_transaction_compaction_sequence: Arc::new(AtomicU64::new(0)),
             state_persist_scheduled: AtomicBool::new(false),
             #[cfg(test)]
             workspace_write_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             workspace_commit_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_capture_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -533,9 +569,27 @@ impl SessionContext {
         self.mutation_lock.clone().lock_owned().await
     }
 
+    pub(crate) async fn owned_persist_guard(&self) -> OwnedMutexGuard<()> {
+        let guard = self.persist_lock.clone().lock_owned().await;
+        // A canceled snapshot may still have an offline journal rotation queued
+        // on the blocking pool. Its store permit is the remaining filesystem
+        // lifetime guard; deletion/replacement must drain it before proceeding.
+        drop(self.store.owned_persistence_mutation_guard().await);
+        guard
+    }
+
+    /// The latest transaction boundary whose snapshot and journal cleanup both
+    /// completed. A successful metadata save alone does not establish cleanup.
+    pub fn transaction_compacted_event_sequence(&self) -> u64 {
+        self.confirmed_transaction_compaction_sequence
+            .load(Ordering::Acquire)
+    }
+
     pub async fn persist_mutation_locked(&self) -> Result<SessionMetadata> {
-        let _persist_guard = self.persist_lock.lock().await;
-        self.persist_with_workspace_snapshot_locked(self.workspace.snapshot().await)
+        let persist_guard = self.owned_persist_guard().await;
+        // A request queued behind session deletion must not recreate its root.
+        ensure_existing_private_session_dir(&self.storage_dir)?;
+        self.persist_with_workspace_snapshot_locked(self.workspace.snapshot().await, persist_guard)
             .await
     }
 
@@ -661,6 +715,13 @@ impl SessionContext {
                     // Workspace-only persistence is also safe for a read-only
                     // inactive context. Do not hydrate its unrelated journals.
                     match tokio::task::spawn_blocking(move || {
+                        ensure_existing_private_session_dir(
+                            path.parent().expect("workspace has a session root"),
+                        )
+                        .map_err(|error| JsonWriteFailure {
+                            error,
+                            committed: false,
+                        })?;
                         write_json_with_commit_status(&path, &workspace)
                     })
                     .await?
@@ -715,6 +776,12 @@ impl SessionContext {
         &self,
         workspace: &WorkspaceStateSnapshot,
     ) -> std::result::Result<(), JsonWriteFailure> {
+        ensure_existing_private_session_dir(&self.storage_dir).map_err(|error| {
+            JsonWriteFailure {
+                error,
+                committed: false,
+            }
+        })?;
         let path = workspace_path(&self.storage_dir);
         #[cfg(test)]
         {
@@ -767,6 +834,31 @@ impl SessionContext {
         (ready, resume)
     }
 
+    #[cfg(test)]
+    fn pause_next_snapshot_capture(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, ready) = oneshot::channel();
+        let (resume, release) = oneshot::channel();
+        *self.snapshot_capture_gate.lock().unwrap() = Some((entered, release));
+        (ready, resume)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_snapshot(
+        &self,
+        phase: SnapshotTestPhase,
+    ) -> (oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, ready) = oneshot::channel();
+        let (resume, release) = mpsc::channel();
+        *self.snapshot_gate.lock().unwrap() = Some(SnapshotTestGate {
+            phase,
+            gate: WorkspaceCommitGate {
+                entered,
+                resume: release,
+            },
+        });
+        (ready, resume)
+    }
+
     /// Everything in the session document except the two big journal-backed
     /// sections, which are left empty. Written on its own to `state.json` so that
     /// changing a scanner finding, an intercept queue entry or a fuzzer attack
@@ -810,18 +902,14 @@ impl SessionContext {
         let state = self
             .build_state_snapshot(self.workspace.snapshot().await)
             .await;
-        create_private_dir_all(&self.storage_dir).with_context(|| {
-            format!(
-                "failed to create session directory {}",
-                self.storage_dir.display()
-            )
-        })?;
+        ensure_existing_private_session_dir(&self.storage_dir)?;
         write_json(&state_path(&self.storage_dir), &state)
     }
 
     async fn persist_with_workspace_snapshot_locked(
         &self,
         workspace: WorkspaceStateSnapshot,
+        persist_guard: OwnedMutexGuard<()>,
     ) -> Result<SessionMetadata> {
         validate_workspace_serialized_size(&workspace)
             .map_err(anyhow::Error::msg)
@@ -841,6 +929,14 @@ impl SessionContext {
                     self.storage_dir.display()
                 )
             })?;
+        #[cfg(test)]
+        {
+            let gate = self.snapshot_capture_gate.lock().unwrap().take();
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                let _ = resume.await;
+            }
+        }
         let websockets = self
             .websockets
             .snapshot_with_frame_limit(
@@ -855,7 +951,7 @@ impl SessionContext {
         // empty at this point.
         let mut snapshot = state.clone();
         snapshot.websockets = websockets;
-        snapshot.transaction_event_sequence = self.store.latest_event_sequence();
+        snapshot.transaction_event_sequence = transactions.latest_event_sequence;
 
         let mut metadata = self
             .metadata
@@ -869,57 +965,78 @@ impl SessionContext {
         metadata.fuzzer_count = snapshot.fuzzer_attacks.len();
         metadata.rule_count = snapshot.match_replace_rules.len();
 
-        create_private_dir_all(&self.storage_dir).with_context(|| {
-            format!(
-                "failed to create session directory {}",
-                self.storage_dir.display()
-            )
-        })?;
-        // Transactions go to their own file, and snapshot.json is written without
-        // them — writing both would double the ~1.2 GB they occupy on disk. The
-        // transactions file goes first, so if this is interrupted the loader still
-        // finds the newer copy there rather than a stale one in snapshot.json.
-        //
-        // Both writes are serializing and fsyncing over a GB once a session is
-        // large, and the proxy shares this tokio runtime, so they run off it.
         let snapshot_file = snapshot_path(&self.storage_dir);
         let transactions_file = transactions_path(&self.storage_dir);
-        let source_file = transactions_file.clone();
-        let written_locators = tokio::task::spawn_blocking(move || -> Result<_> {
-            let locators =
-                write_transactions_file_streaming(&transactions_file, &source_file, &transactions)?;
+        let storage_dir = self.storage_dir.clone();
+        let store = Arc::clone(&self.store);
+        let websocket_journal_tx = self.websocket_journal_tx.clone();
+        let confirmed_compaction = Arc::clone(&self.confirmed_transaction_compaction_sequence);
+        let session_id = self.id;
+        let live_metadata = Arc::clone(&self.metadata);
+        #[cfg(test)]
+        let mut snapshot_gate = self.snapshot_gate.lock().unwrap().take();
+        // Cancellation only drops the waiter. The owned permit stays with the
+        // writer through publication and journal cleanup, so a second snapshot
+        // cannot rotate its checkpoint or replace its source underneath it.
+        let (metadata, _persist_guard) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let _persist_guard = persist_guard;
+            ensure_existing_private_session_dir(&storage_dir)?;
+            let mut prepared = prepare_transactions_file_streaming(
+                &transactions_file,
+                &transactions_file,
+                &transactions,
+            )?;
+            #[cfg(test)]
+            wait_snapshot_gate(&mut snapshot_gate, SnapshotTestPhase::Prepared);
+            invalidate_transactions_meta(&storage_dir)?;
+            let locators = prepared.locators.clone();
+            store.publish_persistence_snapshot(&transactions, locators, || {
+                #[cfg(test)]
+                wait_snapshot_gate(&mut snapshot_gate, SnapshotTestPhase::BeforeRename);
+                prepared.rename_into_place(&transactions_file)
+            })?;
+            #[cfg(test)]
+            wait_snapshot_gate(&mut snapshot_gate, SnapshotTestPhase::Published);
+            // No fallible finalization runs between replacement and publishing
+            // its locators. Even a later failure must leave readers on this file.
+            prepared.finalize(&transactions_file)?;
             write_json(&snapshot_file, &snapshot)?;
-            Ok(locators)
+            write_json(&state_path(&storage_dir), &state)?;
+            #[cfg(test)]
+            wait_snapshot_gate(&mut snapshot_gate, SnapshotTestPhase::BeforeCleanup);
+            if transactions.journal_rotation_confirmed {
+                match discard_transaction_journal_checkpoint(&storage_dir) {
+                    Ok(()) => {
+                        confirmed_compaction.fetch_max(
+                            transactions.latest_event_sequence,
+                            Ordering::Release,
+                        );
+                    }
+                    Err(error) => warn!(
+                        %error,
+                        %session_id,
+                        "failed to remove transaction journal checkpoint after writing session snapshot"
+                    ),
+                }
+            }
+            if let Some(tx) = &websocket_journal_tx {
+                if let Err(error) = clear_websocket_journal(tx) {
+                    warn!(%error, %session_id, "failed to clear websocket journal after writing session snapshot");
+                }
+            }
+            // A canceled caller must not skip live bookkeeping. Registry-owned
+            // fields may have advanced during a concurrent rename/activation.
+            let mut current = live_metadata.write().expect("session metadata lock poisoned");
+            metadata.name.clone_from(&current.name);
+            metadata.created_at = current.created_at;
+            metadata.last_opened_at = current.last_opened_at;
+            metadata.updated_at = metadata.updated_at.max(current.updated_at);
+            *current = metadata.clone();
+            drop(current);
+            Ok((metadata, _persist_guard))
         })
         .await
         .context("session snapshot writer panicked")??;
-        // Every offset just moved, so the store has to follow the new file.
-        self.store.adopt_written_locators(written_locators).await;
-        // After snapshot.json, so state.json is never the older of the two — that
-        // is what lets the loader prefer it by mtime. Both hold the same data
-        // here; a crash in between just means the loader takes snapshot.json.
-        write_json(&state_path(&self.storage_dir), &state)?;
-        if let Err(error) = discard_transaction_journal_checkpoint(&self.storage_dir) {
-            warn!(
-                %error,
-                session_id = %self.id,
-                "failed to remove transaction journal checkpoint after writing session snapshot"
-            );
-        }
-        if let Some(tx) = &self.websocket_journal_tx {
-            if let Err(error) = clear_websocket_journal(tx) {
-                warn!(
-                    %error,
-                    session_id = %self.id,
-                    "failed to clear websocket journal after writing session snapshot"
-                );
-            }
-        }
-
-        *self
-            .metadata
-            .write()
-            .expect("session metadata lock poisoned") = metadata.clone();
 
         Ok(metadata)
     }
@@ -2703,19 +2820,75 @@ fn read_transactions_file(storage_dir: &Path) -> Option<Vec<(TransactionRecord, 
 /// reopening the file once per record — 115,000 opens on a real session — and
 /// holding the whole 1.2 GB in memory to write it straight back out. Records that
 /// have not changed since the last rewrite are copied byte for byte.
-fn write_transactions_file_streaming(
+struct PreparedTransactionsFile {
+    temp: TempJsonFile,
+    locators: HashMap<Uuid, BodyLocator>,
+    metadata: Vec<(TransactionRecord, BodyLocator)>,
+    bytes: u64,
+}
+
+impl PreparedTransactionsFile {
+    /// This is the only operation allowed inside the store publication barrier.
+    /// Once rename succeeds, the caller must publish its locators before doing
+    /// anything else that can fail or wait.
+    fn rename_into_place(&mut self, path: &Path) -> io::Result<()> {
+        crate::platform::rename(&self.temp.path, path)?;
+        self.temp.commit();
+        Ok(())
+    }
+
+    fn finalize(&self, path: &Path) -> Result<()> {
+        // The private temporary file already had its permissions and contents
+        // synced. Directory durability is deliberately outside the store lock.
+        if let Some(storage_dir) = path.parent() {
+            sync_directory(storage_dir, "transactions directory")?;
+            if let Err(error) = write_transactions_meta(storage_dir, self.bytes, &self.metadata) {
+                warn!(
+                    ?error,
+                    "failed to write transaction metadata; it will be rebuilt"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Remove the old offset cache durably before replacing its body source. Length
+/// alone cannot distinguish two different snapshots of equal serialized size.
+fn invalidate_transactions_meta(storage_dir: &Path) -> Result<()> {
+    match fs::remove_file(transactions_meta_path(storage_dir)) {
+        Ok(()) => sync_directory(storage_dir, "transaction metadata invalidation directory"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A previous unlink may have succeeded while its directory sync
+            // failed. A retry must establish durable absence before replacing.
+            sync_directory(storage_dir, "transaction metadata invalidation directory")
+        }
+        Err(error) => Err(error).context("failed to invalidate previous transaction metadata"),
+    }
+}
+
+fn prepare_transactions_file_streaming(
     path: &Path,
     source: &Path,
     entries: &[(TransactionRecord, Option<BodyLocator>)],
-) -> Result<HashMap<Uuid, BodyLocator>> {
+) -> Result<PreparedTransactionsFile> {
     if let Some(parent) = path.parent() {
-        create_private_dir_all(parent)
-            .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+        // A live session directory is created by the registry, never by a stale
+        // snapshot writer that might have waited behind its deletion.
+        ensure_existing_private_session_dir(parent)?;
     }
-    let mut reader = fs::File::open(source).ok().map(BufReader::new);
+    let needs_source = entries.iter().any(|(_, locator)| locator.is_some());
+    let mut reader = if needs_source {
+        Some(BufReader::new(fs::File::open(source).context(
+            "failed to open stored transaction bodies for snapshot",
+        )?))
+    } else {
+        None
+    };
     let tmp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    let mut tmp_guard = TempJsonFile::new(tmp_path.clone());
+    let temp = TempJsonFile::new(tmp_path.clone());
     let mut locators = HashMap::with_capacity(entries.len());
+    let mut metadata = Vec::with_capacity(entries.len());
     let mut offset = 0u64;
     {
         let mut file = create_private_file(&tmp_path)
@@ -2725,31 +2898,56 @@ fn write_transactions_file_streaming(
             let mut line = Vec::new();
             for (record, locator) in entries {
                 line.clear();
-                let copied = match (locator, reader.as_mut()) {
-                    (Some(locator), Some(reader)) => {
-                        line.resize(locator.len as usize, 0);
-                        reader
-                            .seek(std::io::SeekFrom::Start(locator.offset))
-                            .and_then(|_| reader.read_exact(&mut line))
-                            .is_ok()
+                if let Some(locator) = locator {
+                    let reader = reader
+                        .as_mut()
+                        .expect("located rows require a source reader");
+                    line.resize(locator.len as usize, 0);
+                    reader
+                        .seek(std::io::SeekFrom::Start(locator.offset))
+                        .and_then(|_| reader.read_exact(&mut line))
+                        .context("failed to copy stored transaction bodies for snapshot")?;
+                    let mut full: TransactionRecord = serde_json::from_slice(&line)
+                        .context("stored transaction line is invalid")?;
+                    if full.id != record.id {
+                        bail!("stored transaction locator does not match its record");
                     }
-                    _ => false,
-                };
-                if !copied {
-                    // No locator, or the copy failed: the in-memory record is what
-                    // there is. A record with a locator always has its bodies on
-                    // disk, so this only serializes ones that still hold them.
+                    // An annotation changes without materializing the body. Its
+                    // durable line must still carry the snapshot's annotations:
+                    // the optional metadata cache cannot be their sole copy.
+                    if full.notes != record.notes
+                        || full.color_tag != record.color_tag
+                        || full.user_note != record.user_note
+                        || full.annotation_revision != record.annotation_revision
+                        || full.annotation_client_versions != record.annotation_client_versions
+                    {
+                        full.notes.clone_from(&record.notes);
+                        full.color_tag.clone_from(&record.color_tag);
+                        full.user_note.clone_from(&record.user_note);
+                        full.annotation_revision = record.annotation_revision;
+                        full.annotation_client_versions
+                            .clone_from(&record.annotation_client_versions);
+                        line = serde_json::to_vec(&full)
+                            .context("failed to serialize annotated transaction record")?;
+                    }
+                } else {
                     line = serde_json::to_vec(record)
                         .context("failed to serialize transaction record")?;
                 }
-                locators.insert(
-                    record.id,
-                    BodyLocator {
-                        offset,
-                        len: line.len() as u32,
-                    },
-                );
-                offset += line.len() as u64 + 1;
+                let locator = BodyLocator {
+                    offset,
+                    len: u32::try_from(line.len())
+                        .context("transaction line exceeds locator size")?,
+                };
+                // Entries are newest-first, matching by_id's authoritative row
+                // when old data contains repeated UUIDs.
+                locators.entry(record.id).or_insert(locator);
+                let mut lean = record.clone();
+                crate::store::strip_transaction_bodies(&mut lean);
+                metadata.push((lean, locator));
+                offset = offset
+                    .checked_add(line.len() as u64 + 1)
+                    .context("transaction snapshot size overflow")?;
                 writer.write_all(&line)?;
                 writer.write_all(b"\n")?;
             }
@@ -2760,40 +2958,28 @@ fn write_transactions_file_streaming(
         file.sync_all()
             .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
     }
-    // Windows cannot replace the destination while our copy reader holds it open.
+    // Close the old source before publication on every platform.
     drop(reader);
-    crate::platform::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "failed to rename {} to {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-    tmp_guard.commit();
-    tighten_private_file(path)
-        .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent, "transactions directory")?;
-    }
-    // The metadata file goes last: if this is interrupted it simply does not match
-    // the transactions file, and the next load rereads that instead.
+    Ok(PreparedTransactionsFile {
+        temp,
+        locators,
+        metadata,
+        bytes: offset,
+    })
+}
+
+fn write_transactions_file_streaming(
+    path: &Path,
+    source: &Path,
+    entries: &[(TransactionRecord, Option<BodyLocator>)],
+) -> Result<HashMap<Uuid, BodyLocator>> {
+    let mut prepared = prepare_transactions_file_streaming(path, source, entries)?;
     if let Some(storage_dir) = path.parent() {
-        let meta: Vec<_> = entries
-            .iter()
-            .filter_map(|(record, _)| {
-                locators
-                    .get(&record.id)
-                    .map(|locator| (record.clone(), *locator))
-            })
-            .collect();
-        if let Err(error) = write_transactions_meta(storage_dir, offset, &meta) {
-            warn!(
-                ?error,
-                "failed to write transaction metadata; it will be rebuilt"
-            );
-        }
+        invalidate_transactions_meta(storage_dir)?;
     }
-    Ok(locators)
+    prepared.rename_into_place(path)?;
+    prepared.finalize(path)?;
+    Ok(prepared.locators)
 }
 
 /// Writes the transactions file and returns where each record landed. Compaction
@@ -3090,6 +3276,63 @@ fn load_session_snapshot_with_mode(
     max_transaction_entries: usize,
     mode: SessionSnapshotLoadMode,
 ) -> Result<StoredSessionSnapshot> {
+    // Validate the storage root without changing its permissions before reading
+    // preflight files; symlink/non-directory roots must still be rejected.
+    if session_storage_metadata(storage_dir)?.is_none() {
+        bail!(
+            "session storage directory {} was not found",
+            storage_dir.display()
+        );
+    }
+    // Prepare duplicate rows and reject ambiguous journals before any writable
+    // load repairs. A rejected saved history must retain every original file.
+    let located =
+        read_transactions_meta(storage_dir).or_else(|| read_transactions_file(storage_dir));
+    let prepared_transactions = if let Some(located) = located {
+        let mut occurrences = HashMap::<Uuid, usize>::new();
+        for (record, _) in &located {
+            *occurrences.entry(record.id).or_default() += 1;
+        }
+        if occurrences.values().any(|count| *count > 1) {
+            ensure_empty_duplicate_recovery_journals(storage_dir)?;
+        }
+        let mut records = Vec::with_capacity(located.len());
+        let mut locators = HashMap::with_capacity(located.len());
+        for (record, locator) in located {
+            if occurrences[&record.id] > 1 {
+                // A by-ID locator cannot represent two different body lines.
+                // Preserve each repeated row from its own offset, without
+                // changing its identity or order. Unique IDs remain lazy.
+                let mut full = read_transaction_at(storage_dir, locator)
+                    .filter(|full| full.id == record.id)
+                    .ok_or_else(|| {
+                        anyhow!("failed to read a repeated transaction row from its stored offset")
+                    })?;
+                full.notes = record.notes;
+                full.color_tag = record.color_tag;
+                full.user_note = record.user_note;
+                full.annotation_revision = record.annotation_revision;
+                full.annotation_client_versions = record.annotation_client_versions;
+                records.push(full);
+            } else {
+                locators.insert(record.id, locator);
+                records.push(record);
+            }
+        }
+        Some((records, locators))
+    } else {
+        // Legacy inline histories need the same read-only preflight. Parse only
+        // when no standalone body file was loaded, before any repair can rename
+        // an unrelated corrupt session component.
+        if let Ok(bytes) = fs::read(snapshot_path(storage_dir)) {
+            if let Ok(legacy) = serde_json::from_slice::<StoredSessionSnapshot>(&bytes) {
+                if repeated_transaction_ids(&legacy.transactions) {
+                    ensure_empty_duplicate_recovery_journals(storage_dir)?;
+                }
+            }
+        }
+        None
+    };
     match mode {
         SessionSnapshotLoadMode::Writable => ensure_existing_private_session_dir(storage_dir)?,
         SessionSnapshotLoadMode::ReadOnly => {
@@ -3134,20 +3377,7 @@ fn load_session_snapshot_with_mode(
         Err(error) => Err(error)
             .with_context(|| format!("failed to read session snapshot {}", path.display())),
     }?;
-    // Transactions live in their own newline-delimited file so they can be parsed
-    // across cores. When it is absent — a session written before the move — they
-    // are still in snapshot.json, and the first persist migrates them.
-    // Prefer the body-less metadata file: it describes the same records at about
-    // an eighth of the bytes, so a load does not have to read the bodies at all.
-    let located =
-        read_transactions_meta(storage_dir).or_else(|| read_transactions_file(storage_dir));
-    if let Some(located) = located {
-        let mut records = Vec::with_capacity(located.len());
-        let mut locators = HashMap::with_capacity(located.len());
-        for (record, locator) in located {
-            locators.insert(record.id, locator);
-            records.push(record);
-        }
+    if let Some((records, locators)) = prepared_transactions {
         snapshot.transactions = records;
         snapshot.transaction_locators = locators;
     }
@@ -3227,6 +3457,35 @@ fn move_corrupt_session_file_aside(parent_dir: &Path, path: &Path, label: &str) 
     }
 }
 
+fn repeated_transaction_ids(records: &[TransactionRecord]) -> bool {
+    let mut ids = HashSet::with_capacity(records.len());
+    records.iter().any(|record| !ids.insert(record.id))
+}
+
+fn ensure_empty_duplicate_recovery_journals(storage_dir: &Path) -> Result<()> {
+    let journal = transaction_journal_path(storage_dir);
+    let checkpoint = transaction_journal_checkpoint_path(&journal);
+    for path in [&checkpoint, &journal] {
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .context("failed to inspect duplicate transaction recovery journal")
+            }
+        };
+        let mut byte = [0u8; 1];
+        if file
+            .read(&mut byte)
+            .context("failed to inspect duplicate transaction recovery journal")?
+            != 0
+        {
+            bail!("ambiguous transaction recovery: repeated record IDs with nonempty journal data; original files were preserved for review");
+        }
+    }
+    Ok(())
+}
+
 fn replay_transaction_journal(
     storage_dir: &Path,
     max_entries: usize,
@@ -3236,6 +3495,24 @@ fn replay_transaction_journal(
     let journal_path = transaction_journal_path(storage_dir);
     let checkpoint_path = transaction_journal_checkpoint_path(&journal_path);
     let checkpoint_consumed = checkpoint_path.exists();
+
+    if repeated_transaction_ids(&snapshot.transactions) {
+        // A by-ID replay map would silently discard older repeated rows.
+        ensure_empty_duplicate_recovery_journals(storage_dir)?;
+        normalize_snapshot_transaction_sequences(&mut snapshot.transactions);
+        return Ok(TransactionJournalReplayResult {
+            replayed_transaction_ids: HashSet::new(),
+            mutated_snapshot: false,
+            transaction_event_sequence: snapshot.transaction_event_sequence.max(
+                snapshot
+                    .transactions
+                    .iter()
+                    .map(|record| record.sequence)
+                    .max()
+                    .unwrap_or(0),
+            ),
+        });
+    }
 
     normalize_snapshot_transaction_sequences(&mut snapshot.transactions);
     let mut order = Vec::with_capacity(snapshot.transactions.len());
@@ -4194,7 +4471,9 @@ fn discard_transaction_journal_checkpoint(storage_dir: &Path) -> Result<()> {
             }
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            sync_directory(storage_dir, "transaction journal checkpoint directory")
+        }
         Err(error) => Err(error).with_context(|| {
             format!(
                 "failed to remove transaction journal checkpoint {}",
@@ -10656,5 +10935,808 @@ mod tests {
         let restored = loaded.store.snapshot(Some(10)).await;
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].host, "compact.example:443");
+    }
+    async fn snapshot_correction_fixture() -> (
+        std::path::PathBuf,
+        SessionRegistry,
+        std::sync::Arc<super::SessionContext>,
+    ) {
+        let root =
+            std::env::temp_dir().join(format!("sniper-snapshot-correction-{}", Uuid::new_v4()));
+        let (registry, session) = SessionRegistry::load_or_create(&root, 32, 32).unwrap();
+        // Restart fixtures exercise persistence only. Replayed synthetic records
+        // must bypass the existing optional passive scanner recovery path.
+        session
+            .scanner
+            .update_config(ScannerConfig {
+                enabled: false,
+                ..ScannerConfig::default()
+            })
+            .await;
+        session.persist_state_only().await.unwrap();
+        (root, registry, session)
+    }
+
+    #[tokio::test]
+    async fn snapshot_publication_preserves_late_mutations_through_second_save_and_restart() {
+        for change in [
+            "insert",
+            "update",
+            "annotation",
+            "delete",
+            "clear",
+            "same_id",
+            "replace",
+        ] {
+            let (root, registry, session) = snapshot_correction_fixture().await;
+            let record = deletion_test_record(1);
+            let id = record.id;
+            session.store.insert(record).await;
+            session.persist().await.unwrap();
+            let (entered, resume) = session.pause_next_snapshot(super::SnapshotTestPhase::Prepared);
+            let save = tokio::spawn({
+                let session = session.clone();
+                async move { session.persist().await }
+            });
+            entered.await.unwrap();
+            let mut expected_id = id;
+            let mut expected_body = "fixture request body 1".to_owned();
+            match change {
+                "insert" => {
+                    let next = deletion_test_record(2);
+                    expected_id = next.id;
+                    expected_body = next.request.body_preview.clone();
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        session.store.insert(next),
+                    )
+                    .await
+                    .expect("bulk snapshot preparation must not hold the mutation lock");
+                }
+                "update" => {
+                    session
+                        .store
+                        .update_record_durable(id, |record| {
+                            record.request.body_preview = "latest full body".into();
+                            record.request.body_size = "latest full body".len();
+                            record.duration_ms = 77;
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    expected_body = "latest full body".into();
+                }
+                "annotation" => {
+                    session
+                        .store
+                        .update_annotations_durable_with_client(
+                            id,
+                            Some(Some("yellow".into())),
+                            Some(Some("new note".into())),
+                            Some("synthetic-client".into()),
+                            Some(3),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                "delete" => {
+                    session.store.delete_ids(&[id]).await.unwrap();
+                }
+                "clear" => {
+                    session.store.delete_all().await.unwrap();
+                }
+                "same_id" => {
+                    let mut next = session.store.get(id).await.unwrap();
+                    next.request.body_preview = "same ID latest body".into();
+                    next.request.body_size = next.request.body_preview.len();
+                    expected_body = next.request.body_preview.clone();
+                    session.store.insert(next).await;
+                }
+                "replace" => {
+                    let mut next = session.store.get(id).await.unwrap();
+                    next.request.body_preview = "replacement body".into();
+                    next.request.body_size = next.request.body_preview.len();
+                    expected_body = next.request.body_preview.clone();
+                    session.store.replace_all(vec![next]).await;
+                }
+                _ => unreachable!(),
+            }
+            resume.send(()).unwrap();
+            save.await.unwrap().unwrap();
+            if change == "delete" || change == "clear" {
+                assert!(session.store.get(id).await.is_none(), "{change}");
+            } else {
+                let current = session.store.get(expected_id).await.unwrap();
+                assert_eq!(current.request.body_preview, expected_body, "{change}");
+                if change == "update" {
+                    assert_eq!(current.duration_ms, 77);
+                }
+                if change == "annotation" {
+                    assert_eq!(current.user_note.as_deref(), Some("new note"));
+                }
+            }
+            session.persist().await.unwrap();
+            let storage = session.storage_dir().to_path_buf();
+            drop(session);
+            drop(registry);
+            // The body file is authoritative even when the optional cache is rebuilt.
+            std::fs::remove_file(super::transactions_meta_path(&storage)).unwrap();
+            let (registry, loaded) = SessionRegistry::load_or_create(&root, 32, 32).unwrap();
+            if change == "delete" || change == "clear" {
+                assert!(loaded.store.get(id).await.is_none(), "{change}");
+            } else {
+                let current = loaded.store.get(expected_id).await.unwrap();
+                assert_eq!(
+                    current.request.body_preview, expected_body,
+                    "restart {change}"
+                );
+                if change == "update" {
+                    assert_eq!(current.duration_ms, 77);
+                }
+                if change == "annotation" {
+                    assert_eq!(current.user_note.as_deref(), Some("new note"));
+                    assert_eq!(current.color_tag.as_deref(), Some("yellow"));
+                    assert_eq!(
+                        current.annotation_client_versions.get("synthetic-client"),
+                        Some(&3)
+                    );
+                    assert_eq!(current.annotation_revision, 1);
+                }
+            }
+            drop(loaded);
+            drop(registry);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_failure_after_publication_keeps_live_locators_and_restart_bodies() {
+        for failed_file in ["snapshot.json", "state.json"] {
+            let (root, registry, session) = snapshot_correction_fixture().await;
+            let first = deletion_test_record(1);
+            let first_id = first.id;
+            session.store.insert(first).await;
+            session.persist().await.unwrap();
+            let newest = deletion_test_record(2);
+            let newest_id = newest.id;
+            session.store.insert(newest).await;
+            let failed_path = session.storage_dir().join(failed_file);
+            std::fs::remove_file(&failed_path).unwrap();
+            std::fs::create_dir(&failed_path).unwrap();
+            assert!(session.persist().await.is_err());
+            assert_eq!(
+                session
+                    .store
+                    .get(first_id)
+                    .await
+                    .unwrap()
+                    .request
+                    .body_preview,
+                "fixture request body 1"
+            );
+            assert_eq!(
+                session
+                    .store
+                    .get(newest_id)
+                    .await
+                    .unwrap()
+                    .request
+                    .body_preview,
+                "fixture request body 2"
+            );
+            assert!(session.transaction_journal_replay_bytes() > 0);
+            std::fs::remove_dir(failed_path).unwrap();
+            drop(session);
+            drop(registry);
+            let (registry, loaded) = SessionRegistry::load_or_create(&root, 32, 32).unwrap();
+            assert_eq!(
+                loaded
+                    .store
+                    .get(first_id)
+                    .await
+                    .unwrap()
+                    .request
+                    .body_preview,
+                "fixture request body 1"
+            );
+            assert_eq!(
+                loaded
+                    .store
+                    .get(newest_id)
+                    .await
+                    .unwrap()
+                    .request
+                    .body_preview,
+                "fixture request body 2"
+            );
+            drop(loaded);
+            drop(registry);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_canceled_waiter_keeps_serialization_and_live_metadata() {
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        session.store.insert(deletion_test_record(1)).await;
+        let (entered, resume) = session.pause_next_snapshot(super::SnapshotTestPhase::Prepared);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        session.store.insert(deletion_test_record(2)).await;
+        let (next_entered, next_resume) =
+            session.pause_next_snapshot(super::SnapshotTestPhase::Prepared);
+        let mut next = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut next)
+                .await
+                .is_err()
+        );
+        resume.send(()).unwrap();
+        next_entered.await.unwrap();
+        assert_eq!(
+            session.summary(true).request_count,
+            1,
+            "the canceled first save must publish its own metadata"
+        );
+        next_resume.send(()).unwrap();
+        next.await.unwrap().unwrap();
+        assert_eq!(session.summary(true).request_count, 2);
+        assert_eq!(
+            session.transaction_compacted_event_sequence(),
+            session.store.latest_event_sequence()
+        );
+        drop(session);
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_publication_blocks_lazy_reads_until_new_offsets_are_installed() {
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        let first = deletion_test_record(1);
+        let id = first.id;
+        session.store.insert(first).await;
+        session.persist().await.unwrap();
+        session.store.insert(deletion_test_record(2)).await;
+        let (entered, resume) = session.pause_next_snapshot(super::SnapshotTestPhase::BeforeRename);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        let mut read = tokio::spawn({
+            let session = session.clone();
+            async move { session.store.get(id).await }
+        });
+        let mut update = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .store
+                    .update_record_durable(id, |row| {
+                        row.request.body_preview = "fixture latest body".into();
+                        row.request.body_size = row.request.body_preview.len();
+                    })
+                    .await
+            }
+        });
+        let mut search = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .store
+                    .search_bodies(
+                        &crate::store::ListFilters::default(),
+                        &crate::store::BodySearchRequest {
+                            value: "fixture".into(),
+                            sides: crate::store::BodySearchSides::default(),
+                            case_sensitive: true,
+                            max_matches: 100,
+                            byte_budget: 100_000,
+                            context_bytes: 20,
+                        },
+                    )
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut read)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut update)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut search)
+                .await
+                .is_err()
+        );
+        resume.send(()).unwrap();
+        save.await.unwrap().unwrap();
+        let body = read.await.unwrap().unwrap().request.body_preview;
+        assert!(body == "fixture request body 1" || body == "fixture latest body");
+        update.await.unwrap().unwrap().unwrap();
+        let scanned = search.await.unwrap();
+        if scanned.complete {
+            assert_eq!(scanned.unsearchable, 0);
+            assert!(scanned.transactions.iter().any(|hit| hit.id == id));
+        } else {
+            // A full edit after candidate capture makes that candidate partial;
+            // it must never silently substitute another row's body.
+            assert_eq!(scanned.unsearchable, 1);
+        }
+        let latest = session
+            .store
+            .search_bodies(
+                &crate::store::ListFilters::default(),
+                &crate::store::BodySearchRequest {
+                    value: "fixture latest body".into(),
+                    sides: crate::store::BodySearchSides::default(),
+                    case_sensitive: true,
+                    max_matches: 100,
+                    byte_budget: 100_000,
+                    context_bytes: 20,
+                },
+            )
+            .await;
+        assert!(latest.complete);
+        assert_eq!(latest.unsearchable, 0);
+        assert!(latest.transactions.iter().any(|hit| hit.id == id));
+        assert_eq!(
+            session.store.get(id).await.unwrap().request.body_preview,
+            "fixture latest body"
+        );
+        drop(session);
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_missing_or_mismatched_source_fails_without_publishing_empty_bodies() {
+        for missing in [true, false] {
+            let (root, registry, session) = snapshot_correction_fixture().await;
+            let first = deletion_test_record(1);
+            let id = first.id;
+            session.store.insert(first).await;
+            session.persist().await.unwrap();
+            let path = super::transactions_path(session.storage_dir());
+            let original = std::fs::read(&path).unwrap();
+            if missing {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                let mut wrong: TransactionRecord =
+                    serde_json::from_slice(original.strip_suffix(b"\n").unwrap()).unwrap();
+                wrong.id = Uuid::new_v4();
+                let mut bytes = serde_json::to_vec(&wrong).unwrap();
+                bytes.push(b'\n');
+                std::fs::write(&path, bytes).unwrap();
+            }
+            assert!(session.persist().await.is_err());
+            if missing {
+                assert!(!path.exists());
+            }
+            std::fs::write(&path, original).unwrap();
+            assert_eq!(
+                session.store.get(id).await.unwrap().request.body_preview,
+                "fixture request body 1"
+            );
+            drop(session);
+            drop(registry);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_unreadable_same_id_insert_blocks_save_without_overwriting_source() {
+        for prepared_first in [false, true] {
+            for missing in [false, true] {
+                let (root, registry, session) = snapshot_correction_fixture().await;
+                let original = deletion_test_record(1);
+                let id = original.id;
+                session.store.insert(original).await;
+                session.persist().await.unwrap();
+                let pending = if prepared_first {
+                    let (entered, resume) =
+                        session.pause_next_snapshot(super::SnapshotTestPhase::Prepared);
+                    let save = tokio::spawn({
+                        let session = session.clone();
+                        async move { session.persist().await }
+                    });
+                    entered.await.unwrap();
+                    Some((save, resume))
+                } else {
+                    None
+                };
+                let path = super::transactions_path(session.storage_dir());
+                let damaged = if missing {
+                    std::fs::remove_file(&path).unwrap();
+                    None
+                } else {
+                    let unrelated = deletion_test_record(3);
+                    let mut bytes = serde_json::to_vec(&unrelated).unwrap();
+                    bytes.push(b'\n');
+                    std::fs::write(&path, &bytes).unwrap();
+                    Some(bytes)
+                };
+                let mut replacement = deletion_test_record(2);
+                replacement.id = id;
+                session.store.insert(replacement).await;
+                let result = if let Some((save, resume)) = pending {
+                    resume.send(()).unwrap();
+                    save.await.unwrap()
+                } else {
+                    session.persist().await
+                };
+                assert!(
+                    result.is_err(),
+                    "unresolved older body must prevent publication"
+                );
+                assert_eq!(session.store.len().await, 2);
+                assert_eq!(
+                    session.store.get(id).await.unwrap().request.body_preview,
+                    "fixture request body 2"
+                );
+                match damaged {
+                    Some(bytes) => assert_eq!(std::fs::read(&path).unwrap(), bytes),
+                    None => assert!(!path.exists()),
+                }
+                drop(session);
+                drop(registry);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_equal_length_rewrite_has_no_stale_metadata_window() {
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        let first = deletion_test_record(1);
+        let id = first.id;
+        session.store.insert(first).await;
+        session.persist().await.unwrap();
+        let before = std::fs::metadata(super::transactions_path(session.storage_dir()))
+            .unwrap()
+            .len();
+        session
+            .store
+            .update_record_durable(id, |row| {
+                row.request.body_preview = "fixture request body 2".into();
+            })
+            .await
+            .unwrap();
+        let (entered, resume) = session.pause_next_snapshot(super::SnapshotTestPhase::Published);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        assert_eq!(
+            std::fs::metadata(super::transactions_path(session.storage_dir()))
+                .unwrap()
+                .len(),
+            before
+        );
+        assert!(!super::transactions_meta_path(session.storage_dir()).exists());
+        assert_eq!(
+            session.store.get(id).await.unwrap().request.body_preview,
+            "fixture request body 2"
+        );
+        let recovered =
+            super::load_session_snapshot_read_only(session.storage_dir(), 32, 32).unwrap();
+        let row = recovered
+            .transactions
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(
+            row.request.body_preview, "fixture request body 2",
+            "crash-window load must rebuild from the published body file"
+        );
+        resume.send(()).unwrap();
+        save.await.unwrap().unwrap();
+        drop(session);
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_cleanup_failure_does_not_confirm_compaction_or_change_save_contract() {
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        session.store.insert(deletion_test_record(1)).await;
+        session.persist().await.unwrap();
+        let old_boundary = session.transaction_compacted_event_sequence();
+        session.store.insert(deletion_test_record(2)).await;
+        let (entered, resume) =
+            session.pause_next_snapshot(super::SnapshotTestPhase::BeforeCleanup);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        let checkpoint = transaction_journal_checkpoint_path(&super::transaction_journal_path(
+            session.storage_dir(),
+        ));
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        resume.send(()).unwrap();
+        assert!(save.await.unwrap().is_ok());
+        assert_eq!(session.transaction_compacted_event_sequence(), old_boundary);
+        assert_eq!(session.summary(true).request_count, 2);
+        std::fs::remove_dir(checkpoint).unwrap();
+        session.persist().await.unwrap();
+        assert_eq!(
+            session.transaction_compacted_event_sequence(),
+            session.store.latest_event_sequence()
+        );
+        drop(session);
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_cancellation_after_rotation_before_dispatch_preserves_checkpoint() {
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        let record = deletion_test_record(1);
+        let id = record.id;
+        session.store.insert(record).await;
+        let (entered, _resume) = session.pause_next_snapshot_capture();
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        assert!(session.transaction_journal_replay_bytes() > 0);
+        let next = deletion_test_record(2);
+        let next_id = next.id;
+        session.store.insert(next).await;
+        session.persist().await.unwrap();
+        drop(session);
+        drop(registry);
+        let (registry, loaded) = SessionRegistry::load_or_create(&root, 32, 32).unwrap();
+        assert_eq!(
+            loaded.store.get(id).await.unwrap().request.body_preview,
+            "fixture request body 1"
+        );
+        assert_eq!(
+            loaded
+                .store
+                .get(next_id)
+                .await
+                .unwrap()
+                .request
+                .body_preview,
+            "fixture request body 2"
+        );
+        drop(loaded);
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn snapshot_duplicate_rows_keep_order_and_distinct_bodies_across_restarts() {
+        let (root, mut registry, mut session) = snapshot_correction_fixture().await;
+        let mut first = deletion_test_record(1);
+        first.user_note = Some("older duplicate note".into());
+        first.color_tag = Some("blue".into());
+        first.annotation_revision = 8;
+        first
+            .annotation_client_versions
+            .insert("older-client".into(), 4);
+        let duplicate_id = first.id;
+        let mut second = deletion_test_record(2);
+        second.id = duplicate_id;
+        let unique = deletion_test_record(3);
+        let unique_id = unique.id;
+        session.store.insert(first).await;
+        session.store.insert(second).await;
+        session.store.insert(unique).await;
+        session
+            .store
+            .update_annotations_durable_with_client(
+                duplicate_id,
+                Some(Some("yellow".into())),
+                Some(Some("newest duplicate note".into())),
+                Some("newest-client".into()),
+                Some(7),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        session.persist().await.unwrap();
+        let storage = session.storage_dir().to_path_buf();
+        let checkpoint =
+            transaction_journal_checkpoint_path(&super::transaction_journal_path(&storage));
+        std::fs::write(checkpoint, b"").unwrap();
+        for _ in 0..3 {
+            drop(session);
+            drop(registry);
+            (registry, session) = SessionRegistry::load_or_create(&root, 32, 32).unwrap();
+            let rows = session.store.snapshot(None).await;
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                vec![unique_id, duplicate_id, duplicate_id]
+            );
+            assert_eq!(rows[1].request.body_preview, "fixture request body 2");
+            assert_eq!(rows[2].request.body_preview, "fixture request body 1");
+            assert_eq!(rows[1].user_note.as_deref(), Some("newest duplicate note"));
+            assert_eq!(rows[1].color_tag.as_deref(), Some("yellow"));
+            assert_eq!(rows[1].annotation_revision, 1);
+            assert_eq!(
+                rows[1].annotation_client_versions.get("newest-client"),
+                Some(&7)
+            );
+            assert_eq!(rows[2].user_note.as_deref(), Some("older duplicate note"));
+            assert_eq!(rows[2].color_tag.as_deref(), Some("blue"));
+            assert_eq!(rows[2].annotation_revision, 8);
+            assert_eq!(
+                rows[2].annotation_client_versions.get("older-client"),
+                Some(&4)
+            );
+            assert!(!rows[2]
+                .annotation_client_versions
+                .contains_key("newest-client"));
+            assert!(
+                rows[0].request.body_preview.is_empty(),
+                "unique rows remain lazy"
+            );
+            assert_eq!(
+                session
+                    .store
+                    .get(duplicate_id)
+                    .await
+                    .unwrap()
+                    .request
+                    .body_preview,
+                "fixture request body 2"
+            );
+            session.persist().await.unwrap();
+            let disk = super::read_transactions_file(&storage).unwrap();
+            assert_eq!(
+                disk.iter()
+                    .map(|(row, _)| row.request.body_preview.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "fixture request body 3",
+                    "fixture request body 2",
+                    "fixture request body 1"
+                ]
+            );
+        }
+        drop(session);
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_duplicate_rows_with_nonempty_journals_fail_closed_without_rewriting() {
+        for checkpoint in [false, true] {
+            let (root, registry, session) = snapshot_correction_fixture().await;
+            let first = deletion_test_record(1);
+            let id = first.id;
+            let mut second = deletion_test_record(2);
+            second.id = id;
+            session.store.insert(first).await;
+            session.store.insert(second).await;
+            session.persist().await.unwrap();
+            let session_id = session.id();
+            let storage = session.storage_dir().to_path_buf();
+            drop(session);
+            let journal = super::transaction_journal_path(&storage);
+            let delta = if checkpoint {
+                transaction_journal_checkpoint_path(&journal)
+            } else {
+                journal
+            };
+            let bytes =
+                deletion_journal_bytes(&[TransactionJournalEntry::Delete { ids: vec![id] }]);
+            std::fs::write(&delta, &bytes).unwrap();
+            let original = std::fs::read(super::transactions_path(&storage)).unwrap();
+            let error = registry
+                .load_context(session_id)
+                .err()
+                .expect("ambiguous journal must be rejected");
+            assert!(error.to_string().contains("ambiguous transaction recovery"));
+            assert_eq!(
+                std::fs::read(super::transactions_path(&storage)).unwrap(),
+                original
+            );
+            assert_eq!(std::fs::read(&delta).unwrap(), bytes);
+            drop(registry);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_duplicate_row_source_mismatch_fails_without_rewriting() {
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        let first = deletion_test_record(1);
+        let id = first.id;
+        let mut second = deletion_test_record(2);
+        second.id = id;
+        session.store.insert(first).await;
+        session.store.insert(second).await;
+        session.store.insert(deletion_test_record(3)).await;
+        session.persist().await.unwrap();
+        let session_id = session.id();
+        let storage = session.storage_dir().to_path_buf();
+        drop(session);
+        let original = std::fs::read(super::transactions_path(&storage)).unwrap();
+        let mut meta = super::read_transactions_meta(&storage).unwrap();
+        meta[1].1 = meta[0].1;
+        super::write_transactions_meta(&storage, original.len() as u64, &meta).unwrap();
+        let meta_bytes = std::fs::read(super::transactions_meta_path(&storage)).unwrap();
+        assert!(registry.load_context(session_id).is_err());
+        assert_eq!(
+            std::fs::read(super::transactions_path(&storage)).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(super::transactions_meta_path(&storage)).unwrap(),
+            meta_bytes
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn snapshot_ambiguous_duplicate_preflight_preserves_all_session_files() {
+        fn files(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        let first = deletion_test_record(1);
+        let id = first.id;
+        let mut second = deletion_test_record(2);
+        second.id = id;
+        session.store.insert(first).await;
+        session.store.insert(second).await;
+        session.persist().await.unwrap();
+        let session_id = session.id();
+        let storage = session.storage_dir().to_path_buf();
+        drop(session);
+        std::fs::write(
+            super::transaction_journal_path(&storage),
+            deletion_journal_bytes(&[TransactionJournalEntry::Delete { ids: vec![id] }]),
+        )
+        .unwrap();
+        for path in [
+            super::snapshot_path(&storage),
+            super::state_path(&storage),
+            super::workspace_path(&storage),
+        ] {
+            std::fs::write(path, b"synthetic invalid JSON").unwrap();
+        }
+        let before = files(&storage);
+        let error = registry.load_context(session_id).err().unwrap();
+        assert!(error.to_string().contains("ambiguous transaction recovery"));
+        assert_eq!(
+            files(&storage),
+            before,
+            "preflight must precede every writable repair"
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

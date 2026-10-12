@@ -141,6 +141,13 @@ replacement even if a later finalization step fails. The original error still
 matters: visibility is not proof of crash durability, and callers must not infer
 that every failed operation was unapplied.
 
+HTTP history snapshots publish body files and their read offsets together, while
+preserving later record edits and annotations. Missing or mismatched stored
+bodies stop persistence rather than becoming empty saved bodies. Ambiguous
+repeated-ID histories with nonempty recovery journals now refuse loading and
+preserve their files for review. See [transaction snapshot safety](../persistence-safety.md)
+for cancellation, recovery, and supported session-lifecycle boundaries.
+
 Ordinary and keepalive workspace saves also retain the visible committed revision
 when finalization fails. They return HTTP 500 with
 `code: "WORKSPACE_COMMIT_UNCERTAIN"`; callers must reload before retrying. When

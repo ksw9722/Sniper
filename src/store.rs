@@ -5,13 +5,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc,
+        mpsc, Arc,
     },
     thread,
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, OwnedMutexGuard, RwLock};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -251,17 +251,48 @@ pub struct TransactionStore {
     // Sequence numbers may be reused after reloading a trimmed/cleared store.
     // Saved-data cursors expire when the underlying store is reconstructed.
     saved_cursor_generation: Uuid,
-    inner: RwLock<StoreInner>,
-    insert_lock: AsyncMutex<()>,
+    inner: Arc<RwLock<StoreInner>>,
+    insert_lock: Arc<AsyncMutex<()>>,
     events: broadcast::Sender<TransactionEvent>,
     retention_events: broadcast::Sender<()>,
     journal_tx: Option<mpsc::Sender<TransactionJournalCommand>>,
+    // Set only when startup proves no journal writer ever became ready.
+    journal_start_failed: bool,
     /// Session directory, so a record whose bodies were dropped can be read back
     /// out of transactions.ndjson. Derived from the journal path.
     storage_dir: Option<PathBuf>,
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
     next_event_sequence: AtomicU64,
+}
+
+/// A persistence plan binds its records to the journal and file versions from
+/// which they were captured. A later live mutation must never adopt its bodies.
+#[derive(Debug)]
+pub struct TransactionPersistenceSnapshot {
+    entries: Vec<(TransactionRecord, Option<crate::session::BodyLocator>)>,
+    body_generations: HashMap<Uuid, Uuid>,
+    file_generation: Uuid,
+    complete_capture: bool,
+    pub latest_event_sequence: u64,
+    pub journal_rotation_confirmed: bool,
+}
+
+impl std::ops::Deref for TransactionPersistenceSnapshot {
+    type Target = [(TransactionRecord, Option<crate::session::BodyLocator>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl IntoIterator for TransactionPersistenceSnapshot {
+    type Item = (TransactionRecord, Option<crate::session::BodyLocator>);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -356,6 +387,10 @@ enum TransactionJournalCommand {
     Rotate {
         ack: mpsc::Sender<io::Result<()>>,
     },
+    #[cfg(test)]
+    StopForTest {
+        ack: mpsc::Sender<()>,
+    },
 }
 
 #[derive(Default)]
@@ -363,6 +398,13 @@ struct StoreInner {
     /// Oldest to newest. New captures append, queries iterate in reverse.
     entries: Vec<TransactionRecord>,
     summaries: Vec<CachedSummary>,
+    // Parallel to entries, including duplicate IDs. Only annotations retain a token.
+    body_generations: Vec<Uuid>,
+    // Displaced lazy rows whose saved bodies could not be recovered. Their
+    // ordering rows remain present, but no compaction may silently erase them.
+    unresolved_body_generations: HashSet<Uuid>,
+    // Changed only after publishing a replacement transactions file.
+    file_generation: Uuid,
     by_id: HashMap<Uuid, usize>,
     /// Where a record's line sits in transactions.ndjson, for records whose bodies
     /// were dropped after loading. Bodies are read back through this rather than
@@ -402,6 +444,42 @@ pub(crate) fn strip_transaction_bodies(record: &mut TransactionRecord) {
     {
         message.body_preview = String::new();
     }
+}
+
+/// The caller holds `inner` through the complete disk read. Mutation callers
+/// propagate failure before invoking their edit closure or appending a journal.
+fn rehydrate_checked(
+    record: &TransactionRecord,
+    inner: &StoreInner,
+    storage_dir: Option<&Path>,
+) -> io::Result<TransactionRecord> {
+    let Some(locator) = inner.locators.get(&record.id).copied() else {
+        return Ok(record.clone());
+    };
+    let storage_dir = storage_dir.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "transaction body storage is unavailable",
+        )
+    })?;
+    let mut full = crate::session::read_transaction_at(storage_dir, locator).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transaction body could not be read",
+        )
+    })?;
+    if full.id != record.id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transaction body locator points to a different record",
+        ));
+    }
+    full.notes = record.notes.clone();
+    full.color_tag = record.color_tag.clone();
+    full.user_note = record.user_note.clone();
+    full.annotation_revision = record.annotation_revision;
+    full.annotation_client_versions = record.annotation_client_versions.clone();
+    Ok(full)
 }
 
 #[derive(Clone, Debug)]
@@ -510,17 +588,35 @@ impl StoreInner {
             summaries.push(CachedSummary::new(record.summary()));
             by_id.insert(record.id, index);
         }
+        let body_generations = entries.iter().map(|_| Uuid::new_v4()).collect();
         Self {
             entries,
             summaries,
+            body_generations,
+            unresolved_body_generations: HashSet::new(),
+            file_generation: Uuid::new_v4(),
             by_id,
             locators: HashMap::new(),
+        }
+    }
+
+    fn require_resolved_bodies(&self) -> io::Result<()> {
+        if self.unresolved_body_generations.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot save snapshot while a preserved transaction body dependency is unresolved",
+            ))
         }
     }
 
     fn push(&mut self, record: TransactionRecord, summary: TransactionSummary) {
         let index = self.entries.len();
         self.by_id.insert(record.id, index);
+        // Reusing an ID creates a new full record, never a view of the old body.
+        self.locators.remove(&record.id);
+        self.body_generations.push(Uuid::new_v4());
         self.entries.push(record);
         self.summaries.push(CachedSummary::new(summary));
     }
@@ -531,7 +627,10 @@ impl StoreInner {
                 !self.entries.is_empty() || !self.summaries.is_empty() || !self.by_id.is_empty();
             self.entries.clear();
             self.summaries.clear();
+            self.body_generations.clear();
+            self.unresolved_body_generations.clear();
             self.by_id.clear();
+            self.locators.clear();
             return trimmed;
         }
 
@@ -540,13 +639,18 @@ impl StoreInner {
         }
 
         let remove_count = self.entries.len().saturating_sub(max_entries);
-        for record in self.entries.drain(0..remove_count) {
-            self.by_id.remove(&record.id);
-        }
+        self.entries.drain(0..remove_count);
         self.summaries.drain(0..remove_count);
-        for index in self.by_id.values_mut() {
-            *index = index.saturating_sub(remove_count);
+        for generation in self.body_generations.drain(0..remove_count) {
+            self.unresolved_body_generations.remove(&generation);
         }
+        self.by_id = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.id, index))
+            .collect();
+        self.locators.retain(|id, _| self.by_id.contains_key(id));
         true
     }
 }
@@ -586,11 +690,12 @@ impl TransactionStore {
         let max_seq = inner.entries.iter().map(|r| r.sequence).max().unwrap_or(0);
         Self {
             saved_cursor_generation: Uuid::new_v4(),
-            inner: RwLock::new(inner),
-            insert_lock: AsyncMutex::new(()),
+            inner: Arc::new(RwLock::new(inner)),
+            insert_lock: Arc::new(AsyncMutex::new(())),
             events,
             retention_events,
             journal_tx: None,
+            journal_start_failed: false,
             storage_dir: None,
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
@@ -666,6 +771,7 @@ impl TransactionStore {
         );
         store.storage_dir = journal_path.parent().map(Path::to_path_buf);
         store.journal_tx = start_transaction_journal_writer(journal_path);
+        store.journal_start_failed = store.journal_tx.is_none();
         store
     }
 
@@ -696,6 +802,21 @@ impl TransactionStore {
         };
         let summary = record.summary();
         let mut inner = self.inner.write().await;
+        if let Some(&index) = inner.by_id.get(&record.id) {
+            // Duplicate IDs remain separate ordering rows. Before moving the
+            // authoritative ID to the new row, keep the old row self-contained.
+            if inner.locators.contains_key(&record.id) {
+                match rehydrate_checked(&inner.entries[index], &inner, self.storage_dir.as_deref())
+                {
+                    Ok(full) => inner.entries[index] = full,
+                    Err(error) => {
+                        let generation = inner.body_generations[index];
+                        inner.unresolved_body_generations.insert(generation);
+                        warn!(?error, record_id = %record.id, "could not preserve older duplicate transaction body; snapshot persistence is blocked")
+                    }
+                }
+            }
+        }
         inner.push(record, summary.clone());
         let mut retention_trimmed = false;
         if let Some(max_entries) = self.max_entries {
@@ -809,9 +930,27 @@ impl TransactionStore {
             .map_err(io::Error::other)?;
 
         let mut inner = self.inner.write().await;
+        let mut removed_generations = Vec::new();
+        let retained_generations = inner
+            .entries
+            .iter()
+            .zip(&inner.body_generations)
+            .filter_map(|(record, generation)| {
+                if selected.contains(&record.id) {
+                    removed_generations.push(*generation);
+                    None
+                } else {
+                    Some(*generation)
+                }
+            })
+            .collect();
+        for generation in removed_generations {
+            inner.unresolved_body_generations.remove(&generation);
+        }
         inner
             .entries
             .retain(|record| !selected.contains(&record.id));
+        inner.body_generations = retained_generations;
         inner
             .summaries
             .retain(|cached| !selected.contains(&cached.summary.id));
@@ -1094,16 +1233,14 @@ impl TransactionStore {
             return outcome;
         }
 
-        // Collect candidates under the lock, then let it go: the reads below are
-        // blocking file I/O and holding a read lock across them would stall every
-        // writer for the length of the scan. A rewrite in the meantime moves the
-        // offsets, and the id check in the read path turns that into a record we
-        // count as unsearchable rather than someone else's traffic.
+        // Keep the original row identity as well as ordering hints. An ID may
+        // occur more than once, so resolving every candidate through by_id would
+        // scan the newest duplicate repeatedly and omit older bodies.
         struct Candidate {
             id: Uuid,
-            sequence: u64,
-            locator: Option<crate::session::BodyLocator>,
-            in_memory: Option<TransactionRecord>,
+            index: usize,
+            body_generation: Uuid,
+            sort_offset: u64,
         }
         let candidates: Vec<Candidate> = {
             let inner = self.inner.read().await;
@@ -1150,17 +1287,14 @@ impl TransactionStore {
                 })
                 .map(|(index, cached)| {
                     let id = cached.summary.id;
-                    let locator = inner.locators.get(&id).copied();
                     Candidate {
                         id,
-                        sequence: cached.summary.sequence,
-                        locator,
-                        // Anything captured since the last persist still holds its
-                        // bodies here, and has no locator to read them back from.
-                        in_memory: if locator.is_none() {
-                            inner.entries.get(index).cloned()
+                        index,
+                        body_generation: inner.body_generations[index],
+                        sort_offset: if inner.by_id.get(&id) == Some(&index) {
+                            inner.locators.get(&id).map_or(0, |locator| locator.offset)
                         } else {
-                            None
+                            0
                         },
                     }
                 })
@@ -1171,11 +1305,12 @@ impl TransactionStore {
         // The reads are blocking file I/O over as much as the byte budget allows,
         // which is far too long to hold a runtime worker that proxy tasks share.
         let storage_dir = self.storage_dir.clone();
+        let inner = Arc::clone(&self.inner);
         let request = request.clone();
         let scan = tokio::task::spawn_blocking(move || {
             // File order, so the pass over transactions.ndjson only moves forward.
             let mut ordered = candidates;
-            ordered.sort_by_key(|candidate| candidate.locator.map(|l| l.offset).unwrap_or(0));
+            ordered.sort_by_key(|candidate| candidate.sort_offset);
             for candidate in ordered {
                 if outcome.match_count >= request.max_matches {
                     outcome.stop("max_matches");
@@ -1185,21 +1320,30 @@ impl TransactionStore {
                     outcome.stop("byte_budget");
                     break;
                 }
-                let record = match (candidate.in_memory, candidate.locator, &storage_dir) {
-                    (Some(record), _, _) => record,
-                    (None, Some(locator), Some(dir)) => {
-                        match crate::session::read_transaction_at(dir, locator) {
-                            // Same reason rehydrate checks: a byte range is not a key.
-                            Some(full) if full.id == candidate.id => full,
-                            _ => {
-                                outcome.unsearchable += 1;
-                                continue;
-                            }
+                let record = {
+                    let inner = inner.blocking_read();
+                    let current = inner.entries.get(candidate.index).filter(|record| {
+                        record.id == candidate.id
+                            && inner.body_generations.get(candidate.index)
+                                == Some(&candidate.body_generation)
+                            && !inner
+                                .unresolved_body_generations
+                                .contains(&candidate.body_generation)
+                    });
+                    match current.and_then(|record| {
+                        if inner.by_id.get(&candidate.id) == Some(&candidate.index) {
+                            rehydrate_checked(record, &inner, storage_dir.as_deref()).ok()
+                        } else {
+                            // An older duplicate owns its resident body, never
+                            // the locator belonging to the newest same-ID row.
+                            Some(record.clone())
                         }
-                    }
-                    _ => {
-                        outcome.unsearchable += 1;
-                        continue;
+                    }) {
+                        Some(record) => record,
+                        None => {
+                            outcome.unsearchable += 1;
+                            continue;
+                        }
                     }
                 };
                 outcome.records_scanned += 1;
@@ -1213,13 +1357,7 @@ impl TransactionStore {
                             .map(|message| message.body_size as u64)
                             .unwrap_or(0),
                     );
-                collect_record_matches(
-                    &record,
-                    candidate.sequence,
-                    &needle,
-                    &request,
-                    &mut outcome,
-                );
+                collect_record_matches(&record, record.sequence, &needle, &request, &mut outcome);
             }
             if outcome.unsearchable > 0 {
                 outcome.complete = false;
@@ -1248,64 +1386,88 @@ impl TransactionStore {
     /// The in-memory copy carries the current annotations, which may be ahead of
     /// what is on disk, so those are kept and only the bodies come from the file.
     fn rehydrate(&self, record: &TransactionRecord, inner: &StoreInner) -> TransactionRecord {
-        let Some(locator) = inner.locators.get(&record.id).copied() else {
-            return record.clone();
-        };
-        let Some(storage_dir) = self.storage_dir.as_deref() else {
-            return record.clone();
-        };
-        let Some(mut full) = crate::session::read_transaction_at(storage_dir, locator) else {
-            warn!(record_id = %record.id, "could not read transaction bodies back from disk");
-            return record.clone();
-        };
-        // The locator is a byte range, not a key: nothing in the read path ties it
-        // to this record. A stale one that happens to land on another record's line
-        // parses cleanly, and the caller would be handed someone else's traffic with
-        // no error and no crash — the failure AGENTS.md section 5.1 warns about.
-        // Checking the id costs nothing and turns that into a missing body.
-        if full.id != record.id {
-            warn!(
-                record_id = %record.id,
-                "transaction locator pointed at a different record; serving the copy in memory"
-            );
-            return record.clone();
-        }
-        full.notes = record.notes.clone();
-        full.color_tag = record.color_tag.clone();
-        full.user_note = record.user_note.clone();
-        full.annotation_revision = record.annotation_revision;
-        full.annotation_client_versions = record.annotation_client_versions.clone();
-        full
+        rehydrate_checked(record, inner, self.storage_dir.as_deref()).unwrap_or_else(|error| {
+            warn!(?error, record_id = %record.id, "could not read transaction bodies back from disk");
+            record.clone()
+        })
     }
 
-    /// Records to write, each with where its bodies already sit on disk. The
-    /// writer copies those lines across rather than loading them, so compaction
-    /// never has to hold the whole history in memory.
+    /// Drain any detached persistence worker before changing the session's
+    /// directory lifetime. Acquire after the session persistence guard.
+    pub(crate) async fn owned_persistence_mutation_guard(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.insert_lock).lock_owned().await
+    }
+
+    /// Records, body locations and the exact journal boundary captured together.
+    /// The writer can stream existing bodies without materializing the history.
     pub async fn snapshot_for_persistence(
         &self,
         limit: Option<usize>,
-    ) -> io::Result<Vec<(TransactionRecord, Option<crate::session::BodyLocator>)>> {
-        let _insert_guard = self.insert_lock.lock().await;
+    ) -> io::Result<TransactionPersistenceSnapshot> {
+        let mut _insert_guard = self.owned_persistence_mutation_guard().await;
         let inner = self.inner.read().await;
-        if let Some(tx) = &self.journal_tx {
-            if let Err(error) = rotate_transaction_journal(tx) {
-                if error.kind() == io::ErrorKind::BrokenPipe {
-                    warn!(
-                        ?error,
-                        "transaction journal writer stopped; continuing with full snapshot"
-                    );
-                } else {
-                    return Err(error);
+        inner.require_resolved_bodies()?;
+        let journal_rotation_confirmed = match &self.journal_tx {
+            Some(tx) => match rotate_transaction_journal(tx) {
+                Ok(()) => self.storage_dir.is_some(),
+                Err(JournalRotationError::SendDisconnected) => {
+                    if let Some(storage_dir) = &self.storage_dir {
+                        // A failed send proves no receiver can still append. An
+                        // absent acknowledgement proves no such thing.
+                        _insert_guard =
+                            rotate_stopped_transaction_journal(storage_dir, _insert_guard).await?;
+                        true
+                    } else {
+                        false
+                    }
                 }
+                Err(JournalRotationError::AckLost) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "transaction journal rotation acknowledgement was lost",
+                    ));
+                }
+                Err(JournalRotationError::Writer(error)) => return Err(error),
+            },
+            None if self.journal_start_failed && self.storage_dir.is_some() => {
+                _insert_guard = rotate_stopped_transaction_journal(
+                    self.storage_dir.as_ref().unwrap(),
+                    _insert_guard,
+                )
+                .await?;
+                true
             }
+            None if self.storage_dir.is_some() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "transaction journal rotation cannot be confirmed",
+                ));
+            }
+            None => false,
+        };
+        let mut entries = Vec::new();
+        let mut body_generations = HashMap::new();
+        for index in (0..inner.entries.len())
+            .rev()
+            .take(limit.unwrap_or(usize::MAX))
+        {
+            let record = &inner.entries[index];
+            body_generations
+                .entry(record.id)
+                .or_insert(inner.body_generations[index]);
+            let locator = (inner.by_id.get(&record.id) == Some(&index))
+                .then(|| inner.locators.get(&record.id).copied())
+                .flatten();
+            entries.push((record.clone(), locator));
         }
-        Ok(snapshot_entries(&inner, limit)
-            .into_iter()
-            .map(|record| {
-                let locator = inner.locators.get(&record.id).copied();
-                (record, locator)
-            })
-            .collect())
+        Ok(TransactionPersistenceSnapshot {
+            complete_capture: entries.len() == inner.entries.len(),
+            entries,
+            body_generations,
+            file_generation: inner.file_generation,
+            latest_event_sequence: self.latest_event_sequence(),
+            journal_rotation_confirmed,
+        })
     }
 
     pub async fn update_annotations(
@@ -1377,7 +1539,7 @@ impl TransactionStore {
             // go — and with no locator the writer serialises whatever is in memory,
             // which has to be the whole record by then. Without this the update
             // survives only in memory and the journal.
-            self.rehydrate(record, &inner)
+            rehydrate_checked(record, &inner, self.storage_dir.as_deref())?
         };
         update(&mut updated_record);
         updated_record.id = id;
@@ -1415,6 +1577,7 @@ impl TransactionStore {
             return Ok(None);
         }
         inner.entries[index] = updated_record;
+        inner.body_generations[index] = Uuid::new_v4();
         inner.summaries[index] = CachedSummary::new(summary.clone());
         // Memory is now newer than the line on disk. Leaving the locator in place
         // makes the next persist copy that stale line byte for byte and throw this
@@ -1671,10 +1834,28 @@ impl TransactionStore {
             inner.trim_to_max_entries(max_entries);
         }
         let max_seq = inner.entries.iter().map(|r| r.sequence).max().unwrap_or(0);
-        *self.inner.write().await = inner;
+        let mut current = self.inner.write().await;
+        // Replacing memory does not replace the file; preserve its publication guard.
+        inner.file_generation = current.file_generation;
+        *current = inner;
+        drop(current);
         self.next_sequence.store(max_seq + 1, Ordering::Relaxed);
-        self.next_event_sequence
-            .store(max_seq + 1, Ordering::Relaxed);
+        let mut current = self.next_event_sequence.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .expect("transaction event sequence exhausted")
+                .max(max_seq + 1);
+            match self.next_event_sequence.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TransactionEvent> {
@@ -1685,10 +1866,60 @@ impl TransactionStore {
         self.retention_events.subscribe()
     }
 
-    /// Points the store at where a compaction just put each record, and drops the
-    /// bodies it no longer has to hold. Must be called after every rewrite of
-    /// transactions.ndjson: the offsets from before it are stale, and a stale
-    /// offset silently returns a different request's traffic.
+    /// Publish the prepared file and its offsets as one reader-visible change.
+    /// Call from a blocking worker. The closure must perform only the atomic
+    /// rename: successful rename cannot be followed by a fallible adoption step.
+    pub(crate) fn publish_persistence_snapshot(
+        &self,
+        snapshot: &TransactionPersistenceSnapshot,
+        mut locators: HashMap<Uuid, crate::session::BodyLocator>,
+        rename: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut inner = self.inner.blocking_write();
+        // A duplicate insertion may have discovered a missing dependency after
+        // this plan was prepared. Do not publish over the only recovery source.
+        inner.require_resolved_bodies()?;
+        if !snapshot.complete_capture {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a partial transaction snapshot cannot replace the complete file",
+            ));
+        }
+        if inner.file_generation != snapshot.file_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction snapshot source file changed before publication",
+            ));
+        }
+        if self.storage_dir.is_some() && !snapshot.journal_rotation_confirmed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction snapshot journal boundary is not confirmed",
+            ));
+        }
+        // Precompute every decision before rename. New full records keep their
+        // resident bodies; annotation-only edits retain their generation and data.
+        locators.retain(|id, _| {
+            inner.by_id.get(id).is_some_and(|&index| {
+                snapshot.body_generations.get(id) == inner.body_generations.get(index)
+            })
+        });
+        let next_file_generation = Uuid::new_v4();
+        rename()?;
+        for index in 0..inner.entries.len() {
+            let id = inner.entries[index].id;
+            if locators.contains_key(&id) && inner.by_id.get(&id) == Some(&index) {
+                strip_transaction_bodies(&mut inner.entries[index]);
+            }
+        }
+        inner.locators = locators;
+        inner.file_generation = next_file_generation;
+        Ok(())
+    }
+
+    // Synthetic fixtures may install a file written outside the production
+    // publisher. Production callers must always use the versioned barrier above.
+    #[cfg(test)]
     pub async fn adopt_written_locators(
         &self,
         mut locators: HashMap<Uuid, crate::session::BodyLocator>,
@@ -1701,6 +1932,30 @@ impl TransactionStore {
             }
         }
         inner.locators = locators;
+        inner.file_generation = Uuid::new_v4();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_mutation_locked_for_test(&self) -> bool {
+        self.insert_lock.try_lock().is_err()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_journal_writer_for_test(&mut self) -> io::Result<()> {
+        if let Some(tx) = self.journal_tx.take() {
+            let (ack, finished) = mpsc::channel();
+            if tx
+                .send(TransactionJournalCommand::StopForTest { ack })
+                .is_ok()
+            {
+                finished.recv().map_err(io::Error::other)?;
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        self.journal_tx = Some(tx);
+        self.journal_start_failed = false;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1909,6 +2164,12 @@ fn start_transaction_journal_writer(
                             return;
                         }
                     }
+                    #[cfg(test)]
+                    TransactionJournalCommand::StopForTest { ack } => {
+                        drop(file);
+                        let _ = ack.send(());
+                        return;
+                    }
                     TransactionJournalCommand::Rotate { ack } => {
                         let result = rotate_transaction_journal_file(&mut file, &journal_path);
                         if let Err(error) = &result {
@@ -1945,21 +2206,22 @@ fn start_transaction_journal_writer(
     }
 }
 
-fn rotate_transaction_journal(tx: &mpsc::Sender<TransactionJournalCommand>) -> io::Result<()> {
+#[derive(Debug)]
+enum JournalRotationError {
+    SendDisconnected,
+    AckLost,
+    Writer(io::Error),
+}
+
+fn rotate_transaction_journal(
+    tx: &mpsc::Sender<TransactionJournalCommand>,
+) -> Result<(), JournalRotationError> {
     let (ack, rx) = mpsc::channel();
     tx.send(TransactionJournalCommand::Rotate { ack })
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "transaction journal writer stopped",
-            )
-        })?;
-    rx.recv().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "transaction journal writer stopped",
-        )
-    })?
+        .map_err(|_| JournalRotationError::SendDisconnected)?;
+    rx.recv()
+        .map_err(|_| JournalRotationError::AckLost)?
+        .map_err(JournalRotationError::Writer)
 }
 
 async fn append_transaction_journal(
@@ -1983,6 +2245,22 @@ async fn append_transaction_journal(
             "transaction journal writer stopped",
         )
     })?
+}
+
+async fn rotate_stopped_transaction_journal(
+    storage_dir: &Path,
+    mutation_guard: OwnedMutexGuard<()>,
+) -> io::Result<OwnedMutexGuard<()>> {
+    let path = storage_dir.join("transactions.journal");
+    tokio::task::spawn_blocking(move || {
+        // A cancelled async waiter must not let another mutation or rotation
+        // enter while this worker still owns the journal files.
+        let mut file = open_private_append_file(&path)?;
+        rotate_transaction_journal_file(&mut file, &path)?;
+        Ok(mutation_guard)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 fn rotate_transaction_journal_file(file: &mut fs::File, journal_path: &Path) -> io::Result<()> {
@@ -4541,6 +4819,830 @@ pub(crate) mod tests {
         assert_eq!(after.sequence, before.sequence);
     }
 
+    async fn publish_fixture_snapshot(
+        store: Arc<TransactionStore>,
+        snapshot: TransactionPersistenceSnapshot,
+        storage_dir: &Path,
+    ) -> io::Result<()> {
+        let staged = storage_dir.join(format!("staged-{}", Uuid::new_v4()));
+        fs::create_dir_all(&staged)?;
+        let records: Vec<_> = snapshot.iter().map(|(record, _)| record.clone()).collect();
+        let locators =
+            crate::session::write_transactions_file_for_test_returning_locators(&staged, &records)
+                .unwrap();
+        let source = staged.join("transactions.ndjson");
+        let destination = storage_dir.join("transactions.ndjson");
+        let result = tokio::task::spawn_blocking(move || {
+            store.publish_persistence_snapshot(&snapshot, locators, || {
+                crate::platform::rename(&source, &destination)
+            })
+        })
+        .await
+        .unwrap();
+        let _ = fs::remove_dir_all(staged);
+        result
+    }
+
+    #[tokio::test]
+    async fn publication_keeps_late_updates_inserts_annotations_and_deletions() {
+        let dir = std::env::temp_dir().join(format!("sniper-publication-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let updated = record_with_bodies("example.com", "old update", "saved");
+        let annotated = record_with_bodies("example.com", "annotated body", "saved");
+        let deleted = record_with_bodies("example.com", "deleted body", "saved");
+        let reused = record_with_bodies("example.com", "old reused body", "saved");
+        let (updated_id, annotated_id, deleted_id, reused_id) =
+            (updated.id, annotated.id, deleted.id, reused.id);
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![updated, annotated, deleted, reused],
+            dir.join("transactions.journal"),
+            None,
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let captured_event = snapshot.latest_event_sequence;
+        assert!(snapshot.journal_rotation_confirmed);
+        store
+            .update_record(updated_id, |record| {
+                record.request.body_preview = "late update".into();
+                record.request.body_size = 11;
+            })
+            .await
+            .unwrap();
+        store
+            .update_annotations(
+                annotated_id,
+                Some(Some("blue".into())),
+                Some(Some("late note".into())),
+            )
+            .await
+            .unwrap();
+        store.delete_ids(&[deleted_id]).await.unwrap();
+        let inserted = record_with_bodies("example.com", "late insert", "saved");
+        let inserted_id = inserted.id;
+        store.insert(inserted).await;
+        let mut replacement = record_with_bodies("example.com", "late same id", "saved");
+        replacement.id = reused_id;
+        store.insert(replacement).await;
+        assert!(store.latest_event_sequence() > captured_event);
+
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(updated_id).await.unwrap().request.body_preview,
+            "late update"
+        );
+        assert_eq!(
+            store.get(inserted_id).await.unwrap().request.body_preview,
+            "late insert"
+        );
+        assert_eq!(
+            store.get(reused_id).await.unwrap().request.body_preview,
+            "late same id"
+        );
+        assert!(store.get(deleted_id).await.is_none());
+        let annotated = store.get(annotated_id).await.unwrap();
+        assert_eq!(annotated.request.body_preview, "annotated body");
+        assert_eq!(annotated.color_tag.as_deref(), Some("blue"));
+        assert_eq!(annotated.user_note.as_deref(), Some("late note"));
+        let inner = store.inner.read().await;
+        assert_eq!(inner.locators.len(), 1);
+        assert!(inner.locators.contains_key(&annotated_id));
+        assert!(inner.entries[inner.by_id[&annotated_id]]
+            .request
+            .body_preview
+            .is_empty());
+        drop(inner);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn duplicate_insert_unreadable_dependency_blocks_capture_and_prepared_publication() {
+        let mut failures = Vec::new();
+        for mismatched in [false, true] {
+            let dir = std::env::temp_dir()
+                .join(format!("sniper-duplicate-dependency-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let original = record_with_bodies("example.com", "original saved body", "saved");
+            let id = original.id;
+            let store = Arc::new(TransactionStore::from_records_with_journal(
+                vec![original],
+                dir.join("transactions.journal"),
+                None,
+            ));
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            publish_fixture_snapshot(store.clone(), snapshot, &dir)
+                .await
+                .unwrap();
+            let prepared = store.snapshot_for_persistence(None).await.unwrap();
+            if mismatched {
+                let other = record_with_bodies("example.com", "unrelated saved body", "saved");
+                crate::session::write_transactions_file_for_test(&dir, &[other]).unwrap();
+            } else {
+                fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            }
+            let mut replacement = record_with_bodies("example.com", "new supplied body", "saved");
+            replacement.id = id;
+            store.insert(replacement).await;
+            assert_eq!(
+                store.len().await,
+                2,
+                "same-ID ordering rows must remain present"
+            );
+            assert_eq!(
+                store.get(id).await.unwrap().request.body_preview,
+                "new supplied body"
+            );
+            let capture_rejected = store.snapshot_for_persistence(None).await.is_err();
+            let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let attempted_by_publisher = attempted.clone();
+            let publisher = store.clone();
+            let publication_rejected = tokio::task::spawn_blocking(move || {
+                publisher.publish_persistence_snapshot(
+                    &prepared,
+                    HashMap::from([(id, crate::session::BodyLocator { offset: 0, len: 1 })]),
+                    || {
+                        attempted_by_publisher.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .is_err();
+            let renamed = attempted.load(Ordering::SeqCst);
+            if !capture_rejected || !publication_rejected || renamed {
+                failures.push(format!("{} source: capture_rejected={capture_rejected}, publication_rejected={publication_rejected}, rename_attempted={renamed}", if mismatched { "mismatched" } else { "missing" }));
+            }
+            if mismatched {
+                store.replace_all(Vec::new()).await;
+            } else {
+                store.delete_ids(&[id]).await.unwrap();
+            }
+            assert!(
+                store
+                    .snapshot_for_persistence(None)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "removing all dependent rows must clear the blocker"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+        assert!(
+            failures.is_empty(),
+            "unreadable duplicate bodies must fail closed: {}",
+            failures.join("; ")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_body_search_keeps_each_ordering_rows_distinct_body() {
+        let older = record_with_bodies("example.com", "older-only-needle", "saved");
+        let mut newer = record_with_bodies("example.com", "newer-only-needle", "saved");
+        newer.id = older.id;
+        let store = TransactionStore::from_records(vec![newer, older]);
+        let older_outcome = store
+            .search_bodies(
+                &ListFilters::default(),
+                &search_request("older-only-needle"),
+            )
+            .await;
+        let newer_outcome = store
+            .search_bodies(
+                &ListFilters::default(),
+                &search_request("newer-only-needle"),
+            )
+            .await;
+        assert_eq!(
+            (older_outcome.match_count, newer_outcome.match_count),
+            (1, 1),
+            "duplicate ordering rows must search their own bodies exactly once"
+        );
+        assert!(older_outcome.complete && newer_outcome.complete);
+        assert_ne!(
+            older_outcome.transactions[0].sequence,
+            newer_outcome.transactions[0].sequence
+        );
+    }
+
+    async fn unreadable_duplicate_fixture(
+        max_entries: Option<usize>,
+    ) -> (Arc<TransactionStore>, PathBuf, TransactionRecord) {
+        let dir = std::env::temp_dir().join(format!("sniper-unresolved-row-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let original = record_with_bodies("example.com", "original saved body", "saved");
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![original.clone()],
+            dir.join("transactions.journal"),
+            max_entries,
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+        let mut replacement = record_with_bodies("example.com", "new supplied body", "saved");
+        replacement.id = original.id;
+        store.insert(replacement).await;
+        (store, dir, original)
+    }
+
+    #[tokio::test]
+    async fn unresolved_duplicate_dependency_survives_annotations_noops_and_source_restore() {
+        let (store, dir, original) = unreadable_duplicate_fixture(None).await;
+        let id = original.id;
+        store
+            .update_annotations(id, Some(Some("blue".into())), Some(Some("new note".into())))
+            .await
+            .unwrap();
+        store.update_record(id, |_| {}).await.unwrap();
+        crate::session::write_transactions_file_for_test(&dir, &[original]).unwrap();
+        let journal_before = fs::read(dir.join("transactions.journal")).unwrap();
+        let error = store.snapshot_for_persistence(None).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("preserved transaction body dependency"));
+        assert_eq!(
+            fs::read(dir.join("transactions.journal")).unwrap(),
+            journal_before,
+            "a blocked capture must not rotate the journal"
+        );
+        assert_eq!(store.len().await, 2);
+        assert_eq!(
+            store.inner.read().await.unresolved_body_generations.len(),
+            1
+        );
+        let outcome = store
+            .search_bodies(
+                &ListFilters::default(),
+                &search_request("new supplied body"),
+            )
+            .await;
+        assert_eq!(outcome.match_count, 1);
+        assert_eq!(outcome.unsearchable, 1);
+        assert!(!outcome.complete);
+        store.delete_all().await.unwrap();
+        assert!(store
+            .snapshot_for_persistence(None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .inner
+            .read()
+            .await
+            .unresolved_body_generations
+            .is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn late_retention_trim_keeps_survivor_and_new_body_during_publication() {
+        let dir = std::env::temp_dir().join(format!("sniper-late-trim-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let oldest = record_with_bodies("example.com", "trimmed body", "saved");
+        let oldest_id = oldest.id;
+        let survivor = record_with_bodies("example.com", "surviving body", "saved");
+        let survivor_id = survivor.id;
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![survivor, oldest],
+            dir.join("transactions.journal"),
+            Some(2),
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let newest = record_with_bodies("example.com", "new resident body", "saved");
+        let newest_id = newest.id;
+        store.insert(newest).await;
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        assert_eq!(store.len().await, 2);
+        assert!(store.get(oldest_id).await.is_none());
+        assert_eq!(
+            store.get(survivor_id).await.unwrap().request.body_preview,
+            "surviving body"
+        );
+        assert_eq!(
+            store.get(newest_id).await.unwrap().request.body_preview,
+            "new resident body"
+        );
+        let inner = store.inner.read().await;
+        assert!(inner.locators.contains_key(&survivor_id));
+        assert!(!inner.locators.contains_key(&oldest_id));
+        assert!(!inner.locators.contains_key(&newest_id));
+        drop(inner);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn retention_removes_only_the_discarded_duplicate_dependency() {
+        let (store, dir, original) = unreadable_duplicate_fixture(Some(1)).await;
+        assert_eq!(store.len().await, 1);
+        assert!(store
+            .inner
+            .read()
+            .await
+            .unresolved_body_generations
+            .is_empty());
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        assert_eq!(snapshot[0].0.request.body_preview, "new supplied body");
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(original.id).await.unwrap().request.body_preview,
+            "new supplied body"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn queued_body_search_never_rebinds_displaced_or_replaced_rows() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for replace_body in [false, true] {
+                let record = record_with_bodies("example.com", "original-only-needle", "saved");
+                let id = record.id;
+                let store = Arc::new(TransactionStore::from_records(vec![record]));
+                let (started_tx, started_rx) = oneshot::channel();
+                let (resume_tx, resume_rx) = mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                });
+                started_rx.await.unwrap();
+                let searching = store.clone();
+                let (queued_tx, queued_rx) = oneshot::channel();
+                let search = tokio::spawn(async move {
+                    let filters = ListFilters::default();
+                    let request = search_request("original-only-needle");
+                    let future = searching.search_bodies(&filters, &request);
+                    tokio::pin!(future);
+                    let mut queued_tx = Some(queued_tx);
+                    std::future::poll_fn(|context| {
+                        match std::future::Future::poll(future.as_mut(), context) {
+                            std::task::Poll::Pending => {
+                                if let Some(tx) = queued_tx.take() {
+                                    tx.send(()).unwrap();
+                                }
+                                std::task::Poll::Pending
+                            }
+                            ready => ready,
+                        }
+                    })
+                    .await
+                });
+                queued_rx.await.unwrap();
+                if replace_body {
+                    store
+                        .update_record(id, |record| {
+                            record.request.body_preview = "replacement-only-needle".into();
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    let mut replacement =
+                        record_with_bodies("example.com", "replacement-only-needle", "saved");
+                    replacement.id = id;
+                    store.insert(replacement).await;
+                }
+                resume_tx.send(()).unwrap();
+                blocker.await.unwrap();
+                let outcome = search.await.unwrap();
+                if replace_body {
+                    assert_eq!(outcome.match_count, 0);
+                    assert_eq!(outcome.unsearchable, 1);
+                    assert!(!outcome.complete);
+                } else {
+                    assert_eq!(outcome.match_count, 1);
+                    assert_eq!(outcome.unsearchable, 0);
+                    assert!(outcome.complete);
+                }
+                let latest = store
+                    .search_bodies(
+                        &ListFilters::default(),
+                        &search_request("replacement-only-needle"),
+                    )
+                    .await;
+                assert_eq!(latest.match_count, 1);
+                assert!(latest.complete);
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn same_id_insert_invalidates_locator_and_preserves_older_ordering_row() {
+        let dir = std::env::temp_dir().join(format!("sniper-same-id-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let record = record_with_bodies("example.com", "older body", "saved");
+        let id = record.id;
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![record],
+            dir.join("transactions.journal"),
+            None,
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        let old_generation = store.inner.read().await.body_generations[0];
+        let mut replacement = record_with_bodies("example.com", "replacement body", "saved");
+        replacement.id = id;
+        store.insert(replacement).await;
+        assert_eq!(
+            store.get(id).await.unwrap().request.body_preview,
+            "replacement body"
+        );
+        let inner = store.inner.read().await;
+        assert_eq!(inner.entries.len(), 2);
+        assert_eq!(inner.by_id[&id], 1);
+        assert!(!inner.locators.contains_key(&id));
+        assert_eq!(inner.entries[0].request.body_preview, "older body");
+        assert_eq!(inner.body_generations[0], old_generation);
+        assert_ne!(inner.body_generations[1], old_generation);
+        drop(inner);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publication_generation_survives_replace_all_and_rejects_stale_file() {
+        let record = record_with_bodies("example.com", "before", "saved");
+        let id = record.id;
+        let store = Arc::new(TransactionStore::from_records(vec![record.clone()]));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let stale_snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let old_token = snapshot.body_generations[&id];
+        store
+            .update_annotations(id, None, Some(Some("one".into())))
+            .await
+            .unwrap();
+        store
+            .update_annotations(id, None, Some(Some("two".into())))
+            .await
+            .unwrap();
+        let event_before_replace = store.latest_event_sequence();
+        let mut replacement = record;
+        replacement.request.body_preview = "after replacement".into();
+        store.replace_all(vec![replacement]).await;
+        assert!(store.latest_event_sequence() > event_before_replace);
+        assert_ne!(store.inner.read().await.body_generations[0], old_token);
+        let publisher = store.clone();
+        tokio::task::spawn_blocking(move || {
+            publisher.publish_persistence_snapshot(
+                &snapshot,
+                HashMap::from([(id, crate::session::BodyLocator { offset: 0, len: 1 })]),
+                || Ok(()),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            store.get(id).await.unwrap().request.body_preview,
+            "after replacement"
+        );
+        assert!(store.inner.read().await.locators.is_empty());
+        let file_generation = store.inner.read().await.file_generation;
+        store.replace_all(Vec::new()).await;
+        assert_eq!(store.inner.read().await.file_generation, file_generation);
+        let result = tokio::task::spawn_blocking(move || {
+            store.publish_persistence_snapshot(&stale_snapshot, HashMap::new(), || {
+                panic!("stale snapshot must not attempt rename")
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn partial_snapshot_cannot_publish_or_discard_omitted_rows() {
+        let store = Arc::new(TransactionStore::from_records(vec![
+            record_with_bodies("example.com", "first", "saved"),
+            record_with_bodies("example.com", "second", "saved"),
+        ]));
+        let snapshot = store.snapshot_for_persistence(Some(1)).await.unwrap();
+        assert_eq!(snapshot.len(), 1);
+        let generation = snapshot.file_generation;
+        let publisher = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            publisher.publish_persistence_snapshot(&snapshot, HashMap::new(), || {
+                panic!("partial snapshots must not rename the file")
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let inner = store.inner.read().await;
+        assert_eq!(inner.entries.len(), 2);
+        assert_eq!(inner.file_generation, generation);
+        assert!(inner.locators.is_empty());
+        assert!(inner
+            .entries
+            .iter()
+            .all(|record| !record.request.body_preview.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn publication_rename_error_leaves_generations_and_bodies_unchanged() {
+        let record = record_with_bodies("example.com", "resident body", "saved");
+        let id = record.id;
+        let store = Arc::new(TransactionStore::from_records(vec![record]));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let old_generation = snapshot.file_generation;
+        let publisher = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            publisher.publish_persistence_snapshot(
+                &snapshot,
+                HashMap::from([(id, crate::session::BodyLocator { offset: 0, len: 1 })]),
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic rename failure",
+                    ))
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let inner = store.inner.read().await;
+        assert_eq!(inner.file_generation, old_generation);
+        assert!(inner.locators.is_empty());
+        assert_eq!(inner.entries[0].request.body_preview, "resident body");
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatched_body_aborts_update_before_edit_or_journal() {
+        let dir = std::env::temp_dir().join(format!("sniper-missing-body-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let record = record_with_bodies("example.com", "saved body", "saved");
+        let id = record.id;
+        let other = record_with_bodies("example.com", "other body", "saved");
+        let locators = crate::session::write_transactions_file_for_test_returning_locators(
+            &dir,
+            &[other.clone()],
+        )
+        .unwrap();
+        let mut stripped = record;
+        strip_transaction_bodies(&mut stripped);
+        let store = TransactionStore::from_records_with_journal(
+            vec![stripped],
+            dir.join("transactions.journal"),
+            None,
+        );
+        store
+            .set_body_locator_for_test(id, locators[&other.id])
+            .await;
+        for remove_file in [false, true] {
+            if remove_file {
+                fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            }
+            let result = store
+                .update_record_durable(id, |_| panic!("edit must not run without its body"))
+                .await;
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert!(fs::read(dir.join("transactions.journal"))
+                .unwrap()
+                .is_empty());
+            assert!(store.inner.read().await.locators.contains_key(&id));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn body_search_resolves_current_locator_after_queued_worker_resumes() {
+        // Occupy the sole blocking worker so publication definitely occurs
+        // between candidate collection and disk access, with no timing sleeps.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("sniper-search-publication-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let mut first = record_with_bodies("example.com", "first-only-needle", "saved");
+            first.sequence = 2;
+            let mut second = record_with_bodies("example.com", "other body", "saved");
+            second.sequence = 1;
+            let old_locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &dir,
+                &[second.clone(), first.clone()],
+            )
+            .unwrap();
+            let store = Arc::new(TransactionStore::from_records_with_journal(
+                vec![first.clone(), second.clone()],
+                dir.join("transactions.journal"),
+                None,
+            ));
+            store.adopt_written_locators(old_locators).await;
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            let staged = dir.join("staged");
+            fs::create_dir_all(&staged).unwrap();
+            let new_locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &staged,
+                &[first.clone(), second],
+            )
+            .unwrap();
+            let source = staged.join("transactions.ndjson");
+            let destination = dir.join("transactions.ndjson");
+            let (started_tx, started_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let searching = store.clone();
+            let (queued_tx, queued_rx) = oneshot::channel();
+            let search = tokio::spawn(async move {
+                let filters = ListFilters::default();
+                let request = search_request("first-only-needle");
+                let future = searching.search_bodies(&filters, &request);
+                tokio::pin!(future);
+                // Poll once to enqueue its blocking scan before announcing the barrier.
+                let mut queued_tx = Some(queued_tx);
+                std::future::poll_fn(|context| {
+                    match std::future::Future::poll(future.as_mut(), context) {
+                        std::task::Poll::Pending => {
+                            if let Some(tx) = queued_tx.take() {
+                                tx.send(()).unwrap();
+                            }
+                            std::task::Poll::Pending
+                        }
+                        ready => ready,
+                    }
+                })
+                .await
+            });
+            queued_rx.await.unwrap();
+            let publisher = store.clone();
+            thread::spawn(move || {
+                publisher.publish_persistence_snapshot(&snapshot, new_locators, || {
+                    crate::platform::rename(&source, &destination)
+                })
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+            resume_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let outcome = search.await.unwrap();
+            assert!(outcome.complete);
+            assert_eq!(outcome.unsearchable, 0);
+            assert_eq!(outcome.match_count, 1);
+            assert_eq!(outcome.transactions[0].id, first.id);
+            let _ = fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn cancelled_offline_rotation_keeps_mutation_guard_until_worker_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("sniper-cancel-offline-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let record = test_record("example.com");
+            let line = encode_transaction_insert_journal_line(&record).unwrap();
+            fs::write(dir.join("transactions.journal"), &line).unwrap();
+            let mut store = TransactionStore::from_records(vec![record]);
+            store.storage_dir = Some(dir.clone());
+            let (tx, rx) = mpsc::channel();
+            drop(rx);
+            store.journal_tx = Some(tx);
+            let (started_tx, started_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let mut snapshot = Box::pin(store.snapshot_for_persistence(None));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(snapshot.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(snapshot);
+            assert!(
+                store.insert_lock.try_lock().is_err(),
+                "detached worker must own the mutation barrier"
+            );
+            resume_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let _guard =
+                tokio::time::timeout(std::time::Duration::from_secs(5), store.insert_lock.lock())
+                    .await
+                    .unwrap();
+            assert!(fs::read(dir.join("transactions.journal"))
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                fs::read(dir.join("transactions.journal.checkpoint")).unwrap(),
+                line
+            );
+            let _ = fs::remove_dir_all(dir);
+        });
+    }
+
+    #[tokio::test]
+    async fn disconnected_writer_rotates_offline_before_confirming_snapshot() {
+        let dir = std::env::temp_dir().join(format!("sniper-offline-rotate-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let record = test_record("example.com");
+        let line = encode_transaction_insert_journal_line(&record).unwrap();
+        fs::write(dir.join("transactions.journal"), &line).unwrap();
+        let mut store = TransactionStore::from_records(vec![record]);
+        store.storage_dir = Some(dir.clone());
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        store.journal_tx = Some(tx);
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        assert!(snapshot.journal_rotation_confirmed);
+        assert!(fs::read(dir.join("transactions.journal"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fs::read(dir.join("transactions.journal.checkpoint")).unwrap(),
+            line
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn lost_rotation_ack_or_writer_error_never_truncates_offline() {
+        for explicit_error in [false, true] {
+            let dir =
+                std::env::temp_dir().join(format!("sniper-uncertain-rotate-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let record = test_record("example.com");
+            let line = encode_transaction_insert_journal_line(&record).unwrap();
+            fs::write(dir.join("transactions.journal"), &line).unwrap();
+            let mut store = TransactionStore::from_records(vec![record]);
+            store.storage_dir = Some(dir.clone());
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let writer = thread::spawn(move || match rx.recv().unwrap() {
+                TransactionJournalCommand::Rotate { ack } => {
+                    if explicit_error {
+                        ack.send(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "explicit writer error",
+                        )))
+                        .unwrap();
+                    }
+                }
+                _ => panic!("expected rotation"),
+            });
+            assert!(store.snapshot_for_persistence(None).await.is_err());
+            writer.join().unwrap();
+            assert_eq!(fs::read(dir.join("transactions.journal")).unwrap(), line);
+            assert!(!dir.join("transactions.journal.checkpoint").exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_writer_startup_can_rotate_after_storage_recovers() {
+        let dir = std::env::temp_dir().join(format!("sniper-startup-rotate-{}", Uuid::new_v4()));
+        let journal = dir.join("transactions.journal");
+        fs::create_dir_all(&journal).unwrap();
+        let record = test_record("example.com");
+        let line = encode_transaction_insert_journal_line(&record).unwrap();
+        let store =
+            TransactionStore::from_records_with_journal(vec![record], journal.clone(), None);
+        assert!(store.journal_tx.is_none());
+        assert!(store.journal_start_failed);
+        fs::remove_dir(&journal).unwrap();
+        fs::write(&journal, &line).unwrap();
+        assert!(
+            store
+                .snapshot_for_persistence(None)
+                .await
+                .unwrap()
+                .journal_rotation_confirmed
+        );
+        assert!(fs::read(&journal).unwrap().is_empty());
+        assert_eq!(
+            fs::read(dir.join("transactions.journal.checkpoint")).unwrap(),
+            line
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn snapshot_for_persistence_continues_when_journal_writer_stopped() {
         let mut store =
@@ -4553,6 +5655,7 @@ pub(crate) mod tests {
 
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].0.host, "example.com");
+        assert!(!snapshot.journal_rotation_confirmed);
     }
 
     #[tokio::test]

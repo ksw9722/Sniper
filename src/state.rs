@@ -809,12 +809,19 @@ impl AppState {
             Some(session) => Some(session.owned_mutation_guard().await),
             None => None,
         };
+        // A canceled full-save waiter may have released its mutation guard while
+        // its blocking writer still owns persistence. Drain it before quarantine.
+        let persist_guard = match cached_session.as_ref() {
+            Some(session) => Some(session.owned_persist_guard().await),
+            None => None,
+        };
         let state = self.clone();
         // Waiting for either guard remains cancellable. Once persistence starts,
         // finish cache teardown before releasing them even if the caller leaves.
         tokio::spawn(async move {
             let _operation_guard = operation_guard;
             let _mutation_guard = mutation_guard;
+            let _persist_guard = persist_guard;
             let sessions = state.sessions.clone();
             let commit =
                 tokio::task::spawn_blocking(move || sessions.delete_session_with_commit_status(id))
@@ -942,12 +949,26 @@ impl AppState {
             .lock()
             .await
             .remove(&session.id());
-        {
+        let old_context = self
+            .session_contexts
+            .lock()
+            .await
+            .get(&session.id())
+            .filter(|current| !Arc::ptr_eq(current, session))
+            .cloned();
+        // Operation-serialized replacement must wait for an old context's
+        // detached snapshot writer before another context uses the same files.
+        let _old_persist_guard = match old_context.as_ref() {
+            Some(current) => Some(current.owned_persist_guard().await),
+            None => None,
+        };
+        if old_context.is_some() {
             let mut contexts = self.session_contexts.lock().await;
-            if contexts
-                .get(&session.id())
-                .is_some_and(|current| !Arc::ptr_eq(current, session))
-            {
+            if contexts.get(&session.id()).is_some_and(|current| {
+                old_context
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(current, old))
+            }) {
                 contexts.remove(&session.id());
             }
         }
@@ -5643,5 +5664,161 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+    #[tokio::test]
+    async fn snapshot_canceled_writer_blocks_session_deletion_and_cannot_recreate_root() {
+        let (root, state) = delete_commit_test_state();
+        let session = state.session().await;
+        let id = session.id();
+        state
+            .create_session(Some("Synthetic survivor".into()))
+            .await
+            .unwrap();
+        let (entered, resume) =
+            session.pause_next_snapshot(crate::session::SnapshotTestPhase::Prepared);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        let mut deletion = tokio::spawn({
+            let state = state.clone();
+            async move { state.delete_session(id).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut deletion)
+                .await
+                .is_err()
+        );
+        assert!(session.storage_dir().is_dir());
+        resume.send(()).unwrap();
+        deletion.await.unwrap().unwrap();
+        assert!(!session.storage_dir().exists());
+        assert!(session.persist().await.is_err());
+        assert!(session.persist_state_only().await.is_err());
+        assert!(
+            !session.storage_dir().exists(),
+            "queued stale persistence must not recreate deleted storage"
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_canceled_writer_blocks_different_context_eviction() {
+        let (root, state) = delete_commit_test_state();
+        let original = state.session().await;
+        let id = original.id();
+        state
+            .create_session(Some("Synthetic active".into()))
+            .await
+            .unwrap();
+        let replacement = state.sessions.load_context_read_only(id).unwrap();
+        let workspace = replacement.workspace.snapshot().await;
+        let (entered, resume) =
+            original.pause_next_snapshot(crate::session::SnapshotTestPhase::Prepared);
+        let save = tokio::spawn({
+            let original = original.clone();
+            async move { original.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        let mut replace = tokio::spawn({
+            let state = state.clone();
+            let replacement = replacement.clone();
+            async move {
+                let operation = state.session_operation_lock(id).await;
+                let _operation = operation.lock().await;
+                state
+                    .replace_workspace_state_and_persist(&replacement, workspace)
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut replace)
+                .await
+                .is_err()
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            state.session_contexts.lock().await.get(&id).unwrap(),
+            &original
+        ));
+        resume.send(()).unwrap();
+        replace.await.unwrap().unwrap();
+        assert!(!state.session_contexts.lock().await.contains_key(&id));
+        assert!(replacement.storage_dir().is_dir());
+        drop(replacement);
+        drop(original);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn snapshot_canceled_offline_rotation_blocks_deletion_until_its_worker_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (root, state) = delete_commit_test_state();
+            let metadata = state
+                .sessions
+                .create_session(Some("Synthetic offline journal".into()))
+                .unwrap();
+            let id = metadata.id;
+            let mut session = state.sessions.load_context(id).unwrap();
+            std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut session).unwrap().store)
+                .unwrap()
+                .disconnect_journal_writer_for_test()
+                .unwrap();
+            state
+                .session_contexts
+                .lock()
+                .await
+                .insert(id, session.clone());
+            let (blocked, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = blocked.send(());
+                wait.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let save = tokio::spawn({
+                let session = session.clone();
+                async move { session.persist().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !session.store.persistence_mutation_locked_for_test() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            save.abort();
+            assert!(save.await.unwrap_err().is_cancelled());
+            let mut deletion = tokio::spawn({
+                let state = state.clone();
+                async move { state.delete_session(id).await }
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut deletion)
+                    .await
+                    .is_err()
+            );
+            assert!(session.storage_dir().is_dir());
+            release.send(()).unwrap();
+            occupied.await.unwrap();
+            deletion.await.unwrap().unwrap();
+            assert!(!session.storage_dir().exists());
+            assert!(session.persist().await.is_err());
+            assert!(!session.storage_dir().exists());
+            drop(session);
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        });
     }
 }
