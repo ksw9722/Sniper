@@ -38,7 +38,10 @@
   }
   // This closed catalog mirrors the passive header extractor. Display names and
   // categories never come from arbitrary header text or describe deployed roles.
-  const TECHNOLOGY_CATALOG = new Map([
+  const TECHNOLOGY_CATALOG_VERSION = 2;
+  const TECHNOLOGY_CATALOG_HEADER = "X-Sniper-Technology-Catalog-Version";
+  const LEGACY_CATALOG_NOTICE = "Legacy server: catalog v1; additional declarations were not inspected.";
+  const TECHNOLOGY_CATALOG_V1 = new Map([
     ["nginx", ["nginx", "web_server", "nginx", ["server"]]],
     ["apache_http_server", ["Apache", "web_server", "Apache", ["server"]]],
     ["caddy", ["Caddy", "web_server", "Caddy", ["server"]]],
@@ -54,6 +57,28 @@
     ["wordpress", ["WordPress", "cms", "WordPress", ["x-generator"]]],
     ["drupal", ["Drupal", "cms", "Drupal", ["x-generator"]]],
   ]);
+  const TECHNOLOGY_CATALOG_V2 = new Map([
+    ...TECHNOLOGY_CATALOG_V1,
+    ["gunicorn", ["Gunicorn", "application_server", "gunicorn", ["server"]]],
+    ["uvicorn", ["Uvicorn", "application_server", "uvicorn", ["server"]]],
+    ["waitress", ["Waitress", "application_server", "waitress", ["server"]]],
+    ["openresty", ["OpenResty", "web_server", "openresty", ["server"]]],
+    ["litespeed", ["LiteSpeed", "web_server", "LiteSpeed", ["server"]]],
+    ["next_js", ["Next.js", "application_framework", "Next.js", ["x-powered-by"]]],
+  ]);
+  function technologyCatalogVersion(payload, requestedVersion = TECHNOLOGY_CATALOG_VERSION) {
+    if (![1, 2].includes(requestedVersion)) throw new Error("Invalid requested technology catalog version");
+    // Old servers ignore the version header. An absent marker permits only the
+    // closed v1 catalog on this response, never a retry or cached negotiation.
+    if (!Object.prototype.hasOwnProperty.call(payload, "technology_catalog_version")) return 1;
+    if (payload.technology_catalog_version !== requestedVersion) throw new Error("Invalid retained technology catalog version");
+    return requestedVersion;
+  }
+  function technologyCatalog(version) {
+    if (version === 1) return TECHNOLOGY_CATALOG_V1;
+    if (version === 2) return TECHNOLOGY_CATALOG_V2;
+    throw new Error("Invalid retained technology catalog version");
+  }
   const TECHNOLOGY_FIELDS = ["product_id", "name", "catalog_category", "reported_version", "version_status", "source", "strength", "header_name"];
   const TECHNOLOGY_CATEGORIES = { web_server: "Web server", edge_service: "Edge service", language_runtime: "Language runtime", application_server: "Application server", connector: "Connector", application_framework: "Application framework", cms: "CMS" };
   const technologyInteger = (value, max) => Number.isSafeInteger(value) && value >= 0 && value <= max;
@@ -74,8 +99,8 @@
     // proving an observation stays inside its origin's retained time window.
     return Number.isFinite(milliseconds) ? BigInt(milliseconds) * 1000000n + BigInt(fraction.padEnd(9, "0")) : null;
   }
-  function technologyBase(item) {
-    const catalog = TECHNOLOGY_CATALOG.get(item?.product_id);
+  function technologyBase(item, catalogVersion) {
+    const catalog = technologyCatalog(catalogVersion).get(item?.product_id);
     if (!catalog || item.name !== catalog[0] || item.catalog_category !== catalog[1] || !catalog[3].includes(item.header_name)
       || item.source !== "response_header" || item.strength !== "literal_declaration"
       || !["reported", "not_reported", "unsupported_format", "non_product_version"].includes(item.version_status)
@@ -90,11 +115,11 @@
     if (!Array.isArray(value) || value.length > max) invalidTechnology();
     return value;
   }
-  function normalizeRowTechnologies(value) {
+  function normalizeRowTechnologies(value, catalogVersion = 1) {
     const positions = new Set(), headers = new Map(), headerSpans = new Map();
     return technologyList(value, 8).map((item) => {
       if (!exactFields(item, [...TECHNOLOGY_FIELDS, "header_index", "product_span", "version_span", "offset_basis", "rule_id"])) invalidTechnology();
-      const base = technologyBase(item), catalog = TECHNOLOGY_CATALOG.get(item.product_id);
+      const base = technologyBase(item, catalogVersion), catalog = technologyCatalog(catalogVersion).get(item.product_id);
       const span = (value) => exactFields(value, ["start", "end"]) && technologyInteger(value.start, 4096)
         && technologyInteger(value.end, 4096) && value.start < value.end;
       const rule = `${item.header_name.replaceAll("-", "_")}.${item.product_id}.v1`;
@@ -125,11 +150,11 @@
       && [fields[1], fields[2], fields[4], fields[5]].every((field) => uuid.test(field))
       && /^(?:0|[1-9][0-9]{0,19})$/.test(fields[3]) && BigInt(fields[3]) <= 18446744073709551615n;
   }
-  function normalizeOriginTechnologies(origin, sessionId, generation) {
+  function normalizeOriginTechnologies(origin, sessionId, generation, catalogVersion) {
     const keys = new Set();
     return technologyList(origin?.technology_observations, 32).map((item) => {
       if (!exactFields(item, [...TECHNOLOGY_FIELDS, "row_count", "first_seen", "last_seen", "evidence"])) invalidTechnology();
-      const base = technologyBase(item), first = observationTime(item.first_seen), last = observationTime(item.last_seen);
+      const base = technologyBase(item, catalogVersion), first = observationTime(item.first_seen), last = observationTime(item.last_seen);
       const originFirst = observationTime(origin.first_seen), originLast = observationTime(origin.last_seen);
       if (!technologyInteger(origin.request_count, 50000) || !technologyInteger(item.row_count, origin.request_count) || !item.row_count
         || first === null || last === null || first > last
@@ -150,7 +175,7 @@
         : item.version_status === "non_product_version" ? "Reported version: unknown (non-product version)"
           : "Reported version: unknown (not reported)";
   }
-  function normalizeEvidenceObservations(row) {
+  function normalizeEvidenceObservations(row, catalogVersion) {
     const invalid = () => { throw new Error("Invalid retained source observations"); };
     const text = (value, limit) => typeof value === "string" && value.length > 0 && value.length <= limit;
     const origin = (value) => text(value, 1024) && !!safeOrigin(value);
@@ -176,7 +201,7 @@
       if (!origin(row.redirect.target_origin) || !text(row.redirect.target_path, 2048)) invalid();
       redirect = { target_origin: safeOrigin(row.redirect.target_origin), target_path: safePath(row.redirect.target_path) };
     }
-    const technology_observations = normalizeRowTechnologies(row.technology_observations);
+    const technology_observations = normalizeRowTechnologies(row.technology_observations, catalogVersion);
     if (row.technology_observations !== undefined && (row.metadata_complete !== (omitted.length === 0)
       || omitted.includes("technology_observations_limit") && technology_observations.length !== 8)
       || omitted.includes("technology_token_scan_limit") && row.metadata_complete !== false) invalidTechnology();
@@ -253,10 +278,11 @@
       candidates_scanned: payload.candidates_scanned, omitted_reference_occurrences: payload.omitted_reference_occurrences,
       capture_preview_truncated: payload.capture_preview_truncated, scan_prefix_truncated: payload.scan_prefix_truncated };
   }
-  function normalizeSnapshot(payload, sessionId) {
+  function normalizeSnapshot(payload, sessionId, requestedVersion = TECHNOLOGY_CATALOG_VERSION) {
     if (payload?.schema_version !== 1 || payload.session_id !== sessionId || !payload.snapshot || !Array.isArray(payload.origins)) {
       throw new Error("Invalid service map response");
     }
+    const catalogVersion = technologyCatalogVersion(payload, requestedVersion);
     for (const [key, limit] of Object.entries({ technology_observations_per_row: 8, technology_observations_per_origin: 32, technology_observations: 2000, technology_version_bytes: 32, technology_token_candidates_per_row: 128 })) {
       if (payload.snapshot.limits?.[key] !== undefined && payload.snapshot.limits[key] !== limit) invalidTechnology();
     }
@@ -264,7 +290,7 @@
     let technologyCount = 0;
     const technologySources = new Map();
     const technologies = payload.origins.map((item) => {
-      const observations = normalizeOriginTechnologies(item, sessionId, payload.snapshot.generation);
+      const observations = normalizeOriginTechnologies(item, sessionId, payload.snapshot.generation, catalogVersion);
       technologyCount += observations.length;
       if (technologyCount > 2000) invalidTechnology();
       for (const observation of observations) for (const id of observation.evidence) {
@@ -310,7 +336,7 @@
         })),
       }];
     });
-    return { snapshot: payload.snapshot, origins, warningCount: array(payload.warnings).length };
+    return { snapshot: payload.snapshot, origins, warningCount: array(payload.warnings).length, technologyCatalogVersion: catalogVersion, legacyCatalog: catalogVersion !== requestedVersion };
   }
   function stableOrder(previous, origins) {
     const ids = new Set(origins.map((origin) => origin.origin));
@@ -426,7 +452,7 @@
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
-      evidenceLoading: false, evidenceError: "", evidenceId: null, socketPeer: null, page: 0, detailPage: 0,
+      evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       bodyReferencesSource: null, bodyReferenceOverlay: null, bodyOverlayNotice: "",
       historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
@@ -717,6 +743,8 @@
       evidenceAbort?.abort();
       evidenceAbort = null;
       state.evidence = null;
+      state.evidenceCatalogVersion = null;
+      state.evidenceLegacyCatalog = false;
       state.socketPeer = null;
       state.evidenceLoading = false;
       state.evidenceError = "";
@@ -769,14 +797,15 @@
       if (!state.snapshot || force) render();
       try {
         const params = new URLSearchParams({ session_id: sessionId, in_scope_only: String(scopeOnly), max_records: "10000" });
-        const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal });
+        const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal, headers: { [TECHNOLOGY_CATALOG_HEADER]: String(TECHNOLOGY_CATALOG_VERSION) } });
         if (!response.ok) throw new Error("Service map unavailable");
         const snapshot = normalizeSnapshot(await response.json(), sessionId);
         if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
         if (state.bodyReferenceOverlay && !sourceIsRetained(state.bodyReferenceOverlay.source, snapshot)) {
           clearOverlay("Temporary body references cleared: the exact source is absent or retained history changed.");
         }
-        if (state.snapshot && state.snapshot.snapshot.generation !== snapshot.snapshot.generation) cancelEvidence();
+        if (state.snapshot && (state.snapshot.snapshot.generation !== snapshot.snapshot.generation
+          || state.snapshot.technologyCatalogVersion !== snapshot.technologyCatalogVersion)) cancelEvidence();
         state.snapshot = snapshot;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
@@ -848,12 +877,13 @@
       renderDetail();
       try {
         const params = new URLSearchParams({ session_id: sessionId, evidence_id: id, include_socket_peer: "true" });
-        const response = await request(`/api/target/service-map/evidence?${params}`, { signal: evidenceAbort.signal });
+        const response = await request(`/api/target/service-map/evidence?${params}`, { signal: evidenceAbort.signal, headers: { [TECHNOLOGY_CATALOG_HEADER]: String(TECHNOLOGY_CATALOG_VERSION) } });
         if (!response.ok) throw new Error("Evidence unavailable");
         const result = await response.json();
         if (requestId !== state.evidenceRequestId || sessionId !== getSessionId() || selected !== state.selectedOrigin) return false;
         if (result.schema_version !== 1 || result.session_id !== sessionId || result.evidence_id !== id
           || result.source !== "captured_http_metadata" || typeof result.available !== "boolean") throw new Error("Evidence source changed");
+        const catalogVersion = technologyCatalogVersion(result);
         const row = result.row;
         if (result.available && (!row || row.evidence_id !== id || safeOrigin(row.origin) !== selected
           || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.record_id || "") || typeof row.sequence !== "string" || !/^[0-9]+$/.test(row.sequence)
@@ -862,7 +892,9 @@
         const source = overlaySource();
         if (result.available && source && (row.method !== source.method || safePath(row.path) !== source.path
           || row.sequence !== source.sequence || row.started_at !== source.startedAt)) throw new Error("Overlay source changed");
-        state.evidence = result.available === true ? normalizeEvidenceObservations(row) : null;
+        state.evidence = result.available === true ? normalizeEvidenceObservations(row, catalogVersion) : null;
+        state.evidenceCatalogVersion = state.evidence ? catalogVersion : null;
+        state.evidenceLegacyCatalog = !!state.evidence && catalogVersion !== TECHNOLOGY_CATALOG_VERSION;
         state.socketPeer = state.evidence ? normalizeSocketPeer(result.socket_peer) : null;
         state.evidenceError = state.evidence ? "" : "Source unavailable. The retained row may have changed or been removed. Refresh the map to select current evidence.";
         state.evidenceLoading = false;
@@ -874,6 +906,8 @@
       } catch (_) {
         if (requestId !== state.evidenceRequestId || sessionId !== getSessionId() || selected !== state.selectedOrigin) return false;
         state.evidence = null;
+        state.evidenceCatalogVersion = null;
+        state.evidenceLegacyCatalog = false;
         state.socketPeer = null;
         cancelBodyReferences();
         state.evidenceLoading = false;
@@ -943,6 +977,7 @@
         status += ` · ${count(snapshot.included_rows)} included / ${count(snapshot.excluded_rows)} excluded / ${count(snapshot.omitted_rows)} omitted among analyzed`;
         status += ` · Newest capture-sequence window: ${snapshot.oldest_considered_at || "unknown"} to ${snapshot.latest_considered_at || "unknown"}`;
         if (array(snapshot.stopped_by).includes("technology_token_scan_limit")) status += " · Header technology scan partial: token candidate limit reached";
+        if (state.snapshot.legacyCatalog) status += ` · ${LEGACY_CATALOG_NOTICE}`;
         if (state.scopeOnly) status += " · In scope only";
         if (state.stale) status += " · History changed: counts are from the previous snapshot";
         if (state.snapshot.warningCount) status += ` · ${state.snapshot.warningCount} metadata notice(s)`;
@@ -1124,7 +1159,7 @@
       const items = evidenceItems(origin);
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
       const row = state.evidence;
-      const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${technologyMarkup(row.technology_observations)}<p>Exact retained source verified for this read.</p></div>` : "";
+      const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${state.evidenceLegacyCatalog ? `<p class="service-map-muted">${LEGACY_CATALOG_NOTICE}</p>` : ""}${technologyMarkup(row.technology_observations)}<p>Exact retained source verified for this read.</p></div>` : "";
       return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
         ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? socketPeerMarkup() + bodyReferencesMarkup() : ""}

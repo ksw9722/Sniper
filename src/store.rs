@@ -1340,8 +1340,23 @@ impl TransactionStore {
         session_id: Uuid,
         max_records: usize,
     ) -> crate::service_map::MetadataSnapshot {
+        self.service_map_snapshot_for_catalog(
+            session_id,
+            max_records,
+            crate::service_map_technology::CatalogVersion::V1,
+        )
+        .await
+    }
+
+    pub(crate) async fn service_map_snapshot_for_catalog(
+        &self,
+        session_id: Uuid,
+        max_records: usize,
+        catalog: crate::service_map_technology::CatalogVersion,
+    ) -> crate::service_map::MetadataSnapshot {
         use crate::service_map::{
-            evidence_id, project_record, MetadataSnapshot, MAX_METADATA_BYTES,
+            evidence_id, project_record, project_record_for_catalog, MetadataSnapshot,
+            MAX_METADATA_BYTES,
         };
         let inner = self.inner.read().await;
         let mut snapshot = MetadataSnapshot {
@@ -1380,7 +1395,13 @@ impl TransactionStore {
                 continue;
             }
             let id = evidence_id(session_id, self.saved_cursor_generation, *revision, record);
-            let Some(row) = project_record(record, id) else {
+            let row = match catalog {
+                crate::service_map_technology::CatalogVersion::V1 => project_record(record, id),
+                crate::service_map_technology::CatalogVersion::V2 => {
+                    project_record_for_catalog(record, id, catalog)
+                }
+            };
+            let Some(row) = row else {
                 snapshot.omitted_rows += 1;
                 snapshot
                     .stopped_by
@@ -1417,7 +1438,23 @@ impl TransactionStore {
         id: &str,
         include_socket_peer: bool,
     ) -> crate::service_map::ServiceMapEvidence {
-        use crate::service_map::{project_record, EvidenceKey, ServiceMapEvidence};
+        self.service_map_evidence_for_catalog(
+            session_id,
+            id,
+            include_socket_peer,
+            crate::service_map_technology::CatalogVersion::V1,
+        )
+        .await
+    }
+
+    pub(crate) async fn service_map_evidence_for_catalog(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        include_socket_peer: bool,
+        catalog: crate::service_map_technology::CatalogVersion,
+    ) -> crate::service_map::ServiceMapEvidence {
+        use crate::service_map::{project_record_for_catalog, EvidenceKey, ServiceMapEvidence};
         let missing = |reason| ServiceMapEvidence::missing(session_id, id.into(), reason);
         let Some(key) = EvidenceKey::parse(id) else {
             return missing("invalid_evidence_id");
@@ -1444,7 +1481,7 @@ impl TransactionStore {
         if inner.body_generations[index] != key.revision {
             return missing("record_changed");
         }
-        match project_record(record, id.into()) {
+        match project_record_for_catalog(record, id.into(), catalog) {
             Some(row) => {
                 let mut evidence = ServiceMapEvidence::found(session_id, row);
                 if include_socket_peer {

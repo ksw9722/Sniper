@@ -5370,10 +5370,37 @@ struct ServiceMapBodyEvidenceQuery {
     evidence_id: String,
 }
 
+const TECHNOLOGY_CATALOG_HEADER: &str = "x-sniper-technology-catalog-version";
+const INVALID_TECHNOLOGY_CATALOG: &str = "invalid technology catalog version header";
+
+fn service_map_catalog(
+    headers: &HeaderMap,
+) -> Result<(crate::service_map_technology::CatalogVersion, Option<u32>), &'static str> {
+    use crate::service_map_technology::CatalogVersion;
+    let mut values = headers.get_all(TECHNOLOGY_CATALOG_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok((CatalogVersion::V1, None));
+    };
+    if values.next().is_some() {
+        return Err(INVALID_TECHNOLOGY_CATALOG);
+    }
+    let catalog = match value.as_bytes() {
+        b"1" => CatalogVersion::V1,
+        b"2" => CatalogVersion::V2,
+        _ => return Err(INVALID_TECHNOLOGY_CATALOG),
+    };
+    Ok((catalog, Some(catalog.number())))
+}
+
 async fn get_target_service_map(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<ServiceMapQuery>,
 ) -> Response {
+    let (catalog, catalog_marker) = match service_map_catalog(&headers) {
+        Ok(selection) => selection,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     let max_records = query
         .max_records
         .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
@@ -5397,10 +5424,20 @@ async fn get_target_service_map(
     };
     // Freeze scope once. Per-card reads could mix rules from two user edits.
     let scope = session.runtime.snapshot().await;
-    let snapshot = session
-        .store
-        .service_map_snapshot(session.id(), max_records)
-        .await;
+    let snapshot = match catalog {
+        crate::service_map_technology::CatalogVersion::V1 => {
+            session
+                .store
+                .service_map_snapshot(session.id(), max_records)
+                .await
+        }
+        crate::service_map_technology::CatalogVersion::V2 => {
+            session
+                .store
+                .service_map_snapshot_for_catalog(session.id(), max_records, catalog)
+                .await
+        }
+    };
     if !state.sessions.contains_session(session.id())
         || !state.is_current_session_context(&session).await
     {
@@ -5410,7 +5447,7 @@ async fn get_target_service_map(
         )
             .into_response();
     }
-    Json(crate::service_map::build(
+    let mut map = crate::service_map::build(
         session.id(),
         snapshot,
         max_records,
@@ -5418,14 +5455,20 @@ async fn get_target_service_map(
         origin,
         &scope.scope_patterns,
         &scope.excluded_scope_patterns,
-    ))
-    .into_response()
+    );
+    map.technology_catalog_version = catalog_marker;
+    Json(map).into_response()
 }
 
 async fn get_target_service_map_evidence(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(query): Query<ServiceMapEvidenceQuery>,
 ) -> Response {
+    let (catalog, catalog_marker) = match service_map_catalog(&headers) {
+        Ok(selection) => selection,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
         return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
     }
@@ -5433,24 +5476,25 @@ async fn get_target_service_map_evidence(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let evidence = session
+    let mut evidence = session
         .store
-        .service_map_evidence_with_socket_peer(
+        .service_map_evidence_for_catalog(
             session.id(),
             &query.evidence_id,
             query.include_socket_peer,
+            catalog,
         )
         .await;
     if !state.sessions.contains_session(session.id())
         || !state.is_current_session_context(&session).await
     {
-        return Json(crate::service_map::ServiceMapEvidence::missing(
+        evidence = crate::service_map::ServiceMapEvidence::missing(
             query.session_id,
             query.evidence_id,
             "session_source_changed",
-        ))
-        .into_response();
+        );
     }
+    evidence.technology_catalog_version = catalog_marker;
     Json(evidence).into_response()
 }
 
@@ -14823,6 +14867,71 @@ mod tests {
         assert!(error.contains("replay tab tab-a sequence is too large"));
     }
 
+    #[test]
+    fn service_map_catalog_header_requires_one_exact_supported_value() {
+        use crate::service_map_technology::CatalogVersion;
+        assert_eq!(
+            super::service_map_catalog(&HeaderMap::new()),
+            Ok((CatalogVersion::V1, None))
+        );
+        for (value, catalog) in [("1", CatalogVersion::V1), ("2", CatalogVersion::V2)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                super::TECHNOLOGY_CATALOG_HEADER,
+                HeaderValue::from_static(value),
+            );
+            assert_eq!(
+                super::service_map_catalog(&headers),
+                Ok((catalog, Some(catalog.number())))
+            );
+        }
+        for value in [
+            b"".as_slice(),
+            b" ",
+            b" 2",
+            b"2 ",
+            b"01",
+            b"0",
+            b"3",
+            b"2,2",
+            b"1, 2",
+            b"SECRET_SENTINEL",
+            b"\xff",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                super::TECHNOLOGY_CATALOG_HEADER,
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+            assert_eq!(
+                super::service_map_catalog(&headers),
+                Err(super::INVALID_TECHNOLOGY_CATALOG)
+            );
+        }
+        for first in ["1", "2"] {
+            for second in ["1", "2"] {
+                let mut headers = HeaderMap::new();
+                headers.append(
+                    super::TECHNOLOGY_CATALOG_HEADER,
+                    HeaderValue::from_static(first),
+                );
+                headers.append(
+                    super::TECHNOLOGY_CATALOG_HEADER,
+                    HeaderValue::from_static(second),
+                );
+                assert_eq!(
+                    super::service_map_catalog(&headers),
+                    Err(super::INVALID_TECHNOLOGY_CATALOG)
+                );
+            }
+        }
+        assert!(serde_json::from_value::<super::ServiceMapQuery>(
+            serde_json::json!({"technology_catalog_version":2})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<super::ServiceMapEvidenceQuery>(serde_json::json!({"session_id":Uuid::new_v4(), "evidence_id":"test", "technology_catalog_version":2})).is_err());
+    }
+
     #[tokio::test]
     async fn service_map_api_reads_pinned_inactive_without_writes_or_workers() {
         let (state, data_dir) = test_state("sniper-service-map-inactive");
@@ -14854,6 +14963,7 @@ mod tests {
         let map: crate::service_map::ServiceMap = response_json(
             super::get_target_service_map(
                 State(state.clone()),
+                HeaderMap::new(),
                 Query(super::ServiceMapQuery {
                     session_id: Some(metadata.id),
                     in_scope_only: false,
@@ -14871,6 +14981,7 @@ mod tests {
         let evidence: crate::service_map::ServiceMapEvidence = response_json(
             super::get_target_service_map_evidence(
                 State(state.clone()),
+                HeaderMap::new(),
                 Query(super::ServiceMapEvidenceQuery {
                     session_id: metadata.id,
                     evidence_id: token,
@@ -14917,6 +15028,7 @@ mod tests {
         ] {
             let response = super::get_target_service_map(
                 State(state.clone()),
+                HeaderMap::new(),
                 Query(super::ServiceMapQuery {
                     session_id: None,
                     in_scope_only: false,
@@ -14930,6 +15042,7 @@ mod tests {
         for limit in [0, crate::service_map::MAX_RECORDS + 1] {
             let response = super::get_target_service_map(
                 State(state.clone()),
+                HeaderMap::new(),
                 Query(super::ServiceMapQuery {
                     session_id: None,
                     in_scope_only: false,
@@ -14948,6 +15061,7 @@ mod tests {
         let map: crate::service_map::ServiceMap = response_json(
             super::get_target_service_map(
                 State(state.clone()),
+                HeaderMap::new(),
                 Query(super::ServiceMapQuery {
                     session_id: Some(session.id()),
                     in_scope_only: false,
@@ -14966,6 +15080,7 @@ mod tests {
         let evidence: crate::service_map::ServiceMapEvidence = response_json(
             super::get_target_service_map_evidence(
                 State(state.clone()),
+                HeaderMap::new(),
                 Query(super::ServiceMapEvidenceQuery {
                     session_id: session.id(),
                     evidence_id: token,
@@ -14980,6 +15095,7 @@ mod tests {
         assert_eq!(evidence.reason.as_deref(), Some("record_changed"));
         let response = super::get_target_service_map_evidence(
             State(state.clone()),
+            HeaderMap::new(),
             Query(super::ServiceMapEvidenceQuery {
                 session_id: session.id(),
                 evidence_id: "bad".into(),
@@ -15122,6 +15238,7 @@ mod tests {
             .unwrap();
         let response = super::get_target_service_map(
             State(state.clone()),
+            HeaderMap::new(),
             Query(super::ServiceMapQuery {
                 session_id: Some(metadata.id),
                 in_scope_only: false,
@@ -15134,6 +15251,7 @@ mod tests {
         state.delete_session(metadata.id).await.unwrap();
         let response = super::get_target_service_map(
             State(state.clone()),
+            HeaderMap::new(),
             Query(super::ServiceMapQuery {
                 session_id: Some(metadata.id),
                 in_scope_only: false,

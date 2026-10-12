@@ -32,6 +32,266 @@ async fn read(dir: &Path, api: &str, operation: &str, input: Value) -> Value {
     response["data"].clone()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_map_catalog_negotiation_keeps_legacy_reads_and_exact_sources_compatible() {
+    const SELECTOR: &str = "x-sniper-technology-catalog-version";
+    let dir = std::env::temp_dir().join(format!("sniper-map-catalog-{}", Uuid::new_v4()));
+    let state = Arc::new(
+        AppState::new(AppConfig {
+            data_dir: dir.clone(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 1024,
+        })
+        .unwrap(),
+    );
+    let session = state.session().await;
+    let session_id = session.id();
+    let mut record = row("/catalog");
+    let response = record.response.as_mut().unwrap();
+    response
+        .headers
+        .retain(|header| !header.name.eq_ignore_ascii_case("server"));
+    response.headers.extend([
+        sniper::model::HeaderRecord {
+            name: "Server".into(),
+            value: "nginx/1.26.2 gunicorn/23.0.0 uvicorn/0.30.6 waitress/3.0.0 openresty/1.27.1.2 LiteSpeed/6.3".into(),
+        },
+        sniper::model::HeaderRecord {
+            name: "X-Powered-By".into(),
+            value: "Next.js/15.0.0".into(),
+        },
+    ]);
+    let id = record.id;
+    session.store.insert(record).await;
+    let original = serde_json::to_value(session.store.get(id).await.unwrap()).unwrap();
+    let mut events = session.store.subscribe();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let app = sniper::api::router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let map_url = format!("{api}/api/target/service-map?session_id={session_id}");
+    // Every map read has its own observation time and snapshot UUID. Compare
+    // all retained metadata and limits without conflating those read receipts.
+    let stable_map = |value: &Value| {
+        let mut stable = value.clone();
+        let snapshot = stable["snapshot"].as_object_mut().unwrap();
+        let id = snapshot.remove("id").unwrap();
+        Uuid::parse_str(id.as_str().unwrap()).unwrap();
+        let captured_at = snapshot.remove("captured_at").unwrap();
+        chrono::DateTime::parse_from_rfc3339(captured_at.as_str().unwrap()).unwrap();
+        stable
+    };
+    let legacy: Value = client
+        .get(&map_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(legacy.get("technology_catalog_version").is_none());
+    assert_eq!(
+        legacy["origins"][0]["technology_observations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        legacy["origins"][0]["technology_observations"][0]["product_id"],
+        "nginx"
+    );
+    let mut v1: Value = client
+        .get(&map_url)
+        .header(SELECTOR, "1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v1.as_object_mut()
+            .unwrap()
+            .remove("technology_catalog_version"),
+        Some(json!(1))
+    );
+    assert_eq!(
+        stable_map(&v1),
+        stable_map(&legacy),
+        "explicit v1 changed legacy metadata or caps"
+    );
+    let v2: Value = client
+        .get(&map_url)
+        .header(SELECTOR, "2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v2["technology_catalog_version"], 2);
+    assert_eq!(stable_map(&v2)["snapshot"], stable_map(&legacy)["snapshot"]);
+    let expected: std::collections::BTreeSet<_> = [
+        "nginx",
+        "gunicorn",
+        "uvicorn",
+        "waitress",
+        "openresty",
+        "litespeed",
+        "next_js",
+    ]
+    .into_iter()
+    .collect();
+    let products = |observations: &Value| -> std::collections::BTreeSet<String> {
+        observations
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["product_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        products(&v2["origins"][0]["technology_observations"]),
+        expected.iter().map(|value| (*value).to_owned()).collect()
+    );
+    assert!(!v2.to_string().contains("SYNTHETIC_PRIVATE"));
+    let token = legacy["origins"][0]["endpoints"][0]["evidence"][0]
+        .as_str()
+        .unwrap();
+    let evidence_url = format!(
+        "{api}/api/target/service-map/evidence?session_id={session_id}&evidence_id={token}"
+    );
+    let legacy_evidence: Value = client
+        .get(&evidence_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(legacy_evidence.get("technology_catalog_version").is_none());
+    let mut evidence_v1: Value = client
+        .get(&evidence_url)
+        .header(SELECTOR, "1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence_v1
+            .as_object_mut()
+            .unwrap()
+            .remove("technology_catalog_version"),
+        Some(json!(1))
+    );
+    assert_eq!(evidence_v1, legacy_evidence);
+    let evidence_v2: Value = client
+        .get(&evidence_url)
+        .header(SELECTOR, "2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(evidence_v2["technology_catalog_version"], 2);
+    assert_eq!(evidence_v2["row"]["evidence_id"], token);
+    assert_eq!(
+        products(&evidence_v2["row"]["technology_observations"]),
+        products(&v2["origins"][0]["technology_observations"])
+    );
+
+    // Invalid selectors are rejected once, with no captured-content echo.
+    for url in [&map_url, &evidence_url] {
+        for value in ["", "0", "3", "1,2", "SYNTHETIC_PRIVATE"] {
+            let response = client
+                .get(url)
+                .header(SELECTOR, value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert!(!response.text().await.unwrap().contains("SYNTHETIC_PRIVATE"));
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(SELECTOR, "1".parse().unwrap());
+        headers.append(SELECTOR, "2".parse().unwrap());
+        let response = client.get(url).headers(headers).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    let cli_map = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id":session_id}),
+    )
+    .await;
+    assert_eq!(stable_map(&cli_map), stable_map(&v2));
+    let cli_v1 = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id":session_id,"technology_catalog_version":1}),
+    )
+    .await;
+    assert_eq!(cli_v1["technology_catalog_version"], 1);
+    assert_eq!(cli_v1["origins"], legacy["origins"]);
+    let cli_evidence = read(
+        &dir,
+        &api,
+        "target.service_map.evidence.get",
+        json!({"session_id":session_id,"evidence_id":token}),
+    )
+    .await;
+    assert_eq!(cli_evidence, evidence_v2);
+
+    // The selector does not change the separate explicit URL-reference contract.
+    let body_url = format!(
+        "{api}/api/target/service-map/body-references?session_id={session_id}&evidence_id={token}"
+    );
+    let body: Value = client
+        .get(&body_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let body_with_selector: Value = client
+        .get(&body_url)
+        .header(SELECTOR, "2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body, body_with_selector);
+    assert!(body.get("technology_catalog_version").is_none());
+    assert_eq!(
+        original,
+        serde_json::to_value(session.store.get(id).await.unwrap()).unwrap()
+    );
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(state.session().await.id(), session_id);
+    server.abort();
+    let _ = server.await;
+    drop(session);
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn row(path: &str) -> TransactionRecord {
     let mut request_headers = HeaderMap::new();
     request_headers.insert("origin", "https://app.example.com".parse().unwrap());

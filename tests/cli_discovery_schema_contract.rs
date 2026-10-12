@@ -580,6 +580,7 @@ mod history_fixture {
         path: String,
         query: BTreeMap<String, String>,
         body_len: usize,
+        catalog_header: Option<String>,
     }
 
     struct MockState {
@@ -652,7 +653,7 @@ mod history_fixture {
                 Some(expected_code),
                 "{args:?}: {output:?}"
             );
-            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+            assert_service_map_stderr(&output, expected_code);
             assert!(
                 !self.unused_dir.exists(),
                 "read-only fixture created a data directory"
@@ -661,10 +662,30 @@ mod history_fixture {
         }
 
         fn assert_reads(&self, path: &str, expected_query: &[(&str, &str)]) {
+            let catalog = matches!(
+                path,
+                "/api/target/service-map" | "/api/target/service-map/evidence"
+            )
+            .then_some("2");
+            self.assert_reads_with_catalog(path, expected_query, catalog);
+        }
+
+        fn assert_reads_with_catalog(
+            &self,
+            path: &str,
+            expected_query: &[(&str, &str)],
+            catalog: Option<&str>,
+        ) {
             let requests = std::mem::take(&mut *self.state.requests.lock().unwrap());
             assert_eq!(requests.len(), 2, "{requests:?}");
             assert_eq!(requests[0].path, "/api/settings", "{requests:?}");
             assert!(requests[0].query.is_empty(), "{requests:?}");
+            assert_eq!(requests[0].catalog_header, None, "{requests:?}");
+            assert_eq!(
+                requests[1].catalog_header.as_deref(),
+                catalog,
+                "{requests:?}"
+            );
             assert_eq!(requests[1].path, path, "{requests:?}");
             let mut expected =
                 BTreeMap::from([("session_id".to_string(), Uuid::nil().to_string())]);
@@ -679,6 +700,24 @@ mod history_fixture {
                 assert_eq!(request.body_len, 0, "{request:?}");
             }
         }
+    }
+
+    fn assert_service_map_stderr(output: &std::process::Output, expected_code: i32) {
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let data = payload.get("data").unwrap_or(&payload);
+        let legacy = expected_code == 0
+            && data.get("technology_catalog_version").is_none()
+            && (data.get("snapshot").is_some() || data["source"] == "captured_http_metadata");
+        let expected = if legacy {
+            "Warning: Service Map API returned legacy technology catalog v1; technology coverage is limited to v1.\n"
+        } else {
+            ""
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected,
+            "{output:?}"
+        );
     }
 
     impl Drop for MockApi {
@@ -697,6 +736,10 @@ mod history_fixture {
                 .into_owned()
                 .collect(),
             body_len: body.len(),
+            catalog_header: parts
+                .headers
+                .get("x-sniper-technology-catalog-version")
+                .map(|value| value.to_str().unwrap().to_owned()),
         });
         if parts.method != "GET" {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -886,6 +929,9 @@ mod history_fixture {
         assert_eq!(requests[0].path, "/api/settings");
         assert_eq!(requests[1].path, "/api/sessions");
         assert_eq!(requests[2].path, "/api/target/service-map");
+        assert_eq!(requests[0].catalog_header, None);
+        assert_eq!(requests[1].catalog_header, None);
+        assert_eq!(requests[2].catalog_header.as_deref(), Some("2"));
         assert_eq!(requests[2].query["session_id"], Uuid::nil().to_string());
         assert!(requests
             .iter()
@@ -992,7 +1038,7 @@ mod history_fixture {
             .unwrap()
             .unwrap();
         assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
-        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_service_map_stderr(&output, expected_code);
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
@@ -1187,6 +1233,401 @@ mod history_fixture {
         payload
     }
 
+    fn catalog_test_input(exact_row: bool, version: Option<u32>) -> Value {
+        let mut input = json!({"session_id":Uuid::nil()});
+        if exact_row {
+            input["evidence_id"] = json!(BODY_REFERENCE_TOKEN);
+        }
+        if let Some(version) = version {
+            input["technology_catalog_version"] = json!(version);
+        }
+        input
+    }
+
+    fn catalog_operation(exact_row: bool) -> &'static str {
+        if exact_row {
+            "target.service_map.evidence.get"
+        } else {
+            "target.service_map.get"
+        }
+    }
+
+    fn assert_catalog_read(mock: &MockApi, exact_row: bool, version: &str) {
+        let (path, query) = if exact_row {
+            (
+                "/api/target/service-map/evidence",
+                vec![("evidence_id", BODY_REFERENCE_TOKEN)],
+            )
+        } else {
+            (
+                "/api/target/service-map",
+                vec![("in_scope_only", "false"), ("max_records", "10000")],
+            )
+        };
+        mock.assert_reads_with_catalog(path, &query, Some(version));
+    }
+
+    fn catalog_v2_payload(
+        exact_row: bool,
+        entry: &sniper::service_map_technology::CatalogEntry,
+    ) -> Value {
+        let mut payload = if exact_row {
+            technology_evidence_payload()
+        } else {
+            technology_map_payload()
+        };
+        payload["technology_catalog_version"] = json!(2);
+        let observation = if exact_row {
+            &mut payload["row"]["technology_observations"][0]
+        } else {
+            &mut payload["origins"][0]["technology_observations"][0]
+        };
+        observation["product_id"] = json!(entry.product_id);
+        observation["name"] = json!(entry.name);
+        observation["catalog_category"] = json!(entry.catalog_category);
+        observation["header_name"] = json!(entry.header_name);
+        if exact_row {
+            observation["rule_id"] = json!(entry.rule_id);
+            observation["product_span"] = json!({"start":0,"end":entry.literal.len()});
+            observation["version_span"] =
+                json!({"start":entry.literal.len()+1,"end":entry.literal.len()+7});
+        }
+        payload
+    }
+
+    #[test]
+    fn service_map_catalog_discovery_and_dry_run_are_header_only() {
+        let session = Uuid::nil().to_string();
+        for exact_row in [false, true] {
+            let operation = catalog_operation(exact_row);
+            let spec = super::spec(operation);
+            let schema = super::cli(&["schema", "input", operation], 0)["schema"].clone();
+            assert_eq!(spec["input_schema"], schema);
+            assert_eq!(
+                schema["properties"]["technology_catalog_version"]["type"],
+                "integer"
+            );
+            assert_eq!(
+                schema["properties"]["technology_catalog_version"]["enum"],
+                json!([1, 2])
+            );
+            assert_eq!(
+                schema["properties"]["technology_catalog_version"]["default"],
+                2
+            );
+            assert!(spec["command"]
+                .as_str()
+                .unwrap()
+                .contains("--technology-catalog-version"));
+            for version in [None, Some(1), Some(2)] {
+                let requested = version.unwrap_or(2).to_string();
+                let input = catalog_test_input(exact_row, version).to_string();
+                let called = super::cli(&["--dry-run", "call", operation, "--input", &input], 0);
+                let mut args = vec![
+                    "--dry-run",
+                    "scope",
+                    if exact_row {
+                        "service-map-evidence"
+                    } else {
+                        "service-map"
+                    },
+                    "--session-id",
+                    &session,
+                ];
+                if exact_row {
+                    args.extend(["--evidence-id", BODY_REFERENCE_TOKEN]);
+                }
+                if version.is_some() {
+                    args.extend(["--technology-catalog-version", &requested]);
+                }
+                let direct = super::cli(&args, 0);
+                assert_eq!(called["data"], direct);
+                assert_eq!(
+                    direct["input"]["technology_catalog_version"],
+                    version.unwrap_or(2)
+                );
+                assert_eq!(direct["api"]["method"], "GET");
+                assert_eq!(
+                    direct["api"]["headers"],
+                    json!({"X-Sniper-Technology-Catalog-Version":requested})
+                );
+                assert_eq!(direct["api"]["body"], Value::Null);
+                let path = direct["api"]["path"].as_str().unwrap();
+                assert!(
+                    !path.contains("technology_catalog") && !path.contains("technology-catalog")
+                );
+            }
+            for input in spec["examples"].as_array().unwrap() {
+                let example = super::cli(
+                    &[
+                        "--dry-run",
+                        "call",
+                        operation,
+                        "--input",
+                        &input.to_string(),
+                    ],
+                    0,
+                );
+                assert_eq!(
+                    example["data"]["api"]["headers"]["X-Sniper-Technology-Catalog-Version"],
+                    input
+                        .get("technology_catalog_version")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(2)
+                        .to_string()
+                );
+            }
+            for invalid in [
+                Value::Null,
+                json!(0),
+                json!(3),
+                json!(-1),
+                json!(2.0),
+                json!("2"),
+                json!(true),
+                json!({}),
+            ] {
+                let mut input = catalog_test_input(exact_row, None);
+                input["technology_catalog_version"] = invalid;
+                let error = super::cli(
+                    &[
+                        "--dry-run",
+                        "call",
+                        operation,
+                        "--input",
+                        &input.to_string(),
+                    ],
+                    2,
+                );
+                assert_eq!(error["error"]["code"], "INVALID_INPUT");
+            }
+        }
+        let operation = "target.service_map.body_references.get";
+        let spec = super::spec(operation);
+        assert!(spec["input_schema"]["properties"]
+            .get("technology_catalog_version")
+            .is_none());
+        assert!(spec["output_schema"]["properties"]
+            .get("technology_catalog_version")
+            .is_none());
+        let input = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN});
+        let preview = super::cli(
+            &[
+                "--dry-run",
+                "call",
+                operation,
+                "--input",
+                &input.to_string(),
+            ],
+            0,
+        );
+        assert!(preview["data"]["api"].get("headers").is_none());
+        assert!(preview["data"]["input"]
+            .get("technology_catalog_version")
+            .is_none());
+        let mut rejected = input;
+        rejected["technology_catalog_version"] = json!(2);
+        let error = super::cli(
+            &[
+                "--dry-run",
+                "call",
+                operation,
+                "--input",
+                &rejected.to_string(),
+            ],
+            2,
+        );
+        assert_eq!(error["error"]["code"], "INVALID_INPUT");
+        let error = super::cli(
+            &[
+                "--dry-run",
+                "scope",
+                "service-map",
+                "--technology-catalog-version",
+                "2",
+                "body-references",
+                "--session-id",
+                &session,
+                "--evidence-id",
+                BODY_REFERENCE_TOKEN,
+            ],
+            2,
+        );
+        assert_eq!(error["error"]["code"], "INVALID_INPUT");
+        let other = super::cli(&["--dry-run", "scope", "get-scope"], 0);
+        assert!(other["api"].get("headers").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_catalog_marker_negotiation_preserves_legacy_without_retry() {
+        let mock = MockApi::new().await;
+        for exact_row in [false, true] {
+            let operation = catalog_operation(exact_row);
+            let schema = output_schema(operation);
+            for requested in [1, 2] {
+                for marker in [
+                    None,
+                    Some(json!(1)),
+                    Some(json!(2)),
+                    Some(json!(0)),
+                    Some(json!(3)),
+                    Some(Value::Null),
+                    Some(json!("SYNTHETIC_PRIVATE_VALUE")),
+                    Some(json!(2.0)),
+                    Some(json!(-1)),
+                    Some(json!(true)),
+                ] {
+                    let mut payload = if exact_row {
+                        technology_evidence_payload()
+                    } else {
+                        technology_map_payload()
+                    };
+                    if let Some(marker) = &marker {
+                        payload["technology_catalog_version"] = marker.clone();
+                    }
+                    let valid = marker
+                        .as_ref()
+                        .is_none_or(|marker| marker.as_u64() == Some(requested as u64));
+                    *mock.state.payload.lock().unwrap() = payload.clone();
+                    let input = catalog_test_input(exact_row, Some(requested)).to_string();
+                    let result = mock
+                        .command_with_code(
+                            &["call", operation, "--input", &input],
+                            if valid { 0 } else { 5 },
+                        )
+                        .await;
+                    if valid {
+                        assert_eq!(result["data"], payload);
+                        assert_schema(&result["data"], &schema);
+                    } else {
+                        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+                        assert_eq!(result["error"]["retryable"], false);
+                        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+                    }
+                    assert_catalog_read(&mock, exact_row, &requested.to_string());
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_catalog_v2_products_require_explicit_v2_response_marker() {
+        use sniper::service_map_technology::CATALOG_V2_ADDITIONS;
+        let mock = MockApi::new().await;
+        assert_eq!(
+            CATALOG_V2_ADDITIONS
+                .iter()
+                .map(|entry| entry.product_id)
+                .collect::<Vec<_>>(),
+            [
+                "gunicorn",
+                "uvicorn",
+                "waitress",
+                "openresty",
+                "litespeed",
+                "next_js"
+            ]
+        );
+        for exact_row in [false, true] {
+            let operation = catalog_operation(exact_row);
+            let schema = output_schema(operation);
+            for entry in CATALOG_V2_ADDITIONS {
+                let payload = catalog_v2_payload(exact_row, entry);
+                *mock.state.payload.lock().unwrap() = payload.clone();
+                let input = catalog_test_input(exact_row, None).to_string();
+                let result = mock.command(&["call", operation, "--input", &input]).await;
+                assert_eq!(result["data"], payload);
+                assert_schema(&payload, &schema);
+                assert_catalog_read(&mock, exact_row, "2");
+                for marker in [None, Some(1)] {
+                    let mut invalid = payload.clone();
+                    invalid
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("technology_catalog_version");
+                    if let Some(marker) = marker {
+                        invalid["technology_catalog_version"] = json!(marker);
+                    }
+                    assert!(!super::matches_schema(&invalid, &schema));
+                    *mock.state.payload.lock().unwrap() = invalid;
+                    let input = catalog_test_input(exact_row, marker).to_string();
+                    let result = mock
+                        .command_with_code(&["call", operation, "--input", &input], 5)
+                        .await;
+                    assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+                    assert_catalog_read(&mock, exact_row, if marker.is_some() { "1" } else { "2" });
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_catalog_v2_keeps_identity_bounds_and_error_guards() {
+        use sniper::service_map_technology::CATALOG_V2_ADDITIONS;
+        let mock = MockApi::new().await;
+        for exact_row in [false, true] {
+            let operation = catalog_operation(exact_row);
+            let base = catalog_v2_payload(exact_row, &CATALOG_V2_ADDITIONS[0]);
+            let input = catalog_test_input(exact_row, None).to_string();
+            let mut invalids = Vec::new();
+            for (field, value) in [
+                ("name", json!("nginx")),
+                ("catalog_category", json!("web_server")),
+                ("header_name", json!("x-powered-by")),
+                ("reported_version", json!("1.2beta")),
+            ] {
+                let mut invalid = base.clone();
+                let observation = if exact_row {
+                    &mut invalid["row"]["technology_observations"][0]
+                } else {
+                    &mut invalid["origins"][0]["technology_observations"][0]
+                };
+                observation[field] = value;
+                invalids.push(invalid);
+            }
+            let mut over_cap = base.clone();
+            if exact_row {
+                over_cap["row"]["technology_observations"] =
+                    json!(vec![base["row"]["technology_observations"][0].clone(); 9]);
+                let mut wrong_rule = base.clone();
+                wrong_rule["row"]["technology_observations"][0]["rule_id"] =
+                    json!("server.gunicorn.v2");
+                invalids.push(wrong_rule);
+            } else {
+                over_cap["origins"][0]["technology_observations"] = json!(vec![
+                        base["origins"][0]["technology_observations"][0].clone();
+                        33
+                    ]);
+                let mut wrong_identity = base.clone();
+                wrong_identity["origins"][0]["technology_observations"][0]["evidence"] =
+                    json!([BODY_REFERENCE_TOKEN.replace("22222222-2222", "11111111-2222")]);
+                invalids.push(wrong_identity);
+            }
+            invalids.push(over_cap);
+            for invalid in invalids {
+                *mock.state.payload.lock().unwrap() = invalid;
+                let result = mock
+                    .command_with_code(&["call", operation, "--input", &input], 5)
+                    .await;
+                assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+                assert_eq!(result["error"]["retryable"], false);
+                assert_catalog_read(&mock, exact_row, "2");
+            }
+            *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+            for (status, exit) in [(400, 5), (503, 6)] {
+                *mock.state.read_status.lock().unwrap() = status;
+                let result = mock
+                    .command_with_code(&["call", operation, "--input", &input], exit)
+                    .await;
+                assert_eq!(result["error"]["code"], "HTTP_STATUS_ERROR");
+                assert_eq!(result["error"]["retryable"], false);
+                assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+                assert_catalog_read(&mock, exact_row, "2");
+            }
+            *mock.state.read_status.lock().unwrap() = 200;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_map_technology_extensions_preserve_old_servers_and_both_envelopes() {
         let mock = MockApi::new().await;
@@ -1266,7 +1707,9 @@ mod history_fixture {
         let row_schema = output_schema("target.service_map.evidence.get");
         let schema = &row_schema["properties"]["row"]["anyOf"][1]["properties"]
             ["technology_observations"]["items"];
-        for entry in sniper::service_map_technology::CATALOG {
+        for entry in sniper::service_map_technology::catalog_entries(
+            sniper::service_map_technology::CatalogVersion::V2,
+        ) {
             let mut observation = technology_observation_payload();
             observation["product_id"] = json!(entry.product_id);
             observation["name"] = json!(entry.name);

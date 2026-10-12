@@ -165,12 +165,38 @@ or an authoritative current version. Catalog categories such as `web_server`,
 `application_server`, `language_runtime`, `edge_service`, `cms`, `connector`, and
 `unknown` are product labels, not observed physical WEB/WAS or backend roles.
 
-The fixed header/product allowlist is:
+The frozen catalog revision 1 header/product allowlist is:
 
 - `Server`: nginx, Apache, Caddy, Cloudflare, Microsoft-IIS, Envoy, PHP, Jetty,
   Apache-Coyote, and the literal two-word declaration Apache Tomcat
 - `X-Powered-By`: PHP, Express, and ASP.NET, at the beginning of the value
 - `X-Generator`: WordPress and Drupal, at the beginning of the value
+
+Catalog revision 2 includes revision 1 and exactly these additions:
+
+| Header | Literal | Product ID | Name | Category | Rule ID |
+| --- | --- | --- | --- | --- | --- |
+| `Server` | `gunicorn` | `gunicorn` | Gunicorn | `application_server` | `server.gunicorn.v1` |
+| `Server` | `uvicorn` | `uvicorn` | Uvicorn | `application_server` | `server.uvicorn.v1` |
+| `Server` | `waitress` | `waitress` | Waitress | `application_server` | `server.waitress.v1` |
+| `Server` | `openresty` | `openresty` | OpenResty | `web_server` | `server.openresty.v1` |
+| `Server` | `LiteSpeed` | `litespeed` | LiteSpeed | `web_server` | `server.litespeed.v1` |
+| `X-Powered-By` | `Next.js` | `next_js` | Next.js | `application_framework` | `x_powered_by.next_js.v1` |
+
+These additions follow primary-source header declarations in
+[Gunicorn](https://github.com/benoitc/gunicorn/blob/master/gunicorn/http/wsgi.py),
+[Uvicorn](https://github.com/Kludex/uvicorn/blob/main/uvicorn/config.py),
+[Waitress](https://docs.pylonsproject.org/projects/waitress/en/latest/arguments.html),
+[OpenResty](https://openresty.org/en/ann-1027001002.html),
+[LiteSpeed](https://docs.litespeedtech.com/lscache/tips/), and
+[Next.js](https://github.com/vercel/next.js/blob/canary/packages/next/src/server/send-payload.ts).
+They use only the existing bare-product and slash-version grammar. A bare product
+has `not_reported` version status; an unsupported suffix keeps the product but
+returns a null version, never a numeric prefix. No edition, installed version,
+companion product, or infrastructure role is inferred. In particular, OpenResty
+adds no nginx or Lua observation, LiteSpeed adds no edition or OpenLiteSpeed
+observation, and Next.js adds no React or Node.js observation. Rule suffixes
+remain `.v1`: catalog revisions and individual rule revisions are independent.
 
 Matching is ASCII case-insensitive, with complete product-name boundaries.
 `Server` can supply several whitespace-separated products. Nested and escaped
@@ -468,6 +494,45 @@ for you.
 - `GET /api/target/service-map?session_id=<uuid>&in_scope_only=false&max_records=10000`
 - `GET /api/target/service-map/evidence?session_id=<uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/body-references?session_id=<active-uuid>&evidence_id=<opaque-token>`
+
+### Technology catalog negotiation
+
+Only the map and exact-row evidence GET endpoints accept the inbound local API
+header `X-Sniper-Technology-Catalog-Version`. Its value must be exactly one `1`
+or `2`. Omission selects the frozen revision-1 catalog and preserves the legacy
+wire shape: there is no `technology_catalog_version` field. Explicit `1` or `2`
+selects that catalog before literal parsing, token/row caps, metadata-byte limits,
+and origin/map aggregation. Its successful response, including unavailable
+exact-row evidence, adds top-level numeric `technology_catalog_version: 1` or
+`technology_catalog_version: 2`. Other response fields and `schema_version: 1`
+are unchanged. Selecting a catalog never changes exact retained-row tokens.
+
+Duplicate header fields, comma lists, empty values, and malformed or unsupported
+values receive HTTP 400 with the fixed message `invalid technology catalog
+version header`; the supplied value is never echoed. There is no new API query
+parameter and no outgoing target header. The body-reference endpoint and its
+projection do not negotiate catalogs and remain unchanged.
+
+Compatibility works in both directions:
+
+- Old clients omit this header. New servers keep revision-1 products, observation
+  bytes, and omission behavior, including when new products would otherwise fill
+  row or aggregate caps. Expanding the catalog and then filtering is not equivalent.
+- New clients request revision 2. An old server may ignore the header and omit
+  the response marker. The client then validates strictly against revision 1 and
+  reports legacy catalog availability; absence never means revision 2 succeeded.
+  This also supports older servers that omit the observation extension itself.
+- A present marker must be a supported integer equal to the requested revision.
+  Malformed, unsupported, or mismatched markers are rejected before validating
+  observations. Neither clients nor servers silently retry with another catalog.
+
+The Scope UI requests revision 2 on both metadata reads. The CLI defaults to
+revision 2 for map and evidence; `--technology-catalog-version 1` or the numeric
+`technology_catalog_version: 1` call input explicitly requests revision 1. These
+CLI options become a local request header, not query parameters. CLI dry-run
+reports the selected header without contacting the server. A legacy fallback
+notice is separate from the machine-readable result. Body-reference commands
+send no catalog header and gain no catalog option.
 
 URL-encode the opaque token as a query parameter. These endpoints use the existing
 local API access control. Service Map discovery and reads do not follow API

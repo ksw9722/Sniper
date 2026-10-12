@@ -11,6 +11,31 @@ pub const MAX_OBSERVATIONS: usize = 2_000;
 pub const MAX_VERSION_BYTES: usize = 32;
 pub const MAX_TOKEN_CANDIDATES_PER_ROW: usize = 128;
 
+/// Catalog revisions are independent of observation rule revisions. The default
+/// stays frozen so new products cannot displace legacy observations at any cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogVersion {
+    V1,
+    V2,
+}
+
+impl CatalogVersion {
+    pub const fn number(self) -> u32 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    pub const fn from_number(number: u32) -> Option<Self> {
+        match number {
+            1 => Some(Self::V1),
+            2 => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
+
 /// Shared across eligible response headers so short unknown tokens cannot
 /// amplify projection work while the retained store's read lock is held.
 #[derive(Default)]
@@ -139,7 +164,7 @@ macro_rules! entry {
     };
 }
 
-/// Fixed allowlist, also shared with clients' validation and schema generation.
+/// Frozen revision-1 allowlist, shared with clients' validation and schema generation.
 pub const CATALOG: &[CatalogEntry] = &[
     // The longer literal must precede Apache so it cannot become an HTTPD claim.
     entry!(
@@ -272,6 +297,66 @@ pub const CATALOG: &[CatalogEntry] = &[
     ),
 ];
 
+/// Revision 2 adds only these independently declared product literals.
+/// Categories describe products, never inferred deployed infrastructure roles.
+pub const CATALOG_V2_ADDITIONS: &[CatalogEntry] = &[
+    entry!(
+        "gunicorn",
+        "Gunicorn",
+        ApplicationServer,
+        "server",
+        "gunicorn",
+        "server.gunicorn.v1"
+    ),
+    entry!(
+        "uvicorn",
+        "Uvicorn",
+        ApplicationServer,
+        "server",
+        "uvicorn",
+        "server.uvicorn.v1"
+    ),
+    entry!(
+        "waitress",
+        "Waitress",
+        ApplicationServer,
+        "server",
+        "waitress",
+        "server.waitress.v1"
+    ),
+    entry!(
+        "openresty",
+        "OpenResty",
+        WebServer,
+        "server",
+        "openresty",
+        "server.openresty.v1"
+    ),
+    entry!(
+        "litespeed",
+        "LiteSpeed",
+        WebServer,
+        "server",
+        "LiteSpeed",
+        "server.litespeed.v1"
+    ),
+    entry!(
+        "next_js",
+        "Next.js",
+        ApplicationFramework,
+        "x-powered-by",
+        "Next.js",
+        "x_powered_by.next_js.v1"
+    ),
+];
+
+pub fn catalog_entries(version: CatalogVersion) -> impl Iterator<Item = &'static CatalogEntry> {
+    CATALOG.iter().chain(match version {
+        CatalogVersion::V1 => [].iter(),
+        CatalogVersion::V2 => CATALOG_V2_ADDITIONS.iter(),
+    })
+}
+
 fn numeric_version(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_VERSION_BYTES
@@ -295,7 +380,11 @@ impl TechnologyObservation {
     /// Validates the safe contract without needing (or exposing) raw headers.
     /// Only the original projection can establish the literal substring match.
     pub fn is_valid(&self) -> bool {
-        let Some(entry) = CATALOG.iter().find(|entry| {
+        self.is_valid_for_catalog(CatalogVersion::V1)
+    }
+
+    pub fn is_valid_for_catalog(&self, catalog: CatalogVersion) -> bool {
+        let Some(entry) = catalog_entries(catalog).find(|entry| {
             entry.rule_id == self.rule_id
                 && entry.product_id == self.product_id
                 && entry.name == self.name
@@ -336,7 +425,11 @@ impl TechnologyObservation {
 
 impl TechnologyAggregate {
     pub fn is_valid(&self) -> bool {
-        CATALOG.iter().any(|entry| {
+        self.is_valid_for_catalog(CatalogVersion::V1)
+    }
+
+    pub fn is_valid_for_catalog(&self, catalog: CatalogVersion) -> bool {
+        catalog_entries(catalog).any(|entry| {
             entry.product_id == self.product_id
                 && entry.name == self.name
                 && entry.catalog_category == self.catalog_category
@@ -399,12 +492,31 @@ fn token_end(bytes: &[u8], mut index: usize) -> usize {
 
 /// Adds at most the row cap. Returns true if a literal declaration was omitted.
 /// The caller applies the existing total-header/value/metadata budgets first.
+#[cfg(test)]
 pub(crate) fn observe_header(
     header_name: &str,
     value: &str,
     header_index: usize,
     observations: &mut Vec<TechnologyObservation>,
     budget: &mut TokenScanBudget,
+) -> bool {
+    observe_header_for_catalog(
+        header_name,
+        value,
+        header_index,
+        observations,
+        budget,
+        CatalogVersion::V1,
+    )
+}
+
+pub(crate) fn observe_header_for_catalog(
+    header_name: &str,
+    value: &str,
+    header_index: usize,
+    observations: &mut Vec<TechnologyObservation>,
+    budget: &mut TokenScanBudget,
+    catalog: CatalogVersion,
 ) -> bool {
     if !matches!(header_name, "server" | "x-powered-by" | "x-generator")
         || value.len() > MAX_HEADER_VALUE_BYTES
@@ -450,7 +562,7 @@ pub(crate) fn observe_header(
             index = token_end(bytes, index + 1).max(index + 1);
             continue;
         }
-        let entry = CATALOG.iter().find(|entry| {
+        let entry = catalog_entries(catalog).find(|entry| {
             entry.header_name == header_name
                 && entry.rule_id != "server.jetty_parenthesized.v1"
                 && value
@@ -479,8 +591,7 @@ pub(crate) fn observe_header(
             after = token_end(bytes, start);
             candidate = Some(ByteSpan { start, end: after });
         } else if entry.product_id == "jetty" && bytes.get(after) == Some(&b'(') {
-            entry = CATALOG
-                .iter()
+            entry = catalog_entries(catalog)
                 .find(|entry| entry.rule_id == "server.jetty_parenthesized.v1")
                 .unwrap();
             let start = after + 1;
@@ -572,6 +683,196 @@ mod tests {
         assert!(!budget.omitted);
         assert!(observations.iter().all(TechnologyObservation::is_valid));
         observations
+    }
+
+    fn parse_catalog(
+        header: &str,
+        value: &str,
+        catalog: CatalogVersion,
+    ) -> Vec<TechnologyObservation> {
+        let mut observations = vec![];
+        let mut budget = TokenScanBudget::default();
+        assert!(!observe_header_for_catalog(
+            header,
+            value,
+            7,
+            &mut observations,
+            &mut budget,
+            catalog
+        ));
+        assert!(!budget.omitted);
+        assert!(observations
+            .iter()
+            .all(|observation| observation.is_valid_for_catalog(catalog)));
+        observations
+    }
+
+    #[test]
+    fn header_technology_catalog_v2_literals_are_opt_in_and_preserve_exact_provenance() {
+        assert_eq!(CATALOG_V2_ADDITIONS.len(), 6);
+        assert_eq!(catalog_entries(CatalogVersion::V1).count(), CATALOG.len());
+        assert_eq!(
+            catalog_entries(CatalogVersion::V2).count(),
+            CATALOG.len() + 6
+        );
+        for entry in CATALOG_V2_ADDITIONS {
+            for (suffix, expected_status) in [
+                ("", VersionStatus::NotReported),
+                ("/12.3.4", VersionStatus::Reported),
+            ] {
+                let prefix = if entry.header_name == "server" {
+                    " \t(한글 😀) "
+                } else {
+                    " \t"
+                };
+                let literal = entry.literal.to_ascii_uppercase();
+                let value = format!("{prefix}{literal}{suffix}");
+                assert!(parse_catalog(entry.header_name, &value, CatalogVersion::V1).is_empty());
+                let observations = parse_catalog(entry.header_name, &value, CatalogVersion::V2);
+                assert_eq!(observations.len(), 1, "{}", entry.rule_id);
+                let observation = &observations[0];
+                assert_eq!(observation.product_id, entry.product_id);
+                assert_eq!(observation.name, entry.name);
+                assert_eq!(observation.catalog_category, entry.catalog_category);
+                assert_eq!(observation.rule_id, entry.rule_id);
+                assert_eq!(observation.header_index, 7);
+                assert_eq!(
+                    observation.product_span,
+                    ByteSpan {
+                        start: prefix.len(),
+                        end: prefix.len() + entry.literal.len()
+                    }
+                );
+                assert_eq!(observation.version_status, expected_status);
+                assert!(!observation.is_valid());
+                match observation.version_span {
+                    Some(span) => assert_eq!(&value[span.start..span.end], "12.3.4"),
+                    None => assert!(suffix.is_empty()),
+                }
+            }
+            for suffix in [
+                "/",
+                "/v1.2",
+                "/1.2-SENTINEL",
+                "/1..2",
+                "/1.2;SENTINEL",
+                "/123456789012345678901234567890123",
+            ] {
+                let observations = parse_catalog(
+                    entry.header_name,
+                    &format!("{}{suffix}", entry.literal),
+                    CatalogVersion::V2,
+                );
+                assert_eq!(
+                    observations[0].version_status,
+                    VersionStatus::UnsupportedFormat
+                );
+                assert!(observations[0].reported_version.is_none());
+                assert!(observations[0].version_span.is_none());
+                assert!(!serde_json::to_string(&observations)
+                    .unwrap()
+                    .contains("SENTINEL"));
+            }
+            for value in [
+                format!("not{}/1", entry.literal),
+                format!("{}extra/1", entry.literal),
+                format!("({}/1)", entry.literal),
+                format!("(ignored){}/1", entry.literal),
+            ] {
+                assert!(
+                    parse_catalog(entry.header_name, &value, CatalogVersion::V2).is_empty(),
+                    "{value}"
+                );
+            }
+            for header in [
+                "authorization",
+                "set-cookie",
+                "server-timing",
+                "x-generator",
+            ] {
+                assert!(parse_catalog(header, entry.literal, CatalogVersion::V2).is_empty());
+            }
+        }
+        assert!(parse_catalog("server", "Next.js/1", CatalogVersion::V2).is_empty());
+        assert!(parse_catalog("x-powered-by", "unknown Next.js/1", CatalogVersion::V2).is_empty());
+        assert!(parse_catalog("x-powered-by", "gunicorn/1", CatalogVersion::V2).is_empty());
+        let all = parse_catalog(
+            "server",
+            "gunicorn uvicorn waitress openresty LiteSpeed",
+            CatalogVersion::V2,
+        );
+        assert_eq!(
+            all.iter()
+                .map(|o| o.product_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gunicorn", "uvicorn", "waitress", "openresty", "litespeed"]
+        );
+        assert_eq!(all[3].catalog_category, CatalogCategory::WebServer);
+        assert_eq!(
+            parse_catalog(
+                "server",
+                "openresty/12345678901234567890123456789012",
+                CatalogVersion::V2
+            )[0]
+            .version_status,
+            VersionStatus::Reported
+        );
+    }
+
+    #[test]
+    fn header_technology_catalog_v2_uses_the_same_shared_token_and_header_bounds() {
+        for catalog in [CatalogVersion::V1, CatalogVersion::V2] {
+            for count in [
+                MAX_TOKEN_CANDIDATES_PER_ROW - 1,
+                MAX_TOKEN_CANDIDATES_PER_ROW,
+            ] {
+                let mut observations = vec![];
+                let mut budget = TokenScanBudget::default();
+                observe_header_for_catalog(
+                    "server",
+                    &"x ".repeat(count),
+                    0,
+                    &mut observations,
+                    &mut budget,
+                    catalog,
+                );
+                observe_header_for_catalog(
+                    "x-powered-by",
+                    "Next.js/1.2",
+                    1,
+                    &mut observations,
+                    &mut budget,
+                    catalog,
+                );
+                assert_eq!(budget.omitted, count == MAX_TOKEN_CANDIDATES_PER_ROW);
+                assert_eq!(
+                    observations.len(),
+                    usize::from(
+                        catalog == CatalogVersion::V2 && count < MAX_TOKEN_CANDIDATES_PER_ROW
+                    )
+                );
+            }
+            let mut observations = vec![];
+            let mut budget = TokenScanBudget::default();
+            observe_header_for_catalog(
+                "server",
+                "gunicorn/1",
+                MAX_HEADERS,
+                &mut observations,
+                &mut budget,
+                catalog,
+            );
+            observe_header_for_catalog(
+                "server",
+                &format!("gunicorn/{}", "1".repeat(MAX_HEADER_VALUE_BYTES)),
+                0,
+                &mut observations,
+                &mut budget,
+                catalog,
+            );
+            assert!(observations.is_empty());
+            assert_eq!(budget.candidates, 0);
+        }
     }
 
     #[test]

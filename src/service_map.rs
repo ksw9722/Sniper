@@ -138,6 +138,13 @@ pub struct ServiceMapSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceMap {
     pub schema_version: u32,
+    /// Absent means the legacy revision-1 contract; explicit requests are marked.
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_catalog_version: Option<u32>,
     pub session_id: Uuid,
     pub snapshot: ServiceMapSnapshot,
     pub in_scope_only: bool,
@@ -274,6 +281,13 @@ where
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceMapEvidence {
     pub schema_version: u32,
+    /// Absent means the legacy revision-1 contract; explicit requests are marked.
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_catalog_version: Option<u32>,
     pub session_id: Uuid,
     pub evidence_id: String,
     pub available: bool,
@@ -326,6 +340,7 @@ impl ServiceMapEvidence {
     pub(crate) fn missing(session_id: Uuid, evidence_id: String, reason: &str) -> Self {
         Self {
             schema_version: 1,
+            technology_catalog_version: None,
             session_id,
             evidence_id,
             available: false,
@@ -339,6 +354,7 @@ impl ServiceMapEvidence {
     pub(crate) fn found(session_id: Uuid, row: ServiceMapRow) -> Self {
         Self {
             schema_version: 1,
+            technology_catalog_version: None,
             session_id,
             evidence_id: row.evidence_id.clone(),
             available: true,
@@ -483,6 +499,14 @@ fn product(value: &str, expected: &str) -> bool {
 }
 
 pub(crate) fn project_record(record: &TransactionRecord, id: String) -> Option<ServiceMapRow> {
+    project_record_for_catalog(record, id, technology::CatalogVersion::V1)
+}
+
+pub(crate) fn project_record_for_catalog(
+    record: &TransactionRecord,
+    id: String,
+    catalog: technology::CatalogVersion,
+) -> Option<ServiceMapRow> {
     if record.method == "CONNECT" {
         return None;
     }
@@ -608,12 +632,13 @@ pub(crate) fn project_record(record: &TransactionRecord, id: String) -> Option<S
             continue;
         }
         let header_name = header.name.to_ascii_lowercase();
-        if technology::observe_header(
+        if technology::observe_header_for_catalog(
             &header_name,
             &header.value,
             index,
             row.technology_observations.as_mut().unwrap(),
             &mut technology_budget,
+            catalog,
         ) {
             row.omitted.push("technology_observations_limit".into());
         }
@@ -1010,7 +1035,7 @@ pub(crate) fn build(
             (&a.target_origin, &a.target_path).cmp(&(&b.target_origin, &b.target_path))
         });
     }
-    ServiceMap { schema_version: 1, session_id,
+    ServiceMap { schema_version: 1, technology_catalog_version: None, session_id,
         snapshot: ServiceMapSnapshot {
             window_order: "newest_capture_sequence".into(), id: Uuid::new_v4(), generation: snapshot.generation,
             captured_at: snapshot.captured_at,
@@ -1911,6 +1936,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_map_catalog_selection_precedes_row_caps_and_keeps_exact_identity() {
+        let mut first = record("/catalog-first");
+        first.response.as_mut().unwrap().headers = headers(&[(
+            "Server",
+            &format!(
+                "{}nginx/1.2",
+                "gunicorn/3 ".repeat(technology::MAX_OBSERVATIONS_PER_ROW)
+            ),
+        )]);
+        let mut second = first.clone();
+        second.path = "/catalog-second".into();
+        let session = Uuid::new_v4();
+        let store = TransactionStore::from_records(vec![first, second]);
+        let legacy = store.service_map_snapshot(session, 10).await;
+        let explicit_v1 = store
+            .service_map_snapshot_for_catalog(session, 10, technology::CatalogVersion::V1)
+            .await;
+        assert_eq!(
+            serde_json::to_vec(&legacy.rows).unwrap(),
+            serde_json::to_vec(&explicit_v1.rows).unwrap()
+        );
+        let v2 = store
+            .service_map_snapshot_for_catalog(session, 10, technology::CatalogVersion::V2)
+            .await;
+        for (old, new) in legacy.rows.iter().zip(&v2.rows) {
+            assert_eq!(old.evidence_id, new.evidence_id);
+            assert_eq!(old.sequence, new.sequence);
+            assert_eq!(old.record_id, new.record_id);
+            assert!(old.omitted.is_empty());
+            assert_eq!(old.technology_observations.as_ref().unwrap().len(), 1);
+            assert_eq!(
+                old.technology_observations.as_ref().unwrap()[0].product_id,
+                "nginx"
+            );
+            assert_eq!(
+                new.technology_observations.as_ref().unwrap().len(),
+                technology::MAX_OBSERVATIONS_PER_ROW
+            );
+            assert!(new
+                .technology_observations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|o| o.product_id == "gunicorn"));
+            assert_eq!(new.omitted, vec!["technology_observations_limit"]);
+            for (catalog, projected) in [
+                (technology::CatalogVersion::V1, old),
+                (technology::CatalogVersion::V2, new),
+            ] {
+                let evidence = store
+                    .service_map_evidence_for_catalog(
+                        session,
+                        &projected.evidence_id,
+                        false,
+                        catalog,
+                    )
+                    .await;
+                assert_eq!(
+                    serde_json::to_vec(evidence.row.as_ref().unwrap()).unwrap(),
+                    serde_json::to_vec(projected).unwrap()
+                );
+                assert!(evidence.technology_catalog_version.is_none());
+            }
+        }
+        assert_ne!(legacy.rows[0].evidence_id, legacy.rows[1].evidence_id);
+        let result = build(session, v2, 10, false, None, &[], &[]);
+        let aggregate = &result.origins[0].technology_observations.as_ref().unwrap()[0];
+        assert_eq!(aggregate.row_count, 2);
+        assert_eq!(aggregate.evidence.len(), 2);
+        assert!(aggregate.is_valid_for_catalog(technology::CatalogVersion::V2));
+        assert!(!aggregate.is_valid());
+    }
+
+    #[tokio::test]
+    async fn service_map_catalog_selection_precedes_origin_and_global_caps() {
+        for (rows, cap, marker) in [
+            (
+                technology::MAX_OBSERVATIONS_PER_ORIGIN,
+                technology::MAX_OBSERVATIONS_PER_ORIGIN,
+                "technology_observations_per_origin_limit",
+            ),
+            (
+                technology::MAX_OBSERVATIONS,
+                technology::MAX_OBSERVATIONS,
+                "technology_observations_map_limit",
+            ),
+        ] {
+            let records = (0..rows)
+                .map(|index| {
+                    let host = if rows == technology::MAX_OBSERVATIONS {
+                        format!("{}.example.com", index / 8)
+                    } else {
+                        "example.com".into()
+                    };
+                    let mut record = technology_record(&host, index);
+                    record.response.as_mut().unwrap().headers =
+                        headers(&[("Server", &format!("gunicorn/{index} nginx/{index}"))]);
+                    record
+                })
+                .collect();
+            let store = TransactionStore::from_records(records);
+            let session = Uuid::new_v4();
+            let legacy = build(
+                session,
+                store.service_map_snapshot(session, MAX_RECORDS).await,
+                MAX_RECORDS,
+                false,
+                None,
+                &[],
+                &[],
+            );
+            let v1 = build(
+                session,
+                store
+                    .service_map_snapshot_for_catalog(
+                        session,
+                        MAX_RECORDS,
+                        technology::CatalogVersion::V1,
+                    )
+                    .await,
+                MAX_RECORDS,
+                false,
+                None,
+                &[],
+                &[],
+            );
+            assert_eq!(
+                serde_json::to_vec(&legacy.origins).unwrap(),
+                serde_json::to_vec(&v1.origins).unwrap()
+            );
+            assert_eq!(legacy.snapshot.stopped_by, v1.snapshot.stopped_by);
+            assert!(!legacy.snapshot.stopped_by.contains(&marker.into()));
+            let v2 = build(
+                session,
+                store
+                    .service_map_snapshot_for_catalog(
+                        session,
+                        MAX_RECORDS,
+                        technology::CatalogVersion::V2,
+                    )
+                    .await,
+                MAX_RECORDS,
+                false,
+                None,
+                &[],
+                &[],
+            );
+            let observations: Vec<_> = v2
+                .origins
+                .iter()
+                .flat_map(|origin| origin.technology_observations.as_ref().unwrap())
+                .collect();
+            assert_eq!(observations.len(), cap);
+            assert!(observations
+                .iter()
+                .any(|observation| observation.product_id == "gunicorn"));
+            assert!(v2.snapshot.stopped_by.contains(&marker.into()));
+            assert!(!v2.snapshot.stopped_by.contains(&"metadata_bytes".into()));
+            assert_eq!(v2.snapshot.included_rows, rows);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_catalog_marker_absence_preserves_legacy_wire_shape() {
+        let result = map(vec![record("/legacy")]).await;
+        let mut value = serde_json::to_value(&result).unwrap();
+        assert!(!value
+            .as_object()
+            .unwrap()
+            .contains_key("technology_catalog_version"));
+        value["technology_catalog_version"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ServiceMap>(value).is_err());
+        let evidence =
+            ServiceMapEvidence::missing(result.session_id, "test".into(), "record_missing");
+        let mut value = serde_json::to_value(&evidence).unwrap();
+        assert!(!value
+            .as_object()
+            .unwrap()
+            .contains_key("technology_catalog_version"));
+        value["technology_catalog_version"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ServiceMapEvidence>(value).is_err());
+    }
+
+    #[tokio::test]
     async fn service_map_technology_aggregates_distinct_rows_without_selecting_a_version() {
         let mut first = record("/a");
         first.started_at = Utc::now() - chrono::Duration::hours(2);
@@ -2239,62 +2448,69 @@ mod tests {
             // No journal, storage directory, locators, app, or target is involved.
             let store = TransactionStore::from_records(records);
             let session = Uuid::new_v4();
-            let started = std::time::Instant::now();
-            let snapshot = store.service_map_snapshot(session, ROWS).await;
-            let elapsed = started.elapsed();
-            let projected_bytes = snapshot
-                .rows
-                .iter()
-                .map(|row| {
-                    let serialized = serde_json::to_string(row).unwrap();
-                    assert!(!serialized.contains("BODY_SENTINEL"));
-                    assert!(!serialized.contains("body_preview"));
-                    assert!(!serialized.contains("99.99"));
-                    assert_eq!(
-                        row.technology_observations.as_ref().unwrap().len(),
-                        observations_per_row
-                    );
-                    assert_eq!(row.metadata_complete, !expected_partial);
-                    assert_eq!(
-                        row.omitted.contains(&"technology_token_scan_limit".into()),
-                        expected_partial
-                    );
-                    serialized.len()
-                })
-                .sum::<usize>();
-            eprintln!(
-                "service-map header scan {scenario}: retained_rows={}, considered_rows={}, projected_rows={}, retained_header_bytes={}, projected_bytes={}, snapshot_elapsed={elapsed:?}",
+            for catalog in [
+                technology::CatalogVersion::V1,
+                technology::CatalogVersion::V2,
+            ] {
+                let started = std::time::Instant::now();
+                let snapshot = store
+                    .service_map_snapshot_for_catalog(session, ROWS, catalog)
+                    .await;
+                let elapsed = started.elapsed();
+                let projected_bytes = snapshot
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let serialized = serde_json::to_string(row).unwrap();
+                        assert!(!serialized.contains("BODY_SENTINEL"));
+                        assert!(!serialized.contains("body_preview"));
+                        assert!(!serialized.contains("99.99"));
+                        assert_eq!(
+                            row.technology_observations.as_ref().unwrap().len(),
+                            observations_per_row
+                        );
+                        assert_eq!(row.metadata_complete, !expected_partial);
+                        assert_eq!(
+                            row.omitted.contains(&"technology_token_scan_limit".into()),
+                            expected_partial
+                        );
+                        serialized.len()
+                    })
+                    .sum::<usize>();
+                eprintln!(
+                "service-map header scan catalog={catalog:?} {scenario}: retained_rows={}, considered_rows={}, projected_rows={}, retained_header_bytes={}, projected_bytes={}, snapshot_elapsed={elapsed:?}",
                 snapshot.retained_rows,
                 snapshot.considered_rows,
                 snapshot.rows.len(),
                 ROWS * header_bytes_per_row,
                 projected_bytes,
             );
-            assert_eq!(snapshot.retained_rows, ROWS);
-            assert_eq!(snapshot.considered_rows, ROWS);
-            assert_eq!(snapshot.rows.len(), ROWS);
-            assert_eq!(snapshot.omitted_rows, 0);
-            // Row reasons enter aggregate completeness in build(), while the
-            // snapshot's own limits still describe the retained row window.
-            assert!(snapshot.stopped_by.is_empty());
-            assert!(projected_bytes <= MAX_METADATA_BYTES);
-            let result = build(session, snapshot, ROWS, false, None, &[], &[]);
-            assert_eq!(result.snapshot.complete, !expected_partial);
-            assert_eq!(
-                result
-                    .snapshot
-                    .stopped_by
-                    .contains(&"technology_token_scan_limit".into()),
-                expected_partial
-            );
-            assert_eq!(result.snapshot.included_rows, ROWS);
-            assert_eq!(result.origins[0].request_count, ROWS);
-            assert!(result.origins[0]
-                .technology_observations
-                .as_ref()
-                .unwrap()
-                .iter()
-                .all(|observation| observation.row_count == ROWS));
+                assert_eq!(snapshot.retained_rows, ROWS);
+                assert_eq!(snapshot.considered_rows, ROWS);
+                assert_eq!(snapshot.rows.len(), ROWS);
+                assert_eq!(snapshot.omitted_rows, 0);
+                // Row reasons enter aggregate completeness in build(), while the
+                // snapshot's own limits still describe the retained row window.
+                assert!(snapshot.stopped_by.is_empty());
+                assert!(projected_bytes <= MAX_METADATA_BYTES);
+                let result = build(session, snapshot, ROWS, false, None, &[], &[]);
+                assert_eq!(result.snapshot.complete, !expected_partial);
+                assert_eq!(
+                    result
+                        .snapshot
+                        .stopped_by
+                        .contains(&"technology_token_scan_limit".into()),
+                    expected_partial
+                );
+                assert_eq!(result.snapshot.included_rows, ROWS);
+                assert_eq!(result.origins[0].request_count, ROWS);
+                assert!(result.origins[0]
+                    .technology_observations
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|observation| observation.row_count == ROWS));
+            }
         }
     }
 }

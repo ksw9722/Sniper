@@ -2042,3 +2042,183 @@ for (const extension of [true, false]) test(`candidate-limited exact row rejects
   assert.equal(await resolveTechnologySource(f, value), false); assert.equal(f.state.evidence, null);
   assert.match(f.els.detail.innerHTML, /Source unavailable/);
 });
+
+// Catalog negotiation is per metadata response: a single GET, no downgrade
+// retry, and no capability remembered across sessions or inspected sources.
+const catalogV2Products = [
+  ['gunicorn', 'Gunicorn', 'application_server', 'gunicorn', 'server'],
+  ['uvicorn', 'Uvicorn', 'application_server', 'uvicorn', 'server'],
+  ['waitress', 'Waitress', 'application_server', 'waitress', 'server'],
+  ['openresty', 'OpenResty', 'web_server', 'openresty', 'server'],
+  ['litespeed', 'LiteSpeed', 'web_server', 'LiteSpeed', 'server'],
+  ['next_js', 'Next.js', 'application_framework', 'Next.js', 'x-powered-by'],
+];
+const withCatalog = (payload, version = 2) => ({ ...payload, technology_catalog_version: version });
+const legacyCatalogNotice = 'Legacy server: catalog v1; additional declarations were not inspected.';
+const requestedCatalog = request => request.options.headers?.['X-Sniper-Technology-Catalog-Version'];
+
+test('GUI map and exact source request catalog 2 on exactly one GET each, without query negotiation', async () => {
+  const f = await technologyFixture(withCatalog(technologySnapshot()));
+  assert.equal(f.requests.length, 1); assert.equal(requestedCatalog(f.requests[0]), '2');
+  assert.equal(f.state.snapshot.technologyCatalogVersion, 2); assert.equal(f.state.snapshot.legacyCatalog, false);
+  assert.equal(await resolveTechnologySource(f, withCatalog(technologyEvidence())), true);
+  assert.equal(f.requests.length, 2); assert.equal(f.state.evidenceCatalogVersion, 2); assert.equal(f.state.evidenceLegacyCatalog, false);
+  for (const request of f.requests) {
+    assert.equal(request.options.method || 'GET', 'GET'); assert.equal(requestedCatalog(request), '2');
+    assert.doesNotMatch(request.url, /catalog|version=|body-references|transactions|replay|scan|capture/);
+  }
+  assert.doesNotMatch(f.els.status.textContent + f.els.detail.innerHTML, /Legacy server/);
+});
+
+test('old server ignores catalog header and strict unmarked v1 succeeds without fallback GET', async () => {
+  const f = await technologyFixture();
+  assert.equal(f.requests.length, 1); assert.equal(requestedCatalog(f.requests[0]), '2');
+  assert.equal(f.state.snapshot.technologyCatalogVersion, 1); assert.equal(f.state.snapshot.legacyCatalog, true);
+  assert.ok(f.els.status.textContent.includes(legacyCatalogNotice));
+  assert.equal(await resolveTechnologySource(f), true); assert.equal(f.requests.length, 2);
+  assert.equal(f.state.evidenceCatalogVersion, 1); assert.equal(f.state.evidenceLegacyCatalog, true);
+  assert.ok(f.els.detail.innerHTML.includes(legacyCatalogNotice));
+});
+
+test('normalization accepts explicit matching v1/v2 and unmarked v1, while markers must match the request', () => {
+  for (const version of [1, 2]) {
+    const value = map.normalizeSnapshot(withCatalog(technologySnapshot(), version), technologySession, version);
+    assert.equal(value.technologyCatalogVersion, version); assert.equal(value.legacyCatalog, false);
+  }
+  for (const requested of [1, 2]) {
+    assert.equal(map.normalizeSnapshot(technologySnapshot(), technologySession, requested).technologyCatalogVersion, 1);
+    assert.throws(() => map.normalizeSnapshot(withCatalog(technologySnapshot(), requested === 1 ? 2 : 1), technologySession, requested), /catalog version/);
+  }
+  for (const requested of [0, 3, '2', null]) assert.throws(() => map.normalizeSnapshot(technologySnapshot(), technologySession, requested), /requested technology catalog/);
+});
+
+for (const marker of [undefined, null, '2', '1', 0, 1, 3, 2.5, true, {}, [], [2]]) {
+  test(`map rejects present malformed or mismatched catalog marker without retry: ${JSON.stringify(marker)}`, async () => {
+    const f = fixture(); f.setSession(technologySession);
+    await f.load(withCatalog(technologySnapshot(), 2));
+    const previous = f.state.snapshot, pending = f.controller.refresh();
+    const payload = technologySnapshot(); payload.technology_catalog_version = marker;
+    f.requests.at(-1).resolve(response(payload)); assert.equal(await pending, false);
+    assert.equal(f.requests.length, 2); assert.equal(f.state.snapshot, previous); assert.match(f.state.error, /Refresh failed/);
+  });
+  test(`exact source rejects present malformed or mismatched catalog marker without retry: ${JSON.stringify(marker)}`, async () => {
+    const f = await technologyFixture(withCatalog(technologySnapshot()));
+    const payload = technologyEvidence(); payload.technology_catalog_version = marker;
+    assert.equal(await resolveTechnologySource(f, payload), false);
+    assert.equal(f.requests.length, 2); assert.equal(f.state.evidence, null); assert.equal(f.state.evidenceCatalogVersion, null);
+    assert.equal(f.state.evidenceLegacyCatalog, false); assert.match(f.state.evidenceError, /Source unavailable/);
+  });
+}
+
+for (const product of catalogV2Products) test(`v2 literal ${product[0]} is scoped to catalog 2, with unchanged reported/unknown versions`, async () => {
+  for (const [version, status] of [['10.2.003', 'reported'], [null, 'not_reported'], [null, 'unsupported_format']]) {
+    const row = technologyRow(product, version, { version_status: status });
+    const payload = withCatalog(technologySnapshot([technologyAggregate(row)]));
+    assert.equal(map.normalizeRowTechnologies([row], 2)[0].product_id, product[0]);
+    assert.throws(() => map.normalizeRowTechnologies([row]), /Invalid retained technology observations/);
+    assert.throws(() => map.normalizeSnapshot({ ...payload, technology_catalog_version: 1 }, technologySession, 1), /Invalid retained technology observations/);
+    const unmarked = { ...payload }; delete unmarked.technology_catalog_version;
+    assert.throws(() => map.normalizeSnapshot(unmarked, technologySession), /Invalid retained technology observations/);
+    const f = await technologyFixture(payload);
+    assert.equal(await resolveTechnologySource(f, withCatalog(technologyEvidence([row]))), true);
+    assert.equal(f.state.evidence.technology_observations.length, 1);
+    assert.equal(f.state.evidence.technology_observations[0].product_id, product[0]);
+    assert.ok(f.els.detail.innerHTML.includes(version ? `Reported version: ${version}` : `unknown (${status === 'not_reported' ? 'not reported' : 'unsupported format'})`));
+    assert.equal(await resolveTechnologySource(f, technologyEvidence([row])), false, 'a v2 map never permits v2 evidence in an unmarked response');
+    assert.equal(f.requests.length, 3);
+  }
+});
+
+test('v2 observations do not invent language runtimes, frameworks, proxies, or companion products', async () => {
+  const rows = catalogV2Products.map((product, header_index) => technologyRow(product, null, { header_index }));
+  const f = await technologyFixture(withCatalog(technologySnapshot(rows.map(row => technologyAggregate(row)))));
+  assert.equal(await resolveTechnologySource(f, withCatalog(technologyEvidence(rows))), true);
+  assert.deepEqual(Array.from(f.state.evidence.technology_observations, item => item.product_id), catalogV2Products.map(product => product[0]));
+  assert.deepEqual(Array.from(f.state.snapshot.origins[0].technology_observations, item => item.product_id), catalogV2Products.map(product => product[0]));
+  assert.doesNotMatch(f.els.detail.innerHTML, /Python|Node\.js|React|nginx|load balancer|reverse proxy/);
+  assert.equal(f.state.snapshot.origins[0].technology_clues.length, 0);
+});
+
+for (const [name, patch] of [
+  ['v2 rule suffix', { rule_id: 'server.gunicorn.v2' }],
+  ['invented category', { catalog_category: 'language_runtime' }],
+  ['wrong literal span', { product_span: { start: 0, end: 7 } }],
+  ['wrong header', { header_name: 'x-powered-by', rule_id: 'x_powered_by.gunicorn.v1' }],
+  ['unsupported reported suffix', { reported_version: '2.1-beta' }],
+  ['invented non-product status', { reported_version: null, version_status: 'non_product_version', version_span: null }],
+]) test(`v2 retains closed identity/span/version checks: ${name}`, async () => {
+  const row = technologyRow(catalogV2Products[0], '2.1', patch);
+  const f = await technologyFixture(withCatalog(technologySnapshot()));
+  assert.equal(await resolveTechnologySource(f, withCatalog(technologyEvidence([row]))), false);
+  assert.equal(f.requests.length, 2);
+});
+
+for (const kind of ['map', 'evidence']) for (const failure of ['http', 'network', 'json']) test(`${kind} ${failure} failure adds no catalog retry`, async () => {
+  const f = fixture();
+  if (kind === 'evidence') { await f.load(withCatalog(snapshot())); f.controller.selectOrigin(originA); }
+  const baseline = f.requests.length;
+  const pending = kind === 'map' ? f.controller.refresh() : f.controller.loadEvidence('evidence-one');
+  const request = f.requests.at(-1);
+  if (failure === 'http') request.resolve(response({}, 400));
+  if (failure === 'network') request.reject(new Error('offline'));
+  if (failure === 'json') request.resolve({ ok: true, json: async () => { throw new Error('bad JSON'); } });
+  assert.equal(await pending, false); assert.equal(f.requests.length, baseline + 1);
+  assert.equal(requestedCatalog(request), '2');
+});
+
+test('newest map response owns catalog state even when old-server JSON completes last', async () => {
+  const f = fixture(), parse = deferred(), old = f.controller.refresh();
+  f.requests[0].resolve({ ok: true, json: () => parse.promise }); await Promise.resolve();
+  const current = f.controller.refresh({ force: true });
+  f.requests[1].resolve(response(withCatalog(snapshot()))); await current;
+  parse.resolve(snapshot()); await old;
+  assert.equal(f.state.snapshot.technologyCatalogVersion, 2); assert.equal(f.state.snapshot.legacyCatalog, false);
+  assert.doesNotMatch(f.els.status.textContent, /Legacy server/); assert.equal(f.requests.length, 2);
+});
+
+test('source catalog is validated independently and a later inspection clears fallback state', async () => {
+  const f = await technologyFixture(withCatalog(technologySnapshot()));
+  assert.equal(await resolveTechnologySource(f), true); assert.equal(f.state.evidenceLegacyCatalog, true);
+  const pending = f.controller.loadEvidence(technologyToken());
+  assert.equal(f.state.evidenceLegacyCatalog, false); assert.equal(f.state.evidenceCatalogVersion, null);
+  f.requests.at(-1).resolve(response(withCatalog(technologyEvidence()))); await pending;
+  assert.equal(f.state.evidenceLegacyCatalog, false); assert.equal(f.state.evidenceCatalogVersion, 2);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Legacy server/); assert.equal(f.requests.length, 3);
+});
+
+test('map catalog transition invalidates an in-flight source and does not cache old-server capability', async () => {
+  const f = await technologyFixture(withCatalog(technologySnapshot()));
+  const pending = f.controller.loadEvidence(technologyToken()), old = f.requests.at(-1);
+  await f.load(technologySnapshot());
+  old.resolve(response(withCatalog(technologyEvidence()))); assert.equal(await pending, false);
+  assert.equal(f.state.evidence, null); assert.equal(f.state.evidenceCatalogVersion, null);
+  assert.equal(f.state.snapshot.technologyCatalogVersion, 1);
+  await f.load(withCatalog(technologySnapshot()));
+  assert.equal(f.state.snapshot.technologyCatalogVersion, 2);
+  assert.equal(f.requests.length, 4); assert.ok(f.requests.every(request => requestedCatalog(request) === '2'));
+});
+
+test('session changes discard pending catalog data and the next session negotiates afresh', async () => {
+  const f = await technologyFixture(withCatalog(technologySnapshot()));
+  const pending = f.controller.loadEvidence(technologyToken()), old = f.requests.at(-1), parse = deferred();
+  old.resolve({ ok: true, json: () => parse.promise }); await Promise.resolve();
+  f.setSession('session-two'); f.controller.reset();
+  assert.equal(f.state.snapshot, null); assert.equal(f.state.evidenceCatalogVersion, null);
+  await f.load(snapshot(undefined, 'session-two'));
+  parse.resolve(withCatalog(technologyEvidence())); assert.equal(await pending, false);
+  assert.equal(f.state.evidence, null); assert.equal(f.state.snapshot.technologyCatalogVersion, 1);
+  f.setSession(technologySession); await f.load(withCatalog(technologySnapshot()));
+  assert.equal(f.state.snapshot.technologyCatalogVersion, 2); assert.equal(f.state.snapshot.legacyCatalog, false);
+  assert.equal(f.requests.length, 4); assert.ok(f.requests.every(request => requestedCatalog(request) === '2'));
+});
+
+test('catalog header never reaches the existing explicit body-reference request and unchanged polls preserve it', async () => {
+  const f = fixture(); await f.load(withCatalog(snapshot())); f.controller.selectOrigin(originA, 0);
+  const pending = f.controller.loadEvidence('evidence-one'); f.requests.at(-1).resolve(response(withCatalog(evidence()))); await pending;
+  assert.equal(f.requests.length, 2);
+  assert.equal(await resolveBodyReferences(f), true); const result = f.state.bodyReferences;
+  assert.equal(f.requests.length, 3); assert.equal(f.requests[2].options.headers, undefined);
+  await f.load(withCatalog(snapshot()));
+  assert.equal(f.requests.length, 4); assert.equal(f.state.bodyReferences, result);
+  assert.equal(requestedCatalog(f.requests[3]), '2');
+});

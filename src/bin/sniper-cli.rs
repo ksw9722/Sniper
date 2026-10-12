@@ -40,6 +40,7 @@ use sniper::{
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     service_map::{ServiceMap, ServiceMapEvidence, ServiceMapSocketPeerStatus},
     service_map_body::ServiceMapBodyReferences,
+    service_map_technology::CatalogVersion,
     session::{validate_session_creation_name, SessionSummary},
     skills,
     workspace::{
@@ -49,6 +50,9 @@ use sniper::{
 };
 use url::Url;
 use uuid::Uuid;
+
+const SERVICE_MAP_CATALOG_HEADER: &str = "X-Sniper-Technology-Catalog-Version";
+const SERVICE_MAP_LEGACY_CATALOG_WARNING: &str = "Warning: Service Map API returned legacy technology catalog v1; technology coverage is limited to v1.";
 
 const DEFAULT_READ_LIST_LIMIT: usize = 100;
 const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
@@ -886,6 +890,9 @@ struct ServiceMapArgs {
     /// Bound the retained rows considered; incomplete results say why.
     #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
     max_records: usize,
+    /// Select the literal response-header technology catalog (default: 2).
+    #[arg(long, default_value_t = 2, value_parser = parse_service_map_catalog_version)]
+    technology_catalog_version: u32,
 }
 
 #[derive(Subcommand, Debug)]
@@ -909,6 +916,9 @@ struct ServiceMapBodyReferencesArgs {
 
 #[derive(Args, Debug)]
 struct ServiceMapEvidenceArgs {
+    /// Select the literal response-header technology catalog (default: 2).
+    #[arg(long, default_value_t = 2, value_parser = parse_service_map_catalog_version)]
+    technology_catalog_version: u32,
     /// Use the exact session returned by the map; never resolve evidence across sessions.
     #[arg(long)]
     session_id: Uuid,
@@ -918,6 +928,25 @@ struct ServiceMapEvidenceArgs {
     /// Opaque evidence token returned by the map, not a transaction UUID.
     #[arg(long, value_parser = parse_service_map_evidence_id)]
     evidence_id: String,
+}
+
+fn parse_service_map_catalog_version(value: &str) -> std::result::Result<u32, String> {
+    match value {
+        "1" => Ok(1),
+        "2" => Ok(2),
+        _ => Err("technology-catalog-version must be 1 or 2".into()),
+    }
+}
+
+fn call_service_map_catalog_version(input: &Value) -> Result<u32> {
+    match input.get("technology_catalog_version") {
+        None => Ok(2),
+        Some(value) => value
+            .as_u64()
+            .filter(|version| matches!(*version, 1 | 2))
+            .map(|version| version as u32)
+            .ok_or_else(|| anyhow!("field `technology_catalog_version` must be integer 1 or 2")),
+    }
 }
 
 fn parse_service_map_origin(value: &str) -> std::result::Result<String, String> {
@@ -3308,8 +3337,10 @@ fn service_map_object(properties: Value) -> Value {
 
 // Keep product identities tied to the parser's fixed catalog. Header values and
 // arbitrary server declarations must never become output-schema alternatives.
-fn service_map_technology_schema(exact_row: bool) -> Value {
-    use sniper::service_map_technology::{CATALOG, MAX_OBSERVATIONS_PER_ROW, MAX_VERSION_BYTES};
+fn service_map_technology_schema(exact_row: bool, catalog_version: CatalogVersion) -> Value {
+    use sniper::service_map_technology::{
+        catalog_entries, MAX_OBSERVATIONS_PER_ROW, MAX_VERSION_BYTES,
+    };
     let span = service_map_object(json!({
         "start":{"type":"integer","minimum":0,"maximum":4095},
         "end":{"type":"integer","minimum":1,"maximum":4096}
@@ -3360,7 +3391,7 @@ fn service_map_technology_schema(exact_row: bool) -> Value {
     }
     let required: Vec<_> = properties.keys().cloned().collect();
     schema["required"] = json!(required);
-    let catalog: Vec<_> = CATALOG.iter().map(|entry| {
+    let catalog: Vec<_> = catalog_entries(catalog_version).map(|entry| {
         let mut fields = json!({
             "product_id":{"enum":[entry.product_id]},"name":{"enum":[entry.name]},
             "catalog_category":{"enum":[entry.catalog_category]},
@@ -3390,6 +3421,24 @@ fn service_map_technology_schema(exact_row: bool) -> Value {
         schema["allOf"][1]["oneOf"][1]["properties"]["version_span"] = json!({"type":"null"});
         schema["description"] = json!(format!("Literal allowlisted response-header declaration with UTF-8 byte spans. At most {MAX_OBSERVATIONS_PER_ROW} per exact retained row; no inferred software identity."));
     }
+    schema
+}
+
+// The union supports negotiated v2 without allowing an unmarked legacy response
+// to claim products that its effective v1 catalog cannot recognize.
+fn service_map_catalog_output_schema(mut schema: Value, exact_row: bool) -> Value {
+    schema["properties"]["technology_catalog_version"] = json!({"type":"integer","enum":[1,2],"description":"Present only when the API recognizes catalog negotiation. Absence means legacy v1 coverage; rule IDs retain their own version."});
+    let observations =
+        json!({"items":service_map_technology_schema(exact_row, CatalogVersion::V1)});
+    let legacy_properties = if exact_row {
+        json!({"technology_catalog_version":{"enum":[1]},"row":{"properties":{"technology_observations":observations}}})
+    } else {
+        json!({"technology_catalog_version":{"enum":[1]},"origins":{"items":{"properties":{"technology_observations":observations}}}})
+    };
+    schema["allOf"] = json!([{"anyOf":[
+        {"required":["technology_catalog_version"],"properties":{"technology_catalog_version":{"enum":[2]}}},
+        {"properties":legacy_properties}
+    ]}]);
     schema
 }
 
@@ -3471,7 +3520,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             "metadata_complete":boolean,"omitted":strings
         }));
         row["properties"]["technology_observations"] = json!({
-            "type":"array","maxItems":8,"items":service_map_technology_schema(true)
+            "type":"array","maxItems":8,"items":service_map_technology_schema(true, CatalogVersion::V2)
         });
         let mut schema = service_map_object(json!({
             "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":string,
@@ -3503,7 +3552,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             {"properties":{"available":{"enum":[true]},"reason":{"type":"null"},"row":{"type":"object"}}},
             {"properties":{"available":{"enum":[false]},"reason":{"type":"string"},"row":{"type":"null"},"socket_peer":{"enum":[]}}}
         ]);
-        return Some(schema);
+        return Some(service_map_catalog_output_schema(schema, true));
     }
     let endpoint = service_map_object(json!({
         "method":string,"path":string,"path_group":{"type":["string","null"]},
@@ -3533,7 +3582,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "header_links":{"type":"array","items":links}
     }));
     origin["properties"]["technology_observations"] = json!({
-        "type":"array","maxItems":32,"items":service_map_technology_schema(false)
+        "type":"array","maxItems":32,"items":service_map_technology_schema(false, CatalogVersion::V2)
     });
     let mut limits = serde_json::Map::new();
     for field in [
@@ -3576,21 +3625,26 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "excluded_rows":count,"omitted_rows":count,"origin_count":count,"endpoint_count":count,
         "complete":boolean,"stopped_by":strings,"limits":limits
     }));
-    Some(service_map_object(json!({
-        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
-        "in_scope_only":boolean,"origin_filter":{"type":["string","null"]},
-        "origins":{"type":"array","items":origin},"unavailable":strings,"deferred":strings,"warnings":strings
-    })))
+    Some(service_map_catalog_output_schema(
+        service_map_object(json!({
+            "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
+            "in_scope_only":boolean,"origin_filter":{"type":["string","null"]},
+            "origins":{"type":"array","items":origin},"unavailable":strings,"deferred":strings,"warnings":strings
+        })),
+        false,
+    ))
 }
 
 fn service_map_input_schema(operation: &str) -> Option<Value> {
     let uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
     let evidence_pattern =
         format!("^v1\\.{uuid}\\.{uuid}\\.(0|[1-9][0-9]{{0,19}})\\.{uuid}\\.{uuid}$");
+    let catalog = json!({"type":"integer","enum":[1,2],"default":2,"description":"Request this technology catalog using an API-only header. One target GET, without retries or fallback requests. An unmarked legacy response is strictly v1 and reports reduced coverage on stderr."});
     match operation {
         "target.service_map.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":[],
             "properties":{
+                "technology_catalog_version":catalog,
                 "session_id":legacy_uuid_input_schema(true, "Read this retained session without switching it. Omitted or null pins the active session once."),
                 "origin":{"type":["string","null"],"description":"Exact canonical HTTP(S) origin (for example https://example.com), without path, credentials, query, fragment, or explicit default port. Omitted or null selects all observed origins."},
                 "in_scope_only":{"type":["boolean","null"],"default":false,"description":"Filter retained rows using the session's current shared scope matcher. Null uses false."},
@@ -3607,6 +3661,7 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
         "target.service_map.evidence.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
             "properties":{
+                "technology_catalog_version":catalog,
                 "include_socket_peer":{"type":"boolean","default":false,"description":"Explicitly read one retained observed socket peer after exact-token validation. Does not enable capture, probe, aggregate peers or infer origin ownership. Omission preserves the default evidence shape."},
                 "session_id":legacy_uuid_input_schema(false, "Exact session UUID returned by the service map. Always explicit, including for inactive sessions."),
                 "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete v1 evidence token returned by the map, with canonical UUID components and an unsigned 64-bit sequence. At most 200 UTF-8 bytes; pass unchanged, not a transaction UUID."}
@@ -3652,12 +3707,12 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
     vec![
         op(
             "target.service_map.get",
-            "scope service-map",
-            "Read a bounded passive inventory from retained captured metadata. No requests to mapped services, scans, replay, or crawling. Counts include duplicate-ID rows; inspect completeness and unavailable fields.",
+            "scope service-map [--technology-catalog-version <1|2>]",
+            "Read a bounded passive inventory from retained captured metadata. No requests to mapped services, scans, replay, or crawling. Counts include duplicate-ID rows; inspect completeness and unavailable fields. Catalog 2 is requested by default; explicit 1 limits coverage. Legacy servers return strict v1 with a stderr warning; negotiation never adds requests or retries.",
             CliSideEffect::Read,
             false,
             &[],
-            vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":true,"max_records":10000})],
+            vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":true,"max_records":10000,"technology_catalog_version":2}), json!({"technology_catalog_version":1})],
         ),
         op(
             "target.service_map.body_references.get",
@@ -3670,12 +3725,12 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
         ),
         op(
             "target.service_map.evidence.get",
-            "scope service-map-evidence --session-id <uuid> --evidence-id <token> [--include-socket-peer]",
-            "Read safe metadata for an exact retained row using its session-bound opaque evidence token. Stale, edited, deleted, or ambiguous evidence is explicitly unavailable; never falls back to UUID-only history lookup. Explicit include_socket_peer adds one retained observation without enabling capture or probing; socket peers do not prove origin ownership.",
+            "scope service-map-evidence --session-id <uuid> --evidence-id <token> [--include-socket-peer] [--technology-catalog-version <1|2>]",
+            "Read safe metadata for an exact retained row using its session-bound opaque evidence token. Stale, edited, deleted, or ambiguous evidence is explicitly unavailable; never falls back to UUID-only history lookup. Explicit include_socket_peer adds one retained observation without enabling capture or probing; socket peers do not prove origin ownership. Catalog 2 is requested by default; explicit 1 limits coverage. An unmarked legacy response is strictly v1 with a stderr warning; no negotiation retries or fallback requests.",
             CliSideEffect::Read,
             false,
             &["session_id", "evidence_id"],
-            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"}), json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","include_socket_peer":true})],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","technology_catalog_version":2}), json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","include_socket_peer":true,"technology_catalog_version":1})],
         ),
     ]
 }
@@ -4426,8 +4481,19 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "note",
             "clear_note",
         ],
-        "target.service_map.get" => &["session_id", "origin", "in_scope_only", "max_records"],
-        "target.service_map.evidence.get" => &["session_id", "evidence_id", "include_socket_peer"],
+        "target.service_map.get" => &[
+            "session_id",
+            "origin",
+            "in_scope_only",
+            "max_records",
+            "technology_catalog_version",
+        ],
+        "target.service_map.evidence.get" => &[
+            "session_id",
+            "evidence_id",
+            "include_socket_peer",
+            "technology_catalog_version",
+        ],
         "target.service_map.body_references.get" => &["session_id", "evidence_id"],
         "scope.get" => &["session_id"],
         "scope.set" => &[
@@ -4617,12 +4683,14 @@ fn command_input_preview(command: &Command) -> Value {
                     "in_scope_only": args.in_scope_only,
                     "origin": args.origin,
                     "max_records": args.max_records,
+                    "technology_catalog_version": args.technology_catalog_version,
                 }),
             },
             TargetCommand::ServiceMapEvidence(args) => json!({
                 "session_id": args.session_id,
                 "evidence_id": args.evidence_id,
                 "include_socket_peer": args.include_socket_peer,
+                "technology_catalog_version": args.technology_catalog_version,
             }),
             TargetCommand::GetScope(args) => json!({ "session_id": args.session_id }),
             TargetCommand::SetScope(args) => json!({
@@ -5003,11 +5071,15 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 Some(ServiceMapCommand::BodyReferences(args)) => {
                     api_preview("GET", service_map_body_references_path(args), None)
                 }
-                None => api_preview("GET", service_map_path(args, args.session_id), None),
+                None => service_map_catalog_api_preview(
+                    service_map_path(args, args.session_id),
+                    args.technology_catalog_version,
+                ),
             },
-            TargetCommand::ServiceMapEvidence(args) => {
-                api_preview("GET", service_map_evidence_path(args), None)
-            }
+            TargetCommand::ServiceMapEvidence(args) => service_map_catalog_api_preview(
+                service_map_evidence_path(args),
+                args.technology_catalog_version,
+            ),
             TargetCommand::GetScope(args) => api_preview(
                 "GET",
                 session_query_path("/api/runtime", args.session_id),
@@ -5471,6 +5543,12 @@ fn findings_api_preview(command: &FindingsCommand) -> Value {
     api_preview("GET", path, None)
 }
 
+fn service_map_catalog_api_preview(path: String, version: u32) -> Value {
+    let mut preview = api_preview("GET", path, None);
+    preview["headers"] = json!({(SERVICE_MAP_CATALOG_HEADER):version.to_string()});
+    preview
+}
+
 fn api_preview(method: &str, path: impl Into<String>, body: Option<Value>) -> Value {
     json!({
         "method": method,
@@ -5492,6 +5570,7 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             notes.push("Literal absolute HTTP(S) references do not prove calls or ownership. Results expose canonical origins and retained UTF-8 preview byte offsets, never body text or full URLs. Completeness applies only to the supported bounded literal grammar.");
         } else {
             notes.push("Offline preview only. Execution reads retained metadata from one pinned session; it never probes, scans, replays, crawls, or follows service redirects.");
+            notes.push("The API-only technology catalog header requests catalog 2 by default or explicit catalog 1. One target GET is made, with no negotiation retries or fallback requests. An unmarked legacy response is validated only as v1 and reports reduced coverage on stderr.");
             notes.push("Counts include retained rows with duplicate UUIDs. Inspect completeness and unavailable data; evidence tokens identify exact row states and never fall back to UUID-only lookup.");
         }
     }
@@ -5964,6 +6043,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                         })
                         .transpose()?,
                     max_records,
+                    technology_catalog_version: call_service_map_catalog_version(input)?,
                 }),
             }
         }
@@ -5983,6 +6063,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     origin: None,
                     in_scope_only: false,
                     max_records: 10_000,
+                    technology_catalog_version: 2,
                 }),
             }
         }
@@ -5992,6 +6073,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
             Command::Scope {
                 command: TargetCommand::ServiceMapEvidence(ServiceMapEvidenceArgs {
+                    technology_catalog_version: call_service_map_catalog_version(input)?,
                     session_id: call_required(operation, input, "session_id")?,
                     evidence_id,
                     include_socket_peer: match input.get("include_socket_peer") {
@@ -7845,7 +7927,20 @@ async fn service_map_get<T: DeserializeOwned>(
     client: &reqwest::Client,
     path: &str,
 ) -> Result<T> {
-    let response = client.get(api.url(path)).send().await.map_err(|_| {
+    service_map_get_with_catalog(api, client, path, None).await
+}
+
+async fn service_map_get_with_catalog<T: DeserializeOwned>(
+    api: &ApiClient,
+    client: &reqwest::Client,
+    path: &str,
+    catalog_version: Option<u32>,
+) -> Result<T> {
+    let mut request = client.get(api.url(path));
+    if let Some(version) = catalog_version {
+        request = request.header(SERVICE_MAP_CATALOG_HEADER, version.to_string());
+    }
+    let response = request.send().await.map_err(|_| {
         service_map_error(
             "API_UNAVAILABLE",
             "Could not read Service Map metadata from the selected API",
@@ -7884,7 +7979,10 @@ fn service_map_safe_origin(origin: &str) -> bool {
     sniper::service_map::canonical_origin(origin).as_deref() == Some(origin)
 }
 
-fn service_map_technology_response_valid(result: &ServiceMap) -> bool {
+fn service_map_technology_response_valid(
+    result: &ServiceMap,
+    catalog_version: CatalogVersion,
+) -> bool {
     use sniper::service_map_technology::{
         MAX_OBSERVATIONS, MAX_OBSERVATIONS_PER_ORIGIN, MAX_OBSERVATIONS_PER_ROW,
         MAX_TOKEN_CANDIDATES_PER_ROW, MAX_VERSION_BYTES,
@@ -7926,7 +8024,7 @@ fn service_map_technology_response_valid(result: &ServiceMap) -> bool {
         let mut keys = std::collections::BTreeSet::new();
         for observation in observations {
             let mut rows = std::collections::HashSet::new();
-            if !observation.is_valid()
+            if !observation.is_valid_for_catalog(catalog_version)
                 || observation.row_count > origin.request_count
                 || observation.first_seen < origin.first_seen
                 || observation.last_seen > origin.last_seen
@@ -8000,7 +8098,10 @@ fn service_map_technology_response_valid(result: &ServiceMap) -> bool {
             }))
 }
 
-fn service_map_row_technology_valid(row: &sniper::service_map::ServiceMapRow) -> bool {
+fn service_map_row_technology_valid(
+    row: &sniper::service_map::ServiceMapRow,
+    catalog_version: CatalogVersion,
+) -> bool {
     use sniper::service_map_technology::MAX_OBSERVATIONS_PER_ROW;
     if row.metadata_complete
         && row
@@ -8023,7 +8124,7 @@ fn service_map_row_technology_valid(row: &sniper::service_map::ServiceMapRow) ->
             .any(|reason| reason == "technology_observations_limit")
             || observations.len() == MAX_OBSERVATIONS_PER_ROW)
         && observations.iter().all(|observation| {
-            observation.is_valid()
+            observation.is_valid_for_catalog(catalog_version)
                 && std::iter::once(observation.product_span)
                     .chain(observation.version_span)
                     .all(|span| {
@@ -8043,14 +8144,42 @@ fn service_map_row_technology_valid(row: &sniper::service_map::ServiceMapRow) ->
         })
 }
 
+fn service_map_response_catalog(marker: Option<u32>, requested: u32) -> Result<CatalogVersion> {
+    match marker {
+        None => Ok(CatalogVersion::V1),
+        Some(version) if version == requested => {
+            CatalogVersion::from_number(version).ok_or_else(|| {
+                service_map_error(
+                    "INVALID_RESPONSE",
+                    "Service Map returned an unsupported technology catalog",
+                )
+            })
+        }
+        Some(_) => Err(service_map_error(
+            "INVALID_RESPONSE",
+            "Service Map technology catalog does not match the requested catalog",
+        )),
+    }
+}
+
+fn warn_legacy_service_map_catalog(marker: Option<u32>) {
+    if marker.is_none() {
+        eprintln!("{SERVICE_MAP_LEGACY_CATALOG_WARNING}");
+    }
+}
+
 fn validate_service_map_response(
     result: &ServiceMap,
     args: &ServiceMapArgs,
     session_id: Uuid,
 ) -> Result<()> {
+    let catalog_version = service_map_response_catalog(
+        result.technology_catalog_version,
+        args.technology_catalog_version,
+    )?;
     let snapshot = &result.snapshot;
     let valid = result.schema_version == 1
-        && service_map_technology_response_valid(result)
+        && service_map_technology_response_valid(result, catalog_version)
         && result.session_id == session_id
         && result.in_scope_only == args.in_scope_only
         && result.origin_filter == args.origin
@@ -8110,6 +8239,10 @@ fn validate_service_map_evidence_response(
     result: &ServiceMapEvidence,
     args: &ServiceMapEvidenceArgs,
 ) -> Result<()> {
+    let catalog_version = service_map_response_catalog(
+        result.technology_catalog_version,
+        args.technology_catalog_version,
+    )?;
     let token_fields: Vec<_> = args.evidence_id.split('.').collect();
     let token_valid = parse_service_map_evidence_id(&args.evidence_id).is_ok();
     let row_valid = match (
@@ -8130,7 +8263,7 @@ fn validate_service_map_evidence_response(
                 && service_map_safe_origin(&row.origin)
                 && matches!(row.scheme.as_str(), "http" | "https")
                 && service_map_safe_path(&row.path)
-                && service_map_row_technology_valid(row)
+                && service_map_row_technology_valid(row, catalog_version)
                 && row.redirect.as_ref().is_none_or(|redirect| {
                     service_map_safe_origin(&redirect.target_origin)
                         && service_map_safe_path(&redirect.target_path)
@@ -8356,9 +8489,15 @@ async fn read_service_map(api: &ApiClient, args: &ServiceMapArgs) -> Result<Serv
             anyhow!("no active session; pass --session-id to choose a session explicitly")
         })?
     };
-    let result: ServiceMap =
-        service_map_get(api, &client, &service_map_path(args, Some(session_id))).await?;
+    let result: ServiceMap = service_map_get_with_catalog(
+        api,
+        &client,
+        &service_map_path(args, Some(session_id)),
+        Some(args.technology_catalog_version),
+    )
+    .await?;
     validate_service_map_response(&result, args, session_id)?;
+    warn_legacy_service_map_catalog(result.technology_catalog_version);
     Ok(result)
 }
 
@@ -8367,9 +8506,15 @@ async fn read_service_map_evidence(
     args: &ServiceMapEvidenceArgs,
 ) -> Result<ServiceMapEvidence> {
     let client = service_map_read_client()?;
-    let result: ServiceMapEvidence =
-        service_map_get(api, &client, &service_map_evidence_path(args)).await?;
+    let result: ServiceMapEvidence = service_map_get_with_catalog(
+        api,
+        &client,
+        &service_map_evidence_path(args),
+        Some(args.technology_catalog_version),
+    )
+    .await?;
     validate_service_map_evidence_response(&result, args)?;
+    warn_legacy_service_map_catalog(result.technology_catalog_version);
     Ok(result)
 }
 
@@ -16942,7 +17087,7 @@ mod tests {
         let defaults = command_from_operation_input("target.service_map.get", &json!({})).unwrap();
         assert_eq!(
             command_input_preview(&defaults),
-            json!({"session_id":null,"origin":null,"in_scope_only":false,"max_records":10000})
+            json!({"session_id":null,"origin":null,"in_scope_only":false,"max_records":10000,"technology_catalog_version":2})
         );
         let nulls = command_from_operation_input(
             "target.service_map.get",
@@ -17062,6 +17207,7 @@ mod tests {
             vec!["--origin", "https://example.com"],
             vec!["--in-scope-only"],
             vec!["--max-records", "25"],
+            vec!["--technology-catalog-version", "1"],
             vec!["--session-id", session],
         ] {
             let mut map = vec!["sniper-cli", "scope", "service-map"];
