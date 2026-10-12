@@ -2533,3 +2533,140 @@ for (const mutate of [parts => parts[5] += '\n', parts => parts[3] += '\n', part
   const parts = technologyToken().split('.'); mutate(parts); const token = parts.join('.'), value = htmlGenerators({ evidence_id: token });
   assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, token, technologyEvidence().row), /Invalid retained HTML-generator response/);
 });
+
+// The shared transport boundary applies only to these four local retained-data
+// reads. Native-fetch cases below use disposable loopback fixtures, never Sniper.
+const passiveReads = [
+  { name: 'metadata', path: '/api/target/service-map', start: f => f.controller.refresh(),
+    payload: () => withCatalog(technologySnapshot()), result: 'snapshot', loading: 'loading', error: 'error' },
+  { name: 'exact evidence', path: '/api/target/service-map/evidence', start: f => f.controller.loadEvidence(technologyToken()),
+    payload: () => withCatalog(technologyEvidence()), result: 'evidence', loading: 'evidenceLoading', error: 'evidenceError' },
+  { name: 'URL body references', path: '/api/target/service-map/body-references', start: f => f.controller.loadBodyReferences(),
+    payload: () => bodyReferences({ session_id: technologySession, evidence_id: technologyToken(), source_sequence: '1' }),
+    result: 'bodyReferences', loading: 'bodyReferencesLoading', error: 'bodyReferencesError' },
+  { name: 'HTML generators', path: '/api/target/service-map/html-generators', start: f => f.controller.loadHtmlGenerators(),
+    payload: () => htmlGenerators(), result: 'htmlGenerators', loading: 'htmlGeneratorsLoading', error: 'htmlGeneratorsError' },
+];
+
+function assertPassiveReadRequest(request, read) {
+  const url = new URL(request.url, originA);
+  assert.equal(url.pathname, read.path); assert.equal(request.options.redirect, 'error');
+  assert.equal(request.options.method || 'GET', 'GET'); assert.equal(request.options.body, undefined);
+  assert.ok(request.options.signal instanceof AbortSignal); assert.equal(request.options.signal.aborted, false);
+  const metadata = read.name === 'metadata', evidenceRead = read.name === 'exact evidence';
+  assert.deepEqual(Object.fromEntries(url.searchParams), metadata
+    ? { session_id: technologySession, in_scope_only: 'false', max_records: '10000' }
+    : { session_id: technologySession, evidence_id: technologyToken(), ...(evidenceRead ? { include_socket_peer: 'true' } : {}) });
+  assert.deepEqual(request.options.headers && { ...request.options.headers }, metadata || evidenceRead
+    ? { 'X-Sniper-Technology-Catalog-Version': '2' } : undefined);
+}
+
+function assertPassiveReadFailure(f, read, previousSnapshot) {
+  assert.equal(f.state[read.loading], false); assert.ok(f.state[read.error]);
+  assert.equal(f.state[read.result], read.name === 'metadata' ? previousSnapshot : null);
+  assert.doesNotMatch(f.els.status.textContent + f.els.detail.innerHTML,
+    /PRIVATE_REDIRECT|PRIVATE_ERROR|redirect-destination|http:\/\/127\.0\.0\.1/);
+}
+
+for (const read of passiveReads) {
+  test(`${read.name} shares enforced redirect refusal without changing exact request or local search`, async () => {
+    const f = await htmlGeneratorFixture(), before = f.requests.length, pending = read.start(f), request = f.requests.at(-1);
+    assertPassiveReadRequest(request, read); assert.equal(f.requests.length, before + 1);
+    f.els.search.value = 'not-visible.example.com'; f.els.search.dispatch('input');
+    assert.equal(f.requests.length, before + 1); assert.equal(request.options.signal.aborted, false);
+    request.resolve(response(read.payload())); assert.equal(await pending, true);
+    assert.ok(f.state[read.result]); assert.equal(f.state[read.loading], false); assert.equal(f.requests.length, before + 1);
+  });
+
+  for (const failure of ['redirect rejection', 'non-success 302']) {
+    test(`${read.name} ${failure} uses safe errors and cannot add a fallback read`, async () => {
+      const f = await htmlGeneratorFixture(), before = f.requests.length, previous = f.state.snapshot;
+      const pending = read.start(f), request = f.requests.at(-1); assertPassiveReadRequest(request, read);
+      if (failure === 'redirect rejection') request.reject(new TypeError('PRIVATE_ERROR http://127.0.0.1/redirect-destination?PRIVATE_REDIRECT'));
+      else request.resolve({ ok: false, status: 302,
+        json() { assert.fail('Never parse redirect JSON'); }, text() { assert.fail('Never read redirect text'); } });
+      assert.equal(await pending, false); await new Promise(resolve => setImmediate(resolve));
+      assertPassiveReadFailure(f, read, previous); assert.equal(f.requests.length, before + 1);
+      assert.equal(f.state.bodyReferenceOverlay, null);
+      assert.doesNotMatch(f.requests.map(item => item.url).join(' '), /transactions|replay|scan|capture|redirect-destination/);
+    });
+  }
+
+  for (const boundary of ['session', 'scope']) {
+    test(`${read.name} late redirect rejection remains fenced after ${boundary} replacement`, async () => {
+      const f = await htmlGeneratorFixture(), pending = read.start(f), old = f.requests.at(-1);
+      if (boundary === 'session') { f.setSession('session-two'); f.controller.reset(); await f.load(snapshot(undefined, 'session-two')); }
+      else {
+        f.els.scope.checked = true; f.els.scope.dispatch('change');
+        f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await new Promise(resolve => setImmediate(resolve));
+      }
+      assert.equal(old.options.signal.aborted, true);
+      const stateBefore = JSON.stringify(f.state), before = f.requests.length;
+      old.reject(new TypeError('PRIVATE_ERROR redirect refusal')); assert.equal(await pending, false);
+      assert.equal(JSON.stringify(f.state), stateBefore); assert.equal(f.requests.length, before);
+    });
+  }
+
+  test(`${read.name} refusal preserves normal polling and permits exactly one explicit next read`, async () => {
+    const f = await htmlGeneratorFixture(), before = f.requests.length, pending = read.start(f);
+    f.requests.at(-1).reject(new TypeError('PRIVATE_ERROR redirect refusal')); assert.equal(await pending, false);
+    const countForPath = () => f.requests.filter(item => new URL(item.url, originA).pathname === read.path).length;
+    const failedReads = countForPath(), poll = pollRealTargetMap(f);
+    assert.equal(f.requests.length, before + 2);
+    assert.equal(new URL(f.requests.at(-1).url, originA).pathname, '/api/target/service-map');
+    assert.equal(f.requests.at(-1).options.redirect, 'error');
+    f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await poll;
+    assert.equal(countForPath(), failedReads + (read.name === 'metadata' ? 1 : 0));
+    const next = read.name === 'metadata' ? f.controller.refresh({ force: true }) : read.start(f);
+    assert.equal(f.requests.length, before + 3); assertPassiveReadRequest(f.requests.at(-1), read);
+    f.requests.at(-1).resolve(response(read.payload())); assert.equal(await next, true);
+    assert.equal(f.requests.length, before + 3);
+  });
+}
+
+test('initial metadata redirect refusal leaves an empty map and an enabled manual Refresh', async () => {
+  const f = fixture(), pending = f.controller.refresh();
+  assert.equal(f.requests[0].options.redirect, 'error'); f.requests[0].reject(new TypeError('PRIVATE_ERROR'));
+  assert.equal(await pending, false); assert.equal(f.requests.length, 1); assert.equal(f.state.snapshot, null);
+  assert.match(f.state.error, /Could not load the service map\. Use Refresh to retry/);
+  assert.equal(f.els.refresh.disabled, false); assert.doesNotMatch(f.els.status.textContent, /PRIVATE_ERROR/);
+  f.els.refresh.dispatch('click'); assert.equal(f.requests.length, 2);
+  f.requests[1].resolve(response(snapshot())); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(f.state.snapshot); assert.equal(f.state.error, '');
+});
+
+async function syntheticRedirectServer(t, handler) {
+  const server = require('node:http').createServer(handler);
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  t.after(async () => {
+    const closed = new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    server.closeAllConnections(); await closed;
+  });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+for (const read of passiveReads) for (const destination of ['same origin', 'other loopback port']) {
+  test(`${read.name} native fetch refuses a 302 to ${destination} with one API hit and zero destination hits`, async t => {
+    const f = await htmlGeneratorFixture(), before = f.requests.length, previous = f.state.snapshot;
+    const apiRequests = []; let destinationHits = 0;
+    const destinationHandler = (_request, result) => {
+      destinationHits++; result.writeHead(200, { 'Content-Type': 'application/json' }); result.end(JSON.stringify(read.payload()));
+    };
+    const otherOrigin = destination === 'other loopback port' ? await syntheticRedirectServer(t, destinationHandler) : '';
+    const location = `${otherOrigin}/redirect-destination?PRIVATE_REDIRECT`;
+    const localOrigin = await syntheticRedirectServer(t, (request, result) => {
+      if (new URL(request.url, 'http://127.0.0.1').pathname !== read.path) return destinationHandler(request, result);
+      apiRequests.push({ url: request.url, method: request.method, catalog: request.headers['x-sniper-technology-catalog-version'] });
+      result.writeHead(302, { Location: location, 'Content-Type': 'text/plain' }); result.end('PRIVATE_REDIRECT');
+    });
+    const pending = read.start(f), request = f.requests.at(-1);
+    // Keep the production relative path/options intact; only the test transport
+    // supplies the disposable loopback origin that a browser normally supplies.
+    request.resolve(fetch(new URL(request.url, localOrigin), request.options));
+    assert.equal(await pending, false); await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(apiRequests, [{ url: request.url, method: 'GET',
+      catalog: ['metadata', 'exact evidence'].includes(read.name) ? '2' : undefined }]);
+    assert.equal(destinationHits, 0); assert.equal(f.requests.length, before + 1);
+    assertPassiveReadFailure(f, read, previous);
+  });
+}

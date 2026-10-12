@@ -562,7 +562,10 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, request, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, request: sendRequest, document: doc = root.document }) {
+    // A local retained-data read must not turn an API redirect into another
+    // request. Enforce this for every map/inspector read, preserving its signal.
+    const request = (path, options) => sendRequest(path, { ...options, redirect: "error" });
     const state = {
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
@@ -1126,7 +1129,7 @@
       let unsupportedServer = false;
       try {
         const params = new URLSearchParams({ session_id: sessionId, evidence_id: source.evidenceId });
-        const response = await request(`/api/target/service-map/html-generators?${params}`, { signal: htmlGeneratorsAbort.signal, redirect: "error" });
+        const response = await request(`/api/target/service-map/html-generators?${params}`, { signal: htmlGeneratorsAbort.signal });
         unsupportedServer = response.status === 404;
         if (!response.ok) throw new Error("Retained HTML generators unavailable");
         const payload = await response.json();

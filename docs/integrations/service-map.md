@@ -652,8 +652,13 @@ send no catalog header and gain no catalog option.
 
 URL-encode the opaque token as a query parameter. These endpoints use the existing
 local API access control. Service Map discovery and reads do not follow API
-redirects or retry failed requests. Discovery validates the usual Sniper identity;
-when it reads local runtime-state, it preserves that file even if it is stale or
+redirects or add automatic retries. The GUI enforces redirect refusal on all four
+reads: metadata, exact-row evidence, URL-body references, and HTML generators.
+A redirect fails through the existing fixed error message without following its
+destination or reading its response body. Normal metadata polling is unchanged;
+it never repeats either supplementary inspection. Refresh and inspection buttons
+remain explicit ways to request another read. Discovery validates the usual
+Sniper identity; when it reads local runtime-state, it preserves that file even if it is stale or
 invalid and does not create lock or recovery files. A CLI schema describes the installed CLI; an older
 running Sniper may not provide the Service Map endpoints. Never fall back to
 active traffic generation when a read is unsupported or incomplete.
