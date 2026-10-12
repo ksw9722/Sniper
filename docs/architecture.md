@@ -83,6 +83,12 @@ flowchart LR
     the CLI, with exact-row evidence and explicitly typed header declarations
   - reads no bodies and starts no network discovery or persistent index; see
     [Service Map](integrations/service-map.md) for limits and evidence semantics
+- `src/service_map_body.rs`
+  - inspects one explicitly selected retained UTF-8 HTML/JavaScript response
+    preview for bounded literal absolute HTTP(S) references in the active session
+  - returns canonical origins and retained-preview offsets, with explicit limits
+    and unsupported/unavailable states; it performs no target requests and never
+    augments the default metadata projection automatically
 - `src/api.rs`
   - exposes record/detail APIs
   - serves the lightweight desktop UI

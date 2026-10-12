@@ -1,5 +1,5 @@
-/* Read-only projection of retained HTTP metadata. Deliberately no capture,
-   replay, remote resources, or UUID-only detail navigation in this module. */
+/* Read-only retained metadata map with explicit, bounded single-source body
+   references. No capture, replay, remote fetch, or UUID-only detail navigation. */
 (function (root) {
   "use strict";
   const MAX_CARDS = 24;
@@ -7,6 +7,23 @@
   const MAX_REFERENCE_CARDS = 100;
   const MAX_REFERENCE_SOURCES = 30;
   const API_PAGE_SIZE = 50;
+  const BODY_REFERENCE_LIMITS = Object.freeze({ scan_bytes: 262144, serialized_row_bytes: 2097152, origins: 100, candidates: 4096, candidate_bytes: 4096, offsets_per_origin: 5 });
+  const BODY_REFERENCE_REASONS = {
+    capture_preview_truncated: "Capture preview is truncated", scan_prefix_truncated: "Scan prefix limit reached",
+    candidate_limit: "URL candidate limit reached", candidate_bytes: "An oversized URL candidate was skipped",
+    origin_limit: "Origin output limit reached", offset_limit: "Offset output limit reached",
+    inactive_session: "Only the active session can be inspected", invalid_evidence_id: "Evidence token is invalid",
+    session_mismatch: "The source session changed", stale_generation: "Retained history changed",
+    record_missing: "The source row is no longer retained", record_changed: "The source row changed",
+    body_identity_unverifiable: "The retained body identity could not be verified",
+    body_storage_unavailable: "Retained body storage is unavailable", body_read_failed: "The retained body could not be read",
+    serialized_row_limit: "The retained row exceeds the read limit", malformed_retained_row: "The retained row could not be verified",
+    response_unavailable: "No retained response is available", retained_preview_unavailable: "No retained response preview is available",
+    unsupported_metadata: "Source metadata is unsupported", metadata_limit: "Source metadata exceeds its limit",
+    unsupported_content_type: "Only retained HTML and JavaScript text previews are supported",
+    unsupported_body_encoding: "The retained preview is not UTF-8 text",
+    unsupported_content_encoding: "The retained response encoding is unsupported", body_scan_failed: "The retained preview could not be inspected",
+  };
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char]);
   const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const array = (value) => Array.isArray(value) ? value : [];
@@ -16,6 +33,51 @@
       const url = new URL(value);
       return ["http:", "https:"].includes(url.protocol) ? url.origin : "";
     } catch (_) { return ""; }
+  }
+  function normalizeBodyReferences(payload, sessionId, evidenceId, row) {
+    const invalid = () => { throw new Error("Invalid retained body-reference response"); };
+    const integer = (value, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && value >= 0 && value <= max;
+    const canonical = (value) => typeof value === "string" && value.length <= BODY_REFERENCE_LIMITS.candidate_bytes && value === safeOrigin(value) && !!value;
+    const scanned = payload?.status === "scanned" || payload?.status === "partial";
+    if (payload?.schema_version !== 1 || payload.session_id !== sessionId || payload.evidence_id !== evidenceId
+      || !["scanned", "partial", "unsupported", "unavailable"].includes(payload.status)
+      || payload.available !== scanned || payload.complete !== (payload.status === "scanned")
+      || payload.coverage !== "literal_absolute_http_urls" || payload.offset_basis !== "retained_utf8_preview"
+      || !Array.isArray(payload.references) || payload.references.length > BODY_REFERENCE_LIMITS.origins
+      || !Array.isArray(payload.reasons) || payload.reasons.length > 32
+      || payload.reasons.some((reason) => typeof reason !== "string" || !/^[a-z_]{1,80}$/.test(reason))
+      || !Object.entries(BODY_REFERENCE_LIMITS).every(([key, value]) => payload.limits?.[key] === value)
+      || !integer(payload.scanned_bytes, BODY_REFERENCE_LIMITS.scan_bytes)
+      || !integer(payload.candidates_scanned, BODY_REFERENCE_LIMITS.candidates)
+      || !integer(payload.omitted_reference_occurrences, payload.candidates_scanned)
+      || typeof payload.capture_preview_truncated !== "boolean" || typeof payload.scan_prefix_truncated !== "boolean") invalid();
+    if ((scanned || payload.source_origin !== undefined) && (!canonical(payload.source_origin) || payload.source_origin !== row.origin)
+      || (scanned || payload.source_sequence !== undefined) && (typeof payload.source_sequence !== "string" || payload.source_sequence !== row.sequence)
+      || (scanned || payload.source_started_at !== undefined) && (typeof payload.source_started_at !== "string" || payload.source_started_at !== row.started_at)
+      || scanned && (!integer(payload.retained_preview_bytes) || payload.scanned_bytes > payload.retained_preview_bytes)
+      || !scanned && (payload.references.length || payload.scanned_bytes || payload.candidates_scanned || payload.omitted_reference_occurrences)
+      || payload.status === "scanned" && (payload.reasons.length || payload.capture_preview_truncated || payload.scan_prefix_truncated || payload.omitted_reference_occurrences)
+      || payload.status === "partial" && !payload.reasons.length) invalid();
+    const seen = new Set();
+    let occurrences = payload.omitted_reference_occurrences;
+    const references = payload.references.map((item) => {
+      if (!canonical(item?.target_origin) || seen.has(item.target_origin)
+        || !integer(item.occurrences, payload.candidates_scanned) || !item.occurrences
+        || !Array.isArray(item.preview_byte_offsets) || !item.preview_byte_offsets.length || item.preview_byte_offsets.length > BODY_REFERENCE_LIMITS.offsets_per_origin
+        || !integer(item.omitted_offsets, item.occurrences) || item.occurrences !== item.preview_byte_offsets.length + item.omitted_offsets
+        || payload.status === "scanned" && item.omitted_offsets
+        || item.preview_byte_offsets.some((offset, index, offsets) => !integer(offset) || offset >= payload.scanned_bytes || index > 0 && offset <= offsets[index - 1])) invalid();
+      seen.add(item.target_origin);
+      occurrences += item.occurrences;
+      return { target_origin: item.target_origin, occurrences: item.occurrences, preview_byte_offsets: [...item.preview_byte_offsets], omitted_offsets: item.omitted_offsets };
+    });
+    if (occurrences > payload.candidates_scanned) invalid();
+    // Keep a bounded allowlist. Unexpected payload fields, including body content,
+    // never become inspector state or markup.
+    return { status: payload.status, complete: payload.complete, reasons: [...payload.reasons], references,
+      retained_preview_bytes: scanned ? payload.retained_preview_bytes : null, scanned_bytes: payload.scanned_bytes,
+      candidates_scanned: payload.candidates_scanned, omitted_reference_occurrences: payload.omitted_reference_occurrences,
+      capture_preview_truncated: payload.capture_preview_truncated, scan_prefix_truncated: payload.scan_prefix_truncated };
   }
   function normalizeSnapshot(payload, sessionId) {
     if (payload?.schema_version !== 1 || payload.session_id !== sessionId || !payload.snapshot || !Array.isArray(payload.origins)) {
@@ -138,10 +200,13 @@
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, page: 0, detailPage: 0,
+      bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "",
     };
     let abort = null;
     let evidenceAbort = null;
+    let bodyReferencesAbort = null;
+    let detailRender = null;
     let visible = false;
     function replace(element, html) {
       if (!element || element.innerHTML === html) return;
@@ -272,7 +337,16 @@
       state.modeNotice = "";
       render();
     }
+    function cancelBodyReferences() {
+      state.bodyReferencesRequestId += 1;
+      bodyReferencesAbort?.abort();
+      bodyReferencesAbort = null;
+      state.bodyReferences = null;
+      state.bodyReferencesLoading = false;
+      state.bodyReferencesError = "";
+    }
     function cancelEvidence() {
+      cancelBodyReferences();
       state.evidenceRequestId += 1;
       evidenceAbort?.abort();
       evidenceAbort = null;
@@ -310,6 +384,9 @@
       const sessionId = getSessionId();
       if (state.sessionId !== sessionId) reset();
       if (!sessionId || state.loading && !force) return false;
+      // The app polls every 1.2 seconds. A same-source background snapshot must
+      // not erase an explicit inspection or continually abort its pending read.
+      if (force) cancelBodyReferences();
       abort?.abort();
       abort = new AbortController();
       const requestId = ++state.requestId;
@@ -319,12 +396,14 @@
       state.error = "";
       renderStatus();
       if (!state.snapshot) render();
+      else if (force && state.detailTab === "evidence") renderDetail();
       try {
         const params = new URLSearchParams({ session_id: sessionId, in_scope_only: String(scopeOnly), max_records: "10000" });
         const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal });
         if (!response.ok) throw new Error("Service map unavailable");
         const snapshot = normalizeSnapshot(await response.json(), sessionId);
         if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
+        if (state.snapshot && state.snapshot.snapshot.generation !== snapshot.snapshot.generation) cancelEvidence();
         state.snapshot = snapshot;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
@@ -411,6 +490,41 @@
         if (requestId !== state.evidenceRequestId || sessionId !== getSessionId() || selected !== state.selectedOrigin) return false;
         state.evidenceLoading = false;
         state.evidenceError = "Source unavailable. The exact retained row could not be verified. Refresh the map and try again.";
+        renderDetail();
+        return false;
+      }
+    }
+    async function loadBodyReferences() {
+      const row = state.evidence;
+      const sessionId = getSessionId();
+      if (!visible || state.sessionId !== sessionId || !row || state.evidenceId !== row.evidence_id
+        || state.evidenceLoading || state.bodyReferencesLoading
+        || !evidenceItems(selectedOrigin()).some((item) => item.id === row.evidence_id)) return false;
+      cancelBodyReferences();
+      const requestId = ++state.bodyReferencesRequestId;
+      const evidenceId = row.evidence_id;
+      const selected = state.selectedOrigin;
+      const current = () => requestId === state.bodyReferencesRequestId && visible && sessionId === getSessionId()
+        && sessionId === state.sessionId && selected === state.selectedOrigin && row === state.evidence && evidenceId === state.evidenceId;
+      state.bodyReferencesLoading = true;
+      bodyReferencesAbort = new AbortController();
+      renderDetail();
+      try {
+        const params = new URLSearchParams({ session_id: sessionId, evidence_id: evidenceId });
+        const response = await request(`/api/target/service-map/body-references?${params}`, { signal: bodyReferencesAbort.signal });
+        if (!response.ok) throw new Error("Retained body references unavailable");
+        const payload = await response.json();
+        if (!current()) return false;
+        state.bodyReferences = normalizeBodyReferences(payload, sessionId, evidenceId, row);
+        state.bodyReferencesLoading = false;
+        bodyReferencesAbort = null;
+        renderDetail();
+        return true;
+      } catch (_) {
+        if (!current()) return false;
+        state.bodyReferencesLoading = false;
+        bodyReferencesAbort = null;
+        state.bodyReferencesError = "Could not verify retained body references. Retry explicitly, or refresh the map and select the source again.";
         renderDetail();
         return false;
       }
@@ -521,6 +635,22 @@
       if (!group?.items.length) return "";
       return `<h4>Metadata relationships</h4><p class="service-map-muted">Header declarations and redirect instructions do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${group.items.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}</span><span>${item.evidence ? "View source ›" : "Inspect ›"}</span></button>`).join("")}</div>${group.omitted ? `<p class="service-map-muted">${group.omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
     }
+    function bodyReferencesMarkup() {
+      const result = state.bodyReferences;
+      const buttonLabel = state.bodyReferencesLoading ? "Inspecting retained body references…" : state.bodyReferencesError || result?.status === "unavailable" ? "Retry retained body references" : result ? "Inspect retained body references again" : "Inspect retained body references";
+      let summary = "";
+      if (result) {
+        const scanned = result.status === "scanned" || result.status === "partial";
+        const occurrences = result.references.reduce((total, item) => total + item.occurrences, 0);
+        const message = result.status === "unsupported" ? "Retained preview is unsupported. No references were inspected."
+          : result.status === "unavailable" ? "Retained preview is unavailable. No references were inspected."
+          : result.references.length ? `${result.references.length} referenced origin${result.references.length === 1 ? "" : "s"} · ${occurrences.toLocaleString()} literal URL occurrence${occurrences === 1 ? "" : "s"}`
+          : "No literal absolute HTTP(S) URL references found in the inspected preview.";
+        summary = `<div class="service-map-body-reference-result" role="status"><p>${escape(message)}</p>${scanned ? `<p class="service-map-muted">${result.complete ? "Complete retained-preview scan" : "Partial retained-preview scan"} · ${result.scanned_bytes.toLocaleString()} / ${result.retained_preview_bytes.toLocaleString()} UTF-8 preview bytes inspected${result.omitted_reference_occurrences ? ` · ${result.omitted_reference_occurrences.toLocaleString()} reference occurrence(s) omitted` : ""}</p>` : ""}${result.reasons.length ? `<p class="service-map-muted">${result.reasons.map((reason) => escape(BODY_REFERENCE_REASONS[reason] || reason.replace(/_/g, " "))).join(" · ")}</p>` : ""}</div>
+          ${result.references.length ? `<ul class="service-map-body-reference-list" aria-label="Literal URL reference origins">${result.references.map((item) => `<li><span class="service-map-body-reference-origin">${escape(item.target_origin)}</span><span>${item.occurrences.toLocaleString()} occurrence${item.occurrences === 1 ? "" : "s"} · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets.toLocaleString()} more offset(s) omitted` : ""}</span></li>`).join("")}</ul>` : ""}`;
+      }
+      return `<section class="service-map-body-references" aria-label="Retained body references" aria-busy="${state.bodyReferencesLoading}"><h4>Retained body references</h4><p class="service-map-muted">Optional inspection of this exact response’s retained HTML or JavaScript preview. Active session only. A literal URL reference does not prove a request, call, or service ownership.</p><button class="secondary-action" type="button" data-service-body-references="inspect" data-service-focus="body-references:inspect" ${state.bodyReferencesLoading ? "disabled" : ""}>${buttonLabel}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting one retained preview locally…</p>' : ""}${state.bodyReferencesError ? `<p class="service-map-error" role="status">${escape(state.bodyReferencesError)}</p>` : ""}${summary}<details class="service-map-body-reference-limits"><summary data-service-focus="body-references:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) URLs only. Origins are text, never fetched. No script execution, relative URL resolution, or additional map relationships. Offsets are zero-based bytes relative to the retained UTF-8 preview, not the original response.</p><p>Scan: ${BODY_REFERENCE_LIMITS.scan_bytes.toLocaleString()} bytes · Serialized row read: ${BODY_REFERENCE_LIMITS.serialized_row_bytes.toLocaleString()} bytes · Origins: ${BODY_REFERENCE_LIMITS.origins} · URL candidates: ${BODY_REFERENCE_LIMITS.candidates.toLocaleString()} · Candidate: ${BODY_REFERENCE_LIMITS.candidate_bytes.toLocaleString()} bytes · Offsets per origin: ${BODY_REFERENCE_LIMITS.offsets_per_origin}.</p>${result ? `<p>${result.candidates_scanned.toLocaleString()} candidates inspected · Capture preview truncated: ${result.capture_preview_truncated ? "yes" : "no"} · Scan prefix truncated: ${result.scan_prefix_truncated ? "yes" : "no"}.</p>` : ""}</details></section>`;
+    }
     function evidenceMarkup(origin) {
       const items = evidenceItems(origin);
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
@@ -528,22 +658,46 @@
       const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul><p>Exact retained source verified for this read.</p></div>` : "";
       return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
-        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}
+        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? bodyReferencesMarkup() : ""}
         <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || '<p class="service-map-muted">No source samples are available in this bounded snapshot.</p>'}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
         ${!endpoint ? relationshipMarkup(origin) : ""}
         ${!endpoint && origin.technology_clues.length ? `<h4>Observed header clues</h4><p class="service-map-muted">${origin.technology_clues.map((clue) => escape(clue.name)).join(", ")} · response headers only</p>` : ""}`;
     }
+    function replaceDetail(html) {
+      const identity = JSON.stringify([state.sessionId, state.selectedOrigin, state.endpointSelection?.method, state.endpointSelection?.path, state.detailTab, state.evidenceId]);
+      const sameSource = detailRender?.identity === identity && detailRender.evidence === state.evidence;
+      // Native disclosures and browser HTML serialization change innerHTML.
+      // Compare our generated markup locally so unchanged polls leave the
+      // inspector DOM, keyboard focus, and nested scroll positions untouched.
+      if (sameSource && detailRender.html === html) return;
+      const previousBody = els.detail.querySelector?.(".service-map-detail-body");
+      const previousList = els.detail.querySelector?.(".service-map-body-reference-list");
+      const previousLimits = els.detail.querySelector?.(".service-map-body-reference-limits");
+      const bodyScroll = previousBody?.scrollTop;
+      const listScroll = previousList?.scrollTop;
+      const limitsOpen = previousLimits?.open;
+      replace(els.detail, html);
+      detailRender = { identity, evidence: state.evidence, html };
+      if (sameSource) {
+        const body = els.detail.querySelector?.(".service-map-detail-body");
+        const list = els.detail.querySelector?.(".service-map-body-reference-list");
+        const limits = els.detail.querySelector?.(".service-map-body-reference-limits");
+        if (limits && limitsOpen !== undefined) limits.open = limitsOpen;
+        if (body && bodyScroll !== undefined) body.scrollTop = bodyScroll;
+        if (list && listScroll !== undefined) list.scrollTop = listScroll;
+      }
+    }
     function renderDetail() {
       const origin = selectedOrigin();
-      if (!origin) { replace(els.detail, '<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
+      if (!origin) { replaceDetail('<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
       if (!origin.captured) {
-        replace(els.detail, `<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in captured metadata within this snapshot. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
+        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in captured metadata within this snapshot. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
         return;
       }
       const pageCount = Math.max(1, Math.ceil(origin.endpoints.length / API_PAGE_SIZE));
       state.detailPage = Math.min(state.detailPage, pageCount - 1);
       const start = state.detailPage * API_PAGE_SIZE;
-      replace(els.detail, `<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
+      replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
         <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, IP or certificate association is available.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
     }
@@ -577,6 +731,7 @@
       } else if (data.serviceOrigin) selectOrigin(data.serviceOrigin);
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; if (state.detailTab === "apis") { state.endpointIndex = null; state.endpointSelection = null; } renderDetail(); }
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
+      else if (data.serviceBodyReferences) loadBodyReferences();
       else if (data.servicePage !== undefined) { state.page = Math.max(0, Number(data.servicePage) || 0); renderCatalog(); els.catalog.scrollTop = 0; }
       else if (data.serviceDetailPage !== undefined) { state.detailPage = Math.max(0, Number(data.serviceDetailPage) || 0); renderDetail(); }
     }
@@ -607,7 +762,7 @@
     });
     render();
     return {
-      refresh, reset, selectOrigin, loadEvidence,
+      refresh, reset, selectOrigin, loadEvidence, loadBodyReferences,
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
         if (signature(previous) === signature(next)) return false;
@@ -621,6 +776,7 @@
         if (state.detailTab === "evidence") renderDetail();
       },
       setVisible(value, view = state.view) {
+        if (!value) cancelBodyReferences();
         visible = value;
         state.view = view;
         if (state.sessionId !== getSessionId()) reset();
@@ -642,5 +798,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, normalizeSnapshot, stableOrder, graphLayout, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS };
+  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeBodyReferences, BODY_REFERENCE_LIMITS, stableOrder, graphLayout, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS };
 })(typeof window === "undefined" ? globalThis : window);

@@ -568,6 +568,47 @@ fn rehydrate_checked(
     Ok(full)
 }
 
+// Resolve the full row token rather than UUID: older retained duplicates can
+// only use their own resident preview, never the newest row's disk locator.
+fn service_map_body_row_index(
+    inner: &StoreInner,
+    key: &crate::service_map::EvidenceKey,
+) -> Result<usize, &'static str> {
+    let index = inner
+        .entries
+        .binary_search_by_key(&key.sequence, |record| record.sequence)
+        .map_err(|_| "record_missing")?;
+    if inner.entries[index].id != key.record_id {
+        return Err("record_missing");
+    }
+    if inner.body_generations[index] != key.revision {
+        return Err("record_changed");
+    }
+    if inner.unresolved_body_generations.contains(&key.revision) {
+        return Err("body_identity_unverifiable");
+    }
+    Ok(index)
+}
+
+fn validate_service_map_body_locator(
+    inner: &StoreInner,
+    key: &crate::service_map::EvidenceKey,
+    file_generation: Uuid,
+    locator: crate::session::BodyLocator,
+) -> Result<(), &'static str> {
+    let index = service_map_body_row_index(inner, key)?;
+    if inner.file_generation != file_generation
+        || inner.by_id.get(&key.record_id) != Some(&index)
+        || inner.locators.get(&key.record_id) != Some(&locator)
+    {
+        return Err("body_identity_unverifiable");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+type ServiceMapBodyReadHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Clone, Debug)]
 struct CachedSummary {
     summary: TransactionSummary,
@@ -1397,6 +1438,144 @@ impl TransactionStore {
             Some(row) => ServiceMapEvidence::found(session_id, row),
             None => missing("metadata_unavailable"),
         }
+    }
+
+    /// Opt-in, exact-token reads of a retained response preview. No generic
+    /// transaction lookup, body decoding, or full record hydration is allowed.
+    pub async fn service_map_body_references(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map_body::ServiceMapBodyReferences {
+        self.service_map_body_references_impl(
+            session_id,
+            id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn service_map_body_references_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_body::ServiceMapBodyReferences {
+        use crate::{
+            service_map::EvidenceKey,
+            service_map_body::{
+                read_preview, scan_preview, BodySource, RetainedPreview, ServiceMapBodyReferences,
+                MAX_SERIALIZED_ROW_BYTES,
+            },
+        };
+        let missing = |reason| ServiceMapBodyReferences::missing(session_id, id.into(), reason);
+        let Some(key) = EvidenceKey::parse(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        let (source, resident, located) = {
+            let inner = self.inner.read().await;
+            let index = match service_map_body_row_index(&inner, &key) {
+                Ok(index) => index,
+                Err(reason) => return missing(reason),
+            };
+            let record = &inner.entries[index];
+            let source = match BodySource::from_record(record) {
+                Ok(source) => source,
+                Err("response_unavailable") => return missing("response_unavailable"),
+                Err(reason) => {
+                    return ServiceMapBodyReferences::unsupported(session_id, id.into(), reason)
+                }
+            };
+            let locator = (inner.by_id.get(&record.id) == Some(&index))
+                .then(|| inner.locators.get(&record.id).copied())
+                .flatten();
+            match locator {
+                Some(locator) => {
+                    if locator.len as usize > MAX_SERIALIZED_ROW_BYTES {
+                        return missing("serialized_row_limit");
+                    }
+                    (source, None, Some((locator, inner.file_generation)))
+                }
+                None => {
+                    let preview = RetainedPreview::from_str(
+                        &record
+                            .response
+                            .as_ref()
+                            .expect("supported response")
+                            .body_preview,
+                    );
+                    (source, Some(preview), None)
+                }
+            }
+        };
+        let inner = Arc::clone(&self.inner);
+        let storage_dir = self.storage_dir.clone();
+        let evidence_id = id.to_owned();
+        let task = tokio::task::spawn_blocking(move || {
+            let missing =
+                |reason| ServiceMapBodyReferences::missing(session_id, evidence_id.clone(), reason);
+            let preview = if let Some((locator, file_generation)) = located {
+                let Some(storage_dir) = storage_dir else {
+                    return missing("body_storage_unavailable");
+                };
+                // Opening before the generation check gives us a stable inode.
+                // Publication renames and adopts locators under the write lock:
+                // either this handle and captured offsets agree, or we reject.
+                let file = match fs::File::open(storage_dir.join("transactions.ndjson")) {
+                    Ok(file) => file,
+                    Err(_) => return missing("body_storage_unavailable"),
+                };
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook("after_open");
+                }
+                if let Err(reason) = validate_service_map_body_locator(
+                    &inner.blocking_read(),
+                    &key,
+                    file_generation,
+                    locator,
+                ) {
+                    return missing(reason);
+                }
+                // All file I/O and JSON parsing happen without a store lock.
+                read_preview(file, locator, key.record_id, &source)
+            } else {
+                Ok(resident.expect("resident preview or locator"))
+            };
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("before_scan");
+            }
+            let result = match preview {
+                Ok(preview) => scan_preview(session_id, evidence_id.clone(), source, preview),
+                Err(reason) => missing(reason),
+            };
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("after_scan");
+            }
+            // Never publish evidence after deletion, retention, full mutation,
+            // duplicate displacement, or a transactions-file replacement.
+            let current = inner.blocking_read();
+            let validity = match located {
+                Some((locator, file_generation)) => {
+                    validate_service_map_body_locator(&current, &key, file_generation, locator)
+                }
+                None => service_map_body_row_index(&current, &key).map(|_| ()),
+            };
+            match validity {
+                Ok(()) => result,
+                Err(reason) => missing(reason),
+            }
+        });
+        task.await.unwrap_or_else(|_| missing("body_scan_failed"))
     }
 
     pub async fn site_map_records(&self) -> Vec<SiteMapRecord> {
@@ -3383,6 +3562,485 @@ pub(crate) mod tests {
             None,
             None,
         )
+    }
+
+    mod service_map_body_tests {
+        use super::*;
+        use crate::service_map::{evidence_id, EvidenceKey};
+        use crate::service_map_body::{ServiceMapBodyReferences, MAX_SERIALIZED_ROW_BYTES};
+        use std::time::Duration as WaitDuration;
+
+        fn body_record(body: &str, sequence: u64) -> TransactionRecord {
+            let mut record = test_record("source.example.com");
+            record.sequence = sequence;
+            let response = record.response.as_mut().unwrap();
+            response.content_type = Some("text/html".into());
+            response.body_preview = body.into();
+            response.body_size = body.len();
+            record
+        }
+
+        async fn fixture_store(
+            records: &[TransactionRecord],
+            lazy: bool,
+        ) -> (Arc<TransactionStore>, PathBuf) {
+            let dir = std::env::temp_dir().join(format!("sniper-passive-body-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let store = Arc::new(TransactionStore::from_records_with_journal(
+                records.iter().rev().cloned().collect(),
+                dir.join("transactions.journal"),
+                None,
+            ));
+            if lazy {
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &dir, records,
+                )
+                .unwrap();
+                store.adopt_written_locators(locators).await;
+            }
+            (store, dir)
+        }
+
+        async fn token(store: &TransactionStore, session: Uuid, sequence: u64) -> String {
+            let inner = store.inner.read().await;
+            let index = inner
+                .entries
+                .binary_search_by_key(&sequence, |r| r.sequence)
+                .unwrap();
+            evidence_id(
+                session,
+                store.saved_cursor_generation,
+                inner.body_generations[index],
+                &inner.entries[index],
+            )
+        }
+
+        fn barrier(
+            stage: &'static str,
+        ) -> (
+            ServiceMapBodyReadHook,
+            oneshot::Receiver<()>,
+            mpsc::Sender<()>,
+        ) {
+            let (ready, started) = oneshot::channel();
+            let ready = Mutex::new(Some(ready));
+            let (release, wait) = mpsc::channel();
+            let wait = Mutex::new(wait);
+            let hook = Arc::new(move |current: &str| {
+                if current == stage {
+                    ready.lock().unwrap().take().unwrap().send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(WaitDuration::from_secs(10))
+                        .unwrap();
+                }
+            });
+            (hook, started, release)
+        }
+
+        fn paused_read(
+            store: Arc<TransactionStore>,
+            session: Uuid,
+            token: String,
+            hook: ServiceMapBodyReadHook,
+        ) -> tokio::task::JoinHandle<ServiceMapBodyReferences> {
+            tokio::spawn(async move {
+                store
+                    .service_map_body_references_impl(session, &token, Some(hook))
+                    .await
+            })
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_distinguishes_resident_and_lazy_duplicate_rows() {
+            let first = body_record("https://older.example.com/private?secret=one ", 1);
+            let mut second = body_record("https://newer.example.com/private?secret=two ", 2);
+            second.id = first.id;
+            let (store, dir) = fixture_store(&[first, second], false).await;
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            let staged = dir.join("replacement");
+            fs::create_dir_all(&staged).unwrap();
+            // The fixture writer uses last-wins UUID locators, so give it
+            // oldest-first rows. Production streaming uses newest-first and
+            // first-wins locators; both must select the same authoritative row.
+            let records: Vec<_> = snapshot
+                .iter()
+                .rev()
+                .map(|(record, _)| record.clone())
+                .collect();
+            let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &staged, &records,
+            )
+            .unwrap();
+            let publisher = store.clone();
+            let destination = dir.join("transactions.ndjson");
+            tokio::task::spawn_blocking(move || {
+                publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                    crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let session = Uuid::new_v4();
+            let older_token = token(&store, session, 1).await;
+            let newer_token = token(&store, session, 2).await;
+            let older = store
+                .service_map_body_references(session, &older_token)
+                .await;
+            let newer = store
+                .service_map_body_references(session, &newer_token)
+                .await;
+            assert_eq!(
+                older.references[0].target_origin,
+                "https://older.example.com"
+            );
+            assert_eq!(
+                newer.references[0].target_origin,
+                "https://newer.example.com"
+            );
+            let inner = store.inner.read().await;
+            assert!(!inner.entries[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            assert!(inner.entries[1]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            drop(inner);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_invalid_session_generation_and_revision_tokens() {
+            let record = body_record("https://example.com/ ", 1);
+            let (store, dir) = fixture_store(&[record.clone()], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_body_references(session, "bad")
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            assert_eq!(
+                store
+                    .service_map_body_references(Uuid::new_v4(), &id)
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            let replacement = TransactionStore::from_records(vec![record.clone()]);
+            assert_eq!(
+                replacement
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            store
+                .update_record(record.id, |r| {
+                    r.response.as_mut().unwrap().body_preview =
+                        "https://changed.example.com/ ".into()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["record_changed"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_fails_closed_for_oversized_wrong_missing_and_malformed_disk_rows(
+        ) {
+            for case in [
+                "oversized",
+                "wrong_locator",
+                "missing_file",
+                "malformed_json",
+                "malformed_utf8",
+                "wrong_sequence",
+                "missing_preview",
+            ] {
+                let first = body_record("https://first.example.com/ ", 1);
+                let second = body_record("https://second.example.com/ ", 2);
+                let (store, dir) = fixture_store(&[first.clone(), second.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let expected = match case {
+                    "oversized" => {
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: u64::MAX,
+                                    len: (MAX_SERIALIZED_ROW_BYTES + 1) as u32,
+                                },
+                            )
+                            .await;
+                        "serialized_row_limit"
+                    }
+                    "wrong_locator" => {
+                        let locator = store.inner.read().await.locators[&second.id];
+                        store.set_body_locator_for_test(first.id, locator).await;
+                        "body_identity_unverifiable"
+                    }
+                    "missing_file" => {
+                        fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                        "body_storage_unavailable"
+                    }
+                    case => {
+                        let mut value = serde_json::to_value(&first).unwrap();
+                        let bytes = match case {
+                            "malformed_json" => b"{not json}".to_vec(),
+                            "malformed_utf8" => {
+                                // Put invalid UTF-8 in an ignored request field:
+                                // malformed bytes must not bypass the projection.
+                                let mut bytes = serde_json::to_vec(&first).unwrap();
+                                let needle = b"\"body_preview\":\"\"";
+                                let start = bytes
+                                    .windows(needle.len())
+                                    .position(|part| part == needle)
+                                    .unwrap();
+                                bytes.insert(start + needle.len() - 1, 0xff);
+                                bytes
+                            }
+                            "wrong_sequence" => {
+                                value["sequence"] = 0.into();
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            "missing_preview" => {
+                                value["response"]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("body_preview");
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            _ => unreachable!(),
+                        };
+                        fs::write(dir.join("transactions.ndjson"), &bytes).unwrap();
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: 0,
+                                    len: bytes.len() as u32,
+                                },
+                            )
+                            .await;
+                        match case {
+                            "wrong_sequence" => "body_identity_unverifiable",
+                            "missing_preview" => "retained_preview_unavailable",
+                            _ => "malformed_retained_row",
+                        }
+                    }
+                };
+                let result = store.service_map_body_references(session, &id).await;
+                assert!(!result.available, "{case}");
+                assert!(result.references.is_empty(), "{case}");
+                assert_eq!(result.reasons, [expected], "{case}");
+                // The normal map and metadata evidence remain independent of
+                // body storage, including missing/corrupt files and bad locators.
+                assert_eq!(store.service_map_snapshot(session, 10).await.rows.len(), 2);
+                assert!(store.service_map_evidence(session, &id).await.available);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_unresolved_and_nonresident_older_duplicate() {
+            let first = body_record("https://older.example.com/ ", 1);
+            let mut second = body_record("https://newer.example.com/ ", 2);
+            second.id = first.id;
+            // A legacy-loaded older duplicate has no authoritative locator.
+            let (store, dir) = fixture_store(&[first, second], true).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["retained_preview_unavailable"]
+            );
+            let key = EvidenceKey::parse(&id).unwrap();
+            store
+                .inner
+                .write()
+                .await
+                .unresolved_body_generations
+                .insert(key.revision);
+            assert_eq!(
+                store
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["body_identity_unverifiable"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_resident_and_lazy_reject_deletion_retention_and_mutation_races()
+        {
+            for lazy in [false, true] {
+                for mutation in ["delete", "retention", "body"] {
+                    let first = body_record("https://before.example.com/ ", 1);
+                    let (store, dir) = fixture_store(&[first.clone()], lazy).await;
+                    let session = Uuid::new_v4();
+                    let id = token(&store, session, 1).await;
+                    let (hook, started, release) = barrier("after_scan");
+                    let reading = paused_read(store.clone(), session, id, hook);
+                    tokio::time::timeout(WaitDuration::from_secs(10), started)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // If the reader held the store lock during file/scan work,
+                    // these real mutations would deadlock at this barrier.
+                    let expected = match mutation {
+                        "delete" => {
+                            assert_eq!(store.delete_ids(&[first.id]).await.unwrap(), 1);
+                            "record_missing"
+                        }
+                        "retention" => {
+                            assert_eq!(
+                                store
+                                    .trim_retention(0, &HashSet::new(), 10)
+                                    .await
+                                    .unwrap()
+                                    .deleted_ids,
+                                [first.id]
+                            );
+                            "record_missing"
+                        }
+                        _ => {
+                            store
+                                .update_record(first.id, |r| {
+                                    r.response.as_mut().unwrap().body_preview =
+                                        "https://after.example.com/ ".into()
+                                })
+                                .await
+                                .unwrap();
+                            "record_changed"
+                        }
+                    };
+                    release.send(()).unwrap();
+                    let result = reading.await.unwrap();
+                    assert!(!result.available, "{lazy} {mutation}");
+                    assert_eq!(result.reasons, [expected], "{lazy} {mutation}");
+                    drop(store);
+                    fs::remove_dir_all(dir).unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_annotations_keep_evidence_valid_during_scan() {
+            for lazy in [false, true] {
+                let record = body_record("https://example.com/ ", 1);
+                let (store, dir) = fixture_store(&[record.clone()], lazy).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier("after_scan");
+                let reading = paused_read(store.clone(), session, id, hook);
+                started.await.unwrap();
+                store
+                    .update_annotations(record.id, None, Some(Some("note".into())))
+                    .await
+                    .unwrap();
+                release.send(()).unwrap();
+                assert!(reading.await.unwrap().complete);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_atomic_publication_before_and_after_disk_scan() {
+            for stage in ["after_open", "after_scan"] {
+                let record = body_record("https://example.com/ ", 1);
+                let (store, dir) = fixture_store(&[record.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+                let staged = dir.join("replacement");
+                fs::create_dir_all(&staged).unwrap();
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &staged,
+                    &[record],
+                )
+                .unwrap();
+                let (hook, started, release) = barrier(stage);
+                let reading = paused_read(store.clone(), session, id.clone(), hook);
+                started.await.unwrap();
+                let publisher = store.clone();
+                let destination = dir.join("transactions.ndjson");
+                tokio::task::spawn_blocking(move || {
+                    publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                        crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert_eq!(result.reasons, ["body_identity_unverifiable"], "{stage}");
+                assert!(result.references.is_empty());
+                // A fresh explicit read uses the adopted locator/file generation.
+                assert!(
+                    store
+                        .service_map_body_references(session, &id)
+                        .await
+                        .complete
+                );
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_base64_from_invalid_utf8_capture() {
+            let mut record = body_record("", 1);
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/html"),
+            );
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                &[0xff, 0xfe, 0xfd],
+                100,
+            ));
+            assert_eq!(
+                record.response.as_ref().unwrap().body_encoding,
+                BodyEncoding::Base64
+            );
+            let (store, dir) = fixture_store(&[record], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store.service_map_body_references(session, &id).await;
+            assert_eq!(result.status, "unsupported");
+            assert_eq!(result.reasons, ["unsupported_body_encoding"]);
+            assert!(!result.available);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     mod retention_tests {

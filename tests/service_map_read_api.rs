@@ -44,6 +44,15 @@ fn row(path: &str) -> TransactionRecord {
             .unwrap(),
     );
     response_headers.insert("server", "nginx/SYNTHETIC_PRIVATE".parse().unwrap());
+    response_headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+    let target = if path.starts_with("/users/1") {
+        "older.example.com"
+    } else {
+        "newer.example.com"
+    };
+    let response_body = format!(
+        "<a href=\"https://user:SYNTHETIC_PRIVATE@{target}/private?token=SYNTHETIC_PRIVATE#SYNTHETIC_PRIVATE\">fixture</a>"
+    );
     TransactionRecord::http(
         chrono::Utc::now(),
         "GET".into(),
@@ -55,7 +64,7 @@ fn row(path: &str) -> TransactionRecord {
         MessageRecord::from_headers_and_body(&request_headers, b"SYNTHETIC_PRIVATE", 1024),
         Some(MessageRecord::from_headers_and_body(
             &response_headers,
-            b"SYNTHETIC_PRIVATE",
+            response_body.as_bytes(),
             1024,
         )),
         Vec::new(),
@@ -86,6 +95,9 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     second.id = duplicate_id;
     session.store.insert(first).await;
     session.store.insert(second).await;
+    // Exercise the real persistence path: the newest UUID occurrence becomes
+    // lazy, while its older retained sibling must keep its own resident body.
+    session.persist().await.unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
@@ -148,12 +160,47 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     assert_eq!(evidence["row"]["path"], "/users/1");
     assert_eq!(evidence["row"]["record_id"], duplicate_id.to_string());
 
+    let body = read(
+        &dir,
+        &api,
+        "target.service_map.body_references.get",
+        input.clone(),
+    )
+    .await;
+    assert_eq!(body["available"], true, "{body}");
+    assert_eq!(body["status"], "scanned");
+    assert_eq!(
+        body["references"][0]["target_origin"],
+        "https://older.example.com"
+    );
+    assert_eq!(body["offset_basis"], "retained_utf8_preview");
+    assert_eq!(body["evidence_id"], token);
+    assert_eq!(body["source_sequence"], evidence["row"]["sequence"]);
+    let newest_token = origin["endpoints"][1]["evidence"][0].as_str().unwrap();
+    let lazy_body = read(
+        &dir,
+        &api,
+        "target.service_map.body_references.get",
+        json!({"session_id": session_id, "evidence_id": newest_token}),
+    )
+    .await;
+    assert_eq!(lazy_body["available"], true, "{lazy_body}");
+    assert_eq!(
+        lazy_body["references"][0]["target_origin"],
+        "https://newer.example.com"
+    );
+    assert_ne!(body["source_sequence"], lazy_body["source_sequence"]);
+
     // Deletion reports distinct IDs; the map must still account for both rows.
     assert_eq!(session.store.delete_ids(&[duplicate_id]).await.unwrap(), 1);
     assert_eq!(session.store.len().await, 0);
-    let missing = read(&dir, &api, "target.service_map.evidence.get", input).await;
+    let missing = read(&dir, &api, "target.service_map.evidence.get", input.clone()).await;
     assert_eq!(missing["available"], false);
     assert!(missing["row"].is_null());
+    let missing_body = read(&dir, &api, "target.service_map.body_references.get", input).await;
+    assert_eq!(missing_body["available"], false);
+    assert_eq!(missing_body["status"], "unavailable");
+    assert!(missing_body["references"].as_array().unwrap().is_empty());
     let empty = read(
         &dir,
         &api,

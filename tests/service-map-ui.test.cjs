@@ -39,9 +39,10 @@ function fixture() {
   let session = 'session-one';
   const requests = [];
   const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics'].map(name => [name, node()]));
-  const controller = map.createController({ elements: els, getSessionId: () => session, document: { activeElement: null, body: {}, querySelector: () => null }, request(url, options) { const pending = deferred(); requests.push({ url, options, ...pending }); return pending.promise; } });
+  const document = { activeElement: null, body: {}, querySelector: () => null };
+  const controller = map.createController({ elements: els, getSessionId: () => session, document, request(url, options) { const pending = deferred(); requests.push({ url, options, ...pending }); return pending.promise; } });
   controller.setVisible(true);
-  return { controller, els, requests, state: controller.getState(), setSession(value) { session = value; }, async load(payload = snapshot()) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
+  return { controller, els, requests, document, state: controller.getState(), setSession(value) { session = value; }, async load(payload = snapshot()) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
 }
 
 test('map is lazy: construction/hidden refresh cause no request', async () => {
@@ -784,4 +785,394 @@ test('primary direct summary keeps meaningful omissions visible without opening 
   assert.match(f.els.graphBounds.textContent, /20 hidden by query/);
   assert.match(f.els.graphBounds.textContent, /Pinned anchor is outside the search query/);
   assert.doesNotMatch(f.els.graphBounds.textContent, /\b0 omitted|\b0 hidden/);
+});
+
+function bodyReferences(overrides = {}) {
+  return { schema_version: 1, session_id: 'session-one', evidence_id: 'evidence-one', available: true,
+    status: 'scanned', complete: true, reasons: [], source_origin: originA, source_sequence: '9007199254740993',
+    source_started_at: '2026-10-12T01:00:00Z', retained_preview_bytes: 300, scanned_bytes: 300,
+    capture_preview_truncated: false, scan_prefix_truncated: false, candidates_scanned: 2,
+    omitted_reference_occurrences: 0, references: [{ target_origin: 'https://assets.example.com', occurrences: 2, preview_byte_offsets: [24, 148], omitted_offsets: 0 }],
+    limits: { ...map.BODY_REFERENCE_LIMITS }, coverage: 'literal_absolute_http_urls', offset_basis: 'retained_utf8_preview', ...overrides };
+}
+async function verifiedBodyFixture() {
+  const f = fixture(); await f.load(); f.controller.selectOrigin(originA, 0);
+  const pending = f.controller.loadEvidence('evidence-one'); f.requests.at(-1).resolve(response(evidence())); await pending;
+  return f;
+}
+async function resolveBodyReferences(f, payload = bodyReferences()) {
+  const pending = f.controller.loadBodyReferences(); f.requests.at(-1).resolve(response(payload)); return pending;
+}
+
+test('body inspection is opt-in: map, source verification, tabs, filters and refresh never request bodies', async () => {
+  const f = fixture(); await f.controller.loadBodyReferences(); assert.equal(f.requests.length, 0);
+  await f.load(); await f.controller.loadBodyReferences(); assert.equal(f.requests.length, 1);
+  assert.doesNotMatch(f.els.detail.innerHTML, /data-service-body-references/);
+  f.controller.selectOrigin(originA, 0);
+  const sourceRead = f.controller.loadEvidence('evidence-one');
+  assert.doesNotMatch(f.els.detail.innerHTML, /data-service-body-references/);
+  f.requests.at(-1).resolve(response(evidence())); await sourceRead;
+  assert.match(f.els.detail.innerHTML, /Inspect retained body references/);
+  assert.match(f.els.detail.innerHTML, /Active session only/);
+  f.els.search.value = 'app'; f.els.search.dispatch('input');
+  f.controller.setVisible(false); f.controller.setVisible(true); await f.load();
+  assert.equal(f.requests.length, 3);
+  assert.ok(f.requests.every(item => !item.url.includes('/body-references')));
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceBodyReferences: 'inspect' } }) } });
+  assert.equal(f.requests.length, 4);
+  const read = f.requests.at(-1), url = new URL(read.url, 'http://localhost');
+  assert.equal(url.pathname, '/api/target/service-map/body-references');
+  assert.deepEqual(Object.fromEntries(url.searchParams), { session_id: 'session-one', evidence_id: 'evidence-one' });
+  assert.equal(read.options.method, undefined);
+  read.resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.bodyReferences.status, 'scanned');
+});
+
+test('body references remain supplemental plaintext evidence with exact UTF-8 preview offsets', async () => {
+  const f = await verifiedBodyFixture(), graph = f.els.canvas.innerHTML, graphBounds = boundsText(f);
+  const payload = bodyReferences({ raw_body: 'private synthetic content', response: { body_preview: 'not for the inspector' } });
+  await resolveBodyReferences(f, payload);
+  assert.match(f.els.detail.innerHTML, /2 literal URL occurrences/);
+  assert.match(f.els.detail.innerHTML, /https:\/\/assets\.example\.com/);
+  assert.match(f.els.detail.innerHTML, /Preview byte offsets: 24, 148/);
+  assert.match(f.els.detail.innerHTML, /Complete retained-preview scan/);
+  assert.match(f.els.detail.innerHTML, /zero-based bytes relative to the retained UTF-8 preview/);
+  assert.match(f.els.detail.innerHTML, /does not prove a request, call, or service ownership/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /href=|src=|private synthetic|not for the inspector/);
+  assert.doesNotMatch(JSON.stringify(f.state.bodyReferences), /raw_body|response|private synthetic/);
+  assert.equal(f.els.canvas.innerHTML, graph); assert.equal(boundsText(f), graphBounds);
+  assert.equal(f.requests.length, 3);
+});
+
+test('body inspection deduplicates loading clicks and retries only on an explicit request', async () => {
+  const f = await verifiedBodyFixture(); const first = f.controller.loadBodyReferences();
+  assert.equal(f.state.bodyReferencesLoading, true);
+  assert.match(f.els.detail.innerHTML, /data-service-body-references="inspect"[^>]*disabled/);
+  await f.controller.loadBodyReferences(); await f.controller.loadBodyReferences();
+  assert.equal(f.requests.length, 3);
+  f.requests.at(-1).reject(new Error('private synthetic body')); await first;
+  assert.match(f.els.detail.innerHTML, /Could not verify retained body references/);
+  assert.match(f.els.detail.innerHTML, /Retry retained body references/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /private synthetic body/);
+  f.els.search.dispatch('input'); f.controller.setVisible(true);
+  assert.equal(f.requests.length, 3);
+  await resolveBodyReferences(f); assert.equal(f.requests.length, 4);
+  assert.equal(f.state.bodyReferencesError, '');
+});
+
+for (const [name, change] of [
+  ['wrong schema', p => { p.schema_version = 2; }],
+  ['wrong session', p => { p.session_id = 'session-two'; }],
+  ['wrong exact token', p => { p.evidence_id = 'other-evidence'; }],
+  ['wrong source origin', p => { p.source_origin = originB; }],
+  ['missing source origin', p => { delete p.source_origin; }],
+  ['wrong exact sequence', p => { p.source_sequence = '9007199254740992'; }],
+  ['numeric sequence', p => { p.source_sequence = 9007199254740993; }],
+  ['changed capture time', p => { p.source_started_at = '2026-10-12T02:00:00Z'; }],
+  ['unknown status', p => { p.status = 'complete'; }],
+  ['wrong available flag', p => { p.available = false; }],
+  ['wrong complete flag', p => { p.complete = false; }],
+  ['wrong coverage', p => { p.coverage = 'inferred_urls'; }],
+  ['wrong offset basis', p => { p.offset_basis = 'raw_response'; }],
+  ['noncanonical target with credentials', p => { p.references[0].target_origin = 'https://user:pass@assets.example.com'; }],
+  ['noncanonical target path', p => { p.references[0].target_origin = 'https://assets.example.com/path?private=value'; }],
+  ['noncanonical target case', p => { p.references[0].target_origin = 'https://ASSETS.example.com'; }],
+  ['non-HTTP target', p => { p.references[0].target_origin = 'javascript:alert(1)'; }],
+  ['duplicate origins', p => { p.references.push({ ...p.references[0] }); }],
+  ['too many origins', p => { p.references = Array.from({ length: 101 }, (_, i) => ({ ...p.references[0], target_origin: `https://r${i}.example.com` })); }],
+  ['too many offsets', p => { p.references[0].preview_byte_offsets = [1, 2, 3, 4, 5, 6]; }],
+  ['negative offset', p => { p.references[0].preview_byte_offsets[0] = -1; }],
+  ['out-of-range offset', p => { p.references[0].preview_byte_offsets[1] = 300; }],
+  ['unordered offsets', p => { p.references[0].preview_byte_offsets = [148, 24]; }],
+  ['unsafe occurrence count', p => { p.references[0].occurrences = Number.MAX_SAFE_INTEGER + 1; }],
+  ['wrong omitted offset count', p => { p.references[0].omitted_offsets = 1; }],
+  ['wrong scan limit', p => { p.limits.scan_bytes += 1; }],
+  ['oversized scan', p => { p.scanned_bytes = 262145; }],
+  ['unsafe retained preview count', p => { p.retained_preview_bytes = Number.MAX_SAFE_INTEGER + 1; }],
+  ['scan beyond retained preview', p => { p.retained_preview_bytes = 299; }],
+  ['too many candidates', p => { p.candidates_scanned = 4097; }],
+  ['too many omitted references', p => { p.omitted_reference_occurrences = 100; }],
+  ['reference count exceeds candidates', p => { p.candidates_scanned = 1; }],
+  ['raw content in reason', p => { p.reasons = ['https://private.example.com/raw']; }],
+  ['truncated scan called complete', p => { p.capture_preview_truncated = true; }],
+  ['partial without reason', p => { p.status = 'partial'; p.complete = false; }],
+  ['unsupported with references', p => { p.status = 'unsupported'; p.available = false; p.complete = false; }],
+]) test(`retained body-reference validation rejects ${name}`, async () => {
+  const f = await verifiedBodyFixture(), p = bodyReferences(); change(p);
+  await resolveBodyReferences(f, p);
+  assert.equal(f.state.bodyReferences, null);
+  assert.match(f.state.bodyReferencesError, /Could not verify/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /user:pass|private\.example|alert\(1\)/);
+  assert.equal(f.requests.length, 3);
+});
+
+for (const [name, change] of [
+  ['origin selection', f => f.controller.selectOrigin(originB)],
+  ['endpoint selection', f => f.controller.selectOrigin(originA)],
+  ['another evidence request', f => f.controller.loadEvidence('evidence-one')],
+  ['session reset', f => { f.setSession('session-two'); f.controller.reset(); }],
+  ['unannounced session transition', f => f.setSession('session-two')],
+  ['history changes', f => f.controller.markDirty()],
+  ['retention invalidation', f => f.controller.invalidate()],
+  ['scope change', f => { f.els.scope.checked = true; f.els.scope.dispatch('change'); }],
+  ['map refresh', f => f.controller.refresh({ force: true })],
+  ['hidden map', f => f.controller.setVisible(false)],
+]) test(`late body-reference responses cannot publish after ${name}`, async () => {
+  const f = await verifiedBodyFixture(), parsing = deferred();
+  const pending = f.controller.loadBodyReferences(), request = f.requests.at(-1);
+  request.resolve({ ok: true, json: () => parsing.promise }); await Promise.resolve();
+  change(f); parsing.resolve(bodyReferences()); await pending;
+  assert.equal(f.state.bodyReferences, null);
+  assert.doesNotMatch(f.els.detail.innerHTML, /assets\.example\.com/);
+  if (name !== 'unannounced session transition') assert.equal(request.options.signal.aborted, true);
+});
+
+test('previous body-reference result clears immediately when exact source is invalidated', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f);
+  f.controller.markDirty();
+  assert.equal(f.state.bodyReferences, null); assert.equal(f.state.evidence, null);
+  assert.doesNotMatch(f.els.detail.innerHTML, /data-service-body-references|assets\.example\.com/);
+});
+
+test('a newer body-reference read wins even if the cancelled read finishes last', async () => {
+  const f = await verifiedBodyFixture(), first = f.controller.loadBodyReferences(), old = f.requests.at(-1);
+  const sourceRead = f.controller.loadEvidence('evidence-one'); f.requests.at(-1).resolve(response(evidence())); await sourceRead;
+  await resolveBodyReferences(f, bodyReferences({ candidates_scanned: 0, references: [] }));
+  old.resolve(response(bodyReferences())); await first;
+  assert.equal(f.state.bodyReferences.references.length, 0);
+  assert.match(f.els.detail.innerHTML, /No literal absolute HTTP\(S\) URL references found/);
+});
+
+for (const status of ['unsupported', 'unavailable']) test(`${status} retained previews are distinct from a successful zero-reference scan`, async () => {
+  const f = await verifiedBodyFixture();
+  const p = bodyReferences({ status, available: false, complete: false, reasons: [status === 'unsupported' ? 'unsupported_content_type' : 'inactive_session'],
+    references: [], scanned_bytes: 0, candidates_scanned: 0 });
+  delete p.retained_preview_bytes; delete p.source_origin; delete p.source_sequence; delete p.source_started_at;
+  await resolveBodyReferences(f, p);
+  assert.equal(f.state.bodyReferences.status, status);
+  assert.match(f.els.detail.innerHTML, new RegExp(`Retained preview is ${status}`));
+  assert.doesNotMatch(f.els.detail.innerHTML, /No literal absolute HTTP\(S\) URL references found|Complete retained-preview scan/);
+});
+
+test('partial output exposes truncation, omissions, long origins and full independent limits', async () => {
+  const f = await verifiedBodyFixture(), longOrigin = `https://${['a'.repeat(50), 'b'.repeat(50), 'c'.repeat(50), 'd'.repeat(50)].join('.')}.example.com`;
+  const refs = Array.from({ length: 100 }, (_, i) => ({ target_origin: i ? `https://reference${i}.example.com` : longOrigin, occurrences: 7, preview_byte_offsets: [1, 25, 55, 80, 140], omitted_offsets: 2 }));
+  await resolveBodyReferences(f, bodyReferences({ status: 'partial', complete: false,
+    reasons: ['capture_preview_truncated', 'scan_prefix_truncated', 'candidate_limit', 'origin_limit', 'offset_limit'],
+    retained_preview_bytes: 300000, scanned_bytes: 262144, candidates_scanned: 4096, omitted_reference_occurrences: 30,
+    capture_preview_truncated: true, scan_prefix_truncated: true, references: refs }));
+  assert.equal(f.state.bodyReferences.references.length, 100);
+  assert.match(f.els.detail.innerHTML, /100 referenced origins · 700 literal URL occurrences/);
+  assert.match(f.els.detail.innerHTML, /Partial retained-preview scan/);
+  assert.match(f.els.detail.innerHTML, /30 reference occurrence\(s\) omitted/);
+  assert.match(f.els.detail.innerHTML, /2 more offset\(s\) omitted/);
+  assert.match(f.els.detail.innerHTML, /Scan: 262,144 bytes · Serialized row read: 2,097,152 bytes · Origins: 100 · URL candidates: 4,096 · Candidate: 4,096 bytes · Offsets per origin: 5/);
+  assert.ok(f.els.detail.innerHTML.includes(longOrigin));
+  assert.equal((f.els.detail.innerHTML.match(/class="service-map-body-reference-origin"/g) || []).length, 100);
+  assert.equal(f.state.snapshot.origins.length, 2);
+  const styles = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  assert.match(styles, /\.service-map-body-reference-list \{[^}]*max-height: 300px;[^}]*overflow: auto;/);
+  assert.match(styles, /\.service-map-body-reference-list span \{[^}]*overflow-wrap: anywhere;/);
+});
+
+
+test('resident previews can exceed the serialized disk-read ceiling while scanning remains bounded', async () => {
+  const f = await verifiedBodyFixture();
+  await resolveBodyReferences(f, bodyReferences({ status: 'partial', complete: false, reasons: ['scan_prefix_truncated'],
+    retained_preview_bytes: 3000000, scanned_bytes: 262144, scan_prefix_truncated: true }));
+  assert.equal(f.state.bodyReferences.retained_preview_bytes, 3000000);
+  assert.match(f.els.detail.innerHTML, /262,144 \/ 3,000,000 UTF-8 preview bytes inspected/);
+});
+
+test('canonical omitted references cannot exceed the inspected candidate budget', async () => {
+  const f = await verifiedBodyFixture();
+  await resolveBodyReferences(f, bodyReferences({ status: 'partial', complete: false, reasons: ['origin_limit'],
+    retained_preview_bytes: 100000, scanned_bytes: 100000, candidates_scanned: 4096, omitted_reference_occurrences: 4095 }));
+  assert.equal(f.state.bodyReferences, null);
+  assert.match(f.state.bodyReferencesError, /Could not verify/);
+});
+
+function pollRealTargetMap(f) {
+  return loadFunctions(['pollAuxiliaryData'], {
+    state: { activeTool: 'target', activeTargetView: 'service-map' }, targetServiceMapController: f.controller,
+    isWebsocketHistoryVisible: () => false, shouldPollFindingsBadge: () => false,
+    loadTargetSiteMap() { assert.fail('No legacy map read'); },
+  }).pollAuxiliaryData();
+}
+function clickBodyInspector(f) {
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceBodyReferences: 'inspect' } }) } });
+}
+test('real app background polling preserves body results produced by the delegated Inspect click', async () => {
+  const f = await verifiedBodyFixture(); clickBodyInspector(f);
+  f.requests.at(-1).resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.bodyReferences.status, 'scanned');
+  const replacements = f.els.detail.replacements;
+  for (let i = 0; i < 4; i++) {
+    const poll = pollRealTargetMap(f);
+    f.requests.at(-1).resolve(response(snapshot())); await poll;
+    assert.equal(f.state.bodyReferences?.status, 'scanned');
+    assert.equal(f.els.detail.replacements, replacements);
+  }
+  assert.match(f.els.detail.innerHTML, /https:\/\/assets\.example\.com/);
+  assert.equal(f.requests.filter(item => item.url.includes('/body-references')).length, 1);
+});
+
+
+test('delegated Inspect during a background poll stays enabled and can finish after repeated unchanged polls', async () => {
+  const f = await verifiedBodyFixture(); const firstPoll = pollRealTargetMap(f), mapRead = f.requests.at(-1);
+  assert.equal(f.state.loading, true);
+  assert.doesNotMatch(f.els.detail.innerHTML, /data-service-body-references="inspect"[^>]*disabled/);
+  clickBodyInspector(f); const bodyRead = f.requests.at(-1);
+  assert.match(bodyRead.url, /body-references/); assert.equal(f.state.bodyReferencesLoading, true);
+  mapRead.resolve(response(snapshot())); await firstPoll;
+  for (let i = 0; i < 3; i++) {
+    const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(snapshot())); await poll;
+    assert.equal(bodyRead.options.signal.aborted, false); assert.equal(f.state.bodyReferencesLoading, true);
+  }
+  bodyRead.resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.bodyReferences.status, 'scanned');
+  assert.equal(f.requests.filter(item => item.url.includes('/body-references')).length, 1);
+});
+
+test('explicit force refresh clears a completed inspection without starting a body read', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f);
+  const refresh = f.controller.refresh({ force: true });
+  assert.equal(f.state.bodyReferences, null); assert.doesNotMatch(f.els.detail.innerHTML, /assets\.example\.com/);
+  f.requests.at(-1).resolve(response(snapshot())); await refresh;
+  assert.equal(f.requests.filter(item => item.url.includes('/body-references')).length, 1);
+});
+
+for (const change of ['generation', 'exact token']) test(`background poll changing ${change} clears the source and fences pending body inspection`, async () => {
+  const f = await verifiedBodyFixture(); clickBodyInspector(f); const bodyRead = f.requests.at(-1);
+  const value = change === 'generation' ? snapshot(undefined, 'session-one', { generation: 'generation-two' })
+    : snapshot([origin(originA, [endpoint('/users', 'GET', 'new-exact-token')]), origin(originB)]);
+  const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(value)); await poll;
+  assert.equal(f.state.evidence, null); assert.equal(bodyRead.options.signal.aborted, true);
+  bodyRead.resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.bodyReferences, null); assert.doesNotMatch(f.els.detail.innerHTML, /assets\.example\.com/);
+});
+
+test('newly re-verified exact source can be inspected while only the map counts remain stale', async () => {
+  const f = await verifiedBodyFixture(); f.controller.markDirty();
+  assert.equal(f.state.evidence, null); assert.equal(f.state.stale, true);
+  const verify = f.controller.loadEvidence('evidence-one'); f.requests.at(-1).resolve(response(evidence())); await verify;
+  clickBodyInspector(f); const bodyRead = f.requests.at(-1);
+  assert.match(bodyRead.url, /body-references/);
+  bodyRead.resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.bodyReferences.status, 'scanned');
+  assert.equal(f.state.stale, true);
+});
+
+test('native Coverage open attribute survives unchanged polling without replacing inspector DOM', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f);
+  const nativeOpenHtml = f.els.detail.innerHTML.replace('<details class="service-map-body-reference-limits">', '<details class="service-map-body-reference-limits" open="">');
+  f.els.detail.innerHTML = nativeOpenHtml;
+  const replacements = f.els.detail.replacements;
+  for (let i = 0; i < 3; i++) {
+    const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(snapshot())); await poll;
+    assert.equal(f.els.detail.innerHTML, nativeOpenHtml);
+    assert.equal(f.els.detail.replacements, replacements);
+  }
+});
+
+// Model native DOM-owned state separately from generated markup. Replacing
+// innerHTML creates fresh elements and loses focus/scroll/open, as a browser does.
+function nativeInspectorModel(f) {
+  const descriptor = Object.getOwnPropertyDescriptor(f.els.detail, 'innerHTML');
+  const fresh = html => ({
+    body: html.includes('service-map-detail-body') ? { scrollTop: 0 } : null,
+    list: html.includes('class="service-map-body-reference-list"') ? { scrollTop: 0 } : null,
+    limits: html.includes('class="service-map-body-reference-limits"') ? { open: false } : null,
+    summary: html.includes('data-service-focus="body-references:limits"') ? {
+      dataset: { serviceFocus: 'body-references:limits' }, isConnected: true,
+      getClientRects: () => [{}], focus() { f.document.activeElement = this; },
+    } : null,
+  });
+  let current = fresh(f.els.detail.innerHTML);
+  f.els.detail.querySelector = selector => current[{
+    '.service-map-detail-body': 'body', '.service-map-body-reference-list': 'list', '.service-map-body-reference-limits': 'limits',
+  }[selector]] || null;
+  f.els.detail.querySelectorAll = () => current.summary ? [current.summary] : [];
+  Object.defineProperty(f.els.detail, 'innerHTML', {
+    get: descriptor.get,
+    set(html) {
+      if (current.summary) current.summary.isConnected = false;
+      if (f.document.activeElement === current.summary) f.document.activeElement = f.document.body;
+      descriptor.set.call(this, html); current = fresh(html);
+    },
+  });
+  return () => current;
+}
+
+test('unchanged polls preserve nested scroll and native-normalized loading markup', async () => {
+  const f = await verifiedBodyFixture(); clickBodyInspector(f); const bodyRead = f.requests.at(-1);
+  const view = nativeInspectorModel(f); view().limits.open = true; view().body.scrollTop = 240;
+  // Boolean attributes and insignificant spaces normalize when assigned to DOM.
+  f.els.detail.innerHTML = f.els.detail.innerHTML.replace(/ disabled>/g, ' disabled="">').replace(/inspect" >/g, 'inspect">');
+  view().limits.open = true; view().body.scrollTop = 240;
+  const before = f.els.detail.replacements;
+  const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(snapshot())); await poll;
+  assert.equal(f.els.detail.replacements, before);
+  assert.equal(view().limits.open, true); assert.equal(view().body.scrollTop, 240);
+  bodyRead.resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(view().limits.open, true); assert.equal(view().body.scrollTop, 240);
+});
+
+test('same-source output changes retain Coverage keyboard focus, disclosure and both scroll positions', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f);
+  const view = nativeInspectorModel(f), previous = view();
+  previous.limits.open = true; previous.body.scrollTop = 350; previous.list.scrollTop = 110;
+  f.document.activeElement = previous.summary;
+  const data = snapshot(); data.origins[0].endpoints[0].request_count = 3;
+  const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(data)); await poll;
+  assert.notEqual(view(), previous);
+  assert.equal(view().limits.open, true);
+  assert.equal(view().body.scrollTop, 350); assert.equal(view().list.scrollTop, 110);
+  assert.equal(f.document.activeElement, view().summary);
+  assert.match(f.els.detail.innerHTML, /data-service-focus="body-references:limits"/);
+  assert.match(f.els.detail.innerHTML, /3 sampled rows/);
+});
+
+test('source invalidation resets Coverage and nested scroll instead of transferring native state', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f);
+  const view = nativeInspectorModel(f);
+  view().limits.open = true; view().list.scrollTop = 110; view().body.scrollTop = 350;
+  f.controller.markDirty(); assert.equal(view().limits, null);
+  const verify = f.controller.loadEvidence('evidence-one'); f.requests.at(-1).resolve(response(evidence())); await verify;
+  assert.equal(view().limits.open, false); assert.equal(view().body.scrollTop, 0);
+  await resolveBodyReferences(f);
+  assert.equal(view().limits.open, false); assert.equal(view().list.scrollTop, 0);
+});
+
+test('the existing native Relation details footer stays open through metadata polling', async () => {
+  const f = await verifiedBodyFixture(); pin(f, originA);
+  f.els.boundsDetails.open = true;
+  const before = f.els.boundsDetails.replacements;
+  const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(snapshot())); await poll;
+  assert.equal(f.els.boundsDetails.open, true); assert.equal(f.els.boundsDetails.replacements, before);
+  assert.equal(f.els.boundsDetails.classList.contains('hidden'), false);
+});
+
+test('same exact source keeps native inspector state when its selected endpoint moves to another index', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f);
+  const view = nativeInspectorModel(f);
+  f.els.detail.innerHTML = f.els.detail.innerHTML.replace('<details class="service-map-body-reference-limits">', '<details class="service-map-body-reference-limits" open="">');
+  const previous = view(); previous.limits.open = true; previous.list.scrollTop = 110; previous.body.scrollTop = 350;
+  f.document.activeElement = previous.summary;
+  const replacements = f.els.detail.replacements;
+  const data = snapshot([origin(originA, [endpoint('/inserted', 'GET', 'inserted-source'), endpoint()]), origin(originB)]);
+  const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(data)); await poll;
+  assert.equal(f.state.endpointIndex, 1); assert.equal(f.state.endpointSelection.path, '/users');
+  assert.equal(f.state.evidenceId, 'evidence-one'); assert.equal(f.state.bodyReferences.status, 'scanned');
+  assert.equal(f.els.detail.replacements, replacements); assert.equal(view(), previous);
+  assert.equal(view().limits.open, true); assert.equal(view().list.scrollTop, 110); assert.equal(view().body.scrollTop, 350);
+  assert.equal(f.document.activeElement, previous.summary);
+  assert.equal(f.requests.filter(item => item.url.includes('/body-references')).length, 1);
+});
+
+
+test('metadata map footer distinguishes explicit body inspection from map-wide extraction', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  assert.match(html, /Body references require explicit inspection of one retained response; they are not added to this map\./);
+  assert.doesNotMatch(html, /Response-body reference extraction is deferred/);
 });

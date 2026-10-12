@@ -39,6 +39,7 @@ use sniper::{
     },
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     service_map::{ServiceMap, ServiceMapEvidence},
+    service_map_body::ServiceMapBodyReferences,
     session::{validate_session_creation_name, SessionSummary},
     skills,
     workspace::{
@@ -828,7 +829,10 @@ enum TargetCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
 struct ServiceMapArgs {
+    #[command(subcommand)]
+    command: Option<ServiceMapCommand>,
     #[arg(long)]
     session_id: Option<Uuid>,
     /// Exact canonical HTTP(S) origin, with no path, credentials, query or fragment.
@@ -840,6 +844,25 @@ struct ServiceMapArgs {
     /// Bound the retained rows considered; incomplete results say why.
     #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
     max_records: usize,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceMapCommand {
+    /// Explicitly inspect one retained response preview in the active session only.
+    #[command(
+        after_help = "Requires the current active session UUID and an exact-row evidence token. An inactive session returns unavailable; this command never loads or activates it. Reads one retained UTF-8 HTML/JavaScript preview only, with no target requests, automatic reads, or batch reads. Literal HTTP(S) references do not establish calls or ownership; offsets address the retained preview, not wire bytes or a full body."
+    )]
+    BodyReferences(ServiceMapBodyReferencesArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapBodyReferencesArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained row.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
 }
 
 #[derive(Args, Debug)]
@@ -2376,7 +2399,12 @@ impl TargetCommand {
         match self {
             TargetCommand::GetScope(_) => "scope.get",
             TargetCommand::SetScope(_) => "scope.set",
-            TargetCommand::ServiceMap(_) => "target.service_map.get",
+            TargetCommand::ServiceMap(args) => match &args.command {
+                Some(ServiceMapCommand::BodyReferences(_)) => {
+                    "target.service_map.body_references.get"
+                }
+                None => "target.service_map.get",
+            },
             TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
         }
     }
@@ -3222,7 +3250,9 @@ fn service_map_object(properties: Value) -> Value {
 fn service_map_output_schema(operation: &str) -> Option<Value> {
     if !matches!(
         operation,
-        "target.service_map.get" | "target.service_map.evidence.get"
+        "target.service_map.get"
+            | "target.service_map.evidence.get"
+            | "target.service_map.body_references.get"
     ) {
         return None;
     }
@@ -3238,6 +3268,49 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "source_origin":string,
         "relationship":{"type":"string","enum":["origin_header","referer_header"]}
     }));
+    if operation == "target.service_map.body_references.get" {
+        let reference = service_map_object(json!({
+            "target_origin":string,"occurrences":{"type":"integer","minimum":1,"maximum":4096},
+            "preview_byte_offsets":{"type":"array","minItems":1,"maxItems":5,"items":{"type":"integer","minimum":0,"maximum":262143}},
+            "omitted_offsets":{"type":"integer","minimum":0,"maximum":4091}
+        }));
+        let mut schema = service_map_object(json!({
+            "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":string,
+            "available":boolean,"status":{"type":"string","enum":["scanned","partial","unsupported","unavailable"]},
+            "complete":boolean,"reasons":strings,
+            "source_origin":string,"source_sequence":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+            "source_started_at":timestamp,"retained_preview_bytes":count,
+            "scanned_bytes":{"type":"integer","minimum":0,"maximum":262144},
+            "capture_preview_truncated":boolean,"scan_prefix_truncated":boolean,
+            "candidates_scanned":{"type":"integer","minimum":0,"maximum":4096},
+            "omitted_reference_occurrences":{"type":"integer","minimum":0,"maximum":4096},"references":{"type":"array","maxItems":100,"items":reference},
+            "limits":service_map_object(json!({
+                "scan_bytes":{"type":"integer","enum":[262144]},
+                "serialized_row_bytes":{"type":"integer","enum":[2097152]},
+                "origins":{"type":"integer","enum":[100]},
+                "candidates":{"type":"integer","enum":[4096]},
+                "candidate_bytes":{"type":"integer","enum":[4096]},
+                "offsets_per_origin":{"type":"integer","enum":[5]}
+            })),
+            "coverage":{"type":"string","enum":["literal_absolute_http_urls"]},
+            "offset_basis":{"type":"string","enum":["retained_utf8_preview"]}
+        }));
+        schema["required"].as_array_mut().unwrap().retain(|name| {
+            ![
+                "source_origin",
+                "source_sequence",
+                "source_started_at",
+                "retained_preview_bytes",
+            ]
+            .contains(&name.as_str().unwrap())
+        });
+        schema["oneOf"] = json!([
+            {"required":["source_origin","source_sequence","source_started_at","retained_preview_bytes"],"properties":{"available":{"enum":[true]},"status":{"enum":["scanned"]},"complete":{"enum":[true]},"reasons":{"enum":[[]]},"capture_preview_truncated":{"enum":[false]},"scan_prefix_truncated":{"enum":[false]}}},
+            {"required":["source_origin","source_sequence","source_started_at","retained_preview_bytes"],"properties":{"available":{"enum":[true]},"status":{"enum":["partial"]},"complete":{"enum":[false]},"reasons":{"minItems":1}}},
+            {"properties":{"available":{"enum":[false]},"status":{"enum":["unsupported","unavailable"]},"complete":{"enum":[false]},"reasons":{"minItems":1},"references":{"enum":[[]]},"scanned_bytes":{"enum":[0]},"candidates_scanned":{"enum":[0]},"omitted_reference_occurrences":{"enum":[0]}}}
+        ]);
+        return Some(schema);
+    }
     if operation == "target.service_map.evidence.get" {
         let row = service_map_object(json!({
             "evidence_id":string,"record_id":uuid,
@@ -3342,6 +3415,13 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."}
             }
         })),
+        "target.service_map.body_references.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
+                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged v1 evidence token for one retained row. Explicit one-row preview inspection only; no batch reads or target requests."}
+            }
+        })),
         "target.service_map.evidence.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
             "properties":{
@@ -3373,6 +3453,14 @@ fn service_map_evidence_path(args: &ServiceMapEvidenceArgs) -> String {
     )
 }
 
+fn service_map_body_references_path(args: &ServiceMapBodyReferencesArgs) -> String {
+    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/body-references?{query}"),
+        Some(args.session_id),
+    )
+}
+
 fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
     vec![
         op(
@@ -3383,6 +3471,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &[],
             vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":true,"max_records":10000})],
+        ),
+        op(
+            "target.service_map.body_references.get",
+            "scope service-map body-references --session-id <uuid> --evidence-id <token>",
+            "Explicitly read literal absolute HTTP(S) URL references from one retained UTF-8 HTML/JavaScript response preview. Active session only; inactive sessions return unavailable without loading or activation. Returns origins and preview-byte offsets, never body text or URL paths, queries, or credentials. No target requests or automatic/batch reads; references do not prove calls or ownership. Inspect status, completeness, truncation, reasons, and limits.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
         ),
         op(
             "target.service_map.evidence.get",
@@ -4137,7 +4234,9 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "clear_note",
         ],
         "target.service_map.get" => &["session_id", "origin", "in_scope_only", "max_records"],
-        "target.service_map.evidence.get" => &["session_id", "evidence_id"],
+        "target.service_map.evidence.get" | "target.service_map.body_references.get" => {
+            &["session_id", "evidence_id"]
+        }
         "scope.get" => &["session_id"],
         "scope.set" => &[
             "session_id",
@@ -4317,12 +4416,17 @@ fn command_input_preview(command: &Command) -> Value {
             json!({"session_id":args.session_id,"limit":args.limit})
         }
         Command::Scope { command } => match command {
-            TargetCommand::ServiceMap(args) => json!({
-                "session_id": args.session_id,
-                "in_scope_only": args.in_scope_only,
-                "origin": args.origin,
-                "max_records": args.max_records,
-            }),
+            TargetCommand::ServiceMap(args) => match &args.command {
+                Some(ServiceMapCommand::BodyReferences(args)) => json!({
+                    "session_id": args.session_id,"evidence_id":args.evidence_id,
+                }),
+                None => json!({
+                    "session_id": args.session_id,
+                    "in_scope_only": args.in_scope_only,
+                    "origin": args.origin,
+                    "max_records": args.max_records,
+                }),
+            },
             TargetCommand::ServiceMapEvidence(args) => json!({
                 "session_id": args.session_id,
                 "evidence_id": args.evidence_id,
@@ -4696,9 +4800,12 @@ fn command_api_preview(command: &Command) -> Result<Value> {
         ),
         Command::Capture { command } => capture_api_preview(command)?,
         Command::Scope { command } => match command {
-            TargetCommand::ServiceMap(args) => {
-                api_preview("GET", service_map_path(args, args.session_id), None)
-            }
+            TargetCommand::ServiceMap(args) => match &args.command {
+                Some(ServiceMapCommand::BodyReferences(args)) => {
+                    api_preview("GET", service_map_body_references_path(args), None)
+                }
+                None => api_preview("GET", service_map_path(args, args.session_id), None),
+            },
             TargetCommand::ServiceMapEvidence(args) => {
                 api_preview("GET", service_map_evidence_path(args), None)
             }
@@ -5176,10 +5283,17 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
     let mut notes = Vec::new();
     if matches!(
         command.operation_name(),
-        "target.service_map.get" | "target.service_map.evidence.get"
+        "target.service_map.get"
+            | "target.service_map.evidence.get"
+            | "target.service_map.body_references.get"
     ) {
-        notes.push("Offline preview only. Execution reads retained metadata from one pinned session; it never probes, scans, replays, crawls, or follows service redirects.");
-        notes.push("Counts include retained rows with duplicate UUIDs. Inspect completeness and unavailable data; evidence tokens identify exact row states and never fall back to UUID-only lookup.");
+        if command.operation_name() == "target.service_map.body_references.get" {
+            notes.push("Explicit one-row retained-preview read only. The session must already be active; an inactive session returns unavailable without being loaded or activated. No target requests, automatic reads, or batch reads.");
+            notes.push("Literal absolute HTTP(S) references do not prove calls or ownership. Results expose canonical origins and retained UTF-8 preview byte offsets, never body text or full URLs. Completeness applies only to the supported bounded literal grammar.");
+        } else {
+            notes.push("Offline preview only. Execution reads retained metadata from one pinned session; it never probes, scans, replays, crawls, or follows service redirects.");
+            notes.push("Counts include retained rows with duplicate UUIDs. Inspect completeness and unavailable data; evidence tokens identify exact row states and never fall back to UUID-only lookup.");
+        }
     }
     if command.requires_confirmation() {
         notes.push("Use --yes to apply this side-effecting operation after reviewing the dry-run.");
@@ -5624,6 +5738,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 .map_err(|message| anyhow!(message))?;
             Command::Scope {
                 command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: None,
                     session_id: call_optional(operation, input, "session_id")?,
                     in_scope_only: call_bool(operation, input, "in_scope_only")?,
                     origin: call_optional::<String>(operation, input, "origin")?
@@ -5632,6 +5747,25 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                         })
                         .transpose()?,
                     max_records,
+                }),
+            }
+        }
+        "target.service_map.body_references.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::BodyReferences(
+                        ServiceMapBodyReferencesArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
                 }),
             }
         }
@@ -6714,7 +6848,9 @@ async fn run(cli: Cli) -> Result<()> {
         command => {
             let api = if matches!(
                 command.operation_name(),
-                "target.service_map.get" | "target.service_map.evidence.get"
+                "target.service_map.get"
+                    | "target.service_map.evidence.get"
+                    | "target.service_map.body_references.get"
             ) {
                 discover_service_map_api(api_override).await?
             } else {
@@ -7630,6 +7766,167 @@ fn validate_service_map_evidence_response(
     Ok(())
 }
 
+fn service_map_body_safe_origin(origin: &str) -> bool {
+    origin.len() <= sniper::service_map_body::MAX_CANDIDATE_BYTES
+        && Url::parse(origin).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.origin().ascii_serialization() == origin
+        })
+}
+
+fn validate_service_map_body_references_response(
+    result: &ServiceMapBodyReferences,
+    args: &ServiceMapBodyReferencesArgs,
+) -> Result<()> {
+    use sniper::service_map_body::{
+        MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_OFFSETS_PER_ORIGIN, MAX_ORIGINS, MAX_SCAN_BYTES,
+        MAX_SERIALIZED_ROW_BYTES,
+    };
+    let token_fields: Vec<_> = args.evidence_id.split('.').collect();
+    let token_valid = parse_service_map_evidence_id(&args.evidence_id).is_ok();
+    let known_reasons = [
+        "capture_preview_truncated",
+        "scan_prefix_truncated",
+        "candidate_limit",
+        "candidate_bytes",
+        "origin_limit",
+        "offset_limit",
+        "invalid_evidence_id",
+        "session_mismatch",
+        "stale_generation",
+        "record_missing",
+        "record_changed",
+        "body_identity_unverifiable",
+        "body_storage_unavailable",
+        "body_read_failed",
+        "serialized_row_limit",
+        "malformed_retained_row",
+        "response_unavailable",
+        "retained_preview_unavailable",
+        "unsupported_metadata",
+        "metadata_limit",
+        "unsupported_content_type",
+        "unsupported_body_encoding",
+        "unsupported_content_encoding",
+        "body_scan_failed",
+        "inactive_session",
+        "session_source_changed",
+        "metadata_unavailable",
+    ];
+    let status_valid = match result.status.as_str() {
+        "scanned" => result.available && result.complete && result.reasons.is_empty(),
+        "partial" => result.available && !result.complete && !result.reasons.is_empty(),
+        "unsupported" | "unavailable" => {
+            !result.available
+                && !result.complete
+                && !result.reasons.is_empty()
+                && result.references.is_empty()
+                && result.scanned_bytes == 0
+                && result.candidates_scanned == 0
+                && result.omitted_reference_occurrences == 0
+        }
+        _ => false,
+    };
+    let mut origins = std::collections::HashSet::new();
+    let references_valid = result.references.iter().all(|reference| {
+        service_map_body_safe_origin(&reference.target_origin)
+            && origins.insert(&reference.target_origin)
+            && reference.occurrences > 0
+            && reference.occurrences <= MAX_CANDIDATES
+            && reference.preview_byte_offsets.len()
+                == reference.occurrences.min(MAX_OFFSETS_PER_ORIGIN)
+            && reference.omitted_offsets
+                == reference.occurrences - reference.preview_byte_offsets.len()
+            && (reference.omitted_offsets == 0
+                || result.reasons.iter().any(|reason| reason == "offset_limit"))
+            && reference
+                .preview_byte_offsets
+                .iter()
+                .all(|offset| *offset < result.scanned_bytes)
+            && reference
+                .preview_byte_offsets
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+    });
+    let valid = result.schema_version == 1
+        && result.session_id == args.session_id
+        && result.evidence_id == args.evidence_id
+        && result.coverage == "literal_absolute_http_urls"
+        && result.offset_basis == "retained_utf8_preview"
+        && status_valid
+        && token_valid
+        && result
+            .reasons
+            .iter()
+            .all(|reason| known_reasons.contains(&reason.as_str()))
+        && result
+            .source_origin
+            .as_deref()
+            .is_none_or(service_map_safe_origin)
+        && result.source_sequence.as_ref().is_none_or(|sequence| {
+            token_fields[1] == args.session_id.to_string()
+                && token_fields[3] == sequence
+                && sequence
+                    .parse::<u64>()
+                    .is_ok_and(|value| value.to_string() == *sequence)
+        })
+        && (!result.available
+            || (result.source_origin.is_some()
+                && result.source_sequence.is_some()
+                && result.source_started_at.is_some()
+                && result.retained_preview_bytes.is_some()))
+        && result.scanned_bytes <= MAX_SCAN_BYTES
+        && result
+            .retained_preview_bytes
+            .is_none_or(|bytes| result.scanned_bytes <= bytes)
+        && result.candidates_scanned <= MAX_CANDIDATES
+        && result.references.len() <= MAX_ORIGINS
+        && result.omitted_reference_occurrences <= result.candidates_scanned
+        && result.references.iter().fold(0usize, |total, reference| {
+            total.saturating_add(reference.occurrences)
+        }) <= result
+            .candidates_scanned
+            .saturating_sub(result.omitted_reference_occurrences)
+        && (!result.available
+            || !result.capture_preview_truncated
+            || result
+                .reasons
+                .iter()
+                .any(|reason| reason == "capture_preview_truncated"))
+        && (!result.scan_prefix_truncated
+            || result
+                .reasons
+                .iter()
+                .any(|reason| reason == "scan_prefix_truncated"))
+        && result.limits.scan_bytes == MAX_SCAN_BYTES
+        && result.limits.serialized_row_bytes == MAX_SERIALIZED_ROW_BYTES
+        && result.limits.origins == MAX_ORIGINS
+        && result.limits.candidates == MAX_CANDIDATES
+        && result.limits.candidate_bytes == MAX_CANDIDATE_BYTES
+        && result.limits.offsets_per_origin == MAX_OFFSETS_PER_ORIGIN
+        && references_valid;
+    if !valid {
+        return Err(service_map_error("INVALID_RESPONSE", "Service Map body references do not match the requested session, exact-row token, bounds, or origin-only response contract"));
+    }
+    Ok(())
+}
+
+async fn read_service_map_body_references(
+    api: &ApiClient,
+    args: &ServiceMapBodyReferencesArgs,
+) -> Result<ServiceMapBodyReferences> {
+    let client = service_map_read_client()?;
+    let result: ServiceMapBodyReferences =
+        service_map_get(api, &client, &service_map_body_references_path(args)).await?;
+    validate_service_map_body_references_response(&result, args)?;
+    Ok(result)
+}
+
 async fn read_service_map(api: &ApiClient, args: &ServiceMapArgs) -> Result<ServiceMap> {
     let client = service_map_read_client()?;
     let session_id = if let Some(session_id) = args.session_id {
@@ -7659,10 +7956,16 @@ async fn read_service_map_evidence(
 
 async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
     match command {
-        TargetCommand::ServiceMap(args) => {
-            let result = read_service_map(&api, &args).await?;
-            print_session_read_json(&result, result.session_id)
-        }
+        TargetCommand::ServiceMap(args) => match &args.command {
+            Some(ServiceMapCommand::BodyReferences(args)) => {
+                let result = read_service_map_body_references(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            None => {
+                let result = read_service_map(&api, &args).await?;
+                print_session_read_json(&result, result.session_id)
+            }
+        },
         TargetCommand::ServiceMapEvidence(args) => {
             let result = read_service_map_evidence(&api, &args).await?;
             print_session_read_json(&result, args.session_id)
@@ -15802,6 +16105,12 @@ mod tests {
                 json!({"session_id":session,"evidence_id":"v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"}),
                 format!("/api/target/service-map/evidence?evidence_id=v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444&session_id={session}"),
             ),
+            (
+                "target.service_map.body_references.get",
+                vec!["target", "service-map", "body-references", "--session-id", session, "--evidence-id", "v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"],
+                json!({"session_id":session,"evidence_id":"v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"}),
+                format!("/api/target/service-map/body-references?evidence_id=v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444&session_id={session}"),
+            ),
         ] {
             let mut argv = vec!["sniper-cli"];
             argv.extend(args);
@@ -15934,6 +16243,112 @@ mod tests {
             &json!({"session_id":session,"evidence_id":"opaque&query=not-a-field"}),
         )
         .is_err());
+    }
+
+    #[test]
+    fn service_map_body_references_require_one_explicit_row_and_reject_batch_or_map_options() {
+        let session = "11111111-1111-1111-1111-111111111111";
+        let token = "v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444";
+        for input in [
+            json!({}),
+            json!({"session_id":session}),
+            json!({"evidence_id":token}),
+            json!({"session_id":null,"evidence_id":token}),
+            json!({"session_id":session,"evidence_id":null}),
+            json!({"session_id":session,"evidence_id":session}),
+            json!({"session_id":session,"evidence_id":[token]}),
+            json!({"session_id":session,"evidence_id":token,"max_records":1}),
+            json!({"session_id":session,"evidence_id":token,"origin":"https://example.com"}),
+            json!({"session_id":session,"evidence_id":token,"activate":true}),
+            json!({"session_id":session,"evidence_id":token,"automatic":true}),
+            json!({"session_id":session,"evidence_id":token,"body":true}),
+            json!({"session_id":session,"evidence_id":token,"follow_redirects":true}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.body_references.get", &input)
+                    .is_err(),
+                "{input}"
+            );
+        }
+        for args in [
+            vec![
+                "scope",
+                "service-map",
+                "body-references",
+                "--evidence-id",
+                token,
+            ],
+            vec![
+                "scope",
+                "service-map",
+                "--session-id",
+                session,
+                "body-references",
+                "--session-id",
+                session,
+                "--evidence-id",
+                token,
+            ],
+            vec![
+                "scope",
+                "service-map",
+                "body-references",
+                "--session-id",
+                session,
+                "--evidence-id",
+                token,
+                "--max-records",
+                "2",
+            ],
+        ] {
+            let mut argv = vec!["sniper-cli"];
+            argv.extend(args);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        for map_flags in [
+            vec!["--origin", "https://example.com"],
+            vec!["--in-scope-only"],
+            vec!["--max-records", "25"],
+            vec!["--session-id", session],
+        ] {
+            let mut map = vec!["sniper-cli", "scope", "service-map"];
+            map.extend(map_flags.iter().copied());
+            assert!(Cli::try_parse_from(map.clone()).is_ok(), "{map_flags:?}");
+            map.extend([
+                "body-references",
+                "--session-id",
+                session,
+                "--evidence-id",
+                token,
+            ]);
+            assert!(
+                Cli::try_parse_from(map).is_err(),
+                "parent map flags must not be ignored: {map_flags:?}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "target",
+            "service-map",
+            "body-references",
+            "--session-id",
+            session,
+            "--evidence-id",
+            token,
+        ])
+        .is_ok());
+        let help = Cli::try_parse_from([
+            "sniper-cli",
+            "scope",
+            "service-map",
+            "body-references",
+            "--help",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(help.contains("active session"), "{help}");
+        assert!(help.contains("never loads or activates"), "{help}");
+        assert!(help.contains("not wire bytes"), "{help}");
     }
 
     #[test]

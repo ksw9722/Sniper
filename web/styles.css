@@ -7504,3 +7504,17 @@ button.utility-button.replay-tab-add {
 .service-map-endpoint-summary .service-map-method { max-width: 100%; }
 .service-map-api-copy > span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; line-height: 1.4; max-height: 2.8em; }
 .service-map-api-count { flex-shrink: 0; }
+
+/* Single-source, opt-in evidence stays bounded inside the existing inspector. */
+.service-map-body-references { margin: 14px 0; padding: 0 12px 12px; border: 1px solid var(--line); border-radius: 9px; min-width: 0; }
+.service-map-body-references > button { width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.service-map-body-reference-result p { margin: 10px 0; font-size: var(--font-xs); line-height: 1.5; overflow-wrap: anywhere; }
+.service-map-body-reference-list { max-height: 300px; overflow: auto; padding: 0; margin: 10px 0; list-style: none; border: 1px solid var(--line); border-radius: 7px; }
+.service-map-body-reference-list li { padding: 9px; border-bottom: 1px solid var(--line); min-width: 0; }
+.service-map-body-reference-list li:last-child { border-bottom: 0; }
+.service-map-body-reference-list span { display: block; font-size: var(--font-xs); line-height: 1.5; overflow-wrap: anywhere; }
+.service-map-body-reference-origin { font-family: var(--mono); color: var(--text); }
+.service-map-body-reference-list span + span { color: var(--text-dim); margin-top: 4px; }
+.service-map-body-reference-limits { color: var(--text-dim); font-size: var(--font-xs); line-height: 1.5; margin-top: 10px; overflow-wrap: anywhere; }
+.service-map-body-reference-limits summary { cursor: pointer; }
+.service-map-body-reference-limits p { margin: 8px 0 0; }

@@ -285,6 +285,12 @@ impl AppState {
         session
     }
 
+    /// Inspect the already-active context without starting retention work or
+    /// resolving a saved session. Bounded passive reads must not load history.
+    pub(crate) async fn active_session_for_read(&self) -> Arc<SessionContext> {
+        self.active_session.read().await.clone()
+    }
+
     pub(crate) fn start_history_retention_worker(&self, session: &Arc<SessionContext>) {
         crate::history_retention::start_worker(
             session,

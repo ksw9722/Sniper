@@ -53,6 +53,8 @@ fn matches_schema(value: &Value, schema: &Value) -> bool {
             "items",
             "minimum",
             "maximum",
+            "minItems",
+            "maxItems",
             "pattern",
             "format",
             "allOf",
@@ -117,6 +119,15 @@ fn matches_schema_value(value: &Value, schema: &Value) -> bool {
         }
     }
     if let Some(items) = value.as_array() {
+        if schema["minItems"]
+            .as_u64()
+            .is_some_and(|min| items.len() < min as usize)
+            || schema["maxItems"]
+                .as_u64()
+                .is_some_and(|max| items.len() > max as usize)
+        {
+            return false;
+        }
         if let Some(item_schema) = schema.get("items") {
             if items
                 .iter()
@@ -188,6 +199,15 @@ fn service_map_parse_errors_hide_rejected_credentials_and_queries() {
             "service-map",
             "--origin",
             "https://user:SYNTHETIC_PRIVATE_VALUE@example.com",
+        ],
+        vec![
+            "target",
+            "service-map",
+            "body-references",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--evidence-id",
+            "https://example.com?token=SYNTHETIC_PRIVATE_VALUE",
         ],
         vec![
             "scope",
@@ -634,7 +654,7 @@ mod history_fixture {
             "/api/transactions" | "/api/transactions-page" => {
                 Json(state.payload.lock().unwrap().clone()).into_response()
             }
-            "/api/target/service-map" | "/api/target/service-map/evidence" => {
+            "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" => {
                 let status = StatusCode::from_u16(*state.read_status.lock().unwrap()).unwrap();
                 let mut response =
                     (status, Json(state.payload.lock().unwrap().clone())).into_response();
@@ -1060,6 +1080,266 @@ mod history_fixture {
         json!({"schema_version":1,"session_id":Uuid::nil(),"evidence_id":"v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000",
             "available":available,"reason":if available {Value::Null} else {json!("store_generation_changed")},
             "source":"captured_http_metadata","row":if available {row} else {Value::Null}})
+    }
+
+    const BODY_REFERENCE_TOKEN: &str = "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000";
+
+    fn body_references_payload(status: &str) -> Value {
+        let available = matches!(status, "scanned" | "partial");
+        let mut payload = json!({
+            "schema_version":1,"session_id":Uuid::nil(),"evidence_id":BODY_REFERENCE_TOKEN,
+            "available":available,"status":status,"complete":status == "scanned",
+            "reasons":match status {
+                "scanned" => json!([]),"partial" => json!(["capture_preview_truncated"]),
+                "unsupported" => json!(["unsupported_content_type"]),_ => json!(["inactive_session"])
+            },
+            "scanned_bytes":if available {100} else {0},
+            "capture_preview_truncated":status == "partial","scan_prefix_truncated":false,
+            "candidates_scanned":if available {2} else {0},"omitted_reference_occurrences":0,
+            "references":if available {json!([{"target_origin":"https://cdn.example.com","occurrences":2,"preview_byte_offsets":[10,60],"omitted_offsets":0}])} else {json!([])},
+            "limits":{"scan_bytes":262144,"serialized_row_bytes":2097152,"origins":100,"candidates":4096,"candidate_bytes":4096,"offsets_per_origin":5},
+            "coverage":"literal_absolute_http_urls","offset_basis":"retained_utf8_preview"
+        });
+        if available {
+            payload["source_origin"] = json!("https://example.com");
+            payload["source_sequence"] = json!("9007199254740993");
+            payload["source_started_at"] = json!("2026-10-12T06:00:00Z");
+            payload["retained_preview_bytes"] = json!(100);
+        }
+        payload
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_body_reference_statuses_match_schema_and_explicit_read_paths() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let schema = output_schema("target.service_map.body_references.get");
+        let scanned = body_references_payload("scanned");
+        for field in [
+            "source_origin",
+            "source_sequence",
+            "source_started_at",
+            "retained_preview_bytes",
+        ] {
+            let mut missing = scanned.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!super::matches_schema(&missing, &schema));
+        }
+        let mut too_many_offsets = scanned.clone();
+        too_many_offsets["references"][0]["preview_byte_offsets"] = json!([1, 2, 3, 4, 5, 6]);
+        assert!(!super::matches_schema(&too_many_offsets, &schema));
+        let mut invalid_status = scanned.clone();
+        invalid_status["status"] = json!("partial");
+        assert!(!super::matches_schema(&invalid_status, &schema));
+        let operation = super::spec("target.service_map.body_references.get");
+        assert_eq!(operation["side_effect"], "read");
+        assert_eq!(operation["requires_confirmation"], false);
+        assert_eq!(
+            operation["input_schema"]["required"],
+            json!(["session_id", "evidence_id"])
+        );
+        for status in ["scanned", "partial", "unsupported", "unavailable"] {
+            let payload = body_references_payload(status);
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let direct = mock
+                .command(&[
+                    "target",
+                    "service-map",
+                    "body-references",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ])
+                .await;
+            assert_eq!(direct, payload);
+            assert_schema(&direct, &schema);
+            mock.assert_reads(
+                "/api/target/service-map/body-references",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+            let input =
+                json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN}).to_string();
+            let called = mock
+                .command(&[
+                    "call",
+                    "target.service_map.body_references.get",
+                    "--input",
+                    &input,
+                ])
+                .await;
+            assert_eq!(called["data"], direct);
+            assert_eq!(called["meta"]["session_id"], session);
+            mock.assert_reads(
+                "/api/target/service-map/body-references",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        // Body-origin limits differ from the smaller metadata-origin limits.
+        let mut long_origin = body_references_payload("scanned");
+        long_origin["references"][0]["target_origin"] =
+            json!(format!("https://{}.example.com", "a".repeat(600)));
+        *mock.state.payload.lock().unwrap() = long_origin.clone();
+        let result = mock
+            .command(&[
+                "scope",
+                "service-map",
+                "body-references",
+                "--session-id",
+                &session,
+                "--evidence-id",
+                BODY_REFERENCE_TOKEN,
+            ])
+            .await;
+        assert_eq!(result, long_origin);
+        assert_schema(&result, &schema);
+        mock.assert_reads(
+            "/api/target/service-map/body-references",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+        // Valid references omitted by the origin cap remain counted explicitly.
+        let mut capped = body_references_payload("partial");
+        capped["reasons"] = json!(["capture_preview_truncated", "origin_limit"]);
+        capped["candidates_scanned"] = json!(104);
+        capped["scanned_bytes"] = json!(20000);
+        capped["retained_preview_bytes"] = json!(20000);
+        capped["references"] = json!((0..100)
+            .map(|index| json!({
+                "target_origin":format!("https://ref{index}.example.com"),"occurrences":1,
+                "preview_byte_offsets":[index * 100],"omitted_offsets":0
+            }))
+            .collect::<Vec<_>>());
+        capped["omitted_reference_occurrences"] = json!(4);
+        *mock.state.payload.lock().unwrap() = capped.clone();
+        let result = mock
+            .command(&[
+                "scope",
+                "service-map",
+                "body-references",
+                "--session-id",
+                &session,
+                "--evidence-id",
+                BODY_REFERENCE_TOKEN,
+            ])
+            .await;
+        assert_eq!(result, capped);
+        mock.assert_reads(
+            "/api/target/service-map/body-references",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_body_references_reject_misbound_unsafe_or_unbounded_responses() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "body-references",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        for (pointer, value) in [
+            ("/schema_version", json!(2)),
+            ("/session_id", json!(Uuid::from_u128(1))),
+            ("/evidence_id", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/status", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/available", json!(false)),
+            ("/complete", json!(false)),
+            ("/reasons", json!(["SYNTHETIC_PRIVATE_VALUE"])),
+            ("/source_sequence", json!("9007199254740992")),
+            (
+                "/source_origin",
+                json!("https://user:SYNTHETIC_PRIVATE_VALUE@example.com"),
+            ),
+            (
+                "/source_origin",
+                json!("https://example.com/private?SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            (
+                "/references/0/target_origin",
+                json!("https://example.com/private?SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            (
+                "/references/0/target_origin",
+                json!("https://user:SYNTHETIC_PRIVATE_VALUE@example.com"),
+            ),
+            (
+                "/references/0/target_origin",
+                json!(format!("https://{}.example.com", "a".repeat(4096))),
+            ),
+            ("/references/0/occurrences", json!(0)),
+            ("/references/0/omitted_offsets", json!(1)),
+            ("/references/0/preview_byte_offsets", json!([60, 10])),
+            ("/references/0/preview_byte_offsets", json!([10, 100])),
+            ("/scanned_bytes", json!(262145)),
+            ("/retained_preview_bytes", json!(99)),
+            ("/candidates_scanned", json!(4097)),
+            ("/candidates_scanned", json!(1)),
+            ("/omitted_reference_occurrences", json!(15)),
+            ("/capture_preview_truncated", json!(true)),
+            ("/scan_prefix_truncated", json!(true)),
+            ("/coverage", json!("all_runtime_calls")),
+            ("/offset_basis", json!("wire_bytes")),
+            ("/limits/scan_bytes", json!(262145)),
+        ] {
+            let mut payload = body_references_payload("scanned");
+            *payload.pointer_mut(pointer).unwrap() = value;
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{pointer}");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/body-references",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        for field in [
+            "source_origin",
+            "source_sequence",
+            "source_started_at",
+            "retained_preview_bytes",
+        ] {
+            let mut payload = body_references_payload("scanned");
+            payload.as_object_mut().unwrap().remove(field);
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            mock.assert_reads(
+                "/api/target/service-map/body-references",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_body_reference_http_failures_do_not_retry_follow_or_echo() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "target",
+            "service-map",
+            "body-references",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        for (status, code, exit) in [(302, "REDIRECT_REFUSED", 5), (503, "HTTP_STATUS_ERROR", 6)] {
+            *mock.state.read_status.lock().unwrap() = status;
+            *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+            let result = mock.command_with_code(&args, exit).await;
+            assert_eq!(result["error"]["code"], code);
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/body-references",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

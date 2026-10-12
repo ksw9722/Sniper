@@ -222,6 +222,13 @@ is performed. Always inspect the reported completeness and unavailable fields;
 this is an observed inventory, not a verified infrastructure topology. See the
 [Service Map contract and examples](docs/integrations/service-map.md).
 
+A separate, explicit `sniper-cli target service-map body-references --session-id
+<active-session-uuid> --evidence-id <returned-token>` read can inspect one retained
+UTF-8 HTML/JavaScript response preview. It returns canonical origins and preview
+byte offsets, with truncation and limits; literal references do not prove calls
+or ownership. The session must already be active. Default map/evidence reads
+remain metadata-only, with no automatic body reads or target requests.
+
 ## CLI
 
 For the current development branch, see the

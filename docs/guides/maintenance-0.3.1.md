@@ -13,6 +13,15 @@ request. No scans, probes, replay, or crawling are introduced. Check completenes
 and unavailable data before drawing conclusions. See the
 [Service Map contract](../integrations/service-map.md).
 
+An optional, explicit one-row body-reference read is available through the
+Service Map evidence inspector and `target.service_map.body_references.get`.
+It requires the current active session and an exact-row token. Inactive sessions
+remain unavailable without being loaded or activated. Only bounded retained
+UTF-8 HTML/JavaScript previews are inspected; results expose canonical origins
+and retained-preview offsets with separate capture/prefix truncation and cap
+reasons. References do not establish calls or ownership. The default map and
+metadata evidence still read no bodies, and nothing sends target requests.
+
 ## Predictable CLI contracts
 
 - Discovery, examples, and schemas describe the corrected saved-data and local

@@ -26,6 +26,7 @@ pub mod scanner;
 pub mod scope;
 pub mod sequence;
 pub mod service_map;
+pub mod service_map_body;
 pub mod session;
 pub mod skill_managed;
 pub mod skill_status;

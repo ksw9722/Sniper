@@ -63,6 +63,26 @@ transaction UUID detail read as a substitute: repeated IDs can resolve to anothe
 row. The map and its evidence omit query strings, URL credentials, raw headers,
 and bodies. Paths can still be sensitive; summarize responsibly.
 
+For an explicitly requested one-row response-preview inspection, use
+`target service-map body-references --session-id <active-session-uuid>
+--evidence-id <returned-token>` (`target.service_map.body_references.get`). Both
+fields are required. The session must already be active: an inactive request is
+unavailable and never loads or activates the session. Do not switch sessions,
+fetch UUID-only details, inspect other rows, batch-read bodies, or start target
+requests as a fallback. Default map and metadata evidence reads remain body-free.
+
+Only retained UTF-8 HTML/JavaScript previews with supported content encoding are
+inspected, within the reported byte, row, candidate, origin, and offset limits.
+No decompression, Base64 decoding, document parsing, or JavaScript execution is
+performed. Check `available`, `status`, `complete`, `reasons`, both truncation
+flags, and counts. `scanned` covers only `literal_absolute_http_urls`; `partial`
+means incomplete, and `unsupported`/`unavailable` must not be treated as empty
+successful coverage. Output contains canonical origins and retained UTF-8 preview
+byte offsets, never body text, snippets, query strings, paths, or credentials.
+Offsets are not full-body or wire offsets. Literal references do not prove calls,
+followed links, ownership, or service dependencies; never add them to observed
+traffic counts or silently infer an architecture.
+
 ## Saved data and session management
 
 ### Prefer the saved-data v1 contract

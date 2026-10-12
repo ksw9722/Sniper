@@ -80,7 +80,7 @@ sniper-cli call target.service_map.get --input '{"session_id":"00000000-0000-000
 
 The UUID in the JSON example is synthetic. Select a real session deliberately
 from session discovery. `target` remains an alias for the `scope` command group.
-Both Service Map operations have `side_effect: "read"` and need no `--yes`.
+All three Service Map operations have `side_effect: "read"` and need no `--yes`.
 `--dry-run` describes the local API request without contacting it.
 
 `session_id` is optional for the map: omission or null resolves the active session
@@ -129,9 +129,11 @@ active-discovery option, or automatic retry with a larger limit.
   view.
 
 The result lists initiator, remote IP, and TLS certificate in `unavailable`.
-Response-body reference extraction is explicitly `deferred`; bodies are not read
-to build this map. Do not fill these gaps using a hostname guess or present them
-as collected evidence.
+The default map continues to list response-body references as `deferred`: bodies
+are never read to build or refresh the map or its metadata evidence. A separate,
+explicit one-row retained-preview read is described below. It does not enrich the
+default inventory automatically. Do not fill unavailable gaps using hostname
+guesses or present them as collected evidence.
 
 ## Completeness and freshness
 
@@ -175,10 +177,102 @@ It does not hydrate bodies, expose raw headers, or call the usual UUID-only HTTP
 detail endpoint as a fallback. Refresh the map deliberately if you need current
 evidence; do not describe unavailable historical evidence as verified.
 
+## Explicit one-row response-body references
+
+This optional read requires a deliberate selection of one exact retained row:
+
+```bash
+sniper-cli schema input target.service_map.body_references.get
+sniper-cli schema output target.service_map.body_references.get
+sniper-cli examples target.service_map.body_references.get
+sniper-cli target service-map body-references --session-id <active-session-uuid> --evidence-id <returned-evidence-token>
+sniper-cli call target.service_map.body_references.get --input '{"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"<returned-evidence-token>"}'
+```
+
+Both fields are required. Copy the complete evidence token unchanged. The chosen
+session must already be active: an inactive session returns `unavailable` with
+`inactive_session`, without loading or activating it. No session lookup, switch,
+UUID-only detail fallback, body batch, or automatic retry occurs. Session and
+row changes during a read invalidate its result. Tokens obtained for an inactive
+metadata inventory may become stale if that session is later opened; deliberately
+read a fresh map before inspecting one of its rows.
+
+The Scope inspector offers an explicit action for the selected evidence row.
+Selecting or expanding an origin, API, relationship, or evidence item does not
+read bodies. Body-reference results stay separate from observed traffic and
+header-derived links. Closing or changing the selection/session invalidates a
+pending inspector response.
+
+The reader inspects only the retained response preview of UTF-8 HTML or
+JavaScript. Supported media types, ignoring case and parameters, are `text/html`,
+`application/xhtml+xml`, `application/javascript`, `text/javascript`,
+`application/ecmascript`, `text/ecmascript`, and `application/x-javascript`.
+An encoded body is accepted only if capture already decoded it, or all declared
+content encodings are `identity`. The read does not decompress content, decode
+Base64 or entities/JavaScript escapes, parse a document, execute JavaScript,
+resolve relative URLs, or contact any target. Missing, unsupported, stale, and
+unverifiable source data are explicit states rather than empty successful scans.
+
+`coverage: "literal_absolute_http_urls"` means bounded literal absolute HTTP(S)
+URL references. Scheme matching is ASCII case-insensitive; a start immediately
+after an ASCII letter, digit, or underscore is ignored. Candidates end at ASCII
+whitespace/control characters, quotes, angle brackets, backticks, backslashes,
+parentheses, or braces. The reader parses each bounded candidate as an absolute
+HTTP(S) URL, then retains only its canonical origin. A final candidate cut by
+capture or prefix truncation is omitted conservatively. It cannot establish
+runtime calls, followed links, initiators, ownership, or service dependencies. An
+empty complete result means no references were found within this supported
+retained-preview grammar, not that the response
+has no URLs or that the application makes no other calls.
+
+The response has `schema_version: 1`, the selected `session_id` and `evidence_id`,
+`available`, `status`, `complete`, and `reasons`. Status is one of:
+
+- `scanned`: the supported retained preview was inspected within the limits;
+  `available: true`, `complete: true`, and no reasons
+- `partial`: a capture, prefix, candidate, origin, or offset limit left coverage
+  incomplete; `available: true`, `complete: false`, with reasons
+- `unsupported`: the retained representation cannot be inspected by this reader;
+  `available: false`, `complete: false`
+- `unavailable`: the exact retained row or required data cannot be read safely;
+  `available: false`, `complete: false`
+
+Available responses identify `source_origin`, decimal-string `source_sequence`,
+`source_started_at`, and `retained_preview_bytes`. Source metadata may be omitted
+when unavailable. `references` contains only `target_origin`, `occurrences`,
+`preview_byte_offsets`, and `omitted_offsets`. Origins are canonical scheme/host/
+port values; response text, snippets, paths, queries, fragments, and URL credentials
+are never returned. Origin names can still reveal private service information.
+
+Offsets are zero-based UTF-8 byte offsets in the retained preview,
+`offset_basis: "retained_utf8_preview"`. They are not offsets in the full body,
+compressed response, or wire traffic. Capture truncation and scan-prefix truncation
+are reported separately as `capture_preview_truncated` and
+`scan_prefix_truncated`; inspect both along with `scanned_bytes`.
+
+The fixed `limits` are:
+
+- `scan_bytes`: 262144 retained UTF-8 preview bytes, ending on a character boundary
+- `serialized_row_bytes`: 2097152 bytes for one disk-backed serialized row
+- `origins`: 100 distinct referenced origins
+- `candidates`: 4096 candidates, counted in `candidates_scanned`
+- `candidate_bytes`: 4096 bytes per literal URL candidate
+- `offsets_per_origin`: 5 stored offsets per referenced origin
+
+Resident preview length may exceed the disk-row limit; only its bounded prefix is
+inspected. An overlarge disk row is refused before hydration. Origin-cap omissions
+are counted in `omitted_reference_occurrences` only for validated references;
+further candidates beyond the candidate cap have unknown reference coverage.
+`omitted_offsets` counts additional occurrences whose offsets were not retained.
+Reasons name each applicable cap or unsupported/unavailable state. No automatic
+larger read follows a partial result. Even `complete: true` describes only this
+supported literal grammar within one retained preview, never all runtime calls.
+
 ## Local API
 
 - `GET /api/target/service-map?session_id=<uuid>&in_scope_only=false&max_records=10000`
 - `GET /api/target/service-map/evidence?session_id=<uuid>&evidence_id=<opaque-token>`
+- `GET /api/target/service-map/body-references?session_id=<active-uuid>&evidence_id=<opaque-token>`
 
 URL-encode the opaque token as a query parameter. These endpoints use the existing
 local API access control. Service Map discovery and reads do not follow API

@@ -451,6 +451,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_evidence),
         )
         .route(
+            "/api/target/service-map/body-references",
+            get(get_target_service_map_body_references),
+        )
+        .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
         )
@@ -5228,6 +5232,63 @@ async fn get_target_service_map_evidence(
         .into_response();
     }
     Json(evidence).into_response()
+}
+
+async fn get_target_service_map_body_references(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapEvidenceQuery>,
+) -> Response {
+    use crate::service_map_body::ServiceMapBodyReferences;
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    // Unlike metadata reads, this opt-in operation never opens an inactive
+    // saved context: its legacy loader can hydrate unbounded retained bodies.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(ServiceMapBodyReferences::missing(
+            query.session_id,
+            query.evidence_id,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    let result = session
+        .store
+        .service_map_body_references(session.id(), &query.evidence_id)
+        .await;
+    // The reader fences its row and file generations. Recheck source identity
+    // across its asynchronous work as well, without starting a session worker.
+    if let Some(reason) =
+        service_map_body_source_changed(&state, &session, &query.evidence_id).await
+    {
+        return Json(ServiceMapBodyReferences::missing(
+            query.session_id,
+            query.evidence_id,
+            &reason,
+        ))
+        .into_response();
+    }
+    Json(result).into_response()
+}
+
+async fn service_map_body_source_changed(
+    state: &AppState,
+    session: &Arc<crate::session::SessionContext>,
+    evidence_id: &str,
+) -> Option<String> {
+    let evidence = session
+        .store
+        .service_map_evidence(session.id(), evidence_id)
+        .await;
+    let active = state.active_session_for_read().await;
+    if !Arc::ptr_eq(&active, session) || !state.sessions.contains_session(session.id()) {
+        Some("session_source_changed".into())
+    } else if !evidence.available {
+        Some(evidence.reason.unwrap_or_else(|| "record_changed".into()))
+    } else {
+        None
+    }
 }
 
 async fn get_target_site_map(
@@ -14705,6 +14766,126 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_body_api_rejects_inactive_without_loading_saved_data() {
+        let (state, data_dir) = test_state("sniper-service-map-body-inactive");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive body fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        // If this endpoint accidentally starts resolving saved contexts, the
+        // intentionally invalid saved snapshot cannot be loaded successfully.
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let response: serde_json::Value = response_json(
+            super::get_target_service_map_body_references(
+                State(state.clone()),
+                Query(super::ServiceMapEvidenceQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["available"], false);
+        assert_eq!(response["reasons"], serde_json::json!(["inactive_session"]));
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "inactive body read changed saved files");
+        let invalid = super::get_target_service_map_body_references(
+            State(state.clone()),
+            Query(super::ServiceMapEvidenceQuery {
+                session_id: active.id(),
+                evidence_id: "invalid".into(),
+            }),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_body_publication_revalidates_row_and_active_context() {
+        let (state, data_dir) = test_state("sniper-service-map-body-publication");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        let id = record.id;
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        assert_eq!(
+            super::service_map_body_source_changed(&state, &active, &token).await,
+            None
+        );
+        active
+            .store
+            .update_record(id, |record| record.path = "/changed".into())
+            .await;
+        assert_eq!(
+            super::service_map_body_source_changed(&state, &active, &token)
+                .await
+                .as_deref(),
+            Some("record_changed")
+        );
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        state
+            .create_session(Some("New active fixture".into()))
+            .await
+            .unwrap();
+        // This is the exact final guard used after asynchronous body work. A
+        // formerly active context can still exist in cache, but cannot publish.
+        assert_eq!(
+            super::service_map_body_source_changed(&state, &active, &token)
+                .await
+                .as_deref(),
+            Some("session_source_changed")
+        );
+        drop(active);
         drop(state);
         let _ = std::fs::remove_dir_all(data_dir);
     }
