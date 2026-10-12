@@ -293,3 +293,13 @@ test('a body inspection reporting exact source loss clears a shown Link overlay'
   for (const key of ['source_origin', 'source_sequence', 'source_started_at', 'retained_preview_bytes']) delete value[key];
   await f.inspect(value); assert.equal(f.state.bodyReferenceOverlay, null);
 });
+
+for (const marker of ['session_changed', 'scope_changed', 'history_changed']) test(`ordinary map ${marker} clears exact Link evidence and overlay`, async () => {
+  const f = await displayedLink(), previous = f.state.snapshot;
+  const task = f.controller.refresh(); f.requests.at(-1).resolve({ ok: false, status: 409,
+    headers: { get: () => marker }, json() { assert.fail('No failure body read'); } });
+  assert.equal(await task, false);
+  for (const key of ['evidence', 'evidenceId', 'linkDeclarations', 'linkDeclarationsSource', 'bodyReferenceOverlay']) assert.equal(f.state[key], null, key);
+  assert.equal(f.state.snapshot, previous); assert.equal(f.state.stale, true); assert.equal(f.state.refreshPaused, true);
+  const count = f.requests.length; await f.controller.refresh(); assert.equal(f.requests.length, count);
+});

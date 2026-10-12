@@ -16,7 +16,7 @@ use anyhow::Result;
 use reqwest::StatusCode;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -135,6 +135,9 @@ pub struct AppState {
     workspace_retention_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
     retention_persistence_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
     upstream_peer_durability_gates: Arc<crate::upstream_peer_settings::DurabilityGates>,
+    /// Bounds queued plus running ordinary Service Map jobs across all sessions.
+    /// Other API reads and proxy work never acquire this permit.
+    service_map_read_slot: Arc<Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,10 +223,15 @@ impl AppState {
             workspace_retention_uncertain: Arc::new(Default::default()),
             retention_persistence_uncertain: Arc::new(Default::default()),
             upstream_peer_durability_gates: Arc::new(Default::default()),
+            service_map_read_slot: Arc::new(Semaphore::new(1)),
         };
         state.bind_upstream_peer_durability(&initial_session);
         state.start_history_retention_worker(&initial_session);
         Ok(state)
+    }
+
+    pub(crate) fn try_service_map_read(&self) -> Option<OwnedSemaphorePermit> {
+        self.service_map_read_slot.clone().try_acquire_owned().ok()
     }
 
     pub fn set_proxy_online(&self, online: bool) {

@@ -11,6 +11,18 @@
   "loaded_endpoints": 354,
   "explicit_peer_origin_groups": 30,
   "networking": "CSP connect-src none; guarded browser connections; closed in-memory GET adapter",
+  "ordinary_map_errors": [
+    "busy",
+    "scope_work_limit",
+    "session_changed",
+    "scope_changed",
+    "history_changed",
+    "build_failed",
+    "unknown",
+    "duplicate",
+    "mismatch",
+    "missing"
+  ],
   "scenarios": [
     "base",
     "reordered",
@@ -23,13 +35,13 @@
     "empty"
   ],
   "sha256": {
-    "web/service-map.js": "afbce52cf0262954b5e50138a71e0e27b38fd5765683796e82435a3e5dbe7af9",
+    "web/service-map.js": "6feea2b770334484e727c3470a61cac673772f7d39b3df20e8f991d43c441980",
     "web/styles.css": "d975c30e67d8510251e6331ae7046595656e574681ebdcb364b576c47a447fa2",
     "web/index.html": "25e128c32dab1376dbde6898b81b2c886c4b40439a99de1633cb1b10d609b73f",
-    "tests/fixtures/reported-products-browser.html": "ae83c4a00d1eddb1c953005186109976629ce78e4e5dd21a6e108810e815f3f9",
-    "tests/fixtures/reported-products-browser.js": "cef3e5c16b0eebc134f3a48c2610e4611a5c720c32bfd7481437002fba728a40",
+    "tests/fixtures/reported-products-browser.html": "89d6a7a6169b5bfb6b9aaad77d465861cc10136050e347a10a9ee1e54af2c24c",
+    "tests/fixtures/reported-products-browser.js": "ac6568b9f7cde297a5403e80db898f4e2dfb125a96d958b1f0367afe1bcdf832",
     "tests/fixtures/reported-products-browser.css": "eeb7ca8714d5cf00c578c0ca4adc628b614dea367ad4439cfc9fdd73a1f42657",
-    "tests/fixtures/reported-products-browser.README.md": "011b2de7ec5d0663e495b3bf1f37106692fd6a36866c20ac2ea3cd56fa5b7741",
-    "tests/fixtures/reported-products-browser-manifest.py": "1b05efce5a67ac5db57abdaf0984253d7de2ba38686a3563aeac7b22185d1aa2"
+    "tests/fixtures/reported-products-browser.README.md": "4aed19a954bcb1327cf0773ca9fdad5212beb6073d838e8d3f8674933f27c3cd",
+    "tests/fixtures/reported-products-browser-manifest.py": "2da179e6215fc17cdff71bef164a546c8610a63b6a9e8617b37c04bd2cb7f0b5"
   }
 }

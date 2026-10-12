@@ -45,6 +45,64 @@ and labels a selected origin outside the filter or card limit. Redirect
 relationship rows include the query-free target path so different destinations
 on the same origin remain distinguishable.
 
+## Bounded ordinary-map refresh
+
+Ordinary map reads share one nonqueued application-wide worker slot. This slot
+never gates proxy forwarding or unrelated API operations. A second concurrent
+map read receives HTTP 429 with `x-sniper-service-map-error: busy`; canceling the
+first HTTP request does not free the slot while its queued or running worker is
+still projecting, aggregating or serializing. Admission is bounded, but Tokio's
+shared blocking pool does not provide a scheduling deadline.
+
+The default 10,000 / maximum 50,000 considered-row window and 8 MiB metadata
+projection limit are unchanged. Metadata projection still takes one coherent
+store read lock and can delay store writers; aggregation and JSON serialization
+run after releasing that lock. These three stages run on the bounded blocking
+worker. The existing initial read-only inactive-session loader remains
+synchronous and is outside this offload; this is not a claim that all session
+loading or all map work is nonblocking.
+
+Scope uses the shared matcher with at most 500 entries in each include/exclude
+list and 512 raw bytes per pattern. Excess preparation input fails explicitly;
+no rules are silently truncated. One read has 8,388,608 logical patterned-match
+work units, charged before comparisons. This is a deterministic work bound, not
+a wall-clock promise. A read-local cache retains completed true/false decisions
+for at most 512 exact raw hosts and 128 KiB of key bytes. Reaching cache capacity
+only stops further caching; it never drops rows, resets the budget or changes
+scope semantics. If preparation or matching exceeds its bound, HTTP 422 with
+`scope_work_limit` replaces the entire result. No partial map or guessed coverage
+counts are returned. Narrow the scope rules or request a lower row window before
+retrying; the application never changes these settings automatically.
+
+After serialization, publication checks validate session/context identity,
+frozen scope-list equality and a private destructive-history epoch. Delete,
+retention trim, full-record update, store replacement and duplicate-ID hydration
+invalidate that epoch under the same store write lock. Pure appends and
+annotation/body-storage-only changes do not. The captured window may therefore
+remain valid after an append; new appended rows are not added to its counts.
+Full response updates elsewhere in the store can conservatively reject a read.
+These are validated checkpoints, not an atomic transaction across session,
+runtime and history. The private epoch changes no saved format or evidence token.
+
+Fixed failure markers are paired with exact statuses: 429 `busy`, 422
+`scope_work_limit`, 409 `session_changed`, `scope_changed` or `history_changed`,
+and 500 `build_failed`. GUI and CLI accept only these exact pairs and never echo
+server error bodies. Unrecognized, duplicate or mismatched markers use a fixed
+generic error; older servers need not supply a marker. Successful legacy/v1/v2
+response shapes and catalog negotiation are unchanged.
+
+After a failed refresh, the GUI visibly pauses background reads and offers
+**Refresh**. Any retained previous map is labeled stale. A source/scope/history
+conflict clears verified evidence and supplementary overlays. History events,
+reconnects and leaving/reopening the view do not silently restart paused reads.
+An explicit Refresh or actual scope/session change can resume them. Local origin,
+product, method and path filters remain read-free and do not clear the pause.
+The CLI reports a fixed failure once without retrying. Its codes are
+`SERVICE_MAP_BUSY`, `SERVICE_MAP_SCOPE_WORK_LIMIT`,
+`SERVICE_MAP_SESSION_CHANGED`, `SERVICE_MAP_SCOPE_CHANGED`,
+`SERVICE_MAP_HISTORY_CHANGED` and `SERVICE_MAP_BUILD_FAILED`; existing status-
+based exit codes and `retryable:false` remain unchanged.
+
 ## Reported products and local origin filters
 
 Origin cards summarize at most two products from the loaded, validated response-

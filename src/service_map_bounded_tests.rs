@@ -1,0 +1,522 @@
+use super::*;
+use crate::{
+    model::{HeaderRecord, MessageRecord},
+    store::TransactionStore,
+};
+use std::time::Instant;
+
+fn fixture_record(host: &str, sequence: u64) -> TransactionRecord {
+    let message = MessageRecord::from_headers_and_body(&http::HeaderMap::new(), b"", 0);
+    let mut record = TransactionRecord::http(
+        DateTime::<Utc>::from_timestamp(1_760_000_000, 0).unwrap(),
+        "GET".into(),
+        "https".into(),
+        host.into(),
+        "/items/1?synthetic=1".into(),
+        Some(200),
+        1,
+        message.clone(),
+        Some(message),
+        vec![],
+        None,
+        None,
+    );
+    record.id = Uuid::from_u128(sequence as u128 + 1);
+    record.sequence = sequence;
+    record.response.as_mut().unwrap().headers = vec![HeaderRecord {
+        name: "Server".into(),
+        value: "nginx/1.28.0 Caddy/2.9.1".into(),
+    }];
+    record
+}
+
+fn same_output(mut legacy: ServiceMap, mut bounded: ServiceMap) {
+    legacy.snapshot.id = Uuid::nil();
+    bounded.snapshot.id = Uuid::nil();
+    assert_eq!(
+        serde_json::to_vec(&legacy).unwrap(),
+        serde_json::to_vec(&bounded).unwrap()
+    );
+}
+
+fn expensive_scope() -> (Vec<String>, Vec<String>) {
+    let include = vec!["*.example.com".into()];
+    let exclude = (0..500)
+        .map(|i| format!("{}z{i:03}*", "*a".repeat(230)))
+        .collect();
+    (include, exclude)
+}
+
+fn long_host(index: usize) -> String {
+    format!(
+        "{index:03}.{}.{}.{}.{}.example.com",
+        "a".repeat(63),
+        "a".repeat(63),
+        "a".repeat(63),
+        "a".repeat(43)
+    )
+}
+
+#[test]
+fn bounded_scope_raw_semantics_include_ipv6_malformed_and_empty() {
+    let values = [
+        "",
+        " ",
+        "*",
+        "*.",
+        "**",
+        "*.*",
+        "a*b",
+        "ab",
+        "a..",
+        "*.EXAMPLE.com.",
+        "https://API.Example.com:443/path?synthetic#fragment",
+        "//api.example.com",
+        "API.Example.com.:8443",
+        "[2001:db8::1]:443",
+        "[::1]ignored",
+        "a:invalid",
+        "\u{2003}API.example.com\u{2003}",
+        "2001:db8::1",
+        "[::1",
+        "[::1]",
+        "127.0.0.1:443",
+        "127.1",
+        "Ä.Example.com",
+        "ä.example.com",
+        "example.com@other.example.com",
+        "a*b*c",
+        "a**b",
+        "a*b*",
+        "*a*b",
+    ];
+    for host in values {
+        for pattern in values {
+            for (include, exclude) in [
+                (vec![pattern.to_owned()], vec![]),
+                (vec![], vec![pattern.to_owned()]),
+            ] {
+                let expected = scope::is_host_in_scope(host, &include, &exclude);
+                let mut bounded = BoundedScope::new(&include, &exclude).unwrap();
+                assert_eq!(
+                    bounded.contains(host),
+                    Ok(expected),
+                    "{host:?}, {pattern:?}"
+                );
+                let remaining = bounded.remaining;
+                assert_eq!(bounded.contains(host), Ok(expected));
+                assert_eq!(bounded.remaining, remaining);
+            }
+        }
+    }
+    let mut empty = BoundedScope::new(&[], &[]).unwrap();
+    empty.remaining = 0;
+    for host in values {
+        assert_eq!(empty.contains(host), Ok(true));
+    }
+    assert!(empty.cache.is_empty());
+    assert_eq!(empty.cache_key_bytes, 0);
+}
+
+#[test]
+fn bounded_scope_budget_boundaries_and_completed_true_false_cache() {
+    let include = vec!["*.example.com".into()];
+    let exclude = vec!["*.blocked.example.com".into()];
+    let mut bounded = BoundedScope::new(&include, &exclude).unwrap();
+    for (host, expected) in [("api.example.com", true), ("a.blocked.example.com", false)] {
+        assert_eq!(bounded.contains(host), Ok(expected));
+        let remaining = bounded.remaining;
+        assert_eq!(bounded.contains(host), Ok(expected));
+        assert_eq!(bounded.remaining, remaining);
+        assert_eq!(bounded.cache.get(host), Some(&expected));
+    }
+    // Canonical aliases must not accidentally reuse the raw-host cache key.
+    assert_eq!(bounded.contains("API.Example.com.:443"), Ok(true));
+    assert_eq!(bounded.cache.len(), 3);
+    let host = "api.example.com";
+    let mut measured = BoundedScope::new(&include, &exclude).unwrap();
+    measured.contains(host).unwrap();
+    let cost = MAX_SCOPE_WORK - measured.remaining;
+    assert!(cost > 0);
+    let mut exact = BoundedScope::new(&include, &exclude).unwrap();
+    exact.remaining = cost;
+    assert_eq!(exact.contains(host), Ok(true));
+    assert_eq!(exact.remaining, 0);
+    assert_eq!(exact.contains(host), Ok(true));
+    let mut short = BoundedScope::new(&include, &exclude).unwrap();
+    short.remaining = cost - 1;
+    assert_eq!(short.contains(host), Err(scope::ScopeWorkLimit));
+    assert!(short.cache.is_empty());
+    assert_eq!(short.cache_key_bytes, 0);
+}
+
+#[test]
+fn bounded_scope_cache_entry_and_byte_limits_keep_charging_uncached_hosts() {
+    let exclude = vec!["*.blocked.example.com".into()];
+    for fill_bytes in [false, true] {
+        let mut bounded = BoundedScope::new(&[], &exclude).unwrap();
+        let count = if fill_bytes {
+            MAX_SCOPE_CACHE_KEY_BYTES / 512
+        } else {
+            MAX_SCOPE_CACHE_ENTRIES
+        };
+        for index in 0..count {
+            let prefix = format!("{index:03}.");
+            let host = if fill_bytes {
+                format!("{prefix}{}", "a".repeat(512 - prefix.len()))
+            } else {
+                format!("{prefix}example.com")
+            };
+            assert_eq!(bounded.contains(&host), Ok(true));
+        }
+        assert_eq!(bounded.cache.len(), count);
+        if fill_bytes {
+            assert_eq!(bounded.cache_key_bytes, MAX_SCOPE_CACHE_KEY_BYTES);
+        }
+        let bytes = bounded.cache_key_bytes;
+        let host = "uncached.example.com";
+        let cost = host.len() + exclude[0].len() + 16;
+        bounded.remaining = cost * 2;
+        assert_eq!(bounded.contains(host), Ok(true));
+        assert_eq!(bounded.remaining, cost);
+        assert_eq!(bounded.contains(host), Ok(true));
+        assert_eq!(bounded.remaining, 0);
+        assert_eq!(bounded.contains(host), Err(scope::ScopeWorkLimit));
+        assert_eq!(bounded.cache.len(), count);
+        assert_eq!(bounded.cache_key_bytes, bytes);
+        assert!(!bounded.cache.contains_key(host));
+    }
+}
+
+#[tokio::test]
+async fn bounded_scope_preparation_rejects_instead_of_truncating() {
+    let session = Uuid::from_u128(90);
+    let store = TransactionStore::from_records(vec![fixture_record("api.example.com", 1)]);
+    let snapshot = store.service_map_snapshot(session, 10).await;
+    for (include, exclude) in [
+        (vec!["example.com".into(); 501], vec![]),
+        (vec![], vec!["example.com".into(); 501]),
+        (vec!["x".repeat(513)], vec![]),
+        (vec![], vec!["x".repeat(513)]),
+    ] {
+        assert!(matches!(
+            build_bounded(
+                session,
+                snapshot.clone(),
+                10,
+                false,
+                None,
+                &include,
+                &exclude
+            ),
+            Err(scope::ScopeWorkLimit)
+        ));
+    }
+    let boundary = vec!["x".repeat(512); 500];
+    assert!(build_bounded(session, snapshot, 10, false, None, &boundary, &boundary).is_ok());
+}
+
+#[tokio::test]
+async fn bounded_scope_complete_v1_v2_outputs_equal_legacy_bytes() {
+    let session = Uuid::from_u128(92);
+    let hosts = [
+        "API.Example.com.:443",
+        "api.example.com:8443",
+        "outside.example.com",
+        "excluded.example.com",
+        "[2001:db8::1]:443",
+        "[2001:0db8:0:0:0:0:0:1]:443",
+        "127.0.0.1:443",
+        "Ä.example.com",
+        "xn--4ca.example.com",
+        "nested.api.example.com",
+        "example.com/path",
+        "[::1",
+        "",
+        "user:synthetic@example.com",
+    ];
+    let store = TransactionStore::from_records(
+        hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| fixture_record(host, index as u64 + 1))
+            .collect(),
+    );
+    let scopes = [
+        (vec![], vec![]),
+        (
+            vec!["*.EXAMPLE.COM.:443".to_owned()],
+            vec!["excluded.example.com".to_owned()],
+        ),
+        (vec![], vec!["*.example.com".to_owned()]),
+        (
+            vec!["*a*i*.example.com".to_owned()],
+            vec!["nested.*".to_owned()],
+        ),
+        (vec!["[2001:0db8:0:0:0:0:0:1]:443".to_owned()], vec![]),
+        (
+            vec!["Ä.example.com".to_owned(), "api.example.com".to_owned()],
+            vec!["ä.example.com".to_owned()],
+        ),
+    ];
+    for catalog in [
+        technology::CatalogVersion::V1,
+        technology::CatalogVersion::V2,
+    ] {
+        let snapshot = store
+            .service_map_snapshot_for_catalog(session, DEFAULT_MAX_RECORDS, catalog)
+            .await;
+        assert!(snapshot.omitted_rows > 0);
+        for (include, exclude) in &scopes {
+            for in_scope_only in [false, true] {
+                for origin in [
+                    None,
+                    Some("https://api.example.com".into()),
+                    Some("https://absent.example.com".into()),
+                ] {
+                    let legacy = build(
+                        session,
+                        snapshot.clone(),
+                        DEFAULT_MAX_RECORDS,
+                        in_scope_only,
+                        origin.clone(),
+                        include,
+                        exclude,
+                    );
+                    let bounded = build_bounded(
+                        session,
+                        snapshot.clone(),
+                        DEFAULT_MAX_RECORDS,
+                        in_scope_only,
+                        origin,
+                        include,
+                        exclude,
+                    )
+                    .unwrap();
+                    same_output(legacy, bounded);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_scope_distinct_host_exhaustion_returns_no_partial_map() {
+    let session = Uuid::from_u128(93);
+    let (include, exclude) = expensive_scope();
+    let store = TransactionStore::from_records(
+        (1..=40)
+            .map(|i| fixture_record(&long_host(i), i as u64))
+            .collect(),
+    );
+    let snapshot = store
+        .service_map_snapshot(session, DEFAULT_MAX_RECORDS)
+        .await;
+    assert_eq!(snapshot.rows.len(), 40);
+    assert!(matches!(
+        build_bounded(
+            session,
+            snapshot,
+            DEFAULT_MAX_RECORDS,
+            false,
+            None,
+            &include,
+            &exclude
+        ),
+        Err(scope::ScopeWorkLimit)
+    ));
+    let store = TransactionStore::from_records(
+        (1..=1000)
+            .map(|i| fixture_record(&long_host(1), i))
+            .collect(),
+    );
+    let snapshot = store
+        .service_map_snapshot(session, DEFAULT_MAX_RECORDS)
+        .await;
+    let expected = snapshot.rows.len();
+    let bounded = build_bounded(
+        session,
+        snapshot,
+        DEFAULT_MAX_RECORDS,
+        false,
+        None,
+        &include,
+        &exclude,
+    )
+    .unwrap();
+    assert_eq!(bounded.snapshot.included_rows, expected);
+    assert_eq!(bounded.snapshot.excluded_rows, 0);
+    assert_eq!(bounded.origins[0].request_count, expected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "local synthetic bounded-path measurement; no timing thresholds"]
+async fn bounded_scope_cost_measurement() {
+    let session = Uuid::from_u128(94);
+    for max_records in [DEFAULT_MAX_RECORDS, MAX_RECORDS] {
+        for scenario in [
+            "empty",
+            "common",
+            "dense_exact",
+            "long_glob_repeated",
+            "long_glob_unique",
+        ] {
+            let (include, exclude) = match scenario {
+                "empty" => (vec![], vec![]),
+                "common" => (
+                    vec!["*.example.com".into()],
+                    vec!["*.blocked.example.com".into()],
+                ),
+                "dense_exact" => {
+                    let mut include: Vec<_> = (0..499)
+                        .map(|i| format!("i-{i:03}.{}.example.com", "a".repeat(478)))
+                        .collect();
+                    include.push("api.example.com".into());
+                    let exclude = (0..500)
+                        .map(|i| format!("e-{i:03}.{}.example.com", "a".repeat(478)))
+                        .collect();
+                    (include, exclude)
+                }
+                _ => {
+                    let mut include = (0..499)
+                        .map(|i| format!("missing-{i:03}.example.com"))
+                        .collect::<Vec<_>>();
+                    include.push("*.example.com".into());
+                    (include, expensive_scope().1)
+                }
+            };
+            let baseline_long_host = format!(
+                "{}.{}.{}.{}.example.com",
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(47),
+            );
+            let store = std::sync::Arc::new(TransactionStore::from_records(
+                (1..=MAX_RECORDS)
+                    .rev()
+                    .map(|i| {
+                        let host = match scenario {
+                            "long_glob_repeated" => baseline_long_host.clone(),
+                            "long_glob_unique" => format!("{i:05}{}", &baseline_long_host[5..]),
+                            _ => "api.example.com".into(),
+                        };
+                        let mut record = fixture_record(&host, i as u64);
+                        // Match the earlier scope-cost audit's header-free rows.
+                        record.response.as_mut().unwrap().headers.clear();
+                        record
+                    })
+                    .collect(),
+            ));
+            for repetition in 1..=2 {
+                let worker_store = std::sync::Arc::clone(&store);
+                let include = include.clone();
+                let exclude = exclude.clone();
+                let (measurement, epoch) = tokio::task::spawn_blocking(move || {
+                    // The uncontended wrapper timing includes read-lock acquisition,
+                    // the coherent projection, and guard drop, but no queue delay.
+                    let started = Instant::now();
+                    let (snapshot, epoch) = worker_store.service_map_snapshot_blocking_for_catalog(session, max_records, technology::CatalogVersion::V1);
+                    let projection = started.elapsed();
+                    let projected_rows = snapshot.rows.len();
+                    let legacy_snapshot = matches!(scenario, "empty" | "common").then(|| snapshot.clone());
+                    let started = Instant::now();
+                    let bounded = build_bounded(session, snapshot, max_records, false, None, &include, &exclude);
+                    let bounded_elapsed = started.elapsed();
+                    let result = if bounded.is_ok() { "ok" } else { "scope_work_limit" };
+                    let serialization = bounded.as_ref().ok().map(|map| {
+                        let started = Instant::now();
+                        let bytes = serde_json::to_vec(map).unwrap().len();
+                        (started.elapsed().as_secs_f64(), bytes)
+                    });
+                    let legacy_elapsed = legacy_snapshot.map(|snapshot| {
+                        let started = Instant::now();
+                        let legacy = build(session, snapshot, max_records, false, None, &include, &exclude);
+                        let elapsed = started.elapsed();
+                        same_output(legacy, bounded.unwrap());
+                        elapsed.as_secs_f64()
+                    });
+                    assert_eq!(result, if scenario == "long_glob_unique" { "scope_work_limit" } else { "ok" });
+                    (serde_json::json!({
+                        "scenario": scenario, "repetition": repetition, "requested_rows": max_records,
+                        "projected_rows": projected_rows, "projection_worker_seconds": projection.as_secs_f64(),
+                        "bounded_build_seconds": bounded_elapsed.as_secs_f64(), "scope_preparation_included": true,
+                        "legacy_build_seconds": legacy_elapsed, "serialization_seconds_and_bytes": serialization,
+                        "result": result, "timing_claim": "local synthetic observation only; no native latency or deadline guarantee"
+                    }), epoch)
+                }).await.unwrap();
+                assert!(store.service_map_metadata_epoch_matches(epoch).await);
+                eprintln!("BOUNDED_SCOPE_MEASUREMENT {measurement}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_scope_full_caches_never_omit_rows() {
+    let session = Uuid::from_u128(95);
+    for byte_limit in [false, true] {
+        let base = if byte_limit {
+            // Synthetic userinfo remains internal, while all rows have the same
+            // canonical origin. This exercises 512-byte raw keys without the
+            // map's unrelated origin or endpoint caps affecting the assertion.
+            format!("{}@example.com", "a".repeat(500))
+        } else {
+            "api.example.com".into()
+        };
+        let count = if byte_limit { 300 } else { 600 };
+        let records = (0..count)
+            .map(|index| {
+                let mut bit = 0;
+                let host: String = base
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphabetic() && bit < 10 {
+                            let upper = index & (1 << bit) != 0;
+                            bit += 1;
+                            if upper {
+                                character.to_ascii_uppercase()
+                            } else {
+                                character
+                            }
+                        } else {
+                            character
+                        }
+                    })
+                    .collect();
+                fixture_record(&host, index as u64 + 1)
+            })
+            .collect();
+        let store = TransactionStore::from_records(records);
+        let snapshot = store
+            .service_map_snapshot(session, DEFAULT_MAX_RECORDS)
+            .await;
+        assert_eq!(snapshot.rows.len(), count);
+        let include = vec!["*example.com".into()];
+        let legacy = build(
+            session,
+            snapshot.clone(),
+            DEFAULT_MAX_RECORDS,
+            false,
+            None,
+            &include,
+            &[],
+        );
+        let bounded = build_bounded(
+            session,
+            snapshot,
+            DEFAULT_MAX_RECORDS,
+            false,
+            None,
+            &include,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(bounded.snapshot.included_rows, count);
+        assert_eq!(bounded.snapshot.omitted_rows, 0);
+        assert_eq!(bounded.snapshot.excluded_rows, 0);
+        assert_eq!(bounded.origins.len(), 1);
+        assert_eq!(bounded.origins[0].request_count, count);
+        same_output(legacy, bounded);
+    }
+}

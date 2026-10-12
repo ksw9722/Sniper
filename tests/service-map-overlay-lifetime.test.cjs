@@ -158,9 +158,13 @@ for (const boundary of ['refresh failure', 'dirty history']) test(`a newly inspe
   else { f.controller.markDirty(); await f.verify(); }
   assertAbsent(f); await f.inspect(); const count = f.requests.length;
   assert.equal(f.controller.showBodyReferencesOnMap(), false); assertAbsent(f); assert.equal(f.requests.length, count);
-  await f.load(); assertAbsent(f);
+  if (boundary === 'refresh failure') {
+    const retry = f.controller.refresh({ force: true, retry: true });
+    f.requests.at(-1).resolve(result(snapshot())); await retry;
+    assertAbsent(f); await f.inspect();
+  } else { await f.load(); assertAbsent(f); }
   assert.equal(f.controller.showBodyReferencesOnMap(), true);
-  assert.equal(f.requests.length, count + 1);
+  assert.equal(f.requests.length, count + (boundary === 'refresh failure' ? 2 : 1));
 });
 
 test('opposite directions and all relationship types use distinct deterministic curves', () => {

@@ -5414,10 +5414,61 @@ fn service_map_catalog(
     Ok((catalog, Some(catalog.number())))
 }
 
+const SERVICE_MAP_ERROR_HEADER: &str = "x-sniper-service-map-error";
+
+#[derive(Clone, Copy, Debug)]
+enum ServiceMapReadError {
+    Busy,
+    ScopeWorkLimit,
+    SessionChanged,
+    ScopeChanged,
+    HistoryChanged,
+    BuildFailed,
+}
+
+impl IntoResponse for ServiceMapReadError {
+    fn into_response(self) -> Response {
+        let (status, marker, message) = match self {
+            Self::Busy => (StatusCode::TOO_MANY_REQUESTS, "busy", "A Service Map read is already running; use Refresh to retry"),
+            Self::ScopeWorkLimit => (StatusCode::UNPROCESSABLE_ENTITY, "scope_work_limit", "The scope work limit was reached; narrow the scope rules or lower max_records, then retry"),
+            Self::SessionChanged => (StatusCode::CONFLICT, "session_changed", "The session source changed; refresh the Service Map"),
+            Self::ScopeChanged => (StatusCode::CONFLICT, "scope_changed", "The scope rules changed; refresh the Service Map"),
+            Self::HistoryChanged => (StatusCode::CONFLICT, "history_changed", "Retained history changed; refresh the Service Map"),
+            Self::BuildFailed => (StatusCode::INTERNAL_SERVER_ERROR, "build_failed", "The Service Map read could not complete; use Refresh to retry"),
+        };
+        (status, [(SERVICE_MAP_ERROR_HEADER, marker)], message).into_response()
+    }
+}
+
 async fn get_target_service_map(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<ServiceMapQuery>,
+) -> Response {
+    get_target_service_map_impl(
+        State(state),
+        headers,
+        Query(query),
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_impl(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceMapQuery>,
+    #[cfg(test)] worker_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 ) -> Response {
     let (catalog, catalog_marker) = match service_map_catalog(&headers) {
         Ok(selection) => selection,
@@ -5440,46 +5491,76 @@ async fn get_target_service_map(
         },
         None => None,
     };
+    // Reject rather than queue another expensive map read. The worker owns the
+    // permit through serialization, even when its HTTP awaiter is cancelled.
+    let Some(permit) = state.try_service_map_read() else {
+        return ServiceMapReadError::Busy.into_response();
+    };
+    let implicit_session = query.session_id.is_none();
     let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    // Freeze scope once. Per-card reads could mix rules from two user edits.
-    let scope = session.runtime.snapshot().await;
-    let snapshot = match catalog {
-        crate::service_map_technology::CatalogVersion::V1 => {
-            session
-                .store
-                .service_map_snapshot(session.id(), max_records)
-                .await
+    let (include, exclude) = session.runtime.scope_lists().await;
+    let worker_include = include.clone();
+    let worker_exclude = exclude.clone();
+    let worker_session = session.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((paused, resume)) = worker_hook {
+            let _ = paused.send(());
+            resume
+                .recv_timeout(Duration::from_secs(10))
+                .expect("map worker test hook resumed");
         }
-        crate::service_map_technology::CatalogVersion::V2 => {
-            session
-                .store
-                .service_map_snapshot_for_catalog(session.id(), max_records, catalog)
-                .await
-        }
+        let (snapshot, epoch) = worker_session
+            .store
+            .service_map_snapshot_blocking_for_catalog(worker_session.id(), max_records, catalog);
+        let mut map = crate::service_map::build_bounded(
+            worker_session.id(),
+            snapshot,
+            max_records,
+            query.in_scope_only,
+            origin,
+            &worker_include,
+            &worker_exclude,
+        )
+        .map_err(|_| ServiceMapReadError::ScopeWorkLimit)?;
+        map.technology_catalog_version = catalog_marker;
+        let bytes = serde_json::to_vec(&map).map_err(|_| ServiceMapReadError::BuildFailed)?;
+        Ok::<_, ServiceMapReadError>((bytes, epoch, permit))
+    })
+    .await;
+    let (bytes, epoch, _permit) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return error.into_response(),
+        Err(_) => return ServiceMapReadError::BuildFailed.into_response(),
     };
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    // These are post-work publication checkpoints, not an atomic transaction
+    // across runtime, session registry and history. Pure appends may coexist
+    // with the captured window; destructive/full-record changes invalidate it.
     if !state.sessions.contains_session(session.id())
         || !state.is_current_session_context(&session).await
+        || implicit_session && !Arc::ptr_eq(&state.active_session_for_read().await, &session)
     {
-        return (
-            StatusCode::CONFLICT,
-            "session source changed; refresh the service map",
-        )
-            .into_response();
+        return ServiceMapReadError::SessionChanged.into_response();
     }
-    let mut map = crate::service_map::build(
-        session.id(),
-        snapshot,
-        max_records,
-        query.in_scope_only,
-        origin,
-        &scope.scope_patterns,
-        &scope.excluded_scope_patterns,
-    );
-    map.technology_catalog_version = catalog_marker;
-    Json(map).into_response()
+    if session.runtime.scope_lists().await != (include, exclude) {
+        return ServiceMapReadError::ScopeChanged.into_response();
+    }
+    if !session
+        .store
+        .service_map_metadata_epoch_matches(epoch)
+        .await
+    {
+        return ServiceMapReadError::HistoryChanged.into_response();
+    }
+    ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
 async fn get_target_service_map_evidence(
@@ -15177,6 +15258,577 @@ mod tests {
         )
         .is_err());
         assert!(serde_json::from_value::<super::ServiceMapEvidenceQuery>(serde_json::json!({"session_id":Uuid::new_v4(), "evidence_id":"test", "technology_catalog_version":2})).is_err());
+    }
+
+    fn bounded_map_query(session_id: Option<Uuid>) -> super::ServiceMapQuery {
+        super::ServiceMapQuery {
+            session_id,
+            in_scope_only: false,
+            max_records: Some(100),
+            origin: None,
+        }
+    }
+
+    async fn bounded_map_assert_error(
+        response: axum::response::Response,
+        status: StatusCode,
+        marker: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get(super::SERVICE_MAP_ERROR_HEADER)
+                .unwrap(),
+            marker
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(super::SERVICE_MAP_ERROR_HEADER)
+                .iter()
+                .count(),
+            1
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !text.contains("SECRET_SENTINEL")
+                && !text.contains("origins")
+                && !text.contains("snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_errors_are_fixed_and_admission_precedes_session_load() {
+        let (state, dir) = test_state("sniper-map-admission");
+        let permit = state.try_service_map_read().unwrap();
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(Some(Uuid::new_v4()))),
+        )
+        .await;
+        bounded_map_assert_error(response, StatusCode::TOO_MANY_REQUESTS, "busy").await;
+        // A normal API read remains available while the map-only slot is held.
+        let response = super::get_runtime_settings(
+            State(state.clone()),
+            Query(super::RuntimeQuery { session_id: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Cheap invalid queries remain 400 rather than consuming admission.
+        let mut invalid = bounded_map_query(None);
+        invalid.max_records = Some(0);
+        assert_eq!(
+            super::get_target_service_map(State(state.clone()), HeaderMap::new(), Query(invalid))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        drop(permit);
+        for (error, status, marker) in [
+            (
+                super::ServiceMapReadError::ScopeWorkLimit,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "scope_work_limit",
+            ),
+            (
+                super::ServiceMapReadError::SessionChanged,
+                StatusCode::CONFLICT,
+                "session_changed",
+            ),
+            (
+                super::ServiceMapReadError::ScopeChanged,
+                StatusCode::CONFLICT,
+                "scope_changed",
+            ),
+            (
+                super::ServiceMapReadError::HistoryChanged,
+                StatusCode::CONFLICT,
+                "history_changed",
+            ),
+            (
+                super::ServiceMapReadError::BuildFailed,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "build_failed",
+            ),
+        ] {
+            bounded_map_assert_error(error.into_response(), status, marker).await;
+        }
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_cancelled_worker_holds_slot_and_executor_stays_available() {
+        let (state, dir) = test_state("sniper-map-cancel-worker");
+        let (paused, ready) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let read_state = state.clone();
+        let reading = tokio::spawn(async move {
+            super::get_target_service_map_impl(
+                State(read_state),
+                HeaderMap::new(),
+                Query(bounded_map_query(None)),
+                Some((paused, resumed)),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        // This current-thread runtime can still execute unrelated work while
+        // the real blocking worker is deliberately occupied.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::get_runtime_settings(
+                State(state.clone()),
+                Query(super::RuntimeQuery { session_id: None }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        reading.abort();
+        assert!(reading.await.unwrap_err().is_cancelled());
+        bounded_map_assert_error(
+            super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(bounded_map_query(None)),
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy",
+        )
+        .await;
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(permit) = state.try_service_map_read() {
+                    drop(permit);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(bounded_map_query(None))
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn service_map_api_bounded_cancelled_queued_job_still_owns_admission() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, dir) = test_state("sniper-map-cancel-queued");
+            let (occupied, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                occupied.send(()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let read_state = state.clone();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map(
+                    State(read_state),
+                    HeaderMap::new(),
+                    Query(bounded_map_query(None)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match state.try_service_map_read() {
+                        Some(permit) => drop(permit),
+                        None => break,
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            reading.abort();
+            assert!(reading.await.unwrap_err().is_cancelled());
+            assert!(
+                state.try_service_map_read().is_none(),
+                "cancelled queued job retains its permit"
+            );
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(permit) = state.try_service_map_read() {
+                        drop(permit);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_worker_panic_is_fixed_and_releases_admission() {
+        let (state, dir) = test_state("sniper-map-worker-failure");
+        let (paused, _) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        drop(resume);
+        let response = super::get_target_service_map_impl(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(None)),
+            Some((paused, resumed)),
+            None,
+        )
+        .await;
+        bounded_map_assert_error(response, StatusCode::INTERNAL_SERVER_ERROR, "build_failed").await;
+        assert!(state.try_service_map_read().is_some());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "local synthetic measurement; explicitly select this test"]
+    async fn service_map_api_bounded_executor_measurement() {
+        let mut config = test_app_config("sniper-map-executor-measurement");
+        config.max_transaction_entries = crate::service_map::MAX_RECORDS;
+        let dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.active_session_for_read().await;
+        let mut template = test_replay_response_record("/items/1", 200);
+        template.host = "api.example.com".into();
+        template.started_at = chrono::DateTime::from_timestamp(1_760_000_000, 0).unwrap();
+        template.response = Some(MessageRecord::from_headers_and_body(
+            &HeaderMap::new(),
+            &[],
+            0,
+        ));
+        session
+            .store
+            .replace_all(
+                (1..=crate::service_map::MAX_RECORDS as u64)
+                    .rev()
+                    .map(|sequence| {
+                        let mut row = template.clone();
+                        row.id = Uuid::from_u128(sequence as u128 + 1);
+                        row.sequence = sequence;
+                        row
+                    })
+                    .collect(),
+            )
+            .await;
+        for scoped in [false, true] {
+            session
+                .runtime
+                .update(crate::runtime::RuntimeSettingsUpdate {
+                    scope_patterns: Some(if scoped {
+                        vec!["*.example.com".into()]
+                    } else {
+                        vec![]
+                    }),
+                    excluded_scope_patterns: Some(if scoped {
+                        vec!["*.blocked.example.com".into()]
+                    } else {
+                        vec![]
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            for max_records in [
+                crate::service_map::DEFAULT_MAX_RECORDS,
+                crate::service_map::MAX_RECORDS,
+            ] {
+                for repetition in 1..=2 {
+                    let mut query = bounded_map_query(Some(session.id()));
+                    query.max_records = Some(max_records);
+                    let read = super::get_target_service_map(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Query(query),
+                    );
+                    tokio::pin!(read);
+                    let mut timer = tokio::time::interval(std::time::Duration::from_millis(1));
+                    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let start = std::time::Instant::now();
+                    let mut ticks = 0usize;
+                    let mut max_lateness = std::time::Duration::ZERO;
+                    let response = loop {
+                        tokio::select! {
+                            result = &mut read => break result,
+                            scheduled = timer.tick() => { ticks += 1; max_lateness = max_lateness.max(tokio::time::Instant::now().saturating_duration_since(scheduled)); }
+                        }
+                    };
+                    let elapsed = start.elapsed();
+                    assert_eq!(
+                        response.headers().get(super::header::CONTENT_TYPE).unwrap(),
+                        "application/json"
+                    );
+                    let map: crate::service_map::ServiceMap = response_json(response).await;
+                    println!(
+                        "MAP_EXECUTOR_MEASUREMENT {}",
+                        serde_json::json!({
+                            "scope": if scoped { "common" } else { "empty" }, "requested_rows": max_records,
+                            "projected_rows": map.snapshot.projected_rows, "repetition": repetition,
+                            "handler_seconds": elapsed.as_secs_f64(), "timer_ticks": ticks,
+                            "max_one_ms_timer_lateness_seconds": max_lateness.as_secs_f64(),
+                            "claim": "local synthetic current-thread runtime observation; no latency threshold or native guarantee"
+                        })
+                    );
+                }
+            }
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_pinned_session_deletion_and_context_replacement() {
+        for activate in [false, true] {
+            let (state, dir) = test_state("sniper-map-pinned-publication");
+            let inactive = state
+                .sessions
+                .create_session(Some("Read-only map fixture".into()))
+                .unwrap();
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let id = inactive.id;
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_impl(
+                    State(read_state),
+                    HeaderMap::new(),
+                    Query(bounded_map_query(Some(id))),
+                    None,
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            if activate {
+                state.activate_session(id).await.unwrap();
+            } else {
+                state.delete_session(id).await.unwrap();
+            }
+            resume.send(()).unwrap();
+            bounded_map_assert_error(
+                reading.await.unwrap(),
+                StatusCode::CONFLICT,
+                "session_changed",
+            )
+            .await;
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_work_exhaustion_returns_no_partial_map() {
+        let (state, dir) = test_state("sniper-map-scope-budget");
+        let session = state.active_session_for_read().await;
+        let patterns = (0..500)
+            .map(|i| format!("{}z{i:03}*", "*a".repeat(230)))
+            .collect();
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                excluded_scope_patterns: Some(patterns),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for index in 0..30 {
+            let mut record = test_replay_response_record("/retained?token=SECRET_SENTINEL", 200);
+            record.host = format!(
+                "{}.{}.{}.{}.{index:02}.example.com",
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(40)
+            );
+            session.store.insert(record).await;
+        }
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(Some(session.id()))),
+        )
+        .await;
+        bounded_map_assert_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "scope_work_limit",
+        )
+        .await;
+        // Failure releases only this map slot, without changing configured scope.
+        assert!(state.try_service_map_read().is_some());
+        assert_eq!(session.runtime.scope_lists().await.1.len(), 500);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_publication_checks_changes_and_allows_append_annotations() {
+        for change in [
+            "scope_include",
+            "scope_exclude",
+            "scope_aba",
+            "update",
+            "delete",
+            "duplicate",
+            "replace",
+            "append",
+            "annotation",
+            "implicit_session",
+        ] {
+            let (state, dir) = test_state("sniper-map-publication");
+            let session = state.active_session_for_read().await;
+            let mut record = test_replay_response_record("/retained?token=SECRET_SENTINEL", 200);
+            record.host = "example.com".into();
+            let id = record.id;
+            session.store.insert(record.clone()).await;
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = session.id();
+            let query_id = if change == "implicit_session" {
+                None
+            } else {
+                Some(session_id)
+            };
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_impl(
+                    State(read_state),
+                    HeaderMap::new(),
+                    Query(bounded_map_query(query_id)),
+                    None,
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                state.try_service_map_read().is_none(),
+                "permit survives serialization and publication checks"
+            );
+            let marker = match change {
+                "scope_include" | "scope_exclude" | "scope_aba" => {
+                    let mut update = crate::runtime::RuntimeSettingsUpdate::default();
+                    if change == "scope_exclude" {
+                        update.excluded_scope_patterns = Some(vec!["example.com".into()]);
+                    } else {
+                        update.scope_patterns = Some(vec!["other.example.com".into()]);
+                    }
+                    session.runtime.update(update).await.unwrap();
+                    if change == "scope_aba" {
+                        session
+                            .runtime
+                            .update(crate::runtime::RuntimeSettingsUpdate {
+                                scope_patterns: Some(vec![]),
+                                ..Default::default()
+                            })
+                            .await
+                            .unwrap();
+                        None
+                    } else {
+                        Some("scope_changed")
+                    }
+                }
+                "update" => {
+                    session
+                        .store
+                        .update_record(id, |r| r.path = "/changed".into())
+                        .await
+                        .unwrap();
+                    Some("history_changed")
+                }
+                "delete" => {
+                    session.store.delete_ids(&[id]).await.unwrap();
+                    Some("history_changed")
+                }
+                "duplicate" => {
+                    session.store.insert(record.clone()).await;
+                    Some("history_changed")
+                }
+                "replace" => {
+                    session.store.replace_all(vec![record.clone()]).await;
+                    Some("history_changed")
+                }
+                "append" => {
+                    record.id = Uuid::new_v4();
+                    record.path = "/appended".into();
+                    session.store.insert(record).await;
+                    None
+                }
+                "annotation" => {
+                    session
+                        .store
+                        .update_annotations(id, None, Some(Some("synthetic note".into())))
+                        .await
+                        .unwrap();
+                    None
+                }
+                "implicit_session" => {
+                    state
+                        .create_session(Some("Map replacement fixture".into()))
+                        .await
+                        .unwrap();
+                    Some("session_changed")
+                }
+                _ => unreachable!(),
+            };
+            resume.send(()).unwrap();
+            let response = reading.await.unwrap();
+            if let Some(marker) = marker {
+                bounded_map_assert_error(response, StatusCode::CONFLICT, marker).await;
+            } else {
+                let map: crate::service_map::ServiceMap = response_json(response).await;
+                assert_eq!(
+                    map.snapshot.retained_rows, 1,
+                    "snapshot window stays coherent for {change}"
+                );
+                assert_eq!(map.origins[0].endpoints[0].path, "/retained");
+            }
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[tokio::test]

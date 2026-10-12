@@ -173,7 +173,7 @@ test('refresh progress change preserves initial loading, stale summary and failu
   const pending = f.controller.refresh(); assert.equal(f.els.status.textContent, stale);
   f.requests.at(-1).reject(new Error('Synthetic refresh failure')); await pending;
   assert.match(f.els.status.textContent, /Refresh failed.*previous snapshot/);
-  assert.match(f.els.status.textContent, /History changed/);
+  assert.match(f.els.status.textContent, /Stale snapshot/);
   assert.equal(f.els.status.classList.contains('service-map-error'), true);
   assert.equal(f.els.refresh.textContent, 'Refresh'); assert.equal(f.els.refresh.disabled, false);
 });
@@ -2609,20 +2609,27 @@ for (const read of passiveReads) {
     });
   }
 
-  test(`${read.name} refusal preserves normal polling and permits exactly one explicit next read`, async () => {
+  test(`${read.name} refusal ${read.name === 'metadata' ? 'pauses' : 'preserves'} normal polling and permits exactly one explicit next read`, async () => {
     const f = await htmlGeneratorFixture(), before = f.requests.length, pending = read.start(f);
     f.requests.at(-1).reject(new TypeError('PRIVATE_ERROR redirect refusal')); assert.equal(await pending, false);
     const countForPath = () => f.requests.filter(item => new URL(item.url, originA).pathname === read.path).length;
     const failedReads = countForPath(), poll = pollRealTargetMap(f);
-    assert.equal(f.requests.length, before + 2);
-    assert.equal(new URL(f.requests.at(-1).url, originA).pathname, '/api/target/service-map');
-    assert.equal(f.requests.at(-1).options.redirect, 'error');
-    f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await poll;
-    assert.equal(countForPath(), failedReads + (read.name === 'metadata' ? 1 : 0));
-    const next = read.name === 'metadata' ? f.controller.refresh({ force: true }) : read.start(f);
-    assert.equal(f.requests.length, before + 3); assertPassiveReadRequest(f.requests.at(-1), read);
+    if (read.name === 'metadata') {
+      await poll;
+      assert.equal(f.requests.length, before + 1);
+      assert.equal(f.state.refreshPaused, true);
+    } else {
+      assert.equal(f.requests.length, before + 2);
+      assert.equal(new URL(f.requests.at(-1).url, originA).pathname, '/api/target/service-map');
+      assert.equal(f.requests.at(-1).options.redirect, 'error');
+      f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await poll;
+    }
+    assert.equal(countForPath(), failedReads);
+    const next = read.name === 'metadata' ? f.controller.refresh({ force: true, retry: true }) : read.start(f);
+    const expected = before + (read.name === 'metadata' ? 2 : 3);
+    assert.equal(f.requests.length, expected); assertPassiveReadRequest(f.requests.at(-1), read);
     f.requests.at(-1).resolve(response(read.payload())); assert.equal(await next, true);
-    assert.equal(f.requests.length, before + 3);
+    assert.equal(f.requests.length, expected);
   });
 }
 
@@ -2630,7 +2637,7 @@ test('initial metadata redirect refusal leaves an empty map and an enabled manua
   const f = fixture(), pending = f.controller.refresh();
   assert.equal(f.requests[0].options.redirect, 'error'); f.requests[0].reject(new TypeError('PRIVATE_ERROR'));
   assert.equal(await pending, false); assert.equal(f.requests.length, 1); assert.equal(f.state.snapshot, null);
-  assert.match(f.state.error, /Could not load the service map\. Use Refresh to retry/);
+  assert.match(f.els.status.textContent, /Could not load the service map\. Automatic refresh paused\. Use Refresh to retry/);
   assert.equal(f.els.refresh.disabled, false); assert.doesNotMatch(f.els.status.textContent, /PRIVATE_ERROR/);
   f.els.refresh.dispatch('click'); assert.equal(f.requests.length, 2);
   f.requests[1].resolve(response(snapshot())); await new Promise(resolve => setImmediate(resolve));
@@ -2672,3 +2679,140 @@ for (const read of passiveReads) for (const destination of ['same origin', 'othe
     assertPassiveReadFailure(f, read, previous);
   });
 }
+
+// Ordinary-map bounded failure markers never interpret or display response bodies.
+const boundedMapFailures = [
+  [429, 'busy', 'Service map is busy.'],
+  [422, 'scope_work_limit', 'Scope matching exceeded the service map work limit. Simplify scope rules or use a smaller CLI --max-records window.'],
+  [409, 'session_changed', 'The selected session source changed while the service map was being built.'],
+  [409, 'scope_changed', 'Scope rules changed while the service map was being built.'],
+  [409, 'history_changed', 'Retained history changed while the service map was being built.'],
+  [500, 'build_failed', 'The service map could not be built.'],
+];
+function boundedMapError(status, marker, headers) {
+  return { ok: false, status, headers: headers || { get(name) { assert.equal(name, 'x-sniper-service-map-error'); return marker; } },
+    json() { assert.fail('Error JSON must never be read'); }, text() { assert.fail('Error text must never be read'); } };
+}
+async function rejectMap(f, status = 429, marker = 'busy', headers) {
+  const task = f.controller.refresh(); f.requests.at(-1).resolve(boundedMapError(status, marker, headers));
+  assert.equal(await task, false);
+}
+for (const [status, marker, message] of boundedMapFailures) test(`ordinary map ${marker} keeps a stale map and pauses real polling until one manual Refresh`, async () => {
+  const f = await htmlGeneratorFixture(), previous = f.state.snapshot, verified = f.state.evidence;
+  await resolveBodyReferences(f, bodyReferences({ session_id: technologySession, evidence_id: technologyToken(), source_sequence: '1' }));
+  assert.equal(f.controller.showBodyReferencesOnMap(), true);
+  await resolveHtmlGenerators(f);
+  assert.ok(f.state.htmlGenerators);
+  await rejectMap(f, status, marker);
+  assert.equal(f.state.snapshot, previous); assert.equal(f.state.stale, true); assert.equal(f.state.refreshPaused, true);
+  assert.ok(f.state.error.startsWith(message)); assert.match(f.els.status.textContent, /previous snapshot as stale/);
+  assert.equal(f.els.refresh.textContent, 'Refresh'); assert.equal(f.els.refresh.disabled, false);
+  assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(f.state.bodyReferences, null); assert.equal(f.state.htmlGenerators, null);
+  assert.equal(f.state.evidence, status === 409 ? null : verified);
+  if (status === 409) { assert.equal(f.state.evidenceId, null); assert.equal(f.state.socketPeer, null); }
+  const before = f.requests.length;
+  for (let i = 0; i < 4; i++) await pollRealTargetMap(f);
+  assert.equal(f.requests.length, before);
+  // The production button is the only automatic-pause bypass.
+  f.els.refresh.dispatch('click'); assert.equal(f.requests.length, before + 1);
+  assert.equal(f.requests.at(-1).options.redirect, 'error');
+  assert.equal(new URL(f.requests.at(-1).url, originA).pathname, '/api/target/service-map');
+  f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.refreshPaused, false); assert.equal(f.state.stale, false); assert.equal(f.state.error, '');
+  assert.equal(f.requests.length, before + 1);
+});
+for (const [name, status, marker, headers] of [
+  ['missing header', 429, null], ['unknown marker', 429, 'PRIVATE_ERROR'], ['empty marker', 429, ''],
+  ['comma separated', 429, 'busy, scope_changed'], ['duplicate marker', 429, 'busy, busy'],
+  ['status mismatch', 500, 'busy'], ['wrong case', 429, 'Busy'], ['trailing whitespace', 429, 'busy '],
+  ['leading whitespace', 429, ' busy'], ['no Headers object', 429, undefined, {}],
+]) test(`ordinary map ${name} uses fixed generic text without reading the body`, async () => {
+  const f = fixture(); await f.load(); await rejectMap(f, status, marker, headers);
+  assert.equal(f.state.error, 'Refresh failed.');
+  assert.match(f.els.status.textContent, /^Refresh failed\. Automatic refresh paused\. Showing the previous snapshot as stale; use Refresh to retry\./);
+  const before = f.requests.length; await pollRealTargetMap(f); assert.equal(f.requests.length, before);
+  assert.doesNotMatch(f.els.status.textContent, /PRIVATE_ERROR|scope_changed/);
+});
+test('native Headers joins duplicated markers and cannot satisfy the single-token contract', async () => {
+  const headers = new Headers(); headers.append('x-sniper-service-map-error', 'busy'); headers.append('x-sniper-service-map-error', 'busy');
+  const f = fixture(); await f.load(); await rejectMap(f, 429, null, headers);
+  assert.match(f.state.error, /^Refresh failed\./);
+});
+for (const [status, marker, message] of boundedMapFailures) test(`initial ${marker} failure is explicit, empty, paused and manually retryable`, async () => {
+  const f = fixture(); await rejectMap(f, status, marker);
+  assert.equal(f.state.snapshot, null); assert.equal(f.state.refreshPaused, true);
+  assert.equal(f.els.status.textContent, `${message} Automatic refresh paused. Use Refresh to retry.`);
+  assert.equal(f.els.refresh.disabled, false); await f.controller.refresh(); assert.equal(f.requests.length, 1);
+});
+test('paused map local origin/product/version/method/path filters add zero reads and preserve exact selection', async () => {
+  const f = await htmlGeneratorFixture(); f.controller.selectOrigin(originA, 0);
+  await resolveTechnologySource(f, withCatalog(technologyEvidence()));
+  await rejectMap(f); const before = f.requests.length, source = f.state.evidence, selection = f.state.endpointSelection;
+  f.els.search.value = 'not-loaded'; f.els.search.dispatch('input');
+  f.controller.setProductFilter('product', 'nginx'); f.controller.setProductFilter('version', 'reported:99.0');
+  f.els.panel.dispatch('change', { target: { dataset: { serviceEndpointFilter: 'method' }, value: 'POST' } });
+  f.els.panel.dispatch('input', { target: { dataset: { serviceEndpointFilter: 'path' }, value: '/absent' } });
+  assert.equal(f.state.evidence, source); assert.equal(f.state.endpointSelection, selection); assert.equal(f.state.refreshPaused, true);
+  await pollRealTargetMap(f); assert.equal(f.requests.length, before);
+});
+for (const boundary of ['visibility', 'apis', 'force-only navigation', 'unchanged scope', 'unchanged scope checkbox', 'history dirty', 'history invalidation', 'disconnect/reconnect']) test(`paused map does not retry after ${boundary}`, async () => {
+  const f = fixture(); await f.load(); await rejectMap(f); const before = f.requests.length;
+  if (boundary === 'visibility') { f.controller.setVisible(false); f.controller.setVisible(true); }
+  if (boundary === 'apis') { f.controller.setVisible(true, 'apis'); f.controller.setVisible(true); }
+  if (boundary === 'force-only navigation') await f.controller.refresh({ force: true });
+  if (boundary === 'unchanged scope') assert.equal(f.controller.scopeChanged({ scope_patterns: ['example.com'] }, { scope_patterns: ['example.com'] }), false);
+  if (boundary === 'unchanged scope checkbox') f.els.scope.dispatch('change');
+  if (boundary === 'history dirty') f.controller.markDirty();
+  if (boundary === 'history invalidation') await f.controller.invalidate();
+  if (boundary === 'disconnect/reconnect') { f.controller.disconnect(); await f.controller.invalidate(); }
+  await pollRealTargetMap(f); assert.equal(f.requests.length, before); assert.equal(f.state.refreshPaused, true);
+  assert.equal(f.els.refresh.disabled, false);
+  if (boundary === 'history invalidation' || boundary === 'disconnect/reconnect') {
+    assert.equal(f.state.snapshot, null);
+    assert.doesNotMatch(f.els.status.textContent, /Showing the previous snapshot|rows considered/);
+    assert.match(f.els.status.textContent, /Automatic refresh paused\. Use Refresh to retry\./);
+  }
+});
+for (const boundary of ['scope rules', 'scope checkbox', 'session reset', 'session detection']) test(`actual ${boundary} clears pause and permits one normal map read`, async () => {
+  const f = fixture(); await f.load(); await rejectMap(f); const before = f.requests.length;
+  let task, session = 'session-one';
+  if (boundary === 'scope rules') task = f.controller.scopeChanged({ scope_patterns: [] }, { scope_patterns: ['example.com'] });
+  if (boundary === 'scope checkbox') { f.els.scope.checked = true; f.els.scope.dispatch('change'); }
+  if (boundary.startsWith('session')) {
+    session = 'session-two'; f.setSession(session);
+    if (boundary === 'session reset') f.controller.reset();
+    task = f.controller.refresh();
+  }
+  assert.equal(f.requests.length, before + 1); assert.equal(f.state.refreshPaused, false);
+  f.requests.at(-1).resolve(response(snapshot(undefined, session))); await task; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.error, ''); assert.equal(f.state.sessionId, session);
+});
+for (const boundary of ['force replacement', 'scope checkbox', 'scope rules', 'session', 'session ABA']) test(`late bounded error after ${boundary} cannot pause or invalidate the replacement`, async () => {
+  const f = fixture(); await f.load(); const oldTask = f.controller.refresh(), old = f.requests.at(-1);
+  let task, session = 'session-one';
+  if (boundary === 'force replacement') task = f.controller.refresh({ force: true });
+  if (boundary === 'scope checkbox') { f.els.scope.checked = true; f.els.scope.dispatch('change'); }
+  if (boundary === 'scope rules') task = f.controller.scopeChanged({ scope_patterns: [] }, { scope_patterns: ['example.com'] });
+  if (boundary.startsWith('session')) {
+    session = 'session-two'; f.setSession(session); f.controller.reset();
+    if (boundary === 'session ABA') { session = 'session-one'; f.setSession(session); f.controller.reset(); }
+    task = f.controller.refresh();
+  }
+  f.requests.at(-1).resolve(response(snapshot(undefined, session))); await task; await new Promise(resolve => setImmediate(resolve));
+  const before = JSON.stringify(f.state); old.resolve(boundedMapError(409, 'history_changed'));
+  assert.equal(await oldTask, false); assert.equal(JSON.stringify(f.state), before); assert.equal(f.state.refreshPaused, false);
+});
+for (const marker of ['session_changed', 'scope_changed', 'history_changed']) test(`${marker} fences a late exact-evidence success`, async () => {
+  const f = fixture(); await f.load(); f.controller.selectOrigin(originA);
+  const evidenceTask = f.controller.loadEvidence('evidence-one'), old = f.requests.at(-1);
+  await rejectMap(f, 409, marker); assert.equal(old.options.signal.aborted, true);
+  old.resolve(response(evidence())); assert.equal(await evidenceTask, false);
+  assert.equal(f.state.evidence, null); assert.equal(f.state.evidenceId, null); assert.equal(f.state.refreshPaused, true);
+});
+test('a failed explicit retry pauses again without automatic fallback', async () => {
+  const f = fixture(); await f.load(); await rejectMap(f);
+  const before = f.requests.length; f.els.refresh.dispatch('click');
+  f.requests.at(-1).resolve(boundedMapError(500, 'build_failed')); await new Promise(resolve => setImmediate(resolve));
+  await pollRealTargetMap(f); await f.controller.refresh({ force: true });
+  assert.equal(f.requests.length, before + 1); assert.equal(f.state.refreshPaused, true);
+});

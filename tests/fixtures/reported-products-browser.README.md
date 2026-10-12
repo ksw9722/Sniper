@@ -193,3 +193,38 @@ NODE
 The manifest hashes production sources plus every fixture source file. Regenerate
 it after the final production edit before browser QA or archival; it records the
 DOM/controller/styles used, not a separate implementation of those components.
+
+## Bounded ordinary-map refresh failures
+
+Open the fixture-only Bounded map refresh checks disclosure. The original
+successful product, endpoint, exact-source and peer scenarios stay unchanged.
+
+1. Verify app `/path-0`, optionally Find matching recorded peer and Show recorded
+   address group. Arm 429 busy, then One background poll. Exactly one map read
+   fails; the previous map is visibly stale, automatic refresh is paused and the
+   production Refresh button remains available. Existing verified source remains;
+   the conservative failure cleanup clears temporary peer inspection/overlay.
+2. Repeat for 422 scope work limit, all three 409 changes and 500 build failed.
+   Each has fixed explanatory text. A 409 additionally clears exact evidence and
+   observed peer data, including any current temporary address overlay.
+3. After any failure, 10 background polls, Map / inspector, API catalog and
+   Simulate Target navigation must add zero map reads. Local origin, product,
+   version, method and path filters also add zero reads and keep pause intact.
+4. The production Refresh button makes one new normal map read, succeeds because
+   the armed failure was one-shot, and clears pause/staleness. In scope only also
+   resumes after an actual checkbox change. Reset fixture models session reset.
+5. Arm Unknown marker, Duplicate marker, Status mismatch or Missing header.
+   Each displays the same fixed generic failure and pauses. Error body reads and
+   connection attempts must remain zero; no synthetic private diagnostic appears
+   in the production error text.
+6. While paused, Invalidate history or Disconnect / reconnect clears invalidated
+   displayed data but preserves pause and adds zero reads. Refresh then recovers.
+7. Arm a 409, enable Hold next map read, and One background poll. Before Release
+   held, click production Refresh for a newer success. Release held must not
+   restore pause, clear newer evidence or replace the new map. The adapter
+   intentionally returns the old failure even if its signal was aborted.
+
+The diagnostics expose refresh paused, stale, armed failure and error-body-read
+counts. Request log entries label the synthetic response case; arming alone is
+local. The read-only fixture handle adds MAP_FAILURES and nextMapError for QA.
+No new production DOM, CSS or controls are introduced by this fixture extension.

@@ -55,6 +55,7 @@ use url::Url;
 use uuid::Uuid;
 
 const SERVICE_MAP_CATALOG_HEADER: &str = "X-Sniper-Technology-Catalog-Version";
+const SERVICE_MAP_ERROR_HEADER: &str = "x-sniper-service-map-error";
 const SERVICE_MAP_LEGACY_CATALOG_WARNING: &str = "Warning: Service Map API returned legacy technology catalog v1; technology coverage is limited to v1.";
 const SERVICE_MAP_PEER_SCOPE_WORK_WARNING: &str = "Warning: Recorded socket peer scope matching exceeded the work limit; use a smaller --max-records window or deliberately simplify scope rules. No retries or settings changes were made.";
 
@@ -8532,6 +8533,55 @@ async fn service_map_get<T: DeserializeOwned>(
     service_map_get_with_catalog(api, client, path, None).await
 }
 
+fn service_map_refresh_error(
+    path: &str,
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ServiceMapCliError> {
+    if !path.starts_with("/api/target/service-map?") {
+        return None;
+    }
+    let mut values = headers.get_all(SERVICE_MAP_ERROR_HEADER).iter();
+    let token = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    // Only this endpoint's fixed header contract may select a diagnostic.
+    // Never classify server prose, combined headers, or response bodies.
+    let (code, message) = match (status.as_u16(), token) {
+        (429, "busy") => (
+            "SERVICE_MAP_BUSY",
+            "A Service Map refresh is already running; wait for it to finish before deliberately refreshing again",
+        ),
+        (422, "scope_work_limit") => (
+            "SERVICE_MAP_SCOPE_WORK_LIMIT",
+            "Service Map scope matching exceeded the work limit; use a smaller --max-records window or deliberately simplify scope rules",
+        ),
+        (409, "session_changed") => (
+            "SERVICE_MAP_SESSION_CHANGED",
+            "The selected session changed while building the Service Map; deliberately refresh the same session",
+        ),
+        (409, "scope_changed") => (
+            "SERVICE_MAP_SCOPE_CHANGED",
+            "Scope changed while building the Service Map; deliberately refresh to use the current scope",
+        ),
+        (409, "history_changed") => (
+            "SERVICE_MAP_HISTORY_CHANGED",
+            "Retained history changed while building the Service Map; deliberately refresh to use the current history",
+        ),
+        (500, "build_failed") => (
+            "SERVICE_MAP_BUILD_FAILED",
+            "The selected API could not build the Service Map",
+        ),
+        _ => return None,
+    };
+    Some(ServiceMapCliError {
+        code,
+        message,
+        status: Some(status.as_u16()),
+    })
+}
+
 async fn service_map_get_with_catalog<T: DeserializeOwned>(
     api: &ApiClient,
     client: &reqwest::Client,
@@ -8550,6 +8600,9 @@ async fn service_map_get_with_catalog<T: DeserializeOwned>(
     })?;
     let status = response.status();
     if !status.is_success() {
+        if let Some(error) = service_map_refresh_error(path, status, response.headers()) {
+            return Err(error.into());
+        }
         if status == StatusCode::NOT_FOUND
             && path.starts_with("/api/target/service-map/html-generators?")
         {

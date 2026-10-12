@@ -170,18 +170,21 @@
   }
   // Data factories also run offline in Node for normalizer checks, without a DOM,
   // network adapter, browser globals, server or application bootstrap.
-  const data = { buildSnapshot, buildEvidence, buildPeerMatches, peerRows, peerObservation, rowObservation, token, SESSION, GENERATION, A, REFERENCE_ONLY, PEER_ONLY, LONG_ORIGIN, LONG_VERSION, LONG_METHOD, SCENARIOS };
+  const MAP_FAILURES = Object.freeze({ busy: [429, 'busy'], scope_work_limit: [422, 'scope_work_limit'],
+    session_changed: [409, 'session_changed'], scope_changed: [409, 'scope_changed'], history_changed: [409, 'history_changed'],
+    build_failed: [500, 'build_failed'], unknown: [429, 'SYNTHETIC_PRIVATE_DIAGNOSTIC'], duplicate: [429, 'busy, busy'], mismatch: [500, 'busy'], missing: [429, null] });
+  const data = { MAP_FAILURES, buildSnapshot, buildEvidence, buildPeerMatches, peerRows, peerObservation, rowObservation, token, SESSION, GENERATION, A, REFERENCE_ONLY, PEER_ONLY, LONG_ORIGIN, LONG_VERSION, LONG_METHOD, SCENARIOS };
   if (typeof document === 'undefined') { if (typeof module !== 'undefined') module.exports = data; return; }
 
   const $ = id => document.getElementById(id);
-  const requests = [], held = [], stats = { map: 0, evidence: 0, matches: 0, unexpected: 0, blockedConnections: 0, cspBlocks: 0, expectedFontBlocks: 0, unexpectedCspBlocks: 0 };
-  let controller, scenario = 'base', view = 'service-map';
+  const requests = [], held = [], stats = { map: 0, evidence: 0, matches: 0, errorBodyReads: 0, unexpected: 0, blockedConnections: 0, cspBlocks: 0, expectedFontBlocks: 0, unexpectedCspBlocks: 0 };
+  let controller, scenario = 'base', view = 'service-map', nextMapError = null;
   const snapshot = () => buildSnapshot(scenario, controller?.getState().scopeOnly === true), evidence = id => buildEvidence(id, scenario);
   function diagnostics() {
     const state = controller?.getState();
     if (!state) return;
-    $('fixtureCounters').textContent = `Stub map reads: ${stats.map} · evidence reads: ${stats.evidence} · peer reads: ${stats.matches} · unexpected: ${stats.unexpected} · connection attempts: ${stats.blockedConnections} · CSP blocks: ${stats.cspBlocks} (${stats.expectedFontBlocks} expected local font; ${stats.unexpectedCspBlocks} unexpected) · held: ${held.length}`;
-    $('fixtureSelection').textContent = `Snapshot: ${scenario} · view: ${state.view} · product: ${state.productId || 'Any'} · version: ${state.productVersion || 'Any'} · origin: ${state.selectedOrigin || 'none'} · inspector page: ${state.detailPage + 1} · catalog page: ${state.page + 1} · endpoint: ${state.endpointSelection ? state.endpointSelection.method + ' ' + state.endpointSelection.path : 'none'} · exact evidence: ${state.evidence ? state.evidence.sequence : 'none'}`;
+    $('fixtureCounters').textContent = `Stub map reads: ${stats.map} · evidence reads: ${stats.evidence} · peer reads: ${stats.matches} · unexpected: ${stats.unexpected} · connection attempts: ${stats.blockedConnections} · CSP blocks: ${stats.cspBlocks} (${stats.expectedFontBlocks} expected local font; ${stats.unexpectedCspBlocks} unexpected) · error body reads: ${stats.errorBodyReads} · held: ${held.length}`;
+    $('fixtureSelection').textContent = `Snapshot: ${scenario} · refresh paused: ${state.refreshPaused} · stale: ${state.stale} · armed failure: ${nextMapError || 'none'} · view: ${state.view} · product: ${state.productId || 'Any'} · version: ${state.productVersion || 'Any'} · origin: ${state.selectedOrigin || 'none'} · inspector page: ${state.detailPage + 1} · catalog page: ${state.page + 1} · endpoint: ${state.endpointSelection ? state.endpointSelection.method + ' ' + state.endpointSelection.path : 'none'} · exact evidence: ${state.evidence ? state.evidence.sequence : 'none'}`;
   }
   function request(path, options = {}) {
     const url = new URL(path, 'http://example.com');
@@ -190,10 +193,19 @@
       stats.unexpected++; diagnostics(); throw new Error('Unexpected stub request blocked');
     }
     stats[kind]++;
-    const entry = { kind, path, scenario, signal: options.signal }; requests.push(entry);
-    const li = document.createElement('li'); li.textContent = `${kind}: GET ${path} (${scenario})`; $('fixtureRequests').append(li);
-    const payload = clone(kind === 'map' ? buildSnapshot(scenario, url.searchParams.get('in_scope_only') === 'true') : kind === 'evidence' ? evidence(url.searchParams.get('evidence_id')) : buildPeerMatches(url.searchParams.get('evidence_id'), scenario, url.searchParams.get('in_scope_only') === 'true'));
-    const response = { ok: true, status: 200, json: async () => clone(payload) };
+    const failure = kind === 'map' ? nextMapError : null;
+    if (kind === 'map') nextMapError = null;
+    const entry = { kind, path, scenario, failure, signal: options.signal }; requests.push(entry);
+    const li = document.createElement('li'); li.textContent = `${kind}: GET ${path} (${failure || scenario})`; $('fixtureRequests').append(li);
+    let response;
+    if (failure) {
+      const [status, marker] = MAP_FAILURES[failure];
+      const rejectBodyRead = () => { stats.errorBodyReads++; diagnostics(); throw new Error('Synthetic failure bodies must not be read'); };
+      response = { ok: false, status, headers: { get: name => name === 'x-sniper-service-map-error' ? marker : null }, json: rejectBodyRead, text: rejectBodyRead };
+    } else {
+      const payload = clone(kind === 'map' ? buildSnapshot(scenario, url.searchParams.get('in_scope_only') === 'true') : kind === 'evidence' ? evidence(url.searchParams.get('evidence_id')) : buildPeerMatches(url.searchParams.get('evidence_id'), scenario, url.searchParams.get('in_scope_only') === 'true'));
+      response = { ok: true, status: 200, json: async () => clone(payload) };
+    }
     if ($('fixtureHold').checked && $('fixtureHoldKind').value === kind) {
       $('fixtureHold').checked = false;
       // Intentionally release even an aborted read: stale-result guards belong
@@ -220,10 +232,10 @@
     graphBounds: 'serviceMapGraphBounds', boundsDetails: 'serviceMapBoundsDetails', graphDiagnostics: 'serviceMapGraphDiagnostics', overlayStatus: 'serviceMapBodyOverlay', detail: 'serviceMapDetail', content: 'serviceMapContent', catalog: 'serviceMapApiCatalog' };
   const on = (id, fn) => $(id).addEventListener('click', () => Promise.resolve().then(fn).then(diagnostics).catch(error => { $('fixtureMessage').textContent = error.message; }));
   function setView(next) { view = next; controller.setVisible(true, view); diagnostics(); }
-  async function refreshScenario() { scenario = $('fixtureScenario').value; await controller.refresh({ force: true }); diagnostics(); }
+  async function refreshScenario() { scenario = $('fixtureScenario').value; await controller.refresh({ force: true, retry: true }); diagnostics(); }
   const releaseHeld = () => { held.splice(0).forEach(resolve => resolve()); diagnostics(); };
   async function reset() {
-    releaseHeld(); scenario = 'base'; $('fixtureScenario').value = scenario; $('fixtureHold').checked = false;
+    nextMapError = null; releaseHeld(); scenario = 'base'; $('fixtureScenario').value = scenario; $('fixtureHold').checked = false;
     controller.setVisible(false, view);
     $('serviceMapSearch').value = ''; $('serviceMapSearch').dispatchEvent(new Event('input'));
     $('serviceMapScopeOnly').checked = false; $('serviceMapScopeOnly').dispatchEvent(new Event('change'));
@@ -233,10 +245,15 @@
   controller.setViewChange(setView);
   on('fixtureMap', () => setView('service-map')); on('fixtureCatalog', () => setView('apis'));
   on('fixtureRefresh', refreshScenario); on('fixtureReset', reset); on('fixtureRelease', releaseHeld); on('fixtureInvalidate', () => controller.invalidate());
+  on('fixtureArmError', () => { nextMapError = $('fixtureMapFailure').value; diagnostics(); });
+  on('fixturePoll', () => controller.refresh());
+  on('fixturePollTen', async () => { for (let i = 0; i < 10; i++) await controller.refresh(); });
+  on('fixtureForce', () => controller.refresh({ force: true }));
+  on('fixtureReconnect', () => { controller.disconnect(); return controller.invalidate(); });
   on('fixtureLongOrigin', () => { controller.selectOrigin(LONG_ORIGIN); diagnostics(); });
   $('fixtureTextSize').addEventListener('change', () => { document.documentElement.style.setProperty('--ui-root-size', $('fixtureTextSize').value + 'px'); controller.displayChanged(); diagnostics(); });
   const observer = new MutationObserver(diagnostics); observer.observe($('targetServiceMapPanel'), { childList: true, subtree: true });
   $('targetServiceMapPanel').addEventListener('input', diagnostics); $('targetServiceMapPanel').addEventListener('change', diagnostics);
-  window.reportedProductsFixture = { ...data, controller, stats, requests, snapshot, evidence, setView, reset, refreshScenario, releaseHeld, get heldCount() { return held.length; }, get scenario() { return scenario; } };
+  window.reportedProductsFixture = { ...data, controller, stats, requests, snapshot, evidence, setView, reset, refreshScenario, releaseHeld, get nextMapError() { return nextMapError; }, get heldCount() { return held.length; }, get scenario() { return scenario; } };
   reset().catch(error => { $('fixtureMessage').textContent = error.message; });
 })();

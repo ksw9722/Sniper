@@ -401,3 +401,13 @@ for (const kind of ['before Show', 'same shown source', 'unrelated shown source'
   assert.match(f.els.detail.innerHTML, /Verified retained source/); assert.match(f.els.detail.innerHTML, /Upstream socket peer/);
   assert.equal(f.state.evidenceError, ''); assert.ok(f.requests.every(request => request.options.redirect === 'error' && !request.options.method));
 });
+
+for (const marker of ['session_changed', 'scope_changed', 'history_changed']) test(`ordinary map ${marker} clears exact peer evidence and address overlay`, async () => {
+  const f = fixture(); await f.show(); const previous = f.state.snapshot;
+  const task = f.controller.refresh(); f.requests.at(-1).resolve({ ok: false, status: 409,
+    headers: { get: () => marker }, json() { assert.fail('No failure body read'); } });
+  assert.equal(await task, false);
+  for (const key of ['evidence', 'evidenceId', 'socketPeer', 'peerMatches', 'peerMatchesSource', 'peerEvidenceBinding', 'bodyReferenceOverlay']) assert.equal(f.state[key], null, key);
+  assert.equal(f.state.snapshot, previous); assert.equal(f.state.stale, true); assert.equal(f.state.refreshPaused, true);
+  const count = f.requests.length; await f.controller.refresh(); assert.equal(f.requests.length, count);
+});

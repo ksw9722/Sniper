@@ -366,6 +366,7 @@ impl ServiceMapEvidence {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct MetadataSnapshot {
     pub generation: Uuid,
     pub captured_at: DateTime<Utc>,
@@ -802,6 +803,84 @@ fn sample(values: &mut Vec<String>, id: &str) {
     }
 }
 
+// These preparation limits mirror the runtime scope lists. Reject oversized
+// snapshots rather than truncating rules and changing the resulting scope.
+const MAX_SCOPE_PATTERN_ENTRIES: usize = 500;
+const MAX_SCOPE_PATTERN_BYTES: usize = 512;
+const MAX_SCOPE_WORK: usize = 8 * 1024 * 1024;
+const MAX_SCOPE_CACHE_ENTRIES: usize = 512;
+const MAX_SCOPE_CACHE_KEY_BYTES: usize = 128 * 1024;
+
+struct BoundedScope {
+    prepared: scope::PreparedScope,
+    empty: bool,
+    remaining: usize,
+    cache: BTreeMap<String, bool>,
+    cache_key_bytes: usize,
+}
+
+impl BoundedScope {
+    fn new(include: &[String], exclude: &[String]) -> Result<Self, scope::ScopeWorkLimit> {
+        let prepared = scope::PreparedScope::try_new(
+            include,
+            exclude,
+            MAX_SCOPE_PATTERN_ENTRIES,
+            MAX_SCOPE_PATTERN_BYTES,
+        )
+        .ok_or(scope::ScopeWorkLimit)?;
+        Ok(Self {
+            prepared,
+            empty: include.is_empty() && exclude.is_empty(),
+            remaining: MAX_SCOPE_WORK,
+            cache: BTreeMap::new(),
+            cache_key_bytes: 0,
+        })
+    }
+
+    fn contains(&mut self, raw_host: &str) -> Result<bool, scope::ScopeWorkLimit> {
+        // The common unscoped path needs neither normalization nor cache keys.
+        if self.empty {
+            return Ok(true);
+        }
+        if let Some(result) = self.cache.get(raw_host) {
+            return Ok(*result);
+        }
+        let result = self
+            .prepared
+            .contains_bounded(raw_host, &mut self.remaining)?;
+        // Cache completed true and false decisions by the exact captured host.
+        // Capacity exhaustion affects reuse only, never rows or the job budget.
+        if self.cache.len() < MAX_SCOPE_CACHE_ENTRIES
+            && raw_host.len() <= MAX_SCOPE_CACHE_KEY_BYTES - self.cache_key_bytes
+        {
+            self.cache.insert(raw_host.to_owned(), result);
+            self.cache_key_bytes += raw_host.len();
+        }
+        Ok(result)
+    }
+}
+
+pub(crate) fn build_bounded(
+    session_id: Uuid,
+    snapshot: MetadataSnapshot,
+    max_records: usize,
+    in_scope_only: bool,
+    origin_filter: Option<String>,
+    include: &[String],
+    exclude: &[String],
+) -> Result<ServiceMap, scope::ScopeWorkLimit> {
+    let mut scope = BoundedScope::new(include, exclude)?;
+    build_with_scope(
+        session_id,
+        snapshot,
+        max_records,
+        in_scope_only,
+        origin_filter,
+        |host| scope.contains(host),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn build(
     session_id: Uuid,
     snapshot: MetadataSnapshot,
@@ -811,6 +890,25 @@ pub(crate) fn build(
     include: &[String],
     exclude: &[String],
 ) -> ServiceMap {
+    build_with_scope(
+        session_id,
+        snapshot,
+        max_records,
+        in_scope_only,
+        origin_filter,
+        |host| Ok(scope::is_host_in_scope(host, include, exclude)),
+    )
+    .expect("legacy scope matching is unbounded")
+}
+
+fn build_with_scope(
+    session_id: Uuid,
+    snapshot: MetadataSnapshot,
+    max_records: usize,
+    in_scope_only: bool,
+    origin_filter: Option<String>,
+    mut is_in_scope: impl FnMut(&str) -> Result<bool, scope::ScopeWorkLimit>,
+) -> Result<ServiceMap, scope::ScopeWorkLimit> {
     let projected_rows = snapshot.rows.len();
     let mut stopped_by = snapshot.stopped_by;
     let mut origins = BTreeMap::<String, ServiceOrigin>::new();
@@ -820,7 +918,7 @@ pub(crate) fn build(
     let mut excluded_rows = 0;
     let mut omitted_rows = snapshot.omitted_rows;
     for row in snapshot.rows {
-        let in_scope = scope::is_host_in_scope(&row.scope_host, include, exclude);
+        let in_scope = is_in_scope(&row.scope_host)?;
         if (in_scope_only && !in_scope)
             || origin_filter
                 .as_ref()
@@ -1035,7 +1133,7 @@ pub(crate) fn build(
             (&a.target_origin, &a.target_path).cmp(&(&b.target_origin, &b.target_path))
         });
     }
-    ServiceMap { schema_version: 1, technology_catalog_version: None, session_id,
+    Ok(ServiceMap { schema_version: 1, technology_catalog_version: None, session_id,
         snapshot: ServiceMapSnapshot {
             window_order: "newest_capture_sequence".into(), id: Uuid::new_v4(), generation: snapshot.generation,
             captured_at: snapshot.captured_at,
@@ -1052,7 +1150,7 @@ pub(crate) fn build(
         warnings: vec!["Counts describe analyzed rows in a newest-capture-sequence window, not all-time traffic. Removed or uncaptured traffic is unavailable; retained first/last timestamps are capture-order boundaries.".into(),
             "Header clues do not prove software identity or a backend chain. Redirect instructions and Origin/Referer declarations do not prove a follow-up or initiating call.".into(),
             "Evidence samples are bounded. Queries, fragments, userinfo, raw headers, and bodies are omitted. Origin in_scope means at least one analyzed row matches scope using its captured host.".into()],
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2561,3 +2659,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "service_map_bounded_tests.rs"]
+mod bounded_tests;

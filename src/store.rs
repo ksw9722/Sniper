@@ -267,6 +267,8 @@ pub struct TransactionStore {
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
     next_event_sequence: AtomicU64,
+    #[cfg(test)]
+    before_transaction_event_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A persistence plan binds its records to the journal and file versions from
@@ -479,7 +481,10 @@ enum TransactionJournalCommand {
     },
 }
 
-#[derive(Default)]
+/// A private publication fence, unrelated to persisted rows or evidence tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ServiceMapMetadataEpoch(Uuid);
+
 struct StoreInner {
     /// Oldest to newest. New captures append, queries iterate in reverse.
     entries: Vec<TransactionRecord>,
@@ -491,6 +496,9 @@ struct StoreInner {
     unresolved_body_generations: HashSet<Uuid>,
     // Changed only after publishing a replacement transactions file.
     file_generation: Uuid,
+    // Changes under the metadata mutation lock, before event publication. Pure
+    // append, annotations and body-file changes preserve the projected rows.
+    service_map_metadata_epoch: Uuid,
     by_id: HashMap<Uuid, usize>,
     /// Where a record's line sits in transactions.ndjson, for records whose bodies
     /// were dropped after loading. Bodies are read back through this rather than
@@ -730,6 +738,7 @@ impl StoreInner {
             body_generations,
             unresolved_body_generations: HashSet::new(),
             file_generation: Uuid::new_v4(),
+            service_map_metadata_epoch: Uuid::new_v4(),
             by_id,
             locators: HashMap::new(),
         }
@@ -766,6 +775,9 @@ impl StoreInner {
             self.unresolved_body_generations.clear();
             self.by_id.clear();
             self.locators.clear();
+            if trimmed {
+                self.service_map_metadata_epoch = Uuid::new_v4();
+            }
             return trimmed;
         }
 
@@ -786,6 +798,7 @@ impl StoreInner {
             .map(|(index, record)| (record.id, index))
             .collect();
         self.locators.retain(|id, _| self.by_id.contains_key(id));
+        self.service_map_metadata_epoch = Uuid::new_v4();
         true
     }
 }
@@ -838,6 +851,8 @@ impl TransactionStore {
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
             next_event_sequence: AtomicU64::new(max_seq.max(latest_event_sequence) + 1),
+            #[cfg(test)]
+            before_transaction_event_hook: Mutex::new(None),
         }
     }
 
@@ -956,6 +971,7 @@ impl TransactionStore {
         let summary = record.summary();
         let mut inner = self.inner.write().await;
         if let Some(&index) = inner.by_id.get(&record.id) {
+            inner.service_map_metadata_epoch = Uuid::new_v4();
             // Duplicate IDs remain separate ordering rows. Before moving the
             // authoritative ID to the new row, keep the old row self-contained.
             if inner.locators.contains_key(&record.id) {
@@ -1124,6 +1140,7 @@ impl TransactionStore {
             .enumerate()
             .map(|(index, record)| (record.id, index))
             .collect();
+        inner.service_map_metadata_epoch = Uuid::new_v4();
         drop(inner);
         let event_sequence = self.next_event_sequence.fetch_add(1, Ordering::Relaxed);
         let event = if automatic_retention {
@@ -1343,6 +1360,7 @@ impl TransactionStore {
 
     /// Capture row-exact metadata while one read lock fixes membership, order and
     /// revisions. Never clone a full transaction or rehydrate a body here.
+    #[cfg(test)]
     pub(crate) async fn service_map_snapshot(
         &self,
         session_id: Uuid,
@@ -1356,8 +1374,44 @@ impl TransactionStore {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn service_map_snapshot_for_catalog(
         &self,
+        session_id: Uuid,
+        max_records: usize,
+        catalog: crate::service_map_technology::CatalogVersion,
+    ) -> crate::service_map::MetadataSnapshot {
+        let inner = self.inner.read().await;
+        self.service_map_snapshot_locked(&inner, session_id, max_records, catalog)
+    }
+
+    /// Call only in a blocking worker. The fence and projection share one read
+    /// lock, which is released before aggregation or response serialization.
+    pub(crate) fn service_map_snapshot_blocking_for_catalog(
+        &self,
+        session_id: Uuid,
+        max_records: usize,
+        catalog: crate::service_map_technology::CatalogVersion,
+    ) -> (
+        crate::service_map::MetadataSnapshot,
+        ServiceMapMetadataEpoch,
+    ) {
+        let inner = self.inner.blocking_read();
+        let epoch = ServiceMapMetadataEpoch(inner.service_map_metadata_epoch);
+        let snapshot = self.service_map_snapshot_locked(&inner, session_id, max_records, catalog);
+        (snapshot, epoch)
+    }
+
+    pub(crate) async fn service_map_metadata_epoch_matches(
+        &self,
+        epoch: ServiceMapMetadataEpoch,
+    ) -> bool {
+        self.inner.read().await.service_map_metadata_epoch == epoch.0
+    }
+
+    fn service_map_snapshot_locked(
+        &self,
+        inner: &StoreInner,
         session_id: Uuid,
         max_records: usize,
         catalog: crate::service_map_technology::CatalogVersion,
@@ -1366,7 +1420,6 @@ impl TransactionStore {
             evidence_id, project_record, project_record_for_catalog, MetadataSnapshot,
             MAX_METADATA_BYTES,
         };
-        let inner = self.inner.read().await;
         let mut snapshot = MetadataSnapshot {
             generation: self.saved_cursor_generation,
             captured_at: chrono::Utc::now(),
@@ -2344,6 +2397,7 @@ impl TransactionStore {
             return Ok(None);
         }
         inner.entries[index] = updated_record;
+        inner.service_map_metadata_epoch = Uuid::new_v4();
         inner.body_generations[index] = Uuid::new_v4();
         inner.summaries[index] = CachedSummary::new(summary.clone());
         // Memory is now newer than the line on disk. Leaving the locator in place
@@ -2893,6 +2947,13 @@ impl TransactionStore {
     }
 
     fn publish_transaction_event(&self, summary: TransactionSummary) {
+        #[cfg(test)]
+        {
+            let hook = self.before_transaction_event_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let event = TransactionEvent {
             event_sequence: self.next_event_sequence.fetch_add(1, Ordering::Relaxed),
             summary,
@@ -10808,3 +10869,7 @@ mod retention_status_tests {
         assert!(!status.identity_conflict);
     }
 }
+
+#[cfg(test)]
+#[path = "store_service_map_epoch_tests.rs"]
+mod service_map_epoch_tests;

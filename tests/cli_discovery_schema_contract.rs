@@ -560,7 +560,7 @@ mod history_fixture {
     use axum::{
         body::{to_bytes, Body},
         extract::State,
-        http::{Request, StatusCode},
+        http::{HeaderMap, Request, StatusCode},
         response::{IntoResponse, Response},
         routing::any,
         Json, Router,
@@ -589,7 +589,9 @@ mod history_fixture {
         settings_override: Mutex<Option<Value>>,
         payload: Mutex<Value>,
         read_status: Mutex<u16>,
+        response_headers: Mutex<HeaderMap>,
         chunked_payload: Mutex<bool>,
+        stalled_payload: Mutex<bool>,
         requests: Mutex<Vec<RecordedRequest>>,
     }
 
@@ -617,7 +619,9 @@ mod history_fixture {
                 settings_override: Mutex::new(None),
                 payload: Mutex::new(json!([])),
                 read_status: Mutex::new(200),
+                response_headers: Mutex::new(HeaderMap::new()),
                 chunked_payload: Mutex::new(false),
+                stalled_payload: Mutex::new(false),
                 requests: Mutex::new(Vec::new()),
             });
             let app = Router::new()
@@ -758,6 +762,7 @@ mod history_fixture {
                 let status = StatusCode::from_u16(*state.settings_status.lock().unwrap()).unwrap();
                 let payload = state.settings_override.lock().unwrap().clone().unwrap_or_else(||state.settings.clone());
                 let mut response = (status,Json(payload)).into_response();
+                response.headers_mut().extend(state.response_headers.lock().unwrap().clone());
                 if status.is_redirection() {
                     response.headers_mut().insert("location","/unexpected-discovery-redirect".parse().unwrap());
                 }
@@ -775,7 +780,12 @@ mod history_fixture {
             "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" | "/api/target/service-map/html-generators" | "/api/target/service-map/link-declarations" | "/api/target/service-map/socket-peer-matches" => {
                 let status = StatusCode::from_u16(*state.read_status.lock().unwrap()).unwrap();
                 let payload = state.payload.lock().unwrap().clone();
-                let mut response = if *state.chunked_payload.lock().unwrap() {
+                let mut response = if *state.stalled_payload.lock().unwrap() {
+                    let body = Body::from_stream(futures_util::stream::pending::<
+                        Result<bytes::Bytes, std::convert::Infallible>,
+                    >());
+                    (status, body).into_response()
+                } else if *state.chunked_payload.lock().unwrap() {
                     let chunks: Vec<_> = payload.to_string().as_bytes().chunks(1024)
                         .map(|chunk| Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(chunk)))
                         .collect();
@@ -783,6 +793,7 @@ mod history_fixture {
                 } else {
                     (status, Json(payload)).into_response()
                 };
+                response.headers_mut().extend(state.response_headers.lock().unwrap().clone());
                 if status.is_redirection() {
                     response
                         .headers_mut()
@@ -6027,13 +6038,270 @@ mod history_fixture {
         }
     }
 
+    const REFRESH_ERROR_HEADER: &str = "x-sniper-service-map-error";
+    const REFRESH_FAILURES: &[(u16, &str, &str, &str)] = &[
+        (
+            429,
+            "busy",
+            "SERVICE_MAP_BUSY",
+            "A Service Map refresh is already running; wait for it to finish before deliberately refreshing again",
+        ),
+        (
+            422,
+            "scope_work_limit",
+            "SERVICE_MAP_SCOPE_WORK_LIMIT",
+            "Service Map scope matching exceeded the work limit; use a smaller --max-records window or deliberately simplify scope rules",
+        ),
+        (
+            409,
+            "session_changed",
+            "SERVICE_MAP_SESSION_CHANGED",
+            "The selected session changed while building the Service Map; deliberately refresh the same session",
+        ),
+        (
+            409,
+            "scope_changed",
+            "SERVICE_MAP_SCOPE_CHANGED",
+            "Scope changed while building the Service Map; deliberately refresh to use the current scope",
+        ),
+        (
+            409,
+            "history_changed",
+            "SERVICE_MAP_HISTORY_CHANGED",
+            "Retained history changed while building the Service Map; deliberately refresh to use the current history",
+        ),
+        (
+            500,
+            "build_failed",
+            "SERVICE_MAP_BUILD_FAILED",
+            "The selected API could not build the Service Map",
+        ),
+    ];
+
+    fn set_refresh_error_headers(mock: &MockApi, values: &[&[u8]]) {
+        let mut headers = mock.state.response_headers.lock().unwrap();
+        headers.clear();
+        for value in values {
+            headers.append(
+                REFRESH_ERROR_HEADER,
+                axum::http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+    }
+
+    fn assert_refresh_error(result: &Value, status: u16, code: &str, message: &str) {
+        assert_eq!(result["error"]["code"], code);
+        assert_eq!(result["error"]["message"], message);
+        assert_eq!(result["error"]["details"], json!({"status":status}));
+        assert_eq!(result["error"]["retryable"], false);
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_refresh_failures_have_fixed_codes_and_do_not_retry_or_echo() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let input = json!({"session_id":session}).to_string();
+        *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+        for &(status, token, code, message) in REFRESH_FAILURES {
+            *mock.state.read_status.lock().unwrap() = status;
+            set_refresh_error_headers(&mock, &[token.as_bytes()]);
+            for args in [
+                vec!["target", "service-map", "--session-id", &session],
+                vec!["scope", "service-map", "--session-id", &session],
+                vec!["call", "target.service_map.get", "--input", &input],
+            ] {
+                let result = mock
+                    .command_with_code(&args, if status < 500 { 5 } else { 6 })
+                    .await;
+                assert_refresh_error(&result, status, code, message);
+                mock.assert_reads(
+                    "/api/target/service-map",
+                    &[("in_scope_only", "false"), ("max_records", "10000")],
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_refresh_rejects_missing_malformed_duplicate_and_mismatched_headers() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        *mock.state.payload.lock().unwrap() = json!({
+            "error":"SYNTHETIC_PRIVATE_VALUE", "reason":"busy", "code":"SERVICE_MAP_BUSY"
+        });
+        let malformed: Vec<Vec<&[u8]>> = vec![
+            vec![],
+            vec![b""],
+            vec![b"Busy"],
+            vec![b"busy, busy"],
+            vec![b"busy,SYNTHETIC_PRIVATE_VALUE"],
+            vec![b"busy diagnostic SYNTHETIC_PRIVATE_VALUE"],
+            vec![b"busy;SYNTHETIC_PRIVATE_VALUE"],
+            vec![b"SYNTHETIC_PRIVATE_VALUE"],
+            vec![b"busy", b"busy"],
+            vec![b"busy", b"SYNTHETIC_PRIVATE_VALUE"],
+            vec![b"SYNTHETIC_PRIVATE_VALUE", b"busy"],
+            vec![b"\xff"],
+        ];
+        for values in malformed {
+            *mock.state.read_status.lock().unwrap() = 429;
+            set_refresh_error_headers(&mock, &values);
+            let result = mock
+                .command_with_code(&["scope", "service-map", "--session-id", &session], 5)
+                .await;
+            assert_refresh_error(
+                &result,
+                429,
+                "HTTP_STATUS_ERROR",
+                "The selected API could not return Service Map metadata",
+            );
+            mock.assert_reads(
+                "/api/target/service-map",
+                &[("in_scope_only", "false"), ("max_records", "10000")],
+            );
+        }
+        for &(expected_status, token, _, _) in REFRESH_FAILURES {
+            set_refresh_error_headers(&mock, &[token.as_bytes()]);
+            for status in [400, 409, 422, 429, 500, 503] {
+                if status == expected_status {
+                    continue;
+                }
+                *mock.state.read_status.lock().unwrap() = status;
+                let result = mock
+                    .command_with_code(
+                        &["scope", "service-map", "--session-id", &session],
+                        if status < 500 { 5 } else { 6 },
+                    )
+                    .await;
+                assert_refresh_error(
+                    &result,
+                    status,
+                    "HTTP_STATUS_ERROR",
+                    "The selected API could not return Service Map metadata",
+                );
+                mock.assert_reads(
+                    "/api/target/service-map",
+                    &[("in_scope_only", "false"), ("max_records", "10000")],
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_refresh_failure_headers_do_not_change_inspector_or_probe_errors() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+        for &(status, token, _, _) in REFRESH_FAILURES {
+            *mock.state.read_status.lock().unwrap() = status;
+            set_refresh_error_headers(&mock, &[token.as_bytes()]);
+            for inspector in [
+                "evidence",
+                "body-references",
+                "html-generators",
+                "link-declarations",
+                "socket-peer-matches",
+            ] {
+                let mut args = if inspector == "evidence" {
+                    vec!["scope", "service-map-evidence"]
+                } else {
+                    vec!["target", "service-map", inspector]
+                };
+                args.extend([
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ]);
+                let result = mock
+                    .command_with_code(&args, if status < 500 { 5 } else { 6 })
+                    .await;
+                assert_refresh_error(
+                    &result,
+                    status,
+                    "HTTP_STATUS_ERROR",
+                    "The selected API could not return Service Map metadata",
+                );
+                let mut query = vec![("evidence_id", BODY_REFERENCE_TOKEN)];
+                if inspector == "socket-peer-matches" {
+                    query.extend([("in_scope_only", "false"), ("max_records", "10000")]);
+                }
+                mock.assert_reads(&format!("/api/target/service-map/{inspector}"), &query);
+            }
+        }
+        *mock.state.settings_status.lock().unwrap() = 429;
+        *mock.state.settings_override.lock().unwrap() =
+            Some(json!({"error":"SYNTHETIC_PRIVATE_VALUE"}));
+        set_refresh_error_headers(&mock, &[b"busy"]);
+        let result = mock
+            .command_with_code(&["scope", "service-map", "--session-id", &session], 5)
+            .await;
+        assert_refresh_error(
+            &result,
+            429,
+            "HTTP_STATUS_ERROR",
+            "The selected API could not return Service Map metadata",
+        );
+        let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].path, "/api/settings");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_refresh_failures_do_not_wait_for_response_bodies() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        *mock.state.stalled_payload.lock().unwrap() = true;
+        for &(status, token, code, message) in REFRESH_FAILURES {
+            *mock.state.read_status.lock().unwrap() = status;
+            for recognized in [true, false] {
+                if recognized {
+                    set_refresh_error_headers(&mock, &[token.as_bytes()]);
+                } else {
+                    set_refresh_error_headers(&mock, &[b"SYNTHETIC_PRIVATE_VALUE"]);
+                }
+                let args = ["scope", "service-map", "--session-id", &session];
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    mock.command_with_code(&args, if status < 500 { 5 } else { 6 }),
+                )
+                .await
+                .expect("Service Map error handling waited for a response body");
+                assert_refresh_error(
+                    &result,
+                    status,
+                    if recognized {
+                        code
+                    } else {
+                        "HTTP_STATUS_ERROR"
+                    },
+                    if recognized {
+                        message
+                    } else {
+                        "The selected API could not return Service Map metadata"
+                    },
+                );
+                mock.assert_reads(
+                    "/api/target/service-map",
+                    &[("in_scope_only", "false"), ("max_records", "10000")],
+                );
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_map_refuses_redirects_and_does_not_echo_error_bodies() {
         let mock = MockApi::new().await;
         let session = Uuid::nil().to_string();
         *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+        set_refresh_error_headers(&mock, &[b"busy"]);
         for (status, code, exit) in [
+            (301, "REDIRECT_REFUSED", 5),
             (302, "REDIRECT_REFUSED", 5),
+            (303, "REDIRECT_REFUSED", 5),
+            (307, "REDIRECT_REFUSED", 5),
+            (308, "REDIRECT_REFUSED", 5),
             (404, "HTTP_STATUS_ERROR", 5),
             (500, "HTTP_STATUS_ERROR", 6),
         ] {

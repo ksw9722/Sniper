@@ -40,6 +40,22 @@
       return ["http:", "https:"].includes(url.protocol) ? url.origin : "";
     } catch (_) { return ""; }
   }
+  const MAP_ERROR_HEADER = "x-sniper-service-map-error";
+  const MAP_FAILURES = new Map([
+    ["busy", { status: 429, message: "Service map is busy." }],
+    ["scope_work_limit", { status: 422, message: "Scope matching exceeded the service map work limit. Simplify scope rules or use a smaller CLI --max-records window." }],
+    ["session_changed", { status: 409, message: "The selected session source changed while the service map was being built." }],
+    ["scope_changed", { status: 409, message: "Scope rules changed while the service map was being built." }],
+    ["history_changed", { status: 409, message: "Retained history changed while the service map was being built." }],
+    ["build_failed", { status: 500, message: "The service map could not be built." }],
+  ]);
+  function mapFailure(response) {
+    // Fetch joins duplicate response headers with commas. Exact tokens reject
+    // these, unfamiliar markers and status mismatches without reading the body.
+    const token = response.headers?.get(MAP_ERROR_HEADER);
+    const failure = MAP_FAILURES.get(token);
+    return failure?.status === response.status ? failure : null;
+  }
   // This closed catalog mirrors the passive header extractor. Display names and
   // categories never come from arbitrary header text or describe deployed roles.
   const TECHNOLOGY_CATALOG_VERSION = 2;
@@ -883,7 +899,7 @@
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null,
-      loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
+      loading: false, error: "", refreshPaused: false, requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       peerMatches: null, peerMatchesSource: null, peerMatchesLoading: false, peerMatchesError: "", peerMatchesRequestId: 0, peerEvidenceBinding: null,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
@@ -1473,7 +1489,7 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
+        selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
@@ -1497,11 +1513,11 @@
       state.detailTab = endpointIndex === null ? "apis" : "evidence";
       render();
     }
-    async function refresh({ force = false } = {}) {
+    async function refresh({ force = false, retry = false } = {}) {
       if (!visible) return false;
       const sessionId = getSessionId();
       if (state.sessionId !== sessionId) reset();
-      if (!sessionId || state.loading && !force) return false;
+      if (!sessionId || state.refreshPaused && !retry || state.loading && !force) return false;
       // The app polls every 1.2 seconds. A same-source background snapshot must
       // not erase an explicit inspection or continually abort its pending read.
       if (force) {
@@ -1519,10 +1535,14 @@
       state.error = "";
       renderStatus();
       if (!state.snapshot || force) render();
+      let failure = null;
       try {
         const params = new URLSearchParams({ session_id: sessionId, in_scope_only: String(scopeOnly), max_records: "10000" });
         const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal, headers: { [TECHNOLOGY_CATALOG_HEADER]: String(TECHNOLOGY_CATALOG_VERSION) } });
-        if (!response.ok) throw new Error("Service map unavailable");
+        if (!response.ok) {
+          failure = mapFailure(response);
+          throw new Error("Service map unavailable");
+        }
         const snapshot = normalizeSnapshot(await response.json(), sessionId);
         if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
         if (state.bodyReferenceOverlay && !(state.bodyReferenceOverlay.kind === "peer" ? peerSourceIsCurrent(state.bodyReferenceOverlay.source, snapshot) : state.bodyReferenceOverlay.kind === "link" ? htmlGeneratorSourceIsRetained(state.bodyReferenceOverlay.source, snapshot) : sourceIsRetained(state.bodyReferenceOverlay.source, snapshot))) {
@@ -1534,6 +1554,7 @@
         if (state.linkDeclarationsSource && !htmlGeneratorSourceIsRetained(state.linkDeclarationsSource, snapshot)) cancelBodyReferences();
         if (state.htmlGeneratorsSource && !htmlGeneratorSourceIsRetained(state.htmlGeneratorsSource, snapshot)) cancelHtmlGenerators();
         state.snapshot = snapshot;
+        state.refreshPaused = false;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
         state.order = state.order.length ? stableOrder(state.order, allOrigins) : [
@@ -1563,13 +1584,18 @@
         render();
         return true;
       } catch (_) {
-        if (requestId !== state.requestId || sessionId !== getSessionId()) return false;
+        if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
         clearOverlay("Temporary body references cleared because the current refresh failed.");
         cancelBodyReferences();
         cancelHtmlGenerators();
         state.loading = false;
         cancelPeerMatches();
-        state.error = state.snapshot ? "Refresh failed. Showing the previous snapshot; use Refresh to retry." : "Could not load the service map. Use Refresh to retry.";
+        if (failure?.status === 409) cancelEvidence();
+        // Polling, visibility and event reconnects must not turn a bounded
+        // failure into an automatic retry loop, including with older servers.
+        state.refreshPaused = true;
+        state.stale = true;
+        state.error = failure?.message || (state.snapshot ? "Refresh failed." : "Could not load the service map.");
         render();
         return false;
       }
@@ -1867,10 +1893,14 @@
         if (array(snapshot.stopped_by).includes("technology_token_scan_limit")) status += " · Header technology scan partial: token candidate limit reached";
         if (state.snapshot.legacyCatalog) status += ` · ${LEGACY_CATALOG_NOTICE}`;
         if (state.scopeOnly) status += " · In scope only";
-        if (state.stale) status += " · History changed: counts are from the previous snapshot";
+        if (state.stale) status += state.refreshPaused ? " · Stale snapshot: counts have not been revalidated" : " · History changed: counts are from the previous snapshot";
         if (state.snapshot.warningCount) status += ` · ${state.snapshot.warningCount} metadata notice(s)`;
       }
-      els.status.textContent = state.error ? `${state.error}${snapshot ? ` ${status}` : ""}` : status;
+      // A deletion/gap can clear the retained snapshot while refresh is paused.
+      // Derive this suffix now so it never claims cleared data is still shown.
+      const error = state.refreshPaused && state.error
+        ? `${state.error} Automatic refresh paused. ${snapshot ? "Showing the previous snapshot as stale; use Refresh to retry." : "Use Refresh to retry."}` : state.error;
+      els.status.textContent = error ? `${error}${snapshot ? ` ${status}` : ""}` : status;
       els.status.classList.toggle("service-map-error", !!state.error);
       els.refresh.disabled = state.loading;
       els.refresh.textContent = state.loading ? "Refreshing…" : "Refresh";
@@ -2317,12 +2347,14 @@
     // Resize only refreshes control availability; Fit is an explicit one-shot
     // action, so resizing or polling cannot silently change the user's zoom.
     if (els.viewport && typeof root.ResizeObserver === "function") new root.ResizeObserver(updateZoomControls).observe(els.viewport);
-    els.refresh.addEventListener("click", () => refresh({ force: true }));
+    els.refresh.addEventListener("click", () => refresh({ force: true, retry: true }));
     els.allOrigins?.addEventListener("click", () => setMapMode(false));
     els.directRelations?.addEventListener("click", () => setMapMode(true));
     els.focusSelection?.addEventListener("click", focusSelection);
     els.search.addEventListener("input", () => { state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
     els.scope.addEventListener("change", () => {
+      if (state.scopeOnly === els.scope.checked) return;
+      state.refreshPaused = false;
       clearOverlay("Temporary body references cleared because the scope filter changed.");
       state.scopeOnly = els.scope.checked;
       state.page = 0;
@@ -2338,6 +2370,7 @@
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
         if (signature(previous) === signature(next)) return false;
+        state.refreshPaused = false;
         return this.invalidate();
       },
       markDirty() {
@@ -2381,7 +2414,7 @@
         state.endpointIndex = null;
         cancelEvidence();
         render();
-        return refresh({ force: true });
+        return refresh();
       },
       // State access makes offline lifecycle tests use the same real controller.
       getState: () => state,

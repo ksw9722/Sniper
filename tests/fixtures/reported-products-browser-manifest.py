@@ -24,6 +24,7 @@ manifest = {'fixture': 'Reported product and literal-version filters',
             'app_bootstrap': False, 'synthetic_origins': 29, 'reference_only_origins': 1, 'metadata_redirects': 29,
             'primary_endpoints': 130, 'loaded_endpoints': 354, 'explicit_peer_origin_groups': 30,
             'networking': 'CSP connect-src none; guarded browser connections; closed in-memory GET adapter',
+            'ordinary_map_errors': ['busy', 'scope_work_limit', 'session_changed', 'scope_changed', 'history_changed', 'build_failed', 'unknown', 'duplicate', 'mismatch', 'missing'],
             'scenarios': ['base', 'reordered', 'disappeared-product', 'disappeared-version', 'partial', 'legacy', 'present-empty', 'field-missing', 'empty'],
             'sha256': {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in paths}}
 (HERE / 'reported-products-browser.manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
