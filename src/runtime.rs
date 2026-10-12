@@ -284,6 +284,13 @@ impl RuntimeSettings {
         self.inner.read().await.clone()
     }
 
+    pub(crate) async fn upstream_peer_capture_inputs(
+        &self,
+    ) -> crate::upstream_peer_settings::CaptureEligibilityInputs {
+        let current = self.inner.read().await;
+        crate::upstream_peer_settings::CaptureEligibilityInputs::from(&*current)
+    }
+
     pub async fn update(&self, update: RuntimeSettingsUpdate) -> Result<RuntimeSettingsSnapshot> {
         if let Some(oast_polling_interval_secs) = update.oast_polling_interval_secs {
             if !(MIN_OAST_POLLING_INTERVAL_SECS..=MAX_OAST_POLLING_INTERVAL_SECS)
@@ -565,6 +572,88 @@ mod tests {
     use super::{
         RuntimeSettings, RuntimeSettingsSnapshot, RuntimeSettingsUpdate, OAST_TOKEN_REDACTION,
     };
+
+    #[tokio::test]
+    async fn peer_capture_inputs_match_full_status_with_large_unrelated_settings() {
+        use crate::upstream_peer_settings::{
+            status, CaptureEligibilityInputs, SessionPeerSettingsState, UpstreamPeerBlockedReason,
+        };
+
+        fn require_copy<T: Copy>() {}
+        require_copy::<CaptureEligibilityInputs>();
+
+        for large_settings in [false, true] {
+            let mut snapshot = RuntimeSettingsSnapshot::default();
+            if large_settings {
+                let patterns = |label: &str| {
+                    (0..super::MAX_RUNTIME_PATTERN_ENTRIES)
+                        .map(|i| {
+                            format!(
+                                "{label}-{i}.{}.{}.example.com",
+                                "a".repeat(50),
+                                "b".repeat(50)
+                            )
+                        })
+                        .collect()
+                };
+                snapshot.scope_patterns = patterns("scope");
+                snapshot.excluded_scope_patterns = patterns("excluded");
+                snapshot.passthrough_hosts = patterns("passthrough");
+                snapshot.upstream_bypass_hosts = patterns("bypass");
+                snapshot.upstream_proxy.url = "http://proxy.example.com:8080".into();
+                snapshot.upstream_proxy.username = "synthetic-user".into();
+                snapshot.upstream_proxy.password = "synthetic-password".into();
+                snapshot.oast_server_url = "https://oast.example.com".into();
+                snapshot.oast_token = "t".repeat(super::MAX_RUNTIME_TEXT_FIELD_BYTES);
+            }
+            let settings = RuntimeSettings::from_snapshot(snapshot);
+            let gate = SessionPeerSettingsState::default();
+
+            for enabled in [false, true] {
+                for http_capture_enabled in [false, true] {
+                    for revision in [None, Some(0), Some(1), Some(u64::MAX - 1), Some(u64::MAX)] {
+                        {
+                            // Include malformed combinations even though the load
+                            // sanitizer already disables an enabled None revision.
+                            let mut current = settings.inner.write().await;
+                            current.upstream_peer_capture_enabled = enabled;
+                            current.upstream_peer_capture_revision = revision;
+                            current.http_capture_enabled = http_capture_enabled;
+                        }
+                        let full = settings.snapshot().await;
+                        let inputs = settings.upstream_peer_capture_inputs().await;
+                        assert!(settings.inner.try_write().is_ok(), "read lock escaped");
+                        assert_eq!(
+                            full.scope_patterns.len(),
+                            if large_settings {
+                                super::MAX_RUNTIME_PATTERN_ENTRIES
+                            } else {
+                                0
+                            }
+                        );
+                        for uncertain in [false, true] {
+                            gate.mark_uncertain(uncertain);
+                            let expected = status(&full, gate.uncertain());
+                            let actual = inputs.status(gate.uncertain());
+                            assert_eq!(actual.effective_enabled, expected.effective_enabled);
+                            assert_eq!(actual.blocked_reason, expected.blocked_reason);
+                            let reason = if uncertain {
+                                Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+                            } else if revision.is_none_or(|value| value == u64::MAX) {
+                                Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+                            } else if enabled && !http_capture_enabled {
+                                Some(UpstreamPeerBlockedReason::HttpCapturePaused)
+                            } else {
+                                None
+                            };
+                            assert_eq!(actual.blocked_reason, reason);
+                            assert_eq!(actual.effective_enabled, enabled && reason.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn peer_settings_legacy_and_malformed_loads_fail_closed_without_losing_other_settings() {

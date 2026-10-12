@@ -86,28 +86,50 @@ pub struct UpstreamPeerSettingsStatus {
     pub blocked_reason: Option<UpstreamPeerBlockedReason>,
 }
 
+/// Only the scalar runtime inputs needed before an ordinary exchange. Keeping
+/// this Copy prevents the hot path from owning unrelated settings or credentials.
+#[derive(Clone, Copy)]
+pub(crate) struct CaptureEligibilityInputs {
+    enabled: bool,
+    revision: Option<u64>,
+    http_capture_enabled: bool,
+}
+
+impl From<&RuntimeSettingsSnapshot> for CaptureEligibilityInputs {
+    fn from(runtime: &RuntimeSettingsSnapshot) -> Self {
+        Self {
+            enabled: runtime.upstream_peer_capture_enabled,
+            revision: runtime.upstream_peer_capture_revision,
+            http_capture_enabled: runtime.http_capture_enabled,
+        }
+    }
+}
+
+impl CaptureEligibilityInputs {
+    pub(crate) fn status(self, uncertain: bool) -> UpstreamPeerSettingsStatus {
+        let blocked_reason = if uncertain {
+            Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+        } else if self.revision.is_none_or(|revision| revision == u64::MAX) {
+            // An exhausted On cannot accept a later Off revision. Fail closed
+            // without resetting the revision or changing its existing CAS token.
+            Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+        } else if self.enabled && !self.http_capture_enabled {
+            Some(UpstreamPeerBlockedReason::HttpCapturePaused)
+        } else {
+            None
+        };
+        UpstreamPeerSettingsStatus {
+            effective_enabled: self.enabled && blocked_reason.is_none(),
+            blocked_reason,
+        }
+    }
+}
+
 pub(crate) fn status(
     runtime: &RuntimeSettingsSnapshot,
     uncertain: bool,
 ) -> UpstreamPeerSettingsStatus {
-    let blocked_reason = if uncertain {
-        Some(UpstreamPeerBlockedReason::PersistenceUncertain)
-    } else if runtime
-        .upstream_peer_capture_revision
-        .is_none_or(|revision| revision == u64::MAX)
-    {
-        // An exhausted On cannot accept a later Off revision. Fail closed
-        // without resetting the revision or changing its existing CAS token.
-        Some(UpstreamPeerBlockedReason::InvalidConfiguration)
-    } else if runtime.upstream_peer_capture_enabled && !runtime.http_capture_enabled {
-        Some(UpstreamPeerBlockedReason::HttpCapturePaused)
-    } else {
-        None
-    };
-    UpstreamPeerSettingsStatus {
-        effective_enabled: runtime.upstream_peer_capture_enabled && blocked_reason.is_none(),
-        blocked_reason,
-    }
+    CaptureEligibilityInputs::from(runtime).status(uncertain)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -227,3 +227,10 @@ recovery lock or quarantine, redacts invalid API addresses and rejected argument
 values, and refuses redirects and retries. Settings writes still require the explicit confirmation and
 session-bound configuration token. Exact evidence unavailability accepts only
 known protocol reason codes, so unexpected diagnostic text is not printed.
+
+Origin declarations are validated before URL normalization so malformed
+authorities and dot-segment paths cannot become relationship evidence. Valid
+origin normalization and path-bearing Referer declarations remain supported.
+Socket-peer eligibility now copies only its three scalar runtime inputs, avoiding
+unrelated settings clones while preserving the existing capture and durability
+gates.

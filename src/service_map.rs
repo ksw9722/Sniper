@@ -644,6 +644,16 @@ fn declared_header_origin(value: &str, origin_header: bool) -> Option<String> {
     {
         return None;
     }
+    if origin_header {
+        // URL parsing repairs extra authority slashes and removes dot segments,
+        // so validate the declared structure before normalization. Keep the
+        // existing allowance for one trailing slash, but never raw userinfo.
+        let (_, authority) = value.split_once("://")?;
+        let authority = authority.strip_suffix('/').unwrap_or(authority);
+        if authority.is_empty() || authority.contains(['/', '?', '#', '@', ',']) {
+            return None;
+        }
+    }
     let url = Url::parse(value).ok()?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str()?.len() > MAX_HOST_BYTES {
         return None;
@@ -1256,6 +1266,179 @@ mod tests {
         assert!(projected
             .omitted
             .contains(&"ambiguous_origin_header".into()));
+    }
+
+    fn header_declaration_cases() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
+        let mut cases = vec![
+            (
+                "Origin",
+                "https://source.example.com",
+                Some("https://source.example.com"),
+            ),
+            (
+                "Origin",
+                "HTTPS://SOURCE.Example.COM:443",
+                Some("https://source.example.com"),
+            ),
+            (
+                "Origin",
+                "http://source.example.com:80",
+                Some("http://source.example.com"),
+            ),
+            (
+                "Origin",
+                "https://source.example.com:8443",
+                Some("https://source.example.com:8443"),
+            ),
+            (
+                "Origin",
+                "https://source.example.com/",
+                Some("https://source.example.com"),
+            ),
+            (
+                "Origin",
+                " https://source.example.com:443/ ",
+                Some("https://source.example.com"),
+            ),
+            (
+                "Origin",
+                "https://[2001:db8:0:0:0:0:0:1]:443",
+                Some("https://[2001:db8::1]"),
+            ),
+            (
+                "Origin",
+                "http://[2001:db8::1]:8080/",
+                Some("http://[2001:db8::1]:8080"),
+            ),
+            (
+                "Referer",
+                "https://source.example.com/path?q=QUERY_SENTINEL#FRAGMENT_SENTINEL",
+                Some("https://source.example.com"),
+            ),
+            (
+                "Referer",
+                "https://source.example.com/a/..",
+                Some("https://source.example.com"),
+            ),
+            (
+                "Referer",
+                "https://source.example.com/%2e",
+                Some("https://source.example.com"),
+            ),
+            (
+                "Referer",
+                "https://USER_SENTINEL:PASS_SENTINEL@source.example.com/path",
+                Some("https://source.example.com"),
+            ),
+        ];
+        cases.extend(
+            [
+                "",
+                "null",
+                "/relative",
+                "javascript:alert(1)",
+                "https://",
+                "https:///source.example.com",
+                "https:////source.example.com",
+                "http://///source.example.com/",
+                "https://source.example.com//",
+                "https://source.example.com/path",
+                "https://source.example.com/.",
+                "https://source.example.com/..",
+                "https://source.example.com/a/..",
+                "https://source.example.com/a/../",
+                "https://source.example.com/%2e",
+                "https://source.example.com/%2E/",
+                "https://source.example.com/a/%2e%2e",
+                "https://source.example.com/a/.%2e",
+                "https://source.example.com/a/%2E.",
+                "https://source.example.com/a/%2e%2E/",
+                "https://@source.example.com",
+                "https://:@source.example.com",
+                "https://user@source.example.com",
+                "https://user:secret@source.example.com",
+                "https://source.example.com?",
+                "https://source.example.com/?q=secret",
+                "https://source.example.com#",
+                "https://source.example.com/#fragment",
+                "https://source.example.com https://other.example.com",
+                "https://source.example.com,https://other.example.com",
+                "https://source.example.com, null",
+                "https://source.example.com,null",
+                "https://source.example.com,",
+                "https://source.example.com\\path",
+            ]
+            .into_iter()
+            .map(|value| ("Origin", value, None)),
+        );
+        cases
+    }
+
+    #[test]
+    fn service_map_header_declaration_rows_validate_raw_origin_structure() {
+        for (header_name, value, expected) in header_declaration_cases() {
+            for with_response in [false, true] {
+                let mut row = record("/captured");
+                row.request.headers = headers(&[(header_name, value)]);
+                if !with_response {
+                    row.response = None;
+                    row.status = None;
+                }
+                let projected = project_record(&row, "test".into()).unwrap();
+                assert_eq!(
+                    projected.header_links.len(),
+                    usize::from(expected.is_some()),
+                    "{header_name}: {value:?}; with_response={with_response}"
+                );
+                if let Some(expected) = expected {
+                    let link = &projected.header_links[0];
+                    assert_eq!(link.source_origin, expected, "{header_name}: {value:?}");
+                    assert_eq!(
+                        link.relationship,
+                        format!("{}_header", header_name.to_ascii_lowercase())
+                    );
+                }
+                assert_eq!(projected.origin, "https://example.com");
+                assert_eq!(projected.path, "/captured");
+                assert!(projected.metadata_complete);
+                assert!(!serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("SENTINEL"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_header_declaration_aggregates_validate_raw_origin_structure() {
+        for (header_name, value, expected) in header_declaration_cases() {
+            let mut row = record("/captured");
+            row.request.headers = headers(&[(header_name, value)]);
+            let result = map(vec![row]).await;
+            assert!(result.snapshot.complete);
+            assert_eq!(result.snapshot.included_rows, 1);
+            assert_eq!(result.snapshot.origin_count, 1);
+            assert_eq!(result.snapshot.endpoint_count, 1);
+            let origin = &result.origins[0];
+            assert_eq!(origin.origin, "https://example.com");
+            assert_eq!(origin.request_count, 1);
+            assert_eq!(origin.endpoints[0].path, "/captured");
+            assert_eq!(
+                origin.header_links.len(),
+                usize::from(expected.is_some()),
+                "{header_name}: {value:?}"
+            );
+            if let Some(expected) = expected {
+                let link = &origin.header_links[0];
+                assert_eq!(link.source_origin, expected, "{header_name}: {value:?}");
+                assert_eq!(
+                    link.relationship,
+                    format!("{}_header", header_name.to_ascii_lowercase())
+                );
+                assert_eq!(link.source, "request_header_declaration");
+                assert_eq!(link.evidence, origin.endpoints[0].evidence);
+            }
+            assert!(!serde_json::to_string(&result).unwrap().contains("SENTINEL"));
+        }
     }
 
     #[tokio::test]

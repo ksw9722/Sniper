@@ -582,8 +582,11 @@ impl SessionContext {
     /// fallback and completion. No lock escapes this helper. An already eligible
     /// exchange may finish recording its observation after the user saves Off.
     pub async fn upstream_peer_capture_eligible(&self) -> bool {
-        let runtime = self.runtime.snapshot().await;
-        crate::upstream_peer_settings::status(&runtime, self.upstream_peer_settings.uncertain())
+        // Copy the coherent runtime inputs, then release its lock before reading
+        // the durability gate, preserving the existing sampling order.
+        let inputs = self.runtime.upstream_peer_capture_inputs().await;
+        inputs
+            .status(self.upstream_peer_settings.uncertain())
             .effective_enabled
     }
 
@@ -4832,6 +4835,53 @@ mod tests {
         },
         ws_replay::WsReplayFrame,
     };
+
+    #[tokio::test]
+    async fn peer_capture_eligibility_matches_status_after_runtime_and_gate_changes() {
+        // An in-memory read-only context avoids journal workers and storage I/O.
+        let session = super::SessionContext::from_snapshot_read_only(
+            super::default_session_metadata("peer eligibility"),
+            std::env::temp_dir().join(format!("sniper-peer-eligibility-{}", Uuid::new_v4())),
+            32,
+            32,
+            super::MAX_PERSISTED_WEBSOCKET_FRAMES_PER_SESSION,
+            super::StoredSessionSnapshot {
+                scanner_config: ScannerConfig {
+                    enabled: false,
+                    ..ScannerConfig::default()
+                },
+                ..super::StoredSessionSnapshot::default()
+            },
+        );
+        assert!(!session.upstream_peer_capture_eligible().await);
+        for enabled in [false, true] {
+            for http_capture_enabled in [false, true] {
+                for revision in [None, Some(0), Some(1), Some(u64::MAX - 1), Some(u64::MAX)] {
+                    session
+                        .runtime
+                        .set_upstream_peer_capture_config(enabled, revision)
+                        .await;
+                    session
+                        .runtime
+                        .update(RuntimeSettingsUpdate {
+                            http_capture_enabled: Some(http_capture_enabled),
+                            ..RuntimeSettingsUpdate::default()
+                        })
+                        .await
+                        .unwrap();
+                    let full = session.runtime.snapshot().await;
+                    for uncertain in [false, true] {
+                        session.upstream_peer_settings.mark_uncertain(uncertain);
+                        assert_eq!(
+                            session.upstream_peer_capture_eligible().await,
+                            crate::upstream_peer_settings::status(&full, uncertain)
+                                .effective_enabled
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn saved_http_workspace_write_distinguishes_precommit_and_postrename_failures() {
