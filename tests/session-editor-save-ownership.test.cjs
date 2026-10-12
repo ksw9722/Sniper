@@ -11,7 +11,7 @@ function fixture(kind) {
   const requests = [], toasts = [], renders = [];
   const rule = { id: 'synthetic-rule', enabled: false, description: '', scope: 'request',
     target: 'any', search: '', replace: '', regex: false, case_sensitive: false };
-  const state = { activeSession: { id: 'session-a' }, runtime: {}, targetScopeDraft: 'example.com',
+  const state = { activeTool: 'target', activeTargetView: 'paths', activeSession: { id: 'session-a' }, runtime: {}, targetScopeDraft: 'example.com',
     targetScopeExcludeDraft: '', targetScopeDirty: true, targetScopeEditorSessionId: 'session-a',
     targetScopeDraftVersion: 0, matchReplaceRules: [{ ...rule }], selectedMatchReplaceRuleId: rule.id,
     matchReplaceDirty: true, matchReplaceEditorSessionId: 'session-a', matchReplaceDraftVersion: 0 };

@@ -1292,6 +1292,113 @@ impl TransactionStore {
         }
     }
 
+    /// Capture row-exact metadata while one read lock fixes membership, order and
+    /// revisions. Never clone a full transaction or rehydrate a body here.
+    pub(crate) async fn service_map_snapshot(
+        &self,
+        session_id: Uuid,
+        max_records: usize,
+    ) -> crate::service_map::MetadataSnapshot {
+        use crate::service_map::{
+            evidence_id, project_record, MetadataSnapshot, MAX_METADATA_BYTES,
+        };
+        let inner = self.inner.read().await;
+        let mut snapshot = MetadataSnapshot {
+            generation: self.saved_cursor_generation,
+            captured_at: chrono::Utc::now(),
+            first_retained_started_at: inner.entries.first().map(|r| r.started_at),
+            last_retained_started_at: inner.entries.last().map(|r| r.started_at),
+            oldest_considered_at: None,
+            latest_considered_at: None,
+            retained_rows: inner.entries.len(),
+            considered_rows: 0,
+            non_http_rows: 0,
+            omitted_rows: 0,
+            stopped_by: Default::default(),
+            rows: Vec::new(),
+        };
+        let mut bytes = 0usize;
+        for (record, revision) in inner.entries.iter().zip(&inner.body_generations).rev() {
+            if snapshot.considered_rows >= max_records {
+                snapshot.stopped_by.insert("max_records".into());
+                break;
+            }
+            snapshot.considered_rows += 1;
+            snapshot.oldest_considered_at = Some(
+                snapshot
+                    .oldest_considered_at
+                    .map_or(record.started_at, |time| time.min(record.started_at)),
+            );
+            snapshot.latest_considered_at = Some(
+                snapshot
+                    .latest_considered_at
+                    .map_or(record.started_at, |time| time.max(record.started_at)),
+            );
+            if record.method == "CONNECT" {
+                snapshot.non_http_rows += 1;
+                continue;
+            }
+            let id = evidence_id(session_id, self.saved_cursor_generation, *revision, record);
+            let Some(row) = project_record(record, id) else {
+                snapshot.omitted_rows += 1;
+                snapshot
+                    .stopped_by
+                    .insert("unsupported_or_oversized_metadata".into());
+                continue;
+            };
+            // Serialization measures only the safe projection, never bodies or
+            // raw headers. Bound cumulative memory even for high-cardinality paths.
+            bytes = bytes.saturating_add(
+                serde_json::to_vec(&row).map_or(MAX_METADATA_BYTES + 1, |v| v.len()),
+            );
+            if bytes > MAX_METADATA_BYTES {
+                snapshot.stopped_by.insert("metadata_bytes".into());
+                snapshot.omitted_rows += 1;
+                break;
+            }
+            snapshot.rows.push(row);
+        }
+        snapshot
+    }
+
+    pub(crate) async fn service_map_evidence(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map::ServiceMapEvidence {
+        use crate::service_map::{project_record, EvidenceKey, ServiceMapEvidence};
+        let missing = |reason| ServiceMapEvidence::missing(session_id, id.into(), reason);
+        let Some(key) = EvidenceKey::parse(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        let inner = self.inner.read().await;
+        // UUID lookup deliberately cannot resolve this: retained legacy rows may
+        // share an ID and get(id) selects the latest one.
+        let Ok(index) = inner
+            .entries
+            .binary_search_by_key(&key.sequence, |record| record.sequence)
+        else {
+            return missing("record_missing");
+        };
+        let record = &inner.entries[index];
+        if record.id != key.record_id {
+            return missing("record_missing");
+        }
+        if inner.body_generations[index] != key.revision {
+            return missing("record_changed");
+        }
+        match project_record(record, id.into()) {
+            Some(row) => ServiceMapEvidence::found(session_id, row),
+            None => missing("metadata_unavailable"),
+        }
+    }
+
     pub async fn site_map_records(&self) -> Vec<SiteMapRecord> {
         let inner = self.inner.read().await;
         inner

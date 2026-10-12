@@ -73,7 +73,7 @@ cargo run --bin sniper-desktop
 | **Fuzzer** | Payload-based request testing with markers |
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
 | **Sessions** | Isolated workspaces — each with its own records, scope, and state |
-| **Scope** | Host and wildcard filtering with site map visualization |
+| **Scope** | Host and wildcard filtering, site map, and a passive retained-history Service Map (unreleased) |
 | **Themes** | 12 themes — 7 dark + 5 light, gold-accent design language |
 | **CLI** | `sniper-cli` — JSON-first automation for scripting |
 | **AI Skills** | Built-in Claude & Codex skill templates using `sniper-cli` |
@@ -211,6 +211,16 @@ stylesheets and their imports, fonts) through Sniper and the session's proxy
 chain, and writes them into the page; scripts still never run. Those requests
 go to the target and to any other host the page names, and are not recorded in
 HTTP history.
+
+## Passive Service Map (unreleased)
+
+Scope's Service Map summarizes origins and method-plus-exact-path endpoints from
+retained capture metadata, with counts, bounded evidence, scope state, header
+clues, and redirect instructions. The UI and `sniper-cli scope service-map` share
+the same read model. No probing, scanning, replay, crawling, or redirect following
+is performed. Always inspect the reported completeness and unavailable fields;
+this is an observed inventory, not a verified infrastructure topology. See the
+[Service Map contract and examples](docs/integrations/service-map.md).
 
 ## CLI
 

@@ -181,6 +181,30 @@ fn assert_schema(value: &Value, schema: &Value) {
 }
 
 #[test]
+fn service_map_parse_errors_hide_rejected_credentials_and_queries() {
+    for args in [
+        vec![
+            "scope",
+            "service-map",
+            "--origin",
+            "https://user:SYNTHETIC_PRIVATE_VALUE@example.com",
+        ],
+        vec![
+            "scope",
+            "service-map-evidence",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--evidence-id",
+            "https://example.com?token=SYNTHETIC_PRIVATE_VALUE",
+        ],
+    ] {
+        let result = cli(&args, 2);
+        assert_eq!(result["error"]["code"], "INVALID_INPUT");
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+    }
+}
+
+#[test]
 fn schema_matcher_guards_its_subset_and_checks_formats() {
     for schema in [
         json!({"properties":{"optional":{"const":"expected"}}}),
@@ -474,7 +498,10 @@ mod history_fixture {
 
     struct MockState {
         settings: Value,
+        settings_status: Mutex<u16>,
+        settings_override: Mutex<Option<Value>>,
         payload: Mutex<Value>,
+        read_status: Mutex<u16>,
         requests: Mutex<Vec<RecordedRequest>>,
     }
 
@@ -498,7 +525,10 @@ mod history_fixture {
                     "data_dir":unused_dir, "max_entries":2,
                     "features":["http_capture","session_storage","replay"]
                 }),
+                settings_status: Mutex::new(200),
+                settings_override: Mutex::new(None),
                 payload: Mutex::new(json!([])),
+                read_status: Mutex::new(200),
                 requests: Mutex::new(Vec::new()),
             });
             let app = Router::new()
@@ -514,6 +544,10 @@ mod history_fixture {
         }
 
         async fn command(&self, args: &[&str]) -> Value {
+            self.command_with_code(args, 0).await
+        }
+
+        async fn command_with_code(&self, args: &[&str], expected_code: i32) -> Value {
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
             command
                 .args(["--output", "compact", "--api", &self.api])
@@ -527,7 +561,11 @@ mod history_fixture {
                 .await
                 .expect("synthetic CLI fixture timed out")
                 .unwrap();
-            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(expected_code),
+                "{args:?}: {output:?}"
+            );
             assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
             assert!(
                 !self.unused_dir.exists(),
@@ -578,9 +616,34 @@ mod history_fixture {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
         match parts.uri.path() {
-            "/api/settings" => Json(state.settings.clone()).into_response(),
+            "/api/settings" => {
+                let status = StatusCode::from_u16(*state.settings_status.lock().unwrap()).unwrap();
+                let payload = state.settings_override.lock().unwrap().clone().unwrap_or_else(||state.settings.clone());
+                let mut response = (status,Json(payload)).into_response();
+                if status.is_redirection() {
+                    response.headers_mut().insert("location","/unexpected-discovery-redirect".parse().unwrap());
+                }
+                response
+            },
+            "/api/sessions" => Json(json!([{
+                "id":Uuid::nil(),"name":"Synthetic session",
+                "created_at":"2026-10-12T06:00:00Z","updated_at":"2026-10-12T06:00:00Z",
+                "last_opened_at":"2026-10-12T06:00:00Z","request_count":2,"websocket_count":0,
+                "event_count":0,"fuzzer_count":0,"rule_count":0,"storage_path":"synthetic-session","active":true
+            }])).into_response(),
             "/api/transactions" | "/api/transactions-page" => {
                 Json(state.payload.lock().unwrap().clone()).into_response()
+            }
+            "/api/target/service-map" | "/api/target/service-map/evidence" => {
+                let status = StatusCode::from_u16(*state.read_status.lock().unwrap()).unwrap();
+                let mut response =
+                    (status, Json(state.payload.lock().unwrap().clone())).into_response();
+                if status.is_redirection() {
+                    response
+                        .headers_mut()
+                        .insert("location", "/unexpected-redirect".parse().unwrap());
+                }
+                response
             }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
@@ -723,6 +786,490 @@ mod history_fixture {
                     &[],
                 );
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_pins_the_active_session_once_without_switching() {
+        let mock = MockApi::new().await;
+        *mock.state.payload.lock().unwrap() = map_payload();
+        let result = mock.command(&["call", "target.service_map.get"]).await;
+        assert_eq!(result["meta"]["session_id"], Uuid::nil().to_string());
+        let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0].path, "/api/settings");
+        assert_eq!(requests[1].path, "/api/sessions");
+        assert_eq!(requests[2].path, "/api/target/service-map");
+        assert_eq!(requests[2].query["session_id"], Uuid::nil().to_string());
+        assert!(requests
+            .iter()
+            .all(|request| request.method == "GET" && request.body_len == 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_empty_and_truncated_results_keep_explicit_completeness() {
+        let mock = MockApi::new().await;
+        let schema = output_schema("target.service_map.get");
+        let mut empty = map_payload();
+        empty["origins"] = json!([]);
+        for key in [
+            "retained_rows",
+            "considered_rows",
+            "non_http_rows",
+            "projected_rows",
+            "included_rows",
+            "excluded_rows",
+            "omitted_rows",
+            "origin_count",
+            "endpoint_count",
+        ] {
+            empty["snapshot"][key] = json!(0);
+        }
+        for key in [
+            "first_retained_started_at",
+            "last_retained_started_at",
+            "oldest_considered_at",
+            "latest_considered_at",
+        ] {
+            empty["snapshot"][key] = Value::Null;
+        }
+        let mut truncated = map_payload();
+        truncated["snapshot"]["complete"] = json!(false);
+        truncated["snapshot"]["stopped_by"] = json!(["metadata_bytes_limit"]);
+        truncated["snapshot"]["retained_rows"] = json!(3);
+        for payload in [empty, truncated] {
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let session = Uuid::nil().to_string();
+            let result = mock
+                .command(&["scope", "service-map", "--session-id", &session])
+                .await;
+            assert_eq!(result, payload);
+            assert_schema(&result, &schema);
+            mock.assert_reads(
+                "/api/target/service-map",
+                &[("in_scope_only", "false"), ("max_records", "10000")],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_discovery_never_follows_redirects_or_retries() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        for (status, code, exit) in [(302, "REDIRECT_REFUSED", 5), (503, "HTTP_STATUS_ERROR", 6)] {
+            *mock.state.settings_status.lock().unwrap() = status;
+            *mock.state.settings_override.lock().unwrap() =
+                Some(json!({"error":"SYNTHETIC_PRIVATE_VALUE"}));
+            let result = mock
+                .command_with_code(&["scope", "service-map", "--session-id", &session], exit)
+                .await;
+            assert_eq!(result["error"]["code"], code);
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].path, "/api/settings");
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].body_len, 0);
+        }
+        *mock.state.settings_status.lock().unwrap() = 200;
+        let result = mock
+            .command_with_code(&["scope", "service-map", "--session-id", &session], 5)
+            .await;
+        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].path, "/api/settings");
+    }
+
+    async fn service_map_discovery_command(
+        root: &std::path::Path,
+        args: &[&str],
+        env_api: Option<&str>,
+        expected_code: i32,
+    ) -> Value {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
+        command
+            .args(["--output", "compact"])
+            .args(args)
+            .env("SNIPER_DATA_DIR", root)
+            .env("HOME", root.join("home"))
+            .env("USERPROFILE", root.join("home"))
+            .env_remove("SNIPER_API_ADDR")
+            .kill_on_drop(true);
+        if let Some(env_api) = env_api {
+            command.env("SNIPER_API_ADDR", env_api);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_discovery_hides_invalid_api_values_without_fallback() {
+        let mock = MockApi::new().await;
+        let invalid = "http://[SYNTHETIC_PRIVATE_VALUE";
+        let result = service_map_discovery_command(
+            &mock.unused_dir,
+            &["--api", invalid, "scope", "service-map"],
+            None,
+            2,
+        )
+        .await;
+        assert_eq!(result["error"]["code"], "INVALID_INPUT");
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        let result = service_map_discovery_command(
+            &mock.unused_dir,
+            &["scope", "service-map"],
+            Some(invalid),
+            2,
+        )
+        .await;
+        assert_eq!(result["error"]["code"], "INVALID_INPUT");
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        assert!(mock.state.requests.lock().unwrap().is_empty());
+        assert!(!mock.unused_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_discovery_preserves_runtime_files_and_checks_identity() {
+        use sniper::runtime_state::{runtime_state_path, RuntimeStateSnapshot};
+        let mock = MockApi::new().await;
+        let root =
+            std::env::temp_dir().join(format!("sniper-service-map-discovery-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = runtime_state_path(&root);
+        let corrupt = b"{SYNTHETIC_PRIVATE_VALUE";
+        std::fs::write(&path, corrupt).unwrap();
+        let result = service_map_discovery_command(&root, &["scope", "service-map"], None, 6).await;
+        assert_eq!(result["error"]["code"], "API_UNAVAILABLE");
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(mock.state.requests.lock().unwrap().is_empty());
+
+        let addr = mock.api.strip_prefix("http://").unwrap().parse().unwrap();
+        let snapshot =
+            RuntimeStateSnapshot::with_proxy_status("127.0.0.1:0".parse().unwrap(), addr, true);
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        for status in [302, 200] {
+            *mock.state.settings_status.lock().unwrap() = status;
+            let result =
+                service_map_discovery_command(&root, &["scope", "service-map"], None, 5).await;
+            assert_eq!(
+                result["error"]["code"],
+                if status == 302 {
+                    "REDIRECT_REFUSED"
+                } else {
+                    "INVALID_RESPONSE"
+                }
+            );
+            assert_eq!(result["error"]["retryable"], false);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+            let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].path, "/api/settings");
+        }
+        // The same identity checks must also permit the intended instance.
+        let mut settings = mock.state.settings.clone();
+        settings["runtime_instance_id"] = json!(snapshot.instance_id);
+        settings["data_dir"] = json!(root);
+        *mock.state.settings_override.lock().unwrap() = Some(settings);
+        *mock.state.payload.lock().unwrap() = map_payload();
+        let session = Uuid::nil().to_string();
+        let result = service_map_discovery_command(
+            &root,
+            &["scope", "service-map", "--session-id", &session],
+            None,
+            0,
+        )
+        .await;
+        assert_eq!(result, map_payload());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn map_payload() -> Value {
+        let mut limits = serde_json::Map::new();
+        for field in [
+            "metadata_bytes",
+            "origins",
+            "endpoints",
+            "endpoints_per_origin",
+            "evidence_per_item",
+            "redirects_per_origin",
+            "header_links_per_origin",
+            "technology_clues_per_row",
+            "statuses_per_endpoint",
+            "content_types_per_endpoint",
+            "path_bytes",
+            "host_bytes",
+            "method_bytes",
+            "headers_per_row",
+            "header_bytes_per_row",
+            "header_value_bytes",
+        ] {
+            limits.insert(field.into(), json!(100));
+        }
+        limits.insert("max_records".into(), json!(10000));
+        let stamp = "2026-10-12T06:00:00Z";
+        json!({
+            "schema_version":1,"session_id":Uuid::nil(),"in_scope_only":false,"origin_filter":null,
+            "snapshot":{
+                "id":Uuid::nil(),"generation":Uuid::nil(),"captured_at":stamp,
+                "first_retained_started_at":stamp,"last_retained_started_at":stamp,
+                "window_order":"newest_capture_sequence",
+                "oldest_considered_at":stamp,"latest_considered_at":stamp,
+                "retained_rows":2,"considered_rows":2,"non_http_rows":0,"projected_rows":2,
+                "included_rows":2,"excluded_rows":0,"omitted_rows":0,
+                "origin_count":1,"endpoint_count":1,"complete":true,"stopped_by":[],"limits":limits
+            },
+            "origins":[{
+                "origin":"https://example.com","host":"example.com","scheme":"https","port":443,
+                "in_scope":true,"request_count":2,"first_seen":stamp,"last_seen":stamp,
+                "endpoints":[{"method":"get","path":"/items/42","path_group":"/items/{number}",
+                    "request_count":2,"statuses":[200,302],"content_types":["text/html"],"evidence":["v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000"]}],
+                "technology_clues":[{"name":"nginx","header_name":"server","source":"response_header","confidence":"observed_header","evidence":["v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000"]}],
+                "redirects":[{"target_origin":"https://login.example.com","target_path":"/sign-in","relationship":"redirect_instruction","source":"response_location_header","evidence":["v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000"]}],
+                "header_links":[{"source_origin":"https://app.example.com","relationship":"referer_header","source":"request_header_declaration","evidence":["v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000"]}]
+            }],
+            "unavailable":["initiator","remote_ip","tls_certificate"],"deferred":["response_body_references"],"warnings":[]
+        })
+    }
+
+    fn evidence_payload(available: bool) -> Value {
+        let row = json!({
+            "evidence_id":"v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000","record_id":Uuid::nil(),"sequence":"9007199254740993",
+            "started_at":"2026-10-12T06:00:00Z","method":"get","origin":"https://example.com",
+            "host":"example.com","scheme":"https","port":443,"path":"/items/42",
+            "status":null,"content_type":null,"is_websocket":false,
+            "technology_clues":[],"redirect":null,"header_links":[],"metadata_complete":true,"omitted":[]
+        });
+        json!({"schema_version":1,"session_id":Uuid::nil(),"evidence_id":"v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000",
+            "available":available,"reason":if available {Value::Null} else {json!("store_generation_changed")},
+            "source":"captured_http_metadata","row":if available {row} else {Value::Null}})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_reads_match_schema_and_share_direct_call_results() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let schema = output_schema("target.service_map.get");
+        *mock.state.payload.lock().unwrap() = map_payload();
+        let direct = mock
+            .command(&["target", "service-map", "--session-id", &session])
+            .await;
+        assert_schema(&direct, &schema);
+        assert_eq!(direct, map_payload());
+        assert_eq!(direct["origins"][0]["endpoints"][0]["method"], "get");
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+        let input = json!({"session_id":session}).to_string();
+        let called = mock
+            .command(&["call", "target.service_map.get", "--input", &input])
+            .await;
+        assert_eq!(called["data"], direct);
+        assert_eq!(called["meta"]["session_id"], session);
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+        let mut filtered = map_payload();
+        filtered["in_scope_only"] = json!(true);
+        filtered["origin_filter"] = json!("https://example.com");
+        filtered["snapshot"]["limits"]["max_records"] = json!(25);
+        *mock.state.payload.lock().unwrap() = filtered.clone();
+        let filtered_result = mock
+            .command(&[
+                "scope",
+                "service-map",
+                "--session-id",
+                &session,
+                "--in-scope-only",
+                "--max-records",
+                "25",
+                "--origin",
+                "https://example.com",
+            ])
+            .await;
+        assert_eq!(filtered_result, filtered);
+        assert_schema(&filtered_result, &schema);
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[
+                ("in_scope_only", "true"),
+                ("max_records", "25"),
+                ("origin", "https://example.com"),
+            ],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_evidence_preserves_unavailable_and_exact_sequence() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let schema = output_schema("target.service_map.evidence.get");
+        for available in [true, false] {
+            let payload = evidence_payload(available);
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let result = mock
+                .command(&[
+                    "scope",
+                    "service-map-evidence",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000",
+                ])
+                .await;
+            assert_eq!(result, payload);
+            assert_schema(&result, &schema);
+            if available {
+                assert_eq!(result["row"]["sequence"], "9007199254740993");
+            }
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[("evidence_id", "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000")],
+            );
+            let input = json!({"session_id":session,"evidence_id":"v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000"}).to_string();
+            let called = mock
+                .command(&["call", "target.service_map.evidence.get", "--input", &input])
+                .await;
+            assert_eq!(called["data"], result);
+            assert_eq!(called["meta"]["session_id"], session);
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[("evidence_id", "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000")],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_rejects_misbound_or_unsafe_responses_without_echoing_data() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = ["scope", "service-map", "--session-id", &session];
+        for (pointer, value) in [
+            ("/schema_version", json!(2)),
+            ("/session_id", json!(Uuid::from_u128(1))),
+            ("/in_scope_only", json!(true)),
+            ("/origin_filter", json!("https://other.example.com")),
+            ("/snapshot/limits/max_records", json!(20)),
+            ("/snapshot/origin_count", json!(2)),
+            ("/snapshot/complete", json!(false)),
+            (
+                "/origins/0/endpoints/0/path",
+                json!("/items/42?token=SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            (
+                "/origins/0/redirects/0/target_origin",
+                json!("https://user:SYNTHETIC_PRIVATE_VALUE@example.com"),
+            ),
+            (
+                "/origins/0/technology_clues/0/confidence",
+                json!("inferred_backend_chain"),
+            ),
+        ] {
+            let mut payload = map_payload();
+            *payload.pointer_mut(pointer).unwrap() = value;
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{pointer}");
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map",
+                &[("in_scope_only", "false"), ("max_records", "10000")],
+            );
+        }
+        let mut payload = map_payload();
+        payload["unknown_sensitive_data"] = json!("SYNTHETIC_PRIVATE_VALUE");
+        payload["origins"][0]["endpoints"][0]["raw_headers"] = json!("SYNTHETIC_PRIVATE_VALUE");
+        *mock.state.payload.lock().unwrap() = payload;
+        let result = mock.command(&args).await;
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        assert_schema(&result, &output_schema("target.service_map.get"));
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_evidence_rejects_ambiguous_or_substituted_rows() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        for (pointer, value) in [
+            ("/session_id", json!(Uuid::from_u128(1))),
+            ("/evidence_id", json!("different-token")),
+            ("/row/evidence_id", json!("different-row-token")),
+            ("/row", Value::Null),
+            ("/available", json!(false)),
+            ("/reason", json!("stale")),
+            ("/row/sequence", json!("09007199254740993")),
+            ("/row/path", json!("/items?token=SYNTHETIC_PRIVATE_VALUE")),
+        ] {
+            let mut payload = evidence_payload(true);
+            *payload.pointer_mut(pointer).unwrap() = value;
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock
+                .command_with_code(
+                    &[
+                        "scope",
+                        "service-map-evidence",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000",
+                    ],
+                    5,
+                )
+                .await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{pointer}");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[("evidence_id", "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000")],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_refuses_redirects_and_does_not_echo_error_bodies() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+        for (status, code, exit) in [
+            (302, "REDIRECT_REFUSED", 5),
+            (404, "HTTP_STATUS_ERROR", 5),
+            (500, "HTTP_STATUS_ERROR", 6),
+        ] {
+            *mock.state.read_status.lock().unwrap() = status;
+            let result = mock
+                .command_with_code(&["scope", "service-map", "--session-id", &session], exit)
+                .await;
+            assert_eq!(result["error"]["code"], code);
+            assert_eq!(result["error"]["details"]["status"], status);
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map",
+                &[("in_scope_only", "false"), ("max_records", "10000")],
+            );
         }
     }
 }

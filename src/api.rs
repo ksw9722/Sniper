@@ -361,6 +361,7 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/decoder/", get(decoder_index))
         .route("/decoder/*path", get(decoder_asset))
         .route("/app.js", get(app_js))
+        .route("/service-map.js", get(service_map_js))
         .route("/codemirror.js", get(codemirror_js))
         .route("/styles.css", get(styles_css))
         .route("/favicon.svg", get(favicon_svg))
@@ -444,6 +445,11 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/oast/generate", post(generate_oast_payload))
         .route("/api/oast/status", get(oast_status))
         .route("/api/target/site-map", get(get_target_site_map))
+        .route("/api/target/service-map", get(get_target_service_map))
+        .route(
+            "/api/target/service-map/evidence",
+            get(get_target_service_map_evidence),
+        )
         .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
@@ -5127,6 +5133,103 @@ async fn update_match_replace_rules(
     Json(rules).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapQuery {
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    in_scope_only: bool,
+    max_records: Option<usize>,
+    origin: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapEvidenceQuery {
+    session_id: Uuid,
+    evidence_id: String,
+}
+
+async fn get_target_service_map(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapQuery>,
+) -> Response {
+    let max_records = query
+        .max_records
+        .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
+    if !(1..=crate::service_map::MAX_RECORDS).contains(&max_records) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "max_records must be between 1 and 50000",
+        )
+            .into_response();
+    }
+    let origin = match query.origin {
+        Some(origin) => match crate::service_map::canonical_origin(&origin) {
+            Some(canonical) if canonical == origin => Some(canonical),
+            _ => return (StatusCode::BAD_REQUEST, "origin must be a canonical HTTP(S) origin without credentials, path, query, or fragment").into_response(),
+        },
+        None => None,
+    };
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    // Freeze scope once. Per-card reads could mix rules from two user edits.
+    let scope = session.runtime.snapshot().await;
+    let snapshot = session
+        .store
+        .service_map_snapshot(session.id(), max_records)
+        .await;
+    if !state.sessions.contains_session(session.id())
+        || !state.is_current_session_context(&session).await
+    {
+        return (
+            StatusCode::CONFLICT,
+            "session source changed; refresh the service map",
+        )
+            .into_response();
+    }
+    Json(crate::service_map::build(
+        session.id(),
+        snapshot,
+        max_records,
+        query.in_scope_only,
+        origin,
+        &scope.scope_patterns,
+        &scope.excluded_scope_patterns,
+    ))
+    .into_response()
+}
+
+async fn get_target_service_map_evidence(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapEvidenceQuery>,
+) -> Response {
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    let session = match resolve_read_session_for_optional_id(&state, Some(query.session_id)).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let evidence = session
+        .store
+        .service_map_evidence(session.id(), &query.evidence_id)
+        .await;
+    if !state.sessions.contains_session(session.id())
+        || !state.is_current_session_context(&session).await
+    {
+        return Json(crate::service_map::ServiceMapEvidence::missing(
+            query.session_id,
+            query.evidence_id,
+            "session_source_changed",
+        ))
+        .into_response();
+    }
+    Json(evidence).into_response()
+}
+
 async fn get_target_site_map(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TargetSiteMapQuery>,
@@ -7729,6 +7832,13 @@ async fn app_js() -> Response {
     asset_response(
         "application/javascript; charset=utf-8",
         include_str!("../web/app.js"),
+    )
+}
+
+async fn service_map_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/service-map.js"),
     )
 }
 
@@ -14430,6 +14540,207 @@ mod tests {
         });
         let error = super::validate_workspace_state(&snapshot).unwrap_err();
         assert!(error.contains("replay tab tab-a sequence is too large"));
+    }
+
+    #[tokio::test]
+    async fn service_map_api_reads_pinned_inactive_without_writes_or_workers() {
+        let (state, data_dir) = test_state("sniper-service-map-inactive");
+        let active_id = state.session().await.id();
+        let metadata = state
+            .sessions
+            .create_session(Some("Map fixture".into()))
+            .unwrap();
+        let inactive = state.sessions.load_context(metadata.id).unwrap();
+        let mut record = test_replay_response_record("/retained?token=SECRET_SENTINEL", 200);
+        record.host = "example.com".into();
+        inactive.store.insert(record).await;
+        inactive.persist().await.unwrap();
+        let dir = inactive.storage_dir().to_path_buf();
+        drop(inactive);
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let map: crate::service_map::ServiceMap = response_json(
+            super::get_target_service_map(
+                State(state.clone()),
+                Query(super::ServiceMapQuery {
+                    session_id: Some(metadata.id),
+                    in_scope_only: false,
+                    max_records: None,
+                    origin: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(map.session_id, metadata.id);
+        assert_eq!(map.snapshot.retained_rows, 1);
+        assert_eq!(map.origins[0].endpoints[0].path, "/retained");
+        let token = map.origins[0].endpoints[0].evidence[0].clone();
+        let evidence: crate::service_map::ServiceMapEvidence = response_json(
+            super::get_target_service_map_evidence(
+                State(state.clone()),
+                Query(super::ServiceMapEvidenceQuery {
+                    session_id: metadata.id,
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(evidence.available);
+        let readonly = state
+            .read_session_context_for_id(metadata.id)
+            .await
+            .unwrap();
+        assert!(!readonly.retention_writable());
+        assert_eq!(state.session().await.id(), active_id);
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "read-only service map changed saved files");
+        drop(readonly);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_rejects_unsafe_filters_and_stale_evidence_is_explicit() {
+        let (state, data_dir) = test_state("sniper-service-map-api-validation");
+        for origin in [
+            "https://example.com/path",
+            "https://example.com?token=SECRET_SENTINEL",
+            "https://user:password@example.com",
+            "ftp://example.com",
+        ] {
+            let response = super::get_target_service_map(
+                State(state.clone()),
+                Query(super::ServiceMapQuery {
+                    session_id: None,
+                    in_scope_only: false,
+                    max_records: None,
+                    origin: Some(origin.into()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        for limit in [0, crate::service_map::MAX_RECORDS + 1] {
+            let response = super::get_target_service_map(
+                State(state.clone()),
+                Query(super::ServiceMapQuery {
+                    session_id: None,
+                    in_scope_only: false,
+                    max_records: Some(limit),
+                    origin: None,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let session = state.session().await;
+        let mut record = test_replay_response_record("/old", 200);
+        record.host = "example.com".into();
+        let id = record.id;
+        session.store.insert(record).await;
+        let map: crate::service_map::ServiceMap = response_json(
+            super::get_target_service_map(
+                State(state.clone()),
+                Query(super::ServiceMapQuery {
+                    session_id: Some(session.id()),
+                    in_scope_only: false,
+                    max_records: None,
+                    origin: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        let token = map.origins[0].endpoints[0].evidence[0].clone();
+        session
+            .store
+            .update_record(id, |record| record.path = "/new".into())
+            .await;
+        let evidence: crate::service_map::ServiceMapEvidence = response_json(
+            super::get_target_service_map_evidence(
+                State(state.clone()),
+                Query(super::ServiceMapEvidenceQuery {
+                    session_id: session.id(),
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(!evidence.available);
+        assert!(evidence.row.is_none());
+        assert_eq!(evidence.reason.as_deref(), Some("record_changed"));
+        let response = super::get_target_service_map_evidence(
+            State(state.clone()),
+            Query(super::ServiceMapEvidenceQuery {
+                session_id: session.id(),
+                evidence_id: "bad".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_deleted_pinned_session_cannot_reappear_from_cache() {
+        let (state, data_dir) = test_state("sniper-service-map-deleted-session");
+        let metadata = state
+            .sessions
+            .create_session(Some("Delete fixture".into()))
+            .unwrap();
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            Query(super::ServiceMapQuery {
+                session_id: Some(metadata.id),
+                in_scope_only: false,
+                max_records: None,
+                origin: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        state.delete_session(metadata.id).await.unwrap();
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            Query(super::ServiceMapQuery {
+                session_id: Some(metadata.id),
+                in_scope_only: false,
+                max_records: None,
+                origin: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

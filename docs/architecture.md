@@ -78,6 +78,11 @@ flowchart LR
   - restores runtime settings, records, websockets, rules, and fuzzer records per session
 - `src/model.rs`
   - defines the shared transaction schema used by proxy, API, and future tooling
+- `src/service_map.rs`
+  - builds a bounded, on-demand projection of retained HTTP metadata for Scope and
+    the CLI, with exact-row evidence and explicitly typed header declarations
+  - reads no bodies and starts no network discovery or persistent index; see
+    [Service Map](integrations/service-map.md) for limits and evidence semantics
 - `src/api.rs`
   - exposes record/detail APIs
   - serves the lightweight desktop UI

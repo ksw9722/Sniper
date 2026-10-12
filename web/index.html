@@ -1353,41 +1353,58 @@
         </section>
 
         <section class="target-shell hidden" id="targetShell">
-          <section class="split-panel split-panel-tight">
-            <section class="panel-card target-scope-card">
-              <header class="panel-toolbar">
-                <div>
-                  <p class="placeholder-kicker">Target</p>
-                  <h2>Scope</h2>
-                </div>
-                <div class="toolbar-actions">
-                  <button class="secondary-action" id="reloadTargetButton" type="button">Reload</button>
-                  <button class="primary-action" id="saveTargetScopeButton" type="button">Save</button>
-                </div>
-              </header>
-              <div class="target-scope-body">
-                <label class="settings-field target-scope-field">
-                  <span>In-scope hosts</span>
-                  <textarea id="targetScopeEditor" rows="4" placeholder="*.example.com&#10;api.example.com"></textarea>
-                  <small>Leave empty to include every host.</small>
-                </label>
-                <label class="settings-field target-scope-field">
-                  <span>Excluded hosts</span>
-                  <textarea id="targetScopeExcludeEditor" rows="4" placeholder="log-*.example.com&#10;static.example.com"></textarea>
-                  <small>Taken back out of scope, with or without an in-scope list. These patterns are shared with intercept and filter settings.</small>
-                </label>
+          <header class="target-workspace-header">
+            <h2>Scope</h2>
+            <div class="target-tabs" role="tablist" aria-label="Scope views">
+              <button class="target-tab" id="targetRulesTab" type="button" data-target-view="rules" role="tab" aria-selected="false" aria-controls="targetRulesPanel">Rules</button>
+              <button class="target-tab active" id="targetServiceMapTab" type="button" data-target-view="service-map" role="tab" aria-selected="true" aria-controls="targetServiceMapPanel">Service Map</button>
+              <button class="target-tab" id="targetApisTab" type="button" data-target-view="apis" role="tab" aria-selected="false" aria-controls="targetServiceMapPanel">APIs</button>
+              <button class="target-tab" id="targetPathsTab" type="button" data-target-view="paths" role="tab" aria-selected="false" aria-controls="targetPathsPanel">Paths</button>
+            </div>
+            <span class="target-passive-label">Retained history · read only</span>
+          </header>
+          <section class="panel-card target-scope-card hidden" id="targetRulesPanel" role="tabpanel" aria-labelledby="targetRulesTab">
+            <header class="panel-toolbar">
+              <div><p class="placeholder-kicker">Scope rules</p><h2>Included and excluded hosts</h2></div>
+              <div class="toolbar-actions">
+                <button class="secondary-action" id="reloadTargetButton" type="button">Reload</button>
+                <button class="primary-action" id="saveTargetScopeButton" type="button">Save</button>
               </div>
-            </section>
-
-            <section class="panel-card">
-              <header class="panel-toolbar">
-                <div>
-                  <p class="placeholder-kicker">Site map</p>
-                  <h2>Captured hosts and paths</h2>
-                </div>
-              </header>
-              <div class="target-tree" id="targetTree"></div>
-            </section>
+            </header>
+            <div class="target-scope-body">
+              <label class="settings-field target-scope-field">
+                <span>In-scope hosts</span>
+                <textarea id="targetScopeEditor" rows="4" placeholder="*.example.com&#10;api.example.com"></textarea>
+                <small>Leave empty to include every host.</small>
+              </label>
+              <label class="settings-field target-scope-field">
+                <span>Excluded hosts</span>
+                <textarea id="targetScopeExcludeEditor" rows="4" placeholder="log-*.example.com&#10;static.example.com"></textarea>
+                <small>Taken back out of scope, with or without an in-scope list. These patterns are shared with intercept and filter settings.</small>
+              </label>
+            </div>
+          </section>
+          <section class="service-map-workspace" id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab">
+            <div class="service-map-toolbar">
+              <span class="service-map-mode">Origins &amp; references</span>
+              <label class="service-map-scope"><input id="serviceMapScopeOnly" type="checkbox" /> In scope only</label>
+              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter captured origins" />
+              <button class="secondary-action" id="serviceMapRefresh" type="button">Refresh</button>
+            </div>
+            <div class="service-map-status" id="serviceMapStatus" role="status" aria-live="polite"></div>
+            <div class="service-map-content" id="serviceMapContent">
+              <section class="service-map-graph" aria-label="Captured service origins">
+                <div class="service-map-viewport" id="serviceMapViewport"><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
+                <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect instruction <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer header declaration · no confirmed calls<span id="serviceMapGraphBounds"></span></div>
+              </section>
+              <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
+            </div>
+            <section class="service-map-api-catalog hidden" id="serviceMapApiCatalog" aria-label="Observed API paths"></section>
+            <footer class="service-map-notice">Passive metadata only. Browser initiators, remote IPs and TLS certificate associations are unavailable. Response-body reference extraction is deferred. Header clues do not establish service ownership or architecture.</footer>
+          </section>
+          <section class="panel-card hidden" id="targetPathsPanel" role="tabpanel" aria-labelledby="targetPathsTab">
+            <header class="panel-toolbar"><div><p class="placeholder-kicker">Site map</p><h2>Captured hosts and paths</h2></div></header>
+            <div class="target-tree" id="targetTree"></div>
           </section>
         </section>
 
@@ -1816,6 +1833,7 @@
     </details>
 
     <script src="/codemirror.js" defer></script>
+    <script src="/service-map.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>

@@ -35,6 +35,34 @@ Use `sniper-cli` for all Sniper operations. Prefer `--output compact` JSON envel
 9. To open a browser that already sends its traffic through Sniper, run `sniper-cli capture browser open --dry-run`, review it, then run it with `--yes`, instead of asking the user to set a proxy or trust a certificate. Add `--agent` only when you will drive the browser yourself; leave it off when the person just wants a wired browser to look at, because for a Chromium-family browser it opens a DevTools port, and for BrowserOS neo its MCP server, that any local process can use (and it is refused while the proxy listens beyond loopback). `capture browser list` shows what is installed, what each driver offers, which browser opens now (`default`) and which one the person saved (`preferred`). A browser that is missing has `install_url`, its vendor's download page: point the person to it, and do not try to install it yourself. Leave the saved choice alone unless the person asks you to change it (`capture browser prefer --browser <name|auto>`, a setting that outlives this session). Without `--browser` the saved choice opens, and with none saved ego, Aside or BrowserOS neo when installed, otherwise Chrome or another Chromium-family browser, so do not assume a DevTools endpoint: read `control` in the result. `{"driver":"cdp","endpoint":…}` means attach a CDP client (Playwright `connectOverCDP`, chrome-devtools-mcp `--browserUrl`) to that endpoint. `{"driver":"ego-cli","server_name":…}` means use the ego-browser skill and put `--ego-server-name=<server_name>` on **every** `ego-browser` command; without it you drive the user's own logged-in ego and nothing is captured. `ego-browser` prints script output on stderr, so read it with `2>&1`. `{"driver":"aside-cli","command":…}` means drive it with deterministic steps through `aside repl '<code>'` only; do not run `aside "<task>"` or `aside exec`, which hand the task to Aside's own assistant on the account signed in to Aside. Aside's command cannot be pointed at a window, so make sure no other Aside is running, or what you do there is not captured. `{"driver":"browseros-mcp","endpoint":…}` (only with `--agent`) means connect your MCP client to that address (Streamable HTTP); it reaches this BrowserOS neo and no other. A `--fresh` BrowserOS neo can come back without `control` and with a warning, because the server bundled with the app may not start; open the persistent one instead. Act on the page the way a person does (snapshot, click an `@ref`, wait for the URL) rather than jumping to URLs. If a browser is already open on that profile with the same settings you get another window (`"reused": true`); with different settings the call is refused and says why, and a DevTools port cannot be added to a running browser, so quit it first or add `--fresh`. `--fresh` gives a throwaway profile (up to eight). Read each `warnings` entry and any `hint` before you rely on the browser: one that could not start is still a 200, and `control` is absent when it ended.
 10. To find where a value appeared — a token, an id, a field name — use `capture http search --value <text>` instead of fetching records one by one. `capture http list --query` matches metadata only and returns nothing for a value that lives in a body. Treat an empty search as absence only when `complete` is `true`; otherwise `stopped_by` names the limit to raise.
 
+## Passive Service Map
+
+Use `scope service-map` (canonical `target.service_map.get`) to inventory retained
+captured origins and method-plus-exact-path endpoints without sending upstream
+traffic. Discover its input/output schemas and examples first. Pin `session_id`
+explicitly, including for inactive sessions; no switch is needed. Optional
+`in_scope_only` uses current shared scope rules. `max_records` defaults to 10000
+and is capped at 50000. Optional `origin` is an exact canonical HTTP(S) origin,
+without a path, query, credentials, or fragment. Check `snapshot.complete`, `stopped_by`, counts, limits,
+`unavailable`, `deferred`, and warnings before claiming coverage. Counts include duplicate-ID
+rows, and even a complete result covers retained captures only.
+
+Grouping numeric or UUID path segments is an inventory hint, not a confirmed
+route. Header technology clues are observed headers, not verified software or an
+infrastructure chain. A `redirect_instruction` is not evidence of a followed
+request or service-to-service call. Origin/Referer links are header declarations,
+not proven initiators. Never invent initiators, remote IPs, TLS
+certificates, response-body links, or other unavailable data. Never launch a scan,
+probe, replay, crawl, or autonomous exploration to complete this passive view.
+
+For evidence, use `scope service-map-evidence --session-id <returned-session-uuid>
+--evidence-id <returned-token>` (`target.service_map.evidence.get`). Pass both
+fields unchanged and check `available` before using `row`. Tokens bind an exact
+retained row and revision; stale or removed evidence is unavailable. Do not use a
+transaction UUID detail read as a substitute: repeated IDs can resolve to another
+row. The map and its evidence omit query strings, URL credentials, raw headers,
+and bodies. Paths can still be sensitive; summarize responsibly.
+
 ## Saved data and session management
 
 ### Prefer the saved-data v1 contract

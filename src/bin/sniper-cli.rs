@@ -38,6 +38,7 @@ use sniper::{
         MAX_SCANNER_FIELD_BYTES,
     },
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
+    service_map::{ServiceMap, ServiceMapEvidence},
     session::{validate_session_creation_name, SessionSummary},
     skills,
     workspace::{
@@ -820,6 +821,69 @@ struct HistoryAnnotateArgs {
 enum TargetCommand {
     GetScope(TargetSessionArgs),
     SetScope(TargetSetScopeArgs),
+    /// Summarize retained captured metadata; never contacts an upstream service.
+    ServiceMap(ServiceMapArgs),
+    /// Read safe metadata for the exact retained row referenced by a service map.
+    ServiceMapEvidence(ServiceMapEvidenceArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Exact canonical HTTP(S) origin, with no path, credentials, query or fragment.
+    #[arg(long, value_parser = parse_service_map_origin)]
+    origin: Option<String>,
+    /// Include only rows matching the selected session's current scope.
+    #[arg(long)]
+    in_scope_only: bool,
+    /// Bound the retained rows considered; incomplete results say why.
+    #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
+    max_records: usize,
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapEvidenceArgs {
+    /// Use the exact session returned by the map; never resolve evidence across sessions.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Opaque evidence token returned by the map, not a transaction UUID.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
+}
+
+fn parse_service_map_origin(value: &str) -> std::result::Result<String, String> {
+    if sniper::service_map::canonical_origin(value).as_deref() != Some(value) {
+        return Err("origin must be an exact canonical HTTP(S) origin without a path, credentials, query or fragment".into());
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_service_map_max_records(value: &str) -> std::result::Result<usize, String> {
+    let value = parse_nonzero_usize(value)?;
+    if value > 50_000 {
+        return Err("max-records must be between 1 and 50000".into());
+    }
+    Ok(value)
+}
+
+fn parse_service_map_evidence_id(value: &str) -> std::result::Result<String, String> {
+    let fields: Vec<_> = value.split('.').collect();
+    let valid = value.len() <= 200
+        && fields.len() == 6
+        && fields[0] == "v1"
+        && [1, 2, 4, 5].into_iter().all(|index| {
+            Uuid::parse_str(fields[index]).is_ok_and(|id| id.to_string() == fields[index])
+        })
+        && fields[3]
+            .parse::<u64>()
+            .is_ok_and(|sequence| sequence.to_string() == fields[3]);
+    if !valid {
+        return Err(
+            "evidence-id must be a complete unchanged v1 token returned by Service Map".into(),
+        );
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Args, Debug, Default)]
@@ -2312,6 +2376,8 @@ impl TargetCommand {
         match self {
             TargetCommand::GetScope(_) => "scope.get",
             TargetCommand::SetScope(_) => "scope.set",
+            TargetCommand::ServiceMap(_) => "target.service_map.get",
+            TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
         }
     }
 }
@@ -3142,9 +3208,192 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             vec![json!({"provider":"interactsh","url":"https://oast.example","token_stdin":true})],
         ),
     ];
+    operations.extend(service_map_manifest_operations());
     operations.extend(scanner_manifest_operations());
     operations.extend(saved_manifest_operations());
     operations
+}
+
+fn service_map_object(properties: Value) -> Value {
+    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+    json!({"type":"object","additionalProperties":false,"required":required,"properties":properties})
+}
+
+fn service_map_output_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "target.service_map.get" | "target.service_map.evidence.get"
+    ) {
+        return None;
+    }
+    let string = json!({"type":"string"});
+    let strings = json!({"type":"array","items":string});
+    let count = json!({"type":"integer","minimum":0});
+    let timestamp = json!({"type":"string","format":"date-time"});
+    let nullable_timestamp = json!({"type":["string","null"],"format":"date-time"});
+    let uuid = json!({"type":"string","format":"uuid"});
+    let boolean = json!({"type":"boolean"});
+    let port = json!({"type":"integer","minimum":0,"maximum":65535});
+    let header_link = service_map_object(json!({
+        "source_origin":string,
+        "relationship":{"type":"string","enum":["origin_header","referer_header"]}
+    }));
+    if operation == "target.service_map.evidence.get" {
+        let row = service_map_object(json!({
+            "evidence_id":string,"record_id":uuid,
+            "sequence":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+            "started_at":timestamp,"method":string,"origin":string,"host":string,
+            "scheme":{"type":"string","enum":["http","https"]},"port":port,"path":string,
+            "status":{"type":["integer","null"],"minimum":0,"maximum":65535},
+            "content_type":{"type":["string","null"]},"is_websocket":boolean,
+            "technology_clues":{"type":"array","items":service_map_object(json!({"name":string,"header_name":string}))},
+            "redirect":{"anyOf":[{"type":"null"},service_map_object(json!({"target_origin":string,"target_path":string}))]},
+            "header_links":{"type":"array","items":header_link},
+            "metadata_complete":boolean,"omitted":strings
+        }));
+        let mut schema = service_map_object(json!({
+            "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":string,
+            "available":boolean,"reason":{"type":["string","null"]},
+            "source":{"type":"string","enum":["captured_http_metadata"]},
+            "row":{"anyOf":[{"type":"null"},row]}
+        }));
+        schema["oneOf"] = json!([
+            {"properties":{"available":{"enum":[true]},"reason":{"type":"null"},"row":{"type":"object"}}},
+            {"properties":{"available":{"enum":[false]},"reason":{"type":"string"},"row":{"type":"null"}}}
+        ]);
+        return Some(schema);
+    }
+    let endpoint = service_map_object(json!({
+        "method":string,"path":string,"path_group":{"type":["string","null"]},
+        "request_count":count,"statuses":{"type":"array","items":port},
+        "content_types":strings,"evidence":strings
+    }));
+    let mut links = header_link;
+    links["properties"]["source"] = json!({"type":"string","enum":["request_header_declaration"]});
+    links["properties"]["evidence"] = strings.clone();
+    links["required"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("source"), json!("evidence")]);
+    let origin = service_map_object(json!({
+        "origin":string,"host":string,"scheme":{"type":"string","enum":["http","https"]},
+        "port":port,"in_scope":boolean,"request_count":count,"first_seen":timestamp,"last_seen":timestamp,
+        "endpoints":{"type":"array","items":endpoint},
+        "technology_clues":{"type":"array","items":service_map_object(json!({
+            "name":string,"source":{"type":"string","enum":["response_header"]},"header_name":string,
+            "confidence":{"type":"string","enum":["observed_header"]},"evidence":strings
+        }))},
+        "redirects":{"type":"array","items":service_map_object(json!({
+            "target_origin":string,"target_path":string,
+            "relationship":{"type":"string","enum":["redirect_instruction"]},
+            "source":{"type":"string","enum":["response_location_header"]},"evidence":strings
+        }))},
+        "header_links":{"type":"array","items":links}
+    }));
+    let mut limits = serde_json::Map::new();
+    for field in [
+        "max_records",
+        "metadata_bytes",
+        "origins",
+        "endpoints",
+        "endpoints_per_origin",
+        "evidence_per_item",
+        "redirects_per_origin",
+        "header_links_per_origin",
+        "technology_clues_per_row",
+        "statuses_per_endpoint",
+        "content_types_per_endpoint",
+        "path_bytes",
+        "host_bytes",
+        "method_bytes",
+        "headers_per_row",
+        "header_bytes_per_row",
+        "header_value_bytes",
+    ] {
+        limits.insert(field.into(), json!({"type":"integer","minimum":1}));
+    }
+    let snapshot = service_map_object(json!({
+        "id":uuid,"generation":uuid,"captured_at":timestamp,
+        "first_retained_started_at":nullable_timestamp,"last_retained_started_at":nullable_timestamp,
+        "window_order":{"type":"string","enum":["newest_capture_sequence"]},
+        "oldest_considered_at":nullable_timestamp,"latest_considered_at":nullable_timestamp,
+        "retained_rows":count,"considered_rows":count,"non_http_rows":count,"projected_rows":count,"included_rows":count,
+        "excluded_rows":count,"omitted_rows":count,"origin_count":count,"endpoint_count":count,
+        "complete":boolean,"stopped_by":strings,"limits":service_map_object(Value::Object(limits))
+    }));
+    Some(service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
+        "in_scope_only":boolean,"origin_filter":{"type":["string","null"]},
+        "origins":{"type":"array","items":origin},"unavailable":strings,"deferred":strings,"warnings":strings
+    })))
+}
+
+fn service_map_input_schema(operation: &str) -> Option<Value> {
+    let uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+    let evidence_pattern =
+        format!("^v1\\.{uuid}\\.{uuid}\\.(0|[1-9][0-9]{{0,19}})\\.{uuid}\\.{uuid}$");
+    match operation {
+        "target.service_map.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":[],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(true, "Read this retained session without switching it. Omitted or null pins the active session once."),
+                "origin":{"type":["string","null"],"description":"Exact canonical HTTP(S) origin (for example https://example.com), without path, credentials, query, fragment, or explicit default port. Omitted or null selects all observed origins."},
+                "in_scope_only":{"type":["boolean","null"],"default":false,"description":"Filter retained rows using the session's current shared scope matcher. Null uses false."},
+                "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."}
+            }
+        })),
+        "target.service_map.evidence.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Exact session UUID returned by the service map. Always explicit, including for inactive sessions."),
+                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete v1 evidence token returned by the map, with canonical UUID components and an unsigned 64-bit sequence. At most 200 UTF-8 bytes; pass unchanged, not a transaction UUID."}
+            }
+        })),
+        _ => None,
+    }
+}
+
+fn service_map_path(args: &ServiceMapArgs, session_id: Option<Uuid>) -> String {
+    let mut params = vec![
+        ("in_scope_only".into(), args.in_scope_only.to_string()),
+        ("max_records".into(), args.max_records.to_string()),
+    ];
+    if let Some(origin) = &args.origin {
+        params.push(("origin".into(), origin.clone()));
+    }
+    let query = encode_query(params);
+    session_query_path(&format!("/api/target/service-map?{query}"), session_id)
+}
+
+fn service_map_evidence_path(args: &ServiceMapEvidenceArgs) -> String {
+    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/evidence?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
+    vec![
+        op(
+            "target.service_map.get",
+            "scope service-map",
+            "Read a bounded passive inventory from retained captured metadata. No requests to mapped services, scans, replay, or crawling. Counts include duplicate-ID rows; inspect completeness and unavailable fields.",
+            CliSideEffect::Read,
+            false,
+            &[],
+            vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":true,"max_records":10000})],
+        ),
+        op(
+            "target.service_map.evidence.get",
+            "scope service-map-evidence --session-id <uuid> --evidence-id <token>",
+            "Read safe metadata for an exact retained row using its session-bound opaque evidence token. Stale, edited, deleted, or ambiguous evidence is explicitly unavailable; never falls back to UUID-only history lookup.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+    ]
 }
 
 fn scanner_manifest_operations() -> Vec<CliOperationSpec> {
@@ -3227,6 +3476,7 @@ fn op(
         input_schema: input_schema(operation, required_fields),
         output_schema: intercept_rule_update_output_schema(operation)
             .or_else(|| replay_saved_tab_output_schema(operation))
+            .or_else(|| service_map_output_schema(operation))
             .or_else(|| scanner_output_schema(operation))
             .or_else(|| history_retention_output_schema(operation))
             .or_else(|| session_list_output_schema(operation))
@@ -3545,6 +3795,9 @@ fn legacy_uuid_input_schema(nullable: bool, context: &str) -> Value {
 }
 
 fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
+    if let Some(schema) = service_map_input_schema(operation) {
+        return schema;
+    }
     if let Some(schema) = history_retention_input_schema(operation) {
         return schema;
     }
@@ -3883,6 +4136,8 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "note",
             "clear_note",
         ],
+        "target.service_map.get" => &["session_id", "origin", "in_scope_only", "max_records"],
+        "target.service_map.evidence.get" => &["session_id", "evidence_id"],
         "scope.get" => &["session_id"],
         "scope.set" => &[
             "session_id",
@@ -4062,6 +4317,16 @@ fn command_input_preview(command: &Command) -> Value {
             json!({"session_id":args.session_id,"limit":args.limit})
         }
         Command::Scope { command } => match command {
+            TargetCommand::ServiceMap(args) => json!({
+                "session_id": args.session_id,
+                "in_scope_only": args.in_scope_only,
+                "origin": args.origin,
+                "max_records": args.max_records,
+            }),
+            TargetCommand::ServiceMapEvidence(args) => json!({
+                "session_id": args.session_id,
+                "evidence_id": args.evidence_id,
+            }),
             TargetCommand::GetScope(args) => json!({ "session_id": args.session_id }),
             TargetCommand::SetScope(args) => json!({
                 "session_id": args.session_id,
@@ -4431,6 +4696,12 @@ fn command_api_preview(command: &Command) -> Result<Value> {
         ),
         Command::Capture { command } => capture_api_preview(command)?,
         Command::Scope { command } => match command {
+            TargetCommand::ServiceMap(args) => {
+                api_preview("GET", service_map_path(args, args.session_id), None)
+            }
+            TargetCommand::ServiceMapEvidence(args) => {
+                api_preview("GET", service_map_evidence_path(args), None)
+            }
             TargetCommand::GetScope(args) => api_preview(
                 "GET",
                 session_query_path("/api/runtime", args.session_id),
@@ -4903,6 +5174,13 @@ fn api_preview(method: &str, path: impl Into<String>, body: Option<Value>) -> Va
 
 fn dry_run_notes(command: &Command) -> Vec<&'static str> {
     let mut notes = Vec::new();
+    if matches!(
+        command.operation_name(),
+        "target.service_map.get" | "target.service_map.evidence.get"
+    ) {
+        notes.push("Offline preview only. Execution reads retained metadata from one pinned session; it never probes, scans, replays, crawls, or follows service redirects.");
+        notes.push("Counts include retained rows with duplicate UUIDs. Inspect completeness and unavailable data; evidence tokens identify exact row states and never fall back to UUID-only lookup.");
+    }
     if command.requires_confirmation() {
         notes.push("Use --yes to apply this side-effecting operation after reviewing the dry-run.");
     }
@@ -5339,6 +5617,35 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     .unwrap_or(DEFAULT_READ_LIST_LIMIT),
             }),
         },
+        "target.service_map.get" => {
+            let max_records =
+                call_optional_nonzero_usize(operation, input, "max_records")?.unwrap_or(10_000);
+            parse_service_map_max_records(&max_records.to_string())
+                .map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    in_scope_only: call_bool(operation, input, "in_scope_only")?,
+                    origin: call_optional::<String>(operation, input, "origin")?
+                        .map(|value| {
+                            parse_service_map_origin(&value).map_err(|message| anyhow!(message))
+                        })
+                        .transpose()?,
+                    max_records,
+                }),
+            }
+        }
+        "target.service_map.evidence.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMapEvidence(ServiceMapEvidenceArgs {
+                    session_id: call_required(operation, input, "session_id")?,
+                    evidence_id,
+                }),
+            }
+        }
         "scope.get" => Command::Scope {
             command: TargetCommand::GetScope(TargetSessionArgs {
                 session_id: call_optional(operation, input, "session_id")?,
@@ -6267,7 +6574,9 @@ async fn main() {
             });
             // Some clap diagnostics render rejected OS strings lossily. Keep
             // those argument bytes out of JSON and the stderr fallback alike.
-            let error = if raw_args.iter().any(|arg| arg.to_str().is_none()) {
+            let error = if operation.starts_with("target.service_map.") {
+                clap::Error::raw(error.kind(), "Invalid Service Map arguments; inspect the command's --help or input schema. Argument values are omitted.")
+            } else if raw_args.iter().any(|arg| arg.to_str().is_none()) {
                 clap::Error::raw(
                     clap::error::ErrorKind::InvalidUtf8,
                     "Command-line arguments must contain valid Unicode.",
@@ -6403,7 +6712,14 @@ async fn run(cli: Cli) -> Result<()> {
             )?)
         }
         command => {
-            let api = ApiClient::discover(api_override).await?;
+            let api = if matches!(
+                command.operation_name(),
+                "target.service_map.get" | "target.service_map.evidence.get"
+            ) {
+                discover_service_map_api(api_override).await?
+            } else {
+                ApiClient::discover(api_override).await?
+            };
             match command {
                 Command::Session { command } => handle_session(api, command).await,
                 Command::Capture { command } => match command {
@@ -7041,8 +7357,316 @@ fn oast_fields_for_output(
     fields
 }
 
+#[derive(Debug)]
+struct ServiceMapCliError {
+    code: &'static str,
+    message: &'static str,
+    status: Option<u16>,
+}
+
+impl fmt::Display for ServiceMapCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+impl std::error::Error for ServiceMapCliError {}
+
+fn service_map_error(code: &'static str, message: &'static str) -> anyhow::Error {
+    ServiceMapCliError {
+        code,
+        message,
+        status: None,
+    }
+    .into()
+}
+
+fn service_map_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot>> {
+    let invalid = || {
+        service_map_error("API_UNAVAILABLE", "Could not read valid local runtime identity for Service Map; existing state was preserved")
+    };
+    let path = sniper::runtime_state::runtime_state_path(data_dir);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(invalid()),
+    };
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err(invalid());
+    }
+    // Runtime-state replacements are atomic. Unlike the general loader, this
+    // passive path creates no lock file and never repairs or moves invalid state.
+    let mut file = fs::File::open(&path).map_err(|_| invalid())?;
+    let bytes =
+        read_limited_to_end(&mut file, "runtime identity", 64 * 1024).map_err(|_| invalid())?;
+    let mut snapshot: RuntimeStateSnapshot =
+        serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let proxy_addr: std::net::SocketAddr = snapshot.proxy_addr.parse().map_err(|_| invalid())?;
+    let ui_addr: std::net::SocketAddr = snapshot.ui_addr.parse().map_err(|_| invalid())?;
+    snapshot.proxy_addr = proxy_addr.to_string();
+    snapshot.ui_addr = sniper::runtime_state::advertise_local_api_addr(ui_addr).to_string();
+    Ok(Some(snapshot))
+}
+
+async fn discover_service_map_api(cli_api: Option<String>) -> Result<ApiClient> {
+    let explicit = cli_api.or_else(|| {
+        env::var("SNIPER_API_ADDR")
+            .ok()
+            .filter(|api| !api.trim().is_empty())
+    });
+    let data_dir = cli_data_dir();
+    let runtime_state = if explicit.is_none() {
+        service_map_runtime_state(&data_dir)?
+    } else {
+        None
+    };
+    let raw = explicit
+        .or_else(|| {
+            runtime_state
+                .as_ref()
+                .map(RuntimeStateSnapshot::api_base_url)
+        })
+        .ok_or_else(|| {
+            service_map_error(
+                "API_UNAVAILABLE",
+                "Could not discover the Service Map API; pass --api or start Sniper Desktop",
+            )
+        })?;
+    let base_url = normalize_api_base_url(&raw).map_err(|_| service_map_error(
+        "INVALID_INPUT", "Invalid Service Map API address; supply an HTTP(S) origin without credentials, path, query, or fragment",
+    ))?;
+    let client = service_map_read_client()?;
+    let api = ApiClient {
+        base_url,
+        client: client.clone(),
+        long_client: client,
+        session_metadata_write_errors: false,
+    };
+    let probe_client = service_map_client(SNIPER_API_PROBE_TIMEOUT)?;
+    let payload: Value = service_map_get(&api, &probe_client, "/api/settings").await?;
+    let expected = runtime_state
+        .as_ref()
+        .map(|runtime_state| SniperApiProbeExpectation {
+            runtime_state,
+            data_dir: &data_dir,
+        });
+    validate_sniper_settings_probe(&payload, expected).map_err(|_| service_map_error(
+        "INVALID_RESPONSE", "The selected Service Map API did not match the expected Sniper identity; existing runtime state was preserved",
+    ))?;
+    Ok(api)
+}
+
+fn service_map_read_client() -> Result<reqwest::Client> {
+    service_map_client(CLI_API_TIMEOUT)
+}
+
+fn service_map_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(timeout)
+        .build()
+        .map_err(|_| {
+            service_map_error(
+                "API_UNAVAILABLE",
+                "Could not prepare the Service Map read client",
+            )
+        })
+}
+
+async fn service_map_get<T: DeserializeOwned>(
+    api: &ApiClient,
+    client: &reqwest::Client,
+    path: &str,
+) -> Result<T> {
+    let response = client.get(api.url(path)).send().await.map_err(|_| {
+        service_map_error(
+            "API_UNAVAILABLE",
+            "Could not read Service Map metadata from the selected API",
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ServiceMapCliError {
+            code: if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            message: if status.is_redirection() {
+                "Service Map API redirects are not followed"
+            } else {
+                "The selected API could not return Service Map metadata"
+            },
+            status: Some(status.as_u16()),
+        }
+        .into());
+    }
+    response.json().await.map_err(|_| {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned invalid Service Map metadata",
+        )
+    })
+}
+
+fn service_map_safe_path(path: &str) -> bool {
+    path.starts_with('/') && !path.contains(['?', '#']) && !path.chars().any(char::is_control)
+}
+
+fn service_map_safe_origin(origin: &str) -> bool {
+    sniper::service_map::canonical_origin(origin).as_deref() == Some(origin)
+}
+
+fn validate_service_map_response(
+    result: &ServiceMap,
+    args: &ServiceMapArgs,
+    session_id: Uuid,
+) -> Result<()> {
+    let snapshot = &result.snapshot;
+    let valid = result.schema_version == 1
+        && result.session_id == session_id
+        && result.in_scope_only == args.in_scope_only
+        && result.origin_filter == args.origin
+        && snapshot.window_order == "newest_capture_sequence"
+        && snapshot.limits.max_records == args.max_records
+        && snapshot.considered_rows <= args.max_records
+        && snapshot.considered_rows <= snapshot.retained_rows
+        && snapshot.projected_rows <= snapshot.considered_rows
+        && snapshot.complete == snapshot.stopped_by.is_empty()
+        && snapshot.origin_count == result.origins.len()
+        && snapshot.endpoint_count
+            == result
+                .origins
+                .iter()
+                .map(|origin| origin.endpoints.len())
+                .sum::<usize>()
+        && result.origins.iter().all(|origin| {
+            service_map_safe_origin(&origin.origin)
+                && matches!(origin.scheme.as_str(), "http" | "https")
+                && (!args.in_scope_only || origin.in_scope)
+                && args
+                    .origin
+                    .as_ref()
+                    .is_none_or(|filter| *filter == origin.origin)
+                && origin.endpoints.iter().all(|endpoint| {
+                    service_map_safe_path(&endpoint.path)
+                        && endpoint
+                            .path_group
+                            .as_deref()
+                            .is_none_or(service_map_safe_path)
+                })
+                && origin.technology_clues.iter().all(|clue| {
+                    clue.source == "response_header" && clue.confidence == "observed_header"
+                })
+                && origin.redirects.iter().all(|redirect| {
+                    redirect.relationship == "redirect_instruction"
+                        && redirect.source == "response_location_header"
+                        && service_map_safe_origin(&redirect.target_origin)
+                        && service_map_safe_path(&redirect.target_path)
+                })
+                && origin.header_links.iter().all(|link| {
+                    link.source == "request_header_declaration"
+                        && matches!(
+                            link.relationship.as_str(),
+                            "origin_header" | "referer_header"
+                        )
+                        && service_map_safe_origin(&link.source_origin)
+                })
+        });
+    if !valid {
+        return Err(service_map_error("INVALID_RESPONSE", "Service Map metadata does not match the requested session, filters, limits, or safe response contract"));
+    }
+    Ok(())
+}
+
+fn validate_service_map_evidence_response(
+    result: &ServiceMapEvidence,
+    args: &ServiceMapEvidenceArgs,
+) -> Result<()> {
+    let token_fields: Vec<_> = args.evidence_id.split('.').collect();
+    let token_valid = parse_service_map_evidence_id(&args.evidence_id).is_ok();
+    let row_valid = match (
+        result.available,
+        result.row.as_ref(),
+        result.reason.as_deref(),
+    ) {
+        (true, Some(row), None) => {
+            token_valid
+                && row.evidence_id == args.evidence_id
+                && token_fields[1] == args.session_id.to_string()
+                && token_fields[3] == row.sequence
+                && token_fields[5] == row.record_id.to_string()
+                && row
+                    .sequence
+                    .parse::<u64>()
+                    .is_ok_and(|sequence| sequence.to_string() == row.sequence)
+                && service_map_safe_origin(&row.origin)
+                && matches!(row.scheme.as_str(), "http" | "https")
+                && service_map_safe_path(&row.path)
+                && row.redirect.as_ref().is_none_or(|redirect| {
+                    service_map_safe_origin(&redirect.target_origin)
+                        && service_map_safe_path(&redirect.target_path)
+                })
+                && row.header_links.iter().all(|link| {
+                    service_map_safe_origin(&link.source_origin)
+                        && matches!(
+                            link.relationship.as_str(),
+                            "origin_header" | "referer_header"
+                        )
+                })
+        }
+        (false, None, Some(reason)) => !reason.is_empty(),
+        _ => false,
+    };
+    if result.schema_version != 1
+        || result.session_id != args.session_id
+        || result.evidence_id != args.evidence_id
+        || result.source != "captured_http_metadata"
+        || !row_valid
+    {
+        return Err(service_map_error("INVALID_RESPONSE", "Service Map evidence does not match the requested session, token, availability, or safe row contract"));
+    }
+    Ok(())
+}
+
+async fn read_service_map(api: &ApiClient, args: &ServiceMapArgs) -> Result<ServiceMap> {
+    let client = service_map_read_client()?;
+    let session_id = if let Some(session_id) = args.session_id {
+        session_id
+    } else {
+        let sessions: Vec<SessionSummary> = service_map_get(api, &client, "/api/sessions").await?;
+        active_session_id_from_summaries(&sessions)?.ok_or_else(|| {
+            anyhow!("no active session; pass --session-id to choose a session explicitly")
+        })?
+    };
+    let result: ServiceMap =
+        service_map_get(api, &client, &service_map_path(args, Some(session_id))).await?;
+    validate_service_map_response(&result, args, session_id)?;
+    Ok(result)
+}
+
+async fn read_service_map_evidence(
+    api: &ApiClient,
+    args: &ServiceMapEvidenceArgs,
+) -> Result<ServiceMapEvidence> {
+    let client = service_map_read_client()?;
+    let result: ServiceMapEvidence =
+        service_map_get(api, &client, &service_map_evidence_path(args)).await?;
+    validate_service_map_evidence_response(&result, args)?;
+    Ok(result)
+}
+
 async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
     match command {
+        TargetCommand::ServiceMap(args) => {
+            let result = read_service_map(&api, &args).await?;
+            print_session_read_json(&result, result.session_id)
+        }
+        TargetCommand::ServiceMapEvidence(args) => {
+            let result = read_service_map_evidence(&api, &args).await?;
+            print_session_read_json(&result, args.session_id)
+        }
         TargetCommand::GetScope(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/runtime", session_id);
@@ -12358,6 +12982,17 @@ fn clap_error_payload(error: &clap::Error) -> CliErrorPayload {
 }
 
 fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload {
+    if let Some(map) = error.downcast_ref::<ServiceMapCliError>() {
+        return CliErrorPayload {
+            code: map.code,
+            message: map.message.into(),
+            hint: Some("Check the selected API and CLI/app compatibility, then deliberately reread the same session. Never substitute a UUID-only detail lookup or generate traffic to fill missing map evidence."),
+            retryable: false,
+            details: json!({"status":map.status}),
+            exit_code: if map.code == "INVALID_INPUT" { 2 } else if map.code == "API_UNAVAILABLE" || map.status.is_some_and(|status| status >= 500) { 6 } else { 5 },
+        };
+    }
+
     if let Some(discovery) = error.downcast_ref::<LocalRuntimeStateReadError>() {
         return CliErrorPayload {
             code: "API_UNAVAILABLE",
@@ -15149,6 +15784,156 @@ mod tests {
             Cli::try_parse_from(["sniper-cli", "capture", "oast", "configure", "--enable",])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn service_map_commands_are_read_only_and_match_manifest() {
+        let session = "11111111-1111-1111-1111-111111111111";
+        for (operation, args, input, endpoint) in [
+            (
+                "target.service_map.get",
+                vec!["scope", "service-map", "--session-id", session, "--in-scope-only", "--max-records", "25"],
+                json!({"session_id":session,"in_scope_only":true,"max_records":25}),
+                format!("/api/target/service-map?in_scope_only=true&max_records=25&session_id={session}"),
+            ),
+            (
+                "target.service_map.evidence.get",
+                vec!["target", "service-map-evidence", "--session-id", session, "--evidence-id", "v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"],
+                json!({"session_id":session,"evidence_id":"v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"}),
+                format!("/api/target/service-map/evidence?evidence_id=v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444&session_id={session}"),
+            ),
+        ] {
+            let mut argv = vec!["sniper-cli"];
+            argv.extend(args);
+            let direct = Cli::try_parse_from(argv).unwrap().command;
+            let call = command_from_operation_input(operation, &input).unwrap();
+            assert_eq!(direct.operation_name(), operation);
+            assert_eq!(call.operation_name(), operation);
+            assert_eq!(command_input_preview(&direct), command_input_preview(&call));
+            assert!(!direct.requires_confirmation());
+            let plan = dry_run_command(&direct).unwrap();
+            assert_eq!(plan["side_effect"], "read");
+            assert_eq!(plan["api"]["method"], "GET");
+            assert_eq!(plan["api"]["path"], endpoint);
+            assert!(plan["api"]["body"].is_null());
+            let spec = operation_spec(operation).unwrap();
+            assert_eq!(spec.input_schema["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn service_map_rejects_active_operations_and_invalid_limits() {
+        for input in [
+            json!({"max_records":0}),
+            json!({"max_records":50001}),
+            json!({"max_records":-1}),
+            json!({"max_records":1.5}),
+            json!({"max_records":"10"}),
+            json!({"in_scope_only":"true"}),
+            json!({"session_id":"invalid"}),
+            json!({"url":"https://example.com"}),
+            json!({"scan":true}),
+            json!({"crawl":true}),
+            json!({"follow_redirects":true}),
+            json!({"offset":1}),
+            Value::Null,
+        ] {
+            let error = command_from_operation_input("target.service_map.get", &input).unwrap_err();
+            assert_eq!(
+                cli_error_payload("target.service_map.get", &error).code,
+                "INVALID_INPUT"
+            );
+        }
+
+        for origin in [
+            "https://example.com/",
+            "https://example.com?token=secret",
+            "https://user:secret@example.com",
+            "https://example.com:443",
+            "ftp://example.com",
+            "https://EXAMPLE.COM",
+        ] {
+            assert!(command_from_operation_input(
+                "target.service_map.get",
+                &json!({"origin":origin})
+            )
+            .is_err());
+            assert!(Cli::try_parse_from([
+                "sniper-cli",
+                "scope",
+                "service-map",
+                "--origin",
+                origin
+            ])
+            .is_err());
+        }
+        for limit in ["0", "50001", "-1", "1.5"] {
+            assert!(Cli::try_parse_from([
+                "sniper-cli",
+                "scope",
+                "service-map",
+                "--max-records",
+                limit
+            ])
+            .is_err());
+        }
+        let defaults = command_from_operation_input("target.service_map.get", &json!({})).unwrap();
+        assert_eq!(
+            command_input_preview(&defaults),
+            json!({"session_id":null,"origin":null,"in_scope_only":false,"max_records":10000})
+        );
+        let nulls = command_from_operation_input(
+            "target.service_map.get",
+            &json!({"session_id":null,"in_scope_only":null,"max_records":null}),
+        )
+        .unwrap();
+        assert_eq!(
+            command_input_preview(&defaults),
+            command_input_preview(&nulls)
+        );
+        for operation in [
+            "target.service_map.scan",
+            "target.service_map.crawl",
+            "target.service_map.follow",
+            "target.service_map.refresh",
+        ] {
+            assert!(operation_spec(operation).is_none());
+            assert!(command_from_operation_input(operation, &json!({})).is_err());
+        }
+    }
+
+    #[test]
+    fn service_map_evidence_requires_explicit_session_and_opaque_token() {
+        let session = "11111111-1111-1111-1111-111111111111";
+        for input in [
+            json!({}),
+            json!({"session_id":session}),
+            json!({"evidence_id":"token"}),
+            json!({"session_id":null,"evidence_id":"token"}),
+            json!({"session_id":session,"evidence_id":""}),
+            json!({"session_id":session,"evidence_id":"line\nbreak"}),
+            json!({"session_id":session,"evidence_id":"x".repeat(513)}),
+            json!({"session_id":session,"evidence_id":42}),
+            json!({"session_id":session,"evidence_id":"token","id":session}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.evidence.get", &input).is_err(),
+                "{input}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "scope",
+            "service-map-evidence",
+            "--evidence-id",
+            "token"
+        ])
+        .is_err());
+        assert!(command_from_operation_input(
+            "target.service_map.evidence.get",
+            &json!({"session_id":session,"evidence_id":"opaque&query=not-a-field"}),
+        )
+        .is_err());
     }
 
     #[test]

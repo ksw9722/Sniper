@@ -473,6 +473,7 @@ const state = {
   targetScopeSaveToken: 0,
   targetScopeEditorSessionId: null,
   targetExpandedHosts: new Set(),
+  activeTargetView: "service-map",
   intercepts: [],
   responseIntercepts: [],
   interceptRules: [],
@@ -948,6 +949,7 @@ const sectionToggles = Array.from(document.querySelectorAll(".section-toggle"));
 let sortHeaders = Array.from(document.querySelectorAll(".sort-header"));
 let historyColumnHandles = Array.from(document.querySelectorAll(".column-resize-handle"));
 
+let targetServiceMapController = null;
 let refreshTimer = null;
 let auxTimer = null;
 let eventSource = null;
@@ -1158,6 +1160,7 @@ function setActiveProxyTab(tab, options = {}) {
 }
 
 function bindEvents() {
+  initializeTargetWorkspace();
   window.addEventListener("resize", resetLayoutTextareas);
   document.addEventListener("visibilitychange", flushWorkspaceStateBeforeHidden);
   window.addEventListener("pagehide", flushWorkspaceStateOnUnload);
@@ -1175,7 +1178,8 @@ function bindEvents() {
         loadSessions({ reloadOnActiveChange: true }).catch(handleWorkspaceActionError);
       }
       if (state.activeTool === "target") {
-        loadTargetSiteMap(true).catch((error) => console.error(error));
+        if (["service-map", "apis"].includes(state.activeTargetView)) targetServiceMapController?.refresh({ force: true });
+        else loadTargetSiteMap(true).catch((error) => console.error(error));
       }
       if (state.activeTool === "logger") {
         loadEventLog().catch((error) => console.error(error));
@@ -1502,6 +1506,7 @@ function bindEvents() {
       await requireOkResponse(response, "Failed to change capture.");
       const runtime = await response.json();
       if (sessionId !== currentSessionId()) return;
+      if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
       state.runtime = runtime;
       syncHttpCapturePill();
     } catch (error) {
@@ -1564,6 +1569,7 @@ function bindEvents() {
       if (sessionId !== currentSessionId()) {
         return;
       }
+      if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
       state.runtime = runtime;
       const savedScopeOnly = state.runtime?.intercept_scope_only ?? nextScopeOnly;
       state.interceptInScopeOnly = savedScopeOnly;
@@ -2814,6 +2820,7 @@ async function loadSettings(retries = 5) {
 
 async function _applySettings(response) {
   state.settings = await response.json();
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, state.settings.runtime);
   state.runtime = state.settings.runtime;
   syncHttpCapturePill();
   state.activeSession = state.settings.active_session;
@@ -5053,6 +5060,7 @@ function resetSessionScopedUiState() {
   state.matchReplaceDirty = false;
   state.matchReplaceEditorSessionId = null;
   state.targetSiteMap = [];
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.reset();
   resetOastUiState();
   state.targetScopeDraft = "";
   state.targetScopeExcludeDraft = "";
@@ -5384,6 +5392,7 @@ async function loadRuntimeSettings() {
   if (sessionId !== currentSessionId()) {
     return;
   }
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
   state.runtime = runtime;
   renderInterceptStatus();
   renderProxySettings();
@@ -7522,14 +7531,17 @@ async function reloadTargetSiteMapFromButton() {
 async function loadTargetSiteMap(forceScopeSync = false, saveContext = null) {
   const sessionId = currentSessionId();
   const workspaceGeneration = workspaceStateGeneration;
+  // The legacy Paths projection is unbounded and carries raw paths. Never load
+  // it as a prerequisite of the bounded, query-free Service Map or APIs views.
+  const loadPaths = state.activeTool === "target" && state.activeTargetView === "paths";
   const [runtimeResponse, siteMapResponse] = await Promise.all([
     fetch(sessionQueryPath("/api/runtime", sessionId)),
-    fetch(sessionQueryPath("/api/target/site-map", sessionId)),
+    loadPaths ? fetch(sessionQueryPath("/api/target/site-map", sessionId)) : null,
   ]);
   await requireOkResponse(runtimeResponse, "Failed to load runtime settings.");
-  await requireOkResponse(siteMapResponse, "Failed to load target site map.");
+  if (siteMapResponse) await requireOkResponse(siteMapResponse, "Failed to load target site map.");
   const runtime = await runtimeResponse.json();
-  const siteMap = jsonArray(await siteMapResponse.json());
+  const siteMap = siteMapResponse ? jsonArray(await siteMapResponse.json()) : null;
   if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
   // A save's follow-up read must not overwrite a newer editor before the
   // waiting save caller gets its chance to check ownership again.
@@ -7541,8 +7553,12 @@ async function loadTargetSiteMap(forceScopeSync = false, saveContext = null) {
     || saveContext.excludeDraft !== state.targetScopeExcludeDraft
     || saveContext.scopeText !== els.targetScopeEditor.value
     || saveContext.excludeText !== els.targetScopeExcludeEditor?.value)) return false;
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
   state.runtime = runtime;
-  state.targetSiteMap = siteMap;
+  if (siteMap) state.targetSiteMap = siteMap;
+  if (typeof targetServiceMapController !== "undefined" && state.activeTool === "target") {
+    targetServiceMapController?.refresh();
+  }
   syncTargetScopeDraft(forceScopeSync);
   renderInterceptStatus();
   renderProxySettings();
@@ -7582,7 +7598,9 @@ async function pollAuxiliaryData() {
   }
 
   if (state.activeTool === "target") {
-    tasks.push(loadTargetSiteMap());
+    if (["service-map", "apis"].includes(state.activeTargetView) && typeof targetServiceMapController !== "undefined") {
+      tasks.push(targetServiceMapController?.refresh());
+    } else tasks.push(loadTargetSiteMap());
   }
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
@@ -7675,6 +7693,7 @@ function applyHistoryRetentionDeletedEvent(event, sessionId = currentSessionId()
 
 function applyConfirmedHistoryRemoval(ids, sessionId = currentSessionId(), cause = "unavailable") {
   if (sessionId !== currentSessionId()) return false;
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.invalidate();
   state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
   state._historyRetentionReconcile = true;
   // Only this batch is needed: old requests carry an epoch, and the server/SSE
@@ -7745,6 +7764,7 @@ function applyConfirmedHistoryRemoval(ids, sessionId = currentSessionId(), cause
 }
 
 function invalidateHistoryAfterEventGap() {
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.invalidate();
   state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
   state._historyRetentionReconcile = true;
   _pendingTransactionSummaries.length = 0;
@@ -7819,6 +7839,7 @@ function connectEvents() {
     if (!ownsHistoryEvents()) {
       return;
     }
+    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.markDirty();
     _lastHttpHistoryFallbackPoll = Date.now();
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");
@@ -8685,6 +8706,9 @@ function scheduleIncrementalRefresh() {
 let _searchActiveUntil = 0;
 
 function renderToolPanels() {
+  if (typeof targetServiceMapController !== "undefined") {
+    targetServiceMapController?.setVisible(state.activeTool === "target" && ["service-map", "apis"].includes(state.activeTargetView), state.activeTargetView);
+  }
   state.activeTool = sanitizeActiveTool(state.activeTool);
 
   mainTabs.forEach((tab) => {
@@ -14434,6 +14458,63 @@ function renderMatchReplaceRules() {
   els.saveMatchReplaceRuleButton.textContent = "Save";
 }
 
+function initializeTargetWorkspace() {
+  const panel = document.getElementById("targetServiceMapPanel");
+  if (!panel || !window.SniperServiceMap) return;
+  targetServiceMapController = window.SniperServiceMap.createController({
+    elements: {
+      panel,
+      status: document.getElementById("serviceMapStatus"),
+      refresh: document.getElementById("serviceMapRefresh"),
+      search: document.getElementById("serviceMapSearch"),
+      scope: document.getElementById("serviceMapScopeOnly"),
+      canvas: document.getElementById("serviceMapCanvas"),
+      graphBounds: document.getElementById("serviceMapGraphBounds"),
+      detail: document.getElementById("serviceMapDetail"),
+      content: document.getElementById("serviceMapContent"),
+      catalog: document.getElementById("serviceMapApiCatalog"),
+    },
+    getSessionId: currentSessionId,
+    request: (path, options) => fetch(path, options),
+  });
+  targetServiceMapController.setViewChange(setActiveTargetView);
+  const tabs = Array.from(document.querySelectorAll("[data-target-view]"));
+  tabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => setActiveTargetView(tab.dataset.targetView));
+    tab.addEventListener("keydown", (event) => {
+      let next = index;
+      if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+      else if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      tabs[next].focus();
+      setActiveTargetView(tabs[next].dataset.targetView);
+    });
+  });
+  setActiveTargetView(state.activeTargetView || "service-map");
+}
+
+function setActiveTargetView(view) {
+  state.activeTargetView = ["rules", "service-map", "apis", "paths"].includes(view) ? view : "service-map";
+  for (const tab of document.querySelectorAll("[data-target-view]")) {
+    const selected = tab.dataset.targetView === state.activeTargetView;
+    tab.classList.toggle("active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  document.getElementById("targetRulesPanel")?.classList.toggle("hidden", state.activeTargetView !== "rules");
+  document.getElementById("targetPathsPanel")?.classList.toggle("hidden", state.activeTargetView !== "paths");
+  const mapVisible = ["service-map", "apis"].includes(state.activeTargetView);
+  const mapPanel = document.getElementById("targetServiceMapPanel");
+  mapPanel?.classList.toggle("hidden", !mapVisible);
+  mapPanel?.setAttribute("aria-labelledby", state.activeTargetView === "apis" ? "targetApisTab" : "targetServiceMapTab");
+  targetServiceMapController?.setVisible(state.activeTool === "target" && mapVisible, state.activeTargetView);
+  if (state.activeTool === "target" && mapVisible) targetServiceMapController?.refresh();
+  else if (state.activeTool === "target" && currentSessionId()) loadTargetSiteMap().catch((error) => console.error(error));
+}
+
 function renderTarget() {
   const sessionId = currentSessionId();
   const targetTree = els.targetTree;
@@ -15078,6 +15159,11 @@ async function saveTargetScope(options = {}) {
     throw new Error(`saveTargetScope failed: ${response.status}`);
   }
   const runtime = await response.json();
+  // Even a save superseded by a newer editor changed server-side scope. Fence
+  // map reads from before that acknowledgement without touching the newer draft.
+  if (ownsWorkspace() && typeof targetServiceMapController !== "undefined") {
+    targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
+  }
   if (!ownsDraft()
     || submittedDraft !== state.targetScopeDraft
     || submittedExcludeDraft !== state.targetScopeExcludeDraft
@@ -16179,6 +16265,7 @@ async function toggleIntercept() {
     if (requestSeq !== _interceptToggleRequestSeq || sessionId !== currentSessionId()) {
       return;
     }
+    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
     state.runtime = runtime;
     renderInterceptStatus();
 
@@ -16352,6 +16439,7 @@ async function saveProxySettings() {
   if (sessionId !== currentSessionId()) {
     return startupResult;
   }
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtimeResult);
   state.runtime = runtimeResult;
   state.oastTokenClearPending = false;
   if (startupResult) {

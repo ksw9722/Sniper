@@ -3,6 +3,16 @@
 This is an overview of maintenance work on `release/0.3.1`, not a release
 announcement. The package version remains `0.3.0` until release preparation.
 
+## Passive Service Map
+
+The Scope UI and read-only CLI share a bounded inventory built from retained
+capture metadata. Origins contain method-plus-exact-path endpoints, observed
+counts and safe exact-row evidence. Header clues and redirect instructions are
+labeled as observations; they do not establish infrastructure or a followed
+request. No scans, probes, replay, or crawling are introduced. Check completeness
+and unavailable data before drawing conclusions. See the
+[Service Map contract](../integrations/service-map.md).
+
 ## Predictable CLI contracts
 
 - Discovery, examples, and schemas describe the corrected saved-data and local
