@@ -286,7 +286,6 @@ pub struct SessionContext {
     id: Uuid,
     storage_dir: PathBuf,
     max_entries: usize,
-    max_transaction_entries: usize,
     pub store: Arc<TransactionStore>,
     pub runtime: Arc<RuntimeSettings>,
     pub intercepts: Arc<InterceptQueue>,
@@ -356,7 +355,7 @@ impl SessionContext {
         metadata: SessionMetadata,
         storage_dir: PathBuf,
         max_entries: usize,
-        max_transaction_entries: usize,
+        _max_transaction_entries: usize,
         max_frames_per_session: usize,
         snapshot: StoredSessionSnapshot,
         enable_journal: bool,
@@ -391,7 +390,6 @@ impl SessionContext {
             id: metadata.id,
             storage_dir,
             max_entries,
-            max_transaction_entries,
             store: Arc::new(if enable_journal {
                 TransactionStore::from_located_records_with_journal(
                     snapshot.transactions,
@@ -831,9 +829,11 @@ impl SessionContext {
         validate_workspace_state(&workspace)
             .map_err(anyhow::Error::msg)
             .with_context(|| "workspace snapshot is invalid")?;
+        // Live HTTP history and journal replay are uncapped. Limiting only the
+        // snapshot silently loses older records when the session next reloads.
         let transactions = self
             .store
-            .snapshot_for_persistence(Some(self.max_transaction_entries))
+            .snapshot_for_persistence(None)
             .await
             .with_context(|| {
                 format!(
@@ -1859,9 +1859,9 @@ fn update_metadata_counts_from_snapshot(
     metadata: &mut SessionMetadata,
     snapshot: &StoredSessionSnapshot,
     max_entries: usize,
-    max_transaction_entries: usize,
+    _max_transaction_entries: usize,
 ) -> bool {
-    let next_request_count = snapshot.transactions.len().min(max_transaction_entries);
+    let next_request_count = snapshot.transactions.len();
     let next_websocket_count = snapshot.websockets.len();
     let next_event_count = snapshot.event_log.len().min(max_entries);
     let next_fuzzer_count = snapshot.fuzzer_attacks.len().min(max_entries);
@@ -8549,7 +8549,7 @@ mod tests {
             1
         ));
 
-        assert_eq!(metadata.request_count, 1);
+        assert_eq!(metadata.request_count, 2);
         assert_eq!(metadata.websocket_count, 2);
         assert_eq!(metadata.event_count, 1);
         assert_eq!(metadata.fuzzer_count, 1);
@@ -10426,6 +10426,184 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    // Passive storage fixtures only: insert synthetic records directly, with no
+    // proxy, scanner, listener or network work. The first persist gives the older
+    // rows disk locators; the second must copy them alongside the new journal row.
+    #[tokio::test]
+    async fn legacy_http_limit_does_not_truncate_persistence_or_restart() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-legacy-http-persist-{}", Uuid::new_v4()));
+        let (registry, active) =
+            SessionRegistry::load_or_create_with_transaction_limit(&data_dir, 2, 2, 2).unwrap();
+        let mut expected = Vec::new();
+        for sequence in 1..=2 {
+            let record = deletion_test_record(sequence);
+            let id = record.id;
+            active.store.insert(record).await;
+            active
+                .store
+                .update_annotations_durable(
+                    id,
+                    Some(Some("blue".into())),
+                    Some(Some(format!("synthetic note {sequence}"))),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            expected.push(active.store.get(id).await.unwrap());
+        }
+        active.persist().await.unwrap();
+        assert!(active.store.snapshot(None).await.iter().all(|record| {
+            record.request.body_preview.is_empty()
+                && record.response.as_ref().unwrap().body_preview.is_empty()
+        }));
+
+        let newest = deletion_test_record(3);
+        let newest_id = newest.id;
+        active.store.insert(newest).await;
+        expected.push(active.store.get(newest_id).await.unwrap());
+        let metadata = active.persist().await.unwrap();
+        let storage_dir = active.storage_dir().to_path_buf();
+        let session_id = active.id();
+        assert_eq!(active.store.len().await, 3);
+        assert_eq!(active.transaction_journal_replay_bytes(), 0);
+        drop(active);
+        drop(registry);
+
+        let (registry, loaded) =
+            SessionRegistry::load_or_create_with_transaction_limit(&data_dir, 2, 2, 2).unwrap();
+        assert_eq!(
+            loaded.store.len().await,
+            3,
+            "restart must keep every HTTP record"
+        );
+        assert_eq!(metadata.request_count, 3);
+        assert_eq!(
+            super::read_transactions_file(&storage_dir).unwrap().len(),
+            3
+        );
+        for record in &expected {
+            assert_eq!(
+                serde_json::to_value(loaded.store.get(record.id).await.unwrap()).unwrap(),
+                serde_json::to_value(record).unwrap(),
+                "rewritten locators must preserve every body and annotation"
+            );
+        }
+        drop(loaded);
+        // Also rebuild the metadata index from the durable body file, rather
+        // than letting a correct index hide a truncated or stale body line.
+        std::fs::remove_file(super::transactions_meta_path(&storage_dir)).unwrap();
+        let rebuilt = registry.load_context(session_id).unwrap();
+        assert_eq!(rebuilt.store.len().await, 3);
+        for record in &expected {
+            assert_eq!(
+                serde_json::to_value(rebuilt.store.get(record.id).await.unwrap()).unwrap(),
+                serde_json::to_value(record).unwrap()
+            );
+        }
+        drop(rebuilt);
+        drop(registry);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_http_limit_does_not_cap_loaded_or_recovered_metadata_counts() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-legacy-http-counts-{}", Uuid::new_v4()));
+        // Seed more than the later legacy limit without relying on the fixed
+        // persist path, so this independently detects the metadata repair bug.
+        let (registry, active) =
+            SessionRegistry::load_or_create_with_transaction_limit(&data_dir, 2, 8, 2).unwrap();
+        for sequence in 1..=3 {
+            active.store.insert(deletion_test_record(sequence)).await;
+        }
+        active.persist().await.unwrap();
+        let session_id = active.id();
+        assert_eq!(active.transaction_journal_replay_bytes(), 0);
+        drop(active);
+        drop(registry);
+
+        let (registry, loaded) =
+            SessionRegistry::load_or_create_with_transaction_limit(&data_dir, 2, 2, 2).unwrap();
+        assert_eq!(loaded.store.len().await, 3);
+        assert_eq!(registry.summaries()[0].request_count, 3);
+        let read_only = registry.load_context_read_only(session_id).unwrap();
+        assert_eq!(read_only.summary(false).request_count, 3);
+        drop(read_only);
+        drop(loaded);
+        drop(registry);
+
+        // Registry recovery uses the same count helper as ordinary loading.
+        std::fs::remove_file(
+            data_dir
+                .join(super::SESSIONS_DIR)
+                .join(super::REGISTRY_FILE),
+        )
+        .unwrap();
+        let (recovered_registry, recovered) =
+            SessionRegistry::load_or_create_with_transaction_limit(&data_dir, 2, 2, 2).unwrap();
+        assert_eq!(recovered.id(), session_id);
+        assert_eq!(recovered.store.len().await, 3);
+        assert_eq!(recovered_registry.summaries()[0].request_count, 3);
+        drop(recovered);
+        drop(recovered_registry);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_http_limit_fix_keeps_websocket_and_event_limits() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-legacy-http-bounded-stores-{}",
+            Uuid::new_v4()
+        ));
+        let (registry, active) =
+            SessionRegistry::load_or_create_with_transaction_limit(&data_dir, 2, 1, 2).unwrap();
+        for sequence in 1..=3 {
+            active
+                .websockets
+                .open(WebSocketSessionRecord {
+                    id: Uuid::new_v4(),
+                    sequence,
+                    started_at: Utc::now(),
+                    closed_at: Some(Utc::now()),
+                    duration_ms: Some(0),
+                    scheme: "wss".into(),
+                    host: "example.com".into(),
+                    path: format!("/synthetic-{sequence}"),
+                    status: Some(101),
+                    request: deletion_test_record(sequence).request,
+                    response: None,
+                    frames: Vec::new(),
+                    notes: Vec::new(),
+                })
+                .await;
+            active
+                .event_log
+                .push(
+                    crate::event_log::EventLevel::Info,
+                    "test",
+                    "synthetic event",
+                    sequence.to_string(),
+                )
+                .await;
+        }
+        let metadata = active.persist().await.unwrap();
+        assert_eq!(metadata.websocket_count, 2);
+        assert_eq!(metadata.event_count, 2);
+        drop(active);
+        drop(registry);
+        let (registry, loaded) =
+            SessionRegistry::load_or_create_with_transaction_limit(&data_dir, 2, 1, 2).unwrap();
+        let websockets = loaded.websockets.snapshot(None).await;
+        assert_eq!(websockets.len(), 2);
+        assert_eq!(websockets[0].sequence, 3);
+        assert_eq!(websockets[1].sequence, 2);
+        assert_eq!(loaded.event_log.snapshot(None).await.len(), 2);
+        drop(loaded);
+        drop(registry);
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[tokio::test]

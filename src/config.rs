@@ -18,11 +18,9 @@ const STARTUP_SETTINGS_FILE: &str = "startup-settings.json";
 /// findings are 3 MB and 5,000 websockets 13 MB in a real session — so the cap can
 /// be generous.
 const DEFAULT_MAX_ENTRIES: usize = 20_000;
-/// Retained captured transactions. Raised now that they load in parallel from
-/// transactions.ndjson: 100,000 records parsed in 2,408 ms inside snapshot.json
-/// and parse in 331 ms as their own file, so a larger history costs less to open
-/// than the old default did. They stay the bulk of a session on disk — roughly
-/// 12 KB per record — so this is the knob to lower if space matters.
+/// Legacy HTTP transaction-limit value kept for configuration compatibility.
+/// HTTP History keeps every captured record; persisted bodies move out of memory
+/// instead of limiting saved history. This value no longer enforces retention.
 const DEFAULT_MAX_TRANSACTION_ENTRIES: usize = 250_000;
 
 #[derive(Clone, Debug)]
