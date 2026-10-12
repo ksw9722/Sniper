@@ -134,6 +134,7 @@ pub struct AppState {
     /// when that context is promoted to a writable one.
     workspace_retention_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
     retention_persistence_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
+    upstream_peer_durability_gates: Arc<crate::upstream_peer_settings::DurabilityGates>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -218,7 +219,9 @@ impl AppState {
             runtime_instance_id,
             workspace_retention_uncertain: Arc::new(Default::default()),
             retention_persistence_uncertain: Arc::new(Default::default()),
+            upstream_peer_durability_gates: Arc::new(Default::default()),
         };
+        state.bind_upstream_peer_durability(&initial_session);
         state.start_history_retention_worker(&initial_session);
         Ok(state)
     }
@@ -289,6 +292,17 @@ impl AppState {
     /// resolving a saved session. Bounded passive reads must not load history.
     pub(crate) async fn active_session_for_read(&self) -> Arc<SessionContext> {
         self.active_session.read().await.clone()
+    }
+
+    fn bind_upstream_peer_durability(&self, session: &Arc<SessionContext>) {
+        let gate = self
+            .upstream_peer_durability_gates
+            .lock()
+            .unwrap()
+            .entry(session.id())
+            .or_default()
+            .clone();
+        session.upstream_peer_settings.bind(gate);
     }
 
     pub(crate) fn start_history_retention_worker(&self, session: &Arc<SessionContext>) {
@@ -444,6 +458,7 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let session = self.sessions.load_context_read_only(id)?;
+        self.bind_upstream_peer_durability(&session);
         read_only_contexts.insert(id, session.clone());
         Ok(session)
     }
@@ -484,6 +499,7 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let session = self.sessions.load_context(id)?;
+        self.bind_upstream_peer_durability(&session);
         contexts.insert(id, session.clone());
         self.start_history_retention_worker(&session);
         Ok(session)
@@ -804,6 +820,7 @@ impl AppState {
                                     "dropped pending intercepts before switching sessions"
                                 );
                             }
+                            state.bind_upstream_peer_durability(&session);
                             *active_session = session.clone();
                         }
                         state.start_history_retention_worker(&session);
@@ -920,6 +937,11 @@ impl AppState {
                 .remove(&id);
             state
                 .retention_persistence_uncertain
+                .lock()
+                .unwrap()
+                .remove(&id);
+            state
+                .upstream_peer_durability_gates
                 .lock()
                 .unwrap()
                 .remove(&id);

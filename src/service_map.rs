@@ -221,6 +221,46 @@ pub struct ServiceMapEvidence {
     pub reason: Option<String>,
     pub source: String,
     pub row: Option<ServiceMapRow>,
+    /// Explicit exact-source extension. Omitted from the default v1 response and
+    /// never part of the aggregate metadata projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_peer: Option<ServiceMapSocketPeerEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceMapSocketPeerStatus {
+    Observed,
+    NotRecorded,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceMapSocketPeerEvidence {
+    pub status: ServiceMapSocketPeerStatus,
+    pub observation: Option<crate::model::ObservedSocketPeer>,
+}
+
+impl ServiceMapSocketPeerEvidence {
+    pub(crate) fn from_record(record: &TransactionRecord) -> Self {
+        let observation = record
+            .observed_socket_peer
+            .as_ref()
+            .filter(|observation| observation.is_valid())
+            .cloned();
+        let status = match observation.as_ref() {
+            Some(observation) if observation.address.is_some() => {
+                ServiceMapSocketPeerStatus::Observed
+            }
+            Some(_) => ServiceMapSocketPeerStatus::Unavailable,
+            None => ServiceMapSocketPeerStatus::NotRecorded,
+        };
+        Self {
+            status,
+            observation,
+        }
+    }
 }
 
 impl ServiceMapEvidence {
@@ -233,6 +273,7 @@ impl ServiceMapEvidence {
             reason: Some(reason.into()),
             source: "captured_http_metadata".into(),
             row: None,
+            socket_peer: None,
         }
     }
 
@@ -245,6 +286,7 @@ impl ServiceMapEvidence {
             reason: None,
             source: "captured_http_metadata".into(),
             row: Some(row),
+            socket_peer: None,
         }
     }
 }
@@ -980,6 +1022,74 @@ mod tests {
         );
         assert_eq!(result.origins[0].request_count, 2);
         assert_eq!(result.origins[0].endpoints.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn socket_peer_extension_is_explicit_exact_and_never_part_of_map_projection() {
+        use crate::model::{ObservedSocketPeer, ObservedSocketPeerRoute};
+        let session = Uuid::new_v4();
+        let mut observed = record("/observed");
+        observed.observed_socket_peer = Some(ObservedSocketPeer::from_remote_addr(
+            observed.started_at,
+            ObservedSocketPeerRoute::SocksProxy,
+            Some("[2001:db8::1]:1080".parse().unwrap()),
+        ));
+        let mut unavailable = record("/unavailable");
+        unavailable.observed_socket_peer = Some(ObservedSocketPeer::from_remote_addr(
+            unavailable.started_at,
+            ObservedSocketPeerRoute::Unknown,
+            None,
+        ));
+        let mut invalid = observed.clone();
+        invalid.id = Uuid::new_v4();
+        invalid.path = "/invalid".into();
+        invalid.observed_socket_peer.as_mut().unwrap().reason =
+            Some(crate::model::ObservedSocketPeerReason::RemoteAddrUnavailable);
+        let store =
+            TransactionStore::from_records(vec![observed, unavailable, invalid, record("/legacy")]);
+        let snapshot = store.service_map_snapshot(session, 10).await;
+        for row in &snapshot.rows {
+            assert!(!serde_json::to_string(row).unwrap().contains("socket_peer"));
+            let default = store.service_map_evidence(session, &row.evidence_id).await;
+            assert!(default.socket_peer.is_none());
+            assert!(serde_json::to_value(default)
+                .unwrap()
+                .get("socket_peer")
+                .is_none());
+            let explicit = store
+                .service_map_evidence_with_socket_peer(session, &row.evidence_id, true)
+                .await;
+            let extension = explicit.socket_peer.unwrap();
+            match row.path.as_str() {
+                "/observed" => {
+                    assert_eq!(extension.status, ServiceMapSocketPeerStatus::Observed);
+                    let observation = extension.observation.unwrap();
+                    assert_eq!(observation.route, ObservedSocketPeerRoute::SocksProxy);
+                    assert_eq!(observation.address.unwrap().ip.to_string(), "2001:db8::1");
+                }
+                "/unavailable" => {
+                    assert_eq!(extension.status, ServiceMapSocketPeerStatus::Unavailable);
+                    assert!(extension.observation.unwrap().address.is_none());
+                }
+                _ => {
+                    assert_eq!(extension.status, ServiceMapSocketPeerStatus::NotRecorded);
+                    assert!(extension.observation.is_none());
+                }
+            }
+            let wrong_session = store
+                .service_map_evidence_with_socket_peer(Uuid::new_v4(), &row.evidence_id, true)
+                .await;
+            assert!(!wrong_session.available);
+            assert!(wrong_session.socket_peer.is_none());
+        }
+        let projection = build(session, snapshot, 10, false, None, &[], &[]);
+        let json = serde_json::to_string(&projection).unwrap();
+        assert!(!json.contains("socket_peer"));
+        assert!(!json.contains("2001:db8::1"));
+        assert!(projection
+            .unavailable
+            .iter()
+            .any(|field| field == "remote_ip"));
     }
 
     #[tokio::test]

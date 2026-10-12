@@ -180,6 +180,23 @@ It does not hydrate bodies, expose raw headers, or call the usual UUID-only HTTP
 detail endpoint as a fallback. Refresh the map deliberately if you need current
 evidence; do not describe unavailable historical evidence as verified.
 
+## Explicit one-row observed socket peer
+
+The default inventory and evidence response do not include socket peer data.
+An explicit `--include-socket-peer` on `scope service-map-evidence`, or boolean
+`include_socket_peer: true` on `target.service_map.evidence.get`, adds one optional
+`socket_peer` envelope only after exact-row token validation succeeds. The
+statuses are `observed`, `not_recorded`, and `unavailable`; check the status and
+nullable observation before using an address. False or omission sends no peer
+query parameter. No peer is returned for stale or unavailable evidence.
+
+Capture is independently Off by default and requires an explicit active-session
+settings save. This read never enables it, backfills rows, probes, or activates a
+session. A socket peer can be a proxy, CDN or shared endpoint, not proof of origin
+ownership or a backend chain. No aggregate peer map or IP edges are added. Retained
+observations are included in session files, exports and full-record JSON; Off
+does not erase them. See [the complete capture and evidence contract](observed-socket-peer.md).
+
 ## Explicit one-row response-body references
 
 This optional read requires a deliberate selection of one exact retained row:

@@ -63,7 +63,7 @@ fn matches_schema(value: &Value, schema: &Value) -> bool {
             "x-sniper-json-number-representation",
         ],
         &["object", "array", "string", "integer", "boolean", "null"],
-        &["uuid", "date-time"],
+        &["uuid", "date-time", "ipv4", "ipv6"],
     );
     matches_schema_value(value, schema)
 }
@@ -161,6 +161,8 @@ fn matches_schema_value(value: &Value, schema: &Value) -> bool {
         }
         match schema["format"].as_str() {
             Some("uuid") if Uuid::parse_str(text).is_err() => return false,
+            Some("ipv4") if text.parse::<std::net::Ipv4Addr>().is_err() => return false,
+            Some("ipv6") if text.parse::<std::net::Ipv6Addr>().is_err() => return false,
             Some("date-time") if DateTime::parse_from_rfc3339(text).is_err() => return false,
             _ => {}
         }
@@ -221,6 +223,70 @@ fn service_map_parse_errors_hide_rejected_credentials_and_queries() {
         let result = cli(&args, 2);
         assert_eq!(result["error"]["code"], "INVALID_INPUT");
         assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+    }
+}
+
+#[test]
+fn upstream_peer_settings_schemas_are_strict_and_discoverable_offline() {
+    let mut value = json!({"session_id":Uuid::nil(),"enabled":false,"config_revision":"9007199254740993",
+        "config_token":"a".repeat(64),"status":{"effective_enabled":false,"blocked_reason":null}});
+    for operation in [
+        "capture.http.upstream_peer.get",
+        "capture.http.upstream_peer.set",
+    ] {
+        let operation_spec = spec(operation);
+        let write = operation.ends_with(".set");
+        assert_eq!(
+            operation_spec["side_effect"],
+            if write { "write" } else { "read" }
+        );
+        assert_eq!(operation_spec["requires_confirmation"], write);
+        assert_eq!(
+            operation_spec["input_schema"]["additionalProperties"],
+            false
+        );
+        let schema = output_schema(operation);
+        if write {
+            value["changed"] = json!(false);
+        }
+        assert_schema(&value, &schema);
+        for reason in [
+            "persistence_uncertain",
+            "invalid_configuration",
+            "http_capture_paused",
+        ] {
+            value["status"]["blocked_reason"] = json!(reason);
+            assert_schema(&value, &schema);
+        }
+        value["status"]["blocked_reason"] = Value::Null;
+        let mut invalid = value.clone();
+        invalid["status"]["blocked_reason"] = json!("anything_else");
+        assert!(!matches_schema(&invalid, &schema));
+        invalid = value.clone();
+        invalid["private"] = json!("forbidden");
+        assert!(!matches_schema(&invalid, &schema));
+        invalid = value.clone();
+        invalid["config_revision"] = json!(9007199254740993_u64);
+        assert!(!matches_schema(&invalid, &schema));
+        invalid = value.clone();
+        invalid["config_revision"] = json!("18446744073709551616");
+        assert!(!matches_schema(&invalid, &schema));
+        for field in [
+            "session_id",
+            "enabled",
+            "config_revision",
+            "config_token",
+            "status",
+        ] {
+            invalid = value.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(!matches_schema(&invalid, &schema), "{operation}: {field}");
+        }
+        if write {
+            invalid = value.clone();
+            invalid.as_object_mut().unwrap().remove("changed");
+            assert!(!matches_schema(&invalid, &schema));
+        }
     }
 }
 
@@ -1083,6 +1149,192 @@ mod history_fixture {
     }
 
     const BODY_REFERENCE_TOKEN: &str = "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000";
+
+    fn peer_evidence_payload(status: &str, ip: &str, route: &str) -> Value {
+        let mut payload = evidence_payload(true);
+        payload["socket_peer"] = json!({
+            "status":status,
+            "observation":if status == "not_recorded" {Value::Null} else {json!({
+                "source":"http_response_remote_addr","observed_at":"2026-10-12T06:00:01Z","route":route,
+                "address":if status == "observed" {json!({"ip":ip,"port":443})} else {Value::Null},
+                "reason":if status == "unavailable" {json!("remote_addr_unavailable")} else {Value::Null}
+            })}
+        });
+        payload
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_evidence_is_explicit_typed_and_matches_schema() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let schema = output_schema("target.service_map.evidence.get");
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("socket_peer")));
+        for status in ["observed", "not_recorded", "unavailable"] {
+            for ip in ["192.0.2.7", "2001:db8::7"] {
+                for route in ["direct", "http_proxy", "socks_proxy", "unknown"] {
+                    let payload = peer_evidence_payload(status, ip, route);
+                    *mock.state.payload.lock().unwrap() = payload.clone();
+                    let direct = mock
+                        .command(&[
+                            "target",
+                            "service-map-evidence",
+                            "--session-id",
+                            &session,
+                            "--evidence-id",
+                            BODY_REFERENCE_TOKEN,
+                            "--include-socket-peer",
+                        ])
+                        .await;
+                    assert_eq!(direct, payload);
+                    assert_schema(&direct, &schema);
+                    mock.assert_reads(
+                        "/api/target/service-map/evidence",
+                        &[
+                            ("evidence_id", BODY_REFERENCE_TOKEN),
+                            ("include_socket_peer", "true"),
+                        ],
+                    );
+                    let input = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN,"include_socket_peer":true}).to_string();
+                    let called = mock
+                        .command(&["call", "target.service_map.evidence.get", "--input", &input])
+                        .await;
+                    assert_eq!(called["data"], direct);
+                    assert_eq!(called["meta"]["session_id"], session);
+                    mock.assert_reads(
+                        "/api/target/service-map/evidence",
+                        &[
+                            ("evidence_id", BODY_REFERENCE_TOKEN),
+                            ("include_socket_peer", "true"),
+                        ],
+                    );
+                }
+            }
+        }
+        *mock.state.payload.lock().unwrap() = evidence_payload(false);
+        let result = mock
+            .command(&[
+                "target",
+                "service-map-evidence",
+                "--session-id",
+                &session,
+                "--evidence-id",
+                BODY_REFERENCE_TOKEN,
+                "--include-socket-peer",
+            ])
+            .await;
+        assert_eq!(result, evidence_payload(false));
+        assert_schema(&result, &schema);
+        mock.assert_reads(
+            "/api/target/service-map/evidence",
+            &[
+                ("evidence_id", BODY_REFERENCE_TOKEN),
+                ("include_socket_peer", "true"),
+            ],
+        );
+        *mock.state.payload.lock().unwrap() = evidence_payload(true);
+        let input = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN,"include_socket_peer":false}).to_string();
+        let result = mock
+            .command(&["call", "target.service_map.evidence.get", "--input", &input])
+            .await;
+        assert_eq!(result["data"], evidence_payload(true));
+        mock.assert_reads(
+            "/api/target/service-map/evidence",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_evidence_fails_closed_on_unrequested_or_malformed_extension() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map-evidence",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+            "--include-socket-peer",
+        ];
+        for (pointer, value) in [
+            ("/socket_peer/status", json!("origin_verified")),
+            ("/socket_peer/status", json!("unavailable")),
+            ("/socket_peer/observation", Value::Null),
+            ("/socket_peer/observation/source", json!("dns_lookup")),
+            ("/socket_peer/observation/observed_at", json!("invalid")),
+            (
+                "/socket_peer/observation/route",
+                json!("inferred_backend_chain"),
+            ),
+            (
+                "/socket_peer/observation/address/ip",
+                json!("SYNTHETIC_PRIVATE_VALUE.example.com"),
+            ),
+            ("/socket_peer/observation/address/port", json!(65536)),
+            (
+                "/socket_peer/observation/reason",
+                json!("remote_addr_unavailable"),
+            ),
+            ("/row/evidence_id", json!("different-token")),
+        ] {
+            let mut payload = peer_evidence_payload("observed", "192.0.2.7", "direct");
+            *payload.pointer_mut(pointer).unwrap() = value;
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{pointer}");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[
+                    ("evidence_id", BODY_REFERENCE_TOKEN),
+                    ("include_socket_peer", "true"),
+                ],
+            );
+        }
+        for mut payload in [
+            evidence_payload(true),
+            peer_evidence_payload("observed", "192.0.2.7", "direct"),
+        ] {
+            if payload.get("socket_peer").is_some() {
+                payload["available"] = json!(false);
+                payload["row"] = Value::Null;
+                payload["reason"] = json!("stale");
+            }
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[
+                    ("evidence_id", BODY_REFERENCE_TOKEN),
+                    ("include_socket_peer", "true"),
+                ],
+            );
+        }
+        *mock.state.payload.lock().unwrap() =
+            peer_evidence_payload("observed", "192.0.2.7", "direct");
+        let result = mock.command_with_code(&args[..args.len() - 1], 5).await;
+        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+        assert!(!result.to_string().contains("192.0.2.7"));
+        mock.assert_reads(
+            "/api/target/service-map/evidence",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+        for value in [Value::Null, json!("true"), json!(1)] {
+            let input = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN,"include_socket_peer":value}).to_string();
+            let result = mock
+                .command_with_code(
+                    &["call", "target.service_map.evidence.get", "--input", &input],
+                    2,
+                )
+                .await;
+            assert_eq!(result["error"]["code"], "INVALID_INPUT");
+            assert!(mock.state.requests.lock().unwrap().is_empty());
+        }
+    }
 
     fn body_references_payload(status: &str) -> Value {
         let available = matches!(status, "scanned" | "partial");

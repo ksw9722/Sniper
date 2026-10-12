@@ -6,7 +6,7 @@ use http::HeaderMap;
 use serde_json::{json, Value};
 use sniper::{
     config::AppConfig,
-    model::{MessageRecord, TransactionRecord},
+    model::{MessageRecord, ObservedSocketPeer, ObservedSocketPeerRoute, TransactionRecord},
     state::AppState,
 };
 use uuid::Uuid;
@@ -53,7 +53,7 @@ fn row(path: &str) -> TransactionRecord {
     let response_body = format!(
         "<a href=\"https://user:SYNTHETIC_PRIVATE@{target}/private?token=SYNTHETIC_PRIVATE#SYNTHETIC_PRIVATE\">fixture</a>"
     );
-    TransactionRecord::http(
+    let mut record = TransactionRecord::http(
         chrono::Utc::now(),
         "GET".into(),
         "https".into(),
@@ -70,7 +70,26 @@ fn row(path: &str) -> TransactionRecord {
         Vec::new(),
         None,
         None,
-    )
+    );
+    let older = path.starts_with("/users/1");
+    record.observed_socket_peer = Some(ObservedSocketPeer::from_remote_addr(
+        record.started_at,
+        if older {
+            ObservedSocketPeerRoute::Direct
+        } else {
+            ObservedSocketPeerRoute::HttpProxy
+        },
+        Some(
+            if older {
+                "192.0.2.10:443"
+            } else {
+                "[2001:db8::20]:8080"
+            }
+            .parse()
+            .unwrap(),
+        ),
+    ));
+    record
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -93,8 +112,16 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     let duplicate_id = first.id;
     let mut second = row("/users/2?secret=SYNTHETIC_PRIVATE");
     second.id = duplicate_id;
+    let mut events = session.store.subscribe();
     session.store.insert(first).await;
     session.store.insert(second).await;
+    for _ in 0..2 {
+        let event = events.recv().await.unwrap();
+        let summary = serde_json::to_value(event.summary).unwrap();
+        assert!(summary.get("observed_socket_peer").is_none());
+        assert!(!summary.to_string().contains("192.0.2.10"));
+        assert!(!summary.to_string().contains("2001:db8::20"));
+    }
     // Exercise the real persistence path: the newest UUID occurrence becomes
     // lazy, while its older retained sibling must keep its own resident body.
     session.persist().await.unwrap();
@@ -139,6 +166,9 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     )
     .await;
     assert_eq!(map["snapshot"]["retained_rows"], 2);
+    assert!(!map.to_string().contains("observed_socket_peer"));
+    assert!(!map.to_string().contains("192.0.2.10"));
+    assert!(!map.to_string().contains("2001:db8::20"));
     assert_eq!(map["snapshot"]["complete"], true);
     let origin = &map["origins"][0];
     assert_eq!(origin["request_count"], 2);
@@ -159,6 +189,61 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     assert_eq!(evidence["available"], true);
     assert_eq!(evidence["row"]["path"], "/users/1");
     assert_eq!(evidence["row"]["record_id"], duplicate_id.to_string());
+    assert!(
+        evidence.get("socket_peer").is_none(),
+        "default evidence shape changed"
+    );
+    let peer_evidence = read(
+        &dir,
+        &api,
+        "target.service_map.evidence.get",
+        json!({"session_id":session_id,"evidence_id":token,"include_socket_peer":true}),
+    )
+    .await;
+    assert_eq!(peer_evidence["socket_peer"]["status"], "observed");
+    assert_eq!(
+        peer_evidence["socket_peer"]["observation"]["address"]["ip"],
+        "192.0.2.10"
+    );
+    assert_eq!(
+        peer_evidence["socket_peer"]["observation"]["route"],
+        "direct"
+    );
+
+    // saved.v1 has summaries, selections and receipts, not full transaction
+    // objects. Its closed response schema remains unchanged even for new rows.
+    let saved: Value = client
+        .post(format!("{api}/api/saved/v1/call"))
+        .json(
+            &json!({"operation":"saved.v1.http.list","input":{"session_id":session_id,"limit":1}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["ok"], true);
+    sniper::saved_contract::validate_output("saved.v1.http.list", &saved["data"]).unwrap();
+    assert_eq!(saved["data"]["items"].as_array().unwrap().len(), 1);
+    assert!(!saved.to_string().contains("observed_socket_peer"));
+    assert!(!saved.to_string().contains("192.0.2.10"));
+    assert!(!saved.to_string().contains("2001:db8::20"));
+    let full: Value = client
+        .get(format!(
+            "{api}/api/transactions/{duplicate_id}?session_id={session_id}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        full["observed_socket_peer"]["address"]["ip"],
+        "2001:db8::20"
+    );
+    assert_eq!(full["observed_socket_peer"]["route"], "http_proxy");
 
     let body = read(
         &dir,
@@ -177,6 +262,21 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     assert_eq!(body["evidence_id"], token);
     assert_eq!(body["source_sequence"], evidence["row"]["sequence"]);
     let newest_token = origin["endpoints"][1]["evidence"][0].as_str().unwrap();
+    let newest_peer = read(
+        &dir,
+        &api,
+        "target.service_map.evidence.get",
+        json!({"session_id":session_id,"evidence_id":newest_token,"include_socket_peer":true}),
+    )
+    .await;
+    assert_eq!(
+        newest_peer["socket_peer"]["observation"]["address"]["ip"],
+        "2001:db8::20"
+    );
+    assert_ne!(
+        peer_evidence["row"]["sequence"],
+        newest_peer["row"]["sequence"]
+    );
     let lazy_body = read(
         &dir,
         &api,
@@ -197,6 +297,18 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     let missing = read(&dir, &api, "target.service_map.evidence.get", input.clone()).await;
     assert_eq!(missing["available"], false);
     assert!(missing["row"].is_null());
+    let missing_peer = read(
+        &dir,
+        &api,
+        "target.service_map.evidence.get",
+        json!({"session_id":session_id,"evidence_id":token,"include_socket_peer":true}),
+    )
+    .await;
+    assert_eq!(missing_peer["available"], false);
+    assert!(
+        missing_peer.get("socket_peer").is_none(),
+        "stale source exposed peer evidence"
+    );
     let missing_body = read(&dir, &api, "target.service_map.body_references.get", input).await;
     assert_eq!(missing_body["available"], false);
     assert_eq!(missing_body["status"], "unavailable");
@@ -217,4 +329,114 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     drop(session);
     drop(state);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn observed_socket_peer_survives_journal_restart_compaction_and_metadata_rebuild() {
+    use sniper::session::SessionRegistry;
+    for compact in [false, true] {
+        let dir = std::env::temp_dir().join(format!("sniper-peer-restart-{}", Uuid::new_v4()));
+        let (registry, active) = SessionRegistry::load_or_create(&dir, 32, 32).unwrap();
+        let record = row("/users/2");
+        let id = record.id;
+        let expected = serde_json::to_value(&record.observed_socket_peer).unwrap();
+        let response_body = record.response.as_ref().unwrap().body_preview.clone();
+        let session_id = active.id();
+        active.store.insert(record).await;
+        let mut legacy = row("/legacy");
+        legacy.observed_socket_peer = None;
+        let legacy_id = legacy.id;
+        active.store.insert(legacy).await;
+        active.persist().await.unwrap();
+        let storage = active.storage_dir().to_path_buf();
+        for filename in ["transactions.ndjson", "transactions.meta.ndjson"] {
+            let bytes = std::fs::read_to_string(storage.join(filename)).unwrap();
+            let rows: Vec<Value> = bytes
+                .lines()
+                .filter_map(|line| {
+                    let value: Value = serde_json::from_str(line).unwrap();
+                    if filename == "transactions.meta.ndjson" {
+                        value.get("r").cloned()
+                    } else {
+                        Some(value)
+                    }
+                })
+                .collect();
+            assert_eq!(
+                rows.iter().find(|row| row["id"] == id.to_string()).unwrap()
+                    ["observed_socket_peer"],
+                expected
+            );
+            assert!(rows
+                .iter()
+                .find(|row| row["id"] == legacy_id.to_string())
+                .unwrap()
+                .get("observed_socket_peer")
+                .is_none());
+        }
+        active
+            .store
+            .update_annotations_durable(id, Some(Some("blue".into())), None)
+            .await
+            .unwrap()
+            .unwrap();
+        if compact {
+            active.persist().await.unwrap();
+        }
+        drop(active);
+        drop(registry);
+        let (registry, active) = SessionRegistry::load_or_create(&dir, 32, 32).unwrap();
+        assert_eq!(active.id(), session_id);
+        let restored = active.store.get(id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.observed_socket_peer).unwrap(),
+            expected
+        );
+        assert_eq!(
+            restored.response.as_ref().unwrap().body_preview,
+            response_body
+        );
+        assert!(serde_json::to_value(restored.summary())
+            .unwrap()
+            .get("observed_socket_peer")
+            .is_none());
+        drop(active);
+        std::fs::remove_file(storage.join("transactions.meta.ndjson")).unwrap();
+        let rebuilt = registry.load_context_read_only(session_id).unwrap();
+        let restored = rebuilt.store.get(id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.observed_socket_peer).unwrap(),
+            expected
+        );
+        assert_eq!(
+            restored.response.as_ref().unwrap().body_preview,
+            response_body
+        );
+        assert!(rebuilt
+            .store
+            .get(legacy_id)
+            .await
+            .unwrap()
+            .observed_socket_peer
+            .is_none());
+        drop(rebuilt);
+        let active = registry.load_context(session_id).unwrap();
+        active.store.delete_ids(&[id]).await.unwrap();
+        active.persist().await.unwrap();
+        drop(active);
+        drop(registry);
+        let (registry, restarted) = SessionRegistry::load_or_create(&dir, 32, 32).unwrap();
+        assert!(restarted.store.get(id).await.is_none());
+        assert_eq!(restarted.store.len().await, 1);
+        assert!(restarted
+            .store
+            .get(legacy_id)
+            .await
+            .unwrap()
+            .observed_socket_peer
+            .is_none());
+        drop(restarted);
+        drop(registry);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

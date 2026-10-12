@@ -144,6 +144,35 @@ test('unavailable source is honest and repeated evidence clicks latest-win', asy
   f.requests[1].resolve(response(evidence())); await a;
   assert.equal(f.state.evidence, null); assert.match(f.state.evidenceError, /Source unavailable/);
 });
+test('background refresh leaves retained metadata summary unchanged while button and busy state show progress', async () => {
+  const f = fixture(); await f.load();
+  const summary = f.els.status.textContent, canvasReplacements = f.els.canvas.replacements;
+  for (let i = 0; i < 3; i += 1) {
+    const pending = f.controller.refresh();
+    assert.equal(f.els.status.textContent, summary, 'polling must not add a line or move the graph');
+    assert.doesNotMatch(f.els.status.textContent, /Refreshing/);
+    assert.equal(f.els.refresh.textContent, 'Refreshing…');
+    assert.equal(f.els.refresh.disabled, true); assert.equal(f.els.panel.attributes['aria-busy'], 'true');
+    assert.equal(f.els.canvas.replacements, canvasReplacements);
+    f.requests.at(-1).resolve(response(snapshot())); await pending;
+    assert.equal(f.els.status.textContent, summary);
+    assert.equal(f.els.refresh.textContent, 'Refresh');
+    assert.equal(f.els.refresh.disabled, false); assert.equal(f.els.panel.attributes['aria-busy'], 'false');
+  }
+});
+test('refresh progress change preserves initial loading, stale summary and failure semantics', async () => {
+  const f = fixture(); const initial = f.controller.refresh();
+  assert.equal(f.els.status.textContent, 'Loading retained HTTP metadata…');
+  f.requests.at(-1).resolve(response(snapshot())); await initial;
+  f.controller.markDirty(); const stale = f.els.status.textContent;
+  assert.match(stale, /History changed: counts are from the previous snapshot/);
+  const pending = f.controller.refresh(); assert.equal(f.els.status.textContent, stale);
+  f.requests.at(-1).reject(new Error('Synthetic refresh failure')); await pending;
+  assert.match(f.els.status.textContent, /Refresh failed.*previous snapshot/);
+  assert.match(f.els.status.textContent, /History changed/);
+  assert.equal(f.els.status.classList.contains('service-map-error'), true);
+  assert.equal(f.els.refresh.textContent, 'Refresh'); assert.equal(f.els.refresh.disabled, false);
+});
 test('network errors keep prior map explicitly labelled; no payload text leaks', async () => {
   const f = fixture(); await f.load(); const pending = f.controller.refresh();
   f.requests.at(-1).reject(new Error('secret header body')); await pending;

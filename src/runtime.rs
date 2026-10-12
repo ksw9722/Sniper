@@ -25,6 +25,19 @@ pub struct RuntimeSettingsSnapshot {
     /// forwarding exactly as before; only the history stops filling.
     #[serde(default = "default_true")]
     pub http_capture_enabled: bool,
+    /// Saved preference for newly eligible ordinary HTTP exchanges. Call
+    /// SessionContext::upstream_peer_capture_eligible for the effective decision;
+    /// an invalid/exhausted revision or uncertain write can still force it Off.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_upstream_peer_enabled_for_load"
+    )]
+    pub upstream_peer_capture_enabled: bool,
+    #[serde(
+        default = "default_upstream_peer_revision",
+        deserialize_with = "deserialize_upstream_peer_revision_for_load"
+    )]
+    pub upstream_peer_capture_revision: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_history_retention_for_load")]
     pub http_history_retention: crate::history_retention::HistoryRetentionPolicy,
     #[serde(
@@ -54,6 +67,32 @@ pub struct RuntimeSettingsSnapshot {
     pub oast_polling_interval_secs: u64,
     #[serde(default, deserialize_with = "deserialize_oast_provider_for_load")]
     pub oast_provider: crate::oast::OastProvider,
+}
+
+fn default_upstream_peer_revision() -> Option<u64> {
+    Some(0)
+}
+
+fn deserialize_upstream_peer_enabled_for_load<'de, D>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // Do not let a malformed saved value opt into retaining extra metadata.
+    Ok(value.as_bool().unwrap_or(false))
+}
+
+fn deserialize_upstream_peer_revision_for_load<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // None stays distinct from both legacy zero and an exhausted valid marker.
+    Ok(value.as_u64())
 }
 
 fn default_history_retention_revision() -> Option<u64> {
@@ -131,6 +170,8 @@ impl Default for RuntimeSettingsSnapshot {
             intercept_enabled: false,
             websocket_capture_enabled: true,
             http_capture_enabled: true,
+            upstream_peer_capture_enabled: false,
+            upstream_peer_capture_revision: Some(0),
             http_history_retention: Default::default(),
             http_history_retention_revision: Some(0),
             scope_patterns: Vec::new(),
@@ -159,6 +200,9 @@ impl RuntimeSettingsSnapshot {
     }
 
     pub fn sanitized_for_load(mut self) -> Self {
+        if self.upstream_peer_capture_revision.is_none() {
+            self.upstream_peer_capture_enabled = false;
+        }
         if self.http_history_retention_revision.is_none() {
             self.http_history_retention = Default::default();
         }
@@ -379,6 +423,16 @@ impl RuntimeSettings {
         current.http_history_retention_revision = Some(revision);
     }
 
+    pub(crate) async fn set_upstream_peer_capture_config(
+        &self,
+        enabled: bool,
+        revision: Option<u64>,
+    ) {
+        let mut current = self.inner.write().await;
+        current.upstream_peer_capture_enabled = enabled && revision.is_some();
+        current.upstream_peer_capture_revision = revision;
+    }
+
     pub async fn intercept_enabled(&self) -> bool {
         self.inner.read().await.intercept_enabled
     }
@@ -511,6 +565,55 @@ mod tests {
     use super::{
         RuntimeSettings, RuntimeSettingsSnapshot, RuntimeSettingsUpdate, OAST_TOKEN_REDACTION,
     };
+
+    #[tokio::test]
+    async fn peer_settings_legacy_and_malformed_loads_fail_closed_without_losing_other_settings() {
+        let legacy: RuntimeSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({"intercept_enabled":true})).unwrap();
+        assert!(!legacy.upstream_peer_capture_enabled);
+        assert_eq!(legacy.upstream_peer_capture_revision, Some(0));
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!({}),
+        ] {
+            let loaded: RuntimeSettingsSnapshot = serde_json::from_value(serde_json::json!({"intercept_enabled":true,"upstream_peer_capture_enabled":invalid})).unwrap();
+            assert!(!loaded.upstream_peer_capture_enabled);
+            assert!(loaded.intercept_enabled);
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("1"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!({}),
+        ] {
+            let loaded: RuntimeSettingsSnapshot = serde_json::from_value(serde_json::json!({"http_capture_enabled":false,"upstream_peer_capture_enabled":true,"upstream_peer_capture_revision":invalid})).unwrap();
+            let restored = RuntimeSettings::from_snapshot(loaded).snapshot().await;
+            assert!(!restored.upstream_peer_capture_enabled);
+            assert!(restored.upstream_peer_capture_revision.is_none());
+            assert!(!restored.http_capture_enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_settings_are_excluded_from_generic_runtime_updates() {
+        let settings = RuntimeSettings::new();
+        let update: RuntimeSettingsUpdate = serde_json::from_value(serde_json::json!({"upstream_peer_capture_enabled":true,"upstream_peer_capture_revision":999,"upstream_insecure":false})).unwrap();
+        let updated = settings.update(update).await.unwrap();
+        assert!(!updated.upstream_peer_capture_enabled);
+        assert_eq!(updated.upstream_peer_capture_revision, Some(0));
+        assert!(!updated.upstream_insecure);
+        settings
+            .set_upstream_peer_capture_config(true, Some(7))
+            .await;
+        let update: RuntimeSettingsUpdate = serde_json::from_value(serde_json::json!({"upstream_peer_capture_enabled":false,"upstream_peer_capture_revision":0,"http_capture_enabled":false})).unwrap();
+        let updated = settings.update(update).await.unwrap();
+        assert!(updated.upstream_peer_capture_enabled);
+        assert_eq!(updated.upstream_peer_capture_revision, Some(7));
+        assert!(!updated.http_capture_enabled);
+    }
 
     #[test]
     fn runtime_settings_accepts_legacy_partial_snapshot() {

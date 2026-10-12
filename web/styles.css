@@ -7457,9 +7457,9 @@ button.utility-button.replay-tab-add {
 .service-map-evidence-button > :last-child { white-space: nowrap; color: var(--point); font-size: var(--font-xs); }
 .service-map-evidence-button.selected { border-color: var(--point-border); }
 .service-map-verified { padding: 0 12px 8px; border: 1px solid var(--point-border); border-radius: 9px; margin: 12px 0; background: var(--point-soft); }
-.service-map-verified dl { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 8px 14px; font-size: var(--font-xs); }
-.service-map-verified dt { color: var(--text-dim); }
-.service-map-verified dd { margin: 0; overflow-wrap: anywhere; }
+.service-map-verified dl, .service-map-socket-peer dl { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 8px 14px; font-size: var(--font-xs); }
+.service-map-verified dt, .service-map-socket-peer dt { color: var(--text-dim); }
+.service-map-verified dd, .service-map-socket-peer dd { margin: 0; overflow-wrap: anywhere; }
 .service-map-verified p { font-size: var(--font-xs); color: var(--text-soft); line-height: 1.5; }
 .service-map-endpoint-summary strong { display: block; margin: 8px 0; font-family: var(--mono); overflow-wrap: anywhere; }
 .service-map-endpoint-summary p { color: var(--text-dim); font-size: var(--font-xs); }
@@ -7527,3 +7527,12 @@ button.utility-button.replay-tab-add {
 .service-map-body-overlay > .service-map-overlay-actions { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 1 auto; min-width: 0; }
 .service-map-overlay-source { font-family: var(--mono); overflow-wrap: anywhere; }
 .service-map-body-overlay .service-map-overlay-source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.upstream-peer-card { flex: 0 0 auto; margin-bottom: 12px; }
+.upstream-peer-card p { margin: 0; line-height: 1.5; }
+.upstream-peer-card .settings-form { gap: 10px; }
+.upstream-peer-card .panel-toolbar { padding-bottom: 10px; }
+.upstream-peer-error { color: var(--danger, #df596a); }
+.upstream-peer-error:empty { display: none; }
+.service-map-socket-peer { border-top: 1px solid var(--line); padding-top: 12px; }
+.service-map-socket-peer p { overflow-wrap: anywhere; }

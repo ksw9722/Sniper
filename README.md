@@ -239,6 +239,16 @@ invalidation removes it; it is never saved or restored automatically. The CLI
 body-reference output is unchanged. See
 [temporary overlay behavior and limits](docs/integrations/service-map.md#temporary-body-reference-overlay-gui-only).
 
+An optional **Upstream socket peer** Capture Settings card records one bounded
+socket observation for eligible future ordinary captured HTTP(S) responses. It
+is Off by default, uses explicit Save/Cancel, and never backfills or probes.
+`capture http upstream-peer get/set --session-id <active-session-uuid>` exposes
+the same active-session settings; set requires `--enabled true|false --yes`.
+An exact evidence read adds it only with `--include-socket-peer`. A socket peer
+may be a proxy, CDN or shared endpoint and does not establish origin ownership.
+Observations persist in session files, exports and full-record JSON; Off does not
+erase them. See [the observed socket peer contract](docs/integrations/observed-socket-peer.md).
+
 ## CLI
 
 For the current development branch, see the

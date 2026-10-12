@@ -688,6 +688,14 @@ const els = {
   oastDetailTitle: document.getElementById("oastDetailTitle"),
   oastDetailView: document.getElementById("oastDetailView"),
   proxySettingsPanel: document.getElementById("proxySettingsPanel"),
+  upstreamPeerSection: document.getElementById("upstreamPeerSection"),
+  upstreamPeerSession: document.getElementById("upstreamPeerSession"),
+  upstreamPeerEnabled: document.getElementById("upstreamPeerEnabled"),
+  upstreamPeerError: document.getElementById("upstreamPeerError"),
+  upstreamPeerStatus: document.getElementById("upstreamPeerStatus"),
+  upstreamPeerSave: document.getElementById("upstreamPeerSave"),
+  upstreamPeerCancel: document.getElementById("upstreamPeerCancel"),
+  upstreamPeerRefresh: document.getElementById("upstreamPeerRefresh"),
   historyRetentionSection: document.getElementById("historyRetentionSection"),
   historyRecoveredNotes: document.getElementById("historyRecoveredNotes"),
   historyRecoveredNotesSummary: document.getElementById("historyRecoveredNotesSummary"),
@@ -1113,6 +1121,7 @@ async function init() {
   if (state.activeProxyTab === "proxy-settings") {
     loadRuntimeSettings().catch((error) => console.error(error));
     loadHistoryRetentionSettings();
+    loadUpstreamPeerSettings();
   }
   renderIntercepts();
   renderWebsocketSessions();
@@ -1212,6 +1221,7 @@ function bindEvents() {
       if (state.activeProxyTab === "proxy-settings") {
         loadRuntimeSettings().catch((error) => console.error(error));
         loadHistoryRetentionSettings();
+        loadUpstreamPeerSettings();
       }
       if (state.activeProxyTab === "replace") {
         flushMatchReplaceDraft()
@@ -1835,6 +1845,10 @@ function bindEvents() {
     loadSettings()
       .then(renderProxySettings)
       .catch((error) => console.error(error)));
+  els.upstreamPeerEnabled?.addEventListener("change", editUpstreamPeerSettings);
+  els.upstreamPeerSave?.addEventListener("click", saveUpstreamPeerSettings);
+  els.upstreamPeerCancel?.addEventListener("click", cancelUpstreamPeerSettings);
+  els.upstreamPeerRefresh?.addEventListener("click", loadUpstreamPeerSettings);
   els.historyRetentionEnabled?.addEventListener("change", editHistoryRetentionSettings);
   els.historyRetentionPreset?.addEventListener("change", editHistoryRetentionSettings);
   els.historyRetentionCustom?.addEventListener("input", editHistoryRetentionSettings);
@@ -4975,6 +4989,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
 function resetSessionScopedUiState() {
   workspaceStateGeneration += 1;
   state.historyRetentionSettings = null;
+  state.upstreamPeerSettings = null;
   state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
   state._historyRetentionEvents = null;
   state._historyDeletedIds = new Set();
@@ -7592,6 +7607,13 @@ async function pollAuxiliaryData() {
   if (state.activeTool === "proxy" && state.activeProxyTab === "proxy-settings"
     && !state.historyRetentionSettings?.loading && !state.historyRetentionSettings?.saving) {
     tasks.push(loadHistoryRetentionSettings());
+  }
+
+  if (state.activeTool === "proxy" && state.activeProxyTab === "proxy-settings"
+    && !state.upstreamPeerSettings?.loading && !state.upstreamPeerSettings?.saving
+    && !state.upstreamPeerSettings?.uncertain && !state.upstreamPeerSettings?.writeConflict
+    && !state.upstreamPeerSettings?.readFailed) {
+    tasks.push(loadUpstreamPeerSettings());
   }
 
   if (state.activeTool === "logger") {
@@ -13361,6 +13383,215 @@ function websocketLoadedWindowCanHideSelection() {
     || (Number.isFinite(total) && loadedCount < total);
 }
 
+function upstreamPeerSettingsState() {
+  const sessionId = currentSessionId();
+  let settings = state.upstreamPeerSettings;
+  if (!settings || settings.sessionId !== sessionId || settings.workspaceGeneration !== workspaceStateGeneration) {
+    settings = { sessionId, workspaceGeneration: workspaceStateGeneration, saved: null, baselineToken: null,
+      draft: false, draftVersion: 0, readOwner: 0, readFailed: false, saving: false, loading: false,
+      dirty: false, conflict: false, writeConflict: false, uncertain: null, error: "", message: "" };
+    state.upstreamPeerSettings = settings;
+  }
+  return settings;
+}
+
+function validateUpstreamPeerSnapshot(payload, sessionId) {
+  const status = payload?.status;
+  if (payload?.session_id !== sessionId || typeof payload.enabled !== "boolean"
+    || typeof payload.config_token !== "string" || !/^[a-f0-9]{64}$/.test(payload.config_token)
+    || typeof payload.config_revision !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(payload.config_revision)
+    || BigInt(payload.config_revision) > 18446744073709551615n
+    || !status || typeof status.effective_enabled !== "boolean"
+    || ![null, "persistence_uncertain", "invalid_configuration", "http_capture_paused"].includes(status.blocked_reason)
+    || (status.effective_enabled && (!payload.enabled || status.blocked_reason !== null))
+    || (status.blocked_reason === null && status.effective_enabled !== payload.enabled)
+    || (status.blocked_reason === "http_capture_paused" && !payload.enabled)) {
+    throw new Error("Could not verify the upstream socket peer setting. Check status before saving.");
+  }
+  return { session_id: sessionId, enabled: payload.enabled, config_token: payload.config_token,
+    config_revision: payload.config_revision, status: { effective_enabled: status.effective_enabled, blocked_reason: status.blocked_reason },
+    ...(Object.prototype.hasOwnProperty.call(payload, "changed") ? { changed: payload.changed } : {}) };
+}
+
+function validateUpstreamPeerAcknowledgement(snapshot, baseline, enabled) {
+  const changed = baseline.enabled !== enabled;
+  if (typeof snapshot.changed !== "boolean" || snapshot.changed !== changed || snapshot.enabled !== enabled
+    || BigInt(snapshot.config_revision) !== BigInt(baseline.config_revision) + (changed ? 1n : 0n)
+    || (changed ? snapshot.config_token === baseline.config_token : snapshot.config_token !== baseline.config_token)
+    || snapshot.status.blocked_reason === "persistence_uncertain") {
+    throw new Error("The save acknowledgement could not be verified. Check status before saving again.");
+  }
+  return snapshot;
+}
+
+function adoptUpstreamPeerSnapshot(settings, snapshot, { replaceDraft = false, preserveDraft = false } = {}) {
+  settings.saved = snapshot;
+  if (replaceDraft) settings.writeConflict = false;
+  if (replaceDraft || (!preserveDraft && !settings.dirty)) {
+    settings.draft = snapshot.enabled;
+    settings.baselineToken = snapshot.config_token;
+    settings.dirty = false;
+  }
+  settings.conflict = settings.writeConflict || settings.baselineToken !== snapshot.config_token;
+}
+
+async function loadUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  if (!settings.sessionId || settings.saving) return false;
+  const readOwner = ++settings.readOwner;
+  const ownsRead = () => settings === state.upstreamPeerSettings && readOwner === settings.readOwner
+    && settings.sessionId === currentSessionId() && settings.workspaceGeneration === workspaceStateGeneration;
+  settings.loading = true;
+  renderUpstreamPeerSettings();
+  try {
+    const response = await fetch(sessionQueryPath("/api/transactions/upstream-peer-settings", settings.sessionId));
+    if (response.status === 409 && ownsRead()) {
+      settings.conflict = true;
+      settings.writeConflict = true;
+    }
+    await requireOkResponse(response, "Failed to check the upstream socket peer setting.");
+    const snapshot = validateUpstreamPeerSnapshot(await response.json(), settings.sessionId);
+    if (!ownsRead()) return false;
+    settings.readFailed = false;
+    const uncertain = settings.uncertain;
+    if (uncertain) {
+      const matched = snapshot.enabled === uncertain.enabled;
+      settings.baselineToken = snapshot.config_token;
+      adoptUpstreamPeerSnapshot(settings, snapshot, { replaceDraft: settings.draftVersion === uncertain.draftVersion && matched,
+        preserveDraft: settings.draftVersion !== uncertain.draftVersion });
+      settings.dirty = settings.draft !== snapshot.enabled;
+      settings.conflict = false;
+      settings.uncertain = null;
+      settings.message = snapshot.status.blocked_reason === "persistence_uncertain"
+        ? "Status checked. Storage is still unconfirmed; use Save to retry explicitly."
+        : "Current saved setting checked. The earlier save acknowledgement was unavailable.";
+    } else {
+      adoptUpstreamPeerSnapshot(settings, snapshot);
+    }
+    settings.error = settings.conflict
+      ? "This setting changed or the active session moved. Cancel to review the saved setting before saving again."
+      : "";
+    return true;
+  } catch (error) {
+    if (ownsRead()) {
+      settings.readFailed = true;
+      settings.error = error?.message || "Failed to check the upstream socket peer setting.";
+    }
+    return false;
+  } finally {
+    if (ownsRead()) { settings.loading = false; renderUpstreamPeerSettings(); }
+  }
+}
+
+function editUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  settings.draft = els.upstreamPeerEnabled.checked;
+  settings.draftVersion += 1;
+  settings.dirty = !!settings.saved && settings.draft !== settings.saved.enabled;
+  settings.message = "";
+  if (!settings.conflict && !settings.uncertain) settings.error = "";
+  renderUpstreamPeerSettings();
+}
+
+function cancelUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  settings.draftVersion += 1;
+  if (settings.saved) adoptUpstreamPeerSnapshot(settings, settings.saved, { replaceDraft: true });
+  settings.error = "";
+  settings.message = settings.uncertain ? "Save outcome is still unknown. Check status before saving again."
+    : settings.readFailed ? "Changes cancelled. Check status before saving again." : "Changes cancelled.";
+  renderUpstreamPeerSettings();
+}
+
+async function saveUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  const retryDurability = settings.saved?.status.blocked_reason === "persistence_uncertain";
+  if (!settings.saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading
+    || settings.readFailed || settings.conflict || settings.uncertain || settings.saved.status.blocked_reason === "invalid_configuration") return false;
+  const enabled = settings.draft;
+  const draftVersion = settings.draftVersion;
+  const baseline = settings.saved;
+  const ownsWrite = () => settings === state.upstreamPeerSettings && settings.sessionId === currentSessionId()
+    && settings.workspaceGeneration === workspaceStateGeneration;
+  settings.saving = true;
+  settings.readOwner += 1;
+  settings.error = "";
+  settings.message = "Saving setting…";
+  renderUpstreamPeerSettings();
+  let rejected = false;
+  try {
+    const response = await fetch(sessionWritePath("/api/transactions/upstream-peer-settings", settings.sessionId), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, expected_config_token: settings.baselineToken }),
+    });
+    if (!ownsWrite()) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        settings.readFailed = true;
+        settings.conflict = true;
+        settings.writeConflict = true;
+        settings.error = "This setting changed or the active session moved. Check status, then Cancel to review the saved setting.";
+        settings.message = "Setting was not saved.";
+        return false;
+      }
+      if (response.status >= 500) throw new Error("The save outcome is unknown. Check status before saving again.");
+      rejected = true;
+      await requireOkResponse(response, "Failed to save the upstream socket peer setting.");
+    }
+    const snapshot = validateUpstreamPeerAcknowledgement(
+      validateUpstreamPeerSnapshot(await response.json(), settings.sessionId), baseline, enabled,
+    );
+    if (!ownsWrite()) return false;
+    settings.baselineToken = snapshot.config_token;
+    adoptUpstreamPeerSnapshot(settings, snapshot, { replaceDraft: draftVersion === settings.draftVersion,
+      preserveDraft: draftVersion !== settings.draftVersion });
+    settings.dirty = settings.draft !== snapshot.enabled;
+    settings.conflict = false;
+    settings.message = "Setting saved. Changes apply to new exchanges.";
+    return true;
+  } catch (error) {
+    if (ownsWrite()) {
+      if (!rejected) settings.uncertain = { enabled, draftVersion };
+      settings.error = error?.message || "The save outcome is unknown. Check status before saving again.";
+      settings.message = rejected ? "Setting was not saved." : "The save will not be retried automatically.";
+    }
+    return false;
+  } finally {
+    if (ownsWrite()) { settings.saving = false; renderUpstreamPeerSettings(); }
+  }
+}
+
+function renderUpstreamPeerSettings() {
+  if (!els.upstreamPeerSection) return;
+  const settings = upstreamPeerSettingsState();
+  const saved = settings.saved;
+  const blocked = saved?.status.blocked_reason;
+  const retryDurability = blocked === "persistence_uncertain" && !settings.dirty;
+  els.upstreamPeerSession.textContent = state.activeSession?.name || settings.sessionId || "No active session";
+  els.upstreamPeerEnabled.checked = settings.draft;
+  els.upstreamPeerEnabled.disabled = !saved || blocked === "invalid_configuration";
+  els.upstreamPeerError.textContent = settings.error;
+  els.upstreamPeerSave.disabled = !saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading
+    || settings.readFailed || settings.conflict || !!settings.uncertain || blocked === "invalid_configuration";
+  els.upstreamPeerSave.textContent = settings.saving ? "Saving…" : retryDurability ? "Retry save" : "Save";
+  els.upstreamPeerCancel.disabled = !saved || (!settings.dirty && !settings.conflict);
+  els.upstreamPeerRefresh.classList.toggle("hidden", !(settings.error || settings.uncertain || settings.conflict || settings.readFailed));
+  els.upstreamPeerRefresh.disabled = settings.loading || settings.saving;
+  const parts = [];
+  if (!saved) parts.push(settings.loading ? "Loading saved setting…" : "Load the saved setting before making changes.");
+  if (saved) {
+    parts.push(`${blocked === "persistence_uncertain" ? "Current setting" : "Saved setting"}: ${saved.enabled ? "On" : "Off"}.`);
+    if (blocked === "persistence_uncertain") parts.push("Storage is unconfirmed. Peer recording is paused until a save succeeds.");
+    else if (blocked === "invalid_configuration") parts.push("The saved configuration is invalid or exhausted. Peer recording is off and this setting cannot be changed here.");
+    else if (blocked === "http_capture_paused") parts.push("HTTP capture is paused, so no new socket peers are being recorded.");
+    else if (saved.status.effective_enabled) parts.push("Recording peers for new captured HTTP(S) exchanges.");
+    if (settings.dirty) parts.push("Unsaved changes.");
+  }
+  if (settings.readFailed && !settings.message.includes("Check status before saving")) parts.push("Check status before saving.");
+  if (settings.message) parts.push(settings.message);
+  els.upstreamPeerStatus.textContent = parts.join(" ");
+}
+
 function historyRetentionSettingsState() {
   const sessionId = currentSessionId();
   let settings = state.historyRetentionSettings;
@@ -13622,6 +13853,7 @@ function renderHistoryRetentionSettings() {
 }
 
 function renderProxySettings() {
+  if (els.upstreamPeerSection) renderUpstreamPeerSettings();
   if (els.historyRetentionSection) renderHistoryRetentionSettings();
   if (!state.settings || !state.runtime) {
     // Data not ready — schedule a background load to self-heal

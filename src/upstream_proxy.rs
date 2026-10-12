@@ -7,6 +7,31 @@ use tokio::{
     net::TcpStream,
 };
 
+use crate::model::ObservedSocketPeerRoute;
+
+/// Only the routing inputs needed to label an existing response. Proxy URLs and
+/// credentials are deliberately not retained in the observation context.
+pub(crate) struct UpstreamProxyRouteSnapshot {
+    route: ObservedSocketPeerRoute,
+    bypass_hosts: Vec<String>,
+}
+
+impl UpstreamProxyRouteSnapshot {
+    pub(crate) fn route_for(&self, destination: &url::Url) -> ObservedSocketPeerRoute {
+        if bypasses_destination(destination, &self.bypass_hosts) {
+            ObservedSocketPeerRoute::Direct
+        } else {
+            self.route
+        }
+    }
+}
+
+fn bypasses_destination(destination: &url::Url, bypass_hosts: &[String]) -> bool {
+    destination
+        .host_str()
+        .is_some_and(|host| crate::scope::host_matches_any(host, bypass_hosts))
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpstreamProxy {
@@ -76,6 +101,22 @@ impl UpstreamProxy {
         url::Url::parse(&self.url).map_err(|_| anyhow::anyhow!("Invalid upstream proxy address"))
     }
 
+    pub(crate) fn route_snapshot(&self) -> UpstreamProxyRouteSnapshot {
+        let route = if !self.enabled {
+            ObservedSocketPeerRoute::Direct
+        } else {
+            match self.parsed_url().ok().as_ref().map(url::Url::scheme) {
+                Some("http") => ObservedSocketPeerRoute::HttpProxy,
+                Some("socks5" | "socks5h") => ObservedSocketPeerRoute::SocksProxy,
+                _ => ObservedSocketPeerRoute::Unknown,
+            }
+        };
+        UpstreamProxyRouteSnapshot {
+            route,
+            bypass_hosts: self.bypass_hosts.clone(),
+        }
+    }
+
     pub fn apply(&self, builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
         let builder = builder.no_proxy();
         if !self.enabled {
@@ -98,9 +139,7 @@ impl UpstreamProxy {
         // per request against the host reqwest is about to dial.
         let bypass_hosts = self.bypass_hosts.clone();
         let proxy = reqwest::Proxy::custom(move |destination| {
-            let direct = destination
-                .host_str()
-                .is_some_and(|host| crate::scope::host_matches_any(host, &bypass_hosts));
+            let direct = bypasses_destination(destination, &bypass_hosts);
             (!direct).then(|| url.clone())
         });
         Ok(builder.proxy(proxy))
@@ -216,5 +255,76 @@ impl UpstreamProxy {
             stream.read_exact(&mut vec![0; len + 2]).await?;
         }
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod peer_route_tests {
+    use super::*;
+
+    #[test]
+    fn observed_route_uses_shared_bypass_and_final_destination() {
+        let proxy = UpstreamProxy {
+            enabled: true,
+            url: "http://192.0.2.10:8080".into(),
+            bypass_hosts: vec!["*.example.com".into(), "[2001:db8::1]".into()],
+            ..Default::default()
+        };
+        let snapshot = proxy.route_snapshot();
+        for destination in [
+            "https://edited.example.com/path",
+            "https://example.com:8443/",
+            "http://[2001:db8::1]/",
+            "https://192.0.2.5/",
+        ] {
+            let destination = url::Url::parse(destination).unwrap();
+            let expected = if bypasses_destination(&destination, &proxy.bypass_hosts) {
+                ObservedSocketPeerRoute::Direct
+            } else {
+                ObservedSocketPeerRoute::HttpProxy
+            };
+            assert_eq!(snapshot.route_for(&destination), expected);
+        }
+        assert_eq!(
+            snapshot.route_for(&url::Url::parse("https://edited.example.com/").unwrap()),
+            ObservedSocketPeerRoute::Direct
+        );
+        assert_eq!(
+            snapshot.route_for(&url::Url::parse("https://192.0.2.5/").unwrap()),
+            ObservedSocketPeerRoute::HttpProxy
+        );
+    }
+
+    #[test]
+    fn observed_route_snapshots_do_not_follow_later_proxy_edits() {
+        let destination = url::Url::parse("https://example.com/").unwrap();
+        let mut proxy = UpstreamProxy::default();
+        let initial = proxy.route_snapshot();
+        proxy.enabled = true;
+        proxy.url = "socks5://192.0.2.10:1080".into();
+        let retry = proxy.route_snapshot();
+        proxy.url = "http://192.0.2.20:8080".into();
+        assert_eq!(
+            initial.route_for(&destination),
+            ObservedSocketPeerRoute::Direct
+        );
+        assert_eq!(
+            retry.route_for(&destination),
+            ObservedSocketPeerRoute::SocksProxy
+        );
+        assert_eq!(
+            proxy.route_snapshot().route_for(&destination),
+            ObservedSocketPeerRoute::HttpProxy
+        );
+        proxy.url = "socks5h://192.0.2.10:1080".into();
+        assert_eq!(
+            proxy.route_snapshot().route_for(&destination),
+            ObservedSocketPeerRoute::SocksProxy
+        );
+        proxy.url = "unrecognized".into();
+        assert_eq!(
+            proxy.route_snapshot().route_for(&destination),
+            ObservedSocketPeerRoute::Unknown
+        );
     }
 }

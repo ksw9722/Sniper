@@ -34,6 +34,32 @@
       return ["http:", "https:"].includes(url.protocol) ? url.origin : "";
     } catch (_) { return ""; }
   }
+  function normalizeSocketPeer(payload) {
+    // This extension is independently optional on older servers. Only typed
+    // socket observations enter the inspector; arbitrary record fields never do.
+    if (payload === undefined) return { status: "unsupported" };
+    if (!payload || !["observed", "not_recorded", "unavailable"].includes(payload.status)) return { status: "invalid" };
+    if (payload.status === "not_recorded") return payload.observation === null ? { status: "not_recorded" } : { status: "invalid" };
+    const observation = payload.observation;
+    if (!observation || observation.source !== "http_response_remote_addr"
+      || !["direct", "http_proxy", "socks_proxy", "unknown"].includes(observation.route)
+      || typeof observation.observed_at !== "string" || observation.observed_at.length > 40
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(observation.observed_at)
+      || !Number.isFinite(Date.parse(observation.observed_at.replace(/\.(\d{1,9})(?=Z|[+-])/, (_, digits) => `.${digits.slice(0, 3).padEnd(3, "0")}`)))) return { status: "invalid" };
+    const normalized = { status: payload.status, source: observation.source, observedAt: observation.observed_at, route: observation.route };
+    if (payload.status === "unavailable") return observation.address === null && observation.reason === "remote_addr_unavailable"
+      ? normalized : { status: "invalid" };
+    const address = observation.address;
+    if (observation.reason !== null || !address || typeof address.ip !== "string" || address.ip.length > 45
+      || !Number.isInteger(address.port) || address.port < 0 || address.port > 65535) return { status: "invalid" };
+    const ip = address.ip;
+    let validIp = /^(0|[1-9]\d{0,2})(?:\.(0|[1-9]\d{0,2})){3}$/.test(ip) && ip.split(".").every((part) => Number(part) <= 255);
+    if (!validIp && ip.includes(":") && /^[0-9a-fA-F:.]+$/.test(ip)) {
+      try { validIp = new URL(`http://[${ip}]/`).hostname.startsWith("["); } catch (_) { /* Invalid IPv6 literal. */ }
+    }
+    return validIp ? { ...normalized, ip, port: address.port } : { status: "invalid" };
+  }
+
   function normalizeBodyReferences(payload, sessionId, evidenceId, row) {
     const invalid = () => { throw new Error("Invalid retained body-reference response"); };
     const integer = (value, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && value >= 0 && value <= max;
@@ -213,7 +239,7 @@
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
-      evidenceLoading: false, evidenceError: "", evidenceId: null, page: 0, detailPage: 0,
+      evidenceLoading: false, evidenceError: "", evidenceId: null, socketPeer: null, page: 0, detailPage: 0,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       bodyReferencesSource: null, bodyReferenceOverlay: null, bodyOverlayNotice: "",
       historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "",
@@ -452,6 +478,7 @@
       evidenceAbort?.abort();
       evidenceAbort = null;
       state.evidence = null;
+      state.socketPeer = null;
       state.evidenceLoading = false;
       state.evidenceError = "";
       state.evidenceId = null;
@@ -580,7 +607,7 @@
       evidenceAbort = new AbortController();
       renderDetail();
       try {
-        const params = new URLSearchParams({ session_id: sessionId, evidence_id: id });
+        const params = new URLSearchParams({ session_id: sessionId, evidence_id: id, include_socket_peer: "true" });
         const response = await request(`/api/target/service-map/evidence?${params}`, { signal: evidenceAbort.signal });
         if (!response.ok) throw new Error("Evidence unavailable");
         const result = await response.json();
@@ -596,6 +623,7 @@
         if (result.available && source && (row.method !== source.method || safePath(row.path) !== source.path
           || row.sequence !== source.sequence || row.started_at !== source.startedAt)) throw new Error("Overlay source changed");
         state.evidence = result.available === true ? row : null;
+        state.socketPeer = state.evidence ? normalizeSocketPeer(result.socket_peer) : null;
         state.evidenceError = state.evidence ? "" : "Source unavailable. The retained row may have changed or been removed. Refresh the map to select current evidence.";
         state.evidenceLoading = false;
         if (!state.evidence && source) {
@@ -673,7 +701,6 @@
         status += ` · Newest capture-sequence window: ${snapshot.oldest_considered_at || "unknown"} to ${snapshot.latest_considered_at || "unknown"}`;
         if (state.scopeOnly) status += " · In scope only";
         if (state.stale) status += " · History changed: counts are from the previous snapshot";
-        if (state.loading) status += " · Refreshing…";
         if (state.snapshot.warningCount) status += ` · ${state.snapshot.warningCount} metadata notice(s)`;
       }
       els.status.textContent = state.error ? `${state.error}${snapshot ? ` ${status}` : ""}` : status;
@@ -819,6 +846,21 @@
       els.overlayStatus.classList.toggle("hidden", !overlay && !state.bodyOverlayNotice);
       replace(els.overlayStatus, overlay ? `<div><strong>Temporary body URL references</strong>${overlayProvenanceMarkup()}<p>Literal references only; no confirmed requests. Changes to history clear this view.</p></div><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-relation-origin="${escape(overlay.source.origin)}" data-service-relation-evidence="${escape(overlay.source.evidenceId)}" data-service-focus="body-references:source">View inspected source</button><button class="secondary-action" type="button" data-service-clear-body-references="clear" data-service-focus="body-references:clear">Clear body references</button></div>` : `<p role="status">${escape(state.bodyOverlayNotice)}</p>`);
     }
+    function socketPeerMarkup() {
+      const peer = state.socketPeer;
+      if (!peer) return "";
+      const heading = '<h4>Upstream socket peer</h4>';
+      let content;
+      if (peer.status === "not_recorded") content = '<p class="service-map-muted">Not recorded for this row.</p>';
+      else if (peer.status === "unsupported") content = '<p class="service-map-muted">Socket peer details are not available from this server.</p>';
+      else if (peer.status === "invalid") content = '<p class="service-map-error">Socket peer details could not be verified for this read.</p>';
+      else {
+        const route = { direct: "Direct", http_proxy: "HTTP proxy", socks_proxy: "SOCKS proxy", unknown: "Unknown" }[peer.route];
+        const address = peer.status === "observed" ? `${peer.ip.includes(":") ? `[${peer.ip}]` : peer.ip}:${peer.port}` : "Unavailable at response headers";
+        content = `<dl><dt>Observed socket peer</dt><dd>${escape(address)}</dd><dt>Route used</dt><dd>${escape(route)}</dd><dt>Response headers observed at</dt><dd>${escape(peer.observedAt)}</dd><dt>Source</dt><dd>HTTP client response remote address</dd></dl><p class="service-map-muted">This may identify an upstream proxy or internal address. It does not establish the origin’s IP address, DNS identity, or TLS certificate identity.</p>`;
+      }
+      return `<section class="service-map-socket-peer" aria-label="Upstream socket peer">${heading}${content}</section>`;
+    }
     function evidenceMarkup(origin) {
       const items = evidenceItems(origin);
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
@@ -826,7 +868,7 @@
       const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul><p>Exact retained source verified for this read.</p></div>` : "";
       return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
-        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? bodyReferencesMarkup() : ""}
+        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? socketPeerMarkup() + bodyReferencesMarkup() : ""}
         <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || '<p class="service-map-muted">No source samples are available in this bounded snapshot.</p>'}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
         ${!endpoint ? relationshipMarkup(origin) : ""}
         ${!endpoint && origin.technology_clues.length ? `<h4>Observed header clues</h4><p class="service-map-muted">${origin.technology_clues.map((clue) => escape(clue.name)).join(", ")} · response headers only</p>` : ""}`;
@@ -868,7 +910,7 @@
       const start = state.detailPage * API_PAGE_SIZE;
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, IP or certificate association is available.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. An optional observed socket peer is shown only in exact source evidence.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
     }
     function renderCatalog() {
       const entries = filteredOrigins().flatMap((origin) => origin.endpoints.map((endpoint, index) => ({ origin, endpoint, index })));
@@ -986,5 +1028,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeBodyReferences, BODY_REFERENCE_LIMITS, stableOrder, graphLayout, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS };
+  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeBodyReferences, normalizeSocketPeer, BODY_REFERENCE_LIMITS, stableOrder, graphLayout, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS };
 })(typeof window === "undefined" ? globalThis : window);

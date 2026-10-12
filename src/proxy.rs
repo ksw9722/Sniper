@@ -59,13 +59,15 @@ use crate::{
     },
     model::{
         BodyEncoding, EditableRequest, EditableResponse, HeaderRecord, MessageRecord,
-        OriginalRequest, RequestTargetOverride, TransactionRecord, WebSocketFrameDirection,
-        WebSocketFrameKind, WebSocketFrameRecord, WebSocketSessionRecord,
+        ObservedSocketPeer, ObservedSocketPeerRoute, OriginalRequest, RequestTargetOverride,
+        TransactionRecord, WebSocketFrameDirection, WebSocketFrameKind, WebSocketFrameRecord,
+        WebSocketSessionRecord,
     },
     runtime_state::{self, RuntimeStateSnapshot},
     session::SessionContext,
     special_host,
     state::AppState,
+    upstream_proxy::UpstreamProxyRouteSnapshot,
 };
 
 const REPLAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -90,6 +92,55 @@ struct ExecutedExchange {
     response: std::result::Result<UpstreamResponse, UpstreamError>,
 }
 
+/// Explicit caller provenance keeps Replay and WebSocket HTTP fallbacks out of
+/// passive capture even though they use the same buffered executor.
+enum SocketPeerCapture {
+    Disabled,
+    ForwardedHttp(UpstreamProxyRouteSnapshot),
+}
+
+struct FrozenSocketPeerCapture {
+    eligible: bool,
+    route: Option<UpstreamProxyRouteSnapshot>,
+}
+
+impl SocketPeerCapture {
+    async fn freeze(self, session: &SessionContext) -> FrozenSocketPeerCapture {
+        match self {
+            Self::Disabled => FrozenSocketPeerCapture {
+                eligible: false,
+                route: None,
+            },
+            Self::ForwardedHttp(route) => FrozenSocketPeerCapture {
+                eligible: session.upstream_peer_capture_eligible().await,
+                route: Some(route),
+            },
+        }
+    }
+}
+
+impl FrozenSocketPeerCapture {
+    fn use_attempt(&mut self, route: UpstreamProxyRouteSnapshot) {
+        // A fallback can build a client from newer proxy settings; eligibility
+        // still belongs to the first attempt and is never sampled again.
+        self.route = Some(route);
+    }
+
+    fn observe_response(&self, response: &reqwest::Response) -> Option<ObservedSocketPeer> {
+        self.eligible.then(|| {
+            ObservedSocketPeer::from_remote_addr(
+                Utc::now(),
+                self.route
+                    .as_ref()
+                    .map_or(ObservedSocketPeerRoute::Unknown, |route| {
+                        route.route_for(response.url())
+                    }),
+                response.remote_addr(),
+            )
+        })
+    }
+}
+
 struct StreamedRecordContext {
     state: Arc<AppState>,
     session: Arc<SessionContext>,
@@ -110,6 +161,7 @@ struct StreamedRecordContext {
     original_request_capture: Option<OriginalRequest>,
     request_version: Option<Version>,
     response_version: Version,
+    observed_socket_peer: Option<ObservedSocketPeer>,
     max_preview: usize,
 }
 
@@ -575,6 +627,7 @@ pub async fn try_send_replay_request_for_session(
         requested_http_version.or(Some(Version::HTTP_11)),
         requested_http_version,
         outbound_uri_authority.as_deref(),
+        SocketPeerCapture::Disabled,
     )
     .await;
 
@@ -2718,10 +2771,9 @@ async fn forward_http_request(
     // request, so its capture is not the true original once intercept changed it.
     let original_request_capture = intercept_original.or(match_replace_original);
 
-    let client = match build_client(
-        session.runtime.upstream_insecure().await,
-        &session.runtime.upstream_proxy().await,
-    ) {
+    let upstream_insecure = session.runtime.upstream_insecure().await;
+    let upstream_proxy = session.runtime.upstream_proxy().await;
+    let client = match build_client(upstream_insecure, &upstream_proxy) {
         Ok(client) => client,
         Err(_) => {
             return text_response_for_method(
@@ -2745,6 +2797,7 @@ async fn forward_http_request(
             Some(request_http_version),
             None,
             None,
+            SocketPeerCapture::ForwardedHttp(upstream_proxy.route_snapshot()),
         )
         .await;
     }
@@ -2763,6 +2816,7 @@ async fn forward_http_request(
         Some(request_http_version),
         None,
         None,
+        SocketPeerCapture::ForwardedHttp(upstream_proxy.route_snapshot()),
     )
     .await;
     let mut record = exchange.record.clone();
@@ -2911,6 +2965,7 @@ async fn forward_websocket_request(
             Some(request_http_version),
             None,
             None,
+            SocketPeerCapture::Disabled,
         )
         .await;
         let record = exchange.record.clone();
@@ -2993,6 +3048,7 @@ async fn forward_websocket_request(
             Some(request_http_version),
             None,
             None,
+            SocketPeerCapture::Disabled,
         )
         .await;
         let record = exchange.record.clone();
@@ -3657,6 +3713,7 @@ async fn execute_streaming_http_exchange(
     request_http_version: Option<Version>,
     requested_http_version: Option<Version>,
     outbound_uri_authority: Option<&str>,
+    peer_capture: SocketPeerCapture,
 ) -> Response<Body> {
     let request_headers = header_map_from_records(&request.headers);
     let request_body = request.body_bytes();
@@ -3754,13 +3811,16 @@ async fn execute_streaming_http_exchange(
     // Same legacy-TLS retry as the buffered path: whether a response streams is
     // decided before the connection is made, so a host that only speaks legacy
     // TLS can arrive on either path.
+    // Sample the pinned session once immediately before the first exchange.
+    let mut peer_capture = peer_capture.freeze(&session).await;
     let mut send_result = build_outbound(client).send().await;
     if let Err(error) = &send_result {
         if should_retry_over_legacy_tls(error, absolute_uri.scheme_str()) {
             let upstream_insecure = session.runtime.upstream_insecure().await;
-            if let Some(legacy_client) =
-                build_legacy_tls_client(upstream_insecure, &session.runtime.upstream_proxy().await)
+            let upstream_proxy = session.runtime.upstream_proxy().await;
+            if let Some(legacy_client) = build_legacy_tls_client(upstream_insecure, &upstream_proxy)
             {
+                peer_capture.use_attempt(upstream_proxy.route_snapshot());
                 let retried = build_outbound(&legacy_client).send().await;
                 if retried.is_ok() {
                     notes.push(
@@ -3775,6 +3835,7 @@ async fn execute_streaming_http_exchange(
 
     match send_result {
         Ok(response) => {
+            let observed_socket_peer = peer_capture.observe_response(&response);
             let status = response.status();
             let response_version = response.version();
             let response_headers = response.headers().clone();
@@ -3814,7 +3875,8 @@ async fn execute_streaming_http_exchange(
                     ),
                     request_http_version,
                     Some(Version::HTTP_11),
-                );
+                )
+                .with_observed_socket_peer(observed_socket_peer);
                 store_record_and_scan(&state, &session, record).await;
                 return response;
             }
@@ -3842,6 +3904,7 @@ async fn execute_streaming_http_exchange(
                 original_request_capture,
                 request_version: request_http_version,
                 response_version,
+                observed_socket_peer,
                 max_preview: state.config.body_preview_bytes,
             };
 
@@ -4131,6 +4194,7 @@ impl StreamedRecordContext {
             self.request_version,
             Some(self.response_version),
         )
+        .with_observed_socket_peer(self.observed_socket_peer.clone())
     }
 }
 
@@ -4147,6 +4211,7 @@ async fn execute_http_exchange(
     request_http_version: Option<Version>,
     requested_http_version: Option<Version>,
     outbound_uri_authority: Option<&str>,
+    peer_capture: SocketPeerCapture,
 ) -> ExecutedExchange {
     let request_headers = header_map_from_records(&request.headers);
     let request_body = request.body_bytes();
@@ -4293,13 +4358,16 @@ async fn execute_http_exchange(
         request_builder
     };
 
+    // Sample the pinned session once immediately before the first exchange.
+    let mut peer_capture = peer_capture.freeze(&session).await;
     let mut send_result = build_outbound(client).send().await;
     if let Err(error) = &send_result {
         if should_retry_over_legacy_tls(error, absolute_uri.scheme_str()) {
             let upstream_insecure = session.runtime.upstream_insecure().await;
-            if let Some(legacy_client) =
-                build_legacy_tls_client(upstream_insecure, &session.runtime.upstream_proxy().await)
+            let upstream_proxy = session.runtime.upstream_proxy().await;
+            if let Some(legacy_client) = build_legacy_tls_client(upstream_insecure, &upstream_proxy)
             {
+                peer_capture.use_attempt(upstream_proxy.route_snapshot());
                 let retried = build_outbound(&legacy_client).send().await;
                 if retried.is_ok() {
                     notes.push(
@@ -4312,8 +4380,44 @@ async fn execute_http_exchange(
         }
     }
 
+    finish_buffered_http_exchange(
+        state,
+        session,
+        request,
+        method,
+        path,
+        started_at,
+        started,
+        notes,
+        request_capture,
+        original_request_capture,
+        request_http_version,
+        send_result,
+        peer_capture,
+    )
+    .await
+}
+
+// Keep response processing separate from dialing so failures after headers can
+// be verified using synthetic responses without opening an upstream connection.
+async fn finish_buffered_http_exchange(
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    request: EditableRequest,
+    method: Method,
+    path: String,
+    started_at: chrono::DateTime<Utc>,
+    started: Instant,
+    mut notes: Vec<String>,
+    request_capture: MessageRecord,
+    original_request_capture: Option<OriginalRequest>,
+    request_http_version: Option<Version>,
+    send_result: std::result::Result<reqwest::Response, reqwest::Error>,
+    peer_capture: FrozenSocketPeerCapture,
+) -> ExecutedExchange {
     match send_result {
         Ok(response) => {
+            let observed_socket_peer = peer_capture.observe_response(&response);
             let status = response.status();
             let resp_version = response.version();
             let response_headers = response.headers().clone();
@@ -4353,7 +4457,8 @@ async fn execute_http_exchange(
                         ),
                         request_http_version,
                         Some(Version::HTTP_11),
-                    ),
+                    )
+                    .with_observed_socket_peer(observed_socket_peer),
                     response: Err(UpstreamError {
                         status: StatusCode::BAD_GATEWAY,
                         message,
@@ -4415,7 +4520,8 @@ async fn execute_http_exchange(
                             ),
                             request_http_version,
                             Some(resp_version),
-                        ),
+                        )
+                        .with_observed_socket_peer(observed_socket_peer),
                         response: Ok(UpstreamResponse {
                             status,
                             headers: applied_response.headers,
@@ -4459,7 +4565,8 @@ async fn execute_http_exchange(
                             ),
                             request_http_version,
                             Some(Version::HTTP_11),
-                        ),
+                        )
+                        .with_observed_socket_peer(observed_socket_peer),
                         response: Err(UpstreamError {
                             status: StatusCode::BAD_GATEWAY,
                             message,
@@ -6494,6 +6601,500 @@ mod tests {
     use crate::model::{HeaderRecord, TransactionRecord};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn synthetic_peer_response(status: u16, body: reqwest::Body) -> reqwest::Response {
+        use reqwest::ResponseBuilderExt;
+        http::Response::builder()
+            .status(status)
+            .url(url::Url::parse("https://example.com/final").unwrap())
+            .body(body)
+            .unwrap()
+            .into()
+    }
+
+    fn enabled_peer_capture() -> FrozenSocketPeerCapture {
+        FrozenSocketPeerCapture {
+            eligible: true,
+            route: Some(crate::upstream_proxy::UpstreamProxy::default().route_snapshot()),
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_peer_loopback_buffered_and_streamed_forwarding_records_listener_endpoint() {
+        let _global_proxy_work = GLOBAL_PROXY_WORK_TEST_LOCK.lock().await;
+        let (state, data_dir) = test_proxy_state("sniper-loopback-peer-capture");
+        let session = state.session().await;
+        let mut scanner = session.scanner.get_config().await;
+        scanner.enabled = false;
+        session.scanner.update_config(scanner).await;
+        session
+            .runtime
+            .set_upstream_peer_capture_config(true, Some(1))
+            .await;
+
+        // Both literal-IP requests stay inside this ephemeral fixture. The
+        // ordinary forwarding client disables environment proxies in apply().
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request_head = Vec::new();
+                while !request_head.ends_with(b"\r\n\r\n") {
+                    request_head.push(stream.read_u8().await.unwrap());
+                    assert!(request_head.len() < 16 * 1024);
+                }
+                stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsynthetic",
+                ).await.unwrap();
+            }
+        });
+
+        let mut captured = Vec::new();
+        for (buffered, path) in [(true, "/buffered"), (false, "/streamed")] {
+            let rules = if buffered {
+                // A non-matching response rule selects the production buffered
+                // path without changing the fixture's headers or bytes.
+                vec![crate::match_replace::MatchReplaceRule {
+                    id: Uuid::new_v4(),
+                    enabled: true,
+                    description: "Synthetic buffering selector".into(),
+                    scope: crate::match_replace::MatchReplaceScope::Response,
+                    target: crate::match_replace::MatchReplaceTarget::Body,
+                    search: "fixture-no-match".into(),
+                    replace: "unused".into(),
+                    regex: false,
+                    case_sensitive: true,
+                }]
+            } else {
+                Vec::new()
+            };
+            session.match_replace.replace_all(rules).await;
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!("http://{upstream_addr}{path}"))
+                .header(HOST, upstream_addr.to_string())
+                .body(())
+                .unwrap();
+            let (parts, _) = request.into_parts();
+            let absolute_uri = parts.uri.clone();
+            let editable = editable_request_from_parts(&parts, &Bytes::new(), &absolute_uri);
+            assert_eq!(
+                should_stream_upstream_response(&session, &editable).await,
+                !buffered
+            );
+            let before = Utc::now();
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                forward_http_request(
+                    parts,
+                    Bytes::new(),
+                    absolute_uri,
+                    state.clone(),
+                    session.clone(),
+                    "127.0.0.1:40123".parse().unwrap(),
+                    before,
+                    Instant::now(),
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+                .await
+                .unwrap()
+                .unwrap()
+                .to_bytes();
+            assert_eq!(body.as_ref(), b"synthetic");
+
+            let rows = session
+                .store
+                .list(&crate::store::ListFilters::default())
+                .await;
+            let summary = rows.iter().find(|row| row.path == path).unwrap();
+            let record = session.store.get(summary.id).await.unwrap();
+            let peer = record.observed_socket_peer.as_ref().unwrap();
+            assert_eq!(
+                peer.source,
+                crate::model::ObservedSocketPeerSource::HttpResponseRemoteAddr
+            );
+            assert_eq!(peer.route, ObservedSocketPeerRoute::Direct);
+            assert_eq!(
+                peer.address,
+                Some(crate::model::ObservedSocketPeerAddress {
+                    ip: upstream_addr.ip(),
+                    port: upstream_addr.port(),
+                })
+            );
+            assert!(peer.reason.is_none());
+            assert!(peer.observed_at >= before && peer.observed_at <= Utc::now());
+            assert!(peer.is_valid());
+            assert_eq!(record.status, Some(503));
+            assert_eq!(record.response.as_ref().unwrap().body_preview, "synthetic");
+            assert!(serde_json::to_value(summary)
+                .unwrap()
+                .get("observed_socket_peer")
+                .is_none());
+            let full_json = serde_json::to_value(&record).unwrap();
+            assert_eq!(
+                full_json["observed_socket_peer"]["address"]["port"],
+                upstream_addr.port()
+            );
+            captured.push((record.id, peer.clone()));
+        }
+        tokio::time::timeout(Duration::from_secs(5), upstream)
+            .await
+            .unwrap()
+            .unwrap();
+        drain_proxy_connections(Duration::from_secs(1)).await;
+        let reloaded = state.sessions.load_context(session.id()).unwrap();
+        for (id, peer) in captured {
+            assert_eq!(
+                reloaded.store.get(id).await.unwrap().observed_socket_peer,
+                Some(peer)
+            );
+        }
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    fn synthetic_stream_context(
+        state: Arc<AppState>,
+        session: Arc<SessionContext>,
+        response: &reqwest::Response,
+        peer_capture: &FrozenSocketPeerCapture,
+    ) -> StreamedRecordContext {
+        StreamedRecordContext {
+            _session_owner: remember_active_proxy_session_owner(
+                session.id(),
+                PROXY_WORK_STREAMED_RESPONSE,
+            ),
+            persist_generation: remember_persist_context(&session),
+            state,
+            session,
+            record_id: None,
+            _record_protection: None,
+            started_at: Utc::now(),
+            started: Instant::now(),
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "example.com".into(),
+            path: "/".into(),
+            status: response.status(),
+            request_capture: MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+            response_headers: response.headers().clone(),
+            notes: Vec::new(),
+            original_request_capture: None,
+            request_version: Some(Version::HTTP_11),
+            response_version: response.version(),
+            observed_socket_peer: peer_capture.observe_response(response),
+            max_preview: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_peer_survives_synthetic_stream_body_failure_and_pause() {
+        let _global_proxy_work = GLOBAL_PROXY_WORK_TEST_LOCK.lock().await;
+        let (state, data_dir) = test_proxy_state("sniper-synthetic-peer-stream-error");
+        let session = state.session().await;
+        let mut scanner = session.scanner.get_config().await;
+        scanner.enabled = false;
+        session.scanner.update_config(scanner).await;
+        let response = synthetic_peer_response(
+            503,
+            reqwest::Body::wrap_stream(futures_util::stream::iter([Err::<Bytes, _>(
+                std::io::Error::other("synthetic stream body failure"),
+            )])),
+        );
+        let mut context = synthetic_stream_context(
+            state.clone(),
+            session.clone(),
+            &response,
+            &enabled_peer_capture(),
+        );
+        let observed_socket_peer = context.observed_socket_peer.clone();
+        context.insert_provisional_record().await;
+        let record_id = context.record_id.unwrap();
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(stream_upstream_response_body(response, context)
+            .collect()
+            .await
+            .is_err());
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let record = session.store.get(record_id).await.unwrap();
+                if record
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("Failed to read upstream response body:"))
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.observed_socket_peer, observed_socket_peer);
+        assert_eq!(completed.status, Some(503));
+        drain_proxy_connections(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn socket_peer_does_not_appear_when_paused_stream_is_inserted_after_resume() {
+        let _global_proxy_work = GLOBAL_PROXY_WORK_TEST_LOCK.lock().await;
+        let (state, data_dir) = test_proxy_state("sniper-synthetic-peer-stream-resume");
+        let session = state.session().await;
+        let mut scanner = session.scanner.get_config().await;
+        scanner.enabled = false;
+        session.scanner.update_config(scanner).await;
+        session
+            .runtime
+            .set_upstream_peer_capture_config(true, Some(1))
+            .await;
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let peer_capture = SocketPeerCapture::ForwardedHttp(
+            crate::upstream_proxy::UpstreamProxy::default().route_snapshot(),
+        )
+        .freeze(&session)
+        .await;
+        let response = synthetic_peer_response(200, reqwest::Body::from("synthetic"));
+        let mut context =
+            synthetic_stream_context(state.clone(), session.clone(), &response, &peer_capture);
+        context.insert_provisional_record().await;
+        assert!(context.record_id.is_none());
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        context.store(b"synthetic".to_vec(), 9).await;
+        let rows = session
+            .store
+            .list(&crate::store::ListFilters::default())
+            .await;
+        assert_eq!(rows.len(), 1);
+        let record = session.store.get(rows[0].id).await.unwrap();
+        assert!(record.observed_socket_peer.is_none());
+        drain_proxy_connections(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn socket_peer_eligibility_is_frozen_across_toggle_pause_and_retry() {
+        let (state, data_dir) = test_proxy_state("sniper-synthetic-peer-policy");
+        let session = state.session().await;
+        let forward = || {
+            SocketPeerCapture::ForwardedHttp(
+                crate::upstream_proxy::UpstreamProxy::default().route_snapshot(),
+            )
+        };
+        let off_at_start = forward().freeze(&session).await;
+        session
+            .runtime
+            .set_upstream_peer_capture_config(true, Some(1))
+            .await;
+        let on_at_start = forward().freeze(&session).await;
+        let mut excluded = SocketPeerCapture::Disabled.freeze(&session).await;
+        session
+            .runtime
+            .set_upstream_peer_capture_config(false, Some(2))
+            .await;
+
+        let response = synthetic_peer_response(503, reqwest::Body::from("synthetic"));
+        assert!(off_at_start.observe_response(&response).is_none());
+        assert!(on_at_start.observe_response(&response).is_some());
+        assert!(excluded.observe_response(&response).is_none());
+        excluded.use_attempt(crate::upstream_proxy::UpstreamProxy::default().route_snapshot());
+        assert!(excluded.observe_response(&response).is_none());
+
+        session
+            .runtime
+            .set_upstream_peer_capture_config(true, Some(3))
+            .await;
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut paused_at_start = forward().freeze(&session).await;
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let retry_proxy = crate::upstream_proxy::UpstreamProxy {
+            enabled: true,
+            url: "socks5h://192.0.2.1:1080".into(),
+            ..Default::default()
+        };
+        paused_at_start.use_attempt(retry_proxy.route_snapshot());
+        assert!(paused_at_start.observe_response(&response).is_none());
+        assert!(forward()
+            .freeze(&session)
+            .await
+            .observe_response(&response)
+            .is_some());
+
+        let mut retried = on_at_start;
+        retried.use_attempt(retry_proxy.route_snapshot());
+        let observation = retried.observe_response(&response).unwrap();
+        assert_eq!(observation.route, ObservedSocketPeerRoute::SocksProxy);
+        assert_eq!(
+            observation.reason,
+            Some(crate::model::ObservedSocketPeerReason::RemoteAddrUnavailable)
+        );
+        assert!(observation.address.is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn socket_peer_uses_response_url_and_original_attempt_snapshot() {
+        let mut proxy = crate::upstream_proxy::UpstreamProxy {
+            enabled: true,
+            url: "http://192.0.2.1:8080".into(),
+            bypass_hosts: vec!["example.com".into()],
+            ..Default::default()
+        };
+        let frozen = FrozenSocketPeerCapture {
+            eligible: true,
+            route: Some(proxy.route_snapshot()),
+        };
+        proxy.bypass_hosts.clear();
+        let response = synthetic_peer_response(200, reqwest::Body::from("synthetic"));
+        assert_eq!(
+            frozen.observe_response(&response).unwrap().route,
+            ObservedSocketPeerRoute::Direct
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_peer_survives_buffered_body_and_encoding_failure() {
+        let (state, data_dir) = test_proxy_state("sniper-synthetic-peer-buffered");
+        let session = state.session().await;
+        let normal = synthetic_peer_response(503, reqwest::Body::from("synthetic"));
+        let failing_body =
+            reqwest::Body::wrap_stream(futures_util::stream::iter([Err::<Bytes, _>(
+                std::io::Error::other("synthetic body failure"),
+            )]));
+        let body_failure = synthetic_peer_response(200, failing_body);
+        use reqwest::ResponseBuilderExt;
+        let encoding_failure = http::Response::builder()
+            .status(200)
+            .url(url::Url::parse("https://example.com/final").unwrap())
+            .header(TRANSFER_ENCODING, "gzip")
+            .body(reqwest::Body::from("synthetic"))
+            .unwrap()
+            .into();
+        for (response, expected_status) in
+            [(normal, 503), (body_failure, 502), (encoding_failure, 502)]
+        {
+            let before = Utc::now();
+            let record = captured_transaction("example.com");
+            let request = record.editable_request();
+            let exchange = finish_buffered_http_exchange(
+                state.clone(),
+                session.clone(),
+                request,
+                Method::GET,
+                "/".into(),
+                before,
+                Instant::now(),
+                Vec::new(),
+                record.request,
+                None,
+                Some(Version::HTTP_11),
+                Ok(response),
+                enabled_peer_capture(),
+            )
+            .await;
+            assert_eq!(exchange.record.status, Some(expected_status));
+            let peer = exchange.record.observed_socket_peer.as_ref().unwrap();
+            assert_eq!(peer.route, ObservedSocketPeerRoute::Direct);
+            assert!(peer.observed_at >= before && peer.observed_at <= Utc::now());
+            assert!(peer.is_valid());
+        }
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn socket_peer_is_absent_before_upstream_headers() {
+        let (state, data_dir) = test_proxy_state("sniper-synthetic-peer-presend");
+        let session = state.session().await;
+        let record = captured_transaction("example.com");
+        let request = record.editable_request();
+        let error = reqwest::Client::new()
+            .get("invalid URL")
+            .build()
+            .unwrap_err();
+        let exchange = finish_buffered_http_exchange(
+            state,
+            session,
+            request,
+            Method::GET,
+            "/".into(),
+            Utc::now(),
+            Instant::now(),
+            Vec::new(),
+            record.request,
+            None,
+            Some(Version::HTTP_11),
+            Err(error),
+            enabled_peer_capture(),
+        )
+        .await;
+        assert!(exchange.record.observed_socket_peer.is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn streamed_completion_preserves_inserted_observation_and_summary_privacy() {
+        let peer = ObservedSocketPeer::from_remote_addr(
+            Utc::now(),
+            ObservedSocketPeerRoute::Direct,
+            Some("192.0.2.1:443".parse().unwrap()),
+        );
+        let mut stored =
+            captured_transaction("example.com").with_observed_socket_peer(Some(peer.clone()));
+        let mut completion = stored.clone();
+        completion.status = Some(502);
+        completion.notes.push("synthetic body failure".into());
+        completion.observed_socket_peer = None;
+        apply_streamed_record_update(&mut stored, &completion);
+        assert_eq!(stored.observed_socket_peer, Some(peer.clone()));
+        assert_eq!(stored.status, Some(502));
+        assert!(serde_json::to_value(stored.summary())
+            .unwrap()
+            .get("observed_socket_peer")
+            .is_none());
+        let another = captured_transaction("example.com").with_observed_socket_peer(Some(peer));
+        assert_ne!(another.id, stored.id);
+        assert_eq!(another.observed_socket_peer, stored.observed_socket_peer);
+    }
+
     fn record(name: &str, value: &str) -> HeaderRecord {
         HeaderRecord {
             name: name.to_string(),
@@ -7074,6 +7675,7 @@ mod tests {
             original_request_capture: None,
             request_version: Some(Version::HTTP_11),
             response_version: Version::HTTP_11,
+            observed_socket_peer: None,
             max_preview: 1024,
         };
 
@@ -7113,6 +7715,11 @@ mod tests {
         scanner_config.enabled = false;
         session.scanner.update_config(scanner_config).await;
 
+        let observed_socket_peer = Some(ObservedSocketPeer::from_remote_addr(
+            Utc::now(),
+            ObservedSocketPeerRoute::HttpProxy,
+            Some("[2001:db8::1]:8080".parse().unwrap()),
+        ));
         let request_capture = MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024);
         let persist_generation = remember_persist_context(&session);
         let mut context = StreamedRecordContext {
@@ -7138,6 +7745,7 @@ mod tests {
             original_request_capture: None,
             request_version: Some(Version::HTTP_11),
             response_version: Version::HTTP_11,
+            observed_socket_peer: observed_socket_peer.clone(),
             max_preview: 1024,
         };
 
@@ -7151,6 +7759,7 @@ mod tests {
             .await
             .expect("provisional record should be visible");
         assert_eq!(provisional.response.as_ref().unwrap().body_size, 0);
+        assert_eq!(provisional.observed_socket_peer, observed_socket_peer);
         assert!(provisional
             .notes
             .iter()
@@ -7177,6 +7786,7 @@ mod tests {
             .await
             .expect("final record should keep provisional id");
         assert_eq!(final_record.response.as_ref().unwrap().body_size, 8);
+        assert_eq!(final_record.observed_socket_peer, observed_socket_peer);
         assert_eq!(final_record.notes, vec!["done"]);
         assert_eq!(final_record.user_note.as_deref(), Some("keep me"));
         drain_proxy_connections(Duration::from_secs(1)).await;
@@ -8927,6 +9537,10 @@ mod tests {
     async fn http_special_host_head_exchange_records_empty_response_body() {
         let (state, data_dir) = test_proxy_state("sniper-http-special-host-head");
         let session = state.session().await;
+        session
+            .runtime
+            .set_upstream_peer_capture_config(true, Some(1))
+            .await;
         let request = EditableRequest {
             scheme: "http".to_string(),
             host: "sniper".to_string(),
@@ -8951,9 +9565,13 @@ mod tests {
             Some(Version::HTTP_11),
             None,
             None,
+            SocketPeerCapture::ForwardedHttp(
+                crate::upstream_proxy::UpstreamProxy::default().route_snapshot(),
+            ),
         )
         .await;
 
+        assert!(exchange.record.observed_socket_peer.is_none());
         assert_eq!(
             exchange
                 .record

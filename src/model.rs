@@ -2,7 +2,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Read};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    net::{IpAddr, SocketAddr},
+};
 use uuid::Uuid;
 
 const MAX_DECODED_CONTENT_BYTES: usize = 16 * 1024 * 1024;
@@ -331,6 +335,91 @@ pub struct OriginalRequest {
     pub path: String,
 }
 
+/// A single socket-peer observation at upstream response headers. This is not
+/// origin identity, a DNS result, or evidence of a new connection/handshake.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSocketPeer {
+    pub source: ObservedSocketPeerSource,
+    pub observed_at: DateTime<Utc>,
+    pub route: ObservedSocketPeerRoute,
+    #[serde(default)]
+    pub address: Option<ObservedSocketPeerAddress>,
+    #[serde(default)]
+    pub reason: Option<ObservedSocketPeerReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedSocketPeerSource {
+    HttpResponseRemoteAddr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedSocketPeerRoute {
+    Direct,
+    HttpProxy,
+    SocksProxy,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSocketPeerAddress {
+    pub ip: IpAddr,
+    pub port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedSocketPeerReason {
+    RemoteAddrUnavailable,
+}
+
+impl ObservedSocketPeer {
+    pub fn is_valid(&self) -> bool {
+        self.address.is_some() != self.reason.is_some()
+            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= 512)
+    }
+
+    pub fn from_remote_addr(
+        observed_at: DateTime<Utc>,
+        route: ObservedSocketPeerRoute,
+        remote_addr: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            source: ObservedSocketPeerSource::HttpResponseRemoteAddr,
+            observed_at,
+            route,
+            address: remote_addr.map(|address| ObservedSocketPeerAddress {
+                ip: address.ip(),
+                port: address.port(),
+            }),
+            reason: remote_addr
+                .is_none()
+                .then_some(ObservedSocketPeerReason::RemoteAddrUnavailable),
+        }
+    }
+}
+
+/// Reject an unknown or malformed extension without losing the surrounding
+/// historical transaction (or its session). No imported free-form fields survive.
+fn deserialize_observed_socket_peer<'de, D>(
+    deserializer: D,
+) -> Result<Option<ObservedSocketPeer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 512) {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<ObservedSocketPeer>(value)
+        .ok()
+        .filter(ObservedSocketPeer::is_valid))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactionRecord {
     pub id: Uuid,
@@ -374,6 +463,14 @@ pub struct TransactionRecord {
     pub http_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_http_version: Option<String>,
+    /// Fixed when the record is first inserted; never refreshed from settings or
+    /// a later network request when the record is read or its body completes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_observed_socket_peer"
+    )]
+    pub observed_socket_peer: Option<ObservedSocketPeer>,
 }
 
 impl TransactionRecord {
@@ -423,11 +520,17 @@ impl TransactionRecord {
             original_response,
             http_version: None,
             response_http_version: None,
+            observed_socket_peer: None,
         }
     }
 
     pub fn with_request_http_version(mut self, version: http::Version) -> Self {
         self.http_version = Some(format_http_version(version));
+        self
+    }
+
+    pub(crate) fn with_observed_socket_peer(mut self, peer: Option<ObservedSocketPeer>) -> Self {
+        self.observed_socket_peer = peer;
         self
     }
 
@@ -484,6 +587,7 @@ impl TransactionRecord {
             original_response: None,
             http_version: None,
             response_http_version: None,
+            observed_socket_peer: None,
         }
     }
 
@@ -980,6 +1084,147 @@ mod tests {
     };
     use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, UPGRADE};
     use std::io::Write;
+
+    fn peer_test_record() -> TransactionRecord {
+        TransactionRecord::http(
+            Utc::now(),
+            "GET".into(),
+            "https".into(),
+            "example.com".into(),
+            "/".into(),
+            Some(200),
+            0,
+            MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 1024),
+            None,
+            Vec::new(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn observed_socket_peer_is_bounded_typed_and_round_trips() {
+        for remote_addr in [
+            Some("192.0.2.1:65535".parse().unwrap()),
+            Some(
+                "[2001:db8:ffff:ffff:ffff:ffff:ffff:ffff]:65535"
+                    .parse()
+                    .unwrap(),
+            ),
+            None,
+        ] {
+            for route in [
+                ObservedSocketPeerRoute::Direct,
+                ObservedSocketPeerRoute::HttpProxy,
+                ObservedSocketPeerRoute::SocksProxy,
+                ObservedSocketPeerRoute::Unknown,
+            ] {
+                let peer = ObservedSocketPeer::from_remote_addr(
+                    DateTime::<Utc>::MAX_UTC,
+                    route,
+                    remote_addr,
+                );
+                assert!(peer.is_valid());
+                let json = serde_json::to_value(&peer).unwrap();
+                assert_eq!(json.as_object().unwrap().len(), 5);
+                assert!(json.get("address").is_some());
+                assert!(json.get("reason").is_some());
+                assert_eq!(json["address"].is_null(), remote_addr.is_none());
+                assert_eq!(json["reason"].is_null(), remote_addr.is_some());
+                assert!(serde_json::to_vec(&peer).unwrap().len() <= 512);
+                let record = peer_test_record().with_observed_socket_peer(Some(peer.clone()));
+                let loaded: TransactionRecord =
+                    serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+                assert_eq!(loaded.observed_socket_peer, Some(peer));
+                assert!(serde_json::to_value(record.summary())
+                    .unwrap()
+                    .get("observed_socket_peer")
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_record_and_tunnel_omit_observed_socket_peer() {
+        let record = peer_test_record();
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("observed_socket_peer").is_none());
+        let loaded: TransactionRecord = serde_json::from_value(json).unwrap();
+        assert!(loaded.observed_socket_peer.is_none());
+        let tunnel = TransactionRecord::tunnel(
+            Utc::now(),
+            "example.com:443".into(),
+            Some(200),
+            0,
+            record.request,
+            Vec::new(),
+        );
+        assert!(tunnel.observed_socket_peer.is_none());
+        assert!(serde_json::to_value(tunnel)
+            .unwrap()
+            .get("observed_socket_peer")
+            .is_none());
+    }
+
+    #[test]
+    fn observed_socket_peer_does_not_store_ipv6_scope_or_flow_information() {
+        let socket = std::net::SocketAddrV6::new("2001:db8::1".parse().unwrap(), 443, 123, 7);
+        let peer = ObservedSocketPeer::from_remote_addr(
+            Utc::now(),
+            ObservedSocketPeerRoute::Direct,
+            Some(SocketAddr::V6(socket)),
+        );
+        let address = serde_json::to_value(peer).unwrap()["address"].clone();
+        assert_eq!(address, serde_json::json!({"ip":"2001:db8::1", "port":443}));
+    }
+
+    #[test]
+    fn malformed_peer_extension_does_not_discard_its_transaction() {
+        let valid = serde_json::to_value(ObservedSocketPeer::from_remote_addr(
+            Utc::now(),
+            ObservedSocketPeerRoute::Direct,
+            Some("192.0.2.2:443".parse().unwrap()),
+        ))
+        .unwrap();
+        let mut cases = vec![
+            serde_json::Value::Null,
+            serde_json::json!("invalid"),
+            serde_json::json!({}),
+        ];
+        for (key, value) in [
+            ("source", serde_json::json!("tls_handshake")),
+            ("route", serde_json::json!("origin")),
+            ("reason", serde_json::json!("remote_addr_unavailable")),
+            ("observed_at", serde_json::json!("not-a-time")),
+            (
+                "address",
+                serde_json::json!({"ip":"example.com", "port":443}),
+            ),
+            (
+                "address",
+                serde_json::json!({"ip":"192.0.2.1", "port":65536}),
+            ),
+            (
+                "address",
+                serde_json::json!({"ip":"192.0.2.1", "port":443, "hostname":"example.com"}),
+            ),
+            ("address", serde_json::Value::Null),
+            ("proxy_url", serde_json::json!("http://example.com:8080")),
+            ("unbounded", serde_json::json!("x".repeat(513))),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            cases.push(invalid);
+        }
+        for invalid in cases {
+            let record = peer_test_record();
+            let mut json = serde_json::to_value(&record).unwrap();
+            json["observed_socket_peer"] = invalid;
+            let loaded: TransactionRecord = serde_json::from_value(json).unwrap();
+            assert_eq!(loaded.id, record.id);
+            assert!(loaded.observed_socket_peer.is_none());
+        }
+    }
 
     fn gzip(body: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());

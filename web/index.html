@@ -757,6 +757,19 @@
           </section>
 
           <section class="proxy-panel hidden" id="proxySettingsPanel">
+            <section class="panel-card upstream-peer-card" id="upstreamPeerSection" aria-labelledby="upstreamPeerHeading">
+              <header class="panel-toolbar">
+                <div><h2 id="upstreamPeerHeading">Upstream socket peer</h2><p>Current session: <strong id="upstreamPeerSession">Loading…</strong></p></div>
+              </header>
+              <div class="settings-form">
+                <label class="settings-toggle"><input id="upstreamPeerEnabled" type="checkbox" aria-describedby="upstreamPeerDisclosure upstreamPeerTiming" disabled /><span>Record upstream socket peer (default: Off)</span></label>
+                <p id="upstreamPeerDisclosure">Stores the observed upstream IP address and port with future captured HTTP(S) exchanges. This may be an internal or proxy address and may identify a proxy rather than the origin. Stored peers are included in session exports and full-record JSON. Turning this off does not remove previously stored peers.</p>
+                <p id="upstreamPeerTiming">Changes apply to new exchanges. Eligible exchanges already in flight may finish using the previous setting.</p>
+                <p id="upstreamPeerError" class="upstream-peer-error" role="alert"></p>
+                <p id="upstreamPeerStatus" role="status" aria-live="polite">Loading saved setting…</p>
+                <div class="toolbar-actions"><button class="primary-action" id="upstreamPeerSave" type="button" disabled>Save</button><button class="secondary-action" id="upstreamPeerCancel" type="button" disabled>Cancel</button><button class="secondary-action hidden" id="upstreamPeerRefresh" type="button">Check status</button></div>
+              </div>
+            </section>
             <section class="panel-card history-retention-card" id="historyRetentionSection" aria-labelledby="historyRetentionHeading">
               <header class="panel-toolbar">
                 <div><h2 id="historyRetentionHeading">HTTP History automatic cleanup</h2><p>Current session: <strong id="historyRetentionSession">Loading…</strong></p></div>
@@ -1405,7 +1418,7 @@
               <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
             </div>
             <section class="service-map-api-catalog hidden" id="serviceMapApiCatalog" aria-label="Observed API paths"></section>
-            <footer class="service-map-notice">Passive retained evidence only. Browser initiators, remote IPs and TLS certificate associations are unavailable. Inspect one retained response, then choose Show references on map for a temporary Direct relations overlay. References and header clues do not establish calls or ownership. Pause HTTP recording manually for steadier inspection; traffic still passes through and other history changes can still clear this view.</footer>
+            <footer class="service-map-notice">Passive retained evidence only. Browser initiators, origin-IP associations and TLS certificate identities are unavailable. Optional observed socket peers appear only in exact source evidence. Inspect one retained response, then choose Show references on map for a temporary Direct relations overlay. References and header clues do not establish calls or ownership. Pause HTTP recording manually for steadier inspection; traffic still passes through and other history changes can still clear this view.</footer>
           </section>
           <section class="panel-card hidden" id="targetPathsPanel" role="tabpanel" aria-labelledby="targetPathsTab">
             <header class="panel-toolbar"><div><p class="placeholder-kicker">Site map</p><h2>Captured hosts and paths</h2></div></header>

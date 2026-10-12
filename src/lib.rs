@@ -36,6 +36,7 @@ pub mod state;
 pub mod store;
 pub mod target;
 pub mod ui_settings;
+pub mod upstream_peer_settings;
 pub mod upstream_proxy;
 pub mod websocket;
 pub mod workspace;

@@ -202,3 +202,14 @@ not undo an unchanged HTTP-version selection; genuine edits still take priority.
 Uncertain session-action failures refresh session rows without silently
 rebinding the active editor. Conflict and recovery messages still require
 attention; copy unrepresented local edits before manually reloading a session.
+
+## Observed socket peer capture
+
+A separate Capture Settings card and `capture http upstream-peer get/set` add an
+explicit default-Off, active-session-only switch. Future eligible ordinary
+HTTP(S) responses may retain one bounded socket observation. Exact Service Map
+evidence exposes it only with `--include-socket-peer`; default map/evidence and
+transaction summary outputs remain unchanged. No probes, backfill, aggregate IP
+map, or origin-ownership inference is added. Observations persist in session
+files, exports and full-record JSON, and Off does not erase them. See the
+[observed socket peer contract](../integrations/observed-socket-peer.md).

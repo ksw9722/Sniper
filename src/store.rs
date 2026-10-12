@@ -1407,6 +1407,16 @@ impl TransactionStore {
         session_id: Uuid,
         id: &str,
     ) -> crate::service_map::ServiceMapEvidence {
+        self.service_map_evidence_with_socket_peer(session_id, id, false)
+            .await
+    }
+
+    pub(crate) async fn service_map_evidence_with_socket_peer(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        include_socket_peer: bool,
+    ) -> crate::service_map::ServiceMapEvidence {
         use crate::service_map::{project_record, EvidenceKey, ServiceMapEvidence};
         let missing = |reason| ServiceMapEvidence::missing(session_id, id.into(), reason);
         let Some(key) = EvidenceKey::parse(id) else {
@@ -1435,7 +1445,14 @@ impl TransactionStore {
             return missing("record_changed");
         }
         match project_record(record, id.into()) {
-            Some(row) => ServiceMapEvidence::found(session_id, row),
+            Some(row) => {
+                let mut evidence = ServiceMapEvidence::found(session_id, row);
+                if include_socket_peer {
+                    evidence.socket_peer =
+                        Some(crate::service_map::ServiceMapSocketPeerEvidence::from_record(record));
+                }
+                evidence
+            }
             None => missing("metadata_unavailable"),
         }
     }
@@ -3613,6 +3630,49 @@ pub(crate) mod tests {
                 inner.body_generations[index],
                 &inner.entries[index],
             )
+        }
+
+        #[tokio::test]
+        async fn exact_socket_peer_reads_remain_metadata_only_with_missing_body_storage() {
+            use crate::model::{ObservedSocketPeer, ObservedSocketPeerRoute};
+            let mut record = body_record("retained synthetic body", 1);
+            record.observed_socket_peer = Some(ObservedSocketPeer::from_remote_addr(
+                record.started_at,
+                ObservedSocketPeerRoute::HttpProxy,
+                Some("198.51.100.7:8080".parse().unwrap()),
+            ));
+            let (store, dir) = fixture_store(&[record.clone()], true).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            let evidence = store
+                .service_map_evidence_with_socket_peer(session, &id, true)
+                .await;
+            assert!(evidence.available);
+            let observation = evidence.socket_peer.unwrap().observation.unwrap();
+            assert_eq!(observation.address.unwrap().ip.to_string(), "198.51.100.7");
+            assert!(store.inner.read().await.entries[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            crate::session::write_transactions_file_for_test_returning_locators(
+                &dir,
+                &[record.clone()],
+            )
+            .unwrap();
+            assert!(store
+                .update_record(record.id, |row| row.path = "/changed".into())
+                .await
+                .is_some());
+            let stale = store
+                .service_map_evidence_with_socket_peer(session, &id, true)
+                .await;
+            assert!(!stale.available);
+            assert!(stale.socket_peer.is_none());
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
         }
 
         fn barrier(

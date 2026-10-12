@@ -366,3 +366,19 @@ CLI.
   exchanged for a session cookie, described in the
   [architecture notes](../architecture.md) — but `sniper-cli` is only ever
   exercised same-machine, so point an agent at a loopback instance.
+
+## Opt-in observed socket peer capture
+
+`capture http upstream-peer get --session-id <active-uuid>` reads the saved
+switch and effective status. `set --session-id <active-uuid> --enabled true|false
+--yes` explicitly changes future eligibility; use `--dry-run` first for an
+offline plan. Canonical operations are `capture.http.upstream_peer.get` and
+`capture.http.upstream_peer.set`. The CLI performs one pinned settings GET and
+one token-bound POST, with no automatic retry or session activation.
+
+Default map/evidence reads remain unchanged. Explicit `--include-socket-peer`
+on exact-row evidence adds a retained observation without enabling capture or
+sending probes. A peer may be a proxy, CDN or shared endpoint, not evidence of
+origin ownership. Observations persist in session files, exports and full-record
+JSON, including after Off. Read the [capture, privacy and recovery contract](observed-socket-peer.md)
+before enabling it or sharing those files.

@@ -432,6 +432,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/clear", post(clear_findings))
         .route(
+            "/api/transactions/upstream-peer-settings",
+            get(get_upstream_peer_settings).post(update_upstream_peer_settings),
+        )
+        .route(
             "/api/transactions/retention",
             get(get_history_retention).post(update_history_retention),
         )
@@ -4653,6 +4657,209 @@ async fn clear_findings(
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamPeerSettingsQuery {
+    session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamPeerSettingsPayload {
+    enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_upstream_peer_config_token")]
+    expected_config_token: Option<String>,
+}
+
+fn deserialize_upstream_peer_config_token<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    // An omitted precondition is 428; an explicit null or wrong type is 400.
+    String::deserialize(deserializer).map(Some)
+}
+
+fn upstream_peer_settings_error(status: StatusCode, code: &str, error: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"code": code, "error": error})),
+    )
+        .into_response()
+}
+
+fn upstream_peer_settings_session_conflict() -> Response {
+    upstream_peer_settings_error(StatusCode::CONFLICT, "UPSTREAM_PEER_SESSION_CHANGED",
+        "Observed socket peer settings require the current active session; reload before continuing.")
+}
+
+async fn pin_upstream_peer_settings_session(
+    state: &Arc<AppState>,
+    query: &UpstreamPeerSettingsQuery,
+) -> std::result::Result<Arc<SessionContext>, Response> {
+    // Never resolve an inactive saved context: even a Check must be bounded and
+    // must not hydrate retained history or activate background work.
+    let session = state.active_session_for_read().await;
+    if query.session_id.is_some_and(|id| id != session.id())
+        || query
+            .expected_active_session_id
+            .is_some_and(|id| id != session.id())
+        || state.sessions.active_session_id() != session.id()
+        || !state.sessions.contains_session(session.id())
+    {
+        return Err(upstream_peer_settings_session_conflict());
+    }
+    Ok(session)
+}
+
+async fn upstream_peer_settings_context_is_current(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    query: &UpstreamPeerSettingsQuery,
+) -> bool {
+    let current = state.active_session_for_read().await;
+    Arc::ptr_eq(&current, session)
+        && state.sessions.active_session_id() == session.id()
+        && state.sessions.contains_session(session.id())
+        && query
+            .expected_active_session_id
+            .is_none_or(|id| id == session.id())
+}
+
+async fn get_upstream_peer_settings(
+    State(state): State<Arc<AppState>>,
+    query: std::result::Result<
+        Query<UpstreamPeerSettingsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return upstream_peer_settings_error(
+            StatusCode::BAD_REQUEST,
+            "UPSTREAM_PEER_INVALID_QUERY",
+            "Invalid observed socket peer settings query.",
+        );
+    };
+    let session = match pin_upstream_peer_settings_session(&state, &query).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = state
+        .session_operation_lock(session.id())
+        .await
+        .lock_owned()
+        .await;
+    if !upstream_peer_settings_context_is_current(&state, &session, &query).await {
+        return upstream_peer_settings_session_conflict();
+    }
+    let _mutation_guard = session.mutation_guard().await;
+    Json(crate::upstream_peer_settings::snapshot(&session, None).await).into_response()
+}
+
+async fn update_upstream_peer_settings(
+    State(state): State<Arc<AppState>>,
+    query: std::result::Result<
+        Query<UpstreamPeerSettingsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+    payload: std::result::Result<
+        Json<UpstreamPeerSettingsPayload>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let (Ok(Query(query)), Ok(Json(payload))) = (query, payload) else {
+        // Extractor errors can echo supplied input. Keep this endpoint's errors
+        // content-free, including malformed credential-looking input.
+        return upstream_peer_settings_error(
+            StatusCode::BAD_REQUEST,
+            "UPSTREAM_PEER_INVALID_REQUEST",
+            "Invalid observed socket peer settings request.",
+        );
+    };
+    let session = match pin_upstream_peer_settings_session(&state, &query).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    // Once dispatched, finish the state-only transaction even if the caller
+    // disconnects. A writer panic leaves the independent eligibility gate set.
+    tokio::spawn(update_upstream_peer_settings_inner(state, session, query, payload))
+        .await.unwrap_or_else(|_| upstream_peer_settings_error(StatusCode::INTERNAL_SERVER_ERROR,
+            "UPSTREAM_PEER_COMMIT_UNCERTAIN", "Observed socket peer settings outcome is unknown; Check and explicitly Save again to confirm durability."))
+}
+
+async fn update_upstream_peer_settings_inner(
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    query: UpstreamPeerSettingsQuery,
+    payload: UpstreamPeerSettingsPayload,
+) -> Response {
+    use crate::upstream_peer_settings::{config_token, SettingsWriteError};
+    let _operation_guard = state
+        .session_operation_lock(session.id())
+        .await
+        .lock_owned()
+        .await;
+    if !upstream_peer_settings_context_is_current(&state, &session, &query).await {
+        return upstream_peer_settings_session_conflict();
+    }
+    let Some(expected) = payload.expected_config_token.as_deref() else {
+        return upstream_peer_settings_error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "UPSTREAM_PEER_TOKEN_REQUIRED",
+            "Use expected_config_token from a fresh Check of observed socket peer settings.",
+        );
+    };
+    if !crate::upstream_peer_settings::valid_config_token(expected) {
+        return upstream_peer_settings_error(
+            StatusCode::BAD_REQUEST,
+            "UPSTREAM_PEER_INVALID_TOKEN",
+            "Invalid observed socket peer settings token.",
+        );
+    }
+    let _mutation_guard = session.mutation_guard().await;
+    let previous = session.runtime.snapshot().await;
+    if expected
+        != config_token(
+            session.id(),
+            previous.upstream_peer_capture_enabled,
+            previous.upstream_peer_capture_revision,
+        )
+    {
+        return upstream_peer_settings_error(
+            StatusCode::CONFLICT,
+            "UPSTREAM_PEER_SETTINGS_CHANGED",
+            "Observed socket peer settings changed; Check and review before saving.",
+        );
+    }
+    let changed = previous.upstream_peer_capture_enabled != payload.enabled;
+    let revision = if changed {
+        match previous.upstream_peer_capture_revision.and_then(|value| value.checked_add(1)) {
+            Some(next) => Some(next),
+            None => return upstream_peer_settings_error(StatusCode::CONFLICT, "UPSTREAM_PEER_REVISION_EXHAUSTED", "Observed socket peer settings revision is invalid or exhausted; settings were not changed."),
+        }
+    } else {
+        previous.upstream_peer_capture_revision
+    };
+    if let Err(error) = session
+        .persist_upstream_peer_settings(payload.enabled, revision)
+        .await
+    {
+        // Never log addresses, credentials, filesystem paths, or raw I/O errors.
+        tracing::warn!(?error, session_id = %session.id(), "observed socket peer settings persistence not confirmed");
+        let (code, message) = match error {
+            SettingsWriteError::NotCommitted => ("UPSTREAM_PEER_NOT_COMMITTED", "Observed socket peer settings were not committed. Previous settings remain; new observations are paused until an explicit successful Save."),
+            SettingsWriteError::CommittedButUncertain => ("UPSTREAM_PEER_COMMIT_UNCERTAIN", "Observed socket peer settings were replaced but durability is uncertain. New observations are paused; Check and explicitly Save again."),
+            SettingsWriteError::OutcomeUnknown => ("UPSTREAM_PEER_COMMIT_UNCERTAIN", "Observed socket peer settings write outcome is unknown. Last attempted settings are shown; new observations are paused. Check and explicitly Save again."),
+        };
+        let settings = crate::upstream_peer_settings::snapshot(&session, None).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"code":code,"error":message,"settings":settings})),
+        )
+            .into_response();
+    }
+    Json(crate::upstream_peer_settings::snapshot(&session, Some(changed)).await).into_response()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoryRetentionPayload {
@@ -5152,6 +5359,15 @@ struct ServiceMapQuery {
 struct ServiceMapEvidenceQuery {
     session_id: Uuid,
     evidence_id: String,
+    #[serde(default)]
+    include_socket_peer: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapBodyEvidenceQuery {
+    session_id: Uuid,
+    evidence_id: String,
 }
 
 async fn get_target_service_map(
@@ -5219,7 +5435,11 @@ async fn get_target_service_map_evidence(
     };
     let evidence = session
         .store
-        .service_map_evidence(session.id(), &query.evidence_id)
+        .service_map_evidence_with_socket_peer(
+            session.id(),
+            &query.evidence_id,
+            query.include_socket_peer,
+        )
         .await;
     if !state.sessions.contains_session(session.id())
         || !state.is_current_session_context(&session).await
@@ -5236,7 +5456,7 @@ async fn get_target_service_map_evidence(
 
 async fn get_target_service_map_body_references(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ServiceMapEvidenceQuery>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
 ) -> Response {
     use crate::service_map_body::ServiceMapBodyReferences;
     if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
@@ -14654,6 +14874,7 @@ mod tests {
                 Query(super::ServiceMapEvidenceQuery {
                     session_id: metadata.id,
                     evidence_id: token,
+                    include_socket_peer: false,
                 }),
             )
             .await,
@@ -14748,6 +14969,7 @@ mod tests {
                 Query(super::ServiceMapEvidenceQuery {
                     session_id: session.id(),
                     evidence_id: token,
+                    include_socket_peer: false,
                 }),
             )
             .await,
@@ -14761,6 +14983,7 @@ mod tests {
             Query(super::ServiceMapEvidenceQuery {
                 session_id: session.id(),
                 evidence_id: "bad".into(),
+                include_socket_peer: false,
             }),
         )
         .await;
@@ -14804,7 +15027,7 @@ mod tests {
         let response: serde_json::Value = response_json(
             super::get_target_service_map_body_references(
                 State(state.clone()),
-                Query(super::ServiceMapEvidenceQuery {
+                Query(super::ServiceMapBodyEvidenceQuery {
                     session_id: inactive.id,
                     evidence_id: token,
                 }),
@@ -14833,7 +15056,7 @@ mod tests {
         assert_eq!(before, after, "inactive body read changed saved files");
         let invalid = super::get_target_service_map_body_references(
             State(state.clone()),
-            Query(super::ServiceMapEvidenceQuery {
+            Query(super::ServiceMapBodyEvidenceQuery {
                 session_id: active.id(),
                 evidence_id: "invalid".into(),
             }),
@@ -21283,6 +21506,642 @@ mod tests {
         assert!(session.store.get(id).await.is_none());
         let _ = std::fs::remove_dir_all(data_dir);
     }
+    async fn peer_settings_request(
+        state: Arc<AppState>,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> axum::response::Response {
+        use hyper::service::Service;
+        let service = hyper_util::service::TowerToHyperService::new(super::router(state));
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.unwrap_or("").to_owned()))
+            .unwrap();
+        service.call(request).await.unwrap()
+    }
+
+    async fn peer_settings_get(
+        state: &Arc<AppState>,
+        session: &Arc<crate::session::SessionContext>,
+    ) -> crate::upstream_peer_settings::UpstreamPeerSettingsSnapshot {
+        let response = peer_settings_request(state.clone(), "GET", &format!("/api/transactions/upstream-peer-settings?session_id={}&expected_active_session_id={}", session.id(), session.id()), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    async fn peer_settings_save(
+        state: &Arc<AppState>,
+        session: &Arc<crate::session::SessionContext>,
+        enabled: bool,
+    ) -> axum::response::Response {
+        let current = peer_settings_get(state, session).await;
+        peer_settings_request(state.clone(), "POST", &format!("/api/transactions/upstream-peer-settings?session_id={}&expected_active_session_id={}", session.id(), session.id()), Some(&serde_json::json!({"enabled":enabled,"expected_config_token":current.config_token}).to_string())).await
+    }
+
+    #[tokio::test]
+    async fn peer_settings_check_is_default_off_and_read_only() {
+        let (state, path) = test_state("peer-settings-read-only");
+        let session = state.active_session_for_read().await;
+        session.persist().await.unwrap();
+        let state_path = session.storage_dir().join("state.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let events = session.event_log.snapshot(None).await.len();
+        let current = peer_settings_get(&state, &session).await;
+        assert!(!current.enabled);
+        assert!(!current.status.effective_enabled);
+        assert_eq!(current.status.blocked_reason, None);
+        assert_eq!(current.config_revision, "0");
+        assert_eq!(current.changed, None);
+        assert!(!session.upstream_peer_capture_eligible().await);
+        assert_eq!(std::fs::read(state_path).unwrap(), before);
+        assert_eq!(session.event_log.snapshot(None).await.len(), events);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_router_rejects_malformed_unknown_and_missing_fields() {
+        let (state, path) = test_state("peer-settings-strict-router");
+        let session = state.active_session_for_read().await;
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        for body in [
+            r#"{"enabled":true"#,
+            r#"{}"#,
+            r#"{"enabled":"true"}"#,
+            r#"{"enabled":null}"#,
+            r#"{"enabled":1}"#,
+            r#"{"enabled":false,"expected_config_token":null}"#,
+            r#"{"enabled":false,"expected_config_token":42}"#,
+            r#"{"enabled":false,"expected_config_token":"secret@example.com"}"#,
+            r#"{"enabled":false,"session_id":"unexpected"}"#,
+            r#"{"enabled":false,"upstream_proxy":{"url":"secret@example.com"}}"#,
+            r#"{"enabled":false,"enabled":true}"#,
+        ] {
+            let response = peer_settings_request(state.clone(), "POST", &uri, Some(body)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error = response_body_json(response).await;
+            assert!(!error.to_string().contains("secret@example.com"));
+        }
+        assert_eq!(
+            peer_settings_request(state.clone(), "POST", &uri, Some(r#"{"enabled":true}"#))
+                .await
+                .status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(
+            peer_settings_request(state.clone(), "GET", &format!("{uri}&unknown=true"), None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            peer_settings_request(
+                state.clone(),
+                "GET",
+                "/api/transactions/upstream-peer-settings?session_id=invalid",
+                None
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!peer_settings_get(&state, &session).await.enabled);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_rejects_inactive_without_loading_or_touching_files() {
+        let (state, path) = test_state("peer-settings-inactive");
+        let active = state.active_session_for_read().await;
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let saved = path.join("sessions").join(inactive.id.to_string());
+        let file = saved.join("state.json");
+        std::fs::write(&file, b"deliberately invalid synthetic saved state").unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let token = crate::upstream_peer_settings::config_token(inactive.id, false, Some(0));
+        let body = serde_json::json!({"enabled":true,"expected_config_token":token}).to_string();
+        for method in ["GET", "POST"] {
+            let response = peer_settings_request(
+                state.clone(),
+                method,
+                &format!(
+                    "/api/transactions/upstream-peer-settings?session_id={}",
+                    inactive.id
+                ),
+                Some(&body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(std::fs::read(&file).unwrap(), before);
+        }
+        let mismatch = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}&expected_active_session_id={}",
+            active.id(),
+            inactive.id
+        );
+        assert_eq!(
+            peer_settings_request(state.clone(), "GET", &mismatch, None)
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            peer_settings_request(state.clone(), "POST", &mismatch, Some(&body))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(!active.upstream_peer_capture_eligible().await);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_cas_prevents_aba_and_foreign_tokens_and_survives_restart() {
+        use crate::upstream_peer_settings::UpstreamPeerSettingsSnapshot;
+        let (state, path) = test_state("peer-settings-cas-restart");
+        let config = state.config.clone();
+        let session = state.active_session_for_read().await;
+        let initial = peer_settings_get(&state, &session).await;
+        let on: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, true).await).await;
+        assert_eq!(on.config_revision, "1");
+        assert_eq!(on.changed, Some(true));
+        assert!(on.status.effective_enabled);
+        let off: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, false).await).await;
+        assert_eq!(off.config_revision, "2");
+        assert_ne!(off.config_token, initial.config_token);
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        for token in [
+            initial.config_token,
+            crate::upstream_peer_settings::config_token(Uuid::new_v4(), false, Some(2)),
+            crate::history_retention::history_retention_config_token(
+                session.id(),
+                &Default::default(),
+                2,
+            ),
+        ] {
+            let body =
+                serde_json::json!({"enabled":true,"expected_config_token":token}).to_string();
+            assert_eq!(
+                peer_settings_request(state.clone(), "POST", &uri, Some(&body))
+                    .await
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        let noop: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, false).await).await;
+        assert_eq!(noop.changed, Some(false));
+        assert_eq!(noop.config_token, off.config_token);
+        assert_eq!(noop.config_revision, "2");
+        let enabled: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, true).await).await;
+        let id = session.id();
+        drop(session);
+        drop(state);
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.active_session_for_read().await;
+        assert_eq!(session.id(), id);
+        let restored = peer_settings_get(&state, &session).await;
+        assert!(restored.enabled);
+        assert!(restored.status.effective_enabled);
+        assert_eq!(restored.config_token, enabled.config_token);
+        assert_eq!(restored.config_revision, "3");
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_saves_are_state_only_and_competing_cas_has_one_winner() {
+        let (state, path) = test_state("peer-settings-state-only-cas");
+        let session = state.active_session_for_read().await;
+        let ids = history_retention_records(&session, 2).await;
+        let before: Vec<_> = [
+            "snapshot.json",
+            "workspace.json",
+            "transactions.ndjson",
+            "transactions.meta.ndjson",
+            "transactions.journal",
+            "websockets.journal",
+        ]
+        .into_iter()
+        .map(|name| (name, std::fs::read(session.storage_dir().join(name)).ok()))
+        .collect();
+        let current = peer_settings_get(&state, &session).await;
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        let body = serde_json::json!({"enabled":true,"expected_config_token":current.config_token})
+            .to_string();
+        let (first, second) = tokio::join!(
+            peer_settings_request(state.clone(), "POST", &uri, Some(&body)),
+            peer_settings_request(state.clone(), "POST", &uri, Some(&body))
+        );
+        let statuses = [first.status(), second.status()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            peer_settings_get(&state, &session).await.config_revision,
+            "1"
+        );
+        for (name, bytes) in before {
+            assert_eq!(
+                std::fs::read(session.storage_dir().join(name)).ok(),
+                bytes,
+                "{name} must not be rewritten by peer settings"
+            );
+        }
+        for (index, id) in ids.into_iter().enumerate() {
+            let record = session.store.get(id).await.unwrap();
+            assert_eq!(
+                record.request.body_preview,
+                format!("synthetic history body {index}")
+            );
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_http_pause_and_other_runtime_updates_do_not_change_opt_in() {
+        use crate::upstream_peer_settings::UpstreamPeerBlockedReason;
+        let (state, path) = test_state("peer-settings-http-pause");
+        let session = state.active_session_for_read().await;
+        assert_eq!(
+            peer_settings_save(&state, &session, true).await.status(),
+            StatusCode::OK
+        );
+        let before = peer_settings_get(&state, &session).await;
+        let broad = serde_json::from_value(serde_json::json!({"http_capture_enabled":false,"upstream_peer_capture_enabled":false,"upstream_peer_capture_revision":42,"upstream_insecure":false})).unwrap();
+        session.runtime.update(broad).await.unwrap();
+        session.persist_state_only().await.unwrap();
+        let paused = peer_settings_get(&state, &session).await;
+        assert!(paused.enabled);
+        assert!(!paused.status.effective_enabled);
+        assert_eq!(
+            paused.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::HttpCapturePaused)
+        );
+        assert_eq!(paused.config_token, before.config_token);
+        assert!(!session.upstream_peer_capture_eligible().await);
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(session.upstream_peer_capture_eligible().await);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_failures_gate_new_exchanges_until_explicit_noop_save() {
+        use crate::upstream_peer_settings::{
+            SettingsWriteFault, UpstreamPeerBlockedReason, UpstreamPeerSettingsSnapshot,
+        };
+        for fault in [
+            SettingsWriteFault::BeforeReplacement,
+            SettingsWriteFault::AfterReplacement,
+            SettingsWriteFault::OutcomeUnknown,
+        ] {
+            let (state, path) = test_state("peer-settings-save-fault");
+            let session = state.active_session_for_read().await;
+            assert_eq!(
+                peer_settings_save(&state, &session, true).await.status(),
+                StatusCode::OK
+            );
+            let eligible_before_disable = session.upstream_peer_capture_eligible().await;
+            assert!(eligible_before_disable);
+            let old_config = peer_settings_get(&state, &session).await;
+            session.fail_next_upstream_peer_write(fault);
+            let response = peer_settings_save(&state, &session, false).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let error = response_body_json(response).await;
+            let current = peer_settings_get(&state, &session).await;
+            if matches!(fault, SettingsWriteFault::BeforeReplacement) {
+                assert!(current.enabled);
+                assert_eq!(current.config_revision, "1");
+                assert_eq!(error["code"], "UPSTREAM_PEER_NOT_COMMITTED");
+            }
+            if matches!(
+                fault,
+                SettingsWriteFault::AfterReplacement | SettingsWriteFault::OutcomeUnknown
+            ) {
+                assert!(!current.enabled);
+                assert_eq!(current.config_revision, "2");
+                assert_ne!(current.config_token, old_config.config_token);
+                let stale_body = serde_json::json!({"enabled":false,"expected_config_token":old_config.config_token}).to_string();
+                let uri = format!(
+                    "/api/transactions/upstream-peer-settings?session_id={}",
+                    session.id()
+                );
+                assert_eq!(
+                    peer_settings_request(state.clone(), "POST", &uri, Some(&stale_body))
+                        .await
+                        .status(),
+                    StatusCode::CONFLICT
+                );
+            }
+            assert_eq!(
+                current.status.blocked_reason,
+                Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+            );
+            assert!(!current.status.effective_enabled);
+            assert!(!session.upstream_peer_capture_eligible().await);
+            // Completion retains a prior eligibility decision; it never re-reads
+            // live settings to fabricate eligibility or erase valid evidence.
+            assert!(eligible_before_disable);
+            session
+                .runtime
+                .update(crate::runtime::RuntimeSettingsUpdate {
+                    upstream_insecure: Some(false),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            session.persist_state_only().await.unwrap();
+            session.persist().await.unwrap();
+            assert!(!session.upstream_peer_capture_eligible().await);
+            assert_eq!(
+                peer_settings_get(&state, &session)
+                    .await
+                    .status
+                    .blocked_reason,
+                Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+            );
+            let confirmed: UpstreamPeerSettingsSnapshot =
+                response_json(peer_settings_save(&state, &session, current.enabled).await).await;
+            assert_eq!(confirmed.changed, Some(false));
+            assert_eq!(confirmed.config_token, current.config_token);
+            assert_eq!(confirmed.status.blocked_reason, None);
+            assert_eq!(confirmed.status.effective_enabled, current.enabled);
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_settings_pending_save_is_gated_and_finishes_after_request_cancellation() {
+        let (state, path) = test_state("peer-settings-cancel");
+        let session = state.active_session_for_read().await;
+        let current = peer_settings_get(&state, &session).await;
+        let persist_guard = session.owned_persist_guard().await;
+        let request_state = state.clone();
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        let body = serde_json::json!({"enabled":true,"expected_config_token":current.config_token})
+            .to_string();
+        let request = tokio::spawn(async move {
+            peer_settings_request(request_state, "POST", &uri, Some(&body)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !session.upstream_peer_settings.uncertain() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !session
+                .runtime
+                .snapshot()
+                .await
+                .upstream_peer_capture_enabled
+        );
+        assert!(!session.upstream_peer_capture_eligible().await);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(persist_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.upstream_peer_settings.uncertain() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(session.upstream_peer_capture_eligible().await);
+        let loaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert!(
+            loaded
+                .runtime
+                .snapshot()
+                .await
+                .upstream_peer_capture_enabled
+        );
+        drop(loaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_invalid_and_exhausted_revisions_never_revive_old_cas() {
+        use crate::upstream_peer_settings::{
+            config_token, UpstreamPeerBlockedReason, UpstreamPeerSettingsSnapshot,
+        };
+        let (state, path) = test_state("peer-settings-exhausted");
+        let session = state.active_session_for_read().await;
+        for revision in [Some(u64::MAX), None] {
+            session
+                .runtime
+                .set_upstream_peer_capture_config(false, revision)
+                .await;
+            let current = peer_settings_get(&state, &session).await;
+            assert_eq!(current.config_revision, u64::MAX.to_string());
+            assert_ne!(
+                current.config_token,
+                config_token(session.id(), false, Some(0))
+            );
+            assert_eq!(
+                peer_settings_save(&state, &session, true).await.status(),
+                StatusCode::CONFLICT
+            );
+            let confirmed: UpstreamPeerSettingsSnapshot =
+                response_json(peer_settings_save(&state, &session, false).await).await;
+            assert_eq!(confirmed.config_token, current.config_token);
+            assert_eq!(
+                session
+                    .runtime
+                    .snapshot()
+                    .await
+                    .upstream_peer_capture_revision,
+                revision
+            );
+            assert_eq!(
+                confirmed.status.blocked_reason,
+                Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+            );
+            if revision.is_none() {
+                assert_ne!(
+                    confirmed.config_token,
+                    config_token(session.id(), false, Some(u64::MAX))
+                );
+            }
+            assert!(!session.upstream_peer_capture_eligible().await);
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_exhausted_on_is_effectively_off_before_and_after_restart() {
+        use crate::upstream_peer_settings::{
+            config_token, UpstreamPeerBlockedReason, UpstreamPeerSettingsSnapshot,
+        };
+        let (state, path) = test_state("peer-settings-exhausted-on");
+        let config = state.config.clone();
+        let session = state.active_session_for_read().await;
+        session
+            .runtime
+            .set_upstream_peer_capture_config(true, Some(u64::MAX))
+            .await;
+        session.persist_state_only().await.unwrap();
+        let current = peer_settings_get(&state, &session).await;
+        assert!(current.enabled);
+        assert!(!current.status.effective_enabled);
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+        );
+        assert!(!session.upstream_peer_capture_eligible().await);
+        assert_eq!(current.config_revision, u64::MAX.to_string());
+        assert_eq!(
+            current.config_token,
+            config_token(session.id(), true, Some(u64::MAX))
+        );
+        assert_ne!(
+            current.config_token,
+            config_token(session.id(), false, None)
+        );
+        assert_ne!(
+            current.config_token,
+            config_token(session.id(), false, Some(u64::MAX))
+        );
+        // Exhaustion never resets the revision, and a no-op durability Save
+        // cannot bypass the independent fail-closed eligibility check.
+        assert_eq!(
+            peer_settings_save(&state, &session, false).await.status(),
+            StatusCode::CONFLICT
+        );
+        let confirmed: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, true).await).await;
+        assert_eq!(confirmed.config_token, current.config_token);
+        assert_eq!(confirmed.changed, Some(false));
+        assert!(!confirmed.status.effective_enabled);
+        assert!(!session.upstream_peer_capture_eligible().await);
+        drop(session);
+        drop(state);
+        let restarted = Arc::new(AppState::new(config).unwrap());
+        let session = restarted.active_session_for_read().await;
+        let restored = peer_settings_get(&restarted, &session).await;
+        assert_eq!(restored.config_token, current.config_token);
+        assert_eq!(restored.config_revision, u64::MAX.to_string());
+        assert!(restored.enabled);
+        assert!(!restored.status.effective_enabled);
+        assert_eq!(
+            restored.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+        );
+        assert!(!session.upstream_peer_capture_eligible().await);
+        drop(session);
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_session_switch_isolated_and_pinned_old_context_rejected() {
+        use crate::upstream_peer_settings::{SettingsWriteFault, UpstreamPeerBlockedReason};
+        let (state, path) = test_state("peer-settings-session-switch");
+        let first = state.active_session_for_read().await;
+        assert_eq!(
+            peer_settings_save(&state, &first, true).await.status(),
+            StatusCode::OK
+        );
+        first.fail_next_upstream_peer_write(SettingsWriteFault::BeforeReplacement);
+        assert_eq!(
+            peer_settings_save(&state, &first, false).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let before = crate::upstream_peer_settings::snapshot(&first, None).await;
+        let second = state
+            .sessions
+            .create_session(Some("Synthetic second".into()))
+            .unwrap();
+        state.activate_session(second.id).await.unwrap();
+        let active = state.active_session_for_read().await;
+        assert!(!peer_settings_get(&state, &active).await.enabled);
+        let response = super::update_upstream_peer_settings_inner(
+            state.clone(),
+            first.clone(),
+            super::UpstreamPeerSettingsQuery {
+                session_id: Some(first.id()),
+                expected_active_session_id: Some(first.id()),
+            },
+            super::UpstreamPeerSettingsPayload {
+                enabled: false,
+                expected_config_token: Some(before.config_token.clone()),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        state.activate_session(first.id()).await.unwrap();
+        let restored = state.active_session_for_read().await;
+        let current = peer_settings_get(&state, &restored).await;
+        assert_eq!(current.config_token, before.config_token);
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+        );
+        assert!(!restored.upstream_peer_capture_eligible().await);
+        drop(restored);
+        drop(active);
+        drop(first);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
     fn history_retention_policy(target: u32) -> crate::history_retention::HistoryRetentionPolicy {
         crate::history_retention::HistoryRetentionPolicy::KeepNewest {
             max_entries: std::num::NonZeroU32::new(target).unwrap(),

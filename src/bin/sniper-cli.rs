@@ -38,7 +38,7 @@ use sniper::{
         MAX_SCANNER_FIELD_BYTES,
     },
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
-    service_map::{ServiceMap, ServiceMapEvidence},
+    service_map::{ServiceMap, ServiceMapEvidence, ServiceMapSocketPeerStatus},
     service_map_body::ServiceMapBodyReferences,
     session::{validate_session_creation_name, SessionSummary},
     skills,
@@ -571,6 +571,11 @@ struct SessionRevealArgs {
 
 #[derive(Subcommand, Debug)]
 enum HistoryCommand {
+    /// Inspect or explicitly enable future observed socket peer capture for the active session.
+    UpstreamPeer {
+        #[command(subcommand)]
+        command: UpstreamPeerCommand,
+    },
     /// Inspect or explicitly opt into automatic saved HTTP history cleanup.
     Retention {
         #[command(subcommand)]
@@ -590,6 +595,43 @@ enum HistoryCommand {
     Replay(HistoryReplayArgs),
     Fuzzer(HistoryFuzzerArgs),
     Annotate(HistoryAnnotateArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum UpstreamPeerCommand {
+    /// Read saved configuration and effective status; requires the current active session.
+    Get(UpstreamPeerGetArgs),
+    /// Save the active session switch. Off is the default and does not erase observations.
+    #[command(
+        after_help = "Requires --yes. Applies only to eligible future ordinary captured HTTP(S) responses; eligible in-flight work may finish after Off. Socket peers may be proxies or shared endpoints, not origin ownership. Observations persist in session files, exports and full-record JSON. No probes, backfill, Replay, WebSocket, CONNECT, TLS details or rendered-resource capture."
+    )]
+    Set(UpstreamPeerSetArgs),
+}
+
+impl UpstreamPeerCommand {
+    fn session_id(&self) -> Uuid {
+        match self {
+            Self::Get(args) => args.session_id,
+            Self::Set(args) => args.session_id,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct UpstreamPeerGetArgs {
+    /// Explicit current active session UUID; this command never switches sessions.
+    #[arg(long)]
+    session_id: Uuid,
+}
+
+#[derive(Args, Debug)]
+struct UpstreamPeerSetArgs {
+    /// Explicit current active session UUID; this command never switches sessions.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Enable or disable future socket peer capture. Off does not erase retained observations.
+    #[arg(long, action = ArgAction::Set, required = true)]
+    enabled: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -870,6 +912,9 @@ struct ServiceMapEvidenceArgs {
     /// Use the exact session returned by the map; never resolve evidence across sessions.
     #[arg(long)]
     session_id: Uuid,
+    /// Explicitly include one retained socket peer observation; never probes or enables capture.
+    #[arg(long)]
+    include_socket_peer: bool,
     /// Opaque evidence token returned by the map, not a transaction UUID.
     #[arg(long, value_parser = parse_service_map_evidence_id)]
     evidence_id: String,
@@ -2377,6 +2422,10 @@ impl CaptureCommand {
 impl HistoryCommand {
     fn operation_name(&self) -> &'static str {
         match self {
+            HistoryCommand::UpstreamPeer { command } => match command {
+                UpstreamPeerCommand::Get(_) => "capture.http.upstream_peer.get",
+                UpstreamPeerCommand::Set(_) => "capture.http.upstream_peer.set",
+            },
             HistoryCommand::Retention { command } => match command {
                 HistoryRetentionCommand::Get(_) => "capture.http.retention.get",
                 HistoryRetentionCommand::Set(_) => "capture.http.retention.set",
@@ -2732,6 +2781,16 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["value"],
             vec![json!({"value":"access_token","side":["response-body"]})],
+        ),
+        op(
+            "capture.http.upstream_peer.get", "capture http upstream-peer get --session-id <uuid>",
+            "Read default-Off observed socket peer configuration and effective status for the current active session only; no activation, upstream requests or traffic reads.",
+            Read, false, &["session_id"], vec![json!({"session_id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.upstream_peer.set", "capture http upstream-peer set --session-id <uuid> --enabled <true|false>",
+            "Explicitly save the active session's future observed socket peer switch. Requires --yes. One pinned configuration GET then one compare-and-swap POST; no retry or backfill. Retained observations remain in session files, exports and full-record JSON after Off. A socket peer may be a proxy or shared endpoint, not origin ownership.",
+            Write, true, &["session_id", "enabled"], vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","enabled":true}), json!({"session_id":"00000000-0000-0000-0000-000000000000","enabled":false})],
         ),
         op(
             "capture.http.retention.get", "capture http retention get [--session-id <uuid>]",
@@ -3330,9 +3389,29 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             "source":{"type":"string","enum":["captured_http_metadata"]},
             "row":{"anyOf":[{"type":"null"},row]}
         }));
+        let observation = service_map_object(json!({
+            "source":{"type":"string","enum":["http_response_remote_addr"]},
+            "observed_at":timestamp,
+            "route":{"type":"string","enum":["direct","http_proxy","socks_proxy","unknown"]},
+            "address":{"anyOf":[{"type":"null"},service_map_object(json!({
+                "ip":{"anyOf":[{"type":"string","format":"ipv4"},{"type":"string","format":"ipv6"}]},"port":port
+            }))]},
+            "reason":{"type":["string","null"],"enum":[null,"remote_addr_unavailable"]}
+        }));
+        let mut peer = service_map_object(json!({
+            "status":{"type":"string","enum":["observed","not_recorded","unavailable"]},
+            "observation":{"anyOf":[{"type":"null"},observation]}
+        }));
+        peer["oneOf"] = json!([
+            {"properties":{"status":{"enum":["observed"]},"observation":{"type":"object","properties":{"address":{"type":"object"},"reason":{"type":"null"}}}}},
+            {"properties":{"status":{"enum":["not_recorded"]},"observation":{"type":"null"}}},
+            {"properties":{"status":{"enum":["unavailable"]},"observation":{"type":"object","properties":{"address":{"type":"null"},"reason":{"enum":["remote_addr_unavailable"]}}}}}
+        ]);
+        peer["description"] = json!("Present only after explicit include_socket_peer and successful exact-row validation. One bounded retained observation, never origin ownership or an aggregate peer map.");
+        schema["properties"]["socket_peer"] = peer;
         schema["oneOf"] = json!([
             {"properties":{"available":{"enum":[true]},"reason":{"type":"null"},"row":{"type":"object"}}},
-            {"properties":{"available":{"enum":[false]},"reason":{"type":"string"},"row":{"type":"null"}}}
+            {"properties":{"available":{"enum":[false]},"reason":{"type":"string"},"row":{"type":"null"},"socket_peer":{"enum":[]}}}
         ]);
         return Some(schema);
     }
@@ -3425,6 +3504,7 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
         "target.service_map.evidence.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
             "properties":{
+                "include_socket_peer":{"type":"boolean","default":false,"description":"Explicitly read one retained observed socket peer after exact-token validation. Does not enable capture, probe, aggregate peers or infer origin ownership. Omission preserves the default evidence shape."},
                 "session_id":legacy_uuid_input_schema(false, "Exact session UUID returned by the service map. Always explicit, including for inactive sessions."),
                 "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete v1 evidence token returned by the map, with canonical UUID components and an unsigned 64-bit sequence. At most 200 UTF-8 bytes; pass unchanged, not a transaction UUID."}
             }
@@ -3446,7 +3526,11 @@ fn service_map_path(args: &ServiceMapArgs, session_id: Option<Uuid>) -> String {
 }
 
 fn service_map_evidence_path(args: &ServiceMapEvidenceArgs) -> String {
-    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    let mut params = vec![("evidence_id".into(), args.evidence_id.clone())];
+    if args.include_socket_peer {
+        params.push(("include_socket_peer".into(), "true".into()));
+    }
+    let query = encode_query(params);
     session_query_path(
         &format!("/api/target/service-map/evidence?{query}"),
         Some(args.session_id),
@@ -3483,12 +3567,12 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
         ),
         op(
             "target.service_map.evidence.get",
-            "scope service-map-evidence --session-id <uuid> --evidence-id <token>",
-            "Read safe metadata for an exact retained row using its session-bound opaque evidence token. Stale, edited, deleted, or ambiguous evidence is explicitly unavailable; never falls back to UUID-only history lookup.",
+            "scope service-map-evidence --session-id <uuid> --evidence-id <token> [--include-socket-peer]",
+            "Read safe metadata for an exact retained row using its session-bound opaque evidence token. Stale, edited, deleted, or ambiguous evidence is explicitly unavailable; never falls back to UUID-only history lookup. Explicit include_socket_peer adds one retained observation without enabling capture or probing; socket peers do not prove origin ownership.",
             CliSideEffect::Read,
             false,
             &["session_id", "evidence_id"],
-            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"}), json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","include_socket_peer":true})],
         ),
     ]
 }
@@ -3575,6 +3659,7 @@ fn op(
             .or_else(|| replay_saved_tab_output_schema(operation))
             .or_else(|| service_map_output_schema(operation))
             .or_else(|| scanner_output_schema(operation))
+            .or_else(|| upstream_peer_output_schema(operation))
             .or_else(|| history_retention_output_schema(operation))
             .or_else(|| session_list_output_schema(operation))
             .or_else(|| session_read_output_schema(operation))
@@ -3895,6 +3980,9 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
     if let Some(schema) = service_map_input_schema(operation) {
         return schema;
     }
+    if let Some(schema) = upstream_peer_input_schema(operation) {
+        return schema;
+    }
     if let Some(schema) = history_retention_input_schema(operation) {
         return schema;
     }
@@ -4170,6 +4258,8 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "scanner.custom.get" | "scanner.custom.delete" => &["session_id", "id"],
         "scanner.custom.create" => &["session_id", "rule", "file", "stdin"],
         "scanner.custom.update" => &["session_id", "id", "patch", "file", "stdin"],
+        "capture.http.upstream_peer.get" => &["session_id"],
+        "capture.http.upstream_peer.set" => &["session_id", "enabled"],
         "capture.http.retention.get" => &["session_id"],
         "capture.http.retention.set" => &["session_id", "off", "max_entries"],
         "capture.http.clear" => &["session_id"],
@@ -4234,9 +4324,8 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "clear_note",
         ],
         "target.service_map.get" => &["session_id", "origin", "in_scope_only", "max_records"],
-        "target.service_map.evidence.get" | "target.service_map.body_references.get" => {
-            &["session_id", "evidence_id"]
-        }
+        "target.service_map.evidence.get" => &["session_id", "evidence_id", "include_socket_peer"],
+        "target.service_map.body_references.get" => &["session_id", "evidence_id"],
         "scope.get" => &["session_id"],
         "scope.set" => &[
             "session_id",
@@ -4430,6 +4519,7 @@ fn command_input_preview(command: &Command) -> Value {
             TargetCommand::ServiceMapEvidence(args) => json!({
                 "session_id": args.session_id,
                 "evidence_id": args.evidence_id,
+                "include_socket_peer": args.include_socket_peer,
             }),
             TargetCommand::GetScope(args) => json!({ "session_id": args.session_id }),
             TargetCommand::SetScope(args) => json!({
@@ -4473,6 +4563,12 @@ fn single_skill_input_preview(args: &SingleSkillArgs) -> Value {
 
 fn history_input_preview(command: &HistoryCommand) -> Value {
     match command {
+        HistoryCommand::UpstreamPeer { command } => match command {
+            UpstreamPeerCommand::Get(args) => json!({"session_id":args.session_id}),
+            UpstreamPeerCommand::Set(args) => {
+                json!({"session_id":args.session_id,"enabled":args.enabled})
+            }
+        },
         HistoryCommand::Retention { command } => match command {
             HistoryRetentionCommand::Get(args) => json!({"session_id":args.session_id}),
             HistoryRetentionCommand::Set(args) => {
@@ -4876,6 +4972,7 @@ fn capture_api_preview(command: &CaptureCommand) -> Result<Value> {
 
 fn history_api_preview(command: &HistoryCommand) -> Result<Value> {
     Ok(match command {
+        HistoryCommand::UpstreamPeer { command } => upstream_peer_api_preview(command),
         HistoryCommand::Retention { command } => history_retention_api_preview(command),
         HistoryCommand::Select(args) => api_preview(
             "POST",
@@ -5328,6 +5425,16 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
     }
     if matches!(
         command.operation_name(),
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+    ) {
+        notes.push("Dry-run is fully offline. The explicit session must already be active; execution never switches or activates it. Discovery and settings reads do not inspect traffic or contact upstream services.");
+        if command.operation_name().ends_with(".set") {
+            notes.push("Execution performs one session-fenced configuration GET and one token-bound POST with expected_active_session_id. No redirects, automatic retry or uncertain-write readback. Inspect the same session's settings deliberately after an uncertain outcome.");
+        }
+        notes.push("Default Off. Eligibility is frozen before an ordinary captured HTTP(S) request's first send; eligible in-flight responses may finish after Off. No backfill, probes, Replay, WebSocket, CONNECT, rendered resources or TLS/DNS details. Observations persist in session files, exports and full-record JSON; Off does not erase them. A proxy, CDN or shared socket peer does not prove origin ownership or a backend chain.");
+    }
+    if matches!(
+        command.operation_name(),
         "capture.http.retention.get" | "capture.http.retention.set"
     ) {
         notes.push("Dry-run is fully offline: no API discovery, session resolution, token read, history inspection or deletion count.");
@@ -5497,6 +5604,13 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 id: call_required(operation, input, "id")?,
                 name: call_required(operation, input, "name")?,
             }),
+        },
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set" => Command::Capture {
+            command: CaptureCommand::Http {
+                command: HistoryCommand::UpstreamPeer {
+                    command: upstream_peer_from_input(operation, input)?,
+                },
+            },
         },
         "capture.http.retention.get" | "capture.http.retention.set" => Command::Capture {
             command: CaptureCommand::Http {
@@ -5777,6 +5891,12 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 command: TargetCommand::ServiceMapEvidence(ServiceMapEvidenceArgs {
                     session_id: call_required(operation, input, "session_id")?,
                     evidence_id,
+                    include_socket_peer: match input.get("include_socket_peer") {
+                        None => false,
+                        Some(value) => value.as_bool().ok_or_else(|| {
+                            anyhow!("field `include_socket_peer` must be a boolean")
+                        })?,
+                    },
                 }),
             }
         }
@@ -7312,6 +7432,7 @@ fn auto_replace_write_session_id(
 
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
+        HistoryCommand::UpstreamPeer { command } => handle_upstream_peer(api, command).await,
         HistoryCommand::Retention { command } => handle_history_retention(api, command).await,
         HistoryCommand::Select(args) => {
             let result: Value = api
@@ -7755,10 +7876,27 @@ fn validate_service_map_evidence_response(
         (false, None, Some(reason)) => !reason.is_empty(),
         _ => false,
     };
+    let peer_valid = match result.socket_peer.as_ref() {
+        None => !args.include_socket_peer || !result.available,
+        Some(peer) if args.include_socket_peer && result.available => {
+            match (&peer.status, peer.observation.as_ref()) {
+                (ServiceMapSocketPeerStatus::NotRecorded, None) => true,
+                (ServiceMapSocketPeerStatus::Observed, Some(observation)) => {
+                    observation.is_valid() && observation.address.is_some()
+                }
+                (ServiceMapSocketPeerStatus::Unavailable, Some(observation)) => {
+                    observation.is_valid() && observation.address.is_none()
+                }
+                _ => false,
+            }
+        }
+        Some(_) => false,
+    };
     if result.schema_version != 1
         || result.session_id != args.session_id
         || result.evidence_id != args.evidence_id
         || result.source != "captured_http_metadata"
+        || !peer_valid
         || !row_valid
     {
         return Err(service_map_error("INVALID_RESPONSE", "Service Map evidence does not match the requested session, token, availability, or safe row contract"));
@@ -9512,6 +9650,330 @@ async fn pinned_read_session_id(api: &ApiClient, explicit: Option<Uuid>) -> Resu
     resolve_session_id_arg(api, explicit).await?.ok_or_else(|| {
         anyhow!("no active session; pass --session-id to choose a session explicitly")
     })
+}
+
+fn upstream_peer_input_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+    ) {
+        return None;
+    }
+    let mut session_id = legacy_uuid_input_schema(
+        false,
+        "Explicit current active session UUID. Never loads or activates a session.",
+    );
+    let hyphenated = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+    session_id["pattern"] = json!(format!(
+        r"^(?:[0-9a-fA-F]{{32}}|{hyphenated}|\{{{hyphenated}\}}|urn:uuid:{hyphenated})$"
+    ));
+    let mut schema = json!({
+        "type":"object","additionalProperties":false,"required":["session_id"],
+        "properties":{"session_id":session_id}
+    });
+    if operation.ends_with(".set") {
+        schema["required"].as_array_mut()?.push(json!("enabled"));
+        schema["properties"]["enabled"] = json!({"type":"boolean","description":"Save future observed socket peer capture On or Off; default Off. Does not erase retained observations or backfill old rows."});
+    }
+    Some(schema)
+}
+
+fn upstream_peer_output_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+    ) {
+        return None;
+    }
+    let mut schema = service_map_object(json!({
+        "session_id":{"type":"string","format":"uuid"},
+        "enabled":{"type":"boolean"},
+        "config_revision":history_retention_revision_schema(),
+        "config_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"Opaque feature/session/configuration-bound compare-and-swap token. Pass unchanged only to this feature's pinned session POST."},
+        "status":service_map_object(json!({
+            "effective_enabled":{"type":"boolean"},
+            "blocked_reason":{"type":["string","null"],"enum":[null,"persistence_uncertain","invalid_configuration","http_capture_paused"]}
+        }))
+    }));
+    if operation.ends_with(".set") {
+        schema["required"].as_array_mut()?.push(json!("changed"));
+        schema["properties"]["changed"] = json!({"type":"boolean","description":"Whether the saved switch changed; not evidence that any response has been captured."});
+    }
+    Some(schema)
+}
+
+fn upstream_peer_from_input(operation: &str, input: &Value) -> Result<UpstreamPeerCommand> {
+    let session_id = call_required(operation, input, "session_id")?;
+    if operation.ends_with(".get") {
+        Ok(UpstreamPeerCommand::Get(UpstreamPeerGetArgs { session_id }))
+    } else {
+        Ok(UpstreamPeerCommand::Set(UpstreamPeerSetArgs {
+            session_id,
+            enabled: call_required(operation, input, "enabled")?,
+        }))
+    }
+}
+
+fn upstream_peer_path(session_id: Uuid) -> String {
+    session_query_path_with_expected_active(
+        "/api/transactions/upstream-peer-settings",
+        Some(session_id),
+        Some(session_id),
+    )
+}
+
+fn upstream_peer_api_preview(command: &UpstreamPeerCommand) -> Value {
+    let path = upstream_peer_path(command.session_id());
+    let read = api_preview("GET", path.clone(), None);
+    let UpstreamPeerCommand::Set(args) = command else {
+        return read;
+    };
+    json!({
+        "read":read,
+        "write":{
+            "method":"POST","path":path,
+            "body":{"enabled":args.enabled,"expected_config_token":"<from the pinned settings GET>"},
+            "automatic_retry":false
+        }
+    })
+}
+
+#[derive(Debug)]
+struct UpstreamPeerCliError {
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Uuid,
+    status: Option<u16>,
+}
+
+impl fmt::Display for UpstreamPeerCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for UpstreamPeerCliError {}
+
+fn upstream_peer_error(
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Uuid,
+    status: Option<StatusCode>,
+) -> anyhow::Error {
+    UpstreamPeerCliError {
+        code,
+        message,
+        outcome,
+        session_id,
+        status: status.map(|value| value.as_u16()),
+    }
+    .into()
+}
+
+fn checked_upstream_peer_response(
+    value: Value,
+    session_id: Uuid,
+    requested_enabled: Option<bool>,
+    expected_changed: Option<bool>,
+    expected_revision: Option<u64>,
+) -> Result<Value> {
+    let invalid = || {
+        upstream_peer_error(
+            "INVALID_RESPONSE",
+            if requested_enabled.is_some() {
+                "Socket peer settings acknowledgement did not match this operation; mutation outcome is unknown"
+            } else {
+                "Socket peer settings were invalid; no mutation was sent"
+            },
+            if requested_enabled.is_some() {
+                "unknown"
+            } else {
+                "not_applied"
+            },
+            session_id,
+            None,
+        )
+    };
+    if value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        != Some(session_id)
+    {
+        return Err(invalid());
+    }
+    let enabled = value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    if requested_enabled.is_some_and(|requested| requested != enabled) {
+        return Err(invalid());
+    }
+    let revision_text = value
+        .get("config_revision")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let revision = revision_text
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| revision.to_string() == revision_text)
+        .ok_or_else(invalid)?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(invalid());
+    }
+    let token = value
+        .get("config_token")
+        .and_then(Value::as_str)
+        .filter(|token| {
+            token.len() == 64
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(invalid)?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let effective = status
+        .get("effective_enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    let blocked = status.get("blocked_reason").ok_or_else(invalid)?;
+    if (!blocked.is_null()
+        && !matches!(
+            blocked.as_str(),
+            Some("persistence_uncertain" | "invalid_configuration" | "http_capture_paused")
+        ))
+        || effective != (enabled && blocked.is_null())
+    {
+        return Err(invalid());
+    }
+    // Project a narrow allowlist so unrelated response data cannot become CLI output.
+    let mut result = json!({
+        "session_id":session_id,"enabled":enabled,"config_revision":revision_text,"config_token":token,
+        "status":{"effective_enabled":effective,"blocked_reason":blocked}
+    });
+    if let Some(expected) = expected_changed {
+        if value.get("changed").and_then(Value::as_bool) != Some(expected) {
+            return Err(invalid());
+        }
+        result["changed"] = json!(expected);
+    }
+    Ok(result)
+}
+
+async fn handle_upstream_peer(api: ApiClient, command: UpstreamPeerCommand) -> Result<()> {
+    let session_id = command.session_id();
+    let client = saved_configuration_write_client().map_err(|_| {
+        upstream_peer_error(
+            "TRANSPORT_ERROR",
+            "Could not prepare socket peer settings client; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let path = upstream_peer_path(session_id);
+    let response = client.get(api.url(&path)).send().await.map_err(|_| {
+        upstream_peer_error(
+            "TRANSPORT_ERROR",
+            "Socket peer settings read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(upstream_peer_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Socket peer settings read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            Some(status),
+        ));
+    }
+    let raw = saved_replay_response_json(response, 16 * 1024).await.map_err(|_| upstream_peer_error(
+        "INVALID_RESPONSE", "Socket peer settings read was missing, malformed or too large; no mutation was sent", "not_applied", session_id, None,
+    ))?;
+    let current = checked_upstream_peer_response(raw, session_id, None, None, None)?;
+    let UpstreamPeerCommand::Set(args) = command else {
+        return print_session_read_json(&current, session_id);
+    };
+    let changed = current["enabled"] != args.enabled;
+    let revision = current["config_revision"]
+        .as_str()
+        .expect("validated revision")
+        .parse::<u64>()
+        .expect("validated revision");
+    let expected_revision = revision.checked_add(u64::from(changed)).ok_or_else(|| {
+        upstream_peer_error(
+            "UPSTREAM_PEER_REVISION_EXHAUSTED",
+            "Socket peer configuration revision cannot be advanced; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let response = client
+        .post(api.url(&path))
+        .json(&json!({"enabled":args.enabled,"expected_config_token":current["config_token"]}))
+        .send()
+        .await
+        .map_err(|_| {
+            upstream_peer_error(
+                "TRANSPORT_ERROR",
+                "Socket peer settings acknowledgement was lost; mutation outcome is unknown",
+                "unknown",
+                session_id,
+                None,
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        // Never follow a redirect, read diagnostic bodies, retry, or silently reconcile a write.
+        return Err(upstream_peer_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Socket peer settings write did not return success; mutation outcome is unknown",
+            "unknown",
+            session_id,
+            Some(status),
+        ));
+    }
+    let raw = saved_replay_response_json(response, 16 * 1024).await.map_err(|_| upstream_peer_error(
+        "INVALID_RESPONSE", "Socket peer settings acknowledgement was missing, malformed or too large; mutation outcome is unknown", "unknown", session_id, None,
+    ))?;
+    let saved = checked_upstream_peer_response(
+        raw,
+        session_id,
+        Some(args.enabled),
+        Some(changed),
+        Some(expected_revision),
+    )?;
+    if (changed && saved["config_token"] == current["config_token"])
+        || (!changed && saved["config_token"] != current["config_token"])
+        || saved["status"]["blocked_reason"] == "persistence_uncertain"
+    {
+        return Err(upstream_peer_error(
+            "INVALID_RESPONSE",
+            "Socket peer settings acknowledgement did not confirm the token transition and durable state; mutation outcome is unknown",
+            "unknown",
+            session_id,
+            None,
+        ));
+    }
+    print_session_read_json(&saved, session_id)
 }
 
 fn history_retention_limit_schema() -> Value {
@@ -13374,6 +13836,16 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
             retryable: false,
             details: json!({"reason":managed.code}),
             exit_code: 5,
+        };
+    }
+    if let Some(peer) = error.downcast_ref::<UpstreamPeerCliError>() {
+        return CliErrorPayload {
+            code: peer.code,
+            message: peer.message.to_owned(),
+            hint: Some("Deliberately inspect capture http upstream-peer get --session-id <the same active session UUID> before another write; never automatically retry or switch sessions."),
+            retryable: false,
+            details: json!({"session_id":peer.session_id,"outcome":peer.outcome,"status":peer.status}),
+            exit_code: if peer.status.is_some_and(|status| status >= 500) { 6 } else { 5 },
         };
     }
     if let Some(retention) = error.downcast_ref::<HistoryRetentionCliError>() {

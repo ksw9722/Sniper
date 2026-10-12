@@ -312,6 +312,7 @@ fn wait_snapshot_gate(gate: &mut Option<SnapshotTestGate>, phase: SnapshotTestPh
 }
 
 pub struct SessionContext {
+    pub(crate) upstream_peer_settings: crate::upstream_peer_settings::SessionPeerSettingsState,
     pub(crate) history_retention: crate::history_retention::SessionRetentionState,
     retention_writable: bool,
     id: Uuid,
@@ -342,6 +343,9 @@ pub struct SessionContext {
     workspace_write_fault: std::sync::Mutex<Option<WorkspaceWriteFault>>,
     #[cfg(test)]
     history_retention_write_fault: std::sync::Mutex<Option<WorkspaceWriteFault>>,
+    #[cfg(test)]
+    upstream_peer_write_fault:
+        std::sync::Mutex<Option<crate::upstream_peer_settings::SettingsWriteFault>>,
     #[cfg(test)]
     workspace_commit_gate: std::sync::Mutex<Option<WorkspaceCommitGate>>,
     #[cfg(test)]
@@ -443,6 +447,7 @@ impl SessionContext {
             store.mark_retention_compaction_pending(transaction_event_sequence);
         }
         Self {
+            upstream_peer_settings: Default::default(),
             history_retention: Default::default(),
             retention_writable: enable_journal,
             id: metadata.id,
@@ -505,6 +510,8 @@ impl SessionContext {
             workspace_write_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             history_retention_write_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            upstream_peer_write_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             workspace_commit_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -569,6 +576,96 @@ impl SessionContext {
             .expect("session metadata lock poisoned");
         metadata.name.clone_from(&renamed.name);
         metadata.updated_at = metadata.updated_at.max(renamed.updated_at);
+    }
+
+    /// Sample once before the first ordinary send, and carry the result through
+    /// fallback and completion. No lock escapes this helper. An already eligible
+    /// exchange may finish recording its observation after the user saves Off.
+    pub async fn upstream_peer_capture_eligible(&self) -> bool {
+        let runtime = self.runtime.snapshot().await;
+        crate::upstream_peer_settings::status(&runtime, self.upstream_peer_settings.uncertain())
+            .effective_enabled
+    }
+
+    /// Caller owns operation and mutation guards. Only this narrow explicit
+    /// save can clear uncertainty; a broad runtime or session save cannot.
+    pub(crate) async fn persist_upstream_peer_settings(
+        &self,
+        enabled: bool,
+        revision: Option<u64>,
+    ) -> std::result::Result<(), crate::upstream_peer_settings::SettingsWriteError> {
+        use crate::upstream_peer_settings::SettingsWriteError;
+        self.upstream_peer_settings.mark_uncertain(true);
+        let _persist_guard = self.persist_lock.lock().await;
+        let mut state = self
+            .build_state_snapshot(self.workspace.snapshot().await)
+            .await;
+        state.runtime.upstream_peer_capture_enabled = enabled && revision.is_some();
+        state.runtime.upstream_peer_capture_revision = revision;
+        let path = state_path(&self.storage_dir);
+        #[cfg(test)]
+        let fault = self.upstream_peer_write_fault.lock().unwrap().take();
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            match fault {
+                Some(crate::upstream_peer_settings::SettingsWriteFault::BeforeReplacement) => {
+                    return Err(JsonWriteFailure {
+                        error: anyhow!("synthetic peer settings write failure"),
+                        committed: false,
+                    });
+                }
+                Some(crate::upstream_peer_settings::SettingsWriteFault::AfterReplacement) => {
+                    return write_json_finalizing(&path, &state, |_| {
+                        bail!("synthetic peer settings finalization failure")
+                    });
+                }
+                Some(crate::upstream_peer_settings::SettingsWriteFault::OutcomeUnknown) => {
+                    let _ = write_json_with_commit_status(&path, &state);
+                    panic!("synthetic peer settings writer outcome unknown");
+                }
+                None => (),
+            }
+            write_json_with_commit_status(&path, &state)
+        })
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                // The candidate may already be on disk. Reserve its revision
+                // instead of reviving a previously issued CAS token. This is
+                // explicitly an attempted value, never confirmed durability.
+                self.runtime
+                    .set_upstream_peer_capture_config(enabled, revision)
+                    .await;
+                return Err(SettingsWriteError::OutcomeUnknown);
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.runtime
+                    .set_upstream_peer_capture_config(enabled, revision)
+                    .await;
+                self.upstream_peer_settings.mark_uncertain(false);
+                Ok(())
+            }
+            Err(failure) if failure.committed => {
+                // Visible replacement is known, but durability is not. Publish
+                // that value honestly while leaving new exchanges gated Off.
+                self.runtime
+                    .set_upstream_peer_capture_config(enabled, revision)
+                    .await;
+                Err(SettingsWriteError::CommittedButUncertain)
+            }
+            Err(_) => Err(SettingsWriteError::NotCommitted),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_upstream_peer_write(
+        &self,
+        fault: crate::upstream_peer_settings::SettingsWriteFault,
+    ) {
+        *self.upstream_peer_write_fault.lock().unwrap() = Some(fault);
     }
 
     pub(crate) fn retention_writable(&self) -> bool {

@@ -63,6 +63,27 @@ transaction UUID detail read as a substitute: repeated IDs can resolve to anothe
 row. The map and its evidence omit query strings, URL credentials, raw headers,
 and bodies. Paths can still be sensitive; summarize responsibly.
 
+Only if requested, add `--include-socket-peer` to exact-row evidence (canonical
+`include_socket_peer: true`). The default map/evidence omit it. `socket_peer` is
+present only after successful exact-token validation: `observed` has a typed
+IP/port, `unavailable` records `remote_addr_unavailable`, and `not_recorded` has
+no observation without claiming why. A socket peer may be a proxy, CDN or shared
+endpoint; never infer origin ownership, IP edges, or a backend chain. Do not
+probe, aggregate peers, enable capture, or use UUID-only fallback for this read.
+
+`capture http upstream-peer get --session-id <active-uuid>` reads settings;
+`set --session-id <active-uuid> --enabled true|false --yes` explicitly saves the
+switch. Canonical names are `capture.http.upstream_peer.get/set`; both require
+`session_id`, and set requires boolean `enabled`. Capture is Off by default and
+active-session-only. Dry-run is offline. One pinned GET obtains a feature-bound
+token and one fenced POST saves; no automatic retry or uncertain-write readback.
+After uncertainty, deliberately read the same active session before another save.
+Eligibility is frozen before the first send; eligible in-flight ordinary HTTP(S)
+responses may complete after Off, while initially ineligible requests stay so.
+No Replay, WebSocket, CONNECT, rendered resources, TLS/DNS details, or backfill.
+Observations persist in session files, exports and full-record JSON; Off does not
+erase them. Disclose this before enabling or sharing those outputs.
+
 For an explicitly requested one-row response-preview inspection, use
 `target service-map body-references --session-id <active-session-uuid>
 --evidence-id <returned-token>` (`target.service_map.body_references.get`). Both
