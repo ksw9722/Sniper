@@ -6461,27 +6461,34 @@ mod tests {
             // This is the exact on-disk boundary after a precommit registry
             // error and failed restore; no physical filesystem fault is needed.
             crate::platform::rename(&canonical, &quarantine).unwrap();
-            match mode {
-                "none" => (),
-                "unrelated" => registry
-                    .update_metadata(active.metadata.read().unwrap().clone())
-                    .unwrap(),
-                "workspace" => {
-                    cached
-                        .persist_workspace_snapshot_locked(WorkspaceStateSnapshot::default())
-                        .await
+            let original_quarantine = quarantine_fixture_tree(&quarantine);
+            let save_error = match mode {
+                "none" => None,
+                "unrelated" => {
+                    registry
+                        .update_metadata(active.metadata.read().unwrap().clone())
                         .unwrap();
+                    None
                 }
-                "state" => cached.persist_state_only().await.unwrap(),
-                "full" => registry
-                    .update_metadata(cached.persist().await.unwrap())
-                    .unwrap(),
+                "workspace" => cached
+                    .persist_workspace_snapshot_locked(WorkspaceStateSnapshot::default())
+                    .await
+                    .err(),
+                "state" => cached.persist_state_only().await.err(),
+                "full" => cached.persist().await.err(),
                 _ => unreachable!(),
+            };
+            if matches!(mode, "workspace" | "state" | "full") {
+                let error = save_error.expect("cached saves must refuse a missing session root");
+                let message = error.to_string();
+                assert!(message.contains("was not found"), "{message}");
+                assert!(
+                    message.contains(&canonical.display().to_string()),
+                    "{message}"
+                );
             }
-            assert_eq!(
-                canonical.exists(),
-                matches!(mode, "workspace" | "state" | "full")
-            );
+            assert!(!canonical.exists());
+            assert_eq!(quarantine_fixture_tree(&quarantine), original_quarantine);
             assert_eq!(
                 std::fs::read(quarantine.join("snapshot.json")).unwrap(),
                 original_snapshot
@@ -6501,6 +6508,43 @@ mod tests {
             drop(active);
             drop(registry);
             assert_quarantine_startup_refused_without_changes(&data_dir);
+
+            if matches!(mode, "workspace" | "state" | "full") {
+                // Older builds or external writers can still leave divergent
+                // canonical files. Construct that evidence explicitly instead
+                // of requiring current cached saves to resurrect the root.
+                std::fs::create_dir(&canonical).unwrap();
+                let workspace = WorkspaceStateSnapshot {
+                    revision: 7,
+                    client_id: Some("synthetic-external-writer".into()),
+                    ..WorkspaceStateSnapshot::default()
+                };
+                if mode == "workspace" {
+                    super::write_json(&super::workspace_path(&canonical), &workspace).unwrap();
+                } else {
+                    let snapshot = super::StoredSessionSnapshot {
+                        workspace,
+                        scanner_config: crate::scanner::ScannerConfig {
+                            enabled: false,
+                            ..crate::scanner::ScannerConfig::default()
+                        },
+                        ..super::StoredSessionSnapshot::default()
+                    };
+                    let path = if mode == "state" {
+                        super::state_path(&canonical)
+                    } else {
+                        super::write_transactions_file_for_test(
+                            &canonical,
+                            &[deletion_test_record(38)],
+                        )
+                        .unwrap();
+                        super::snapshot_path(&canonical)
+                    };
+                    super::write_json(&path, &snapshot).unwrap();
+                }
+                assert_quarantine_startup_refused_without_changes(&data_dir);
+                assert_eq!(quarantine_fixture_tree(&quarantine), original_quarantine);
+            }
             std::fs::remove_dir_all(data_dir).unwrap();
         }
     }
