@@ -7435,6 +7435,16 @@ button.utility-button.replay-tab-add {
 .service-map-detail-tabs button[aria-selected="true"] { border-bottom-color: var(--point); color: var(--point); }
 .service-map-detail-body { padding: 10px 18px 18px; min-height: 0; overflow: auto; }
 .service-map-muted { color: var(--text-dim); font-size: var(--font-xs); line-height: 1.5; }
+/* Filters stay within the two loaded API lists, never the Scope toolbar. */
+.service-map-endpoint-filters { min-inline-size: 0; margin: 8px 0 10px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
+.service-map-endpoint-filters legend { padding: 0 4px; color: var(--text-soft); font-size: var(--font-xs); }
+.service-map-endpoint-filter-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 7px; align-items: end; }
+.service-map-endpoint-filter-controls label { min-width: 0; display: grid; gap: 4px; color: var(--text-soft); font-size: var(--font-xs); }
+.service-map-endpoint-filter-controls input, .service-map-endpoint-filter-controls select { width: 100%; min-width: 0; max-width: 100%; margin: 0; font: inherit; text-overflow: ellipsis; }
+.service-map-endpoint-filter-controls button { padding: 5px 7px; min-width: 0; }
+.service-map-endpoint-filters > p { margin: 6px 0 0; }
+.service-map-filter-notice { margin: 8px 0; padding: 7px 9px; border: 1px solid var(--point-border); border-radius: 6px; color: var(--text-soft); font-size: var(--font-xs); line-height: 1.5; overflow-wrap: anywhere; }
+.service-map-endpoint-counts { font-variant-numeric: tabular-nums; }
 .service-map-api-list { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .service-map-api-row { display: flex; align-items: center; gap: 12px; border: 0; border-bottom: 1px solid var(--line); width: 100%; padding: 12px 10px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
 .service-map-api-row:last-child { border-bottom: 0; }

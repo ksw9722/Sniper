@@ -45,6 +45,24 @@ and labels a selected origin outside the filter or card limit. Redirect
 relationship rows include the query-free target path so different destinations
 on the same origin remain distinguishable.
 
+## Loaded endpoint navigation and filters
+
+Both API lists share local exact, case-sensitive method selection and literal,
+case-sensitive path-substring filtering. These controls inspect only method/path
+combinations already present in the loaded snapshot and make no additional reads.
+Origin search remains separate. Counts distinguish loaded combinations, matches,
+locally hidden combinations, and the server omissions in the snapshot summary;
+the loaded lists are not an exhaustive endpoint inventory.
+
+Opening exact evidence and returning to APIs retains the selected endpoint and
+page. Refreshes reconcile by origin, method, and path rather than stale array
+positions; a removed page anchor keeps the nearest valid previous page. A
+transient invalidated snapshot does not erase that fallback. Filtering an endpoint
+out leaves its inspector and verified evidence selected with a visible notice.
+A selected method absent from a refreshed snapshot remains selected and shows an
+explicit empty state instead of silently widening to all methods. Session changes
+clear these local filters and page anchors.
+
 ## Direct relations view
 
 All origins remains the default graph view. Direct relations is an optional,

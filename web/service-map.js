@@ -823,6 +823,7 @@
     const state = {
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
+      endpointMethod: "", endpointPath: "", pageAnchor: null, detailPageAnchor: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       peerMatches: null, peerMatchesSource: null, peerMatchesLoading: false, peerMatchesError: "", peerMatchesRequestId: 0, peerEvidenceBinding: null,
@@ -896,13 +897,18 @@
       const focused = doc?.activeElement;
       const key = focused?.dataset?.serviceFocus;
       const owned = key && element.contains(focused);
+      const caret = owned && focused.dataset.serviceEndpointFilter === "path"
+        ? [focused.selectionStart, focused.selectionEnd, focused.selectionDirection] : null;
       element.innerHTML = html;
       // Only restore the element that this replacement detached. A newly focused
       // dialog or control is never displaced by a background refresh.
       if (owned && visible && (!doc.activeElement || doc.activeElement === doc.body || doc.activeElement === focused && !focused.isConnected)
         && !doc.querySelector?.(".modal-backdrop:not(.hidden), dialog[open]")) {
         const next = [...element.querySelectorAll("[data-service-focus]")].find((candidate) => candidate.dataset.serviceFocus === key);
-        if (next && !next.disabled && next.getClientRects().length) next.focus({ preventScroll: true });
+        if (next && !next.disabled && next.getClientRects().length) {
+          next.focus({ preventScroll: true });
+          if (caret && typeof caret[0] === "number") next.setSelectionRange?.(...caret);
+        }
       }
     }
     function graphOrigins() {
@@ -1356,13 +1362,15 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        selectionInitialized: false, endpointIndex: null, endpointSelection: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
+        selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
       const item = findOrigin(origin);
       if (!item || endpointIndex !== null && (!Number.isSafeInteger(endpointIndex) || !item.endpoints[endpointIndex])) return;
-      if (state.selectedOrigin !== origin || state.endpointIndex !== endpointIndex) cancelEvidence();
+      const changedOrigin = state.selectedOrigin !== origin;
+      if (changedOrigin || state.endpointIndex !== endpointIndex) cancelEvidence();
+      if (changedOrigin) { state.detailPage = 0; state.detailPageAnchor = null; }
       state.selectedOrigin = origin;
       state.selectionInitialized = true;
       state.endpointIndex = endpointIndex;
@@ -1370,7 +1378,11 @@
       // Keep only the exact identity when invalidation clears all displayed data.
       // An array index cannot safely survive scope filtering or history removal.
       state.endpointSelection = endpoint ? { method: endpoint.method, path: endpoint.path } : null;
-      state.detailPage = 0;
+      if (endpoint) {
+        const entry = { origin: item, endpoint, index: endpointIndex };
+        const index = loadedEndpointEntries([item]).findIndex((candidate) => sameEndpoint(candidate, endpointIdentity(entry)));
+        if (index >= 0) { state.detailPage = Math.floor(index / API_PAGE_SIZE); state.detailPageAnchor = endpointIdentity(entry); }
+      }
       state.detailTab = endpointIndex === null ? "apis" : "evidence";
       render();
     }
@@ -1435,6 +1447,7 @@
           if (index < 0) { state.endpointSelection = null; cancelEvidence(); }
         }
         if (state.evidenceId && !(state.peerEvidenceBinding ? peerBindingIsCurrent(state.peerEvidenceBinding) : evidenceItems(origin).some((item) => item.id === state.evidenceId))) cancelEvidence();
+        reconcileEndpointPages();
         state.loading = false;
         render();
         return true;
@@ -1849,6 +1862,59 @@
         if (els.graphDiagnostics) els.graphDiagnostics.textContent = diagnostics.join(" · ");
       } else els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
     }
+    function endpointMatches(endpoint) {
+      return (!state.endpointMethod || endpoint.method === state.endpointMethod) && endpoint.path.includes(state.endpointPath);
+    }
+    function loadedEndpointEntries(origins = filteredOrigins(), filtered = true) {
+      return origins.flatMap((origin) => origin.endpoints.map((endpoint, index) => ({ origin, endpoint, index })))
+        .filter((entry) => !filtered || endpointMatches(entry.endpoint));
+    }
+    const endpointIdentity = ({ origin, endpoint }) => ({ origin: origin.origin, method: endpoint.method, path: endpoint.path });
+    const sameEndpoint = (entry, identity) => !!identity && entry.origin.origin === identity.origin
+      && entry.endpoint.method === identity.method && entry.endpoint.path === identity.path;
+    function reconcileEndpointPages() {
+      // Selection and pagination use exact retained identities, never old array
+      // offsets. Missing anchors clamp the previous page without choosing a row.
+      for (const [pageKey, anchorKey, entries] of [
+        ["page", "pageAnchor", loadedEndpointEntries()],
+        ["detailPage", "detailPageAnchor", loadedEndpointEntries(selectedOrigin() ? [selectedOrigin()] : [])],
+      ]) {
+        const index = entries.findIndex((entry) => sameEndpoint(entry, state[anchorKey]));
+        state[pageKey] = Math.min(index < 0 ? state[pageKey] : Math.floor(index / API_PAGE_SIZE), Math.max(0, Math.ceil(entries.length / API_PAGE_SIZE) - 1));
+        if (index < 0) state[anchorKey] = entries[state[pageKey] * API_PAGE_SIZE] ? endpointIdentity(entries[state[pageKey] * API_PAGE_SIZE]) : null;
+      }
+    }
+    function setEndpointFilter(kind, value) {
+      if (!["method", "path", "clear"].includes(kind)) return;
+      if (kind === "clear") { state.endpointMethod = ""; state.endpointPath = ""; }
+      else state[kind === "method" ? "endpointMethod" : "endpointPath"] = String(value || "");
+      state.page = 0;
+      state.detailPage = 0;
+      state.pageAnchor = null;
+      state.detailPageAnchor = null;
+      // Local filters never change source identity, cancel pending inspections,
+      // alter graph search/zoom, or issue additional retained-data reads.
+      renderDetail();
+      renderCatalog();
+    }
+    function endpointFiltersMarkup(place) {
+      const methods = new Set(loadedEndpointEntries(state.snapshot?.origins || [], false).map(({ endpoint }) => endpoint.method));
+      const missingMethod = !!state.endpointMethod && !methods.has(state.endpointMethod);
+      if (state.endpointMethod) methods.add(state.endpointMethod);
+      return `<fieldset class="service-map-endpoint-filters"><legend>Loaded endpoint filters</legend><div class="service-map-endpoint-filter-controls"><label>Method (exact)<select data-service-endpoint-filter="method" data-service-focus="${place}:method" title="${escape(state.endpointMethod || "All loaded methods")}" aria-describedby="${place}FilterHelp"><option value="">All methods</option>${[...methods].sort().map((method) => `<option value="${escape(method)}" ${method === state.endpointMethod ? "selected" : ""}>${escape(method)}</option>`).join("")}</select></label><label>Path contains<input type="search" value="${escape(state.endpointPath)}" data-service-endpoint-filter="path" data-service-focus="${place}:path" aria-describedby="${place}FilterHelp" placeholder="Path substring" autocomplete="off" spellcheck="false" /></label><button class="secondary-action" type="button" data-service-endpoint-filter-clear="true" data-service-focus="${place}:clear" ${!state.endpointMethod && !state.endpointPath ? "disabled" : ""}>Clear</button></div><p id="${place}FilterHelp" class="service-map-muted">Both case-sensitive · shared by both API lists · loaded snapshot only.</p>${missingMethod ? '<p class="service-map-filter-notice" role="status">Selected method is absent from the loaded snapshot. Filter retained; no loaded endpoints match.</p>' : ""}</fieldset>`;
+    }
+    function endpointSelectionNotice(origin = selectedOrigin()) {
+      if (!origin) return "";
+      const selected = state.endpointSelection || (state.evidence?.origin === origin.origin ? state.evidence : null);
+      const notices = [];
+      if (selected && !endpointMatches(selected)) notices.push("Selected endpoint is outside the loaded endpoint filters. Its inspector selection and evidence are preserved.");
+      const query = state.query.trim().toLowerCase();
+      if (query && !origin.origin.toLowerCase().includes(query)) notices.push("Selected origin is outside the origin search. Its inspector remains open.");
+      return notices.length ? `<p class="service-map-filter-notice" role="status">${notices.join(" ")}</p>` : "";
+    }
+    function endpointCoverageMarkup(matching, loaded, start, hiddenOrigins = 0) {
+      return `<p class="service-map-muted service-map-endpoint-counts" role="status">${matching ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, matching)} / ${matching.toLocaleString()} matching · ${loaded.toLocaleString()} loaded · ${(loaded - hiddenOrigins - matching).toLocaleString()} hidden by endpoint filters${hiddenOrigins ? ` · ${hiddenOrigins.toLocaleString()} hidden by origin search` : ""}.</p><p class="service-map-muted">Counts cover loaded method/path combinations only. Server scope and projection omissions are separate in the snapshot summary above; this is not an exhaustive endpoint inventory.</p>`;
+    }
     function endpointButton(endpoint, origin, index, catalog = false) {
       const method = endpoint.method;
       const tone = method.toUpperCase() === "GET" ? "get" : method.toUpperCase() === "POST" ? "post" : "other";
@@ -2030,19 +2096,26 @@
         replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in loaded declarations${bodyReference ? state.bodyReferenceOverlay.kind === "link" ? " or the temporary Link declarations" : " or the temporary body URL references" : ""}. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${bodyReference ? `<h4>${state.bodyReferenceOverlay.kind === "link" ? "Retained Link declaration" : "Literal body URL reference"}</h4>${overlayProvenanceMarkup()}<p class="service-map-muted">This reference does not prove a request, call, or service ownership.</p>` : ""}${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
         return;
       }
-      const pageCount = Math.max(1, Math.ceil(origin.endpoints.length / API_PAGE_SIZE));
+      const entries = loadedEndpointEntries([origin]);
+      const pageCount = Math.max(1, Math.ceil(entries.length / API_PAGE_SIZE));
       state.detailPage = Math.min(state.detailPage, pageCount - 1);
       const start = state.detailPage * API_PAGE_SIZE;
+      if (!state.detailPageAnchor && entries[start]) state.detailPageAnchor = endpointIdentity(entries[start]);
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. Optional socket peers start in exact source evidence; explicit recorded matches can be shown as a temporary group.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. Optional socket peers start in exact source evidence; explicit recorded matches can be shown as a temporary group.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
     function renderCatalog() {
-      const entries = filteredOrigins().flatMap((origin) => origin.endpoints.map((endpoint, index) => ({ origin, endpoint, index })));
+      const loaded = loadedEndpointEntries(state.snapshot?.origins || [], false);
+      const originEntries = loadedEndpointEntries(filteredOrigins(), false);
+      const entries = originEntries.filter(({ endpoint }) => endpointMatches(endpoint));
       const pages = Math.max(1, Math.ceil(entries.length / API_PAGE_SIZE));
-      state.page = Math.min(state.page, pages - 1);
+      // Invalidation temporarily removes the snapshot. Keep the previous page
+      // as the fallback if its identity anchor is absent from the next result.
+      if (state.snapshot) state.page = Math.min(state.page, pages - 1);
       const start = state.page * API_PAGE_SIZE;
-      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3><p>Method/path combinations from retained HTTP history. Query strings are omitted; no endpoint is probed.</p></div><span>${entries.length.toLocaleString()} combinations</span></header><div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ origin, endpoint, index }) => endpointButton(endpoint, origin, index, true)).join("") || `<p class="empty-copy">${state.loading ? "Loading retained API paths…" : "No API paths match this view."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${state.page === 0 ? "disabled" : ""}>Previous</button><span>${entries.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, entries.length)} / ${entries.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
+      if (!state.pageAnchor && entries[start]) state.pageAnchor = endpointIdentity(entries[start]);
+      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3><p>Method/path combinations from retained HTTP history. Query strings are omitted; no endpoint is probed.</p></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(entries.length, loaded.length, start, loaded.length - originEntries.length)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ origin, endpoint, index }) => endpointButton(endpoint, origin, index, true)).join("") || `<p class="empty-copy">${state.loading ? "Loading retained API paths…" : "No loaded endpoints match these filters and origin search."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${entries.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, entries.length)} / ${entries.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
     }
     function render() {
       renderStatus();
@@ -2066,10 +2139,15 @@
         if (data.serviceRelationEvidence) loadEvidence(data.serviceRelationEvidence);
         else renderDetail();
       } else if (data.serviceEndpoint !== undefined) {
+        if (state.view === "apis") {
+          const origin = findOrigin(data.serviceOrigin), endpoint = origin?.endpoints[Number(data.serviceEndpoint)];
+          if (endpoint) state.pageAnchor = endpointIdentity({ origin, endpoint });
+        }
         selectOrigin(data.serviceOrigin, Number(data.serviceEndpoint));
         if (state.view === "apis") { state.view = "service-map"; onViewChange?.("service-map"); render(); }
       } else if (data.serviceOrigin) selectOrigin(data.serviceOrigin);
-      else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; if (state.detailTab === "apis") { state.endpointIndex = null; state.endpointSelection = null; } renderDetail(); }
+      else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; renderDetail(); }
+      else if (data.serviceEndpointFilterClear) setEndpointFilter("clear");
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
       else if (data.serviceBodyReferences) loadBodyReferences();
       else if (data.serviceLinkDeclarations) loadLinkDeclarations();
@@ -2077,20 +2155,23 @@
       else if (data.serviceHtmlGenerators) loadHtmlGenerators();
       else if (data.serviceShowBodyReferences) showBodyReferencesOnMap();
       else if (data.serviceClearBodyReferences) clearBodyReferenceOverlay();
-      else if (data.servicePage !== undefined) { state.page = Math.max(0, Number(data.servicePage) || 0); renderCatalog(); els.catalog.scrollTop = 0; }
-      else if (data.serviceDetailPage !== undefined) { state.detailPage = Math.max(0, Number(data.serviceDetailPage) || 0); renderDetail(); }
+      else if (data.servicePage !== undefined) { state.page = Math.max(0, Number(data.servicePage) || 0); state.pageAnchor = null; renderCatalog(); els.catalog.scrollTop = 0; }
+      else if (data.serviceDetailPage !== undefined) { state.detailPage = Math.max(0, Number(data.serviceDetailPage) || 0); state.detailPageAnchor = null; renderDetail(); }
     }
     let onViewChange = null;
     els.panel.addEventListener("click", handleClick);
     els.panel.addEventListener("change", (event) => {
       if (event.target?.dataset?.serviceRelationshipKind) setRelationshipKind(event.target.value);
+      else if (event.target?.dataset?.serviceEndpointFilter === "method") setEndpointFilter("method", event.target.value);
+    });
+    els.panel.addEventListener("input", (event) => {
+      if (event.target?.dataset?.serviceEndpointFilter === "path") setEndpointFilter("path", event.target.value);
     });
     els.panel.addEventListener("keydown", (event) => {
       const tab = event.target.closest('[role="tab"][data-service-detail-tab]');
       if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
       state.detailTab = event.key === "Home" ? "apis" : event.key === "End" ? "evidence" : state.detailTab === "apis" ? "evidence" : "apis";
-      if (state.detailTab === "apis") { state.endpointIndex = null; state.endpointSelection = null; }
       renderDetail();
       const next = [...els.detail.querySelectorAll('[role="tab"][data-service-detail-tab]')].find((button) => button.dataset.serviceDetailTab === state.detailTab);
       next?.focus();
@@ -2113,7 +2194,7 @@
     els.allOrigins?.addEventListener("click", () => setMapMode(false));
     els.directRelations?.addEventListener("click", () => setMapMode(true));
     els.focusSelection?.addEventListener("click", focusSelection);
-    els.search.addEventListener("input", () => { state.query = els.search.value; state.page = 0; render(); });
+    els.search.addEventListener("input", () => { state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
     els.scope.addEventListener("change", () => {
       clearOverlay("Temporary body references cleared because the scope filter changed.");
       state.scopeOnly = els.scope.checked;
