@@ -284,6 +284,41 @@ mod tests {
         let guidance = section(super::CODEX_SKILL_TEMPLATE);
         assert_eq!(guidance, section(super::CLAUDE_SKILL_TEMPLATE));
         for term in [
+            "`technology_observations`",
+            "`reported_version`",
+            "not verified installed software or a vulnerability judgment",
+            "conflicting versions separately",
+            "`version_status: \"reported\"`",
+            "`not_reported`",
+            "`unsupported_format`",
+            "`non_product_version`",
+            "`reported_version: null`",
+            "extension means unavailable metadata; a present empty",
+            "Neither proves product\nabsence",
+            "defaults to catalog 2",
+            "`--technology-catalog-version 1`",
+            "`technology_catalog_version: 1`",
+            "`X-Sniper-Technology-Catalog-Version`",
+            "marker means legacy v1\ncoverage and triggers a warning",
+            "present marker must match the requested supported catalog",
+            "adds no target traffic, body reads, fallback reads, or automatic retries",
+            "map and evidence reads remain metadata-only",
+            "SERVICE_MAP_BUSY",
+            "SERVICE_MAP_SCOPE_WORK_LIMIT",
+            "SERVICE_MAP_SESSION_CHANGED",
+            "SERVICE_MAP_SCOPE_CHANGED",
+            "SERVICE_MAP_HISTORY_CHANGED",
+            "SERVICE_MAP_BUILD_FAILED",
+            "`retryable:false` and no automatic retry",
+            "wait for the running refresh to finish, then deliberately retry",
+            "smaller `max_records` / `--max-records` window",
+            "simplify scope rules only with explicit authorization",
+            "A failed map is not a complete empty inventory",
+            "Only an explicit Refresh or actual scope/session change can resume reads",
+            "History events, reconnecting, reopening the view, and local filters do not clear",
+            "filters issue zero\nreads",
+            "do not\nprove endpoint-level product/version declarations",
+            "remain separate, explicit reads and never run automatically on recovery",
             "scope service-map html-generators",
             "target.service_map.html_generators.get",
             "target.service_map.link_declarations.get",
@@ -306,9 +341,22 @@ mod tests {
         ] {
             assert!(
                 guidance.contains(term),
-                "missing passive supplementary guidance: {term}"
+                "missing passive service map guidance: {term}"
             );
         }
+    }
+
+    #[test]
+    fn service_map_readme_overlay_link_matches_integration_heading() {
+        let readme = include_str!("../README.md");
+        let contract = include_str!("../docs/integrations/service-map.md");
+        assert!(readme.contains(
+            "](docs/integrations/service-map.md#temporary-retained-relationship-overlay-gui-only)"
+        ));
+        assert!(contract
+            .lines()
+            .any(|line| line == "## Temporary retained-relationship overlay (GUI only)"));
+        assert!(!readme.contains("#temporary-body-reference-overlay-gui-only"));
     }
 
     fn saved_data_guidance(template: &str) -> String {

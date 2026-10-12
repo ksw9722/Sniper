@@ -55,6 +55,47 @@ not proven initiators. Never invent initiators, remote IPs, TLS
 certificates, response-body links, or other unavailable data. Never launch a scan,
 probe, replay, crawl, or autonomous exploration to complete this passive view.
 
+Optional `technology_observations` on origins and exact evidence rows describe
+literal retained response-header declarations. `reported_version` is a reported
+value, not verified installed software or a vulnerability judgment. Preserve
+conflicting versions separately; never select a newest or authoritative version.
+`version_status: "reported"` carries the complete accepted numeric string;
+`not_reported` means no version was declared, `unsupported_format` means the
+declared version is unsupported, and `non_product_version` identifies a connector
+version rather than an installed product version. The latter three keep
+`reported_version: null`; never invent or shorten a version. An absent
+`technology_observations` extension means unavailable metadata; a present empty
+array means no supported declarations in that projection. Neither proves product
+absence. Check omission and completeness fields before describing coverage.
+
+The CLI defaults to catalog 2 for map and exact-row evidence reads. Explicit
+`--technology-catalog-version 1` or numeric call input
+`technology_catalog_version: 1` selects catalog 1. These options set only the
+local API header `X-Sniper-Technology-Catalog-Version`, never an outgoing target
+header. A missing response `technology_catalog_version` marker means legacy v1
+coverage and triggers a warning; it does not establish catalog 2 support. A
+present marker must match the requested supported catalog. Catalog selection
+adds no target traffic, body reads, fallback reads, or automatic retries. Default
+map and evidence reads remain metadata-only.
+
+Ordinary-map failures use fixed CLI codes `SERVICE_MAP_BUSY`,
+`SERVICE_MAP_SCOPE_WORK_LIMIT`, `SERVICE_MAP_SESSION_CHANGED`,
+`SERVICE_MAP_SCOPE_CHANGED`, `SERVICE_MAP_HISTORY_CHANGED`, and
+`SERVICE_MAP_BUILD_FAILED`, with `retryable:false` and no automatic retry. Busy
+means wait for the running refresh to finish, then deliberately retry. For a
+scope work limit, choose a smaller `max_records` / `--max-records` window or
+simplify scope rules only with explicit authorization. Session, scope, or history
+conflicts require a deliberate refresh of the intended session and current data;
+never silently switch sessions. A failed map is not a complete empty inventory.
+
+After a failed GUI refresh, background reads pause and any previous map is stale.
+Only an explicit Refresh or actual scope/session change can resume reads.
+History events, reconnecting, reopening the view, and local filters do not clear
+the pause. Local origin, product/version, method, and path filters issue zero
+reads. Product filters select loaded origins; their matching endpoints do not
+prove endpoint-level product/version declarations. Supplementary inspections
+remain separate, explicit reads and never run automatically on recovery.
+
 For evidence, use `scope service-map-evidence --session-id <returned-session-uuid>
 --evidence-id <returned-token>` (`target.service_map.evidence.get`). Pass both
 fields unchanged and check `available` before using `row`. Tokens bind an exact

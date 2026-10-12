@@ -237,7 +237,7 @@ in-memory action makes no further read and leaves All origins and the API catalo
 metadata-only. **Clear body references**, leaving the map, or a history/source
 invalidation removes it; it is never saved or restored automatically. The CLI
 body-reference output is unchanged. See
-[temporary overlay behavior and limits](docs/integrations/service-map.md#temporary-body-reference-overlay-gui-only).
+[temporary overlay behavior and limits](docs/integrations/service-map.md#temporary-retained-relationship-overlay-gui-only).
 
 An optional **Upstream socket peer** Capture Settings card records one bounded
 socket observation for eligible future ordinary captured HTTP(S) responses. It
