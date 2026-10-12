@@ -2406,6 +2406,53 @@ mod tests {
         );
     }
 
+    fn assert_no_synthetic_body_technology(row: &ServiceMapRow) {
+        // Opaque evidence tokens can legitimately contain the same numeric text
+        // across UUID/sequence delimiters. Check only the declaration fields.
+        assert!(row
+            .technology_observations
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|observation| observation.product_id != "jetty"
+                && observation.reported_version.as_deref() != Some("99.99")));
+    }
+
+    #[test]
+    fn service_map_body_technology_check_accepts_opaque_token_collisions() {
+        let mut row = record("/token-collision");
+        row.sequence = 99;
+        row.response.as_mut().unwrap().body_preview = "RESPONSE_BODY_SENTINEL Jetty(99.99)".into();
+        row.response.as_mut().unwrap().headers = headers(&[("Server", "nginx/1.26.2")]);
+        let ending_99 = Uuid::parse_str("00000000-0000-0000-0000-000000000099").unwrap();
+        let starting_99 = Uuid::parse_str("99000000-0000-0000-0000-000000000000").unwrap();
+        for (generation, revision) in [(ending_99, Uuid::nil()), (Uuid::nil(), starting_99)] {
+            let token = evidence_id(Uuid::nil(), generation, revision, &row);
+            assert!(EvidenceKey::parse(&token).is_some());
+            assert!(token.contains("99.99"));
+            let projected = project_record(&row, token).unwrap();
+            let serialized = serde_json::to_string(&projected).unwrap();
+            // This is a deterministic counterexample to a whole-row substring check.
+            assert!(serialized.contains("99.99"));
+            assert!(!serialized.contains("BODY_SENTINEL"));
+            assert!(!serialized.contains("body_preview"));
+            assert_no_synthetic_body_technology(&projected);
+            for product_leak in [false, true] {
+                let mut leaked = projected.clone();
+                let observation = &mut leaked.technology_observations.as_mut().unwrap()[0];
+                if product_leak {
+                    observation.product_id = "jetty".into();
+                } else {
+                    observation.reported_version = Some("99.99".into());
+                }
+                assert!(
+                    std::panic::catch_unwind(|| assert_no_synthetic_body_technology(&leaked))
+                        .is_err()
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn service_map_technology_snapshot_scan_work_is_measured_and_bounded() {
         const ROWS: usize = 1_000;
@@ -2464,7 +2511,7 @@ mod tests {
                         let serialized = serde_json::to_string(row).unwrap();
                         assert!(!serialized.contains("BODY_SENTINEL"));
                         assert!(!serialized.contains("body_preview"));
-                        assert!(!serialized.contains("99.99"));
+                        assert_no_synthetic_body_technology(row);
                         assert_eq!(
                             row.technology_observations.as_ref().unwrap().len(),
                             observations_per_row
