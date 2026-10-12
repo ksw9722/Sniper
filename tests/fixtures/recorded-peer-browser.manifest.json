@@ -6,7 +6,7 @@
   "app_bootstrap": false,
   "networking": "CSP connect-src none; controller uses a closed stub request adapter",
   "sha256": {
-    "web/service-map.js": "6feea2b770334484e727c3470a61cac673772f7d39b3df20e8f991d43c441980",
+    "web/service-map.js": "b40051e49cf5364ff43af5da954046db2d96deccad8c7643970341d64d4b88a0",
     "web/styles.css": "d975c30e67d8510251e6331ae7046595656e574681ebdcb364b576c47a447fa2",
     "web/index.html": "25e128c32dab1376dbde6898b81b2c886c4b40439a99de1633cb1b10d609b73f",
     "tests/fixtures/recorded-peer-browser.html": "b6e650655e35acc99d30bd4829b2c7c0622626215125f4b416c2469ac55a8e1a",

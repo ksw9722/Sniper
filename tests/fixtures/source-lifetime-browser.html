@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src data:; font-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; worker-src 'none'; manifest-src 'none'">
+  <title>Source lifetime · synthetic production UI fixture</title>
+  <link rel="stylesheet" href="../../web/styles.css">
+  <link rel="stylesheet" href="source-lifetime-browser.css">
+  <script src="../../web/service-map.js" defer></script>
+  <script src="source-lifetime-browser.js" defer></script>
+</head>
+<body>
+  <div class="fixture-shell">
+    <header class="fixture-controls">
+      <div class="fixture-title"><strong id="targetServiceMapTab">Exact source lifetime</strong><span>Synthetic browser QA · actual production controller and styles · passive in-memory responses only</span></div>
+      <div class="fixture-actions">
+        <button class="secondary-action" id="fixtureFresh">Fresh session context</button>
+        <button class="secondary-action" id="fixtureSourceA">Inspect source A</button>
+        <button class="secondary-action" id="fixtureSourceB">Inspect source B</button>
+        <label>Exact-row technology field <select id="fixtureTechnology"><option value="declared">Present: nginx declaration</option><option value="absent">Absent: unavailable</option><option value="empty">Present []: inspected-empty</option></select></label>
+      </div>
+      <div class="fixture-actions">
+        <label>Shown overlay <select id="fixtureOverlay"><option value="body">Body references</option><option value="link">Link declarations</option><option value="peer">Recorded peer group</option></select></label>
+        <button class="secondary-action" id="fixturePrepare">1. Prepare A + shown overlay</button>
+        <label>Unavailable response <select id="fixtureKind"><option value="body">Body</option><option value="link">Link</option><option value="html">HTML generators</option><option value="peer">Peer matches</option></select></label>
+        <label>Reason <select id="fixtureReason"></select></label>
+        <button class="secondary-action" id="fixtureArm">2. Arm next response</button>
+        <button class="secondary-action" id="fixtureInspect">3. Run selected inspection</button>
+        <button class="secondary-action" id="fixtureShow">Show selected overlay</button>
+        <button class="secondary-action" id="fixtureClear">Clear overlay</button>
+      </div>
+      <p class="fixture-expectation">Identity failures: clear verified source, peer, supplements and its overlay. inactive_session: preserve ordinary verified source, clear supplements/overlay, block active-only actions until a real selected-session reset. Optional inspection failures: preserve verified evidence and the already shown overlay. Inspect the production wording below.</p>
+      <details class="fixture-lifecycle" open>
+        <summary>Inactive-session latch, stale response, and sibling race controls</summary>
+        <div class="fixture-actions">
+          <button class="secondary-action" id="fixtureSelection">Select B and back to A</button>
+          <button class="secondary-action" id="fixtureRefresh">Same-session refresh</button>
+          <button class="secondary-action" id="fixtureGeneration">New generation + refresh</button>
+          <button class="secondary-action" id="fixtureScope">Scope revision + refresh</button>
+          <button class="secondary-action" id="fixtureReconnect">Reconnect + refresh</button>
+          <button class="secondary-action" id="fixtureSession">Switch selected session</button>
+          <button class="secondary-action" id="fixtureAwayBack">Switch session away and back</button>
+        </div>
+        <div class="fixture-actions">
+          <label><input type="checkbox" id="fixtureHold"> Hold next</label>
+          <label>Response type <select id="fixtureHoldKind"><option value="body">Body</option><option value="link">Link</option><option value="html">HTML generators</option><option value="peer">Peer matches</option></select></label>
+          <button class="secondary-action" id="fixtureRelease">Release held responses</button>
+          <button class="secondary-action" id="fixtureDelayedA">Prepare delayed A result after verified B</button>
+          <button class="secondary-action" id="fixtureSibling">Prepare concurrent same-source sibling</button>
+          <button class="secondary-action" id="fixtureValidate">Validate fixture DTOs</button>
+        </div>
+        <p>Race helpers use the selected response kind, reason, and overlay. They prepare a fresh source A, hold a real controller request, and stop before release. The stub intentionally ignores abort. Ordinary source selection, refresh, generation, scope and reconnect never call controller.reset. Only the visibly labeled session switches do.</p>
+      </details>
+      <div class="fixture-status">
+        <output id="fixtureResult" role="status">Loading production controller…</output>
+        <output id="fixtureCounters" aria-live="polite"></output>
+        <output id="fixtureEvidenceState" aria-live="polite"></output>
+        <output id="fixtureSupplementState" aria-live="polite"></output>
+        <output id="fixtureActionState" aria-live="polite"></output>
+        <output id="fixtureHeldState" aria-live="polite"></output>
+      </div>
+    </header>
+          <section class="service-map-workspace" id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab">
+            <div class="service-map-toolbar">
+              <div class="service-map-view-controls" id="serviceMapViewControls" role="group" aria-label="Service map view">
+                <button class="service-map-mode" id="serviceMapAllOrigins" type="button" aria-pressed="true">All origins</button>
+                <button class="service-map-mode" id="serviceMapDirectRelations" type="button" aria-pressed="false" title="Pin the selected origin and show only its direct metadata neighbors">Direct relations</button>
+                <button class="secondary-action hidden" id="serviceMapFocusSelection" type="button">Focus selection</button>
+              </div>
+              <div class="service-map-zoom-controls" id="serviceMapZoomControls" role="group" aria-label="Map zoom">
+                <button class="secondary-action" id="serviceMapZoomFit" type="button" title="Fit displayed origins in the map">Fit</button>
+                <button class="secondary-action" id="serviceMapZoomOut" type="button" aria-label="Zoom out">−</button>
+                <button class="secondary-action service-map-zoom-reset" id="serviceMapZoomReset" type="button" aria-label="Zoom 100%. Reset to 100%" title="Reset zoom to 100%">100%</button>
+                <button class="secondary-action" id="serviceMapZoomIn" type="button" aria-label="Zoom in">+</button>
+              </div>
+              <label class="service-map-scope"><input id="serviceMapScopeOnly" type="checkbox" /> In scope only</label>
+              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
+              <details class="service-map-product-filters"><summary>Products / versions</summary><div id="serviceMapProductFilters" class="service-map-product-filter-panel"></div></details>
+              <button class="secondary-action" id="serviceMapRefresh" type="button">Refresh</button>
+            </div>
+            <div class="service-map-status" id="serviceMapStatus" role="status" aria-live="polite"></div>
+            <div class="service-map-content" id="serviceMapContent">
+              <section class="service-map-graph" aria-label="Captured service origins">
+                <div class="service-map-body-overlay hidden" id="serviceMapBodyOverlay" aria-label="Temporary retained observation or reference" aria-live="polite"></div>
+                <div class="service-map-viewport" id="serviceMapViewport" tabindex="0" aria-label="Service map. Plus or minus to zoom, zero to reset, F to fit."><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
+                <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect instruction <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer header declaration <span class="service-map-line dotted" aria-hidden="true"></span>Body URL reference <span class="service-map-line link-declaration" aria-hidden="true"></span>Link declaration <span class="service-map-line preconnect-hint" aria-hidden="true"></span>Preconnect hint <span class="service-map-line peer-observation" aria-hidden="true"></span>Recorded address observation · no confirmed calls<span id="serviceMapGraphBounds"></span><details class="service-map-bounds-details hidden" id="serviceMapBoundsDetails"><summary>Relation details</summary><p id="serviceMapGraphDiagnostics"></p></details></div>
+              </section>
+              <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
+            </div>
+            <section class="service-map-api-catalog hidden" id="serviceMapApiCatalog" aria-label="Observed API paths"></section>
+            <footer class="service-map-notice">Passive retained evidence only. Browser initiators, origin-IP associations and TLS certificate identities are unavailable. Inspect one retained response, then choose Show references on map for a temporary Direct relations overlay. Observed socket peers start in exact source evidence. Find matching recorded peer explicitly, then Show recorded address group for temporary undirected observations. A body, Link or recorded-address view replaces the previous temporary visualization. References and header clues do not establish calls or ownership. Pause HTTP recording manually for steadier inspection; traffic still passes through and other history changes can still clear this view.</footer>
+          </section>
+    <details class="fixture-log"><summary>Stub request log and synthetic identity</summary><p id="fixtureIdentity"></p><ol id="fixtureRequests"></ol></details>
+  </div>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "fixture": "Exact source lifetime \u00b7 synthetic actual-code browser QA",
+  "production_controller": "web/service-map.js",
+  "production_styles": "web/styles.css",
+  "production_dom": "targetServiceMapPanel extracted from web/index.html",
+  "app_bootstrap": false,
+  "networking": "CSP connect-src none; closed in-memory request adapter; connection guards",
+  "sha256": {
+    "web/service-map.js": "b40051e49cf5364ff43af5da954046db2d96deccad8c7643970341d64d4b88a0",
+    "web/styles.css": "d975c30e67d8510251e6331ae7046595656e574681ebdcb364b576c47a447fa2",
+    "web/index.html": "25e128c32dab1376dbde6898b81b2c886c4b40439a99de1633cb1b10d609b73f",
+    "tests/fixtures/source-lifetime-browser.html": "4d1baefd6d214e2bb030690efe358e6bfd3b1c8dad5adf4b46c804a94e3f8693",
+    "tests/fixtures/source-lifetime-browser.js": "570117d89e9baeb90412ed9043b47f518e130fc26a7096fc44407b77a237f8cf",
+    "tests/fixtures/source-lifetime-browser.css": "00163a1a46df57cedd63fdccbd01968205d2a6076e4ce0118ee1256bc40468ee",
+    "tests/fixtures/source-lifetime-browser.manifest.py": "a49b43aa6a3b9ab2b7d24637a5ccde54f9b8fb36a08454e10516b614ad5ecb02",
+    "tests/fixtures/source-lifetime-browser.README.md": "14572b4ff0194e8b7900d6467a0c1ebcf63948e68dc138a38460ee19647d6fa9",
+    "tests/fixtures/source-lifetime-browser.check.cjs": "3a573081346f7daa87c08f3cb63101df0af289869ceebe3a4fb6ec977e6f0844"
+  }
+}

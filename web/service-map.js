@@ -27,6 +27,15 @@
     unsupported_content_encoding: "The retained response encoding is unsupported", body_scan_failed: "The retained preview could not be inspected",
     session_source_changed: "The active session source changed", metadata_unavailable: "Retained response metadata is unavailable",
   };
+  const SOURCE_LIFETIME_MESSAGES = Object.freeze({
+    invalid_evidence_id: "Source verification unavailable for this evidence token; verify again.",
+    session_mismatch: "Source session does not match; verify again.",
+    stale_generation: "Retained history changed; verify again.",
+    record_missing: "The source row is no longer retained. Refresh the map to select current evidence.",
+    record_changed: "The source row changed. Refresh the map to select current evidence.",
+    session_source_changed: "Session context changed; verify again.",
+  });
+  const INACTIVE_SESSION_NOTICE = "This session must be active for supplementary inspection. Switch to it again, then verify the source.";
   const BODY_REFERENCE_PARTIAL_REASONS = new Set(["capture_preview_truncated", "scan_prefix_truncated", "candidate_limit", "candidate_bytes", "origin_limit", "offset_limit"]);
   const BODY_REFERENCE_UNSUPPORTED_REASONS = new Set(["unsupported_metadata", "metadata_limit", "unsupported_content_type", "unsupported_body_encoding", "unsupported_content_encoding"]);
   const BODY_REFERENCE_UNAVAILABLE_REASONS = new Set(Object.keys(BODY_REFERENCE_REASONS).filter((reason) => !BODY_REFERENCE_PARTIAL_REASONS.has(reason) && !BODY_REFERENCE_UNSUPPORTED_REASONS.has(reason)));
@@ -263,7 +272,7 @@
     if (row.technology_observations !== undefined && (row.metadata_complete !== (omitted.length === 0)
       || omitted.includes("technology_observations_limit") && technology_observations.length !== 8)
       || omitted.includes("technology_token_scan_limit") && row.metadata_complete !== false) invalidTechnology();
-    return { ...row, technology_clues, technology_observations, header_links, redirect, omitted: [...omitted] };
+    return { ...row, technology_clues, technology_observations, technology_observations_present: Object.prototype.hasOwnProperty.call(row, "technology_observations"), header_links, redirect, omitted: [...omitted] };
   }
   function normalizeSocketPeer(payload) {
     // This extension is independently optional on older servers. Only typed
@@ -906,7 +915,7 @@
       bodyReferencesSource: null, bodyReferenceOverlay: null, bodyOverlayNotice: "",
       relationshipKind: "body", linkDeclarations: null, linkDeclarationsSource: null, linkDeclarationsError: "",
       htmlGenerators: null, htmlGeneratorsLoading: false, htmlGeneratorsError: "", htmlGeneratorsRequestId: 0, htmlGeneratorsSource: null,
-      historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
+      inactiveSessionId: null, historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
     };
     let abort = null;
     let evidenceAbort = null;
@@ -1154,7 +1163,7 @@
     function showBodyReferencesOnMap() {
       if (state.sessionId !== getSessionId()) { reset(); return false; }
       const scan = state.bodyReferences, source = state.bodyReferencesSource;
-      if (state.relationshipKind !== "body" || !visible || !getEventStreamReady() || state.error || state.stale || !scan || !["scanned", "partial"].includes(scan.status) || !sourceIsRetained(source)
+      if (activeInspectionsBlocked() || state.relationshipKind !== "body" || !visible || !getEventStreamReady() || state.error || state.stale || !scan || !["scanned", "partial"].includes(scan.status) || !sourceIsRetained(source)
         || state.evidenceId !== source.evidenceId || state.selectedOrigin !== source.origin
         || !scan.references.some((item) => item.target_origin !== source.origin)) return false;
       clearOverlay();
@@ -1305,7 +1314,7 @@
     }
     async function loadPeerMatches() {
       const row = state.evidence, peer = state.socketPeer, sessionId = getSessionId(), generation = state.snapshot?.snapshot.generation;
-      if (!visible || state.view !== "service-map" || !getEventStreamReady() || state.error || state.stale || state.sessionId !== sessionId
+      if (activeInspectionsBlocked() || !visible || state.view !== "service-map" || !getEventStreamReady() || state.error || state.stale || state.sessionId !== sessionId
         || !row || row.evidence_id !== state.evidenceId || state.evidenceLoading || state.peerMatchesLoading || !usableSocketPeer(peer)
         || !validTechnologyEvidence(row.evidence_id, sessionId, generation) || row.sequence !== row.evidence_id.split(".")[3]
         || row.record_id !== row.evidence_id.split(".")[5] || safeOrigin(row.origin) !== row.origin || observationTime(row.started_at) === null
@@ -1333,19 +1342,7 @@
         state.peerMatches = normalizePeerMatches(payload, sessionId, source.evidenceId, row, peer, source.scopeOnly, generation);
         state.peerMatchesLoading = false;
         peerMatchesAbort = null;
-        const invalidIdentity = !state.peerMatches.available && state.peerMatches.reasons.find((reason) => ["stale_generation", "record_missing", "record_changed", "inactive_session", "session_source_changed"].includes(reason));
-        if (invalidIdentity) {
-          if (state.bodyReferenceOverlay?.source.evidenceId === source.evidenceId) {
-            clearOverlay("Temporary visualization cleared: the exact inspected source is no longer current.");
-          }
-          // Authoritative identity loss invalidates the current verified row,
-          // its peer and every supplementary inspection, even when the row was
-          // reached through the normal default-map evidence allowlist.
-          cancelEvidence();
-          state.evidenceError = `Source unavailable. ${PEER_MATCH_REASONS[invalidIdentity]}. Refresh the map and choose current exact evidence.`;
-          state.detailTab = "evidence";
-          render();
-        } else renderDetail();
+        if (!handleSupplementLifetime(state.peerMatches, source)) renderDetail();
         return true;
       } catch (_) {
         if (!current()) return false;
@@ -1360,7 +1357,7 @@
     }
     function showPeerMatchesOnMap() {
       const scan = state.peerMatches, source = state.peerMatchesSource;
-      if (!visible || state.view !== "service-map" || !getEventStreamReady() || state.error || state.stale || !scan?.available
+      if (activeInspectionsBlocked() || !visible || state.view !== "service-map" || !getEventStreamReady() || state.error || state.stale || !scan?.available
         || !peerSourceIsCurrent(source) || state.evidenceId !== source.evidenceId || state.selectedOrigin !== source.origin) return false;
       // Inspection and visualization are independent. Replacing the shown view
       // uses only this frozen response and never performs another read.
@@ -1385,7 +1382,7 @@
     function peerMatchesMarkup() {
       const scan = state.peerMatches, source = state.peerMatchesSource;
       const ready = usableSocketPeer(state.socketPeer);
-      const disabled = !ready || !visible || !getEventStreamReady() || !!state.error || state.stale || state.evidenceLoading || state.peerMatchesLoading;
+      const disabled = activeInspectionsBlocked() || !ready || !visible || !getEventStreamReady() || !!state.error || state.stale || state.evidenceLoading || state.peerMatchesLoading;
       const showDisabled = !scan?.available || !peerSourceIsCurrent(source) || source.evidenceId !== state.evidenceId || disabled;
       return `<section class="service-map-body-references service-map-peer-matches" aria-label="Matching recorded socket peers" aria-busy="${state.peerMatchesLoading}"><h4>Matching recorded socket peers</h4><p class="service-map-muted">Explicit inspection of retained direct-route observations with equal source, address family, IP and port. No new capture, DNS, connection or remote request.</p><button class="secondary-action" type="button" data-service-peer-matches="inspect" data-service-focus="peer:inspect" ${disabled ? "disabled" : ""}>${state.peerMatchesLoading ? "Finding matching recorded peers…" : "Find matching recorded peer"}</button>${!ready ? '<p class="service-map-muted">Only a usable, recorded direct-route address can seed this inspection. Proxy, unknown, unavailable and excluded address observations remain diagnostics only.</p>' : ""}${state.peerMatchesError ? `<p class="service-map-error" role="status">${escape(state.peerMatchesError)}</p>` : ""}${scan ? `<div class="service-map-body-reference-result" role="status">${scan.available ? `<p>${scan.status === "no_matches" ? "No other matching rows in this considered, filtered window." : "Matching retained observations found."}</p>${peerCountsMarkup(scan)}` : `<p>Inspection unavailable. ${scan.reasons.map((reason) => escape(PEER_MATCH_REASONS[reason])).join(" · ")}</p>`}</div>` : ""}${scan?.available && scan.origins.length ? `<ul class="service-map-body-reference-list">${scan.origins.map((group) => `<li><span class="service-map-body-reference-origin">${escape(group.origin)}</span><span>${group.matching_rows} matching rows · ${group.samples.length} exact samples</span><span>Recorded first: ${escape(group.first_observed_at)} · last: ${escape(group.last_observed_at)}</span></li>`).join("")}</ul>` : ""}<button class="secondary-action" type="button" data-service-show-peer-matches="show" data-service-focus="peer:show" ${showDisabled ? "disabled" : ""}>Show recorded address group</button><p class="service-map-muted">Show replaces the one temporary visualization using this response, with no additional read. Observation timestamps are discrete recorded facts, not connection counts or continuous endpoint occupancy.</p><p class="service-map-muted">${PEER_PRIVACY}</p>${scan?.available ? `<details class="service-map-body-reference-limits"><summary data-service-focus="peer:limits">Coverage and omissions</summary><p>Other considered rows: ${scan.counts.non_http_rows} non-HTTP · ${scan.counts.not_recorded_rows} not recorded · ${scan.counts.unavailable_observation_rows} unavailable · ${scan.counts.non_direct_rows} non-direct · ${scan.counts.invalid_observation_rows} unusable observations · ${scan.counts.different_peer_rows} different peer · ${scan.counts.invalid_metadata_rows} invalid origin metadata · ${scan.counts.scope_excluded_rows} scope excluded.</p><p>Limits: ${PEER_MATCH_LIMITS.max_records.toLocaleString()} newest retained rows · 100 origin groups · 3 samples per origin · 256 KiB result. Unreturned distinct origins are not counted. Exact samples can change after this point-in-time inspection and are verified again when opened.</p></details>` : ""}</section>`;
     }
@@ -1466,6 +1463,40 @@
       state.htmlGeneratorsLoading = false;
       state.htmlGeneratorsError = "";
     }
+    function activeInspectionsBlocked() {
+      return state.inactiveSessionId !== null && state.inactiveSessionId === getSessionId();
+    }
+    function handleSupplementLifetime(result, source) {
+      // Called only after the request's identity fence and typed normalizer.
+      // Eligibility/preview/parser failures cannot disprove ordinary metadata.
+      if (result.status !== "unavailable") return false;
+      const reason = result.reasons[0];
+      const message = SOURCE_LIFETIME_MESSAGES[reason];
+      if (message) {
+        const overlay = state.bodyReferenceOverlay;
+        const sameSession = overlay?.source.sessionId === source.sessionId;
+        const affectedOverlay = sameSession && (reason === "session_source_changed"
+          || reason === "stale_generation" && overlay.source.generation === source.generation
+          || overlay.source.evidenceId === source.evidenceId);
+        if (affectedOverlay) clearOverlay(`Temporary visualization cleared. ${message}`);
+        cancelEvidence();
+        state.evidenceError = `Source unavailable. ${message}`;
+        render();
+        return true;
+      }
+      if (reason !== "inactive_session") return false;
+      state.inactiveSessionId = source.sessionId;
+      // A peer overlay can also contain an independently allowlisted ordinary
+      // row. Detach that binding before clearing, never restore orphan samples.
+      const ordinaryOrigin = state.snapshot?.origins.find((origin) => origin.origin === state.selectedOrigin);
+      if (state.evidence && evidenceItems(ordinaryOrigin).some((item) => item.id === state.evidence.evidence_id)) state.peerEvidenceBinding = null;
+      clearOverlay(INACTIVE_SESSION_NOTICE);
+      cancelPeerMatches();
+      cancelBodyReferences();
+      cancelHtmlGenerators();
+      render();
+      return true;
+    }
     function cancelEvidence() {
       cancelPeerMatches();
       state.peerEvidenceBinding = null;
@@ -1489,7 +1520,7 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
+        inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
@@ -1705,7 +1736,7 @@
     async function loadBodyReferences() {
       const row = state.evidence;
       const sessionId = getSessionId();
-      if (state.relationshipKind !== "body" || !visible || state.sessionId !== sessionId || !row || state.evidenceId !== row.evidence_id
+      if (activeInspectionsBlocked() || state.relationshipKind !== "body" || !visible || state.sessionId !== sessionId || !row || state.evidenceId !== row.evidence_id
         || state.evidenceLoading || state.bodyReferencesLoading
         || !evidenceItems(selectedOrigin()).some((item) => item.id === row.evidence_id)) return false;
       cancelBodyReferences();
@@ -1713,8 +1744,6 @@
       const evidenceId = row.evidence_id;
       const selected = state.selectedOrigin;
       const generation = state.snapshot?.snapshot.generation;
-      const readsOverlaySource = () => state.bodyReferenceOverlay?.kind !== "link" && state.bodyReferenceOverlay?.source.evidenceId === evidenceId
-        && state.bodyReferenceOverlay.source.origin === selected;
       const current = () => requestId === state.bodyReferencesRequestId && state.relationshipKind === "body" && visible && sessionId === getSessionId()
         && sessionId === state.sessionId && selected === state.selectedOrigin && row === state.evidence && evidenceId === state.evidenceId
         && generation === state.snapshot?.snapshot.generation;
@@ -1732,21 +1761,14 @@
           method: row.method, path: safePath(row.path), sequence: row.sequence, startedAt: row.started_at });
         state.bodyReferencesLoading = false;
         bodyReferencesAbort = null;
-        if (!["scanned", "partial"].includes(state.bodyReferences.status) && (readsOverlaySource()
-          || state.bodyReferenceOverlay?.source.evidenceId === evidenceId && ["session_mismatch", "stale_generation", "record_missing", "record_changed", "response_unavailable", "inactive_session", "session_source_changed"].some((reason) => state.bodyReferences.reasons.includes(reason)))) {
-          clearOverlay("Temporary body references cleared: the inspected source preview is no longer available or supported.");
-          render();
-        } else renderDetail();
+        if (!handleSupplementLifetime(state.bodyReferences, state.bodyReferencesSource)) renderDetail();
         return true;
       } catch (_) {
         if (!current()) return false;
         state.bodyReferencesLoading = false;
         bodyReferencesAbort = null;
         state.bodyReferencesError = "Could not verify retained body references. Retry explicitly, or refresh the map and select the source again.";
-        if (readsOverlaySource()) {
-          clearOverlay("Temporary body references cleared: the inspected source preview could not be verified.");
-          render();
-        } else renderDetail();
+        renderDetail();
         return false;
       }
     }
@@ -1759,7 +1781,7 @@
     }
     async function loadLinkDeclarations() {
       const row = state.evidence, sessionId = getSessionId(), generation = state.snapshot?.snapshot.generation;
-      if (state.relationshipKind !== "link" || !visible || !getEventStreamReady() || state.error || state.stale
+      if (activeInspectionsBlocked() || state.relationshipKind !== "link" || !visible || !getEventStreamReady() || state.error || state.stale
         || state.sessionId !== sessionId || !row || state.evidenceId !== row.evidence_id || state.evidenceLoading || state.bodyReferencesLoading
         || !validHtmlGeneratorEvidence(row.evidence_id, sessionId, generation) || row.evidence_id.split(".")[3] !== row.sequence
         || row.evidence_id.split(".")[5] !== row.record_id || safeOrigin(row.origin) !== row.origin || observationTime(row.started_at) === null
@@ -1787,13 +1809,7 @@
         state.linkDeclarations = normalizeLinkDeclarations(payload, sessionId, source.evidenceId, row);
         state.bodyReferencesLoading = false;
         bodyReferencesAbort = null;
-        // Capability, parser, and unrelated read failures do not invalidate an
-        // already shown scan. Only an explicit exact-source lifetime result does.
-        if (["session_mismatch", "stale_generation", "record_missing", "record_changed", "response_unavailable", "inactive_session", "session_source_changed"].some((reason) => state.linkDeclarations.reasons.includes(reason))
-          && state.bodyReferenceOverlay?.source.evidenceId === source.evidenceId) {
-          clearOverlay("Temporary references cleared: the exact inspected source is no longer available.");
-          render();
-        } else renderDetail();
+        if (!handleSupplementLifetime(state.linkDeclarations, source)) renderDetail();
         return true;
       } catch (_) {
         if (!current()) return false;
@@ -1810,7 +1826,7 @@
     function showLinkDeclarationsOnMap() {
       if (state.sessionId !== getSessionId()) { reset(); return false; }
       const scan = state.linkDeclarations, source = state.linkDeclarationsSource;
-      if (state.relationshipKind !== "link" || !visible || !getEventStreamReady() || state.error || state.stale
+      if (activeInspectionsBlocked() || state.relationshipKind !== "link" || !visible || !getEventStreamReady() || state.error || state.stale
         || !scan || scan.status !== "scanned" || !htmlGeneratorSourceIsRetained(source)
         || state.evidenceId !== source.evidenceId || state.selectedOrigin !== source.origin
         || !scan.observations.some((item) => item.target_origin !== source.origin)) return false;
@@ -1837,7 +1853,7 @@
     }
     async function loadHtmlGenerators() {
       const row = state.evidence, sessionId = getSessionId(), generation = state.snapshot?.snapshot.generation;
-      if (!visible || !getEventStreamReady() || state.error || state.stale || state.sessionId !== sessionId || !row
+      if (activeInspectionsBlocked() || !visible || !getEventStreamReady() || state.error || state.stale || state.sessionId !== sessionId || !row
         || state.evidenceId !== row.evidence_id || state.evidenceLoading || state.htmlGeneratorsLoading
         || !validHtmlGeneratorEvidence(row.evidence_id, sessionId, generation)
         || row.evidence_id.split(".")[3] !== row.sequence || row.evidence_id.split(".")[5] !== row.record_id
@@ -1866,7 +1882,7 @@
         state.htmlGenerators = normalizeHtmlGenerators(payload, sessionId, source.evidenceId, row);
         state.htmlGeneratorsLoading = false;
         htmlGeneratorsAbort = null;
-        renderDetail();
+        if (!handleSupplementLifetime(state.htmlGenerators, source)) renderDetail();
         return true;
       } catch (_) {
         if (!current()) return false;
@@ -1900,6 +1916,7 @@
       // Derive this suffix now so it never claims cleared data is still shown.
       const error = state.refreshPaused && state.error
         ? `${state.error} Automatic refresh paused. ${snapshot ? "Showing the previous snapshot as stale; use Refresh to retry." : "Use Refresh to retry."}` : state.error;
+      if (activeInspectionsBlocked()) status += ` · ${INACTIVE_SESSION_NOTICE}`;
       els.status.textContent = error ? `${error}${snapshot ? ` ${status}` : ""}` : status;
       els.status.classList.toggle("service-map-error", !!state.error);
       els.refresh.disabled = state.loading;
@@ -2088,7 +2105,7 @@
       const hasNeighbors = scanned && result.references.some((item) => item.target_origin !== state.bodyReferencesSource?.origin);
       const showing = state.bodyReferenceOverlay?.kind === "body" && state.bodyReferenceOverlay?.source.evidenceId === state.bodyReferencesSource?.evidenceId
         && state.bodyReferenceOverlay?.source.origin === state.bodyReferencesSource?.origin && !!state.bodyReferenceOverlay;
-      const showDisabled = !scanned || !hasNeighbors || !getEventStreamReady() || !!state.error || state.stale || !sourceIsRetained(state.bodyReferencesSource);
+      const showDisabled = activeInspectionsBlocked() || !scanned || !hasNeighbors || !getEventStreamReady() || !!state.error || state.stale || !sourceIsRetained(state.bodyReferencesSource);
       const showHint = !getEventStreamReady() ? "Wait for the session event connection before showing temporary references."
         : state.error || state.stale ? "Wait for a current metadata snapshot, or use Refresh, before showing temporary references."
         : scanned && !hasNeighbors ? result.references.length ? "Only the source origin was referenced; self-links are not drawn." : "There are no referenced origins to show on the map."
@@ -2106,7 +2123,7 @@
         summary = `<div class="service-map-body-reference-result" role="status"><p>${escape(message)}</p>${scanned ? `<p class="service-map-muted">${result.complete ? "Complete retained-preview scan" : "Partial retained-preview scan"} · ${result.scanned_bytes.toLocaleString()} / ${result.retained_preview_bytes.toLocaleString()} UTF-8 preview bytes inspected${result.omitted_reference_occurrences ? ` · ${result.omitted_reference_occurrences.toLocaleString()} reference occurrence(s) omitted` : ""}</p>` : ""}${result.reasons.length ? `<p class="service-map-muted">${result.reasons.map((reason) => escape(BODY_REFERENCE_REASONS[reason] || reason.replace(/_/g, " "))).join(" · ")}</p>` : ""}</div>
           ${result.references.length ? `<ul class="service-map-body-reference-list" aria-label="Literal URL reference origins">${result.references.map((item) => `<li><span class="service-map-body-reference-origin">${escape(item.target_origin)}</span><span>${item.occurrences.toLocaleString()} occurrence${item.occurrences === 1 ? "" : "s"} · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets.toLocaleString()} more offset(s) omitted` : ""}</span></li>`).join("")}</ul>` : ""}`;
       }
-      return `<div aria-busy="${state.bodyReferencesLoading}"><p class="service-map-muted">Optional inspection of this exact response’s retained HTML or JavaScript preview. Active session only. A literal URL reference does not prove a request, call, or service ownership.</p><button class="secondary-action" type="button" data-service-body-references="inspect" data-service-focus="body-references:inspect" ${state.bodyReferencesLoading ? "disabled" : ""}>${buttonLabel}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting one retained preview locally…</p>' : ""}${state.bodyReferencesError ? `<p class="service-map-error" role="status">${escape(state.bodyReferencesError)}</p>` : ""}${summary}${state.bodyReferencesSource && scanned ? relationshipSourceMarkup(state.bodyReferencesSource, result, "body") : ""}<button class="secondary-action" type="button" data-service-show-body-references="show" data-service-focus="body-references:show" aria-pressed="${showing}" aria-describedby="serviceMapBodyShowHint" ${showDisabled ? "disabled" : ""}>${state.bodyReferenceOverlay ? "Replace shown references" : "Show references on map"}</button><p class="service-map-muted" id="serviceMapBodyShowHint">${showHint}</p><details class="service-map-body-reference-limits"><summary data-service-focus="body-references:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) URLs only. Origins are text, never fetched. No script execution or relative URL resolution. Only Show references on map adds temporary Direct relations. Offsets are zero-based bytes relative to the retained UTF-8 preview, not the original response.</p><p>Scan: ${BODY_REFERENCE_LIMITS.scan_bytes.toLocaleString()} bytes · Serialized row read: ${BODY_REFERENCE_LIMITS.serialized_row_bytes.toLocaleString()} bytes · Origins: ${BODY_REFERENCE_LIMITS.origins} · URL candidates: ${BODY_REFERENCE_LIMITS.candidates.toLocaleString()} · Candidate: ${BODY_REFERENCE_LIMITS.candidate_bytes.toLocaleString()} bytes · Offsets per origin: ${BODY_REFERENCE_LIMITS.offsets_per_origin}.</p>${result ? `<p>${result.candidates_scanned.toLocaleString()} candidates inspected · Capture preview truncated: ${result.capture_preview_truncated ? "yes" : "no"} · Scan prefix truncated: ${result.scan_prefix_truncated ? "yes" : "no"}.</p>` : ""}</details></div>`;
+      return `<div aria-busy="${state.bodyReferencesLoading}"><p class="service-map-muted">Optional inspection of this exact response’s retained HTML or JavaScript preview. Active session only. A literal URL reference does not prove a request, call, or service ownership.</p><button class="secondary-action" type="button" data-service-body-references="inspect" data-service-focus="body-references:inspect" ${activeInspectionsBlocked() || state.bodyReferencesLoading ? "disabled" : ""}>${buttonLabel}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting one retained preview locally…</p>' : ""}${state.bodyReferencesError ? `<p class="service-map-error" role="status">${escape(state.bodyReferencesError)}</p>` : ""}${summary}${state.bodyReferencesSource && scanned ? relationshipSourceMarkup(state.bodyReferencesSource, result, "body") : ""}<button class="secondary-action" type="button" data-service-show-body-references="show" data-service-focus="body-references:show" aria-pressed="${showing}" aria-describedby="serviceMapBodyShowHint" ${showDisabled ? "disabled" : ""}>${state.bodyReferenceOverlay ? "Replace shown references" : "Show references on map"}</button><p class="service-map-muted" id="serviceMapBodyShowHint">${showHint}</p><details class="service-map-body-reference-limits"><summary data-service-focus="body-references:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) URLs only. Origins are text, never fetched. No script execution or relative URL resolution. Only Show references on map adds temporary Direct relations. Offsets are zero-based bytes relative to the retained UTF-8 preview, not the original response.</p><p>Scan: ${BODY_REFERENCE_LIMITS.scan_bytes.toLocaleString()} bytes · Serialized row read: ${BODY_REFERENCE_LIMITS.serialized_row_bytes.toLocaleString()} bytes · Origins: ${BODY_REFERENCE_LIMITS.origins} · URL candidates: ${BODY_REFERENCE_LIMITS.candidates.toLocaleString()} · Candidate: ${BODY_REFERENCE_LIMITS.candidate_bytes.toLocaleString()} bytes · Offsets per origin: ${BODY_REFERENCE_LIMITS.offsets_per_origin}.</p>${result ? `<p>${result.candidates_scanned.toLocaleString()} candidates inspected · Capture preview truncated: ${result.capture_preview_truncated ? "yes" : "no"} · Scan prefix truncated: ${result.scan_prefix_truncated ? "yes" : "no"}.</p>` : ""}</details></div>`;
     }
     function relationshipSourceMarkup(source, result, kind) {
       return `<p class="service-map-overlay-source">${escape(source.method)} ${escape(source.origin)}${escape(source.path)}</p><p class="service-map-muted">Sequence ${escape(source.sequence)} · Captured ${escape(source.startedAt)} · ${kind === "link" ? "Response Link headers" : "Body URL references"} · ${result.complete ? "Complete" : "Partial"} inspection</p>`;
@@ -2121,7 +2138,7 @@
       const result = state.linkDeclarations, source = state.linkDeclarationsSource, scanned = result?.status === "scanned";
       const hasNeighbors = scanned && result.observations.some((item) => item.target_origin !== source?.origin);
       const showing = state.bodyReferenceOverlay?.kind === "link" && state.bodyReferenceOverlay.source.evidenceId === source?.evidenceId;
-      const disabled = state.bodyReferencesLoading || !getEventStreamReady() || !!state.error || state.stale;
+      const disabled = activeInspectionsBlocked() || state.bodyReferencesLoading || !getEventStreamReady() || !!state.error || state.stale;
       const showDisabled = !scanned || !hasNeighbors || disabled || !htmlGeneratorSourceIsRetained(source);
       const label = state.bodyReferencesLoading ? "Inspecting retained Link headers…" : state.linkDeclarationsError || result?.status === "unavailable"
         ? "Retry retained Link headers" : result ? "Inspect retained Link headers again" : "Inspect retained Link headers";
@@ -2133,7 +2150,7 @@
     }
     function htmlGeneratorsMarkup() {
       const result = state.htmlGenerators, scanned = result?.status === "scanned";
-      const disabled = state.htmlGeneratorsLoading || !getEventStreamReady() || !!state.error || state.stale;
+      const disabled = activeInspectionsBlocked() || state.htmlGeneratorsLoading || !getEventStreamReady() || !!state.error || state.stale;
       const buttonLabel = state.htmlGeneratorsLoading ? "Inspecting retained HTML generators…"
         : state.htmlGeneratorsError || result?.status === "unavailable" ? "Retry retained HTML generators"
           : result ? "Inspect retained HTML generators again" : "Inspect retained HTML generators";
@@ -2182,7 +2199,8 @@
       }
       return `<section class="service-map-socket-peer" aria-label="Upstream socket peer">${heading}${content}</section>${peerMatchesMarkup()}`;
     }
-    function technologyMarkup(items, origin = null) {
+    function technologyMarkup(items, origin = null, sourceRow = null) {
+      if (!items.length && sourceRow) return `<p class="service-map-muted service-map-product-coverage">${sourceRow.technology_observations_present ? "No header-reported product declarations in the inspected source metadata." : "Product/version metadata unavailable for this source."} Missing or empty observations do not prove that a product is absent.</p>`;
       if (!items.length) return origin ? `<p class="service-map-muted service-map-product-coverage">${origin.technology_observations_present ? "No loaded product declarations." : origin.peerInspectionOnly ? "Default product metadata unavailable. Exact peer samples do not provide a default origin aggregate." : "Product/version metadata unavailable for this origin."} Missing or empty observations do not prove that a product is absent.</p>` : "";
       const rows = items.map((item) => {
         const detail = origin
@@ -2201,10 +2219,10 @@
       const supplementaryMarkup = peerOnlySource
         ? '<p class="service-map-muted">Body URL, response Link and retained HTML generator inspections are unavailable for this source outside the default metadata projection. Its exact source metadata, recorded header observations and socket peer remain available here.</p>'
         : htmlGeneratorsMarkup() + relationshipsMarkup();
-      const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${state.evidenceLegacyCatalog ? `<p class="service-map-muted">${LEGACY_CATALOG_NOTICE}</p>` : ""}${technologyMarkup(row.technology_observations)}<p>Exact retained source verified for this read.</p></div>` : "";
+      const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${state.evidenceLegacyCatalog ? `<p class="service-map-muted">${LEGACY_CATALOG_NOTICE}</p>` : ""}${technologyMarkup(row.technology_observations, null, row)}<p>Exact retained source verified for this read.</p></div>` : "";
       return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
-        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${peerOriginMarkup(origin)}${row ? socketPeerMarkup() + supplementaryMarkup : ""}
+        ${activeInspectionsBlocked() ? `<p class="service-map-error" role="status">${INACTIVE_SESSION_NOTICE}</p>` : ""}${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${peerOriginMarkup(origin)}${row ? socketPeerMarkup() + supplementaryMarkup : ""}
         <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || `<p class="service-map-muted">${origin.peerInspectionOnly ? "No default-map samples are loaded for this origin; use the exact peer-inspection samples above." : "No source samples are available in this bounded snapshot."}</p>`}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
         ${!endpoint ? technologyMarkup(origin.technology_observations, origin) + relationshipMarkup(origin) : ""}
         ${!endpoint && origin.technology_clues.length ? `<h4>Observed header clues</h4><p class="service-map-muted">${origin.technology_clues.map((clue) => escape(clue.name)).join(", ")} · response headers only</p>` : ""}`;

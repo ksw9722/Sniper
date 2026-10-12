@@ -980,7 +980,7 @@ test('a newer body-reference read wins even if the cancelled read finishes last'
 
 for (const status of ['unsupported', 'unavailable']) test(`${status} retained previews are distinct from a successful zero-reference scan`, async () => {
   const f = await verifiedBodyFixture();
-  const p = bodyReferences({ status, available: false, complete: false, reasons: [status === 'unsupported' ? 'unsupported_content_type' : 'inactive_session'],
+  const p = bodyReferences({ status, available: false, complete: false, reasons: [status === 'unsupported' ? 'unsupported_content_type' : 'body_storage_unavailable'],
     references: [], scanned_bytes: 0, candidates_scanned: 0 });
   delete p.retained_preview_bytes; delete p.source_origin; delete p.source_sequence; delete p.source_started_at;
   await resolveBodyReferences(f, p);
@@ -2430,7 +2430,7 @@ test('HTML and URL-reference pending reads, results and overlay are independent 
     else { bodyRead.resolve(response(bodyValue)); await body; assert.equal(f.controller.showBodyReferencesOnMap(), true); htmlRead.resolve(response(htmlGenerators())); await html; }
     assert.equal(f.state.htmlGenerators.observations.length, 1); assert.equal(f.state.bodyReferences.references.length, 1);
     assert.equal(f.controller.showBodyReferencesOnMap(), true); const overlay = f.state.bodyReferenceOverlay;
-    await resolveHtmlGenerators(f, missingHtmlGenerators()); assert.equal(f.state.bodyReferenceOverlay, overlay);
+    await resolveHtmlGenerators(f, missingHtmlGenerators('unavailable', 'body_storage_unavailable')); assert.equal(f.state.bodyReferenceOverlay, overlay);
     assert.equal(f.state.bodyReferences.references.length, 1); f.controller.clearBodyReferenceOverlay();
     assert.equal(f.state.htmlGenerators.status, 'unavailable'); assert.equal(f.requests.filter(r => r.url.includes('/body-references')).length, 1);
     assert.equal(f.requests.filter(r => r.url.includes('/html-generators')).length, 2);

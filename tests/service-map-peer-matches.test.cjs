@@ -339,13 +339,13 @@ test('omitted origins cannot conceal a byte-rejected sample when a full sample c
 for (const reason of [['peer_inspection_failed'], ['source_out_of_scope'], [['peer_inspection_failed']], null, {}, 1, true]) test(`reason values never coerce into fixed codes: ${JSON.stringify(reason)}`, () => {
   const value = unavailable(); value.reasons = [reason]; assert.throws(() => normalize(value));
 });
-for (const reason of ['record_changed', 'record_missing', 'stale_generation', 'inactive_session', 'session_source_changed']) test(`authoritative ${reason} matching response clears normal verified row, peer and supplements`, async () => {
+for (const reason of ['invalid_evidence_id', 'session_mismatch', 'record_changed', 'record_missing', 'stale_generation', 'session_source_changed']) test(`authoritative ${reason} matching response clears normal verified row, peer and supplements`, async () => {
   const f = fixture(); await f.show(); assert.equal(f.state.peerEvidenceBinding, null); assert.ok(f.state.evidence); assert.ok(f.state.socketPeer);
   const task = f.controller.loadPeerMatches(); f.requests.at(-1).resolve(response(unavailable(reason))); assert.equal(await task, true);
   for (const key of ['evidence', 'socketPeer', 'bodyReferenceOverlay', 'bodyReferences', 'linkDeclarations', 'htmlGenerators', 'peerMatches', 'peerMatchesSource']) assert.equal(f.state[key], null, key);
   assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source|Upstream socket peer/); assert.match(f.els.detail.innerHTML, /Source unavailable/);
 });
-for (const reason of ['record_changed', 'record_missing', 'stale_generation', 'inactive_session', 'session_source_changed']) test(`authoritative ${reason} before Show invalidates the source without needing an overlay`, async () => {
+for (const reason of ['invalid_evidence_id', 'session_mismatch', 'record_changed', 'record_missing', 'stale_generation', 'session_source_changed']) test(`authoritative ${reason} before Show invalidates the source without needing an overlay`, async () => {
   const f = fixture(); await f.load(); await f.verify(); assert.equal(f.state.bodyReferenceOverlay, null);
   const task = f.controller.loadPeerMatches(); f.requests.at(-1).resolve(response(unavailable(reason))); assert.equal(await task, true);
   assert.equal(f.state.evidence, null); assert.equal(f.state.socketPeer, null); assert.equal(f.state.peerMatches, null); assert.equal(f.state.bodyReferenceOverlay, null);

@@ -1,0 +1,22 @@
+/* Fixture chrome only. Production service-map markup/styles are unchanged. */
+body { overflow: auto; user-select: text; -webkit-user-select: text; }
+.fixture-shell { min-height: 100vh; display: grid; grid-template-rows: auto minmax(600px, 1fr) auto; }
+.fixture-controls { padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel-code); }
+.fixture-title, .fixture-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.fixture-title { margin-bottom: 10px; }
+.fixture-title strong { font-size: 16px; color: var(--point); }
+.fixture-title span, .fixture-lifecycle p, .fixture-expectation, .fixture-log { color: var(--text-dim); font-size: 11px; line-height: 1.5; }
+.fixture-actions { margin-bottom: 8px; }
+.fixture-actions label { display: inline-flex; align-items: center; gap: 5px; }
+.fixture-actions select { max-width: 285px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text); }
+.fixture-lifecycle summary, .fixture-log summary { cursor: pointer; }
+.fixture-lifecycle[open] summary { margin-bottom: 8px; }
+.fixture-status { display: grid; gap: 4px; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+#fixtureCounters, #fixtureHeldState { font-family: var(--mono); color: var(--text-soft); }
+#fixtureResult { color: var(--point); }
+#fixtureEvidenceState { font-weight: 600; }
+#targetServiceMapPanel { min-height: 640px; height: 740px; box-sizing: border-box; }
+.fixture-log { padding: 8px 16px 16px; }
+.fixture-log p, .fixture-log li { overflow-wrap: anywhere; font-family: var(--mono); }
+.fixture-log ol { max-height: 240px; overflow: auto; }
+@media (max-width: 780px) { #targetServiceMapPanel { height: 1000px; } .fixture-actions select { max-width: 225px; } }

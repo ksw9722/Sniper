@@ -235,17 +235,20 @@ test('body priority keeps separate metadata omissions and partial coverage visib
   assert.equal(f.state.snapshot.origins.length, 2);
 });
 
-for (const failure of ['unavailable', 'unsupported', 'source mismatch', 'network error']) test(`explicit original body-source reinspection ${failure} drops its shown overlay`, async () => {
-  const f = await displayed(); const task = f.controller.loadBodyReferences(), read = f.requests.at(-1);
+for (const failure of ['unavailable', 'unsupported', 'source mismatch', 'network error']) test(`explicit body reinspection ${failure} clears its overlay only for a valid identity failure`, async () => {
+  const f = await displayed(), shown = f.state.bodyReferenceOverlay, row = f.state.evidence; const task = f.controller.loadBodyReferences(), read = f.requests.at(-1);
   if (failure === 'network error') read.reject(new Error('Synthetic body read failure'));
   else {
     const payload = scan();
     if (failure === 'source mismatch') payload.source_sequence = '9007199254740993';
     else Object.assign(payload, { status: failure, available: false, complete: false, reasons: [failure === 'unavailable' ? 'record_changed' : 'unsupported_content_type'],
-      references: [], scanned_bytes: 0, candidates_scanned: 0 });
+      references: [], scanned_bytes: 0, candidates_scanned: 0, source_origin: null, source_sequence: null, source_started_at: null, retained_preview_bytes: null });
     read.resolve(result(payload));
   }
-  await task; assertAbsent(f); assert.equal(f.requests.length, 4);
+  await task;
+  if (failure === 'unavailable') { assertAbsent(f); assert.equal(f.state.evidence, null); }
+  else { assert.equal(f.state.bodyReferenceOverlay, shown); assert.equal(f.state.evidence, row); }
+  assert.equal(f.requests.length, 4);
 });
 
 test('unavailable body inspection on an unrelated source preserves original shown provenance', async () => {
