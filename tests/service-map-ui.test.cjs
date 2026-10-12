@@ -2222,3 +2222,314 @@ test('catalog header never reaches the existing explicit body-reference request 
   assert.equal(f.requests.length, 4); assert.equal(f.state.bodyReferences, result);
   assert.equal(requestedCatalog(f.requests[3]), '2');
 });
+
+// Independent HTML-generator inspection: all payloads below are synthetic.
+function htmlGeneratorObservation(product = 'wordpress', version = '6.8.1', start = 12, status = version === null ? 'not_reported' : 'reported') {
+  const name = product === 'wordpress' ? 'WordPress' : 'Drupal', productStart = start + 32, productEnd = productStart + name.length;
+  const end = status === 'reported' ? productEnd + 1 + version.length : status === 'unsupported_format' ? productEnd + 6 : productEnd;
+  return { product_id: product, name, catalog_category: 'cms', reported_version: version, version_status: status,
+    source: 'response_html_meta_generator', strength: 'literal_declaration', rule_id: `html_meta_generator.${product}.v1`,
+    tag_span: { start, end: end + 2 }, content_span: { start: productStart, end }, product_span: { start: productStart, end: productEnd },
+    version_span: status === 'reported' ? { start: productEnd + 1, end } : null, offset_basis: 'retained_utf8_preview' };
+}
+function htmlGenerators(patch = {}) {
+  return { schema_version: 1, generator_catalog_version: 1, session_id: technologySession, evidence_id: technologyToken(),
+    available: true, status: 'scanned', complete: true, reasons: [], source_origin: originA, source_sequence: '1', source_started_at: technologyTime,
+    retained_preview_bytes: 1024, scan_prefix_bytes: 1024, capture_preview_truncated: false, scan_prefix_truncated: false,
+    coverage: 'literal_html_generator_explicit_head', head_closed: true, parser_stop: null, tag_candidates_inspected: 4,
+    additional_tag_candidate_encountered: false, additional_observation_encountered: false, unknown_product_declarations: 0,
+    observations: [htmlGeneratorObservation()], limits: { ...map.HTML_GENERATOR_LIMITS }, offset_basis: 'retained_utf8_preview', ...patch };
+}
+function missingHtmlGenerators(status = 'unavailable', reason = 'record_missing') {
+  return htmlGenerators({ available: false, status, complete: false, reasons: [reason], source_origin: null, source_sequence: null,
+    source_started_at: null, retained_preview_bytes: null, scan_prefix_bytes: 0, head_closed: false, tag_candidates_inspected: 0, observations: [] });
+}
+async function htmlGeneratorFixture() {
+  const f = await technologyFixture(withCatalog(technologySnapshot()));
+  await resolveTechnologySource(f, withCatalog(technologyEvidence())); return f;
+}
+async function resolveHtmlGenerators(f, value = htmlGenerators()) {
+  const pending = f.controller.loadHtmlGenerators(); f.requests.at(-1).resolve(response(value)); return pending;
+}
+function clickHtmlInspector(f) {
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceHtmlGenerators: 'inspect' } }) } });
+}
+function htmlSection(f) { return f.els.detail.innerHTML.match(/<section[^>]*service-map-html-generators[\s\S]*?<\/section>/)?.[0] || ''; }
+
+test('HTML generator action is independent, explicit and uses one exact token GET without catalog negotiation', async () => {
+  const f = await technologyFixture(withCatalog(technologySnapshot()));
+  assert.equal(await f.controller.loadHtmlGenerators(), false); assert.equal(f.requests.length, 1);
+  await resolveTechnologySource(f, withCatalog(technologyEvidence()));
+  assert.match(htmlSection(f), /Inspect retained HTML generators/);
+  const count = f.requests.length; f.controller.setZoom(1.2); f.controller.fitGraph(); f.controller.displayChanged();
+  f.controller.selectOrigin(originA, 0); await resolveTechnologySource(f, withCatalog(technologyEvidence()));
+  assert.equal(f.requests.length, count + 1); assert.equal(f.requests.filter(r => /html-generators|body-references/.test(r.url)).length, 0);
+  clickHtmlInspector(f); clickHtmlInspector(f); assert.equal(await f.controller.loadHtmlGenerators(), false);
+  const request = f.requests.at(-1), url = new URL(request.url, originA);
+  assert.equal(url.pathname, '/api/target/service-map/html-generators'); assert.equal(url.searchParams.get('session_id'), technologySession);
+  assert.equal(url.searchParams.get('evidence_id'), technologyToken()); assert.equal([...url.searchParams.keys()].length, 2);
+  assert.equal(request.options.method || 'GET', 'GET'); assert.equal(request.options.headers, undefined); assert.equal(request.options.redirect, 'error');
+  assert.match(htmlSection(f), /data-service-html-generators="inspect"[^>]*disabled/);
+  request.resolve(response(htmlGenerators())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.htmlGenerators.status, 'scanned'); assert.equal(f.state.bodyReferences, null); assert.equal(f.state.bodyReferenceOverlay, null);
+  assert.equal(f.requests.filter(r => r.url.includes('/html-generators')).length, 1);
+  assert.doesNotMatch(htmlSection(f), /data-service-show|Show references on map/);
+});
+
+test('HTML generators retain conflicting literal reports, category, exact provenance and qualified versions', async () => {
+  const f = await htmlGeneratorFixture();
+  const observations = [htmlGeneratorObservation(), htmlGeneratorObservation('wordpress', '6.7.2', 90),
+    htmlGeneratorObservation('drupal', null, 170), htmlGeneratorObservation('drupal', null, 240, 'unsupported_format')];
+  assert.equal(await resolveHtmlGenerators(f, htmlGenerators({ observations, tag_candidates_inspected: 7 })), true);
+  const html = htmlSection(f);
+  for (const text of ['WordPress', 'Drupal', 'Reported version: 6.8.1', 'Reported version: 6.7.2', 'unknown (not reported)', 'unknown (unsupported format)',
+    'Catalog: CMS', 'tag 12–61', 'content 44–59', 'product 44–53', 'version 54–59', 'zero-based, end exclusive', 'Sequence 1', technologyTime,
+    'reported generators, not proven backend/runtime technologies or installed versions']) assert.ok(html.includes(text), text);
+  assert.equal(f.state.htmlGenerators.observations.length, 4); assert.doesNotMatch(html, /<meta|<script|Show references on map/);
+});
+
+for (const [name, patch, expected] of [
+  ['complete head', {}, /Complete supported-head inspection/],
+  ['capture-truncated body after closed head', { capture_preview_truncated: true, complete: false, reasons: ['capture_preview_truncated'] }, /Partial retained-preview coverage/],
+  ['prefix-truncated body after closed head', { scan_prefix_truncated: true, retained_preview_bytes: 300000, scan_prefix_bytes: 262144, complete: false, reasons: ['scan_prefix_truncated'] }, /Partial retained-preview coverage/],
+  ['both truncation flags after closed head', { capture_preview_truncated: true, scan_prefix_truncated: true, retained_preview_bytes: 300000, scan_prefix_bytes: 262144, complete: false, reasons: ['capture_preview_truncated', 'scan_prefix_truncated'] }, /Partial retained-preview coverage/],
+]) test(`HTML generator ${name} labels head and overall coverage separately`, async () => {
+  const f = await htmlGeneratorFixture(); assert.equal(await resolveHtmlGenerators(f, htmlGenerators(patch)), true);
+  assert.match(htmlSection(f), expected); assert.match(htmlSection(f), /Supported explicit head closed: yes/);
+  assert.match(htmlSection(f), /body after the head is not parsed/); assert.match(htmlSection(f), /offered to the parser/);
+});
+
+for (const reason of ['end_of_preview', 'input_limit', 'tag_candidate_limit', 'tag_byte_limit', 'attribute_limit', 'observation_limit',
+  'unsupported_document_context', 'unsupported_head_context', 'unsupported_doctype', 'unsupported_comment', 'unsupported_script_escape',
+  'unsupported_entity', 'unsupported_self_closing', 'malformed_tag', 'duplicate_attribute', 'null_byte']) test(`HTML generator partial parser stop is bounded and honest: ${reason}`, async () => {
+  const f = await htmlGeneratorFixture(), value = htmlGenerators({ complete: false, head_closed: false, parser_stop: { reason, byte_cursor: 900 }, reasons: [reason], observations: [] });
+  if (reason === 'input_limit') { value.scan_prefix_truncated = true; value.retained_preview_bytes = 300000; value.scan_prefix_bytes = 262144; value.parser_stop.byte_cursor = 262144; value.reasons = ['input_limit', 'scan_prefix_truncated']; }
+  if (reason === 'end_of_preview') value.parser_stop.byte_cursor = value.scan_prefix_bytes;
+  if (reason === 'tag_candidate_limit') { value.additional_tag_candidate_encountered = true; value.tag_candidates_inspected = 4096; value.retained_preview_bytes = 262144; value.scan_prefix_bytes = 262144; value.parser_stop.byte_cursor = 262100; }
+  if (reason === 'observation_limit') { value.additional_observation_encountered = true; value.tag_candidates_inspected = 11; value.observations = Array.from({ length: 8 }, (_, i) => htmlGeneratorObservation('wordpress', '6.8.1', 12 + i * 70)); }
+  assert.equal(await resolveHtmlGenerators(f, value), true);
+  assert.match(htmlSection(f), /Partial retained-preview coverage/); assert.match(htmlSection(f), /Supported explicit head closed: no/);
+  assert.doesNotMatch(htmlSection(f), /not found|No supported WordPress or Drupal generator declarations in the inspected head/);
+  assert.match(htmlSection(f), /Uninspected declarations are not counted/);
+});
+
+test('HTML generator empty proven preview remains partial without inventing declarations or skipped totals', async () => {
+  const f = await htmlGeneratorFixture(); const value = htmlGenerators({ complete: false, head_closed: false, retained_preview_bytes: 0, scan_prefix_bytes: 0,
+    parser_stop: { reason: 'end_of_preview', byte_cursor: 0 }, reasons: ['end_of_preview'], tag_candidates_inspected: 0, observations: [] });
+  assert.equal(await resolveHtmlGenerators(f, value), true); assert.match(htmlSection(f), /coverage is partial/); assert.doesNotMatch(htmlSection(f), /not found/);
+});
+for (const [status, reason] of [['unsupported', 'unsupported_content_type'], ['unavailable', 'retained_preview_unavailable']]) test(`HTML generator ${status} has no source or false negative report`, async () => {
+  const f = await htmlGeneratorFixture(); assert.equal(await resolveHtmlGenerators(f, missingHtmlGenerators(status, reason)), true);
+  assert.match(htmlSection(f), /Generator declarations were not inspected/); assert.doesNotMatch(htmlSection(f), /not found|Source: https|Sequence 1|Complete supported-head/);
+  assert.equal(f.state.htmlGenerators.source_origin, null); assert.equal(f.state.htmlGenerators.observations.length, 0);
+});
+
+test('old-server HTML generator 404 is unsupported without response-body parsing, retries or raw errors', async () => {
+  const f = await htmlGeneratorFixture(), count = f.requests.length, pending = f.controller.loadHtmlGenerators();
+  f.requests.at(-1).resolve({ ok: false, status: 404, json() { assert.fail('Never parse old-server errors'); }, text() { assert.fail('Never echo old-server errors'); } });
+  assert.equal(await pending, false); assert.equal(f.requests.length, count + 1); assert.equal(f.state.htmlGenerators, null);
+  assert.match(htmlSection(f), /This server does not support retained HTML generator inspection/);
+  const poll = f.controller.refresh(); f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await poll;
+  assert.equal(f.requests.filter(r => r.url.includes('/html-generators')).length, 1);
+});
+
+for (const [name, mutate] of [
+  ['schema', v => v.schema_version = 2], ['catalog', v => v.generator_catalog_version = 2], ['session', v => v.session_id = 'other'],
+  ['evidence', v => v.evidence_id = technologyToken('2')], ['availability', v => v.available = false], ['status', v => v.status = 'partial'],
+  ['non-boolean complete', v => v.complete = 'true'], ['false complete', v => v.complete = false], ['coverage', v => v.coverage = 'all_html'],
+  ['offset basis', v => v.offset_basis = 'response'], ['omitted nullable stop', v => delete v.parser_stop], ['raw body', v => v.body = 'PRIVATE_BODY'],
+  ['raw diagnostic', v => v.diagnostic = 'PRIVATE_DIAGNOSTIC'], ['origin', v => v.source_origin = originB], ['uncanonical origin', v => v.source_origin += '/'],
+  ['numeric sequence', v => v.source_sequence = 1], ['wrong sequence', v => v.source_sequence = '2'], ['time', v => v.source_started_at = technologyLast],
+  ['invalid time', v => v.source_started_at = '2026-02-30T00:00:00Z'], ['preview null', v => v.retained_preview_bytes = null],
+  ['prefix exceeds preview', v => v.scan_prefix_bytes = 1025], ['prefix exceeds limit', v => { v.scan_prefix_bytes = 262145; v.retained_preview_bytes = 262145; }],
+  ['fractional prefix', v => v.scan_prefix_bytes = 1.5], ['limit', v => v.limits.attributes = 33], ['additional limit key', v => v.limits.unknown = 1],
+  ['unallowlisted reason', v => v.reasons = ['PRIVATE_BODY']], ['capture flag without reason', v => v.capture_preview_truncated = true],
+  ['prefix flag without reason', v => v.scan_prefix_truncated = true], ['non-boolean head', v => v.head_closed = 1], ['missing stop for partial head', v => v.head_closed = false],
+  ['tag count', v => v.tag_candidates_inspected = 4097], ['unknown count', v => v.unknown_product_declarations = 5],
+  ['unproven extra tag', v => v.additional_tag_candidate_encountered = true], ['unproven extra observation', v => v.additional_observation_encountered = true],
+  ['arbitrary product', v => v.observations[0].product_id = 'private-product'], ['product alias', v => v.observations[0].name = 'WORDPRESS'],
+  ['category', v => v.observations[0].catalog_category = 'runtime'], ['source', v => v.observations[0].source = 'response_header'],
+  ['strength', v => v.observations[0].strength = 'verified'], ['rule', v => v.observations[0].rule_id = 'unknown'],
+  ['raw tag', v => v.observations[0].raw_tag = '<meta PRIVATE_BODY>'], ['version suffix', v => v.observations[0].reported_version = '6.8-PRIVATE_BODY'],
+  ['version whitespace', v => v.observations[0].reported_version = '6.8.1 '], ['version unicode', v => v.observations[0].reported_version = '٦.٨.١'],
+  ['version status', v => v.observations[0].version_status = 'verified'], ['hidden rejected version', v => v.observations[0].version_status = 'unsupported_format'],
+  ['tag before prefix', v => v.observations[0].tag_span.start = -1], ['tag exceeds prefix', v => v.observations[0].tag_span.end = 1025],
+  ['reversed tag', v => v.observations[0].tag_span.end = 1], ['raw span key', v => v.observations[0].tag_span.raw = 'PRIVATE_BODY'],
+  ['content outside tag', v => v.observations[0].content_span.end = 61], ['wrong product start', v => v.observations[0].product_span.start++],
+  ['wrong product length', v => v.observations[0].product_span.end++], ['overlapping version', v => v.observations[0].version_span.start = 53],
+  ['wrong version length', v => v.observations[0].version_span.start++], ['version outside content', v => v.observations[0].version_span.end++],
+  ['overlapping declarations', v => v.observations.push(htmlGeneratorObservation())], ['output overflow', v => v.observations = Array(9).fill(v.observations[0])],
+]) test(`HTML generator envelope rejects ${name} without publishing private content`, async () => {
+  const f = await htmlGeneratorFixture(), value = htmlGenerators(); mutate(value);
+  assert.equal(await resolveHtmlGenerators(f, value), false); assert.equal(f.state.htmlGenerators, null);
+  assert.match(htmlSection(f), /Could not verify retained HTML generators/);
+  assert.doesNotMatch(JSON.stringify(f.state.htmlGenerators) + htmlSection(f), /PRIVATE_BODY|PRIVATE_DIAGNOSTIC|private-product|6\.8-PRIVATE/);
+});
+
+for (const key of ['source_origin', 'source_sequence', 'source_started_at', 'retained_preview_bytes', 'parser_stop']) test(`HTML generator unavailable requires explicit null ${key}`, () => {
+  const value = missingHtmlGenerators(); delete value[key];
+  assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row), /Invalid retained HTML-generator response/);
+});
+
+for (const [name, mutate] of [
+  ['source metadata', v => v.source_origin = originA], ['observation', v => v.observations = [htmlGeneratorObservation()]],
+  ['scan bytes', v => v.scan_prefix_bytes = 1], ['tags', v => v.tag_candidates_inspected = 1], ['truncation', v => v.capture_preview_truncated = true],
+  ['parser reason', v => v.reasons = ['end_of_preview']], ['no reason', v => v.reasons = []],
+]) test(`HTML generator unavailable rejects leftover ${name}`, () => {
+  const value = missingHtmlGenerators(); mutate(value);
+  assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row), /Invalid retained HTML-generator response/);
+});
+
+test('HTML generator pending and result survive real app unchanged polls without repeated inspection reads', async () => {
+  const f = await htmlGeneratorFixture(); clickHtmlInspector(f); const request = f.requests.at(-1), initial = f.els.detail.replacements;
+  for (let i = 0; i < 3; i++) {
+    const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await poll;
+    assert.equal(request.options.signal.aborted, false); assert.equal(f.state.htmlGeneratorsLoading, true); assert.equal(f.els.detail.replacements, initial);
+  }
+  request.resolve(response(htmlGenerators())); await new Promise(resolve => setImmediate(resolve));
+  const result = f.state.htmlGenerators, source = f.state.htmlGeneratorsSource;
+  const nativeHtml = f.els.detail.innerHTML.replace('<details class="service-map-html-generator-limits">', '<details class="service-map-html-generator-limits" open="">');
+  f.els.detail.innerHTML = nativeHtml; const replacements = f.els.detail.replacements;
+  const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await poll;
+  assert.equal(f.state.htmlGenerators, result); assert.equal(f.state.htmlGeneratorsSource, source);
+  assert.equal(f.els.detail.replacements, replacements); assert.equal(f.els.detail.innerHTML, nativeHtml);
+  assert.equal(f.requests.filter(r => r.url.includes('/html-generators')).length, 1);
+});
+
+for (const change of ['token', 'generation', 'source path', 'source method', 'origin removed', 'refresh failure', 'force refresh', 'history invalidation', 'source reinspection', 'hide', 'disconnect', 'session']) test(`HTML generator late result is fenced after ${change}`, async () => {
+  const f = await htmlGeneratorFixture(); const pending = f.controller.loadHtmlGenerators(), request = f.requests.at(-1);
+  if (['token', 'generation', 'source path', 'source method', 'origin removed', 'refresh failure', 'force refresh'].includes(change)) {
+    const payload = withCatalog(technologySnapshot());
+    if (change === 'token') { payload.origins[0].endpoints[0].evidence = [technologyToken('2')]; payload.origins[0].technology_observations = []; }
+    if (change === 'generation') { payload.snapshot.generation = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'; payload.origins[0].technology_observations = []; }
+    if (change === 'source path') payload.origins[0].endpoints[0].path = '/changed';
+    if (change === 'source method') payload.origins[0].endpoints[0].method = 'POST';
+    if (change === 'origin removed') payload.origins = [];
+    const poll = f.controller.refresh({ force: change === 'force refresh' });
+    if (change === 'refresh failure') f.requests.at(-1).reject(new Error('PRIVATE_BODY'));
+    else f.requests.at(-1).resolve(response(payload));
+    await poll;
+  } else if (change === 'history invalidation') f.controller.markDirty();
+  else if (change === 'source reinspection') { const verify = f.controller.loadEvidence(technologyToken()); f.requests.at(-1).resolve(response(withCatalog(technologyEvidence()))); await verify; }
+  else if (change === 'hide') f.controller.setVisible(false);
+  else if (change === 'disconnect') f.controller.disconnect();
+  else { f.setSession('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'); f.controller.reset(); }
+  assert.equal(request.options.signal.aborted, true); assert.equal(f.state.htmlGeneratorsSource, null);
+  request.resolve(response(htmlGenerators())); assert.equal(await pending, false); assert.equal(f.state.htmlGenerators, null);
+  assert.equal(f.state.htmlGeneratorsLoading, false); assert.doesNotMatch(htmlSection(f), /Reported version: 6\.8\.1/);
+});
+
+test('HTML and URL-reference pending reads, results and overlay are independent in either completion order', async () => {
+  for (const htmlFirst of [true, false]) {
+    const f = await htmlGeneratorFixture(), html = f.controller.loadHtmlGenerators(), htmlRead = f.requests.at(-1);
+    const body = f.controller.loadBodyReferences(), bodyRead = f.requests.at(-1);
+    const bodyValue = bodyReferences({ session_id: technologySession, evidence_id: technologyToken(), source_sequence: '1' });
+    if (htmlFirst) { htmlRead.resolve(response(htmlGenerators())); await html; bodyRead.resolve(response(bodyValue)); await body; }
+    else { bodyRead.resolve(response(bodyValue)); await body; assert.equal(f.controller.showBodyReferencesOnMap(), true); htmlRead.resolve(response(htmlGenerators())); await html; }
+    assert.equal(f.state.htmlGenerators.observations.length, 1); assert.equal(f.state.bodyReferences.references.length, 1);
+    assert.equal(f.controller.showBodyReferencesOnMap(), true); const overlay = f.state.bodyReferenceOverlay;
+    await resolveHtmlGenerators(f, missingHtmlGenerators()); assert.equal(f.state.bodyReferenceOverlay, overlay);
+    assert.equal(f.state.bodyReferences.references.length, 1); f.controller.clearBodyReferenceOverlay();
+    assert.equal(f.state.htmlGenerators.status, 'unavailable'); assert.equal(f.requests.filter(r => r.url.includes('/body-references')).length, 1);
+    assert.equal(f.requests.filter(r => r.url.includes('/html-generators')).length, 2);
+  }
+});
+
+test('HTML generator rejects malformed verified-token identities before issuing an inspection request', async () => {
+  const f = await verifiedBodyFixture(), count = f.requests.length;
+  assert.equal(await f.controller.loadHtmlGenerators(), false); assert.equal(f.requests.length, count);
+  for (const mutate of [row => row.sequence = '2', row => row.record_id = technologyGeneration, row => row.started_at = 'invalid', row => row.origin += '/']) {
+    const good = await htmlGeneratorFixture(), count = good.requests.length; mutate(good.state.evidence);
+    assert.equal(await good.controller.loadHtmlGenerators(), false); assert.equal(good.requests.length, count);
+  }
+});
+
+function nativeHtmlGeneratorModel(f) {
+  const descriptor = Object.getOwnPropertyDescriptor(f.els.detail, 'innerHTML');
+  const fresh = html => ({
+    body: html.includes('service-map-detail-body') ? { scrollTop: 0 } : null,
+    limits: html.includes('class="service-map-html-generator-limits"') ? { open: false } : null,
+    bodyLimits: html.includes('class="service-map-body-reference-limits"') ? { open: false } : null,
+    summary: html.includes('data-service-focus="html-generators:limits"') ? { dataset: { serviceFocus: 'html-generators:limits' }, isConnected: true,
+      getClientRects: () => [{}], focus() { f.document.activeElement = this; } } : null,
+  });
+  let current = fresh(f.els.detail.innerHTML);
+  f.els.detail.querySelector = selector => current[{ '.service-map-detail-body': 'body', '.service-map-html-generator-limits': 'limits', '.service-map-body-reference-limits': 'bodyLimits' }[selector]] || null;
+  f.els.detail.querySelectorAll = () => current.summary ? [current.summary] : [];
+  Object.defineProperty(f.els.detail, 'innerHTML', { get: descriptor.get, set(html) {
+    if (current.summary) current.summary.isConnected = false;
+    if (f.document.activeElement === current.summary) f.document.activeElement = f.document.body;
+    descriptor.set.call(this, html); current = fresh(html);
+  } });
+  return () => current;
+}
+
+test('HTML generator completion and same-source markup changes preserve focus, scroll and independent native disclosures', async () => {
+  const f = await htmlGeneratorFixture(), view = nativeHtmlGeneratorModel(f);
+  const pending = f.controller.loadHtmlGenerators();
+  view().limits.open = true; view().bodyLimits.open = true; view().body.scrollTop = 360; f.document.activeElement = view().summary;
+  f.requests.at(-1).resolve(response(htmlGenerators())); await pending;
+  assert.equal(view().limits.open, true); assert.equal(view().bodyLimits.open, true); assert.equal(view().body.scrollTop, 360); assert.equal(f.document.activeElement, view().summary);
+  const result = f.state.htmlGenerators, previous = view(), payload = withCatalog(technologySnapshot()); payload.origins[0].technology_observations[0].row_count++;
+  const poll = f.controller.refresh(); f.requests.at(-1).resolve(response(payload)); await poll;
+  assert.notEqual(view(), previous); assert.equal(f.state.htmlGenerators, result);
+  assert.equal(view().limits.open, true); assert.equal(view().bodyLimits.open, true); assert.equal(view().body.scrollTop, 360); assert.equal(f.document.activeElement, view().summary);
+  const verify = f.controller.loadEvidence(technologyToken()); f.requests.at(-1).resolve(response(withCatalog(technologyEvidence()))); await verify;
+  assert.equal(f.state.htmlGenerators, null); assert.equal(view().limits.open, false); assert.equal(view().bodyLimits.open, false); assert.equal(view().body.scrollTop, 0);
+  assert.notEqual(f.document.activeElement, view().summary);
+});
+
+test('HTML generator normalization copies every mutable output span and reasons array', () => {
+  const payload = htmlGenerators(), normalized = map.normalizeHtmlGenerators(payload, technologySession, technologyToken(), technologyEvidence().row);
+  payload.observations[0].tag_span.start = 1; payload.observations[0].content_span.start = 1; payload.observations[0].product_span.start = 1;
+  payload.observations[0].version_span.start = 1; payload.reasons.push('PRIVATE_BODY'); payload.observations.push(htmlGeneratorObservation('drupal', '10.3', 200));
+  assert.equal(normalized.observations.length, 1); assert.equal(normalized.observations[0].tag_span.start, 12);
+  assert.equal(normalized.observations[0].content_span.start, 44); assert.equal(normalized.observations[0].product_span.start, 44);
+  assert.equal(normalized.observations[0].version_span.start, 54); assert.equal(normalized.reasons.length, 0);
+});
+
+for (const mutate of [v => v.parser_stop.byte_cursor = 1025, v => v.parser_stop.byte_cursor = 60, v => v.parser_stop.reason = 'PRIVATE_DIAGNOSTIC',
+  v => v.parser_stop.raw = 'PRIVATE_BODY', v => v.reasons = ['unsupported_head_context', 'unsupported_head_context'],
+  v => v.reasons = ['unsupported_head_context', 'capture_preview_truncated'], v => v.head_closed = true]) test('HTML generator rejects inconsistent parser coverage metadata', () => {
+  const value = htmlGenerators({ complete: false, head_closed: false, parser_stop: { reason: 'unsupported_head_context', byte_cursor: 100 }, reasons: ['unsupported_head_context'] }); mutate(value);
+  assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row), /Invalid retained HTML-generator response/);
+});
+
+for (const [name, mutate] of [
+  ['zero-byte closed head', v => { v.retained_preview_bytes = 0; v.scan_prefix_bytes = 0; v.tag_candidates_inspected = 0; v.observations = []; }],
+  ['two-tag closed head', v => { v.tag_candidates_inspected = 2; v.observations = []; }],
+  ['missing consumed document tags', v => v.tag_candidates_inspected = 3],
+  ['short non-capped prefix', v => { v.retained_preview_bytes = 200; v.scan_prefix_bytes = 100; v.scan_prefix_truncated = true; v.complete = false; v.reasons = ['scan_prefix_truncated']; }],
+  ['over-short capped prefix', v => { v.retained_preview_bytes = 300000; v.scan_prefix_bytes = 262140; v.scan_prefix_truncated = true; v.complete = false; v.reasons = ['scan_prefix_truncated']; }],
+  ['EOF before prefix boundary', v => { v.complete = false; v.head_closed = false; v.reasons = ['end_of_preview']; v.parser_stop = { reason: 'end_of_preview', byte_cursor: 900 }; }],
+  ['input-limit before prefix boundary', v => { v.complete = false; v.head_closed = false; v.scan_prefix_truncated = true; v.retained_preview_bytes = 300000; v.scan_prefix_bytes = 262144; v.reasons = ['input_limit', 'scan_prefix_truncated']; v.parser_stop = { reason: 'input_limit', byte_cursor: 262143 }; }],
+  ['tags exceed prefix bytes', v => { v.observations = []; v.tag_candidates_inspected = 1025; }],
+  ['tags exceed stop cursor', v => { v.complete = false; v.head_closed = false; v.observations = []; v.reasons = ['unsupported_document_context']; v.parser_stop = { reason: 'unsupported_document_context', byte_cursor: 0 }; }],
+]) test(`HTML generator rejects impossible bounded coverage: ${name}`, () => {
+  const value = htmlGenerators(); mutate(value); assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row), /Invalid retained HTML-generator response/);
+});
+for (const bytes of [262141, 262142, 262143, 262144]) test(`HTML generator accepts capped UTF-8 prefix boundary ${bytes}`, () => {
+  const value = htmlGenerators({ retained_preview_bytes: 300000, scan_prefix_bytes: bytes, scan_prefix_truncated: true, complete: false, reasons: ['scan_prefix_truncated'] });
+  assert.equal(map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row).scan_prefix_bytes, bytes);
+});
+test('HTML generator actual ninth declaration consumes a candidate in addition to explicit document tags', () => {
+  const value = htmlGenerators({ observations: Array.from({ length: 8 }, (_, i) => htmlGeneratorObservation('wordpress', '6.8.1', 12 + i * 70)),
+    tag_candidates_inspected: 10, additional_observation_encountered: true, complete: false, head_closed: false,
+    parser_stop: { reason: 'observation_limit', byte_cursor: 900 }, reasons: ['observation_limit'] });
+  assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row), /Invalid retained HTML-generator response/);
+  value.tag_candidates_inspected = 11; assert.equal(map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row).observations.length, 8);
+});
+test('HTML generator unavailable has exactly one acquisition reason', () => {
+  const value = missingHtmlGenerators(); value.reasons = ['record_missing', 'session_mismatch'];
+  assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row), /Invalid retained HTML-generator response/);
+});
+
+for (const suffix of ['\n', '\r', '\u2028', '\u2029', '\t', ' ']) test(`HTML generator numeric version rejects terminal whitespace ${JSON.stringify(suffix)} even with consistent spans`, () => {
+  const value = htmlGenerators(), item = value.observations[0]; item.reported_version += suffix;
+  item.version_span.end++; item.content_span.end++; item.tag_span.end++;
+  assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, technologyToken(), technologyEvidence().row), /Invalid retained HTML-generator response/);
+});
+for (const mutate of [parts => parts[5] += '\n', parts => parts[3] += '\n', parts => parts[2] = parts[2].toUpperCase(), parts => parts[1] = parts[1].toUpperCase()]) test('HTML generator evidence token requires canonical lowercase full UUID and numeric segments', () => {
+  const parts = technologyToken().split('.'); mutate(parts); const token = parts.join('.'), value = htmlGenerators({ evidence_id: token });
+  assert.throws(() => map.normalizeHtmlGenerators(value, technologySession, token, technologyEvidence().row), /Invalid retained HTML-generator response/);
+});

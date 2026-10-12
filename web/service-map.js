@@ -278,6 +278,121 @@
       candidates_scanned: payload.candidates_scanned, omitted_reference_occurrences: payload.omitted_reference_occurrences,
       capture_preview_truncated: payload.capture_preview_truncated, scan_prefix_truncated: payload.scan_prefix_truncated };
   }
+  const HTML_GENERATOR_LIMITS = Object.freeze({ scan_bytes: 262144, serialized_row_bytes: 2097152, tag_candidates: 4096, tag_bytes: 4096, attributes: 32, observations: 8, version_bytes: 32, version_separator_bytes: 32 });
+  const HTML_GENERATOR_ACQUISITION_REASONS = new Set([
+    "invalid_evidence_id", "session_mismatch", "stale_generation", "record_missing", "record_changed", "body_identity_unverifiable",
+    "response_unavailable", "metadata_limit", "unsupported_content_type", "unsupported_body_encoding", "unsupported_content_encoding",
+    "unsupported_metadata", "serialized_row_limit", "body_storage_unavailable", "body_read_failed", "malformed_retained_row",
+    "retained_preview_unavailable", "body_scan_failed", "inactive_session", "session_source_changed", "metadata_unavailable",
+  ]);
+  const HTML_GENERATOR_STOP_REASONS = {
+    end_of_preview: "Preview ended before a supported closing head", input_limit: "Input limit reached before a supported closing head",
+    tag_candidate_limit: "Tag candidate limit reached", tag_byte_limit: "Tag byte limit reached", attribute_limit: "Attribute limit reached",
+    observation_limit: "Generator declaration output limit reached", unsupported_document_context: "Document context is unsupported",
+    unsupported_head_context: "Head context is unsupported", unsupported_doctype: "Doctype is unsupported",
+    unsupported_comment: "Comment context is unsupported", unsupported_script_escape: "Script escape context is unsupported",
+    unsupported_entity: "Entity spelling is unsupported", unsupported_self_closing: "Self-closing context is unsupported",
+    malformed_tag: "Tag structure is unsupported", duplicate_attribute: "Duplicate attribute encountered", null_byte: "Null byte encountered",
+  };
+  const HTML_GENERATOR_REASONS = { ...BODY_REFERENCE_REASONS, ...HTML_GENERATOR_STOP_REASONS,
+    unsupported_content_type: "Only retained HTML text previews are supported", session_source_changed: "The active session source changed",
+    metadata_unavailable: "Retained metadata is unavailable" };
+  function validHtmlGeneratorEvidence(value, sessionId, generation) {
+    if (typeof value !== "string") return false;
+    const fields = value.split("."), uuid = (part) => typeof part === "string" && part.length === 36
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(part);
+    return fields.length === 6 && [fields[1], fields[2], fields[4], fields[5]].every(uuid)
+      && !/[^0-9]/.test(fields[3]) && validTechnologyEvidence(value, sessionId, generation);
+  }
+  function normalizeHtmlGenerators(payload, sessionId, evidenceId, row) {
+    const invalid = () => { throw new Error("Invalid retained HTML-generator response"); };
+    const integer = (value, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && value >= 0 && value <= max;
+    const fields = ["schema_version", "generator_catalog_version", "session_id", "evidence_id", "available", "status", "complete", "reasons",
+      "source_origin", "source_sequence", "source_started_at", "retained_preview_bytes", "scan_prefix_bytes", "capture_preview_truncated",
+      "scan_prefix_truncated", "coverage", "head_closed", "parser_stop", "tag_candidates_inspected", "additional_tag_candidate_encountered",
+      "additional_observation_encountered", "unknown_product_declarations", "observations", "limits", "offset_basis"];
+    if (!exactFields(payload, fields) || payload.schema_version !== 1 || payload.generator_catalog_version !== 1
+      || payload.session_id !== sessionId || payload.evidence_id !== evidenceId
+      || !validHtmlGeneratorEvidence(evidenceId, sessionId, typeof evidenceId === "string" ? evidenceId.split(".")[2] : null)
+      || !["scanned", "unsupported", "unavailable"].includes(payload.status) || payload.available !== (payload.status === "scanned")
+      || ["complete", "capture_preview_truncated", "scan_prefix_truncated", "head_closed", "additional_tag_candidate_encountered", "additional_observation_encountered"].some((key) => typeof payload[key] !== "boolean")
+      || payload.coverage !== "literal_html_generator_explicit_head" || payload.offset_basis !== "retained_utf8_preview"
+      || !exactFields(payload.limits, Object.keys(HTML_GENERATOR_LIMITS))
+      || !Object.entries(HTML_GENERATOR_LIMITS).every(([key, value]) => payload.limits[key] === value)
+      || !integer(payload.scan_prefix_bytes, HTML_GENERATOR_LIMITS.scan_bytes)
+      || !integer(payload.tag_candidates_inspected, HTML_GENERATOR_LIMITS.tag_candidates)
+      || !integer(payload.unknown_product_declarations, payload.tag_candidates_inspected)
+      || !Array.isArray(payload.observations) || payload.observations.length > HTML_GENERATOR_LIMITS.observations
+      || !Array.isArray(payload.reasons) || payload.reasons.length > 3
+      || payload.reasons.some((reason, index) => typeof reason !== "string" || index > 0 && payload.reasons[index - 1] >= reason)) invalid();
+    const scanned = payload.available;
+    if (!scanned) {
+      if (payload.complete || payload.reasons.length !== 1 || payload.reasons.some((reason) => !HTML_GENERATOR_ACQUISITION_REASONS.has(reason))
+        || ["source_origin", "source_sequence", "source_started_at", "retained_preview_bytes", "parser_stop"].some((key) => payload[key] !== null)
+        || payload.scan_prefix_bytes || payload.tag_candidates_inspected || payload.unknown_product_declarations || payload.observations.length
+        || payload.head_closed || payload.capture_preview_truncated || payload.scan_prefix_truncated
+        || payload.additional_tag_candidate_encountered || payload.additional_observation_encountered) invalid();
+    } else {
+      if (typeof payload.source_origin !== "string" || payload.source_origin.length > 4096 || payload.source_origin !== safeOrigin(payload.source_origin)
+        || payload.source_origin !== row.origin || payload.source_sequence !== row.sequence || payload.source_sequence !== evidenceId.split(".")[3]
+        || payload.source_started_at !== row.started_at || observationTime(payload.source_started_at) === null
+        || !integer(payload.retained_preview_bytes) || payload.scan_prefix_bytes > payload.retained_preview_bytes
+        || (payload.retained_preview_bytes <= HTML_GENERATOR_LIMITS.scan_bytes ? payload.scan_prefix_bytes !== payload.retained_preview_bytes
+          : payload.scan_prefix_bytes < HTML_GENERATOR_LIMITS.scan_bytes - 3)
+        || payload.scan_prefix_truncated !== (payload.scan_prefix_bytes < payload.retained_preview_bytes)
+        || payload.head_closed !== (payload.parser_stop === null)) invalid();
+      const stop = payload.parser_stop;
+      if (stop !== null && (!exactFields(stop, ["reason", "byte_cursor"]) || !Object.prototype.hasOwnProperty.call(HTML_GENERATOR_STOP_REASONS, stop.reason)
+        || !integer(stop.byte_cursor, payload.scan_prefix_bytes)
+        || stop.reason === "input_limit" && (!payload.scan_prefix_truncated || stop.byte_cursor !== payload.scan_prefix_bytes)
+        || stop.reason === "end_of_preview" && (payload.scan_prefix_truncated || stop.byte_cursor !== payload.scan_prefix_bytes))) invalid();
+      const declarations = payload.observations.length + payload.unknown_product_declarations + Number(payload.additional_observation_encountered);
+      const minimumTags = declarations ? declarations + 2 + Number(payload.head_closed) : payload.head_closed ? 3 : 0;
+      const reasons = [...(payload.capture_preview_truncated ? ["capture_preview_truncated"] : []),
+        ...(payload.scan_prefix_truncated ? ["scan_prefix_truncated"] : []), ...(stop ? [stop.reason] : [])].sort();
+      if (JSON.stringify(payload.reasons) !== JSON.stringify(reasons) || payload.complete !== (payload.head_closed && !reasons.length)
+        || payload.additional_tag_candidate_encountered !== (stop?.reason === "tag_candidate_limit")
+        || payload.additional_tag_candidate_encountered && payload.tag_candidates_inspected !== HTML_GENERATOR_LIMITS.tag_candidates
+        || payload.additional_observation_encountered !== (stop?.reason === "observation_limit")
+        || payload.additional_observation_encountered && payload.observations.length !== HTML_GENERATOR_LIMITS.observations
+        || payload.tag_candidates_inspected < minimumTags || payload.tag_candidates_inspected > payload.scan_prefix_bytes
+        || stop && payload.tag_candidates_inspected > stop.byte_cursor + 1) invalid();
+    }
+    let previousTagEnd = 0;
+    const observations = payload.observations.map((item) => {
+      const name = item?.product_id === "wordpress" ? "WordPress" : item?.product_id === "drupal" ? "Drupal" : null;
+      const span = (value) => exactFields(value, ["start", "end"]) && integer(value.start, payload.scan_prefix_bytes)
+        && integer(value.end, payload.scan_prefix_bytes) && value.start < value.end;
+      if (!exactFields(item, ["product_id", "name", "catalog_category", "reported_version", "version_status", "source", "strength", "rule_id", "tag_span", "content_span", "product_span", "version_span", "offset_basis"])
+        || !name || item.name !== name || item.catalog_category !== "cms" || item.source !== "response_html_meta_generator"
+        || item.strength !== "literal_declaration" || item.rule_id !== `html_meta_generator.${item.product_id}.v1`
+        || item.offset_basis !== "retained_utf8_preview" || !["reported", "not_reported", "unsupported_format"].includes(item.version_status)
+        || !span(item.tag_span) || !span(item.content_span) || !span(item.product_span)
+        || item.tag_span.start < previousTagEnd || item.tag_span.end - item.tag_span.start > HTML_GENERATOR_LIMITS.tag_bytes
+        || item.content_span.start <= item.tag_span.start || item.content_span.end >= item.tag_span.end
+        || item.product_span.start !== item.content_span.start || item.product_span.end > item.content_span.end
+        || item.product_span.end - item.product_span.start !== name.length
+        || payload.parser_stop && item.tag_span.end > payload.parser_stop.byte_cursor) invalid();
+      if (item.version_status === "reported") {
+        if (typeof item.reported_version !== "string" || item.reported_version.length > HTML_GENERATOR_LIMITS.version_bytes
+          || !item.reported_version.split(".").every((part) => part.length > 0 && !/[^0-9]/.test(part)) || !span(item.version_span)
+          || item.version_span.start <= item.product_span.end || item.version_span.start - item.product_span.end > HTML_GENERATOR_LIMITS.version_separator_bytes
+          || item.version_span.end !== item.content_span.end || item.version_span.end - item.version_span.start !== item.reported_version.length) invalid();
+      } else if (item.reported_version !== null || item.version_span !== null
+        || item.version_status === "not_reported" && item.product_span.end !== item.content_span.end
+        || item.version_status === "unsupported_format" && item.product_span.end === item.content_span.end) invalid();
+      previousTagEnd = item.tag_span.end;
+      return { product_id: item.product_id, name, catalog_category: "cms", reported_version: item.reported_version, version_status: item.version_status,
+        source: item.source, strength: item.strength, rule_id: item.rule_id, tag_span: { ...item.tag_span }, content_span: { ...item.content_span },
+        product_span: { ...item.product_span }, version_span: item.version_span ? { ...item.version_span } : null, offset_basis: item.offset_basis };
+    });
+    return { status: payload.status, complete: payload.complete, reasons: [...payload.reasons], source_origin: payload.source_origin,
+      source_sequence: payload.source_sequence, source_started_at: payload.source_started_at, retained_preview_bytes: payload.retained_preview_bytes,
+      scan_prefix_bytes: payload.scan_prefix_bytes, capture_preview_truncated: payload.capture_preview_truncated, scan_prefix_truncated: payload.scan_prefix_truncated,
+      head_closed: payload.head_closed, parser_stop: payload.parser_stop ? { ...payload.parser_stop } : null,
+      tag_candidates_inspected: payload.tag_candidates_inspected, additional_tag_candidate_encountered: payload.additional_tag_candidate_encountered,
+      additional_observation_encountered: payload.additional_observation_encountered, unknown_product_declarations: payload.unknown_product_declarations, observations };
+  }
   function normalizeSnapshot(payload, sessionId, requestedVersion = TECHNOLOGY_CATALOG_VERSION) {
     if (payload?.schema_version !== 1 || payload.session_id !== sessionId || !payload.snapshot || !Array.isArray(payload.origins)) {
       throw new Error("Invalid service map response");
@@ -455,11 +570,13 @@
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       bodyReferencesSource: null, bodyReferenceOverlay: null, bodyOverlayNotice: "",
+      htmlGenerators: null, htmlGeneratorsLoading: false, htmlGeneratorsError: "", htmlGeneratorsRequestId: 0, htmlGeneratorsSource: null,
       historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
     };
     let abort = null;
     let evidenceAbort = null;
     let bodyReferencesAbort = null;
+    let htmlGeneratorsAbort = null;
     let detailRender = null;
     let visible = false;
     let currentLayout = null;
@@ -737,7 +854,17 @@
       state.bodyReferencesLoading = false;
       state.bodyReferencesError = "";
     }
+    function cancelHtmlGenerators() {
+      state.htmlGeneratorsRequestId += 1;
+      htmlGeneratorsAbort?.abort();
+      htmlGeneratorsAbort = null;
+      state.htmlGenerators = null;
+      state.htmlGeneratorsSource = null;
+      state.htmlGeneratorsLoading = false;
+      state.htmlGeneratorsError = "";
+    }
     function cancelEvidence() {
+      cancelHtmlGenerators();
       cancelBodyReferences();
       state.evidenceRequestId += 1;
       evidenceAbort?.abort();
@@ -785,6 +912,7 @@
       if (force) {
         clearOverlay("Temporary body references cleared by Refresh. Inspect and show references again when ready.");
         cancelBodyReferences();
+        cancelHtmlGenerators();
       }
       abort?.abort();
       abort = new AbortController();
@@ -806,6 +934,7 @@
         }
         if (state.snapshot && (state.snapshot.snapshot.generation !== snapshot.snapshot.generation
           || state.snapshot.technologyCatalogVersion !== snapshot.technologyCatalogVersion)) cancelEvidence();
+        if (state.htmlGeneratorsSource && !htmlGeneratorSourceIsRetained(state.htmlGeneratorsSource, snapshot)) cancelHtmlGenerators();
         state.snapshot = snapshot;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
@@ -838,6 +967,7 @@
         if (requestId !== state.requestId || sessionId !== getSessionId()) return false;
         clearOverlay("Temporary body references cleared because the current refresh failed.");
         cancelBodyReferences();
+        cancelHtmlGenerators();
         state.loading = false;
         state.error = state.snapshot ? "Refresh failed. Showing the previous snapshot; use Refresh to retry." : "Could not load the service map. Use Refresh to retry.";
         render();
@@ -910,6 +1040,7 @@
         state.evidenceLegacyCatalog = false;
         state.socketPeer = null;
         cancelBodyReferences();
+        cancelHtmlGenerators();
         state.evidenceLoading = false;
         state.evidenceError = "Source unavailable. The exact retained row could not be verified. Refresh the map and try again.";
         if (overlaySource()) {
@@ -963,6 +1094,57 @@
           clearOverlay("Temporary body references cleared: the inspected source preview could not be verified.");
           render();
         } else renderDetail();
+        return false;
+      }
+    }
+    function htmlGeneratorSourceIsRetained(source, snapshot = state.snapshot) {
+      if (!sourceIsRetained(source, snapshot)) return false;
+      const origin = snapshot.origins.find((item) => item.origin === source.origin);
+      return origin.endpoints.filter((item) => item.evidence.includes(source.evidenceId))
+        .every((item) => item.method === source.method && item.path === source.path);
+    }
+    async function loadHtmlGenerators() {
+      const row = state.evidence, sessionId = getSessionId(), generation = state.snapshot?.snapshot.generation;
+      if (!visible || !getEventStreamReady() || state.error || state.stale || state.sessionId !== sessionId || !row
+        || state.evidenceId !== row.evidence_id || state.evidenceLoading || state.htmlGeneratorsLoading
+        || !validHtmlGeneratorEvidence(row.evidence_id, sessionId, generation)
+        || row.evidence_id.split(".")[3] !== row.sequence || row.evidence_id.split(".")[5] !== row.record_id
+        || safeOrigin(row.origin) !== row.origin || observationTime(row.started_at) === null
+        || !evidenceItems(selectedOrigin()).some((item) => item.id === row.evidence_id)) return false;
+      const source = Object.freeze({ sessionId, generation, evidenceId: row.evidence_id, origin: row.origin,
+        method: row.method, path: safePath(row.path), sequence: row.sequence, startedAt: row.started_at });
+      if (!htmlGeneratorSourceIsRetained(source)) return false;
+      cancelHtmlGenerators();
+      const requestId = ++state.htmlGeneratorsRequestId, selected = state.selectedOrigin;
+      const current = () => requestId === state.htmlGeneratorsRequestId && visible && getEventStreamReady() && !state.error && !state.stale
+        && sessionId === getSessionId() && sessionId === state.sessionId && selected === state.selectedOrigin
+        && row === state.evidence && source.evidenceId === state.evidenceId && htmlGeneratorSourceIsRetained(source);
+      state.htmlGeneratorsSource = source;
+      state.htmlGeneratorsLoading = true;
+      htmlGeneratorsAbort = new AbortController();
+      renderDetail();
+      let unsupportedServer = false;
+      try {
+        const params = new URLSearchParams({ session_id: sessionId, evidence_id: source.evidenceId });
+        const response = await request(`/api/target/service-map/html-generators?${params}`, { signal: htmlGeneratorsAbort.signal, redirect: "error" });
+        unsupportedServer = response.status === 404;
+        if (!response.ok) throw new Error("Retained HTML generators unavailable");
+        const payload = await response.json();
+        if (!current()) return false;
+        state.htmlGenerators = normalizeHtmlGenerators(payload, sessionId, source.evidenceId, row);
+        state.htmlGeneratorsLoading = false;
+        htmlGeneratorsAbort = null;
+        renderDetail();
+        return true;
+      } catch (_) {
+        if (!current()) return false;
+        state.htmlGeneratorsLoading = false;
+        htmlGeneratorsAbort = null;
+        state.htmlGenerators = null;
+        state.htmlGeneratorsError = unsupportedServer
+          ? "This server does not support retained HTML generator inspection. No generator declarations were inspected."
+          : "Could not verify retained HTML generators. Retry explicitly, or refresh the map and select the source again.";
+        renderDetail();
         return false;
       }
     }
@@ -1117,6 +1299,24 @@
       }
       return `<section class="service-map-body-references" aria-label="Retained body references" aria-busy="${state.bodyReferencesLoading}"><h4>Retained body references</h4><p class="service-map-muted">Optional inspection of this exact response’s retained HTML or JavaScript preview. Active session only. A literal URL reference does not prove a request, call, or service ownership.</p><button class="secondary-action" type="button" data-service-body-references="inspect" data-service-focus="body-references:inspect" ${state.bodyReferencesLoading ? "disabled" : ""}>${buttonLabel}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting one retained preview locally…</p>' : ""}${state.bodyReferencesError ? `<p class="service-map-error" role="status">${escape(state.bodyReferencesError)}</p>` : ""}${summary}<button class="secondary-action" type="button" data-service-show-body-references="show" data-service-focus="body-references:show" aria-pressed="${showing}" aria-describedby="serviceMapBodyShowHint" ${showDisabled ? "disabled" : ""}>Show references on map</button><p class="service-map-muted" id="serviceMapBodyShowHint">${showHint}</p><details class="service-map-body-reference-limits"><summary data-service-focus="body-references:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) URLs only. Origins are text, never fetched. No script execution or relative URL resolution. Only Show references on map adds temporary Direct relations. Offsets are zero-based bytes relative to the retained UTF-8 preview, not the original response.</p><p>Scan: ${BODY_REFERENCE_LIMITS.scan_bytes.toLocaleString()} bytes · Serialized row read: ${BODY_REFERENCE_LIMITS.serialized_row_bytes.toLocaleString()} bytes · Origins: ${BODY_REFERENCE_LIMITS.origins} · URL candidates: ${BODY_REFERENCE_LIMITS.candidates.toLocaleString()} · Candidate: ${BODY_REFERENCE_LIMITS.candidate_bytes.toLocaleString()} bytes · Offsets per origin: ${BODY_REFERENCE_LIMITS.offsets_per_origin}.</p>${result ? `<p>${result.candidates_scanned.toLocaleString()} candidates inspected · Capture preview truncated: ${result.capture_preview_truncated ? "yes" : "no"} · Scan prefix truncated: ${result.scan_prefix_truncated ? "yes" : "no"}.</p>` : ""}</details></section>`;
     }
+    function htmlGeneratorsMarkup() {
+      const result = state.htmlGenerators, scanned = result?.status === "scanned";
+      const disabled = state.htmlGeneratorsLoading || !getEventStreamReady() || !!state.error || state.stale;
+      const buttonLabel = state.htmlGeneratorsLoading ? "Inspecting retained HTML generators…"
+        : state.htmlGeneratorsError || result?.status === "unavailable" ? "Retry retained HTML generators"
+          : result ? "Inspect retained HTML generators again" : "Inspect retained HTML generators";
+      let summary = "";
+      if (result) {
+        const message = result.status === "unsupported" ? "Retained preview is unsupported. Generator declarations were not inspected."
+          : result.status === "unavailable" ? "Retained preview is unavailable. Generator declarations were not inspected."
+            : result.observations.length ? `${result.observations.length} reported HTML generator declaration${result.observations.length === 1 ? "" : "s"}`
+              : result.complete ? "No supported WordPress or Drupal generator declarations in the inspected head."
+                : "No supported generator declarations are available from the inspected prefix; coverage is partial.";
+        summary = `<div class="service-map-html-generator-result" role="status"><p>${escape(message)}</p>${scanned ? `<p class="service-map-muted">${result.complete ? "Complete supported-head inspection" : "Partial retained-preview coverage"} · Supported explicit head closed: ${result.head_closed ? "yes" : "no"}. The body after the head is not parsed.</p><p class="service-map-muted">${result.scan_prefix_bytes.toLocaleString()} / ${result.retained_preview_bytes.toLocaleString()} retained UTF-8 preview bytes offered to the parser; this is not a count of bytes fully parsed.</p><p class="service-map-muted">Capture preview truncated: ${result.capture_preview_truncated ? "yes" : "no"} · Scan prefix truncated: ${result.scan_prefix_truncated ? "yes" : "no"}.</p><p class="service-map-muted">Source: ${escape(result.source_origin)} · Sequence ${escape(result.source_sequence)} · Captured ${escape(result.source_started_at)}</p>` : ""}${result.reasons.length ? `<p class="service-map-muted">${result.reasons.map((reason) => escape(HTML_GENERATOR_REASONS[reason])).join(" · ")}</p>` : ""}</div>`;
+      }
+      const observations = result?.observations.length ? `<ul class="service-map-references service-map-html-generator-list" aria-label="Reported HTML generator declarations">${result.observations.map((item) => `<li><strong>${escape(item.name)}</strong> · ${escape(technologyVersion(item))}<p class="service-map-muted">Catalog: CMS · Source: response HTML meta generator · Literal declaration</p><p class="service-map-muted">Retained UTF-8 preview bytes: tag ${item.tag_span.start}–${item.tag_span.end} · content ${item.content_span.start}–${item.content_span.end} · product ${item.product_span.start}–${item.product_span.end}${item.version_span ? ` · version ${item.version_span.start}–${item.version_span.end}` : ""} (zero-based, end exclusive).</p></li>`).join("")}</ul>` : "";
+      return `<section class="service-map-body-references service-map-html-generators" aria-label="Retained HTML generators" aria-busy="${state.htmlGeneratorsLoading}"><h4>Retained HTML generators</h4><p class="service-map-muted">Optional, independent inspection of this exact response’s retained HTML preview. These are reported generators, not proven backend/runtime technologies or installed versions.</p><button class="secondary-action" type="button" data-service-html-generators="inspect" data-service-focus="html-generators:inspect" ${disabled ? "disabled" : ""}>${buttonLabel}</button>${state.htmlGeneratorsLoading ? '<p class="service-map-muted" role="status">Inspecting one retained HTML preview locally…</p>' : ""}${state.htmlGeneratorsError ? `<p class="service-map-error" role="status">${escape(state.htmlGeneratorsError)}</p>` : ""}${summary}${observations}<details class="service-map-html-generator-limits"><summary data-service-focus="html-generators:limits">Generator coverage and limits</summary><p>Literal WordPress and Drupal declarations in a supported explicit HTML head only. Numeric or dotted reported versions only. No HTML recovery, entity decoding, script execution, fetching or map aggregation. A closed head can coexist with a truncated, unparsed body; overall coverage remains partial.</p><p>Prefix: ${HTML_GENERATOR_LIMITS.scan_bytes.toLocaleString()} bytes · Serialized row read: ${HTML_GENERATOR_LIMITS.serialized_row_bytes.toLocaleString()} bytes · Tag candidates: ${HTML_GENERATOR_LIMITS.tag_candidates.toLocaleString()} · Tag: ${HTML_GENERATOR_LIMITS.tag_bytes.toLocaleString()} bytes · Attributes per tag: ${HTML_GENERATOR_LIMITS.attributes} · Declarations: ${HTML_GENERATOR_LIMITS.observations} · Version and separator: ${HTML_GENERATOR_LIMITS.version_bytes} bytes each.</p>${scanned ? `<p>${result.tag_candidates_inspected.toLocaleString()} tag candidates inspected · Additional tag candidate encountered: ${result.additional_tag_candidate_encountered ? "yes" : "no"} · Additional supported declaration encountered: ${result.additional_observation_encountered ? "yes" : "no"} · Unrecognized product declarations among inspected candidates: ${result.unknown_product_declarations.toLocaleString()}. Uninspected declarations are not counted.</p>${result.parser_stop ? `<p>Parser stop: ${escape(HTML_GENERATOR_STOP_REASONS[result.parser_stop.reason])} · Raw preview byte cursor: ${result.parser_stop.byte_cursor.toLocaleString()} (not a text-slicing boundary).</p>` : ""}` : ""}</details></section>`;
+    }
     function overlayProvenanceMarkup() {
       const overlay = state.bodyReferenceOverlay;
       if (!overlay) return "";
@@ -1162,7 +1362,7 @@
       const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${state.evidenceLegacyCatalog ? `<p class="service-map-muted">${LEGACY_CATALOG_NOTICE}</p>` : ""}${technologyMarkup(row.technology_observations)}<p>Exact retained source verified for this read.</p></div>` : "";
       return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
-        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? socketPeerMarkup() + bodyReferencesMarkup() : ""}
+        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? socketPeerMarkup() + htmlGeneratorsMarkup() + bodyReferencesMarkup() : ""}
         <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || '<p class="service-map-muted">No source samples are available in this bounded snapshot.</p>'}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
         ${!endpoint ? technologyMarkup(origin.technology_observations, origin) + relationshipMarkup(origin) : ""}
         ${!endpoint && origin.technology_clues.length ? `<h4>Observed header clues</h4><p class="service-map-muted">${origin.technology_clues.map((clue) => escape(clue.name)).join(", ")} · response headers only</p>` : ""}`;
@@ -1180,6 +1380,7 @@
       const bodyScroll = previousBody?.scrollTop;
       const listScroll = previousList?.scrollTop;
       const limitsOpen = previousLimits?.open;
+      const generatorLimitsOpen = els.detail.querySelector?.(".service-map-html-generator-limits")?.open;
       replace(els.detail, html);
       detailRender = { identity, evidence: state.evidence, html };
       if (sameSource) {
@@ -1187,6 +1388,8 @@
         const list = els.detail.querySelector?.(".service-map-body-reference-list");
         const limits = els.detail.querySelector?.(".service-map-body-reference-limits");
         if (limits && limitsOpen !== undefined) limits.open = limitsOpen;
+        const generatorLimits = els.detail.querySelector?.(".service-map-html-generator-limits");
+        if (generatorLimits && generatorLimitsOpen !== undefined) generatorLimits.open = generatorLimitsOpen;
         if (body && bodyScroll !== undefined) body.scrollTop = bodyScroll;
         if (list && listScroll !== undefined) list.scrollTop = listScroll;
       }
@@ -1238,6 +1441,7 @@
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; if (state.detailTab === "apis") { state.endpointIndex = null; state.endpointSelection = null; } renderDetail(); }
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
       else if (data.serviceBodyReferences) loadBodyReferences();
+      else if (data.serviceHtmlGenerators) loadHtmlGenerators();
       else if (data.serviceShowBodyReferences) showBodyReferencesOnMap();
       else if (data.serviceClearBodyReferences) clearBodyReferenceOverlay();
       else if (data.servicePage !== undefined) { state.page = Math.max(0, Number(data.servicePage) || 0); renderCatalog(); els.catalog.scrollTop = 0; }
@@ -1285,7 +1489,7 @@
     });
     render();
     return {
-      refresh, reset, selectOrigin, setZoom, fitGraph, loadEvidence, loadBodyReferences, showBodyReferencesOnMap, clearBodyReferenceOverlay,
+      refresh, reset, selectOrigin, setZoom, fitGraph, loadEvidence, loadBodyReferences, loadHtmlGenerators, showBodyReferencesOnMap, clearBodyReferenceOverlay,
       displayChanged() { renderGraph(); },
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
@@ -1303,6 +1507,7 @@
         if (!value || view !== "service-map") {
           clearOverlay("Temporary body references cleared because the map was hidden.");
           cancelBodyReferences();
+        cancelHtmlGenerators();
         }
         visible = value;
         state.view = view;
@@ -1337,5 +1542,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeSocketPeer, BODY_REFERENCE_LIMITS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeSocketPeer, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

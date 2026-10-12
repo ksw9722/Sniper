@@ -353,6 +353,242 @@ fn row(path: &str) -> TransactionRecord {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_html_generator_api_and_cli_keep_exact_rows_and_explicit_coverage() {
+    let dir = std::env::temp_dir().join(format!("sniper-html-generators-{}", Uuid::new_v4()));
+    let state = Arc::new(
+        AppState::new(AppConfig {
+            data_dir: dir.clone(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 1024,
+        })
+        .unwrap(),
+    );
+    let session = state.session().await;
+    let session_id = session.id();
+    let first_body = "<!--☃--><html><head><title>A &amp; B</title><script defer>const text = \"<meta name='generator' content='Drupal 99'>\";</script><meta name='generator' content='WordPress \t6.8.1'></head><body>https://older.example.com/private?secret=SYNTHETIC_PRIVATE</body></html>";
+    let second_body = "<html><head><meta content='Drupal 10.4' name='generator'></head>";
+    let make_record = |path: &str, body: &str, mime: &str| {
+        let mut record = row(path);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", mime.parse().unwrap());
+        record.status = Some(200);
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            body.as_bytes(),
+            body.len(),
+        ));
+        record
+    };
+    let first = make_record("/generators/a", first_body, "text/html; charset=utf-8");
+    let duplicate_id = first.id;
+    let mut second = make_record("/generators/b", second_body, "text/html");
+    second.id = duplicate_id;
+    let mut captured_prefix = make_record("/generators/c", second_body, "text/html");
+    captured_prefix.response.as_mut().unwrap().preview_truncated = true;
+    let large_body = format!("{second_body}{}", " ".repeat(280_000));
+    let bounded_prefix = make_record("/generators/d", &large_body, "text/html");
+    let unsupported = make_record("/generators/e", second_body, "application/javascript");
+    let rejected_version = make_record(
+        "/generators/f",
+        "<html><head><meta name='generator' content='WordPress SYNTHETIC_PRIVATE'></head>",
+        "text/html",
+    );
+    for record in [
+        first,
+        second,
+        captured_prefix,
+        bounded_prefix,
+        unsupported,
+        rejected_version,
+    ] {
+        session.store.insert(record).await;
+    }
+    // The newest duplicate and unique rows are lazy; the older duplicate keeps
+    // its own resident preview. Both modes must use the exact retained token.
+    session.persist().await.unwrap();
+    let mut events = session.store.subscribe();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let app = sniper::api::router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let map = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id":session_id}),
+    )
+    .await;
+    assert_eq!(map["snapshot"]["retained_rows"], 6);
+    let token_for = |path: &str| {
+        map["origins"][0]["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|endpoint| endpoint["path"] == path)
+            .unwrap()["evidence"][0]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let inspect = |token: &str| {
+        format!("{api}/api/target/service-map/html-generators?session_id={session_id}&evidence_id={token}")
+    };
+    let first_token = token_for("/generators/a");
+    let first_result = read(
+        &dir,
+        &api,
+        "target.service_map.html_generators.get",
+        json!({"session_id":session_id,"evidence_id":first_token}),
+    )
+    .await;
+    assert_eq!(first_result["available"], true);
+    assert_eq!(first_result["status"], "scanned");
+    assert_eq!(first_result["complete"], true);
+    assert_eq!(first_result["head_closed"], true);
+    assert!(first_result["parser_stop"].is_null());
+    assert_eq!(first_result["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(first_result["observations"][0]["product_id"], "wordpress");
+    assert_eq!(first_result["observations"][0]["reported_version"], "6.8.1");
+    let observation = &first_result["observations"][0];
+    for (key, expected) in [("product_span", "WordPress"), ("version_span", "6.8.1")] {
+        let start = observation[key]["start"].as_u64().unwrap() as usize;
+        let end = observation[key]["end"].as_u64().unwrap() as usize;
+        assert_eq!(&first_body[start..end], expected);
+    }
+    let second_token = token_for("/generators/b");
+    let second_result: Value = client
+        .get(inspect(&second_token))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second_result["observations"][0]["product_id"], "drupal");
+    assert_eq!(second_result["observations"][0]["reported_version"], "10.4");
+    assert_ne!(
+        first_result["source_sequence"],
+        second_result["source_sequence"]
+    );
+    assert_eq!(second_result["evidence_id"], second_token);
+    assert!(!second_result.to_string().contains("SYNTHETIC_PRIVATE"));
+
+    let capture = read(
+        &dir,
+        &api,
+        "target.service_map.html_generators.get",
+        json!({"session_id":session_id,"evidence_id":token_for("/generators/c")}),
+    )
+    .await;
+    assert_eq!(capture["head_closed"], true);
+    assert_eq!(capture["complete"], false);
+    assert_eq!(capture["capture_preview_truncated"], true);
+    assert!(capture["reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("capture_preview_truncated")));
+    let bounded = read(
+        &dir,
+        &api,
+        "target.service_map.html_generators.get",
+        json!({"session_id":session_id,"evidence_id":token_for("/generators/d")}),
+    )
+    .await;
+    assert_eq!(bounded["head_closed"], true);
+    assert_eq!(bounded["complete"], false);
+    assert_eq!(bounded["scan_prefix_truncated"], true);
+    assert_eq!(bounded["scan_prefix_bytes"], 262_144);
+    assert_eq!(bounded["retained_preview_bytes"], large_body.len());
+    assert!(bounded["parser_stop"].is_null());
+    let unsupported = read(
+        &dir,
+        &api,
+        "target.service_map.html_generators.get",
+        json!({"session_id":session_id,"evidence_id":token_for("/generators/e")}),
+    )
+    .await;
+    assert_eq!(unsupported["status"], "unsupported");
+    assert_eq!(unsupported["available"], false);
+    assert_eq!(unsupported["scan_prefix_bytes"], 0);
+    assert!(unsupported["source_origin"].is_null());
+    assert!(unsupported["observations"].as_array().unwrap().is_empty());
+    let rejected = read(
+        &dir,
+        &api,
+        "target.service_map.html_generators.get",
+        json!({"session_id":session_id,"evidence_id":token_for("/generators/f")}),
+    )
+    .await;
+    assert_eq!(
+        rejected["observations"][0]["version_status"],
+        "unsupported_format"
+    );
+    assert!(rejected["observations"][0]["reported_version"].is_null());
+
+    // Metadata reads do not acquire body files. Explicit HTML reads fail safely
+    // if that exact lazy row is no longer readable, with no alternate lookup.
+    let storage = session.storage_dir().join("transactions.ndjson");
+    let held = session.storage_dir().join("synthetic-body-file-held");
+    std::fs::rename(&storage, &held).unwrap();
+    let still_metadata = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id":session_id}),
+    )
+    .await;
+    assert_eq!(still_metadata["snapshot"]["retained_rows"], 6);
+    let missing = read(
+        &dir,
+        &api,
+        "target.service_map.html_generators.get",
+        json!({"session_id":session_id,"evidence_id":second_token}),
+    )
+    .await;
+    assert_eq!(missing["status"], "unavailable");
+    assert_eq!(missing["reasons"], json!(["body_storage_unavailable"]));
+    assert!(missing["observations"].as_array().unwrap().is_empty());
+    std::fs::rename(&held, &storage).unwrap();
+    let references = read(
+        &dir,
+        &api,
+        "target.service_map.body_references.get",
+        json!({"session_id":session_id,"evidence_id":first_token}),
+    )
+    .await;
+    assert_eq!(
+        references["references"][0]["target_origin"],
+        "https://older.example.com"
+    );
+    assert!(references.get("generator_catalog_version").is_none());
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(state.session().await.id(), session_id);
+    assert_eq!(session.store.delete_ids(&[duplicate_id]).await.unwrap(), 1);
+    let removed = read(
+        &dir,
+        &api,
+        "target.service_map.html_generators.get",
+        json!({"session_id":session_id,"evidence_id":first_token}),
+    )
+    .await;
+    assert_eq!(removed["available"], false);
+    assert!(removed["source_sequence"].is_null());
+    assert!(removed["observations"].as_array().unwrap().is_empty());
+    server.abort();
+    let _ = server.await;
+    drop(session);
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evidence_exact() {
     let dir = std::env::temp_dir().join(format!("sniper-service-map-read-{}", Uuid::new_v4()));
     let state = Arc::new(

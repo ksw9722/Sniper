@@ -40,6 +40,7 @@ use sniper::{
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
     service_map::{ServiceMap, ServiceMapEvidence, ServiceMapSocketPeerStatus},
     service_map_body::ServiceMapBodyReferences,
+    service_map_html::ServiceMapHtmlGenerators,
     service_map_technology::CatalogVersion,
     session::{validate_session_creation_name, SessionSummary},
     skills,
@@ -902,6 +903,21 @@ enum ServiceMapCommand {
         after_help = "Requires the current active session UUID and an exact-row evidence token. An inactive session returns unavailable; this command never loads or activates it. Reads one retained UTF-8 HTML/JavaScript preview only, with no target requests, automatic reads, or batch reads. Literal HTTP(S) references do not establish calls or ownership; offsets address the retained preview, not wire bytes or a full body."
     )]
     BodyReferences(ServiceMapBodyReferencesArgs),
+    /// Explicitly inspect literal generator declarations in one retained HTML preview.
+    #[command(
+        after_help = "Requires the current active session UUID and exact-row evidence token. Reads one retained UTF-8 text/html preview only; no inactive-session loading, target requests, automatic reads, batch reads, retries, or fallback. Fixed generator catalog 1 recognizes WordPress and Drupal declarations in an explicit HTML head. Partial or unsupported inspection does not mean no generator was found. Reported products and numeric versions are literal declarations, not verified software installations. Spans address retained UTF-8 bytes; the parser stop is a raw byte cursor, not a slicing boundary."
+    )]
+    HtmlGenerators(ServiceMapHtmlGeneratorsArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapHtmlGeneratorsArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained row.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
 }
 
 #[derive(Args, Debug)]
@@ -2481,6 +2497,9 @@ impl TargetCommand {
                 Some(ServiceMapCommand::BodyReferences(_)) => {
                     "target.service_map.body_references.get"
                 }
+                Some(ServiceMapCommand::HtmlGenerators(_)) => {
+                    "target.service_map.html_generators.get"
+                }
                 None => "target.service_map.get",
             },
             TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
@@ -3442,14 +3461,129 @@ fn service_map_catalog_output_schema(mut schema: Value, exact_row: bool) -> Valu
     schema
 }
 
+fn service_map_html_generators_output_schema() -> Value {
+    use sniper::service_map_html::{ACQUISITION_REASONS, PARSER_STOP_REASONS, TRUNCATION_REASONS};
+    let span = service_map_object(json!({
+        "start":{"type":"integer","minimum":0,"maximum":262143},
+        "end":{"type":"integer","minimum":1,"maximum":262144}
+    }));
+    let mut observation = service_map_object(json!({
+        "product_id":{"type":"string","enum":["wordpress","drupal"]},
+        "name":{"type":"string","enum":["WordPress","Drupal"]},
+        "catalog_category":{"type":"string","enum":["cms"]},
+        "reported_version":{"anyOf":[{"type":"null"},{"type":"string","allOf":[
+            {"pattern":"^[0-9]+(?:\\.[0-9]+)*$"},{"pattern":"^[0-9.]{1,32}$"}
+        ]}]},
+        "version_status":{"type":"string","enum":["reported","not_reported","unsupported_format"]},
+        "source":{"type":"string","enum":["response_html_meta_generator"]},
+        "strength":{"type":"string","enum":["literal_declaration"]},
+        "rule_id":{"type":"string","enum":["html_meta_generator.wordpress.v1","html_meta_generator.drupal.v1"]},
+        "tag_span":span,"content_span":span,"product_span":span,
+        "version_span":{"anyOf":[{"type":"null"},span]},
+        "offset_basis":{"type":"string","enum":["retained_utf8_preview"]}
+    }));
+    observation["allOf"] = json!([
+        {"oneOf":[
+            {"properties":{"product_id":{"enum":["wordpress"]},"name":{"enum":["WordPress"]},"rule_id":{"enum":["html_meta_generator.wordpress.v1"]}}},
+            {"properties":{"product_id":{"enum":["drupal"]},"name":{"enum":["Drupal"]},"rule_id":{"enum":["html_meta_generator.drupal.v1"]}}}
+        ]},
+        {"oneOf":[
+            {"properties":{"version_status":{"enum":["reported"]},"reported_version":{"type":"string"},"version_span":{"type":"object"}}},
+            {"properties":{"version_status":{"enum":["not_reported","unsupported_format"]},"reported_version":{"type":"null"},"version_span":{"type":"null"}}}
+        ]}
+    ]);
+    observation["description"] = json!("Literal declaration only. Half-open retained UTF-8 byte spans must be ordered and contained: product starts at content.start, content is inside tag, numeric version ends at content.end after 1–32 ASCII whitespace bytes. Tags are disjoint and ordered. No raw HTML, unknown product or rejected version text.");
+    let scan_reasons: Vec<_> = TRUNCATION_REASONS
+        .iter()
+        .chain(PARSER_STOP_REASONS)
+        .copied()
+        .collect();
+    let reasons: Vec<_> = ACQUISITION_REASONS
+        .iter()
+        .copied()
+        .chain(scan_reasons.iter().copied())
+        .collect();
+    let mut schema = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},
+        "generator_catalog_version":{"type":"integer","enum":[1]},
+        "session_id":{"type":"string","format":"uuid"},
+        "evidence_id":{"type":"string","pattern":"^v1\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}\\.(0|[1-9][0-9]{0,19})\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}$"},
+        "available":{"type":"boolean"},
+        "status":{"type":"string","enum":["scanned","unsupported","unavailable"]},
+        "complete":{"type":"boolean"},
+        "reasons":{"type":"array","maxItems":3,"items":{"type":"string","enum":reasons}},
+        "source_origin":{"type":["string","null"]},
+        "source_sequence":{"type":["string","null"],"pattern":"^(0|[1-9][0-9]{0,19})$"},
+        "source_started_at":{"type":["string","null"],"format":"date-time"},
+        "retained_preview_bytes":{"type":["integer","null"],"minimum":0},
+        "scan_prefix_bytes":{"type":"integer","minimum":0,"maximum":262144,"description":"Bounded UTF-8 prefix offered to the parser, not bytes fully parsed."},
+        "capture_preview_truncated":{"type":"boolean"},"scan_prefix_truncated":{"type":"boolean"},
+        "coverage":{"type":"string","enum":["literal_html_generator_explicit_head"]},
+        "head_closed":{"type":"boolean"},
+        "parser_stop":{"anyOf":[{"type":"null"},service_map_object(json!({
+            "reason":{"type":"string","enum":PARSER_STOP_REASONS},
+            "byte_cursor":{"type":"integer","minimum":0,"maximum":262144,"description":"Raw byte cursor; may split UTF-8. Never use to slice text."}
+        }))]},
+        "tag_candidates_inspected":{"type":"integer","minimum":0,"maximum":4096},
+        "additional_tag_candidate_encountered":{"type":"boolean"},
+        "additional_observation_encountered":{"type":"boolean"},
+        "unknown_product_declarations":{"type":"integer","minimum":0,"maximum":4096},
+        "observations":{"type":"array","maxItems":8,"items":observation},
+        "limits":service_map_object(json!({
+            "scan_bytes":{"type":"integer","enum":[262144]},
+            "serialized_row_bytes":{"type":"integer","enum":[2097152]},
+            "tag_candidates":{"type":"integer","enum":[4096]},
+            "tag_bytes":{"type":"integer","enum":[4096]},
+            "attributes":{"type":"integer","enum":[32]},
+            "observations":{"type":"integer","enum":[8]},
+            "version_bytes":{"type":"integer","enum":[32]},
+            "version_separator_bytes":{"type":"integer","enum":[32]}
+        })),
+        "offset_basis":{"type":"string","enum":["retained_utf8_preview"]}
+    }));
+    schema["oneOf"] = json!([
+        {"properties":{
+            "available":{"enum":[true]},"status":{"enum":["scanned"]},
+            "source_origin":{"type":"string"},"source_sequence":{"type":"string"},
+            "source_started_at":{"type":"string"},"retained_preview_bytes":{"type":"integer"},
+            "reasons":{"items":{"enum":scan_reasons}}
+        },"allOf":[
+            {"oneOf":[
+                {"properties":{"head_closed":{"enum":[true]},"parser_stop":{"type":"null"},"tag_candidates_inspected":{"minimum":3}}},
+                {"properties":{"head_closed":{"enum":[false]},"parser_stop":{"type":"object"}}}
+            ]},
+            {"oneOf":[
+                {"properties":{"complete":{"enum":[true]},"reasons":{"enum":[[]]},"head_closed":{"enum":[true]},"capture_preview_truncated":{"enum":[false]},"scan_prefix_truncated":{"enum":[false]},"additional_tag_candidate_encountered":{"enum":[false]},"additional_observation_encountered":{"enum":[false]}}},
+                {"properties":{"complete":{"enum":[false]},"reasons":{"minItems":1}}}
+            ]}
+        ]},
+        {"properties":{
+            "available":{"enum":[false]},"status":{"enum":["unsupported","unavailable"]},
+            "complete":{"enum":[false]},"reasons":{"minItems":1,"maxItems":1,"items":{"enum":ACQUISITION_REASONS}},
+            "source_origin":{"type":"null"},"source_sequence":{"type":"null"},
+            "source_started_at":{"type":"null"},"retained_preview_bytes":{"type":"null"},
+            "scan_prefix_bytes":{"enum":[0]},"capture_preview_truncated":{"enum":[false]},"scan_prefix_truncated":{"enum":[false]},
+            "head_closed":{"enum":[false]},"parser_stop":{"type":"null"},
+            "tag_candidates_inspected":{"enum":[0]},"additional_tag_candidate_encountered":{"enum":[false]},
+            "additional_observation_encountered":{"enum":[false]},"unknown_product_declarations":{"enum":[0]},"observations":{"enum":[[]]}
+        }}
+    ]);
+    schema["description"] = json!("Fixed generator catalog 1. Exact requested session/token binding is required. Partial accepted scans stay available=true/status=scanned; partial or unsupported never means no generator found. Source metadata and scan counters are cleared for unavailable/unsupported results. All nullable fields must be explicit null. Reasons are unique fixed codes and match truncation flags and parser stop. Bounds, span containment/order and exact source sequence are additionally checked at runtime. Declaration counters require two opening-tag candidates and, for a closed head, one closing-tag candidate in addition to each declaration.");
+    schema
+}
+
 fn service_map_output_schema(operation: &str) -> Option<Value> {
     if !matches!(
         operation,
         "target.service_map.get"
             | "target.service_map.evidence.get"
             | "target.service_map.body_references.get"
+            | "target.service_map.html_generators.get"
     ) {
         return None;
+    }
+    if operation == "target.service_map.html_generators.get" {
+        return Some(service_map_html_generators_output_schema());
     }
     let string = json!({"type":"string"});
     let strings = json!({"type":"array","items":string});
@@ -3651,13 +3785,15 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."}
             }
         })),
-        "target.service_map.body_references.get" => Some(json!({
-            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
-            "properties":{
-                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
-                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged v1 evidence token for one retained row. Explicit one-row preview inspection only; no batch reads or target requests."}
-            }
-        })),
+        "target.service_map.body_references.get" | "target.service_map.html_generators.get" => {
+            Some(json!({
+                "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+                "properties":{
+                    "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
+                    "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged v1 evidence token for one retained row. Explicit one-row preview inspection only; no batch reads or target requests."}
+                }
+            }))
+        }
         "target.service_map.evidence.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
             "properties":{
@@ -3703,6 +3839,14 @@ fn service_map_body_references_path(args: &ServiceMapBodyReferencesArgs) -> Stri
     )
 }
 
+fn service_map_html_generators_path(args: &ServiceMapHtmlGeneratorsArgs) -> String {
+    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/html-generators?{query}"),
+        Some(args.session_id),
+    )
+}
+
 fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
     vec![
         op(
@@ -3718,6 +3862,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             "target.service_map.body_references.get",
             "scope service-map body-references --session-id <uuid> --evidence-id <token>",
             "Explicitly read literal absolute HTTP(S) URL references from one retained UTF-8 HTML/JavaScript response preview. Active session only; inactive sessions return unavailable without loading or activation. Returns origins and preview-byte offsets, never body text or URL paths, queries, or credentials. No target requests or automatic/batch reads; references do not prove calls or ownership. Inspect status, completeness, truncation, reasons, and limits.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "target.service_map.html_generators.get",
+            "scope service-map html-generators --session-id <uuid> --evidence-id <token>",
+            "Explicitly inspect one retained UTF-8 text/html response preview for literal WordPress or Drupal meta generator declarations. Active session only; no loading or activation. Fixed generator catalog 1, independent of response-header catalogs and URL references. One inspection GET after existing identity checks, with no target requests, automatic/batch reads, retries, or fallback. Returns safe products, numeric versions, bounded counters and original preview byte spans, never raw content. Inspect completeness, head closure, truncation and parser stop; partial/unsupported never means no generator found. Declarations do not prove installed software or ownership.",
             CliSideEffect::Read,
             false,
             &["session_id", "evidence_id"],
@@ -4494,7 +4647,9 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "include_socket_peer",
             "technology_catalog_version",
         ],
-        "target.service_map.body_references.get" => &["session_id", "evidence_id"],
+        "target.service_map.body_references.get" | "target.service_map.html_generators.get" => {
+            &["session_id", "evidence_id"]
+        }
         "scope.get" => &["session_id"],
         "scope.set" => &[
             "session_id",
@@ -4676,6 +4831,9 @@ fn command_input_preview(command: &Command) -> Value {
         Command::Scope { command } => match command {
             TargetCommand::ServiceMap(args) => match &args.command {
                 Some(ServiceMapCommand::BodyReferences(args)) => json!({
+                    "session_id": args.session_id,"evidence_id":args.evidence_id,
+                }),
+                Some(ServiceMapCommand::HtmlGenerators(args)) => json!({
                     "session_id": args.session_id,"evidence_id":args.evidence_id,
                 }),
                 None => json!({
@@ -5070,6 +5228,9 @@ fn command_api_preview(command: &Command) -> Result<Value> {
             TargetCommand::ServiceMap(args) => match &args.command {
                 Some(ServiceMapCommand::BodyReferences(args)) => {
                     api_preview("GET", service_map_body_references_path(args), None)
+                }
+                Some(ServiceMapCommand::HtmlGenerators(args)) => {
+                    api_preview("GET", service_map_html_generators_path(args), None)
                 }
                 None => service_map_catalog_api_preview(
                     service_map_path(args, args.session_id),
@@ -5564,8 +5725,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
         "target.service_map.get"
             | "target.service_map.evidence.get"
             | "target.service_map.body_references.get"
+            | "target.service_map.html_generators.get"
     ) {
-        if command.operation_name() == "target.service_map.body_references.get" {
+        if command.operation_name() == "target.service_map.html_generators.get" {
+            notes.push("Explicit one-row retained UTF-8 text/html preview read only, with fixed generator catalog 1. The session must already be active. One inspection GET after identity checks, with no target requests, inactive-session loading, automatic/batch reads, retries, fallback, or technology-catalog selector.");
+            notes.push("Products and numeric versions are literal generator declarations, not proven software installations or ownership. Partial/unsupported never means no generator found. Inspect head_closed, complete, reasons, truncation and bounds. scan_prefix_bytes describes the offered prefix, not bytes fully parsed; parser_stop.byte_cursor may split UTF-8 and must not be used to slice text. No raw HTML or rejected declaration text is exposed.");
+        } else if command.operation_name() == "target.service_map.body_references.get" {
             notes.push("Explicit one-row retained-preview read only. The session must already be active; an inactive session returns unavailable without being loaded or activated. No target requests, automatic reads, or batch reads.");
             notes.push("Literal absolute HTTP(S) references do not prove calls or ownership. Results expose canonical origins and retained UTF-8 preview byte offsets, never body text or full URLs. Completeness applies only to the supported bounded literal grammar.");
         } else {
@@ -6055,6 +6220,26 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 command: TargetCommand::ServiceMap(ServiceMapArgs {
                     command: Some(ServiceMapCommand::BodyReferences(
                         ServiceMapBodyReferencesArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    technology_catalog_version: 2,
+                }),
+            }
+        }
+        "target.service_map.html_generators.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::HtmlGenerators(
+                        ServiceMapHtmlGeneratorsArgs {
                             session_id: call_required(operation, input, "session_id")?,
                             evidence_id,
                         },
@@ -7160,6 +7345,7 @@ async fn run(cli: Cli) -> Result<()> {
                 "target.service_map.get"
                     | "target.service_map.evidence.get"
                     | "target.service_map.body_references.get"
+                    | "target.service_map.html_generators.get"
                     | "capture.http.upstream_peer.get"
                     | "capture.http.upstream_peer.set"
             ) {
@@ -7948,6 +8134,15 @@ async fn service_map_get_with_catalog<T: DeserializeOwned>(
     })?;
     let status = response.status();
     if !status.is_success() {
+        if status == StatusCode::NOT_FOUND
+            && path.starts_with("/api/target/service-map/html-generators?")
+        {
+            return Err(ServiceMapCliError {
+                code: "UNSUPPORTED_FEATURE",
+                message: "The selected API does not support retained HTML generator inspection; update the app to use this feature",
+                status: Some(404),
+            }.into());
+        }
         return Err(ServiceMapCliError {
             code: if status.is_redirection() {
                 "REDIRECT_REFUSED"
@@ -8468,6 +8663,237 @@ fn validate_service_map_body_references_response(
     Ok(())
 }
 
+// Version 1 deliberately has no additive free-text fields. Compare the complete
+// shape before printing typed output, including every explicit nullable field.
+fn service_map_html_response_shape(raw: &Value, typed: &Value) -> bool {
+    match (raw, typed) {
+        (Value::Object(raw), Value::Object(typed)) => {
+            raw.len() == typed.len()
+                && typed.iter().all(|(key, value)| {
+                    raw.get(key)
+                        .is_some_and(|raw| service_map_html_response_shape(raw, value))
+                })
+        }
+        (Value::Array(raw), Value::Array(typed)) => {
+            raw.len() == typed.len()
+                && raw
+                    .iter()
+                    .zip(typed)
+                    .all(|(raw, typed)| service_map_html_response_shape(raw, typed))
+        }
+        _ => true,
+    }
+}
+
+fn validate_service_map_html_generators_response(
+    result: &ServiceMapHtmlGenerators,
+    args: &ServiceMapHtmlGeneratorsArgs,
+) -> Result<()> {
+    use sniper::service_map_html::{
+        ByteSpan, ServiceMapHtmlLimits, ACQUISITION_REASONS, MAX_OBSERVATIONS, MAX_SCAN_BYTES,
+        MAX_TAG_BYTES, MAX_TAG_CANDIDATES, MAX_VERSION_BYTES, MAX_VERSION_SEPARATOR_BYTES,
+        PARSER_STOP_REASONS, TRUNCATION_REASONS,
+    };
+    let invalid = || {
+        service_map_error("INVALID_RESPONSE", "HTML generator inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract")
+    };
+    let token_fields: Vec<_> = args.evidence_id.split('.').collect();
+    if parse_service_map_evidence_id(&args.evidence_id).is_err()
+        || result.schema_version != 1
+        || result.generator_catalog_version != 1
+        || result.session_id != args.session_id
+        || result.evidence_id != args.evidence_id
+        || result.coverage != "literal_html_generator_explicit_head"
+        || result.offset_basis != "retained_utf8_preview"
+        || serde_json::to_value(&result.limits).ok()
+            != serde_json::to_value(ServiceMapHtmlLimits::default()).ok()
+    {
+        return Err(invalid());
+    }
+    if !result.available {
+        let valid = matches!(result.status.as_str(), "unsupported" | "unavailable")
+            && !result.complete
+            && result.reasons.len() == 1
+            && ACQUISITION_REASONS.contains(&result.reasons[0].as_str())
+            && result.source_origin.is_none()
+            && result.source_sequence.is_none()
+            && result.source_started_at.is_none()
+            && result.retained_preview_bytes.is_none()
+            && result.scan_prefix_bytes == 0
+            && !result.capture_preview_truncated
+            && !result.scan_prefix_truncated
+            && !result.head_closed
+            && result.parser_stop.is_none()
+            && result.tag_candidates_inspected == 0
+            && !result.additional_tag_candidate_encountered
+            && !result.additional_observation_encountered
+            && result.unknown_product_declarations == 0
+            && result.observations.is_empty();
+        return if valid { Ok(()) } else { Err(invalid()) };
+    }
+    let Some(retained_bytes) = result.retained_preview_bytes else {
+        return Err(invalid());
+    };
+    let prefix_bytes = result.scan_prefix_bytes;
+    let mut expected_reasons = std::collections::BTreeSet::new();
+    if result.capture_preview_truncated {
+        expected_reasons.insert(TRUNCATION_REASONS[0]);
+    }
+    if result.scan_prefix_truncated {
+        expected_reasons.insert(TRUNCATION_REASONS[1]);
+    }
+    if let Some(stop) = &result.parser_stop {
+        // The parser's stop cursor is a raw byte position. Unlike an accepted
+        // span it need not be a character boundary, and never slices text here.
+        if !PARSER_STOP_REASONS.contains(&stop.reason.as_str())
+            || stop.byte_cursor > prefix_bytes
+            || (stop.reason == "end_of_preview"
+                && (stop.byte_cursor != prefix_bytes || result.scan_prefix_truncated))
+            || (stop.reason == "input_limit"
+                && (stop.byte_cursor != prefix_bytes || !result.scan_prefix_truncated))
+        {
+            return Err(invalid());
+        }
+        expected_reasons.insert(stop.reason.as_str());
+    }
+    let reasons: std::collections::BTreeSet<_> =
+        result.reasons.iter().map(String::as_str).collect();
+    let stop_reason = result.parser_stop.as_ref().map(|stop| stop.reason.as_str());
+    let capped_prefix_valid = if retained_bytes <= MAX_SCAN_BYTES {
+        prefix_bytes == retained_bytes
+    } else {
+        (MAX_SCAN_BYTES - 3..=MAX_SCAN_BYTES).contains(&prefix_bytes)
+    };
+    // Every declaration is inside the two explicit opening tags. A closed
+    // head adds its own candidate, including when it contains no declarations.
+    let declaration_count = result
+        .unknown_product_declarations
+        .saturating_add(result.observations.len())
+        .saturating_add(usize::from(result.additional_observation_encountered));
+    let minimum_candidates = if declaration_count > 0 {
+        declaration_count
+            .saturating_add(2)
+            .saturating_add(usize::from(result.head_closed))
+    } else if result.head_closed {
+        3
+    } else {
+        0
+    };
+    if result.status != "scanned"
+        || token_fields[1] != args.session_id.to_string()
+        || result.source_sequence.as_deref() != Some(token_fields[3])
+        || !result
+            .source_origin
+            .as_deref()
+            .is_some_and(service_map_safe_origin)
+        || result.source_started_at.is_none()
+        || !capped_prefix_valid
+        || result.scan_prefix_truncated != (prefix_bytes < retained_bytes)
+        || result.complete != expected_reasons.is_empty()
+        || result.head_closed != result.parser_stop.is_none()
+        || reasons != expected_reasons
+        || reasons.len() != result.reasons.len()
+        || result.tag_candidates_inspected > MAX_TAG_CANDIDATES
+        || result.tag_candidates_inspected > prefix_bytes
+        || result.tag_candidates_inspected < minimum_candidates
+        || result.parser_stop.as_ref().is_some_and(|stop| {
+            result.tag_candidates_inspected > stop.byte_cursor.saturating_add(1)
+        })
+        || result.observations.len() > MAX_OBSERVATIONS
+        || result.unknown_product_declarations > MAX_TAG_CANDIDATES
+        || result.additional_tag_candidate_encountered
+            != (stop_reason == Some("tag_candidate_limit"))
+        || (result.additional_tag_candidate_encountered
+            && result.tag_candidates_inspected != MAX_TAG_CANDIDATES)
+        || result.additional_observation_encountered != (stop_reason == Some("observation_limit"))
+        || (result.additional_observation_encountered
+            && result.observations.len() != MAX_OBSERVATIONS)
+    {
+        return Err(invalid());
+    }
+    let valid_span = |span: ByteSpan| span.start < span.end && span.end <= prefix_bytes;
+    let mut last_tag_end = 0;
+    for observation in &result.observations {
+        let (name, rule) = match observation.product_id.as_str() {
+            "wordpress" => ("WordPress", "html_meta_generator.wordpress.v1"),
+            "drupal" => ("Drupal", "html_meta_generator.drupal.v1"),
+            _ => return Err(invalid()),
+        };
+        let tag = observation.tag_span;
+        let content = observation.content_span;
+        let product = observation.product_span;
+        if observation.name != name
+            || observation.rule_id != rule
+            || observation.catalog_category != "cms"
+            || observation.source != "response_html_meta_generator"
+            || observation.strength != "literal_declaration"
+            || observation.offset_basis != "retained_utf8_preview"
+            || ![tag, content, product].into_iter().all(valid_span)
+            || tag.end - tag.start > MAX_TAG_BYTES
+            || tag.start < last_tag_end
+            || tag.start >= content.start
+            || content.end >= tag.end
+            || product.start != content.start
+            || product.end > content.end
+            || product.end - product.start != name.len()
+            || result
+                .parser_stop
+                .as_ref()
+                .is_some_and(|stop| tag.end > stop.byte_cursor)
+        {
+            return Err(invalid());
+        }
+        last_tag_end = tag.end;
+        let version_valid = match (
+            observation.version_status.as_str(),
+            observation.reported_version.as_deref(),
+            observation.version_span,
+        ) {
+            ("reported", Some(version), Some(span)) => {
+                !version.is_empty()
+                    && version.len() <= MAX_VERSION_BYTES
+                    && version.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    && valid_span(span)
+                    && span.start > product.end
+                    && span.start - product.end <= MAX_VERSION_SEPARATOR_BYTES
+                    && span.end == content.end
+                    && span.end - span.start == version.len()
+            }
+            ("not_reported", None, None) => product.end == content.end,
+            ("unsupported_format", None, None) => product.end < content.end,
+            _ => false,
+        };
+        if !version_valid {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+async fn read_service_map_html_generators(
+    api: &ApiClient,
+    args: &ServiceMapHtmlGeneratorsArgs,
+) -> Result<ServiceMapHtmlGenerators> {
+    let client = service_map_read_client()?;
+    let raw: Value = service_map_get(api, &client, &service_map_html_generators_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid HTML generator inspection envelope",
+        )
+    };
+    let result: ServiceMapHtmlGenerators =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    let typed = serde_json::to_value(&result).map_err(|_| invalid())?;
+    if !service_map_html_response_shape(&raw, &typed) {
+        return Err(invalid());
+    }
+    validate_service_map_html_generators_response(&result, args)?;
+    Ok(result)
+}
+
 async fn read_service_map_body_references(
     api: &ApiClient,
     args: &ServiceMapBodyReferencesArgs,
@@ -8523,6 +8949,10 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
         TargetCommand::ServiceMap(args) => match &args.command {
             Some(ServiceMapCommand::BodyReferences(args)) => {
                 let result = read_service_map_body_references(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::HtmlGenerators(args)) => {
+                let result = read_service_map_html_generators(&api, args).await?;
                 print_session_read_json(&result, args.session_id)
             }
             None => {

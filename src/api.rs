@@ -459,6 +459,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_body_references),
         )
         .route(
+            "/api/target/service-map/html-generators",
+            get(get_target_service_map_html_generators),
+        )
+        .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
         )
@@ -5527,6 +5531,66 @@ async fn get_target_service_map_body_references(
         service_map_body_source_changed(&state, &session, &query.evidence_id).await
     {
         return Json(ServiceMapBodyReferences::missing(
+            query.session_id,
+            query.evidence_id,
+            &reason,
+        ))
+        .into_response();
+    }
+    Json(result).into_response()
+}
+
+async fn get_target_service_map_html_generators(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+) -> Response {
+    get_target_service_map_html_generators_impl(
+        State(state),
+        Query(query),
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_html_generators_impl(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> Response {
+    use crate::service_map_html::ServiceMapHtmlGenerators;
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    // Unlike metadata reads, this opt-in operation never opens an inactive
+    // saved context: its legacy loader can hydrate unbounded retained bodies.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(ServiceMapHtmlGenerators::missing(
+            query.session_id,
+            query.evidence_id,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    let result = session
+        .store
+        .service_map_html_generators(session.id(), &query.evidence_id)
+        .await;
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    // The reader fences its row and file generations. Recheck source identity
+    // across its asynchronous work as well, without starting a session worker.
+    if let Some(reason) =
+        service_map_body_source_changed(&state, &session, &query.evidence_id).await
+    {
+        return Json(ServiceMapHtmlGenerators::missing(
             query.session_id,
             query.evidence_id,
             &reason,
@@ -15182,6 +15246,278 @@ mod tests {
         drop(active);
         drop(state);
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_rejects_inactive_without_loading_saved_data() {
+        let (state, data_dir) = test_state("sniper-service-map-html-inactive");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive body fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        // If this endpoint accidentally starts resolving saved contexts, the
+        // intentionally invalid saved snapshot cannot be loaded successfully.
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let response: serde_json::Value = response_json(
+            super::get_target_service_map_html_generators(
+                State(state.clone()),
+                Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["available"], false);
+        assert_eq!(response["reasons"], serde_json::json!(["inactive_session"]));
+        assert!(response["observations"].as_array().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "inactive body read changed saved files");
+        let invalid = super::get_target_service_map_html_generators(
+            State(state.clone()),
+            Query(super::ServiceMapBodyEvidenceQuery {
+                session_id: active.id(),
+                evidence_id: "invalid".into(),
+            }),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_requires_both_exact_selection_fields() {
+        let (state, data_dir) = test_state("sniper-service-map-html-query");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        let body = "<html><head><meta name='generator' content='WordPress 6.8.1'></head>";
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            body.as_bytes(),
+            body.len(),
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        for query in [
+            String::new(),
+            format!("?session_id={}", active.id()),
+            format!("?evidence_id={token}"),
+            format!("?session_id={}&evidence_id=invalid", active.id()),
+            format!(
+                "?session_id={}&evidence_id={token}&url=https://example.com",
+                active.id()
+            ),
+        ] {
+            let (status, _) = api_route_response(
+                state.clone(),
+                reqwest::Method::GET,
+                &format!("/api/target/service-map/html-generators{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{query}");
+        }
+        let (status, text) = api_route_response(
+            state.clone(),
+            reqwest::Method::GET,
+            &format!(
+                "/api/target/service-map/html-generators?session_id={}&evidence_id={token}",
+                active.id()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let result: crate::service_map_html::ServiceMapHtmlGenerators =
+            serde_json::from_str(&text).unwrap();
+        assert!(result.available && result.complete && result.head_closed);
+        assert_eq!(result.evidence_id, token);
+        assert_eq!(result.session_id, active.id());
+        assert_eq!(result.observations[0].product_id, "wordpress");
+        assert_eq!(
+            result.observations[0].reported_version.as_deref(),
+            Some("6.8.1")
+        );
+        assert!(!text.contains("<meta"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_reports_unsupported_without_a_body_read() {
+        let (state, data_dir) = test_state("sniper-service-map-html-unsupported");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/xhtml+xml".parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            b"SYNTHETIC_PRIVATE_BODY",
+            100,
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let result: serde_json::Value = response_json(
+            super::get_target_service_map_html_generators(
+                State(state.clone()),
+                Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: active.id(),
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result["status"], "unsupported");
+        assert_eq!(result["available"], false);
+        assert_eq!(
+            result["reasons"],
+            serde_json::json!(["unsupported_content_type"])
+        );
+        assert_eq!(result["retained_preview_bytes"], serde_json::Value::Null);
+        assert_eq!(result["source_origin"], serde_json::Value::Null);
+        assert_eq!(result["scan_prefix_bytes"], 0);
+        assert_eq!(result["observations"], serde_json::json!([]));
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_BODY"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_discards_scanned_result_after_session_or_source_change() {
+        for change in ["session", "mutation", "deletion"] {
+            let (state, data_dir) = test_state("sniper-service-map-html-publication");
+            let active = state.active_session_for_read().await;
+            let mut record = test_replay_response_record("/html", 200);
+            record.host = "example.com".into();
+            let body = "<html><head><meta name='generator' content='Drupal 11'></head>";
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "text/html".parse().unwrap());
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                body.as_bytes(),
+                body.len(),
+            ));
+            let id = record.id;
+            active.store.insert(record).await;
+            let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+                .evidence_id
+                .clone();
+            // Establish that the exact input is a successful nonempty scan.
+            let before = active
+                .store
+                .service_map_html_generators(active.id(), &token)
+                .await;
+            assert!(before.complete);
+            assert_eq!(before.observations.len(), 1);
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = active.id();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_html_generators_impl(
+                    State(read_state),
+                    Query(super::ServiceMapBodyEvidenceQuery {
+                        session_id,
+                        evidence_id: token,
+                    }),
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match change {
+                "session" => {
+                    state
+                        .create_session(Some("New HTML fixture".into()))
+                        .await
+                        .unwrap();
+                    "session_source_changed"
+                }
+                "mutation" => {
+                    active
+                        .store
+                        .update_record(id, |row| row.path = "/changed".into())
+                        .await
+                        .unwrap();
+                    "record_changed"
+                }
+                _ => {
+                    assert_eq!(active.store.delete_ids(&[id]).await.unwrap(), 1);
+                    "record_missing"
+                }
+            };
+            resume.send(()).unwrap();
+            let result: crate::service_map_html::ServiceMapHtmlGenerators =
+                response_json(reading.await.unwrap()).await;
+            assert!(
+                !result.available && !result.complete && !result.head_closed,
+                "{change}"
+            );
+            assert_eq!(result.reasons, [expected], "{change}");
+            assert!(result.observations.is_empty());
+            assert!(result.source_origin.is_none());
+            assert!(result.source_sequence.is_none());
+            assert!(result.source_started_at.is_none());
+            assert!(result.retained_preview_bytes.is_none());
+            assert!(result.parser_stop.is_none());
+            assert_eq!(result.scan_prefix_bytes, 0);
+            assert_eq!(result.tag_candidates_inspected, 0);
+            drop(active);
+            drop(state);
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
     }
 
     #[tokio::test]

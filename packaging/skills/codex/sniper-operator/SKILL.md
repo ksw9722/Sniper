@@ -104,6 +104,30 @@ Offsets are not full-body or wire offsets. Literal references do not prove calls
 followed links, ownership, or service dependencies; never add them to observed
 traffic counts or silently infer an architecture.
 
+For a separately requested HTML generator inspection, use
+`scope service-map html-generators --session-id <active-session-uuid>
+--evidence-id <returned-token>` (`target.service_map.html_generators.get`). The
+same exact-row and active-session restrictions apply. This performs one separate
+bounded retained-preview read; neither the metadata map nor URL-reference reads
+invoke it. Only retained UTF-8 `text/html` previews are eligible. An older server
+may not support the endpoint; never retry with body
+hydration, another row, or target traffic.
+
+Check `available`, `status`, `complete`, `reasons`, `head_closed`, both truncation
+flags, and limits. Accepted partial results use `available: true`,
+`status: "scanned"`, and `complete: false`. `scan_prefix_bytes` is the prefix offered to the recognizer,
+not a count of fully parsed bytes. A supported explicit head may be closed even
+when a trailing preview is truncated; `complete` is then false. Partial,
+unsupported, or unavailable inspection cannot establish that a generator is
+absent. Version 1 recognizes only literal WordPress/Drupal declarations in an
+explicit HTML head, returning numeric versions only when wholly supported.
+Unknown or unsupported versions must remain unknown. Treat these as reported
+generator claims, never proven installed software, a backend/runtime identity,
+or a vulnerable-version judgment. Output contains no raw tags or snippets.
+Accepted spans use retained UTF-8 preview byte offsets; the parser stop cursor
+may split a UTF-8 character and must never be used to slice text. There is no map
+aggregation, automatic body scan, or persistence of this supplementary result.
+
 ## Saved data and session management
 
 ### Prefer the saved-data v1 contract

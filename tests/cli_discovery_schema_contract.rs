@@ -763,7 +763,7 @@ mod history_fixture {
             "/api/transactions" | "/api/transactions-page" => {
                 Json(state.payload.lock().unwrap().clone()).into_response()
             }
-            "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" => {
+            "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" | "/api/target/service-map/html-generators" => {
                 let status = StatusCode::from_u16(*state.read_status.lock().unwrap()).unwrap();
                 let mut response =
                     (status, Json(state.payload.lock().unwrap().clone())).into_response();
@@ -2655,6 +2655,846 @@ mod history_fixture {
                 .await;
             assert_eq!(result["error"]["code"], "INVALID_INPUT");
             assert!(mock.state.requests.lock().unwrap().is_empty());
+        }
+    }
+
+    fn html_generators_payload(status: &str) -> Value {
+        let available = matches!(status, "scanned" | "partial");
+        json!({
+            "schema_version":1,"generator_catalog_version":1,"session_id":Uuid::nil(),"evidence_id":BODY_REFERENCE_TOKEN,
+            "available":available,"status":if available {"scanned"} else {status},"complete":status == "scanned",
+            "reasons":match status {
+                "scanned" => json!([]),"partial" => json!(["capture_preview_truncated"]),
+                "unsupported" => json!(["unsupported_content_type"]),_ => json!(["inactive_session"])
+            },
+            "source_origin":if available {json!("https://example.com")} else {Value::Null},
+            "source_sequence":if available {json!("9007199254740993")} else {Value::Null},
+            "source_started_at":if available {json!("2026-10-12T00:00:00Z")} else {Value::Null},
+            "retained_preview_bytes":if available {json!(88)} else {Value::Null},
+            "scan_prefix_bytes":if available {88} else {0},
+            "capture_preview_truncated":status == "partial","scan_prefix_truncated":false,
+            "coverage":"literal_html_generator_explicit_head","head_closed":available,"parser_stop":null,
+            "tag_candidates_inspected":if available {4} else {0},
+            "additional_tag_candidate_encountered":false,"additional_observation_encountered":false,"unknown_product_declarations":0,
+            "observations":if available {json!([{
+                "product_id":"wordpress","name":"WordPress","catalog_category":"cms",
+                "reported_version":"6.8.1","version_status":"reported","source":"response_html_meta_generator",
+                "strength":"literal_declaration","rule_id":"html_meta_generator.wordpress.v1",
+                "tag_span":{"start":12,"end":61},"content_span":{"start":44,"end":59},
+                "product_span":{"start":44,"end":53},"version_span":{"start":54,"end":59},"offset_basis":"retained_utf8_preview"
+            }])} else {json!([])},
+            "limits":{"scan_bytes":262144,"serialized_row_bytes":2097152,"tag_candidates":4096,"tag_bytes":4096,"attributes":32,"observations":8,"version_bytes":32,"version_separator_bytes":32},
+            "offset_basis":"retained_utf8_preview"
+        })
+    }
+
+    #[test]
+    fn service_map_html_generator_discovery_and_preview_are_explicit_and_offline() {
+        let operation = "target.service_map.html_generators.get";
+        let spec = super::spec(operation);
+        let session = Uuid::nil().to_string();
+        let input = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN});
+        assert_eq!(spec["side_effect"], "read");
+        assert_eq!(spec["requires_confirmation"], false);
+        assert_eq!(
+            spec["input_schema"]["required"],
+            json!(["session_id", "evidence_id"])
+        );
+        assert_eq!(spec["input_schema"]["additionalProperties"], false);
+        assert_eq!(
+            spec["input_schema"]["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        let schema = super::cli(&["schema", "input", operation], 0);
+        assert_eq!(schema["schema"], spec["input_schema"]);
+        let called = super::cli(
+            &[
+                "--dry-run",
+                "call",
+                operation,
+                "--input",
+                &input.to_string(),
+            ],
+            0,
+        );
+        for noun in ["scope", "target"] {
+            let direct = super::cli(
+                &[
+                    "--dry-run",
+                    noun,
+                    "service-map",
+                    "html-generators",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ],
+                0,
+            );
+            assert_eq!(direct, called["data"]);
+            assert_eq!(direct["input"], input);
+            assert_eq!(direct["api"]["method"], "GET");
+            assert_eq!(direct["api"]["body"], Value::Null);
+            assert!(direct["api"].get("headers").is_none());
+            let path = direct["api"]["path"].as_str().unwrap();
+            assert!(path.starts_with("/api/target/service-map/html-generators?"));
+            let params: BTreeMap<_, _> =
+                url::form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+                    .into_owned()
+                    .collect();
+            assert_eq!(
+                params,
+                BTreeMap::from([
+                    ("session_id".into(), session.clone()),
+                    ("evidence_id".into(), BODY_REFERENCE_TOKEN.into())
+                ])
+            );
+            for forbidden in ["--technology-catalog-version", "--origin", "--max-records"] {
+                let error = super::cli(
+                    &[
+                        "--dry-run",
+                        noun,
+                        "service-map",
+                        "html-generators",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        BODY_REFERENCE_TOKEN,
+                        forbidden,
+                        "SYNTHETIC_PRIVATE_VALUE",
+                    ],
+                    2,
+                );
+                assert_eq!(error["error"]["code"], "INVALID_INPUT");
+                assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            }
+            for required in [
+                vec!["--session-id", session.as_str()],
+                vec!["--evidence-id", BODY_REFERENCE_TOKEN],
+            ] {
+                let mut args = vec!["--dry-run", noun, "service-map", "html-generators"];
+                args.extend(required);
+                assert_eq!(super::cli(&args, 2)["error"]["code"], "INVALID_INPUT");
+            }
+            for parent_flags in [
+                vec!["--technology-catalog-version", "2"],
+                vec!["--origin", "https://example.com"],
+                vec!["--max-records", "10"],
+                vec!["--session-id", session.as_str()],
+                vec!["--in-scope-only"],
+            ] {
+                let mut args = vec!["--dry-run", noun, "service-map"];
+                args.extend(parent_flags);
+                args.extend([
+                    "html-generators",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ]);
+                assert_eq!(super::cli(&args, 2)["error"]["code"], "INVALID_INPUT");
+            }
+            let help = std::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
+                .args([noun, "service-map", "html-generators", "--help"])
+                .output()
+                .unwrap();
+            assert!(help.status.success());
+            let text = String::from_utf8(help.stdout).unwrap();
+            assert!(text.contains("Partial or unsupported"));
+            assert!(text.contains("--session-id") && text.contains("--evidence-id"));
+        }
+        for field in ["session_id", "evidence_id"] {
+            for value in [
+                None,
+                Some(Value::Null),
+                Some(json!("SYNTHETIC_PRIVATE_VALUE")),
+            ] {
+                let mut invalid = input.clone();
+                if let Some(value) = value {
+                    invalid[field] = value;
+                } else {
+                    invalid.as_object_mut().unwrap().remove(field);
+                }
+                let error = super::cli(
+                    &[
+                        "--dry-run",
+                        "call",
+                        operation,
+                        "--input",
+                        &invalid.to_string(),
+                    ],
+                    2,
+                );
+                assert_eq!(error["error"]["code"], "INVALID_INPUT");
+                assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            }
+        }
+        for field in [
+            "technology_catalog_version",
+            "generator_catalog_version",
+            "origin",
+            "in_scope_only",
+            "max_records",
+            "batch",
+        ] {
+            let mut invalid = input.clone();
+            invalid[field] = json!(true);
+            let error = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    operation,
+                    "--input",
+                    &invalid.to_string(),
+                ],
+                2,
+            );
+            assert_eq!(error["error"]["code"], "INVALID_INPUT");
+        }
+        for example in spec["examples"].as_array().unwrap() {
+            let result = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    operation,
+                    "--input",
+                    &example.to_string(),
+                ],
+                0,
+            );
+            assert!(result["data"]["api"].get("headers").is_none());
+        }
+        assert_eq!(
+            super::cli(&["examples", operation], 0)["examples"],
+            spec["examples"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_html_generator_statuses_preserve_schema_and_exact_read_counts() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let operation = "target.service_map.html_generators.get";
+        let schema = output_schema(operation);
+        for status in ["scanned", "partial", "unsupported", "unavailable"] {
+            let payload = html_generators_payload(status);
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            for noun in ["scope", "target"] {
+                let result = mock
+                    .command(&[
+                        noun,
+                        "service-map",
+                        "html-generators",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        BODY_REFERENCE_TOKEN,
+                    ])
+                    .await;
+                assert_eq!(result, payload);
+                assert_schema(&result, &schema);
+                mock.assert_reads(
+                    "/api/target/service-map/html-generators",
+                    &[("evidence_id", BODY_REFERENCE_TOKEN)],
+                );
+            }
+            let input =
+                json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN}).to_string();
+            let called = mock.command(&["call", operation, "--input", &input]).await;
+            assert_eq!(called["data"], payload);
+            assert_eq!(called["meta"]["session_id"], session);
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        // Reaching a supported head end does not make a truncated body complete.
+        let mut payload = html_generators_payload("partial");
+        payload["scan_prefix_truncated"] = json!(true);
+        payload["scan_prefix_bytes"] = json!(262143);
+        payload["retained_preview_bytes"] = json!(262145);
+        payload["reasons"] = json!(["capture_preview_truncated", "scan_prefix_truncated"]);
+        *mock.state.payload.lock().unwrap() = payload.clone();
+        let result = mock
+            .command(&[
+                "target",
+                "service-map",
+                "html-generators",
+                "--session-id",
+                &session,
+                "--evidence-id",
+                BODY_REFERENCE_TOKEN,
+            ])
+            .await;
+        assert_eq!(result, payload);
+        assert_schema(&result, &schema);
+        mock.assert_reads(
+            "/api/target/service-map/html-generators",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_html_generator_partial_stops_and_version_statuses_are_literal() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "html-generators",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        let schema = output_schema("target.service_map.html_generators.get");
+        for reason in sniper::service_map_html::PARSER_STOP_REASONS {
+            let mut payload = html_generators_payload("scanned");
+            payload["complete"] = json!(false);
+            payload["head_closed"] = json!(false);
+            payload["reasons"] = json!([reason]);
+            payload["parser_stop"] = json!({"reason":reason,"byte_cursor":88});
+            if *reason == "input_limit" {
+                payload["scan_prefix_bytes"] = json!(262142);
+                payload["retained_preview_bytes"] = json!(262145);
+                payload["scan_prefix_truncated"] = json!(true);
+                payload["parser_stop"]["byte_cursor"] = json!(262142);
+                payload["reasons"] = json!(["input_limit", "scan_prefix_truncated"]);
+            }
+            if *reason == "tag_candidate_limit" {
+                payload["tag_candidates_inspected"] = json!(4096);
+                payload["scan_prefix_bytes"] = json!(20000);
+                payload["retained_preview_bytes"] = json!(20000);
+                payload["additional_tag_candidate_encountered"] = json!(true);
+                payload["parser_stop"]["byte_cursor"] = json!(18000);
+            }
+            if *reason == "observation_limit" {
+                let observation = payload["observations"][0].clone();
+                payload["observations"] = json!((0..8)
+                    .map(|index| {
+                        let mut value = observation.clone();
+                        for field in ["tag_span", "content_span", "product_span", "version_span"] {
+                            for bound in ["start", "end"] {
+                                value[field][bound] =
+                                    json!(value[field][bound].as_u64().unwrap() + index * 100);
+                            }
+                        }
+                        value
+                    })
+                    .collect::<Vec<_>>());
+                payload["scan_prefix_bytes"] = json!(1000);
+                payload["retained_preview_bytes"] = json!(1000);
+                payload["parser_stop"]["byte_cursor"] = json!(800);
+                payload["tag_candidates_inspected"] = json!(11);
+                payload["additional_observation_encountered"] = json!(true);
+            }
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let result = mock.command(&args).await;
+            assert_eq!(result, payload);
+            assert_schema(&result, &schema);
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        for product in ["wordpress", "drupal"] {
+            for version_status in ["reported", "not_reported", "unsupported_format"] {
+                let mut payload = html_generators_payload("scanned");
+                let item = &mut payload["observations"][0];
+                if product == "drupal" {
+                    item["product_id"] = json!("drupal");
+                    item["name"] = json!("Drupal");
+                    item["rule_id"] = json!("html_meta_generator.drupal.v1");
+                    item["product_span"]["end"] = json!(50);
+                }
+                item["version_status"] = json!(version_status);
+                if version_status != "reported" {
+                    item["reported_version"] = Value::Null;
+                    item["version_span"] = Value::Null;
+                }
+                if version_status == "not_reported" {
+                    item["content_span"]["end"] = item["product_span"]["end"].clone();
+                }
+                *mock.state.payload.lock().unwrap() = payload.clone();
+                let result = mock.command(&args).await;
+                assert_eq!(result, payload);
+                assert_schema(&result, &schema);
+                mock.assert_reads(
+                    "/api/target/service-map/html-generators",
+                    &[("evidence_id", BODY_REFERENCE_TOKEN)],
+                );
+            }
+        }
+        let mut empty = html_generators_payload("scanned");
+        empty["observations"] = json!([]);
+        empty["unknown_product_declarations"] = json!(1);
+        *mock.state.payload.lock().unwrap() = empty.clone();
+        assert_eq!(mock.command(&args).await, empty);
+        mock.assert_reads(
+            "/api/target/service-map/html-generators",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_html_generator_rejects_misbound_private_or_unbounded_responses() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "html-generators",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        for (pointer, value) in [
+            ("/schema_version", json!(2)),
+            ("/generator_catalog_version", json!(2)),
+            ("/schema_version", json!(1.0)),
+            ("/generator_catalog_version", json!("1")),
+            ("/session_id", json!(Uuid::from_u128(1))),
+            ("/evidence_id", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/source_sequence", json!("9007199254740992")),
+            ("/source_sequence", json!("09007199254740993")),
+            ("/source_sequence", json!("18446744073709551616")),
+            ("/source_started_at", json!("SYNTHETIC_PRIVATE_VALUE")),
+            (
+                "/source_origin",
+                json!("https://user:SYNTHETIC_PRIVATE_VALUE@example.com"),
+            ),
+            (
+                "/source_origin",
+                json!("https://example.com/path?SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            ("/status", json!("partial")),
+            ("/available", json!(false)),
+            ("/complete", json!(false)),
+            ("/reasons", json!(["SYNTHETIC_PRIVATE_VALUE"])),
+            ("/reasons", json!(["inactive_session"])),
+            ("/capture_preview_truncated", json!(true)),
+            ("/scan_prefix_truncated", json!(true)),
+            ("/head_closed", json!(false)),
+            (
+                "/parser_stop",
+                json!({"reason":"end_of_preview","byte_cursor":88}),
+            ),
+            ("/scan_prefix_bytes", json!(262145)),
+            ("/scan_prefix_bytes", json!(87)),
+            ("/scan_prefix_bytes", json!(-1)),
+            ("/retained_preview_bytes", json!(87)),
+            ("/tag_candidates_inspected", json!(4097)),
+            ("/tag_candidates_inspected", json!(0)),
+            ("/additional_tag_candidate_encountered", json!(true)),
+            ("/additional_observation_encountered", json!(true)),
+            ("/unknown_product_declarations", json!(4097)),
+            ("/unknown_product_declarations", json!(4)),
+            ("/coverage", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/offset_basis", json!("wire_bytes")),
+            ("/limits/scan_bytes", json!(262145)),
+            ("/limits/version_bytes", json!(33)),
+            (
+                "/observations/0/product_id",
+                json!("SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            ("/observations/0/name", json!("Drupal")),
+            ("/observations/0/catalog_category", json!("server")),
+            (
+                "/observations/0/rule_id",
+                json!("html_meta_generator.drupal.v1"),
+            ),
+            ("/observations/0/source", json!("response_header")),
+            ("/observations/0/strength", json!("proven")),
+            ("/observations/0/offset_basis", json!("wire_bytes")),
+            ("/observations/0/version_status", json!("not_reported")),
+            (
+                "/observations/0/version_status",
+                json!("SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            (
+                "/observations/0/reported_version",
+                json!("6.8-SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            ("/observations/0/reported_version", json!("6..8")),
+            ("/observations/0/reported_version", json!("6.8.1\n")),
+            ("/observations/0/reported_version", json!("1".repeat(33))),
+            ("/observations/0/tag_span/start", json!(61)),
+            ("/observations/0/tag_span/end", json!(89)),
+            ("/observations/0/content_span/start", json!(12)),
+            ("/observations/0/content_span/end", json!(61)),
+            ("/observations/0/product_span/start", json!(45)),
+            ("/observations/0/product_span/end", json!(52)),
+            ("/observations/0/version_span/start", json!(53)),
+            ("/observations/0/version_span/end", json!(58)),
+        ] {
+            let mut payload = html_generators_payload("scanned");
+            *payload.pointer_mut(pointer).unwrap() = value;
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{pointer}");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        for status in ["scanned", "unavailable"] {
+            let payload = html_generators_payload(status);
+            for field in payload.as_object().unwrap().keys() {
+                let mut missing = payload.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                *mock.state.payload.lock().unwrap() = missing;
+                assert_eq!(
+                    mock.command_with_code(&args, 5).await["error"]["code"],
+                    "INVALID_RESPONSE",
+                    "{status}: {field}"
+                );
+                mock.assert_reads(
+                    "/api/target/service-map/html-generators",
+                    &[("evidence_id", BODY_REFERENCE_TOKEN)],
+                );
+            }
+        }
+        for pointer in ["", "/observations/0", "/observations/0/tag_span", "/limits"] {
+            let mut payload = html_generators_payload("scanned");
+            payload
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("snippet".into(), json!("SYNTHETIC_PRIVATE_VALUE"));
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        let mut duplicated = html_generators_payload("scanned");
+        duplicated["observations"] =
+            json!([duplicated["observations"][0], duplicated["observations"][0]]);
+        *mock.state.payload.lock().unwrap() = duplicated;
+        assert_eq!(
+            mock.command_with_code(&args, 5).await["error"]["code"],
+            "INVALID_RESPONSE"
+        );
+        mock.assert_reads(
+            "/api/target/service-map/html-generators",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+    }
+
+    #[test]
+    fn service_map_html_generator_schemas_reject_missing_nullable_and_free_text_fields() {
+        let schema = output_schema("target.service_map.html_generators.get");
+        for status in ["scanned", "partial", "unsupported", "unavailable"] {
+            let payload = html_generators_payload(status);
+            assert_schema(&payload, &schema);
+            for field in payload.as_object().unwrap().keys() {
+                let mut missing = payload.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(!super::matches_schema(&missing, &schema), "{field}");
+            }
+        }
+        let payload = html_generators_payload("scanned");
+        for field in payload["observations"][0].as_object().unwrap().keys() {
+            let mut missing = payload.clone();
+            missing["observations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(!super::matches_schema(&missing, &schema), "{field}");
+        }
+        for (pointer, value) in [
+            ("/status", json!("partial")),
+            ("/generator_catalog_version", json!(2)),
+            ("/reasons", json!(["SYNTHETIC_PRIVATE_VALUE"])),
+            ("/observations/0/name", json!("Drupal")),
+            ("/observations/0/reported_version", json!("6..8")),
+            ("/observations/0/reported_version", json!("1".repeat(33))),
+            ("/observations/0/version_status", json!("not_reported")),
+            (
+                "/observations/0/product_id",
+                json!("SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            ("/scan_prefix_bytes", json!(262145)),
+            ("/limits/observations", json!(9)),
+        ] {
+            let mut malformed = payload.clone();
+            *malformed.pointer_mut(pointer).unwrap() = value;
+            assert!(!super::matches_schema(&malformed, &schema), "{pointer}");
+        }
+        let mut nine = payload;
+        nine["observations"] = json!(vec![nine["observations"][0].clone(); 9]);
+        assert!(!super::matches_schema(&nine, &schema));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_html_generator_http_failures_never_fallback_or_echo() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "target",
+            "service-map",
+            "html-generators",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        for (status, code, exit) in [
+            (404, "UNSUPPORTED_FEATURE", 5),
+            (302, "REDIRECT_REFUSED", 5),
+            (503, "HTTP_STATUS_ERROR", 6),
+        ] {
+            *mock.state.read_status.lock().unwrap() = status;
+            *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+            let result = mock.command_with_code(&args, exit).await;
+            assert_eq!(result["error"]["code"], code);
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_html_generator_rejects_inconsistent_partial_and_missing_states() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "html-generators",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        let mut partial = html_generators_payload("scanned");
+        partial["head_closed"] = json!(false);
+        partial["complete"] = json!(false);
+        partial["reasons"] = json!(["tag_byte_limit"]);
+        // A raw cap cursor can split a Unicode character in the retained input.
+        // The CLI has no body text and must not treat this as a slicing offset.
+        partial["scan_prefix_bytes"] = json!(5000);
+        partial["retained_preview_bytes"] = json!(5000);
+        partial["parser_stop"] = json!({"reason":"tag_byte_limit","byte_cursor":4163});
+        *mock.state.payload.lock().unwrap() = partial.clone();
+        assert_eq!(mock.command(&args).await, partial);
+        mock.assert_reads(
+            "/api/target/service-map/html-generators",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+        for (pointer, value) in [
+            ("/parser_stop/reason", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/parser_stop/byte_cursor", json!(5001)),
+            ("/parser_stop/byte_cursor", json!(60)),
+            ("/parser_stop/byte_cursor", json!(-1)),
+            ("/parser_stop/byte_cursor", json!(4163.0)),
+            ("/reasons", json!(["tag_byte_limit", "tag_byte_limit"])),
+            ("/reasons", json!(["tag_byte_limit", "attribute_limit"])),
+            ("/complete", json!(true)),
+            ("/head_closed", json!(true)),
+            ("/additional_tag_candidate_encountered", json!(true)),
+            ("/additional_observation_encountered", json!(true)),
+            ("/observations/0/tag_span/end", json!(4110)),
+        ] {
+            let mut payload = partial.clone();
+            *payload.pointer_mut(pointer).unwrap() = value;
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{pointer}");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        for (pointer, value) in [
+            ("/source_origin", json!("https://example.com")),
+            ("/source_sequence", json!("9007199254740993")),
+            ("/source_started_at", json!("2026-10-12T00:00:00Z")),
+            ("/retained_preview_bytes", json!(0)),
+            ("/scan_prefix_bytes", json!(1)),
+            ("/capture_preview_truncated", json!(true)),
+            ("/scan_prefix_truncated", json!(true)),
+            ("/head_closed", json!(true)),
+            ("/tag_candidates_inspected", json!(1)),
+            ("/unknown_product_declarations", json!(1)),
+            ("/reasons", json!(["end_of_preview"])),
+            ("/reasons", json!(["inactive_session", "record_changed"])),
+            (
+                "/parser_stop",
+                json!({"reason":"end_of_preview","byte_cursor":0}),
+            ),
+        ] {
+            let mut payload = html_generators_payload("unavailable");
+            *payload.pointer_mut(pointer).unwrap() = value;
+            *mock.state.payload.lock().unwrap() = payload;
+            assert_eq!(
+                mock.command_with_code(&args, 5).await["error"]["code"],
+                "INVALID_RESPONSE",
+                "{pointer}"
+            );
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        for field in ["reported_version", "version_span"] {
+            let mut payload = html_generators_payload("scanned");
+            payload["observations"][0]["version_status"] = json!("not_reported");
+            payload["observations"][0]["reported_version"] = Value::Null;
+            payload["observations"][0]["version_span"] = Value::Null;
+            payload["observations"][0]["content_span"]["end"] = json!(53);
+            payload["observations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            *mock.state.payload.lock().unwrap() = payload;
+            assert_eq!(
+                mock.command_with_code(&args, 5).await["error"]["code"],
+                "INVALID_RESPONSE",
+                "{field}"
+            );
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_html_generator_identity_failure_stops_before_inspection() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "html-generators",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        *mock.state.settings_override.lock().unwrap() =
+            Some(json!({"error":"SYNTHETIC_PRIVATE_VALUE"}));
+        let result = mock.command_with_code(&args, 5).await;
+        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        let requests = mock.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/settings");
+        assert_eq!(requests[0].catalog_header, None);
+        assert!(requests[0].query.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_html_generator_candidate_counts_include_explicit_head_tags() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "html-generators",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        let mut closed_empty = html_generators_payload("scanned");
+        closed_empty["observations"] = json!([]);
+        let mut closed_unknown = closed_empty.clone();
+        closed_unknown["unknown_product_declarations"] = json!(1);
+        let mut partial_observed = html_generators_payload("scanned");
+        partial_observed["head_closed"] = json!(false);
+        partial_observed["complete"] = json!(false);
+        partial_observed["reasons"] = json!(["end_of_preview"]);
+        partial_observed["parser_stop"] = json!({"reason":"end_of_preview","byte_cursor":88});
+        let mut partial_unknown = partial_observed.clone();
+        partial_unknown["observations"] = json!([]);
+        partial_unknown["unknown_product_declarations"] = json!(1);
+        let mut partial_empty = partial_observed.clone();
+        partial_empty["observations"] = json!([]);
+        partial_empty["scan_prefix_bytes"] = json!(0);
+        partial_empty["retained_preview_bytes"] = json!(0);
+        partial_empty["parser_stop"]["byte_cursor"] = json!(0);
+        for (payload, minimum) in [
+            (html_generators_payload("scanned"), 4),
+            (closed_empty, 3),
+            (closed_unknown, 4),
+            (partial_observed, 3),
+            (partial_unknown, 3),
+            (partial_empty, 0),
+        ] {
+            let mut boundary = payload.clone();
+            boundary["tag_candidates_inspected"] = json!(minimum);
+            *mock.state.payload.lock().unwrap() = boundary.clone();
+            assert_eq!(mock.command(&args).await, boundary);
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+            if minimum > 0 {
+                let mut invalid = payload;
+                invalid["tag_candidates_inspected"] = json!(minimum - 1);
+                *mock.state.payload.lock().unwrap() = invalid;
+                assert_eq!(
+                    mock.command_with_code(&args, 5).await["error"]["code"],
+                    "INVALID_RESPONSE"
+                );
+                mock.assert_reads(
+                    "/api/target/service-map/html-generators",
+                    &[("evidence_id", BODY_REFERENCE_TOKEN)],
+                );
+            }
+        }
+        let mut ninth = html_generators_payload("scanned");
+        let observation = ninth["observations"][0].clone();
+        ninth["observations"] = json!((0..8)
+            .map(|index| {
+                let mut value = observation.clone();
+                for field in ["tag_span", "content_span", "product_span", "version_span"] {
+                    for bound in ["start", "end"] {
+                        value[field][bound] =
+                            json!(value[field][bound].as_u64().unwrap() + index * 100);
+                    }
+                }
+                value
+            })
+            .collect::<Vec<_>>());
+        ninth["head_closed"] = json!(false);
+        ninth["complete"] = json!(false);
+        ninth["reasons"] = json!(["observation_limit"]);
+        ninth["parser_stop"] = json!({"reason":"observation_limit","byte_cursor":800});
+        ninth["scan_prefix_bytes"] = json!(1000);
+        ninth["retained_preview_bytes"] = json!(1000);
+        ninth["additional_observation_encountered"] = json!(true);
+        for candidates in [10, 11] {
+            ninth["tag_candidates_inspected"] = json!(candidates);
+            *mock.state.payload.lock().unwrap() = ninth.clone();
+            let result = mock
+                .command_with_code(&args, if candidates == 11 { 0 } else { 5 })
+                .await;
+            if candidates == 11 {
+                assert_eq!(result, ninth);
+            } else {
+                assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            }
+            mock.assert_reads(
+                "/api/target/service-map/html-generators",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
         }
     }
 

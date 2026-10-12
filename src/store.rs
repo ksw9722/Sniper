@@ -1516,14 +1516,84 @@ impl TransactionStore {
         id: &str,
         #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
     ) -> crate::service_map_body::ServiceMapBodyReferences {
+        use crate::service_map_body::{self, BodySource, ServiceMapBodyReferences};
+        self.service_map_retained_preview(
+            session_id,
+            id,
+            BodySource::from_record,
+            service_map_body::scan_preview,
+            ServiceMapBodyReferences::missing,
+            ServiceMapBodyReferences::unsupported,
+            #[cfg(test)]
+            hook,
+        )
+        .await
+    }
+
+    /// A separate opt-in operation; default metadata and body-reference reads
+    /// never invoke the HTML parser or enrich their existing output.
+    pub async fn service_map_html_generators(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map_html::ServiceMapHtmlGenerators {
+        self.service_map_html_generators_impl(
+            session_id,
+            id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn service_map_html_generators_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_html::ServiceMapHtmlGenerators {
+        use crate::{
+            service_map_body::BodySource,
+            service_map_html::{self, ServiceMapHtmlGenerators},
+        };
+        self.service_map_retained_preview(
+            session_id,
+            id,
+            BodySource::from_html_record,
+            service_map_html::scan_preview,
+            ServiceMapHtmlGenerators::missing,
+            ServiceMapHtmlGenerators::unsupported,
+            #[cfg(test)]
+            hook,
+        )
+        .await
+    }
+
+    // Keep inspection inside the read fence. Returning an unfenced preview to
+    // callers would permit evidence to escape after retention or file replacement.
+    async fn service_map_retained_preview<R: Send + 'static>(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        source_from_record: fn(
+            &TransactionRecord,
+        )
+            -> Result<crate::service_map_body::BodySource, &'static str>,
+        scan_preview: fn(
+            Uuid,
+            String,
+            crate::service_map_body::BodySource,
+            crate::service_map_body::RetainedPreview,
+        ) -> R,
+        missing_result: fn(Uuid, String, &str) -> R,
+        unsupported_result: fn(Uuid, String, &str) -> R,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> R {
         use crate::{
             service_map::EvidenceKey,
-            service_map_body::{
-                read_preview, scan_preview, BodySource, RetainedPreview, ServiceMapBodyReferences,
-                MAX_SERIALIZED_ROW_BYTES,
-            },
+            service_map_body::{read_preview, RetainedPreview, MAX_SERIALIZED_ROW_BYTES},
         };
-        let missing = |reason| ServiceMapBodyReferences::missing(session_id, id.into(), reason);
+        let missing = |reason| missing_result(session_id, id.into(), reason);
         let Some(key) = EvidenceKey::parse(id) else {
             return missing("invalid_evidence_id");
         };
@@ -1540,12 +1610,10 @@ impl TransactionStore {
                 Err(reason) => return missing(reason),
             };
             let record = &inner.entries[index];
-            let source = match BodySource::from_record(record) {
+            let source = match source_from_record(record) {
                 Ok(source) => source,
                 Err("response_unavailable") => return missing("response_unavailable"),
-                Err(reason) => {
-                    return ServiceMapBodyReferences::unsupported(session_id, id.into(), reason)
-                }
+                Err(reason) => return unsupported_result(session_id, id.into(), reason),
             };
             let locator = (inner.by_id.get(&record.id) == Some(&index))
                 .then(|| inner.locators.get(&record.id).copied())
@@ -1573,8 +1641,7 @@ impl TransactionStore {
         let storage_dir = self.storage_dir.clone();
         let evidence_id = id.to_owned();
         let task = tokio::task::spawn_blocking(move || {
-            let missing =
-                |reason| ServiceMapBodyReferences::missing(session_id, evidence_id.clone(), reason);
+            let missing = |reason| missing_result(session_id, evidence_id.clone(), reason);
             let preview = if let Some((locator, file_generation)) = located {
                 let Some(storage_dir) = storage_dir else {
                     return missing("body_storage_unavailable");
@@ -4132,6 +4199,433 @@ pub(crate) mod tests {
             let session = Uuid::new_v4();
             let id = token(&store, session, 1).await;
             let result = store.service_map_body_references(session, &id).await;
+            assert_eq!(result.status, "unsupported");
+            assert_eq!(result.reasons, ["unsupported_body_encoding"]);
+            assert!(!result.available);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+        fn paused_html_read(
+            store: Arc<TransactionStore>,
+            session: Uuid,
+            token: String,
+            hook: ServiceMapBodyReadHook,
+        ) -> tokio::task::JoinHandle<crate::service_map_html::ServiceMapHtmlGenerators> {
+            tokio::spawn(async move {
+                store
+                    .service_map_html_generators_impl(session, &token, Some(hook))
+                    .await
+            })
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_distinguishes_resident_and_lazy_duplicate_rows() {
+            let first = body_record(
+                "<html><head><meta name='generator' content='WordPress 6.8.1'></head>",
+                1,
+            );
+            let mut second = body_record(
+                "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                2,
+            );
+            second.id = first.id;
+            let (store, dir) = fixture_store(&[first, second], false).await;
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            let staged = dir.join("replacement");
+            fs::create_dir_all(&staged).unwrap();
+            // The fixture writer uses last-wins UUID locators, so give it
+            // oldest-first rows. Production streaming uses newest-first and
+            // first-wins locators; both must select the same authoritative row.
+            let records: Vec<_> = snapshot
+                .iter()
+                .rev()
+                .map(|(record, _)| record.clone())
+                .collect();
+            let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &staged, &records,
+            )
+            .unwrap();
+            let publisher = store.clone();
+            let destination = dir.join("transactions.ndjson");
+            tokio::task::spawn_blocking(move || {
+                publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                    crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let session = Uuid::new_v4();
+            let older_token = token(&store, session, 1).await;
+            let newer_token = token(&store, session, 2).await;
+            let older = store
+                .service_map_html_generators(session, &older_token)
+                .await;
+            let newer = store
+                .service_map_html_generators(session, &newer_token)
+                .await;
+            assert_eq!(older.observations[0].product_id, "wordpress");
+            assert_eq!(newer.observations[0].product_id, "drupal");
+            let inner = store.inner.read().await;
+            assert!(!inner.entries[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            assert!(inner.entries[1]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            drop(inner);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_invalid_session_generation_and_revision_tokens() {
+            let record = body_record(
+                "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                1,
+            );
+            let (store, dir) = fixture_store(&[record.clone()], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, "bad")
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            assert_eq!(
+                store
+                    .service_map_html_generators(Uuid::new_v4(), &id)
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            let replacement = TransactionStore::from_records(vec![record.clone()]);
+            assert_eq!(
+                replacement
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            store
+                .update_record(record.id, |r| {
+                    r.response.as_mut().unwrap().body_preview =
+                        "https://changed.example.com/ ".into()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["record_changed"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_fails_closed_for_oversized_wrong_missing_and_malformed_disk_rows(
+        ) {
+            for case in [
+                "oversized",
+                "wrong_locator",
+                "missing_file",
+                "malformed_json",
+                "malformed_utf8",
+                "wrong_sequence",
+                "missing_preview",
+            ] {
+                let first = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    1,
+                );
+                let second = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    2,
+                );
+                let (store, dir) = fixture_store(&[first.clone(), second.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let expected = match case {
+                    "oversized" => {
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: u64::MAX,
+                                    len: (MAX_SERIALIZED_ROW_BYTES + 1) as u32,
+                                },
+                            )
+                            .await;
+                        "serialized_row_limit"
+                    }
+                    "wrong_locator" => {
+                        let locator = store.inner.read().await.locators[&second.id];
+                        store.set_body_locator_for_test(first.id, locator).await;
+                        "body_identity_unverifiable"
+                    }
+                    "missing_file" => {
+                        fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                        "body_storage_unavailable"
+                    }
+                    case => {
+                        let mut value = serde_json::to_value(&first).unwrap();
+                        let bytes = match case {
+                            "malformed_json" => b"{not json}".to_vec(),
+                            "malformed_utf8" => {
+                                // Put invalid UTF-8 in an ignored request field:
+                                // malformed bytes must not bypass the projection.
+                                let mut bytes = serde_json::to_vec(&first).unwrap();
+                                let needle = b"\"body_preview\":\"\"";
+                                let start = bytes
+                                    .windows(needle.len())
+                                    .position(|part| part == needle)
+                                    .unwrap();
+                                bytes.insert(start + needle.len() - 1, 0xff);
+                                bytes
+                            }
+                            "wrong_sequence" => {
+                                value["sequence"] = 0.into();
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            "missing_preview" => {
+                                value["response"]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("body_preview");
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            _ => unreachable!(),
+                        };
+                        fs::write(dir.join("transactions.ndjson"), &bytes).unwrap();
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: 0,
+                                    len: bytes.len() as u32,
+                                },
+                            )
+                            .await;
+                        match case {
+                            "wrong_sequence" => "body_identity_unverifiable",
+                            "missing_preview" => "retained_preview_unavailable",
+                            _ => "malformed_retained_row",
+                        }
+                    }
+                };
+                let result = store.service_map_html_generators(session, &id).await;
+                assert!(!result.available, "{case}");
+                assert!(result.observations.is_empty(), "{case}");
+                assert_eq!(result.reasons, [expected], "{case}");
+                // The normal map and metadata evidence remain independent of
+                // body storage, including missing/corrupt files and bad locators.
+                assert_eq!(store.service_map_snapshot(session, 10).await.rows.len(), 2);
+                assert!(store.service_map_evidence(session, &id).await.available);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_unresolved_and_nonresident_older_duplicate() {
+            let first = body_record(
+                "<html><head><meta name='generator' content='WordPress 6.8.1'></head>",
+                1,
+            );
+            let mut second = body_record(
+                "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                2,
+            );
+            second.id = first.id;
+            // A legacy-loaded older duplicate has no authoritative locator.
+            let (store, dir) = fixture_store(&[first, second], true).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["retained_preview_unavailable"]
+            );
+            let key = EvidenceKey::parse(&id).unwrap();
+            store
+                .inner
+                .write()
+                .await
+                .unresolved_body_generations
+                .insert(key.revision);
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["body_identity_unverifiable"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_resident_and_lazy_reject_deletion_retention_and_mutation_races(
+        ) {
+            for lazy in [false, true] {
+                for mutation in ["delete", "retention", "body"] {
+                    let first = body_record(
+                        "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                        1,
+                    );
+                    let (store, dir) = fixture_store(&[first.clone()], lazy).await;
+                    let session = Uuid::new_v4();
+                    let id = token(&store, session, 1).await;
+                    let (hook, started, release) = barrier("after_scan");
+                    let reading = paused_html_read(store.clone(), session, id, hook);
+                    tokio::time::timeout(WaitDuration::from_secs(10), started)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // If the reader held the store lock during file/scan work,
+                    // these real mutations would deadlock at this barrier.
+                    let expected = match mutation {
+                        "delete" => {
+                            assert_eq!(store.delete_ids(&[first.id]).await.unwrap(), 1);
+                            "record_missing"
+                        }
+                        "retention" => {
+                            assert_eq!(
+                                store
+                                    .trim_retention(0, &HashSet::new(), 10)
+                                    .await
+                                    .unwrap()
+                                    .deleted_ids,
+                                [first.id]
+                            );
+                            "record_missing"
+                        }
+                        _ => {
+                            store
+                                .update_record(first.id, |r| {
+                                    r.response.as_mut().unwrap().body_preview =
+                                        "https://after.example.com/ ".into()
+                                })
+                                .await
+                                .unwrap();
+                            "record_changed"
+                        }
+                    };
+                    release.send(()).unwrap();
+                    let result = reading.await.unwrap();
+                    assert!(!result.available, "{lazy} {mutation}");
+                    assert_eq!(result.reasons, [expected], "{lazy} {mutation}");
+                    drop(store);
+                    fs::remove_dir_all(dir).unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_annotations_keep_evidence_valid_during_scan() {
+            for lazy in [false, true] {
+                let record = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    1,
+                );
+                let (store, dir) = fixture_store(&[record.clone()], lazy).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier("after_scan");
+                let reading = paused_html_read(store.clone(), session, id, hook);
+                started.await.unwrap();
+                store
+                    .update_annotations(record.id, None, Some(Some("note".into())))
+                    .await
+                    .unwrap();
+                release.send(()).unwrap();
+                assert!(reading.await.unwrap().complete);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_atomic_publication_before_and_after_disk_scan() {
+            for stage in ["after_open", "after_scan"] {
+                let record = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    1,
+                );
+                let (store, dir) = fixture_store(&[record.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+                let staged = dir.join("replacement");
+                fs::create_dir_all(&staged).unwrap();
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &staged,
+                    &[record],
+                )
+                .unwrap();
+                let (hook, started, release) = barrier(stage);
+                let reading = paused_html_read(store.clone(), session, id.clone(), hook);
+                started.await.unwrap();
+                let publisher = store.clone();
+                let destination = dir.join("transactions.ndjson");
+                tokio::task::spawn_blocking(move || {
+                    publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                        crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert_eq!(result.reasons, ["body_identity_unverifiable"], "{stage}");
+                assert!(result.observations.is_empty());
+                // A fresh explicit read uses the adopted locator/file generation.
+                assert!(
+                    store
+                        .service_map_html_generators(session, &id)
+                        .await
+                        .complete
+                );
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_base64_from_invalid_utf8_capture() {
+            let mut record = body_record("", 1);
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/html"),
+            );
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                &[0xff, 0xfe, 0xfd],
+                100,
+            ));
+            assert_eq!(
+                record.response.as_ref().unwrap().body_encoding,
+                BodyEncoding::Base64
+            );
+            let (store, dir) = fixture_store(&[record], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store.service_map_html_generators(session, &id).await;
             assert_eq!(result.status, "unsupported");
             assert_eq!(result.reasons, ["unsupported_body_encoding"]);
             assert!(!result.available);

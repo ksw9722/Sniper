@@ -133,6 +133,32 @@ pub(crate) struct BodySource {
 
 impl BodySource {
     pub(crate) fn from_record(record: &TransactionRecord) -> Result<Self, &'static str> {
+        Self::from_record_for_types(
+            record,
+            &[
+                "text/html",
+                "application/xhtml+xml",
+                "application/javascript",
+                "text/javascript",
+                "application/ecmascript",
+                "text/ecmascript",
+                "application/x-javascript",
+            ],
+        )
+    }
+
+    pub(crate) fn from_html_record(record: &TransactionRecord) -> Result<Self, &'static str> {
+        Self::from_record_for_types(record, &["text/html"])
+    }
+
+    pub(crate) fn capture_preview_truncated(&self) -> bool {
+        self.capture_preview_truncated
+    }
+
+    fn from_record_for_types(
+        record: &TransactionRecord,
+        content_types: &[&str],
+    ) -> Result<Self, &'static str> {
         let response = record.response.as_ref().ok_or("response_unavailable")?;
         // An encoding hidden beyond the metadata cap must not be assumed absent.
         let mut header_bytes = 0usize;
@@ -159,17 +185,9 @@ impl BodySource {
         }
         let mime = content_type.split(';').next().unwrap_or("").trim();
         if mime.len() > 128
-            || ![
-                "text/html",
-                "application/xhtml+xml",
-                "application/javascript",
-                "text/javascript",
-                "application/ecmascript",
-                "text/ecmascript",
-                "application/x-javascript",
-            ]
-            .iter()
-            .any(|supported| mime.eq_ignore_ascii_case(supported))
+            || !content_types
+                .iter()
+                .any(|supported| mime.eq_ignore_ascii_case(supported))
         {
             return Err("unsupported_content_type");
         }
@@ -199,7 +217,7 @@ impl BodySource {
         })
     }
 
-    fn expected_preview_bytes(&self) -> Option<usize> {
+    pub(crate) fn expected_preview_bytes(&self) -> Option<usize> {
         if self.content_decoded {
             self.decoded_body_size
         } else {
@@ -207,7 +225,7 @@ impl BodySource {
         }
     }
 
-    fn proves_empty(&self) -> bool {
+    pub(crate) fn proves_empty(&self) -> bool {
         self.expected_preview_bytes() == Some(0)
             && self.decoded_body_size.is_none_or(|size| size == 0)
             && !self.capture_preview_truncated
@@ -221,6 +239,14 @@ pub(crate) struct RetainedPreview {
 }
 
 impl RetainedPreview {
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
     pub(crate) fn from_str(value: &str) -> Self {
         let mut end = value.len().min(MAX_SCAN_BYTES);
         while !value.is_char_boundary(end) {

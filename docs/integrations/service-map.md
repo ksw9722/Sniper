@@ -92,7 +92,7 @@ sniper-cli call target.service_map.get --input '{"session_id":"00000000-0000-000
 
 The UUID in the JSON example is synthetic. Select a real session deliberately
 from session discovery. `target` remains an alias for the `scope` command group.
-All three Service Map operations have `side_effect: "read"` and need no `--yes`.
+All four Service Map operations have `side_effect: "read"` and need no `--yes`.
 `--dry-run` describes the local API request without contacting it.
 
 `session_id` is optional for the map: omission or null resolves the active session
@@ -422,6 +422,121 @@ Reasons name each applicable cap or unsupported/unavailable state. No automatic
 larger read follows a partial result. Even `complete: true` describes only this
 supported literal grammar within one retained preview, never all runtime calls.
 
+## Explicit retained HTML generator declarations
+
+**Inspect retained HTML generators** is a separate explicit inspection of one
+verified exact response in the active session. Selecting evidence, opening or
+polling the map, refreshing metadata, zooming, and opening a disclosure never
+read response bodies. This action does not enrich map cards, header observations,
+the API inventory, or the URL-reference overlay. Inspecting URL references and
+HTML generators requires two separate explicit bounded reads.
+
+```bash
+sniper-cli schema input target.service_map.html_generators.get
+sniper-cli schema output target.service_map.html_generators.get
+sniper-cli scope service-map html-generators --session-id <active-session-uuid> --evidence-id <opaque-token>
+sniper-cli call target.service_map.html_generators.get --input '{"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"<opaque-token>"}'
+```
+
+Both selection fields are required. The `target` command alias also works.
+This read operation needs no `--yes`; `--dry-run` makes no request. An older
+server without the endpoint is unsupported; there is no fallback fetch or retry.
+The generator catalog is independently fixed at revision 1 and does not use the
+header-technology catalog negotiation header.
+
+Only already-retained UTF-8 `text/html` previews are eligible. XHTML, JavaScript,
+base64/binary previews, and undecoded non-identity content encodings are refused.
+No response is fetched, decoded, replayed, evaluated, or persisted by this action.
+The reader copies only bounded metadata and a bounded resident prefix under the
+store lock. Lazy rows use a bounded serialized-row read outside that lock,
+without hydrating the full transaction. Sequence, UUID, row revision, file
+locator/generation, and active-session identity are rechecked before results can
+be published. An inactive session is rejected without loading its saved context
+or starting its worker. Retention, deletion, mutation, or source replacement
+invalidates the result. Existing body-reference behavior and output are unchanged.
+
+This is a deliberately incomplete literal recognizer, not a general HTML parser.
+It requires explicit `html` and `head` elements and quoted literal `name` and
+`content` values on `meta` declarations. Matching is ASCII case-insensitive.
+Only complete WordPress and Drupal product names are returned, as `wordpress` /
+`WordPress` or `drupal` / `Drupal`, with `catalog_category: "cms"`. A whole
+reported version may follow 1–32 original HTML ASCII whitespace bytes. The
+version must contain only nonempty dot-separated ASCII numeric components and
+be at most 32 bytes. Unsupported suffixes retain the recognized product with
+`version_status: "unsupported_format"`, `reported_version: null`, and
+`version_span: null`; no numeric prefix or rejected text is returned. Bare
+products have `not_reported`; accepted versions have `reported`.
+
+Unrelated quoted attributes and Boolean attributes remain opaque. Supported
+comments and literal title/style/script raw text are skipped safely, without
+searching their text for generator tags. There is no entity decoding or HTML
+error recovery. Entities in semantic generator fields, malformed tags, duplicate
+attributes, unsupported script escapes, templates, foreign content, and ambiguous
+contexts stop partial inspection. Unknown products are counted only among
+actually inspected quoted generator declarations; their text is never returned.
+
+### Generator result contract
+
+Every result includes `schema_version: 1`, `generator_catalog_version: 1`, the
+requested `session_id` and `evidence_id`, `available`, `status`, `complete`, and
+fixed-code `reasons`. `status` is `scanned`, `unsupported`, or `unavailable`.
+Accepted partial inspections remain `available: true`, `status: "scanned"`,
+`complete: false`. Unsupported and unavailable results return no observations,
+clear counters/flags, and explicitly null source metadata. Never interpret a
+partial or unsupported result as “generator not found.”
+
+Available results contain `source_origin`, decimal-string `source_sequence`,
+`source_started_at`, and `retained_preview_bytes`. `scan_prefix_bytes` is the
+bounded prefix offered to the recognizer, **not** a claim every byte was parsed.
+`capture_preview_truncated` and `scan_prefix_truncated` are independent. When a
+bounded retained prefix ends while parsing, the adapter reports `input_limit`;
+when only capture is truncated, its stop remains `end_of_preview`, alongside
+the capture-truncation reason. `head_closed` means the supported explicit head
+closed. It may remain true with `parser_stop: null` when an unparsed trailing
+body was truncated; `complete` is still false for any capture or prefix limit.
+Parser, tag, attribute, candidate, or observation limits also make it false.
+Even true completeness covers only this supported head grammar, never all
+possible generators or runtime products.
+
+`coverage` is always `literal_html_generator_explicit_head`. A stopped parser
+returns `parser_stop: {reason, byte_cursor}`. The cursor is a raw-byte position
+that may fall inside a UTF-8 character at a byte cap and must never be used to
+slice text. Accepted `tag_span`, `content_span`, `product_span`, and nullable
+`version_span` are half-open, character-boundary-safe byte ranges in the original
+retained UTF-8 preview. Both envelope and observations use
+`offset_basis: "retained_utf8_preview"`; these are not wire-body offsets.
+
+Each observation has the product/name/category, nullable `reported_version`,
+`version_status`, `source: "response_html_meta_generator"`,
+`strength: "literal_declaration"`, spans, offset basis, and a fixed rule ID:
+`html_meta_generator.wordpress.v1` or `html_meta_generator.drupal.v1`.
+There are no raw tags, body snippets, unknown product names, or rejected version
+strings. Declarations can be spoofed or stale; they do not establish an installed
+version, backend stack, infrastructure role, ownership, or vulnerability.
+
+`tag_candidates_inspected` counts encountered start/end tags and doctype, not
+comments or raw-text decoys. `additional_tag_candidate_encountered` becomes true
+only when an actual next candidate exceeds the cap.
+`additional_observation_encountered` becomes true only for an actual ninth
+recognized supported declaration. No uninspected omission count is guessed.
+`unknown_product_declarations` is an exact count within the inspected prefix only.
+
+The fixed `limits` object contains:
+
+- `scan_bytes`: 262144 retained UTF-8 bytes, ending on a character boundary
+- `serialized_row_bytes`: 2097152 bytes for one disk-backed serialized row
+- `tag_candidates`: 4096
+- `tag_bytes`: 4096
+- `attributes`: 32 per tag
+- `observations`: 8 per inspection
+- `version_bytes`: 32
+- `version_separator_bytes`: 32
+
+The independent UI result has no Show-on-map action. It is cleared when its exact
+source/session or retained history is invalidated and is never saved in workspace
+state. An unchanged valid metadata poll may preserve it; delayed responses cannot
+restore stale evidence. No larger inspection runs automatically after a limit.
+
 ## Temporary body-reference overlay (GUI only)
 
 After **View source** has verified one exact retained row, use **Inspect retained
@@ -494,6 +609,7 @@ for you.
 - `GET /api/target/service-map?session_id=<uuid>&in_scope_only=false&max_records=10000`
 - `GET /api/target/service-map/evidence?session_id=<uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/body-references?session_id=<active-uuid>&evidence_id=<opaque-token>`
+- `GET /api/target/service-map/html-generators?session_id=<active-uuid>&evidence_id=<opaque-token>`
 
 ### Technology catalog negotiation
 

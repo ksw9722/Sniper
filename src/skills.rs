@@ -267,6 +267,40 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn packaged_service_map_guidance_keeps_html_inspection_explicit() {
+        let section = |template: &str| {
+            template
+                .split_once("## Passive Service Map")
+                .unwrap()
+                .1
+                .split_once("## Saved data and session management")
+                .unwrap()
+                .0
+                .lines()
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let guidance = section(super::CODEX_SKILL_TEMPLATE);
+        assert_eq!(guidance, section(super::CLAUDE_SKILL_TEMPLATE));
+        for term in [
+            "scope service-map html-generators",
+            "target.service_map.html_generators.get",
+            "same exact-row and active-session restrictions apply",
+            "separate\nbounded retained-preview read",
+            "never retry with body\nhydration",
+            "`scan_prefix_bytes`",
+            "`head_closed`",
+            "reported\ngenerator claims",
+            "There is no map\naggregation, automatic body scan, or persistence",
+        ] {
+            assert!(
+                guidance.contains(term),
+                "missing passive HTML guidance: {term}"
+            );
+        }
+    }
+
     fn saved_data_guidance(template: &str) -> String {
         let mut lines = template.lines();
         assert!(
