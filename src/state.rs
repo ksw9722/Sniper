@@ -130,6 +130,10 @@ pub struct AppState {
     pub ws_replay: Arc<WsReplayStore>,
     /// Stable owner token for runtime-state writes from this app process.
     pub runtime_instance_id: uuid::Uuid,
+    /// Session-keyed so an uncertain read-only workspace commit remains gated
+    /// when that context is promoted to a writable one.
+    workspace_retention_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
+    retention_persistence_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,7 +191,8 @@ impl AppState {
         let active_proxy_addr = config.proxy_addr;
         let active_ui_addr = config.ui_addr;
         let runtime_instance_id = uuid::Uuid::new_v4();
-        Ok(Self {
+        let initial_session = active_session.clone();
+        let state = Self {
             config,
             certificates,
             startup,
@@ -211,7 +216,11 @@ impl AppState {
             read_only_session_contexts: Arc::new(AsyncMutex::new(HashMap::new())),
             ws_replay: Arc::new(WsReplayStore::new()),
             runtime_instance_id,
-        })
+            workspace_retention_uncertain: Arc::new(Default::default()),
+            retention_persistence_uncertain: Arc::new(Default::default()),
+        };
+        state.start_history_retention_worker(&initial_session);
+        Ok(state)
     }
 
     pub fn set_proxy_online(&self, online: bool) {
@@ -271,7 +280,71 @@ impl AppState {
     }
 
     pub async fn session(&self) -> Arc<SessionContext> {
-        self.active_session.read().await.clone()
+        let session = self.active_session.read().await.clone();
+        self.start_history_retention_worker(&session);
+        session
+    }
+
+    pub(crate) fn start_history_retention_worker(&self, session: &Arc<SessionContext>) {
+        crate::history_retention::start_worker(
+            session,
+            crate::history_retention::RetentionEnvironment {
+                sessions: Arc::downgrade(&self.sessions),
+                active: Arc::downgrade(&self.active_session),
+                contexts: Arc::downgrade(&self.session_contexts),
+                operations: Arc::downgrade(&self.session_operation_locks),
+                workspace_uncertain: Arc::downgrade(&self.workspace_retention_uncertain),
+                persistence_uncertain: Arc::downgrade(&self.retention_persistence_uncertain),
+            },
+        );
+    }
+
+    pub(crate) fn retention_persistence_is_uncertain(&self, id: uuid::Uuid) -> bool {
+        self.retention_persistence_uncertain
+            .lock()
+            .unwrap()
+            .contains(&id)
+    }
+
+    pub(crate) fn mark_retention_policy_durability(
+        &self,
+        session: &Arc<SessionContext>,
+        durable: bool,
+    ) {
+        let mut gate = self.retention_persistence_uncertain.lock().unwrap();
+        if durable {
+            gate.remove(&session.id());
+        } else {
+            gate.insert(session.id());
+        }
+        session
+            .history_retention
+            .persistence_error
+            .store(!durable, Ordering::Release);
+        drop(gate);
+        session.store.notify_retention_work();
+    }
+
+    pub(crate) fn workspace_retention_is_uncertain(&self, id: uuid::Uuid) -> bool {
+        self.workspace_retention_uncertain
+            .lock()
+            .unwrap()
+            .contains(&id)
+    }
+
+    pub(crate) fn mark_workspace_retention_durability(
+        &self,
+        session: &Arc<SessionContext>,
+        durable: bool,
+    ) {
+        let mut gate = self.workspace_retention_uncertain.lock().unwrap();
+        if durable {
+            gate.remove(&session.id());
+        } else {
+            gate.insert(session.id());
+        }
+        drop(gate);
+        session.store.notify_retention_work();
     }
 
     pub(crate) async fn session_with_proxy_owner(
@@ -406,6 +479,7 @@ impl AppState {
         }
         let session = self.sessions.load_context(id)?;
         contexts.insert(id, session.clone());
+        self.start_history_retention_worker(&session);
         Ok(session)
     }
 
@@ -726,6 +800,7 @@ impl AppState {
                             }
                             *active_session = session.clone();
                         }
+                        state.start_history_retention_worker(&session);
                         SessionActivationOutcome::Replaced {
                             summary: session
                                 .summary(commit.metadata.id == state.sessions.active_session_id()),
@@ -828,8 +903,20 @@ impl AppState {
                     .await
                     .context("session delete writer panicked")??;
             state.ws_replay.remove_session(id).await;
-            state.session_contexts.lock().await.remove(&id);
+            if let Some(removed) = state.session_contexts.lock().await.remove(&id) {
+                removed.store.notify_retention_work();
+            }
             state.read_only_session_contexts.lock().await.remove(&id);
+            state
+                .workspace_retention_uncertain
+                .lock()
+                .unwrap()
+                .remove(&id);
+            state
+                .retention_persistence_uncertain
+                .lock()
+                .unwrap()
+                .remove(&id);
             state.remove_session_operation_lock(id).await;
             match commit.finalization_error {
                 Some(error) => Err(error),
@@ -983,11 +1070,13 @@ impl AppState {
                     crate::workspace::WorkspaceReplaceError::Persist(error.to_string())
                 }
                 crate::workspace::WorkspaceReplaceError::CommittedButUncertain(error) => {
+                    self.mark_workspace_retention_durability(session, false);
                     crate::workspace::WorkspaceReplaceError::CommittedButUncertain(
                         error.to_string(),
                     )
                 }
             })?;
+        self.mark_workspace_retention_durability(session, true);
         if let Some(metadata) = fallback_metadata {
             self.finalize_session_persist(session, metadata)
                 .map_err(|error| {

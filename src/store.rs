@@ -5,13 +5,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -254,7 +254,10 @@ pub struct TransactionStore {
     inner: Arc<RwLock<StoreInner>>,
     insert_lock: Arc<AsyncMutex<()>>,
     events: broadcast::Sender<TransactionEvent>,
-    retention_events: broadcast::Sender<()>,
+    retention_events: broadcast::Sender<TransactionRetentionEvent>,
+    in_progress: Arc<InProgressTransactions>,
+    retention_trim_sequence: AtomicU64,
+    retention_compacted_sequence: AtomicU64,
     journal_tx: Option<mpsc::Sender<TransactionJournalCommand>>,
     // Set only when startup proves no journal writer ever became ready.
     journal_start_failed: bool,
@@ -293,6 +296,89 @@ impl IntoIterator for TransactionPersistenceSnapshot {
     fn into_iter(self) -> Self::IntoIter {
         self.entries.into_iter()
     }
+}
+
+/// Metadata-only ownership of provisional records. The synchronous mutex is
+/// never held across an await, filesystem operation, or callback.
+#[derive(Default)]
+struct InProgressTransactions {
+    leases: Mutex<HashMap<Uuid, HashSet<Uuid>>>,
+    notify: Arc<Notify>,
+}
+
+impl InProgressTransactions {
+    fn register(self: &Arc<Self>, id: Uuid) -> InProgressTransactionGuard {
+        let token = Uuid::new_v4();
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(id)
+            .or_default()
+            .insert(token);
+        InProgressTransactionGuard {
+            registry: Arc::clone(self),
+            id,
+            token,
+        }
+    }
+
+    fn release(&self, id: Uuid, token: Uuid) {
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = leases
+            .get_mut(&id)
+            .is_some_and(|tokens| tokens.remove(&token) && tokens.is_empty());
+        if remove {
+            leases.remove(&id);
+        }
+        drop(leases);
+        if remove {
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// A single non-cloneable lease. Dropping it only releases its own token and
+/// wakes the cleanup worker; it never touches records or performs persistence.
+#[must_use = "hold this guard through the provisional record's final update"]
+pub struct InProgressTransactionGuard {
+    registry: Arc<InProgressTransactions>,
+    id: Uuid,
+    token: Uuid,
+}
+
+impl Drop for InProgressTransactionGuard {
+    fn drop(&mut self) {
+        self.registry.release(self.id, self.token);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransactionRetentionEvent {
+    /// Existing manual-delete and legacy-cap invalidation behavior.
+    Gap,
+    Deleted {
+        ids: Vec<Uuid>,
+        generation: Uuid,
+        event_sequence: u64,
+    },
+}
+
+pub(crate) struct RetentionStatusDetails {
+    pub total_count: usize,
+    pub protected_count: usize,
+    pub all_records_protected: bool,
+    pub identity_conflict: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionTrimOutcome {
+    pub deleted_ids: Vec<Uuid>,
+    pub current_count: usize,
+    pub protected_count: usize,
+    pub event_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -694,6 +780,9 @@ impl TransactionStore {
             insert_lock: Arc::new(AsyncMutex::new(())),
             events,
             retention_events,
+            in_progress: Arc::new(InProgressTransactions::default()),
+            retention_trim_sequence: AtomicU64::new(0),
+            retention_compacted_sequence: AtomicU64::new(0),
             journal_tx: None,
             journal_start_failed: false,
             storage_dir: None,
@@ -775,8 +864,23 @@ impl TransactionStore {
         store
     }
 
-    pub async fn insert(&self, mut record: TransactionRecord) -> TransactionInsertOutcome {
+    pub async fn insert(&self, record: TransactionRecord) -> TransactionInsertOutcome {
         let _insert_guard = self.insert_lock.lock().await;
+        self.insert_locked(record).await
+    }
+
+    /// Registers protection and inserts under the same mutation lock. If this
+    /// future is cancelled, its unreturned lease is released synchronously.
+    pub async fn insert_in_progress(
+        &self,
+        record: TransactionRecord,
+    ) -> (TransactionInsertOutcome, InProgressTransactionGuard) {
+        let _insert_guard = self.insert_lock.lock().await;
+        let guard = self.in_progress.register(record.id);
+        (self.insert_locked(record).await, guard)
+    }
+
+    async fn insert_locked(&self, mut record: TransactionRecord) -> TransactionInsertOutcome {
         record.sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let journal_fallback_required = match &self.journal_tx {
             Some(tx) => match encode_transaction_insert_journal_line(&record) {
@@ -825,8 +929,9 @@ impl TransactionStore {
         drop(inner);
         self.publish_transaction_event(summary);
         if retention_trimmed {
-            let _ = self.retention_events.send(());
+            let _ = self.retention_events.send(TransactionRetentionEvent::Gap);
         }
+        self.in_progress.notify.notify_one();
         TransactionInsertOutcome {
             journal_fallback_required,
         }
@@ -891,6 +996,14 @@ impl TransactionStore {
     }
 
     async fn delete_ids_locked(&self, ids: &[Uuid]) -> io::Result<usize> {
+        self.delete_ids_locked_with_event(ids, false).await
+    }
+
+    async fn delete_ids_locked_with_event(
+        &self,
+        ids: &[Uuid],
+        automatic_retention: bool,
+    ) -> io::Result<usize> {
         if ids.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -918,10 +1031,11 @@ impl TransactionStore {
                 "transaction journal writer is not available",
             )
         })?;
-        let line = encode_transaction_journal_line(&TransactionJournalEntry::Delete { ids })
-            .ok_or_else(|| {
-                io::Error::other("failed to encode transaction deletion journal entry")
-            })?;
+        let line =
+            encode_transaction_journal_line(&TransactionJournalEntry::Delete { ids: ids.clone() })
+                .ok_or_else(|| {
+                    io::Error::other("failed to encode transaction deletion journal entry")
+                })?;
         // InvalidInput is reserved for selection checks before an append. Even
         // that OS error can follow a written tombstone (for example at fsync),
         // so callers must treat every append/ack failure as uncertain persistence.
@@ -962,8 +1076,19 @@ impl TransactionStore {
             .map(|(index, record)| (record.id, index))
             .collect();
         drop(inner);
-        self.next_event_sequence.fetch_add(1, Ordering::Relaxed);
-        let _ = self.retention_events.send(());
+        let event_sequence = self.next_event_sequence.fetch_add(1, Ordering::Relaxed);
+        let event = if automatic_retention {
+            self.retention_trim_sequence
+                .fetch_max(event_sequence, Ordering::Release);
+            TransactionRetentionEvent::Deleted {
+                ids,
+                generation: self.saved_cursor_generation,
+                event_sequence,
+            }
+        } else {
+            TransactionRetentionEvent::Gap
+        };
+        let _ = self.retention_events.send(event);
         Ok(selected.len())
     }
 
@@ -1862,7 +1987,7 @@ impl TransactionStore {
         self.events.subscribe()
     }
 
-    pub fn subscribe_retention(&self) -> broadcast::Receiver<()> {
+    pub fn subscribe_retention(&self) -> broadcast::Receiver<TransactionRetentionEvent> {
         self.retention_events.subscribe()
     }
 
@@ -1915,6 +2040,154 @@ impl TransactionStore {
         inner.locators = locators;
         inner.file_generation = next_file_generation;
         Ok(())
+    }
+
+    /// Single-worker notification with a retained permit. Register a waiter
+    /// before checking work so an insert or final lease release cannot be lost.
+    pub fn retention_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.in_progress.notify)
+    }
+
+    pub fn notify_retention_work(&self) {
+        self.in_progress.notify.notify_one();
+    }
+
+    fn protected_existing_ids(
+        &self,
+        inner: &StoreInner,
+        saved_source_ids: &HashSet<Uuid>,
+    ) -> HashSet<Uuid> {
+        let leases = self
+            .in_progress
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        saved_source_ids
+            .iter()
+            .chain(leases.keys())
+            .filter(|id| inner.by_id.contains_key(id))
+            .copied()
+            .collect()
+    }
+
+    /// Counts only metadata; dangling references and duplicate lease owners do
+    /// not inflate the number of protected existing UUIDs.
+    pub async fn retention_status(&self, saved_source_ids: &HashSet<Uuid>) -> (usize, usize) {
+        let _mutation_guard = self.insert_lock.lock().await;
+        let inner = self.inner.read().await;
+        (
+            inner.entries.len(),
+            self.protected_existing_ids(&inner, saved_source_ids).len(),
+        )
+    }
+
+    /// UUID tombstones are indivisible. Distinguish protected records from a
+    /// malformed duplicate-ID group whose removal would overshoot the target.
+    pub(crate) async fn retention_status_details(
+        &self,
+        saved_source_ids: &HashSet<Uuid>,
+        target: Option<usize>,
+    ) -> RetentionStatusDetails {
+        let _mutation_guard = self.insert_lock.lock().await;
+        let inner = self.inner.read().await;
+        let protected = self.protected_existing_ids(&inner, saved_source_ids);
+        let all_records_protected = inner.by_id.keys().all(|id| protected.contains(id));
+        let excess = target.map_or(0, |target| inner.entries.len().saturating_sub(target));
+        let identity_conflict =
+            if excess == 0 || all_records_protected || inner.by_id.len() == inner.entries.len() {
+                false
+            } else {
+                let mut counts = HashMap::<Uuid, usize>::new();
+                for record in &inner.entries {
+                    if !protected.contains(&record.id) {
+                        *counts.entry(record.id).or_default() += 1;
+                    }
+                }
+                !counts.values().any(|count| *count <= excess)
+            };
+        RetentionStatusDetails {
+            total_count: inner.entries.len(),
+            protected_count: protected.len(),
+            all_records_protected,
+            identity_conflict,
+        }
+    }
+
+    /// Durably removes one bounded chunk of oldest eligible excess records.
+    /// Saved-source protection must be stabilized by the caller's workspace
+    /// mutation guard. Provisional insertion and tombstone selection are atomic
+    /// with respect to each other under the store mutation lock.
+    pub async fn trim_retention(
+        &self,
+        max_entries: usize,
+        saved_source_ids: &HashSet<Uuid>,
+        chunk_size: usize,
+    ) -> io::Result<RetentionTrimOutcome> {
+        const MAX_TOMBSTONE_IDS: usize = 1024;
+        let _mutation_guard = self.insert_lock.lock().await;
+        let ids = {
+            let inner = self.inner.read().await;
+            let protected = self.protected_existing_ids(&inner, saved_source_ids);
+            let mut remaining = inner.entries.len().saturating_sub(max_entries);
+            let limit = chunk_size.min(MAX_TOMBSTONE_IDS);
+            let mut ids = Vec::new();
+            let mut seen = HashSet::new();
+            // Preserve existing insertion/UUID behavior. A UUID tombstone can
+            // cover multiple rows; never remove more rows than the excess.
+            let occurrences = if inner.by_id.len() == inner.entries.len() {
+                None
+            } else {
+                let mut counts = HashMap::<Uuid, usize>::new();
+                for record in &inner.entries {
+                    *counts.entry(record.id).or_default() += 1;
+                }
+                Some(counts)
+            };
+            for record in &inner.entries {
+                if remaining == 0 || ids.len() == limit {
+                    break;
+                }
+                if protected.contains(&record.id) || !seen.insert(record.id) {
+                    continue;
+                }
+                let count = occurrences.as_ref().map_or(1, |counts| counts[&record.id]);
+                if count <= remaining {
+                    ids.push(record.id);
+                    remaining -= count;
+                }
+            }
+            ids
+        };
+        if !ids.is_empty() {
+            self.delete_ids_locked_with_event(&ids, true).await?;
+        }
+        let inner = self.inner.read().await;
+        Ok(RetentionTrimOutcome {
+            deleted_ids: ids,
+            current_count: inner.entries.len(),
+            protected_count: self.protected_existing_ids(&inner, saved_source_ids).len(),
+            event_sequence: self.latest_event_sequence(),
+        })
+    }
+
+    /// Restores pending work when journal replay was applied but compaction
+    /// could not finish. The boundary is the replayed mutation event sequence.
+    pub fn mark_retention_compaction_pending(&self, event_sequence: u64) {
+        self.retention_trim_sequence
+            .fetch_max(event_sequence, Ordering::Release);
+    }
+
+    pub fn retention_compaction_pending(&self) -> bool {
+        self.retention_trim_sequence.load(Ordering::Acquire)
+            > self.retention_compacted_sequence.load(Ordering::Acquire)
+    }
+
+    /// Called inside the owned snapshot worker after confirmed journal rotation,
+    /// body/state publication, and checkpoint cleanup, using the captured boundary.
+    /// A later trim remains pending even when an older snapshot finishes last.
+    pub(crate) fn mark_retention_compacted(&self, event_sequence: u64) {
+        self.retention_compacted_sequence
+            .fetch_max(event_sequence, Ordering::Release);
     }
 
     // Synthetic fixtures may install a file written outside the production
@@ -3003,6 +3276,418 @@ pub(crate) mod tests {
             None,
             None,
         )
+    }
+
+    mod retention_tests {
+        use super::*;
+        use futures_util::{poll, FutureExt};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        fn records(count: usize) -> Vec<TransactionRecord> {
+            (0..count)
+                .map(|index| {
+                    let mut record = test_record("example.com");
+                    record.path = format!("/{index}");
+                    record.sequence = index as u64 + 1;
+                    record
+                })
+                .collect()
+        }
+
+        fn journal_store(records: Vec<TransactionRecord>) -> (TransactionStore, PathBuf) {
+            let path =
+                std::env::temp_dir().join(format!("sniper-retention-store-{}", Uuid::new_v4()));
+            let store = TransactionStore::from_records_with_journal(
+                records.into_iter().rev().collect(),
+                path.join("transactions.journal"),
+                None,
+            );
+            (store, path)
+        }
+
+        #[tokio::test]
+        async fn retention_oldest_eligible_holes_deduplicated_protection_and_target() {
+            let records = records(7);
+            let ids: Vec<_> = records.iter().map(|record| record.id).collect();
+            let (store, path) = journal_store(records);
+            let lease = store.in_progress.register(ids[2]);
+            let saved = HashSet::from([ids[0], ids[2], ids[5], Uuid::new_v4()]);
+            assert_eq!(store.retention_status(&saved).await, (7, 3));
+            let outcome = store.trim_retention(4, &saved, 10).await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![ids[1], ids[3], ids[4]]);
+            assert_eq!((outcome.current_count, outcome.protected_count), (4, 3));
+            assert!(store.get(ids[6]).await.is_some());
+            let outcome = store.trim_retention(1, &saved, 10).await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![ids[6]]);
+            assert_eq!((outcome.current_count, outcome.protected_count), (3, 3));
+            let outcome = store.trim_retention(1, &saved, 10).await.unwrap();
+            assert!(outcome.deleted_ids.is_empty());
+            drop(lease);
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_chunks_and_zero_work_do_not_append_or_publish() {
+            let (store, path) = journal_store(records(6));
+            let mut events = store.subscribe_retention();
+            let initial_sequence = store.latest_event_sequence();
+            let no_work = store.trim_retention(6, &HashSet::new(), 2).await.unwrap();
+            assert!(no_work.deleted_ids.is_empty());
+            assert_eq!(no_work.event_sequence, initial_sequence);
+            assert!(!store.retention_compaction_pending());
+            let zero_chunk = store.trim_retention(1, &HashSet::new(), 0).await.unwrap();
+            assert!(zero_chunk.deleted_ids.is_empty());
+            assert!(events.try_recv().is_err());
+            assert_eq!(
+                fs::metadata(path.join("transactions.journal"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            let first = store.trim_retention(1, &HashSet::new(), 2).await.unwrap();
+            assert_eq!(first.deleted_ids.len(), 2);
+            assert_eq!(first.current_count, 4);
+            assert_eq!(first.event_sequence, initial_sequence + 1);
+            let second = store.trim_retention(1, &HashSet::new(), 2).await.unwrap();
+            assert_eq!(second.deleted_ids.len(), 2);
+            assert_eq!(second.current_count, 2);
+            store.mark_retention_compacted(first.event_sequence);
+            assert!(store.retention_compaction_pending());
+            store.mark_retention_compacted(second.event_sequence);
+            assert!(!store.retention_compaction_pending());
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_tombstone_ids_are_hard_bounded() {
+            let (store, path) = journal_store(records(1030));
+            let outcome = store
+                .trim_retention(1, &HashSet::new(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(outcome.deleted_ids.len(), 1024);
+            assert_eq!(outcome.current_count, 6);
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_duplicate_leases_release_only_owned_token_and_notify_last() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let store = TransactionStore::from_records(vec![record]);
+            let first = store.in_progress.register(id);
+            let second = store.in_progress.register(id);
+            let first_token = first.token;
+            let notify = store.retention_notify();
+            drop(second);
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 1));
+            assert!(notify.notified().now_or_never().is_none());
+            store.in_progress.release(id, Uuid::new_v4());
+            assert_eq!(store.retention_status(&HashSet::from([id])).await, (1, 1));
+            drop(first);
+            assert!(notify.notified().now_or_never().is_some());
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 0));
+            store.in_progress.release(id, first_token);
+            store.in_progress.release(Uuid::new_v4(), first_token);
+            assert!(notify.notified().now_or_never().is_none());
+        }
+
+        #[tokio::test]
+        async fn retention_in_progress_insert_and_cleanup_are_atomic() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let mut store = TransactionStore::new();
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let mut insertion = Box::pin(store.insert_in_progress(record));
+            assert!(poll!(&mut insertion).is_pending());
+            let TransactionJournalCommand::Append { ack: Some(ack), .. } = rx.try_recv().unwrap()
+            else {
+                panic!("expected provisional append");
+            };
+            let saved = HashSet::new();
+            let mut cleanup = Box::pin(store.trim_retention(0, &saved, 10));
+            assert!(poll!(&mut cleanup).is_pending());
+            assert_eq!(store.len().await, 0);
+            ack.send(Ok(())).unwrap();
+            let (outcome, guard) = insertion.await;
+            assert!(!outcome.immediate_snapshot_required());
+            let cleanup = cleanup.await.unwrap();
+            assert!(cleanup.deleted_ids.is_empty());
+            assert_eq!((cleanup.current_count, cleanup.protected_count), (1, 1));
+            assert_eq!(store.get(id).await.unwrap().id, id);
+            assert!(rx.try_recv().is_err());
+            drop(guard);
+            assert_eq!(store.retention_status(&saved).await, (1, 0));
+        }
+
+        #[tokio::test]
+        async fn retention_cancelled_insertion_and_owner_panic_release_their_leases() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let mut store = TransactionStore::new();
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let mut insertion = Box::pin(store.insert_in_progress(record));
+            assert!(poll!(&mut insertion).is_pending());
+            let command = rx.try_recv().unwrap();
+            assert!(store.in_progress.leases.lock().unwrap().contains_key(&id));
+            drop(insertion);
+            drop(command);
+            assert!(store.in_progress.leases.lock().unwrap().is_empty());
+            assert_eq!(store.len().await, 0);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _guard = store.in_progress.register(id);
+                panic!("synthetic owner panic");
+            }));
+            assert!(result.is_err());
+            assert!(store.in_progress.leases.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn retention_insert_fallback_and_cancelled_owner_keep_then_release_protection() {
+            let store = Arc::new(TransactionStore::new());
+            let record = test_record("example.com");
+            let id = record.id;
+            let notify = store.retention_notify();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let owner = {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let (outcome, _guard) = store.insert_in_progress(record).await;
+                    assert!(outcome.immediate_snapshot_required());
+                    // Controlled stand-in for the completion/persistence scope.
+                    ready_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                })
+            };
+            ready_rx.await.unwrap();
+            assert!(notify.notified().now_or_never().is_some());
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 1));
+            assert!(store
+                .trim_retention(0, &HashSet::new(), 10)
+                .await
+                .unwrap()
+                .deleted_ids
+                .is_empty());
+            owner.abort();
+            assert!(owner.await.unwrap_err().is_cancelled());
+            assert!(notify.notified().now_or_never().is_some());
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 0));
+            assert!(store.get(id).await.is_some());
+        }
+
+        #[tokio::test]
+        async fn retention_manual_clear_and_absent_update_do_not_resurrect_on_drop() {
+            let (store, path) = journal_store(Vec::new());
+            let record = test_record("example.com");
+            let id = record.id;
+            let (_, guard) = store.insert_in_progress(record).await;
+            let mut events = store.subscribe_retention();
+            assert_eq!(store.delete_all().await.unwrap(), 1);
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                TransactionRetentionEvent::Gap
+            ));
+            assert!(store
+                .update_record_durable(id, |_| panic!("absent update called"))
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(store.retention_status(&HashSet::from([id])).await, (0, 0));
+            drop(guard);
+            assert_eq!(store.len().await, 0);
+            assert!(store.in_progress.leases.lock().unwrap().is_empty());
+            assert!(events.try_recv().is_err());
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_waits_for_durable_ack_before_memory_event_or_compaction_flag() {
+            let rows = records(2);
+            let first_id = rows[0].id;
+            let mut store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let mut events = store.subscribe_retention();
+            let sequence = store.latest_event_sequence();
+            let saved = HashSet::new();
+            let mut cleanup = Box::pin(store.trim_retention(1, &saved, 10));
+            assert!(poll!(&mut cleanup).is_pending());
+            let TransactionJournalCommand::Append {
+                line,
+                ack: Some(ack),
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected acknowledged tombstone");
+            };
+            let entry: TransactionJournalEntry = serde_json::from_slice(&line).unwrap();
+            assert!(
+                matches!(entry, TransactionJournalEntry::Delete { ids } if ids == vec![first_id])
+            );
+            assert_eq!(store.len().await, 2);
+            assert!(store.get(first_id).await.is_some());
+            assert_eq!(store.latest_event_sequence(), sequence);
+            assert!(!store.retention_compaction_pending());
+            assert!(events.try_recv().is_err());
+            ack.send(Ok(())).unwrap();
+            let outcome = cleanup.await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![first_id]);
+            assert_eq!(outcome.event_sequence, sequence + 1);
+            assert_eq!(outcome.current_count, 1);
+            assert!(store.retention_compaction_pending());
+            assert_eq!(
+                events.try_recv().unwrap(),
+                TransactionRetentionEvent::Deleted {
+                    ids: vec![first_id],
+                    generation: store.saved_cursor_generation(),
+                    event_sequence: sequence + 1,
+                }
+            );
+            assert!(events.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn retention_failed_or_lost_ack_keeps_memory_and_event_boundary() {
+            for lose_ack in [false, true] {
+                let rows = records(2);
+                let mut store = TransactionStore::from_records(rows.into_iter().rev().collect());
+                let (tx, rx) = mpsc::channel();
+                store.journal_tx = Some(tx);
+                let before = serde_json::to_value(store.snapshot(None).await).unwrap();
+                let sequence = store.latest_event_sequence();
+                let mut events = store.subscribe_retention();
+                let saved = HashSet::new();
+                let mut cleanup = Box::pin(store.trim_retention(1, &saved, 10));
+                assert!(poll!(&mut cleanup).is_pending());
+                let TransactionJournalCommand::Append { ack: Some(ack), .. } =
+                    rx.try_recv().unwrap()
+                else {
+                    panic!("expected acknowledged tombstone");
+                };
+                if lose_ack {
+                    drop(ack);
+                } else {
+                    ack.send(Err(io::Error::other("synthetic fsync failure")))
+                        .unwrap();
+                }
+                assert!(cleanup.await.is_err());
+                assert_eq!(
+                    serde_json::to_value(store.snapshot(None).await).unwrap(),
+                    before
+                );
+                assert_eq!(store.latest_event_sequence(), sequence);
+                assert!(!store.retention_compaction_pending());
+                assert!(events.try_recv().is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn retention_deletion_only_restart_preserves_survivor_bodies_after_ack_or_failure() {
+            for fail_ack in [false, true] {
+                let path = std::env::temp_dir()
+                    .join(format!("sniper-retention-restart-{}", Uuid::new_v4()));
+                let (registry, session) =
+                    crate::session::SessionRegistry::load_or_create(&path, 32, 32).unwrap();
+                session
+                    .scanner
+                    .update_config(crate::scanner::ScannerConfig {
+                        enabled: false,
+                        ..crate::scanner::ScannerConfig::default()
+                    })
+                    .await;
+                let mut rows = records(3);
+                for (index, record) in rows.iter_mut().enumerate() {
+                    record.request.body_preview = format!("synthetic body {index}");
+                    record.request.body_size = record.request.body_preview.len();
+                    session.store.insert(record.clone()).await;
+                }
+                session.persist().await.unwrap();
+                let journal_path = session.storage_dir().join("transactions.journal");
+                // The baseline is fully compacted before deletion. Restart
+                // replays only tombstones, never inserts or scanner recovery.
+                assert_eq!(fs::metadata(&journal_path).unwrap().len(), 0);
+                let protected_id = rows[0].id;
+                let survivor_body = rows[0].request.body_preview.clone();
+                drop(session);
+                drop(registry);
+                let mut store = TransactionStore::from_records(rows.into_iter().rev().collect());
+                let (tx, rx) = mpsc::channel();
+                store.journal_tx = Some(tx);
+                let saved = HashSet::from([protected_id]);
+                let mut cleanup = Box::pin(store.trim_retention(1, &saved, 10));
+                assert!(poll!(&mut cleanup).is_pending());
+                let TransactionJournalCommand::Append {
+                    line,
+                    ack: Some(ack),
+                } = rx.try_recv().unwrap()
+                else {
+                    panic!("expected acknowledged tombstone");
+                };
+                let mut journal = OpenOptions::new().append(true).open(&journal_path).unwrap();
+                journal.write_all(&line).unwrap();
+                journal.flush().unwrap();
+                journal.sync_all().unwrap();
+                drop(journal);
+                if fail_ack {
+                    ack.send(Err(io::Error::other("synthetic acknowledgement failure")))
+                        .unwrap();
+                    assert!(cleanup.await.is_err());
+                    assert_eq!(store.len().await, 3);
+                } else {
+                    ack.send(Ok(())).unwrap();
+                    assert_eq!(cleanup.await.unwrap().current_count, 1);
+                }
+                drop(store);
+                let (registry, reloaded) =
+                    crate::session::SessionRegistry::load_or_create(&path, 32, 32).unwrap();
+                assert!(!reloaded.scanner.get_config().await.enabled);
+                assert_eq!(reloaded.store.len().await, 1);
+                assert_eq!(
+                    reloaded
+                        .store
+                        .get(protected_id)
+                        .await
+                        .unwrap()
+                        .request
+                        .body_preview,
+                    survivor_body
+                );
+                assert_eq!(fs::metadata(&journal_path).unwrap().len(), 0);
+                drop(reloaded);
+                drop(registry);
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn retention_keeps_duplicate_uuid_insertion_semantics_and_counts_once() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let (store, path) = journal_store(Vec::new());
+            let (_, first) = store.insert_in_progress(record.clone()).await;
+            let (_, second) = store.insert_in_progress(record).await;
+            assert_eq!(store.len().await, 2);
+            assert_eq!(store.retention_status(&HashSet::from([id])).await, (2, 1));
+            drop(first);
+            assert_eq!(store.retention_status(&HashSet::new()).await, (2, 1));
+            assert!(store
+                .trim_retention(0, &HashSet::new(), 10)
+                .await
+                .unwrap()
+                .deleted_ids
+                .is_empty());
+            drop(second);
+            let outcome = store.trim_retention(0, &HashSet::new(), 10).await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![id]);
+            assert_eq!(outcome.current_count, 0);
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     fn history_header_record() -> TransactionRecord {
@@ -7289,5 +7974,80 @@ pub(crate) mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].host, "api.example.test:9443");
+    }
+}
+
+#[cfg(test)]
+mod retention_status_tests {
+    use super::*;
+
+    fn record() -> TransactionRecord {
+        TransactionRecord::http(
+            chrono::Utc::now(),
+            "GET".into(),
+            "https".into(),
+            "example.com".into(),
+            "/synthetic".into(),
+            Some(200),
+            1,
+            crate::model::MessageRecord::from_headers_and_body(
+                &http::HeaderMap::new(),
+                b"fixture",
+                1024,
+            ),
+            None,
+            vec![],
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn history_retention_duplicate_identity_and_protection_status_are_distinct() {
+        let record = record();
+        let id = record.id;
+        let store = TransactionStore::from_records_with_max_entries_and_event_sequence(
+            vec![record.clone(), record],
+            None,
+            0,
+        );
+        let conflict = store
+            .retention_status_details(&HashSet::new(), Some(1))
+            .await;
+        assert_eq!((conflict.total_count, conflict.protected_count), (2, 0));
+        assert!(conflict.identity_conflict);
+        assert!(!conflict.all_records_protected);
+        let protected = store
+            .retention_status_details(&HashSet::from([id]), Some(1))
+            .await;
+        assert_eq!((protected.total_count, protected.protected_count), (2, 1));
+        assert!(protected.all_records_protected);
+        assert!(!protected.identity_conflict);
+        assert!(
+            !store
+                .retention_status_details(&HashSet::new(), Some(2))
+                .await
+                .identity_conflict
+        );
+        assert!(
+            !store
+                .retention_status_details(&HashSet::new(), None)
+                .await
+                .identity_conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn history_retention_duplicate_group_is_eligible_when_within_excess() {
+        let duplicate = record();
+        let store = TransactionStore::from_records_with_max_entries_and_event_sequence(
+            vec![duplicate.clone(), duplicate, record()],
+            None,
+            0,
+        );
+        let status = store
+            .retention_status_details(&HashSet::new(), Some(1))
+            .await;
+        assert!(!status.identity_conflict);
     }
 }

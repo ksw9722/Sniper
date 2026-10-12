@@ -208,6 +208,19 @@ pins the active session once, or reads an explicit `--session-id` without switch
 it. `call` returns the pinned ID in `meta.session_id` for reuse on related reads.
 These commands only read stored data. See the [CLI contract](../../README.md#cli).
 
+## Manage opt-in HTTP history retention
+
+`capture http retention get` reads a session's saved policy and cleanup status.
+`capture http retention set --off` or `--max-entries N` requires `--yes`; use
+`--dry-run` for an offline exact-policy preview. Off is the default. Keep-newest
+permanently removes oldest unprotected excess rows toward a soft total-history
+target, protecting in-progress records and durably saved HTTP tab source originals.
+Obtain explicit approval for this destructive opt-in. Policy-save success does
+not mean pending logical or disk cleanup is finished. Prefer `--session-id`;
+never automatically retry or infer that a lost response means no change.
+See [the retention contract](http-history-retention.md) for canonical `call`
+names, limits, and same-session recovery reads.
+
 ## Manage passive scanner configuration
 
 Use `scanner config get`, `scanner custom list`, and `scanner custom get --id <id>`

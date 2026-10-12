@@ -96,6 +96,7 @@ struct StreamedRecordContext {
     _session_owner: ActiveProxySessionGuard,
     persist_generation: u64,
     record_id: Option<Uuid>,
+    _record_protection: Option<crate::store::InProgressTransactionGuard>,
     started_at: chrono::DateTime<Utc>,
     started: Instant,
     method: String,
@@ -2438,7 +2439,7 @@ async fn serve_passthrough_tunnel(
         Some(Version::HTTP_11),
     );
     let record_id = record.id;
-    let insert_outcome = insert_transaction_quiet(&session, record, "passthrough tunnel").await;
+    let (insert_outcome, _record_protection) = session.store.insert_in_progress(record).await;
     persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
 
     let result = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
@@ -3827,6 +3828,7 @@ async fn execute_streaming_http_exchange(
                 ),
                 persist_generation,
                 record_id: None,
+                _record_protection: None,
                 started_at,
                 started,
                 method: method_text.clone(),
@@ -4059,8 +4061,8 @@ impl StreamedRecordContext {
         notes.push("Streaming response capture is still in progress.".to_string());
         let record = self.build_record(Vec::new(), 0, notes);
         self.record_id = Some(record.id);
-        let insert_outcome =
-            insert_transaction_quiet(&self.session, record, "streaming response started").await;
+        let (insert_outcome, protection) = self.session.store.insert_in_progress(record).await;
+        self._record_protection = Some(protection);
         persist_transaction_insert_outcome(&self.state, &self.session, insert_outcome).await;
     }
 
@@ -7058,6 +7060,7 @@ mod tests {
             ),
             persist_generation,
             record_id: None,
+            _record_protection: None,
             started_at: Utc::now(),
             started: Instant::now(),
             method: "GET".to_string(),
@@ -7121,6 +7124,7 @@ mod tests {
             ),
             persist_generation,
             record_id: None,
+            _record_protection: None,
             started_at: Utc::now(),
             started: Instant::now(),
             method: "GET".to_string(),

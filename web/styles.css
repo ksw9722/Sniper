@@ -7333,3 +7333,24 @@ button.utility-button.replay-tab-add {
   background: var(--point-soft);
   color: var(--point);
 }
+
+/* The cleanup policy owns its form and save boundary, apart from runtime settings. */
+#proxySettingsPanel { overflow: auto; }
+#proxySettingsPanel > .split-panel { height: auto; min-height: 500px; }
+#proxySettingsPanel > .split-panel > .panel-card > .settings-form { overflow: visible; }
+.history-retention-card { flex: 0 0 auto; margin-bottom: 12px; }
+.history-retention-card p { margin: 0; line-height: 1.5; }
+.history-retention-fields { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(150px, 1fr); gap: 12px; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-md); }
+.history-retention-fields legend { padding: 0 6px; color: var(--text-dim); }
+.history-retention-fields .settings-toggle { grid-column: 1 / -1; }
+.history-retention-warning { color: var(--text); font-weight: 600; }
+.history-retention-error { color: var(--danger, #df596a); }
+.history-retention-error:empty { display: none; }
+@media (max-width: 700px) { .history-retention-fields { grid-template-columns: 1fr; } }
+
+.history-recovered-notes { position: fixed; right: 18px; bottom: 30px; z-index: 1200; width: min(480px, calc(100vw - 36px)); max-height: 55vh; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--panel-code); color: var(--text); box-shadow: 0 4px 24px #0006; }
+.history-recovered-notes summary { cursor: pointer; font-weight: 600; }
+.history-recovered-notes p { line-height: 1.5; }
+.history-recovered-note { display: grid; gap: 8px; margin-top: 12px; }
+.history-recovered-note textarea { resize: vertical; }
+.history-recovered-note .secondary-action { justify-self: start; }

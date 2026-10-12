@@ -183,6 +183,8 @@ struct StoredSessionSnapshot {
     #[serde(skip)]
     replayed_transaction_journal: bool,
     #[serde(skip)]
+    replayed_transaction_deletion: bool,
+    #[serde(skip)]
     replayed_transaction_ids: HashSet<Uuid>,
     #[serde(skip)]
     replayed_websocket_journal: bool,
@@ -200,6 +202,7 @@ enum SessionSnapshotLoadMode {
 
 struct TransactionJournalReplayResult {
     replayed_transaction_ids: HashSet<Uuid>,
+    replayed_deletion: bool,
     mutated_snapshot: bool,
     transaction_event_sequence: u64,
 }
@@ -309,6 +312,8 @@ fn wait_snapshot_gate(gate: &mut Option<SnapshotTestGate>, phase: SnapshotTestPh
 }
 
 pub struct SessionContext {
+    pub(crate) history_retention: crate::history_retention::SessionRetentionState,
+    retention_writable: bool,
     id: Uuid,
     storage_dir: PathBuf,
     max_entries: usize,
@@ -335,6 +340,8 @@ pub struct SessionContext {
     state_persist_scheduled: AtomicBool,
     #[cfg(test)]
     workspace_write_fault: std::sync::Mutex<Option<WorkspaceWriteFault>>,
+    #[cfg(test)]
+    history_retention_write_fault: std::sync::Mutex<Option<WorkspaceWriteFault>>,
     #[cfg(test)]
     workspace_commit_gate: std::sync::Mutex<Option<WorkspaceCommitGate>>,
     #[cfg(test)]
@@ -417,25 +424,31 @@ impl SessionContext {
         let websocket_journal_tx = enable_journal
             .then(|| start_websocket_journal_writer(websocket_journal_path(&storage_dir)))
             .flatten();
+        let store = Arc::new(if enable_journal {
+            TransactionStore::from_located_records_with_journal(
+                snapshot.transactions,
+                snapshot.transaction_locators,
+                &snapshot.replayed_transaction_ids,
+                journal_path,
+                transaction_event_sequence,
+            )
+        } else {
+            TransactionStore::from_records_with_max_entries_and_event_sequence(
+                snapshot.transactions,
+                None,
+                transaction_event_sequence,
+            )
+        });
+        if !enable_journal && snapshot.replayed_transaction_deletion {
+            store.mark_retention_compaction_pending(transaction_event_sequence);
+        }
         Self {
+            history_retention: Default::default(),
+            retention_writable: enable_journal,
             id: metadata.id,
             storage_dir,
             max_entries,
-            store: Arc::new(if enable_journal {
-                TransactionStore::from_located_records_with_journal(
-                    snapshot.transactions,
-                    snapshot.transaction_locators,
-                    &snapshot.replayed_transaction_ids,
-                    journal_path,
-                    transaction_event_sequence,
-                )
-            } else {
-                TransactionStore::from_records_with_max_entries_and_event_sequence(
-                    snapshot.transactions,
-                    None,
-                    transaction_event_sequence,
-                )
-            }),
+            store,
             runtime: Arc::new(RuntimeSettings::from_snapshot(runtime_snapshot.clone())),
             intercepts: Arc::new(InterceptQueue::new()),
             response_intercepts: Arc::new(ResponseInterceptQueue::new()),
@@ -490,6 +503,8 @@ impl SessionContext {
             state_persist_scheduled: AtomicBool::new(false),
             #[cfg(test)]
             workspace_write_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            history_retention_write_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             workspace_commit_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -554,6 +569,71 @@ impl SessionContext {
             .expect("session metadata lock poisoned");
         metadata.name.clone_from(&renamed.name);
         metadata.updated_at = metadata.updated_at.max(renamed.updated_at);
+    }
+
+    pub(crate) fn retention_writable(&self) -> bool {
+        self.retention_writable
+    }
+
+    /// Called under the session mutation lock. Publish the new policy only
+    /// after its state-only atomic write has confirmed durability.
+    pub(crate) async fn persist_history_retention_policy(
+        &self,
+        policy: crate::history_retention::HistoryRetentionPolicy,
+        revision: u64,
+    ) -> std::result::Result<(), crate::history_retention::PolicyWriteError> {
+        use crate::history_retention::PolicyWriteError;
+        let _persist_guard = self.persist_lock.lock().await;
+        let mut state = self
+            .build_state_snapshot(self.workspace.snapshot().await)
+            .await;
+        state.runtime.http_history_retention = policy.clone();
+        state.runtime.http_history_retention_revision = Some(revision);
+        let path = state_path(&self.storage_dir);
+        #[cfg(test)]
+        let fault = self.history_retention_write_fault.lock().unwrap().take();
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            match fault {
+                Some(WorkspaceWriteFault::BeforeReplacement) => {
+                    return Err(JsonWriteFailure {
+                        error: anyhow!("synthetic retention write failure before replacement"),
+                        committed: false,
+                    })
+                }
+                Some(WorkspaceWriteFault::AfterReplacement) => {
+                    return write_json_finalizing(&path, &state, |_| {
+                        bail!("synthetic retention write finalization failure")
+                    })
+                }
+                None => (),
+            }
+            write_json_with_commit_status(&path, &state)
+        })
+        .await
+        .map_err(|_| PolicyWriteError::OutcomeUnknown)?;
+        match result {
+            Ok(()) => {
+                self.runtime
+                    .set_history_retention_policy(policy, revision)
+                    .await;
+                Ok(())
+            }
+            Err(failure) if failure.committed => {
+                // Keep memory aligned with the visible replacement, but the
+                // caller gates destructive work until a durable retry succeeds.
+                self.runtime
+                    .set_history_retention_policy(policy, revision)
+                    .await;
+                Err(PolicyWriteError::CommittedButUncertain)
+            }
+            Err(_) => Err(PolicyWriteError::NotCommitted),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_history_retention_write(&self, fault: WorkspaceWriteFault) {
+        *self.history_retention_write_fault.lock().unwrap() = Some(fault);
     }
 
     pub async fn persist(&self) -> Result<SessionMetadata> {
@@ -886,6 +966,7 @@ impl SessionContext {
             workspace,
             transaction_locators: HashMap::new(),
             replayed_transaction_journal: false,
+            replayed_transaction_deletion: false,
             replayed_transaction_ids: HashSet::new(),
             replayed_websocket_journal: false,
             compactable_websocket_journal: false,
@@ -1011,6 +1092,7 @@ impl SessionContext {
                             transactions.latest_event_sequence,
                             Ordering::Release,
                         );
+                        store.mark_retention_compacted(transactions.latest_event_sequence);
                     }
                     Err(error) => warn!(
                         %error,
@@ -1037,7 +1119,6 @@ impl SessionContext {
         })
         .await
         .context("session snapshot writer panicked")??;
-
         Ok(metadata)
     }
 }
@@ -1801,8 +1882,10 @@ impl SessionRegistry {
             write_json(&snapshot_path(&storage_dir), &snapshot)?;
             snapshot.transactions = entries.into_iter().map(|(record, _)| record).collect();
         }
+        let mut retention_compaction_pending = false;
         if replayed_transaction_journal {
             if let Err(error) = compact_replayed_transaction_journal(&storage_dir) {
+                retention_compaction_pending = snapshot.replayed_transaction_deletion;
                 warn!(
                     %error,
                     session_id = %id,
@@ -1838,14 +1921,20 @@ impl SessionRegistry {
                 );
             }
         }
-        Ok(Arc::new(SessionContext::from_snapshot(
+        let session = Arc::new(SessionContext::from_snapshot(
             metadata,
             storage_dir,
             self.max_entries,
             self.max_transaction_entries,
             self.max_frames_per_session,
             snapshot,
-        )))
+        ));
+        if retention_compaction_pending {
+            session
+                .store
+                .mark_retention_compaction_pending(session.store.latest_event_sequence());
+        }
+        Ok(session)
     }
 
     pub fn load_context_read_only(&self, id: Uuid) -> Result<Arc<SessionContext>> {
@@ -3433,6 +3522,7 @@ fn load_session_snapshot_with_mode(
     snapshot.transaction_event_sequence = replay_result.transaction_event_sequence;
     snapshot.replayed_transaction_ids = replay_result.replayed_transaction_ids;
     snapshot.replayed_transaction_journal = replay_result.mutated_snapshot;
+    snapshot.replayed_transaction_deletion = replay_result.replayed_deletion;
     let websocket_replay_result = replay_websocket_journal(
         storage_dir,
         max_entries,
@@ -3502,6 +3592,7 @@ fn replay_transaction_journal(
         normalize_snapshot_transaction_sequences(&mut snapshot.transactions);
         return Ok(TransactionJournalReplayResult {
             replayed_transaction_ids: HashSet::new(),
+            replayed_deletion: false,
             mutated_snapshot: false,
             transaction_event_sequence: snapshot.transaction_event_sequence.max(
                 snapshot
@@ -3639,6 +3730,7 @@ fn replay_transaction_journal(
             .any(|id| retained_ids.contains(id));
     Ok(TransactionJournalReplayResult {
         replayed_transaction_ids,
+        replayed_deletion,
         mutated_snapshot,
         transaction_event_sequence,
     })
@@ -11525,6 +11617,158 @@ mod tests {
             session.store.latest_event_sequence()
         );
         drop(session);
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_snapshot_cancellation_late_trim_and_cleanup_failure_keep_exact_boundary() {
+        let (root, registry, session) = snapshot_correction_fixture().await;
+        let mut ids = Vec::new();
+        for index in 1..=5 {
+            let record = deletion_test_record(index);
+            ids.push(record.id);
+            session.store.insert(record).await;
+        }
+        session.persist().await.unwrap();
+
+        // A canceled waiter must not strand an already-persisted trim as pending.
+        let first_trim = session
+            .store
+            .trim_retention(4, &HashSet::new(), 256)
+            .await
+            .unwrap();
+        assert_eq!(first_trim.deleted_ids, vec![ids[0]]);
+        assert!(session.store.retention_compaction_pending());
+        let (entered, resume) = session.pause_next_snapshot(super::SnapshotTestPhase::Prepared);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        resume.send(()).unwrap();
+        drop(session.owned_persist_guard().await);
+        assert_eq!(
+            session.transaction_compacted_event_sequence(),
+            first_trim.event_sequence
+        );
+        assert!(!session.store.retention_compaction_pending());
+        assert!(
+            !crate::history_retention::snapshot(&session, false, false, None)
+                .await
+                .status
+                .disk_cleanup_pending
+        );
+
+        // The next canceled writer may cover only the trim in its captured plan.
+        let captured_trim = session
+            .store
+            .trim_retention(3, &HashSet::new(), 256)
+            .await
+            .unwrap();
+        assert_eq!(captured_trim.deleted_ids, vec![ids[1]]);
+        let (entered, resume) = session.pause_next_snapshot(super::SnapshotTestPhase::Prepared);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        let late_trim = session
+            .store
+            .trim_retention(2, &HashSet::new(), 256)
+            .await
+            .unwrap();
+        assert_eq!(late_trim.deleted_ids, vec![ids[2]]);
+        assert!(late_trim.event_sequence > captured_trim.event_sequence);
+        resume.send(()).unwrap();
+        drop(session.owned_persist_guard().await);
+        assert_eq!(
+            session.transaction_compacted_event_sequence(),
+            captured_trim.event_sequence
+        );
+        assert!(session.store.retention_compaction_pending());
+        let persisted: super::StoredSessionSnapshot = serde_json::from_slice(
+            &std::fs::read(super::snapshot_path(session.storage_dir())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted.transaction_event_sequence,
+            captured_trim.event_sequence
+        );
+        let readonly = registry.load_context_read_only(session.id()).unwrap();
+        assert!(!readonly.scanner.get_config().await.enabled);
+        assert_eq!(readonly.store.len().await, 2);
+        assert!(readonly.store.retention_compaction_pending());
+        assert!(
+            crate::history_retention::snapshot(&readonly, false, false, None)
+                .await
+                .status
+                .disk_cleanup_pending
+        );
+        drop(readonly);
+
+        // Body/state publication succeeds, but a failed purge cannot advance
+        // either cleanup boundary or claim the retained tombstone was compacted.
+        let (entered, resume) =
+            session.pause_next_snapshot(super::SnapshotTestPhase::BeforeCleanup);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        let checkpoint = transaction_journal_checkpoint_path(&super::transaction_journal_path(
+            session.storage_dir(),
+        ));
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        resume.send(()).unwrap();
+        assert!(
+            save.await.unwrap().is_ok(),
+            "cleanup warnings preserve the save contract"
+        );
+        assert_eq!(
+            session.transaction_compacted_event_sequence(),
+            captured_trim.event_sequence
+        );
+        assert!(session.store.retention_compaction_pending());
+        let status = crate::history_retention::snapshot(&session, false, false, None).await;
+        assert!(status.status.disk_cleanup_pending);
+        assert!(status.status.pending);
+        for (index, id) in ids.iter().enumerate() {
+            if index < 3 {
+                assert!(session.store.get(*id).await.is_none());
+            } else {
+                assert_eq!(
+                    session.store.get(*id).await.unwrap().request.body_preview,
+                    format!("fixture request body {}", index + 1)
+                );
+            }
+        }
+
+        std::fs::remove_dir(checkpoint).unwrap();
+        session.persist().await.unwrap();
+        assert_eq!(
+            session.transaction_compacted_event_sequence(),
+            late_trim.event_sequence
+        );
+        assert!(!session.store.retention_compaction_pending());
+        drop(session);
+        drop(registry);
+        let (registry, reloaded) = SessionRegistry::load_or_create(&root, 32, 32).unwrap();
+        assert!(!reloaded.scanner.get_config().await.enabled);
+        assert_eq!(reloaded.store.len().await, 2);
+        assert!(!reloaded.store.retention_compaction_pending());
+        for (index, id) in ids.iter().enumerate().skip(3) {
+            assert_eq!(
+                reloaded.store.get(*id).await.unwrap().request.body_preview,
+                format!("fixture request body {}", index + 1)
+            );
+        }
+        drop(reloaded);
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -339,6 +339,19 @@ impl WorkspaceStateStore {
         });
     }
 
+    /// Retention reads references without cloning request/response bodies.
+    pub async fn http_replay_source_ids(&self) -> std::collections::HashSet<Uuid> {
+        self.inner
+            .read()
+            .await
+            .replay
+            .tabs
+            .iter()
+            .filter(|tab| tab.tab_type.is_empty() || tab.tab_type == "http")
+            .filter_map(|tab| tab.source_transaction_id)
+            .collect()
+    }
+
     pub async fn snapshot(&self) -> WorkspaceStateSnapshot {
         self.inner.read().await.clone()
     }

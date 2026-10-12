@@ -359,6 +359,28 @@ Direct commands return that object; `call` puts it under `data` and adds
 `meta.session_id`. See the
 [saved-tab API contract](docs/integrations/saved-replay-tabs.md) for wire details.
 
+### Opt-in HTTP history retention
+
+Capture → Settings → HTTP History automatic cleanup saves a policy per session. Off is
+always the default, preserving existing traffic. Explicitly enabling keep-newest
+allows permanent deletion of the oldest unprotected excess rows. N is a soft
+**total-history** target: in-progress records and source originals referenced by
+durably saved HTTP Replay tabs are protected, so totals can stay above N.
+
+```bash
+sniper-cli capture http retention get --session-id <session-uuid>
+sniper-cli capture http retention set --max-entries 10000 --session-id <session-uuid> --dry-run
+sniper-cli capture http retention set --max-entries 10000 --session-id <session-uuid> --yes
+sniper-cli capture http retention set --off --session-id <session-uuid> --yes
+```
+
+N must be an integer from 1 through 4294967295. Dry-run is completely offline;
+`--yes` is required to save either policy. Saved-policy success is separate from
+pending logical cleanup and disk reclamation. Off does not restore deleted rows.
+Canonical operations are `capture.http.retention.get` and
+`capture.http.retention.set`. See [the retention contract](docs/integrations/http-history-retention.md)
+for session binding, concurrency, metadata, protection, and uncertain outcomes.
+
 ### Passive scanner configuration
 
 The `scanner` commands manage the existing passive checks for captured response

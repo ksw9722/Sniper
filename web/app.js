@@ -687,6 +687,20 @@ const els = {
   oastDetailTitle: document.getElementById("oastDetailTitle"),
   oastDetailView: document.getElementById("oastDetailView"),
   proxySettingsPanel: document.getElementById("proxySettingsPanel"),
+  historyRetentionSection: document.getElementById("historyRetentionSection"),
+  historyRecoveredNotes: document.getElementById("historyRecoveredNotes"),
+  historyRecoveredNotesSummary: document.getElementById("historyRecoveredNotesSummary"),
+  historyRecoveredNotesList: document.getElementById("historyRecoveredNotesList"),
+  historyRetentionSession: document.getElementById("historyRetentionSession"),
+  historyRetentionEnabled: document.getElementById("historyRetentionEnabled"),
+  historyRetentionPreset: document.getElementById("historyRetentionPreset"),
+  historyRetentionCustom: document.getElementById("historyRetentionCustom"),
+  historyRetentionCustomField: document.getElementById("historyRetentionCustomField"),
+  historyRetentionError: document.getElementById("historyRetentionError"),
+  historyRetentionStatus: document.getElementById("historyRetentionStatus"),
+  historyRetentionSave: document.getElementById("historyRetentionSave"),
+  historyRetentionCancel: document.getElementById("historyRetentionCancel"),
+  historyRetentionRefresh: document.getElementById("historyRetentionRefresh"),
   requestView: document.getElementById("requestView"),
   requestLines: document.getElementById("requestLines"),
   responseView: document.getElementById("responseView"),
@@ -1095,6 +1109,7 @@ async function init() {
   // Ensure Settings tab data loads on startup if it's the active tab
   if (state.activeProxyTab === "proxy-settings") {
     loadRuntimeSettings().catch((error) => console.error(error));
+    loadHistoryRetentionSettings();
   }
   renderIntercepts();
   renderWebsocketSessions();
@@ -1191,6 +1206,7 @@ function bindEvents() {
       }
       if (state.activeProxyTab === "proxy-settings") {
         loadRuntimeSettings().catch((error) => console.error(error));
+        loadHistoryRetentionSettings();
       }
       if (state.activeProxyTab === "replace") {
         flushMatchReplaceDraft()
@@ -1812,6 +1828,12 @@ function bindEvents() {
     loadSettings()
       .then(renderProxySettings)
       .catch((error) => console.error(error)));
+  els.historyRetentionEnabled?.addEventListener("change", editHistoryRetentionSettings);
+  els.historyRetentionPreset?.addEventListener("change", editHistoryRetentionSettings);
+  els.historyRetentionCustom?.addEventListener("input", editHistoryRetentionSettings);
+  els.historyRetentionSave?.addEventListener("click", saveHistoryRetentionSettings);
+  els.historyRetentionCancel?.addEventListener("click", cancelHistoryRetentionSettings);
+  els.historyRetentionRefresh?.addEventListener("click", loadHistoryRetentionSettings);
   document.getElementById("proxySettingAutoContentLength")?.addEventListener("change", (e) => {
     localStorage.setItem("sniper_auto_content_length", e.target.checked);
   });
@@ -2806,7 +2828,7 @@ async function _applySettings(response) {
 
   els.proxyAddr.textContent = state.settings.proxy_addr;
   els.uiAddr.textContent = state.settings.ui_addr;
-  els.captureMode.textContent = `${formatSize(state.settings.body_preview_bytes)} preview cap / ${configuredTransactionEntryLimit()} HTTP entries`;
+  els.captureMode.textContent = `${formatSize(state.settings.body_preview_bytes)} body preview cap`;
   els.settingsSpecialHostHttp.textContent = state.settings.certificate.special_host_http;
 
   updateProxyStatusIndicator(state.settings.proxy_online);
@@ -4218,6 +4240,9 @@ async function flushBeforeNativeClose() {
   if (uiSettingsDirty || uiSettingsInFlight) {
     await persistUiSettings();
   }
+  if (state.historyRecoveredNotes?.size) {
+    throw new Error("Copy and discard recovered unsaved notes before closing again. They are only stored in this window.");
+  }
   // A live editor may still own text that its debounce has not queued yet.
   // Inspect it without interrupting composition or forcing another save.
   for (const input of document.querySelectorAll("input.note-inline-input")) {
@@ -4941,6 +4966,12 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
 
 function resetSessionScopedUiState() {
   workspaceStateGeneration += 1;
+  state.historyRetentionSettings = null;
+  state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
+  state._historyRetentionEvents = null;
+  state._historyDeletedIds = new Set();
+  state._historyRetentionClearedSelection = false;
+  state._historyRetentionReconcile = false;
   workspaceLoaded = false;
   clearReplaySendInFlight();
   closeContextMenu();
@@ -5487,6 +5518,7 @@ function selectedMimeTypes(filters) {
 }
 
 async function fetchTransactionPage(offsetOrOptions = 0) {
+  const retentionEpoch = state._historyRetentionEpoch || 0;
   const options = typeof offsetOrOptions === "object"
     ? offsetOrOptions
     : { offset: offsetOrOptions };
@@ -5500,7 +5532,7 @@ async function fetchTransactionPage(offsetOrOptions = 0) {
   }));
   if (!response.ok) {
     const message = await response.text();
-    if (!isCurrentHistoryQuerySignature(querySignature)) {
+    if (retentionEpoch !== (state._historyRetentionEpoch || 0) || !isCurrentHistoryQuerySignature(querySignature)) {
       return null;
     }
     if (els.historyMeta) els.historyMeta.textContent = `HTTP History filter error: ${message}`;
@@ -5511,7 +5543,7 @@ async function fetchTransactionPage(offsetOrOptions = 0) {
     throw new Error(message);
   }
   const page = await response.json();
-  if (!isCurrentHistoryQuerySignature(querySignature)) {
+  if (retentionEpoch !== (state._historyRetentionEpoch || 0) || !isCurrentHistoryQuerySignature(querySignature)) {
     return null;
   }
   return page;
@@ -5591,6 +5623,11 @@ async function loadTransactions(preserveSelection = true, options = {}) {
     state.historyPaging.loading = true;
     state.historyListError = "";
     const generation = state.historyPaging.generation;
+    const retentionEpoch = state._historyRetentionEpoch || 0;
+    const finishReconciliation = () => {
+      if (retentionEpoch === (state._historyRetentionEpoch || 0)
+        && state.historyPaging.generation === generation) state._historyRetentionReconcile = false;
+    };
     if (options.resetScroll || queryChanged) {
       clearHttpHistoryLoadedRowsForPendingQuery();
     }
@@ -5621,7 +5658,11 @@ async function loadTransactions(preserveSelection = true, options = {}) {
         state.historyPaging.hasMore = false;
         state.historyPaging.fullyLoaded = true;
         state.historyListError = error?.message || "Failed to load HTTP History.";
-        clearHttpHistoryLoadedRowsForPendingQuery();
+        if (typeof document !== "undefined" && document.querySelectorAll?.("input.note-inline-input").length) {
+          renderHistory({ preserveNoteEditor: true });
+        } else {
+          clearHttpHistoryLoadedRowsForPendingQuery();
+        }
       }
       throw error;
     }
@@ -5649,19 +5690,26 @@ async function loadTransactions(preserveSelection = true, options = {}) {
     }
 
     const visibleEntries = getVisibleEntries();
-    if (!preserveSelection || !visibleEntries.some((entry) => entry.item.id === state.selectedId)) {
+    const hasLiveNotes = typeof document !== "undefined" && document.querySelectorAll?.("input.note-inline-input").length > 0;
+    const reconcileRetention = state._historyRetentionReconcile || hasLiveNotes;
+    const preserveMissingSelection = reconcileRetention && preserveSelection && !queryChanged && !options.resetScroll && state.selectedId;
+    if (!state._historyRetentionClearedSelection && !preserveMissingSelection
+      && (!preserveSelection || !visibleEntries.some((entry) => entry.item.id === state.selectedId))) {
       state.selectedId = visibleEntries[0]?.item.id ?? null;
     }
 
-    renderHistory();
+    if (reconcileRetention) reconcileMissingHistoryNoteEditors();
+    renderHistory({ preserveNoteEditor: !!reconcileRetention });
     if (state.selectedId) {
       if (preserveSelection && canReuseSelectedHistoryRecord(state.selectedId)) {
+        finishReconciliation();
         return;
       }
       await selectHistoryTransaction(state.selectedId);
     } else {
       renderEmptyDetail();
     }
+    finishReconciliation();
   } finally {
     _historyFullLoadInFlight = Math.max(0, _historyFullLoadInFlight - 1);
     if (!_historyFullLoadInFlight && _pendingTransactionSummaries.length) {
@@ -5673,12 +5721,17 @@ async function loadTransactions(preserveSelection = true, options = {}) {
 async function loadTransactionDetail(id) {
   const generation = ++_historyDetailGeneration;
   const sessionId = currentSessionId();
+  const reconcileRetention = state._historyRetentionReconcile === true;
   const response = await fetch(transactionPath(id, sessionId));
   if (generation !== _historyDetailGeneration || sessionId !== currentSessionId()) {
     return null;
   }
   if (!response.ok) {
     if (response.status === 404) {
+      if (reconcileRetention) {
+        applyConfirmedHistoryRemoval([id], sessionId);
+        return null;
+      }
       const index = state.items.findIndex((item) => item.id === id);
       let nextSelectedId = null;
       if (index >= 0) {
@@ -5755,6 +5808,7 @@ function canReuseSelectedHistoryRecord(id) {
 async function selectHistoryTransaction(id, options = {}) {
   state._historySelectionGeneration = (state._historySelectionGeneration || 0) + 1;
   const nextId = id ?? null;
+  if (nextId) state._historyRetentionClearedSelection = false;
   if (nextId && state.selectedId === nextId && canReuseSelectedHistoryRecord(nextId)) {
     updateHistorySelection(nextId);
     if (options.scroll) {
@@ -7518,6 +7572,11 @@ async function pollAuxiliaryData() {
     }
   }
 
+  if (state.activeTool === "proxy" && state.activeProxyTab === "proxy-settings"
+    && !state.historyRetentionSettings?.loading && !state.historyRetentionSettings?.saving) {
+    tasks.push(loadHistoryRetentionSettings());
+  }
+
   if (state.activeTool === "logger") {
     tasks.push(loadEventLog());
   }
@@ -7543,15 +7602,202 @@ async function pollAuxiliaryData() {
   await Promise.allSettled(tasks);
 }
 
+function preserveDeletedHistoryNote(transactionId, sessionId, text) {
+  if (!state.historyRecoveredNotes) state.historyRecoveredNotes = new Map();
+  const key = `${sessionId}:${transactionId}`;
+  const existing = state.historyRecoveredNotes.get(key);
+  if (existing?.text === text) return;
+  state.historyRecoveredNotes.set(key, {
+    transactionId, sessionId, text,
+    sessionName: state.activeSession?.id === sessionId ? state.activeSession.name : sessionId,
+  });
+  renderRecoveredHistoryNotes();
+  if (els.historyRecoveredNotes) els.historyRecoveredNotes.open = true;
+}
+
+function discardRecoveredHistoryNote(key) {
+  const note = state.historyRecoveredNotes?.get(key);
+  if (!note) return;
+  showConfirmDialog("Discard this recovered text? It is only stored in this window and cannot be restored after discarding.", () => {
+    // A second deletion notification can update the recovery while confirmation
+    // is open. That newer text was not the text the operator chose to discard.
+    if (state.historyRecoveredNotes?.get(key) !== note) return;
+    state.historyRecoveredNotes.delete(key);
+    renderRecoveredHistoryNotes();
+  }, { title: "Discard recovered text", confirmLabel: "Discard recovered text" });
+}
+
+function renderRecoveredHistoryNotes() {
+  if (!els.historyRecoveredNotes) return;
+  const notes = state.historyRecoveredNotes || new Map();
+  els.historyRecoveredNotes.classList.toggle("hidden", !notes.size);
+  els.historyRecoveredNotesSummary.textContent = `Recovered unsaved notes (${notes.size})`;
+  els.historyRecoveredNotesList.replaceChildren();
+  for (const [key, note] of notes) {
+    const entry = document.createElement("div");
+    entry.className = "history-recovered-note";
+    const label = document.createElement("label");
+    label.className = "settings-field";
+    const title = document.createElement("span");
+    title.textContent = `Session: ${note.sessionName || note.sessionId} · Record: ${note.transactionId}`;
+    const input = document.createElement("textarea");
+    input.readOnly = true;
+    input.rows = 3;
+    input.value = note.text;
+    input.setAttribute("aria-label", `Recovered unsaved note for ${note.transactionId}, session ${note.sessionName || note.sessionId}`);
+    label.append(title, input);
+    const discard = document.createElement("button");
+    discard.type = "button";
+    discard.className = "secondary-action";
+    discard.textContent = "Discard recovered text";
+    discard.addEventListener("click", () => discardRecoveredHistoryNote(key));
+    entry.append(label, discard);
+    els.historyRecoveredNotesList.appendChild(entry);
+  }
+}
+
+function applyHistoryRetentionDeletedEvent(event, sessionId = currentSessionId()) {
+  if (sessionId !== currentSessionId()) return true;
+  let payload;
+  try { payload = JSON.parse(event.data); } catch (_) { return false; }
+  const sequence = /^(0|[1-9][0-9]{0,19})$/.test(event.lastEventId || "")
+    ? event.lastEventId : Number.isSafeInteger(payload?.event_sequence) && payload.event_sequence >= 0 ? String(payload.event_sequence) : null;
+  if (!payload || payload.session_id !== sessionId || typeof payload.generation !== "string"
+    || !payload.generation || sequence === null || BigInt(sequence) > 18446744073709551615n
+    || typeof payload.event_sequence !== "number" || Number(sequence) !== payload.event_sequence
+    || !Array.isArray(payload.ids) || !payload.ids.every((id) => typeof id === "string" && id)) return false;
+  const previous = state._historyRetentionEvents;
+  if (previous?.generation === payload.generation && BigInt(previous.sequence) >= BigInt(sequence)) return true;
+  state._historyRetentionEvents = { generation: payload.generation, sequence };
+  applyConfirmedHistoryRemoval(payload.ids, sessionId, "automatic_cleanup");
+  return true;
+}
+
+function applyConfirmedHistoryRemoval(ids, sessionId = currentSessionId(), cause = "unavailable") {
+  if (sessionId !== currentSessionId()) return false;
+  state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
+  state._historyRetentionReconcile = true;
+  // Only this batch is needed: old requests carry an epoch, and the server/SSE
+  // sequence rejects summaries from before deletion without an unbounded ID set.
+  const deleted = new Set(ids);
+  state._historyDeletedIds = deleted;
+  const recovered = new Set();
+  for (const input of document.querySelectorAll("input.note-inline-input")) {
+    const editor = input.historyRetentionNote;
+    if (!editor || editor.sessionId !== sessionId || !deleted.has(editor.transactionId)) continue;
+    const pending = state._pendingAnnotations?.get(editor.transactionId);
+    const result = editor.cancel();
+    if (result.dirty || (pending?.sessionId === sessionId && pending.payload?.user_note !== undefined)) {
+      preserveDeletedHistoryNote(editor.transactionId, sessionId, result.text);
+      recovered.add(editor.transactionId);
+    }
+    input.closest?.("tr.history-row")?.remove();
+  }
+  for (const [id, entry] of state._pendingAnnotations || []) {
+    if (entry.sessionId !== sessionId || !deleted.has(id)) continue;
+    entry.retentionDeleted = true;
+    const noteInput = entry.noteEdit?.input;
+    const result = noteInput?.historyRetentionNote?.cancel();
+    if (!recovered.has(id) && entry.payload?.user_note !== undefined) {
+      preserveDeletedHistoryNote(id, sessionId, result ? result.text : (entry.payload.user_note ?? ""));
+    }
+    if (entry.noteEdit?.removed) {
+      entry.noteEdit.removed.window.editors.delete(entry.noteEdit);
+      entry.noteEdit.removed = null;
+    }
+    state._pendingAnnotations.delete(id);
+  }
+  for (const row of els.historyTableBody?.querySelectorAll(".history-row") || []) {
+    if (deleted.has(row.dataset.id)) row.remove();
+  }
+  pendingHistoryNoteRead?.cancel();
+  if (deleted.has(contextMenuTargetId)) closeContextMenu();
+  _pendingTransactionSummaries.length = 0;
+  clearHistoryBackfill();
+  state.historyPaging.generation = ++_historyPagingGeneration;
+  state.historyPaging.loading = false;
+  _historyDetailGeneration += 1;
+  cancelHistoryDetailLoading();
+  state.items = state.items.filter((item) => !deleted.has(item.id));
+  state._itemsVersion += 1;
+  precomputeItemIndexes();
+  invalidateVisibleEntriesCache();
+  refreshHistoryPagingCursorFromItems();
+  if (deleted.has(state.selectedId)) {
+    state._historyRetentionClearedSelection = true;
+    state._selectionPastEndId = null;
+    clearHttpHistorySelectionPreview();
+    showToast(cause === "automatic_cleanup"
+      ? "The selected HTTP History entry was permanently removed by automatic cleanup."
+      : "The selected HTTP History entry is no longer available.", "info", 6000);
+  } else if (deleted.has(state.selectedRecord?.id)) {
+    // A newer selection can coexist with an older preview. Remove that preview
+    // without discarding the surviving selection; the refetch loads its detail.
+    state.selectedRecord = null;
+    state.loadingDetailId = null;
+    renderEmptyDetail();
+  }
+  renderHistory({ preserveNoteEditor: true });
+  scheduleRefresh();
+  if (els.historyRetentionSection && state.activeTool === "proxy" && state.activeProxyTab === "proxy-settings"
+    && !state.historyRetentionSettings?.loading && !state.historyRetentionSettings?.saving) loadHistoryRetentionSettings();
+  return true;
+}
+
+function invalidateHistoryAfterEventGap() {
+  state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
+  state._historyRetentionReconcile = true;
+  _pendingTransactionSummaries.length = 0;
+  state.historyPaging.generation = ++_historyPagingGeneration;
+  state.historyPaging.loading = false;
+  _historyDetailGeneration += 1;
+  scheduleRefresh();
+}
+
+function reconcileMissingHistoryNoteEditors() {
+  const sessionId = currentSessionId();
+  const epoch = state._historyRetentionEpoch || 0;
+  if (!state._historyNoteAvailabilityReads) state._historyNoteAvailabilityReads = new Set();
+  const reads = state._historyNoteAvailabilityReads;
+  for (const input of document.querySelectorAll("input.note-inline-input")) {
+    const editor = input.historyRetentionNote;
+    if (!editor || editor.sessionId !== sessionId || getHistoryItem(editor.transactionId)) continue;
+    state._historyRetentionReconcile = true;
+    const key = `${sessionId}:${epoch}:${editor.transactionId}`;
+    if (reads.has(key)) continue;
+    reads.add(key);
+    fetch(transactionPath(editor.transactionId, sessionId)).then((response) => {
+      if (response.status !== 404 || sessionId !== currentSessionId()
+        || epoch !== (state._historyRetentionEpoch || 0)) return;
+      applyConfirmedHistoryRemoval([editor.transactionId], sessionId);
+    }).catch(() => {
+      // An unreadable record is not proof of deletion. Keep the live editor and
+      // its existing close guard; the next refresh can verify availability.
+    }).finally(() => reads.delete(key));
+  }
+}
+
 function connectEvents() {
   if (eventSource) {
     eventSource.close();
   }
   const eventSessionId = currentSessionId();
   eventSource = new EventSource(sessionQueryPath("/api/events", eventSessionId));
+  const eventStreamOwner = eventSource;
+  const eventWorkspaceGeneration = workspaceStateGeneration;
+  const ownsHistoryEvents = () => eventSource === eventStreamOwner
+    && eventWorkspaceGeneration === workspaceStateGeneration && eventSessionId === currentSessionId();
   let openedOnce = false;
 
   eventSource.onopen = () => {
+    if (!ownsHistoryEvents()) return;
+    // A fresh subscription has no older queued events. A restarted store may
+    // reuse low sequence values, so retire the previous stream's boundary.
+    state._historyRetentionEvents = null;
+    state._historyDeletedIds = new Set();
+    // A deletion may fall between the initial page and subscription, or while
+    // disconnected. Reconcile even if the server cannot replay deleted IDs.
+    invalidateHistoryAfterEventGap();
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");
     if (!openedOnce) {
@@ -7570,7 +7816,7 @@ function connectEvents() {
   };
 
   eventSource.addEventListener("transaction", (event) => {
-    if (eventSessionId !== currentSessionId()) {
+    if (!ownsHistoryEvents()) {
       return;
     }
     _lastHttpHistoryFallbackPoll = Date.now();
@@ -7581,11 +7827,16 @@ function connectEvents() {
     }
   });
 
+  eventSource.addEventListener("retention_deleted", (event) => {
+    if (!ownsHistoryEvents()) return;
+    if (!applyHistoryRetentionDeletedEvent(event, eventSessionId)) scheduleRefresh();
+  });
+
   eventSource.addEventListener("transactions_gap", () => {
-    if (eventSessionId !== currentSessionId()) {
+    if (!ownsHistoryEvents()) {
       return;
     }
-    scheduleRefresh();
+    invalidateHistoryAfterEventGap();
   });
 
   eventSource.addEventListener("event_log", (event) => {
@@ -8064,6 +8315,9 @@ function applyTransactionDeltaEvent(event, sessionId = currentSessionId()) {
   }
 
   try {
+    if (state._historyRetentionEvents
+      && (!/^[0-9]+$/.test(event.lastEventId || "")
+        || BigInt(event.lastEventId) <= BigInt(state._historyRetentionEvents.sequence))) return true;
     const summary = JSON.parse(event.data || "null");
     if (!summary || !summary.id) return false;
     _pendingTransactionSummaries.push({ sessionId, summary });
@@ -8110,7 +8364,7 @@ function flushTransactionDeltas() {
   // it starts and changes when its body finishes, often within one flush.
   const latest = new Map();
   for (const { summary } of pending) {
-    if (summary?.id) latest.set(summary.id, summary);
+    if (summary?.id && !state._historyDeletedIds?.has(summary.id)) latest.set(summary.id, summary);
   }
   const fresh = [];
   let totalAdded = 0;
@@ -8351,9 +8605,11 @@ function scheduleIncrementalRefresh() {
         return;
       }
       const refreshSessionId = state.activeSession?.id || null;
+      const retentionEpoch = state._historyRetentionEpoch || 0;
       const resp = await fetch(buildTransactionsPageUrl({ limit: 50, offset: 0, queryState: refreshQueryState }));
       if (
-        refreshSessionId !== (state.activeSession?.id || null)
+        retentionEpoch !== (state._historyRetentionEpoch || 0)
+        || refreshSessionId !== (state.activeSession?.id || null)
         || !isCurrentHistoryQuerySignature(refreshQuerySignature)
       ) {
         return;
@@ -8372,7 +8628,8 @@ function scheduleIncrementalRefresh() {
       }
       const page = await resp.json();
       if (
-        refreshSessionId !== (state.activeSession?.id || null)
+        retentionEpoch !== (state._historyRetentionEpoch || 0)
+        || refreshSessionId !== (state.activeSession?.id || null)
         || !isCurrentHistoryQuerySignature(refreshQuerySignature)
         || state.historyPaging?.querySignature !== refreshQuerySignature
       ) {
@@ -8659,7 +8916,7 @@ function renderDashboard() {
   els.dashboardCurrentSessionStatus.className = `detail-chip ${isActive ? "active-badge" : "none"}`;
   els.dashboardCurrentSessionPath.textContent = current?.storage_path || "No storage path";
   els.dashboardCurrentSessionRequests.textContent =
-    formatCappedCount(current?.request_count ?? 0, retainedTransactionsCap());
+    formatCappedCount(current?.request_count ?? 0);
   els.dashboardCurrentSessionWebsockets.textContent =
     formatCappedCount(current?.websocket_count ?? 0, retainedEntriesCap());
   els.dashboardCurrentSessionEvents.textContent =
@@ -8692,7 +8949,7 @@ function renderDashboard() {
         .map((session) => `
           <tr class="history-row ${session.id === state.selectedSessionId ? "selected" : ""}" data-id="${session.id}">
             <td>${escapeHtml(session.name)}</td>
-            <td>${formatCappedCount(session.request_count, retainedTransactionsCap())}</td>
+            <td>${formatCappedCount(session.request_count)}</td>
             <td>${formatCappedCount(session.websocket_count, retainedEntriesCap())}</td>
             <td>${formatCappedCount(session.event_count, retainedEntriesCap())}</td>
             <td>${session.rule_count}</td>
@@ -9056,16 +9313,12 @@ async function fetchFindingsCount(sessionId) {
   return Number.isFinite(count) && count >= 0 ? count : 0;
 }
 
-// The stores evict past their retention cap, so a count that reaches it has
-// stopped being a total. Show "N+" rather than implying capture stopped growing.
+// Bounded non-HTTP stores evict past their cap. For those stores, "N+"
+// avoids implying capture stopped growing. HTTP counts have no global cap.
 function formatCappedCount(count, cap) {
   const value = Number.isFinite(Number(count)) ? Number(count) : 0;
   const limit = Number(cap);
   return Number.isFinite(limit) && limit > 0 && value >= limit ? `${value}+` : String(value);
-}
-
-function retainedTransactionsCap() {
-  return state.settings?.max_transaction_entries ?? null;
 }
 
 function retainedEntriesCap() {
@@ -13078,7 +13331,268 @@ function websocketLoadedWindowCanHideSelection() {
     || (Number.isFinite(total) && loadedCount < total);
 }
 
+function historyRetentionSettingsState() {
+  const sessionId = currentSessionId();
+  let settings = state.historyRetentionSettings;
+  if (!settings || settings.sessionId !== sessionId) {
+    settings = {
+      sessionId, saved: null, baselineToken: null,
+      draft: { mode: "off", preset: "10000", custom: "" },
+      draftVersion: 0, readOwner: 0, saving: false, loading: false,
+      dirty: false, conflict: false, writeConflict: false, uncertain: null, error: "", message: "",
+    };
+    state.historyRetentionSettings = settings;
+  }
+  return settings;
+}
+
+function historyRetentionDraftFromPolicy(policy) {
+  const value = String(policy.max_entries || 10000);
+  const preset = ["10000", "50000", "100000", "250000"].includes(value) ? value : "custom";
+  return { mode: policy.mode, preset, custom: preset === "custom" ? value : "" };
+}
+
+function historyRetentionPolicyFromDraft(draft) {
+  if (draft.mode === "off") return { mode: "off" };
+  const raw = draft.preset === "custom" ? draft.custom : draft.preset;
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(Number(raw))
+    || Number(raw) < 1 || Number(raw) > 4294967295) {
+    throw new Error("Enter a whole number from 1 to 4,294,967,295.");
+  }
+  return { mode: "keep_newest", max_entries: Number(raw) };
+}
+
+function validateHistoryRetentionSnapshot(payload, sessionId) {
+  const policy = payload?.policy;
+  const status = payload?.status;
+  if (payload?.session_id !== sessionId || typeof payload.config_token !== "string" || !/^[a-f0-9]{64}$/.test(payload.config_token)
+    || typeof payload.config_revision !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(payload.config_revision)
+    || BigInt(payload.config_revision) > 18446744073709551615n
+    || !policy || !["off", "keep_newest"].includes(policy.mode)
+    || (policy.mode === "off" && Object.prototype.hasOwnProperty.call(policy, "max_entries"))
+    || (policy.mode === "keep_newest" && (!Number.isInteger(policy.max_entries)
+      || policy.max_entries < 1 || policy.max_entries > 4294967295))
+    || !status || !Number.isSafeInteger(status.total_count) || status.total_count < 0
+    || !Number.isSafeInteger(status.protected_count) || status.protected_count < 0
+    || status.protected_count > status.total_count
+    || typeof status.pending !== "boolean" || typeof status.disk_cleanup_pending !== "boolean"
+    || ![null, "protected_records", "workspace_durability_uncertain", "persistence_error", "record_identity_conflict"].includes(status.blocked_reason)) {
+    throw new Error("Invalid automatic cleanup response. Reload its status before saving.");
+  }
+  return { ...payload, policy: policy.mode === "off"
+    ? { mode: "off" } : { mode: "keep_newest", max_entries: policy.max_entries } };
+}
+
+function validateHistoryRetentionAcknowledgement(snapshot, baseline, submittedPolicy) {
+  const changed = JSON.stringify(baseline.policy) !== JSON.stringify(submittedPolicy);
+  if (typeof snapshot.changed !== "boolean" || snapshot.changed !== changed
+    || JSON.stringify(snapshot.policy) !== JSON.stringify(submittedPolicy)
+    || BigInt(snapshot.config_revision) !== BigInt(baseline.config_revision) + (changed ? 1n : 0n)
+    || (changed ? snapshot.config_token === baseline.config_token : snapshot.config_token !== baseline.config_token)) {
+    throw new Error("Invalid save acknowledgement. Checking saved status; the save will not be retried automatically.");
+  }
+  return snapshot;
+}
+
+function historyRetentionDraftIsDirty(settings) {
+  if (!settings.saved) return false;
+  try {
+    return JSON.stringify(historyRetentionPolicyFromDraft(settings.draft)) !== JSON.stringify(settings.saved.policy);
+  } catch (_) {
+    return true;
+  }
+}
+
+function adoptHistoryRetentionSnapshot(settings, snapshot, { replaceDraft = false, preserveDraft = false } = {}) {
+  settings.saved = snapshot;
+  if (replaceDraft) settings.writeConflict = false;
+  if (replaceDraft || (!preserveDraft && !settings.dirty)) {
+    settings.draft = historyRetentionDraftFromPolicy(snapshot.policy);
+    settings.baselineToken = snapshot.config_token;
+    settings.dirty = false;
+  }
+  settings.conflict = settings.writeConflict || settings.baselineToken !== snapshot.config_token;
+}
+
+async function loadHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  if (!settings.sessionId || settings.saving) return false;
+  const readOwner = ++settings.readOwner;
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsRead = () => settings === state.historyRetentionSettings && readOwner === settings.readOwner
+    && settings.sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
+  settings.loading = true;
+  renderHistoryRetentionSettings();
+  try {
+    const response = await fetch(sessionQueryPath("/api/transactions/retention", settings.sessionId));
+    await requireOkResponse(response, "Failed to load automatic cleanup settings.");
+    const snapshot = validateHistoryRetentionSnapshot(await response.json(), settings.sessionId);
+    if (!ownsRead()) return false;
+    const uncertain = settings.uncertain;
+    if (uncertain) {
+      const matched = JSON.stringify(snapshot.policy) === JSON.stringify(uncertain.policy);
+      settings.baselineToken = snapshot.config_token;
+      adoptHistoryRetentionSnapshot(settings, snapshot, { replaceDraft: settings.draftVersion === uncertain.draftVersion && matched, preserveDraft: settings.draftVersion !== uncertain.draftVersion });
+      settings.dirty = historyRetentionDraftIsDirty(settings);
+      settings.conflict = false;
+      settings.uncertain = null;
+      settings.message = matched
+        ? "Saved policy verified. Cleanup runs in the background."
+        : "Saved policy checked. The earlier save could not be confirmed; review your draft before saving again.";
+    } else {
+      adoptHistoryRetentionSnapshot(settings, snapshot);
+    }
+    settings.error = settings.conflict
+      ? "This policy changed or the active session moved. Cancel to review the saved policy, then check the current session before saving."
+      : "";
+    return true;
+  } catch (error) {
+    if (ownsRead()) settings.error = error?.message || "Failed to load automatic cleanup settings.";
+    return false;
+  } finally {
+    if (ownsRead()) {
+      settings.loading = false;
+      renderHistoryRetentionSettings();
+    }
+  }
+}
+
+function editHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  settings.draft = {
+    mode: els.historyRetentionEnabled.checked ? "keep_newest" : "off",
+    preset: els.historyRetentionPreset.value,
+    custom: els.historyRetentionCustom.value,
+  };
+  settings.draftVersion += 1;
+  settings.dirty = historyRetentionDraftIsDirty(settings);
+  settings.message = "";
+  if (!settings.conflict && !settings.uncertain) settings.error = "";
+  renderHistoryRetentionSettings();
+}
+
+function cancelHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  settings.draftVersion += 1;
+  if (settings.saved) adoptHistoryRetentionSnapshot(settings, settings.saved, { replaceDraft: true });
+  settings.error = "";
+  settings.message = settings.uncertain ? "Save outcome is still unknown. Check status before saving again." : "Changes cancelled.";
+  renderHistoryRetentionSettings();
+}
+
+async function saveHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  const retryDurability = settings.saved?.status.blocked_reason === "persistence_error";
+  if (!settings.saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading || settings.conflict || settings.uncertain) return false;
+  let policy;
+  try {
+    policy = historyRetentionPolicyFromDraft(settings.draft);
+  } catch (error) {
+    settings.error = error.message;
+    renderHistoryRetentionSettings();
+    els.historyRetentionCustom.focus();
+    return false;
+  }
+  const draftVersion = settings.draftVersion;
+  const submittedBaseline = settings.saved;
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWrite = () => settings === state.historyRetentionSettings
+    && settings.sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
+  settings.saving = true;
+  settings.readOwner += 1;
+  settings.error = "";
+  settings.message = "Saving policy…";
+  renderHistoryRetentionSettings();
+  let verify = false;
+  let rejected = false;
+  try {
+    const response = await fetch(sessionWritePath("/api/transactions/retention", settings.sessionId), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_config_token: settings.baselineToken, policy }),
+    });
+    if (!ownsWrite()) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        settings.conflict = true;
+        settings.writeConflict = true;
+        settings.error = "This policy changed or the active session moved. Check status, then cancel to load the saved policy.";
+        settings.message = "Policy was not saved.";
+        verify = true;
+        return false;
+      }
+      if (response.status >= 500) throw new Error("The save outcome is unknown. Checking saved status; it will not be retried automatically.");
+      rejected = true;
+      await requireOkResponse(response, "Failed to save automatic cleanup settings.");
+    }
+    const snapshot = validateHistoryRetentionAcknowledgement(
+      validateHistoryRetentionSnapshot(await response.json(), settings.sessionId), submittedBaseline, policy,
+    );
+    if (!ownsWrite()) return false;
+    settings.baselineToken = snapshot.config_token;
+    adoptHistoryRetentionSnapshot(settings, snapshot, { replaceDraft: draftVersion === settings.draftVersion, preserveDraft: draftVersion !== settings.draftVersion });
+    settings.dirty = historyRetentionDraftIsDirty(settings);
+    settings.conflict = false;
+    settings.message = "Policy saved. Cleanup runs in the background.";
+    return true;
+  } catch (error) {
+    if (ownsWrite()) {
+      if (!rejected) settings.uncertain = { policy, draftVersion };
+      settings.error = error?.message || "The save outcome is unknown. Check status before saving again.";
+      settings.message = rejected ? "Policy was not saved." : "The save will not be retried automatically.";
+      verify = !rejected;
+    }
+    return false;
+  } finally {
+    if (ownsWrite()) {
+      settings.saving = false;
+      renderHistoryRetentionSettings();
+      if (verify) await loadHistoryRetentionSettings();
+    }
+  }
+}
+
+function renderHistoryRetentionSettings() {
+  if (!els.historyRetentionSection) return;
+  const settings = historyRetentionSettingsState();
+  const { draft, saved } = settings;
+  els.historyRetentionSession.textContent = state.activeSession?.name || settings.sessionId || "No active session";
+  els.historyRetentionEnabled.checked = draft.mode === "keep_newest";
+  els.historyRetentionEnabled.disabled = !saved;
+  els.historyRetentionPreset.value = draft.preset;
+  els.historyRetentionPreset.disabled = !saved || draft.mode === "off";
+  els.historyRetentionCustom.value = draft.custom;
+  els.historyRetentionCustom.disabled = !saved || draft.mode === "off" || draft.preset !== "custom";
+  els.historyRetentionCustomField.classList.toggle("hidden", draft.preset !== "custom");
+  let invalid = false;
+  try { historyRetentionPolicyFromDraft(draft); } catch (_) { invalid = true; }
+  els.historyRetentionCustom.setAttribute("aria-invalid", String(invalid));
+  els.historyRetentionError.textContent = settings.error || (invalid ? "Enter a whole number from 1 to 4,294,967,295." : "");
+  const retryDurability = saved?.status.blocked_reason === "persistence_error" && !settings.dirty;
+  els.historyRetentionSave.disabled = !saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading || settings.conflict || !!settings.uncertain || invalid;
+  els.historyRetentionCancel.disabled = !saved || (!settings.dirty && !settings.conflict);
+  els.historyRetentionRefresh.disabled = settings.loading || settings.saving;
+  els.historyRetentionSave.textContent = settings.saving ? "Saving…" : retryDurability ? "Retry policy save" : "Save cleanup policy";
+  const parts = [];
+  if (!saved) parts.push(settings.loading ? "Loading saved policy…" : "Load the saved policy before making changes.");
+  if (saved) {
+    const status = saved.status;
+    parts.push(`Saved policy: ${saved.policy.mode === "off" ? "Off" : `keep newest ${saved.policy.max_entries.toLocaleString()} total entries`}.`);
+    parts.push(`${status.total_count.toLocaleString()} stored; ${status.protected_count.toLocaleString()} protected.`);
+    if (status.pending) parts.push("Cleanup pending.");
+    if (status.blocked_reason === "protected_records") parts.push("Protected records prevent reaching the target. The limit is soft.");
+    if (status.blocked_reason === "record_identity_conflict") parts.push("Duplicate record IDs prevent further automatic cleanup.");
+    if (status.blocked_reason === "workspace_durability_uncertain") parts.push("Cleanup paused until saved HTTP tab protection is durable.");
+    if (status.blocked_reason === "persistence_error") parts.push("Cleanup paused after a storage error. Retry policy save to confirm durability; cleanup may still be blocked.");
+    if (status.disk_cleanup_pending) parts.push("Deleted records are hidden; disk space reclamation is pending.");
+    if (settings.dirty) parts.push("Unsaved changes.");
+  }
+  if (settings.message) parts.push(settings.message);
+  els.historyRetentionStatus.textContent = parts.join(" ");
+}
+
 function renderProxySettings() {
+  if (els.historyRetentionSection) renderHistoryRetentionSettings();
   if (!state.settings || !state.runtime) {
     // Data not ready — schedule a background load to self-heal
     if (!state._settingsLoadPending) {
@@ -13118,7 +13632,7 @@ function renderProxySettings() {
   els.proxySettingsProxyAddr.textContent = state.settings.proxy_addr;
   els.proxySettingsNextProxyAddr.textContent = startup?.proxy_addr || state.settings.proxy_addr;
   els.proxySettingsUiAddr.textContent = state.settings.ui_addr;
-  els.proxySettingsCaptureCap.textContent = `${formatSize(state.settings.body_preview_bytes)} preview / ${configuredTransactionEntryLimit()} HTTP entries`;
+  els.proxySettingsCaptureCap.textContent = `${formatSize(state.settings.body_preview_bytes)} body preview cap`;
   els.proxySettingsBootstrap.textContent = state.settings.certificate.special_host_https;
   // Auto Content-Length (local UI setting, not server-side)
   const aclEl = document.getElementById("proxySettingAutoContentLength");
@@ -23243,10 +23757,6 @@ function formatSize(bytes) {
   return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function configuredTransactionEntryLimit() {
-  return state.settings?.max_transaction_entries ?? state.settings?.max_entries ?? 0;
-}
-
 function titleCase(value) {
   const text = String(value || "");
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -25427,7 +25937,9 @@ async function beginNoteEdit(cell, transactionId) {
   }
   const sessionId = currentSessionId();
   const focusOwner = document.activeElement;
-  const canEdit = () => currentSessionId() === sessionId && cell.isConnected
+  const retentionEpoch = state._historyRetentionEpoch || 0;
+  const canEdit = () => retentionEpoch === (state._historyRetentionEpoch || 0)
+    && currentSessionId() === sessionId && cell.isConnected
     && isHttpHistoryVisible() && document.activeElement === focusOwner
     && document.visibilityState !== "hidden"
     && !isModalVisible(els.displaySettingsModal) && !isModalVisible(els.filterModal);
@@ -25518,7 +26030,21 @@ async function beginNoteEdit(cell, transactionId) {
   let lastSaved = input.value.trim();
   input.hasPendingNoteEdit = () => !settled && (composing || compositionFinishing
     || truncateUtf8(input.value, MAX_ANNOTATION_NOTE_BYTES).trim() !== lastSaved);
-  const noteEdit = { cell, sessionId, closed: false, removed: null };
+  const noteEdit = { cell, input, sessionId, closed: false, removed: null };
+  input.historyRetentionNote = {
+    transactionId, sessionId,
+    cancel: () => {
+      const result = { text: input.value, dirty: input.hasPendingNoteEdit() };
+      window.clearTimeout(debounce);
+      settled = true;
+      noteEdit.closed = true;
+      if (noteEdit.removed) {
+        noteEdit.removed.window.editors.delete(noteEdit);
+        noteEdit.removed = null;
+      }
+      return result;
+    },
+  };
   inheritPendingHistoryNoteEdit(transactionId, noteEdit);
   const save = (value) => {
     if (value === lastSaved) return;
@@ -25728,6 +26254,7 @@ function inheritPendingHistoryNoteEdit(transactionId, editor) {
 }
 
 async function updateAnnotations(transactionId, payload, sessionId = currentSessionId(), noteEdit = null) {
+  if (sessionId === currentSessionId() && state._historyDeletedIds?.has(transactionId)) return;
   if (!state._pendingAnnotations) state._pendingAnnotations = new Map();
   if (!state._annotationInFlight) state._annotationInFlight = new Set();
   const pending = state._pendingAnnotations;
@@ -25755,7 +26282,7 @@ function flushAnnotationsOnUnload() {
     return;
   }
   for (const [transactionId, entry] of state._pendingAnnotations.entries()) {
-    if (!entry?.sessionId || !entry.payload) continue;
+    if (!entry?.sessionId || !entry.payload || entry.retentionDeleted) continue;
     const body = JSON.stringify(entry.payload);
     if (utf8ByteLength(body) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
     fetch(sessionWritePath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, entry.sessionId), {
@@ -25809,6 +26336,7 @@ async function flushPendingAnnotations(transactionId, options = {}) {
   const entry = pending.get(transactionId);
   if (!entry) return false;
   const { sessionId, payload } = entry;
+  const retentionEpoch = state._historyRetentionEpoch || 0;
 
   state._annotationInFlight.add(transactionId);
   let failureMessage = "";
@@ -25823,14 +26351,25 @@ async function flushPendingAnnotations(transactionId, options = {}) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (entry.retentionDeleted) return false;
+    if (response.status === 404 && currentSessionId() === sessionId) {
+      applyConfirmedHistoryRemoval([transactionId], sessionId);
+      return false;
+    }
     if (!response.ok) {
       failureMessage = await response.text().catch(() => "Failed to save annotation");
       throw new Error(failureMessage || "Failed to save annotation");
     }
     const summary = await response.json();
+    if (entry.retentionDeleted) return false;
     observeAnnotationRevision(summary);
     saved = true;
-    if (currentSessionId() !== sessionId) {
+    if (currentSessionId() !== sessionId) return saved;
+    if (retentionEpoch !== (state._historyRetentionEpoch || 0)) {
+      // An unrelated deletion can overlap this successful annotation. Its first
+      // refetch may have preceded the save; reconcile again without merging the
+      // old acknowledgement into a newer window.
+      scheduleRefresh();
       return saved;
     }
     state.historyPaging.annotationMutationGeneration = (state.historyPaging.annotationMutationGeneration || 0) + 1;
@@ -25905,6 +26444,7 @@ async function flushPendingAnnotations(transactionId, options = {}) {
       }
     }
   } catch (error) {
+    if (entry.retentionDeleted) return false;
     console.error("Failed to update annotations:", error);
     if (currentSessionId() === sessionId) {
       showToast(failureMessage || error.message || "Failed to save annotation", "error");

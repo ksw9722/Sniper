@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use sniper::{
     event_log::EventLogEntry,
     fuzzer::FuzzerAttackRecord,
+    history_retention::{history_retention_config_token, HistoryRetentionPolicy},
     history_selection::HistorySelection,
     intercept::{
         InterceptRecord, InterceptRule, InterceptSummary, ResponseInterceptRecord,
@@ -568,6 +569,11 @@ struct SessionRevealArgs {
 
 #[derive(Subcommand, Debug)]
 enum HistoryCommand {
+    /// Inspect or explicitly opt into automatic saved HTTP history cleanup.
+    Retention {
+        #[command(subcommand)]
+        command: HistoryRetentionCommand,
+    },
     List(HistoryListArgs),
     Get(HistoryGetArgs),
     /// Find a literal value in URLs, headers and bodies. Says what it scanned,
@@ -582,6 +588,46 @@ enum HistoryCommand {
     Replay(HistoryReplayArgs),
     Fuzzer(HistoryFuzzerArgs),
     Annotate(HistoryAnnotateArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum HistoryRetentionCommand {
+    /// Read the saved policy and current cleanup status for one session.
+    Get(SessionReadArgs),
+    /// Save a retention policy. Keep-newest can permanently delete old unprotected history.
+    Set(HistoryRetentionSetArgs),
+}
+
+impl HistoryRetentionCommand {
+    fn session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Get(args) => args.session_id,
+            Self::Set(args) => args.session_id,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("retention_policy").required(true).args(["off", "max_entries"])))]
+struct HistoryRetentionSetArgs {
+    /// Change this session without switching it; omission pins the active session once.
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Disable automatic cleanup. Does not restore deleted history.
+    #[arg(long)]
+    off: bool,
+    /// Soft total-history target, including protected rows; oldest unprotected rows are removed first.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    max_entries: Option<u32>,
+}
+
+impl HistoryRetentionSetArgs {
+    fn policy(&self) -> Value {
+        match self.max_entries {
+            Some(max_entries) => json!({"mode":"keep_newest","max_entries":max_entries}),
+            None => json!({"mode":"off"}),
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -2244,6 +2290,10 @@ impl CaptureCommand {
 impl HistoryCommand {
     fn operation_name(&self) -> &'static str {
         match self {
+            HistoryCommand::Retention { command } => match command {
+                HistoryRetentionCommand::Get(_) => "capture.http.retention.get",
+                HistoryRetentionCommand::Set(_) => "capture.http.retention.set",
+            },
             HistoryCommand::List(_) => "capture.http.list",
             HistoryCommand::Get(_) => "capture.http.get",
             HistoryCommand::Search(_) => "capture.http.search",
@@ -2588,6 +2638,16 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["value"],
             vec![json!({"value":"access_token","side":["response-body"]})],
+        ),
+        op(
+            "capture.http.retention.get", "capture http retention get [--session-id <uuid>]",
+            "Read one session's saved HTTP retention policy and cleanup status without changing it. Off is the default.",
+            Read, false, &[], vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.retention.set", "capture http retention set [--session-id <uuid>] (--off|--max-entries <integer>)",
+            "Explicitly save Off or a keep-newest total-history target. Cleanup permanently deletes oldest unprotected rows; durable saved HTTP tab source originals and in-progress rows are protected, so totals may exceed the target. Requires --yes.",
+            Write, true, &[], vec![json!({"off":true}), json!({"max_entries":10000})],
         ),
         op(
             "capture.http.select", "capture http select --session-id <uuid> [--id <uuid>|filters]",
@@ -3168,6 +3228,7 @@ fn op(
         output_schema: intercept_rule_update_output_schema(operation)
             .or_else(|| replay_saved_tab_output_schema(operation))
             .or_else(|| scanner_output_schema(operation))
+            .or_else(|| history_retention_output_schema(operation))
             .or_else(|| session_list_output_schema(operation))
             .or_else(|| session_read_output_schema(operation))
             .or_else(|| skills_status_output_schema(operation))
@@ -3484,6 +3545,9 @@ fn legacy_uuid_input_schema(nullable: bool, context: &str) -> Value {
 }
 
 fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
+    if let Some(schema) = history_retention_input_schema(operation) {
+        return schema;
+    }
     if matches!(
         operation,
         "skills.install" | "skills.status" | "skills.update_preview"
@@ -3756,6 +3820,8 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "scanner.custom.get" | "scanner.custom.delete" => &["session_id", "id"],
         "scanner.custom.create" => &["session_id", "rule", "file", "stdin"],
         "scanner.custom.update" => &["session_id", "id", "patch", "file", "stdin"],
+        "capture.http.retention.get" => &["session_id"],
+        "capture.http.retention.set" => &["session_id", "off", "max_entries"],
         "capture.http.clear" => &["session_id"],
         "capture.http.select" | "capture.http.delete" => &[
             "session_id",
@@ -4038,6 +4104,18 @@ fn single_skill_input_preview(args: &SingleSkillArgs) -> Value {
 
 fn history_input_preview(command: &HistoryCommand) -> Value {
     match command {
+        HistoryCommand::Retention { command } => match command {
+            HistoryRetentionCommand::Get(args) => json!({"session_id":args.session_id}),
+            HistoryRetentionCommand::Set(args) => {
+                let mut input = json!({"session_id":args.session_id});
+                if args.off {
+                    input["off"] = json!(true);
+                } else {
+                    input["max_entries"] = json!(args.max_entries);
+                }
+                input
+            }
+        },
         HistoryCommand::Clear(args) => json!({ "session_id": args.session_id }),
         HistoryCommand::Select(args) | HistoryCommand::Delete(args) => {
             serde_json::to_value(args.payload()).expect("selection serializes")
@@ -4420,6 +4498,7 @@ fn capture_api_preview(command: &CaptureCommand) -> Result<Value> {
 
 fn history_api_preview(command: &HistoryCommand) -> Result<Value> {
     Ok(match command {
+        HistoryCommand::Retention { command } => history_retention_api_preview(command),
         HistoryCommand::Select(args) => api_preview(
             "POST",
             "/api/transactions/select",
@@ -4855,6 +4934,16 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
         notes.push("Enrollment records explicit local opt-in only and does not enable startup or automatic updates. Preview never implies ownership of unmanaged files.");
         notes.push("Staging requires an unchanged enrolled skill with different bundled bytes and a new output directory. It writes a candidate and receipt only; the active SKILL.md remains unchanged and nothing is activated.");
     }
+    if matches!(
+        command.operation_name(),
+        "capture.http.retention.get" | "capture.http.retention.set"
+    ) {
+        notes.push("Dry-run is fully offline: no API discovery, session resolution, token read, history inspection or deletion count.");
+        if command.operation_name() == "capture.http.retention.set" {
+            notes.push("The exact requested policy is shown in api.write.body.policy. Write execution pins one session, fetches its policy-configuration config_token and sends one compare-and-swap write. An inferred session also carries expected_active_session_id. No redirect, automatic retry or uncertain-write readback is performed.");
+        }
+        notes.push("Off is the default. Keep-newest is a soft total-history target: oldest unprotected rows are removed first, while durable saved HTTP tab source originals and in-progress rows survive. Policy-save success does not mean pending logical or disk cleanup is finished.");
+    }
     if matches!(command, Command::Scanner { .. }) {
         notes.push("Dry-run is offline and validates supplied rule JSON before API discovery. It does not resolve sessions, fetch configuration, apply writes or inspect traffic.");
         notes.push("An omitted session_id is resolved once and pinned; writes also guard expected_active_session_id. Writes fetch a config_token and compare-and-swap once, preserving unrelated fields and custom rule order. Conflicts are not retried.");
@@ -5016,6 +5105,13 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 id: call_required(operation, input, "id")?,
                 name: call_required(operation, input, "name")?,
             }),
+        },
+        "capture.http.retention.get" | "capture.http.retention.set" => Command::Capture {
+            command: CaptureCommand::Http {
+                command: HistoryCommand::Retention {
+                    command: history_retention_from_input(operation, input)?,
+                },
+            },
         },
         "capture.http.clear" => Command::Capture {
             command: CaptureCommand::Http {
@@ -6764,6 +6860,7 @@ fn auto_replace_write_session_id(
 
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
+        HistoryCommand::Retention { command } => handle_history_retention(api, command).await,
         HistoryCommand::Select(args) => {
             let result: Value = api
                 .post_json("/api/transactions/select", &args.payload())
@@ -8488,6 +8585,458 @@ async fn pinned_read_session_id(api: &ApiClient, explicit: Option<Uuid>) -> Resu
     resolve_session_id_arg(api, explicit).await?.ok_or_else(|| {
         anyhow!("no active session; pass --session-id to choose a session explicitly")
     })
+}
+
+fn history_retention_limit_schema() -> Value {
+    json!({
+        "type":"integer","minimum":1,"maximum":u32::MAX,
+        "x-sniper-json-number-representation":"unsigned-integer",
+        "description":"An unsigned JSON integer token from 1 through 4294967295, without a decimal point or exponent. This is a soft total-history target including protected rows."
+    })
+}
+
+fn history_retention_revision_schema() -> Value {
+    let maximum = u64::MAX.to_string();
+    let mut alternatives = vec![
+        "0".to_owned(),
+        "[1-9][0-9]{0,18}".to_owned(),
+        maximum.clone(),
+    ];
+    for (index, digit) in maximum.bytes().enumerate().skip(1) {
+        if digit > b'0' {
+            alternatives.push(format!(
+                "{}[0-{}][0-9]{{{}}}",
+                &maximum[..index],
+                char::from(digit - 1),
+                maximum.len() - index - 1
+            ));
+        }
+    }
+    json!({"type":"string","pattern":format!("^(?:{})$", alternatives.join("|")),
+        "description":"Canonical decimal u64 configuration revision (0 through 18446744073709551615), encoded as a string to preserve precision. Changes advance the revision; a no-op preserves it."})
+}
+
+fn history_retention_policy_schema() -> Value {
+    json!({"oneOf":[
+        {"type":"object","additionalProperties":false,"required":["mode"],"properties":{"mode":{"const":"off"}}},
+        {"type":"object","additionalProperties":false,"required":["mode","max_entries"],"properties":{"mode":{"const":"keep_newest"},"max_entries":history_retention_limit_schema()}}
+    ]})
+}
+
+fn history_retention_input_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.retention.get" | "capture.http.retention.set"
+    ) {
+        return None;
+    }
+    let mut session_id = legacy_uuid_input_schema(true, "Explicit sessions, including inactive sessions, are isolated without switching. Omission or null pins the active session once.");
+    let hyphenated = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+    session_id["pattern"] = json!(format!(
+        r"^(?:[0-9a-fA-F]{{32}}|{hyphenated}|\{{{hyphenated}\}}|urn:uuid:{hyphenated})$"
+    ));
+    let mut schema = json!({
+        "type":"object","additionalProperties":false,"required":[],
+        "properties":{"session_id":session_id}
+    });
+    if operation.ends_with(".set") {
+        schema["properties"]["off"] = json!({"type":"boolean","default":false,"description":"True disables future automatic cleanup; it does not restore deleted history."});
+        schema["properties"]["max_entries"] = history_retention_limit_schema();
+        schema["oneOf"] = json!([
+            {"required":["off"],"properties":{"off":{"const":true}},"not":{"required":["max_entries"]}},
+            {"required":["max_entries"],"properties":{"off":{"const":false}}}
+        ]);
+    }
+    Some(schema)
+}
+
+fn history_retention_output_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.retention.get" | "capture.http.retention.set"
+    ) {
+        return None;
+    }
+    let count = json!({"type":"integer","minimum":0});
+    let mut schema = json!({
+        "type":"object","additionalProperties":false,
+        "description":"Validated retention metadata only. A saved policy acknowledgement does not mean cleanup or disk reclamation has finished.",
+        "required":["session_id","config_token","config_revision","policy","status"],
+        "properties":{
+            "session_id":{"type":"string","format":"uuid"},
+            "config_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"Compare-and-swap token bound to this session, saved policy and configuration revision, never traffic counts."},
+            "config_revision":history_retention_revision_schema(),
+            "policy":history_retention_policy_schema(),
+            "status":{
+                "type":"object","additionalProperties":false,
+                "required":["total_count","protected_count","pending","disk_cleanup_pending","blocked_reason"],
+                "properties":{
+                    "total_count":count,"protected_count":count,
+                    "pending":{"type":"boolean","description":"Logical work remains or disk cleanup is queued; protected rows can keep the total above the target."},
+                    "disk_cleanup_pending":{"type":"boolean","description":"Physical cleanup remains pending, independently of the saved policy acknowledgement."},
+                    "blocked_reason":{"type":["string","null"],"enum":[null,"protected_records","workspace_durability_uncertain","persistence_error","record_identity_conflict"]}
+                }
+            }
+        }
+    });
+    if operation.ends_with(".set") {
+        schema["required"].as_array_mut()?.push(json!("changed"));
+        schema["properties"]["changed"] = json!({"type":"boolean","description":"Whether the saved policy changed; this is not a deletion count or completion signal."});
+    }
+    Some(schema)
+}
+
+fn history_retention_from_input(operation: &str, input: &Value) -> Result<HistoryRetentionCommand> {
+    let session_id = call_optional(operation, input, "session_id")?;
+    if operation.ends_with(".get") {
+        return Ok(HistoryRetentionCommand::Get(SessionReadArgs { session_id }));
+    }
+    for field in ["off", "max_entries"] {
+        if input.get(field).is_some_and(Value::is_null) {
+            bail!("field `{field}` for `{operation}` cannot be null");
+        }
+    }
+    let off = call_bool(operation, input, "off")?;
+    let max_entries: Option<u32> = call_optional(operation, input, "max_entries")?;
+    validate_call_exactly_one(
+        operation,
+        "retention policy",
+        &[("off", off), ("max_entries", max_entries.is_some())],
+    )?;
+    if max_entries == Some(0) {
+        bail!("field `max_entries` for `{operation}` must be between 1 and 4294967295");
+    }
+    Ok(HistoryRetentionCommand::Set(HistoryRetentionSetArgs {
+        session_id,
+        off,
+        max_entries,
+    }))
+}
+
+fn history_retention_api_preview(command: &HistoryRetentionCommand) -> Value {
+    let read = api_preview(
+        "GET",
+        session_query_path("/api/transactions/retention", command.session_id()),
+        None,
+    );
+    let HistoryRetentionCommand::Set(args) = command else {
+        return read;
+    };
+    json!({
+        "read":read,
+        "write":{
+            "method":"POST","path":session_query_path("/api/transactions/retention", args.session_id),
+            "body":{"policy":args.policy(),"expected_config_token":"<from the pinned policy GET>"},
+            "expected_active_session_id":if args.session_id.is_none() { json!("<resolved active session ID; sent in query>") } else { Value::Null },
+            "automatic_retry":false
+        }
+    })
+}
+
+#[derive(Debug)]
+struct HistoryRetentionCliError {
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Option<Uuid>,
+    status: Option<u16>,
+}
+
+impl fmt::Display for HistoryRetentionCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for HistoryRetentionCliError {}
+
+fn history_retention_error(
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Option<Uuid>,
+    status: Option<StatusCode>,
+) -> anyhow::Error {
+    HistoryRetentionCliError {
+        code,
+        message,
+        outcome,
+        session_id,
+        status: status.map(|status| status.as_u16()),
+    }
+    .into()
+}
+
+async fn history_retention_get(
+    api: &ApiClient,
+    client: &reqwest::Client,
+    path: &str,
+    session_id: Option<Uuid>,
+    limit: usize,
+) -> Result<Value> {
+    let response = client.get(api.url(path)).send().await.map_err(|_| {
+        history_retention_error(
+            "TRANSPORT_ERROR",
+            "Retention metadata read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(history_retention_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Retention metadata read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            Some(status),
+        ));
+    }
+    saved_replay_response_json(response, limit)
+        .await
+        .map_err(|_| {
+            history_retention_error(
+                "INVALID_RESPONSE",
+                "Retention metadata read was missing, malformed or too large; no mutation was sent",
+                "not_applied",
+                session_id,
+                None,
+            )
+        })
+}
+
+fn checked_history_retention_response(
+    value: Value,
+    session_id: Uuid,
+    requested_policy: Option<&Value>,
+    expected_changed: Option<bool>,
+    expected_revision: Option<u64>,
+) -> Result<Value> {
+    let invalid = || {
+        history_retention_error(
+            "INVALID_RESPONSE",
+            if requested_policy.is_some() {
+                "Retention acknowledgement did not match this operation; mutation outcome is unknown"
+            } else {
+                "Retention metadata was invalid; no mutation was sent"
+            },
+            if requested_policy.is_some() {
+                "unknown"
+            } else {
+                "not_applied"
+            },
+            Some(session_id),
+            None,
+        )
+    };
+    if value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        != Some(session_id)
+    {
+        return Err(invalid());
+    }
+    let raw_policy = value
+        .get("policy")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    // Accept additive response fields, but project only validated known metadata.
+    // A known field in the wrong policy variant is still an invalid shape.
+    let policy = match raw_policy.get("mode").and_then(Value::as_str) {
+        Some("off") if !raw_policy.contains_key("max_entries") => json!({"mode":"off"}),
+        Some("keep_newest") => {
+            let limit = raw_policy
+                .get("max_entries")
+                .and_then(Value::as_u64)
+                .filter(|limit| (1..=u32::MAX as u64).contains(limit))
+                .ok_or_else(invalid)?;
+            json!({"mode":"keep_newest","max_entries":limit})
+        }
+        _ => return Err(invalid()),
+    };
+    let typed_policy: HistoryRetentionPolicy =
+        serde_json::from_value(policy.clone()).map_err(|_| invalid())?;
+    let revision_text = value
+        .get("config_revision")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let revision = revision_text
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| revision.to_string() == revision_text)
+        .ok_or_else(invalid)?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(invalid());
+    }
+    let config_token = value
+        .get("config_token")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if config_token != history_retention_config_token(session_id, &typed_policy, revision)
+        || requested_policy.is_some_and(|requested| requested != &policy)
+    {
+        return Err(invalid());
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let total = status
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(invalid)?;
+    let protected = status
+        .get("protected_count")
+        .and_then(Value::as_u64)
+        .filter(|protected| *protected <= total)
+        .ok_or_else(invalid)?;
+    let pending = status
+        .get("pending")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    let disk_pending = status
+        .get("disk_cleanup_pending")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    let blocked = status.get("blocked_reason").ok_or_else(invalid)?;
+    if !blocked.is_null()
+        && !matches!(
+            blocked.as_str(),
+            Some(
+                "protected_records"
+                    | "workspace_durability_uncertain"
+                    | "persistence_error"
+                    | "record_identity_conflict"
+            )
+        )
+    {
+        return Err(invalid());
+    }
+    let mut output = json!({
+        "session_id":session_id,"config_token":config_token,"config_revision":revision_text,"policy":policy,
+        "status":{"total_count":total,"protected_count":protected,"pending":pending,"disk_cleanup_pending":disk_pending,"blocked_reason":blocked}
+    });
+    if let Some(expected) = expected_changed {
+        if value.get("changed").and_then(Value::as_bool) != Some(expected) {
+            return Err(invalid());
+        }
+        output["changed"] = json!(expected);
+    }
+    Ok(output)
+}
+
+async fn handle_history_retention(api: ApiClient, command: HistoryRetentionCommand) -> Result<()> {
+    let explicit = command.session_id();
+    let client = saved_configuration_write_client().map_err(|_| {
+        history_retention_error(
+            "TRANSPORT_ERROR",
+            "Could not prepare retention metadata client; no mutation was sent",
+            "not_applied",
+            explicit,
+            None,
+        )
+    })?;
+    let session_id = if let Some(id) = explicit {
+        id
+    } else {
+        let value =
+            history_retention_get(&api, &client, "/api/sessions", None, MAX_CLI_INPUT_BYTES)
+                .await?;
+        let sessions: Vec<SessionSummary> = serde_json::from_value(value).map_err(|_| {
+            history_retention_error(
+                "INVALID_RESPONSE",
+                "Session metadata was invalid; no mutation was sent",
+                "not_applied",
+                None,
+                None,
+            )
+        })?;
+        active_session_id_from_summaries(&sessions)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                history_retention_error(
+                    "INVALID_RESPONSE",
+                    "Expected exactly one active session; pass --session-id explicitly",
+                    "not_applied",
+                    None,
+                    None,
+                )
+            })?
+    };
+    let path = session_query_path("/api/transactions/retention", Some(session_id));
+    let raw = history_retention_get(&api, &client, &path, Some(session_id), 64 * 1024).await?;
+    let current = checked_history_retention_response(raw, session_id, None, None, None)?;
+    let HistoryRetentionCommand::Set(args) = command else {
+        return print_session_read_json(&current, session_id);
+    };
+    let policy = args.policy();
+    let changed = policy != current["policy"];
+    let revision = current["config_revision"]
+        .as_str()
+        .expect("validated revision")
+        .parse::<u64>()
+        .expect("validated revision");
+    let expected_revision = revision.checked_add(u64::from(changed)).ok_or_else(|| {
+        history_retention_error(
+            "RETENTION_REVISION_EXHAUSTED",
+            "Retention configuration revision cannot be advanced; no mutation was sent",
+            "not_applied",
+            Some(session_id),
+            None,
+        )
+    })?;
+    let path = session_query_path_with_expected_active(
+        "/api/transactions/retention",
+        Some(session_id),
+        explicit.is_none().then_some(session_id),
+    );
+    let response = client
+        .post(api.url(&path))
+        .json(&json!({"expected_config_token":current["config_token"],"policy":policy}))
+        .send()
+        .await
+        .map_err(|_| {
+            history_retention_error(
+                "TRANSPORT_ERROR",
+                "Retention acknowledgement was lost; mutation outcome is unknown",
+                "unknown",
+                Some(session_id),
+                None,
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        // Status is authoritative; diagnostic bodies and redirect targets are never read.
+        return Err(history_retention_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Retention policy write did not return success; mutation outcome is unknown",
+            "unknown",
+            Some(session_id),
+            Some(status),
+        ));
+    }
+    let raw = saved_replay_response_json(response, 64 * 1024).await.map_err(|_| history_retention_error(
+        "INVALID_RESPONSE", "Retention acknowledgement was missing, malformed or too large; mutation outcome is unknown", "unknown", Some(session_id), None,
+    ))?;
+    let saved = checked_history_retention_response(
+        raw,
+        session_id,
+        Some(&policy),
+        Some(changed),
+        Some(expected_revision),
+    )?;
+    print_session_read_json(&saved, session_id)
 }
 
 fn scanner_rule_schema(patch: bool) -> Value {
@@ -11887,6 +12436,16 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
             retryable: false,
             details: json!({"reason":managed.code}),
             exit_code: 5,
+        };
+    }
+    if let Some(retention) = error.downcast_ref::<HistoryRetentionCliError>() {
+        return CliErrorPayload {
+            code: retention.code,
+            message: retention.message.to_owned(),
+            hint: Some("Inspect capture http retention get --session-id <the same session UUID> before deliberately issuing another write; never automatically retry."),
+            retryable: false,
+            details: json!({"session_id":retention.session_id,"outcome":retention.outcome,"status":retention.status}),
+            exit_code: if retention.status.is_some_and(|status| status >= 500) { 6 } else { 5 },
         };
     }
     if let Some(tab) = error.downcast_ref::<ReplayTabCliError>() {

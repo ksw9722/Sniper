@@ -757,6 +757,26 @@
           </section>
 
           <section class="proxy-panel hidden" id="proxySettingsPanel">
+            <section class="panel-card history-retention-card" id="historyRetentionSection" aria-labelledby="historyRetentionHeading">
+              <header class="panel-toolbar">
+                <div><h2 id="historyRetentionHeading">HTTP History automatic cleanup</h2><p>Current session: <strong id="historyRetentionSession">Loading…</strong></p></div>
+              </header>
+              <div class="settings-form">
+                <fieldset class="history-retention-fields" aria-describedby="historyRetentionWarning historyRetentionProtection">
+                  <legend>Saved HTTP History limit</legend>
+                  <label class="settings-toggle"><input id="historyRetentionEnabled" type="checkbox" disabled /><span>Enable automatic cleanup (default: Off)</span></label>
+                  <label class="settings-field" for="historyRetentionPreset"><span>Keep newest total entries</span>
+                    <select id="historyRetentionPreset" disabled><option value="10000">10,000</option><option value="50000">50,000</option><option value="100000">100,000</option><option value="250000">250,000</option><option value="custom">Custom</option></select>
+                  </label>
+                  <label class="settings-field hidden" id="historyRetentionCustomField" for="historyRetentionCustom"><span>Custom total entry limit</span><input id="historyRetentionCustom" type="text" inputmode="numeric" pattern="[0-9]+" aria-describedby="historyRetentionCustomHelp historyRetentionError" disabled /><small id="historyRetentionCustomHelp">Whole number from 1 to 4,294,967,295.</small></label>
+                </fieldset>
+                <p id="historyRetentionWarning" class="history-retention-warning">Saving an enabled policy permanently deletes the oldest unprotected entries above the total target, now and as history grows. Deleted requests, responses and notes cannot be restored. Turning cleanup off does not restore deleted entries.</p>
+                <p id="historyRetentionProtection">Original records referenced by durably saved HTTP tabs and in-progress stored records are protected. Protected entries count toward the total; if they exceed the target, the limit is soft. Unsaved tabs and note edits do not protect records.</p>
+                <p id="historyRetentionError" class="history-retention-error" role="alert"></p>
+                <p id="historyRetentionStatus" role="status" aria-live="polite">Loading saved policy…</p>
+                <div class="toolbar-actions"><button class="primary-action" id="historyRetentionSave" type="button" disabled>Save cleanup policy</button><button class="secondary-action" id="historyRetentionCancel" type="button" disabled>Cancel</button><button class="secondary-action" id="historyRetentionRefresh" type="button">Check status</button></div>
+              </div>
+            </section>
             <div class="split-panel split-panel-tight">
               <section class="panel-card">
                 <header class="panel-toolbar">
@@ -887,7 +907,7 @@
                   <dd id="proxySettingsNextProxyAddr">Loading...</dd>
                   <dt>UI listener</dt>
                   <dd id="proxySettingsUiAddr">Loading...</dd>
-                  <dt>Capture cap</dt>
+                  <dt>Body preview cap</dt>
                   <dd id="proxySettingsCaptureCap">Loading...</dd>
                   <dt>Bootstrap host</dt>
                   <dd id="proxySettingsBootstrap">Loading...</dd>
@@ -1788,6 +1808,12 @@
         <button class="context-menu-item" data-pane-action="copy-response-raw">Copy Response Raw</button>
       </div>
     </div>
+
+    <details class="history-recovered-notes hidden" id="historyRecoveredNotes">
+      <summary id="historyRecoveredNotesSummary">Recovered unsaved notes</summary>
+      <p role="status">The original record is no longer available. This unsaved text is only kept in this window, across tabs and sessions. Select and copy anything you need before discarding it or reloading. It will not be saved back to HTTP History.</p>
+      <div id="historyRecoveredNotesList"></div>
+    </details>
 
     <script src="/codemirror.js" defer></script>
     <script src="/app.js" defer></script>

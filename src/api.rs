@@ -431,6 +431,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/clear", post(clear_findings))
         .route(
+            "/api/transactions/retention",
+            get(get_history_retention).post(update_history_retention),
+        )
+        .route(
             "/api/scanner-config",
             get(get_scanner_config).post(update_scanner_config),
         )
@@ -3228,6 +3232,7 @@ async fn mutate_saved_replay_tab_inner(
         .await
     {
         Ok(snapshot) => {
+            state.mark_workspace_retention_durability(&session, true);
             let mut result = serde_json::json!({
                 "session_id": session.id(),
                 "revision": snapshot.revision,
@@ -3282,6 +3287,7 @@ async fn mutate_saved_replay_tab_inner(
                 .into_response()
         }
         Err(WorkspaceTransformError::CommittedButUncertain(error)) => {
+            state.mark_workspace_retention_durability(&session, false);
             tracing::warn!(%error, "saved Replay tab update committed with uncertain durability");
             saved_http_tab_uncertain_response()
         }
@@ -4635,6 +4641,180 @@ async fn clear_findings(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryRetentionPayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_config_token: Option<String>,
+    policy: crate::history_retention::HistoryRetentionPolicy,
+}
+
+async fn get_history_retention(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionScopedQuery>,
+) -> Response {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = state
+        .session_operation_lock(session.id())
+        .await
+        .lock_owned()
+        .await;
+    if !state.is_current_session_context(&session).await {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history settings context changed; reload before reading.",
+        )
+            .into_response();
+    }
+    let _mutation_guard = session.mutation_guard().await;
+    Json(
+        crate::history_retention::snapshot(
+            &session,
+            state.workspace_retention_is_uncertain(session.id()),
+            state.retention_persistence_is_uncertain(session.id()),
+            None,
+        )
+        .await,
+    )
+    .into_response()
+}
+
+async fn update_history_retention(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionWriteQuery>,
+    Json(payload): Json<HistoryRetentionPayload>,
+) -> Response {
+    tokio::spawn(update_history_retention_inner(state, query, payload)).await.unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "HTTP history retention update outcome is unknown; reload this session before retrying.").into_response()
+    })
+}
+
+async fn update_history_retention_inner(
+    state: Arc<AppState>,
+    query: SessionWriteQuery,
+    payload: HistoryRetentionPayload,
+) -> Response {
+    use crate::history_retention::history_retention_config_token;
+    let (target_session_id, explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
+    let session = match resolve_read_session_for_optional_id(&state, target_session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        Some(session.id()),
+    ) {
+        return response;
+    }
+    if !state.is_current_session_context(&session).await {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history settings context changed; reload before saving.",
+        )
+            .into_response();
+    }
+    let Some(expected) = payload.expected_config_token.as_deref() else {
+        return (StatusCode::PRECONDITION_REQUIRED, "HTTP history retention requires expected_config_token from a fresh GET /api/transactions/retention.").into_response();
+    };
+    let read_guard = session.mutation_guard().await;
+    let (read_policy, read_revision) = session.runtime.history_retention_config().await;
+    if expected != history_retention_config_token(session.id(), &read_policy, read_revision) {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history retention changed; reload and review before saving.",
+        )
+            .into_response();
+    }
+    drop(read_guard);
+    let session = if state.sessions.active_session_id() == session.id() {
+        session
+    } else {
+        match state
+            .session_context_for_id_operation_locked(session.id())
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => return session_load_failure_response(session.id(), error),
+        }
+    };
+    let _mutation_guard = session.mutation_guard().await;
+    let (previous, revision) = session.runtime.history_retention_config().await;
+    if expected != history_retention_config_token(session.id(), &previous, revision) {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history retention changed; reload before saving.",
+        )
+            .into_response();
+    }
+    let changed = previous != payload.policy;
+    let next_revision = if changed {
+        match revision.checked_add(1) {
+            Some(next) => next,
+            None => return (StatusCode::CONFLICT, Json(serde_json::json!({"code":"RETENTION_REVISION_EXHAUSTED","error":"HTTP history retention settings revision is exhausted; settings were not changed."}))).into_response(),
+        }
+    } else {
+        revision
+    };
+    // A policy-only save cannot compact or remove traffic. The independent
+    // worker cannot acquire these locks until this durable write has finished.
+    if let Err(error) = session
+        .persist_history_retention_policy(payload.policy, next_revision)
+        .await
+    {
+        state.mark_retention_policy_durability(&session, false);
+        tracing::warn!(?error, session_id = %session.id(), "failed to persist HTTP history retention policy");
+        let (code, message) = match error {
+            crate::history_retention::PolicyWriteError::NotCommitted => ("RETENTION_NOT_COMMITTED", "HTTP history retention could not be saved. Previous settings remain; cleanup is paused until a successful settings save."),
+            _ => ("RETENTION_COMMIT_UNCERTAIN", "HTTP history retention write outcome is uncertain. Cleanup is paused; reload settings and save again to confirm durability."),
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"code":code,"error":message})),
+        )
+            .into_response();
+    }
+    state.mark_retention_policy_durability(&session, true);
+    state.start_history_retention_worker(&session);
+    session.store.notify_retention_work();
+    Json(
+        crate::history_retention::snapshot(
+            &session,
+            state.workspace_retention_is_uncertain(session.id()),
+            state.retention_persistence_is_uncertain(session.id()),
+            Some(changed),
+        )
+        .await,
+    )
+    .into_response()
 }
 
 async fn get_scanner_config(
@@ -7315,6 +7495,7 @@ async fn events(
     let mut websocket_retention_receiver = session.websockets.subscribe_retention();
     let mut workspace_receiver = session.workspace.subscribe();
     let latest_sequence = session.store.latest_event_sequence();
+    let mut retention_event_boundary = 0;
     let event_stream_started_for_active_session = state.sessions.active_session_id() == session_id;
 
     let stream = stream! {
@@ -7345,6 +7526,7 @@ async fn events(
                 result = transaction_receiver.recv() => {
                     match result {
                         Ok(event) => {
+                            if event.event_sequence <= retention_event_boundary { continue; }
                             let summary = event.summary;
                             if let Ok(payload) = serde_json::to_string(&summary) {
                                 yield Ok(Event::default()
@@ -7364,10 +7546,16 @@ async fn events(
                 }
                 result = transaction_retention_receiver.recv() => {
                     match result {
-                        Ok(()) => {
-                            yield Ok(Event::default()
-                                .event("transactions_gap")
-                                .data("retention"));
+                        Ok(crate::store::TransactionRetentionEvent::Gap) => {
+                            yield Ok(Event::default().event("transactions_gap").data("retention"));
+                        }
+                        Ok(crate::store::TransactionRetentionEvent::Deleted { ids, generation, event_sequence }) => {
+                            retention_event_boundary = retention_event_boundary.max(event_sequence);
+                            let payload = serde_json::json!({ "session_id": session_id, "ids": ids, "generation": generation, "event_sequence": event_sequence });
+                            yield Ok(Event::default().event("retention_deleted").id(event_sequence.to_string()).data(payload.to_string()));
+                            // Queued pre-deletion summaries may be skipped above;
+                            // refetch fills in unrelated changes without reviving IDs.
+                            yield Ok(Event::default().event("transactions_gap").data("retention"));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             yield Ok(Event::default()
@@ -20602,6 +20790,1077 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         assert!(session.store.get(id).await.is_none());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+    fn history_retention_policy(target: u32) -> crate::history_retention::HistoryRetentionPolicy {
+        crate::history_retention::HistoryRetentionPolicy::KeepNewest {
+            max_entries: std::num::NonZeroU32::new(target).unwrap(),
+        }
+    }
+
+    async fn history_retention_save(
+        state: &Arc<AppState>,
+        session: &Arc<crate::session::SessionContext>,
+        policy: crate::history_retention::HistoryRetentionPolicy,
+    ) -> axum::response::Response {
+        let (policy_before, revision) = session.runtime.history_retention_config().await;
+        let token = crate::history_retention::history_retention_config_token(
+            session.id(),
+            &policy_before,
+            revision,
+        );
+        super::update_history_retention(
+            State(state.clone()),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session.id()),
+                expected_active_session_id: None,
+            }),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some(token),
+                policy,
+            }),
+        )
+        .await
+    }
+
+    async fn history_retention_records(
+        session: &Arc<crate::session::SessionContext>,
+        count: usize,
+    ) -> Vec<Uuid> {
+        // Persist this opt-out with the fixture so journal recovery cannot run
+        // optional scanner rules when a retention test reloads its synthetic rows.
+        let mut scanner_config = session.scanner.get_config().await;
+        scanner_config.enabled = false;
+        session.scanner.update_config(scanner_config).await;
+        let mut ids = Vec::new();
+        for index in 0..count {
+            let body = format!("synthetic history body {index}");
+            let record = TransactionRecord::http(
+                chrono::Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "example.com".into(),
+                format!("/{index}"),
+                Some(200),
+                1,
+                MessageRecord::from_headers_and_body(&HeaderMap::new(), body.as_bytes(), 4096),
+                None,
+                vec![],
+                None,
+                None,
+            );
+            ids.push(record.id);
+            session.store.insert(record).await;
+        }
+        // Leave no insert journal for restart tests; scanner remains disabled
+        // in stored state even if a later operation appends another journal entry.
+        session.persist().await.unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(session.storage_dir().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["scanner_config"]["enabled"], false);
+        ids
+    }
+
+    async fn history_retention_raw_request(
+        state: Arc<AppState>,
+        uri: &str,
+        body: &str,
+    ) -> axum::response::Response {
+        use hyper::service::Service;
+
+        // Drive the actual router and extractors without a listener or client.
+        let service = hyper_util::service::TowerToHyperService::new(super::router(state));
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap();
+        service.call(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_malformed_json_with_400() {
+        let (state, path) = test_state("history-retention-router-syntax");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [r#"{"policy":{"mode":"off"}"#, r#"{"policy":]}"#] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_semantic_policy_errors_with_422() {
+        let (state, path) = test_state("history-retention-router-policy");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [
+            r#"{"policy":{"mode":"keep_newest","max_entries":0}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":4294967296}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":-1}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1.5}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1e3}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":null}}"#,
+            r#"{"policy":{"mode":"keep_newest"}}"#,
+            r#"{"policy":{"mode":"unknown"}}"#,
+            r#"{"policy":null}"#,
+        ] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_unknown_fields_with_422() {
+        let (state, path) = test_state("history-retention-router-unknown-field");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [
+            r#"{"policy":{"mode":"off"},"config_token":"unexpected"}"#,
+            r#"{"policy":{"mode":"off","max_entries":1}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1,"extra":true}}"#,
+        ] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_missing_token_with_428() {
+        let (state, path) = test_state("history-retention-router-missing-token");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [
+            r#"{"policy":{"mode":"off"}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1}}"#,
+        ] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::PRECONDITION_REQUIRED,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_conflicting_session_ids_with_400() {
+        let (state, path) = test_state("history-retention-router-conflicting-session");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        let current = crate::history_retention::snapshot(&session, false, false, None).await;
+        let body = serde_json::json!({
+            "session_id": Uuid::new_v4(),
+            "expected_config_token": current.config_token,
+            "policy": {"mode": "keep_newest", "max_entries": 1}
+        });
+        let response = history_retention_raw_request(state.clone(), &uri, &body.to_string()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            b"query session_id conflicts with JSON session_id"
+        );
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    async fn history_retention_wait_count(
+        session: &Arc<crate::session::SessionContext>,
+        expected: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.store.len().await != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn history_retention_input_is_strict_and_persisted_invalid_policy_is_off() {
+        use crate::history_retention::HistoryRetentionPolicy;
+        for invalid in [
+            serde_json::json!({"mode":"keep_newest","max_entries":0}),
+            serde_json::json!({"mode":"keep_newest","max_entries":4294967296u64}),
+            serde_json::json!({"mode":"off","max_entries":1}),
+            serde_json::json!({"mode":"unknown"}),
+            serde_json::Value::Null,
+        ] {
+            assert!(serde_json::from_value::<HistoryRetentionPolicy>(invalid.clone()).is_err());
+            let settings: crate::runtime::RuntimeSettingsSnapshot = serde_json::from_value(serde_json::json!({"http_history_retention":invalid,"http_capture_enabled":false,"scope_patterns":["example.com"]})).unwrap();
+            assert_eq!(settings.http_history_retention, HistoryRetentionPolicy::Off);
+            assert!(!settings.http_capture_enabled);
+            assert_eq!(settings.scope_patterns, ["example.com"]);
+        }
+        assert_eq!(
+            serde_json::from_str::<crate::runtime::RuntimeSettingsSnapshot>("{}")
+                .unwrap()
+                .http_history_retention,
+            HistoryRetentionPolicy::Off
+        );
+        assert!(serde_json::from_value::<super::HistoryRetentionPayload>(serde_json::json!({"policy":{"mode":"off"},"expected_config_token":"x","config_token":"other"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn history_retention_default_off_does_not_persist_or_delete_and_worker_drops() {
+        let (state, path) = test_state("history-retention-off");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 4).await;
+        let files = ["state.json", "snapshot.json", "transactions.ndjson"];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(session.storage_dir().join(name)).unwrap())
+            .collect();
+        for _ in 0..8 {
+            session.store.notify_retention_work();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(session.store.len().await, ids.len());
+        for (name, bytes) in files.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(session.storage_dir().join(name)).unwrap(),
+                bytes
+            );
+        }
+        let weak = Arc::downgrade(&session);
+        drop(session);
+        drop(state);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_token_is_count_independent_and_session_bound() {
+        let (state, path) = test_state("history-retention-token");
+        let session = state.session().await;
+        let policy = session.runtime.history_retention_policy().await;
+        let token =
+            crate::history_retention::history_retention_config_token(session.id(), &policy, 0);
+        history_retention_records(&session, 2).await;
+        let snapshot = crate::history_retention::snapshot(&session, false, false, None).await;
+        assert_eq!(token, snapshot.config_token);
+        assert_ne!(
+            token,
+            crate::history_retention::history_retention_config_token(Uuid::new_v4(), &policy, 0)
+        );
+        let query = super::SessionWriteQuery {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+        };
+        let response = super::update_history_retention(
+            State(state.clone()),
+            Query(query.clone()),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some("stale".into()),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = super::update_history_retention(
+            State(state.clone()),
+            Query(query),
+            Json(super::HistoryRetentionPayload {
+                session_id: Some(Uuid::new_v4()),
+                expected_config_token: Some(token),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(session.store.len().await, 2);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_failed_policy_write_never_deletes_and_uncertain_commit_is_explicit()
+    {
+        for fault in [
+            crate::session::WorkspaceWriteFault::BeforeReplacement,
+            crate::session::WorkspaceWriteFault::AfterReplacement,
+        ] {
+            let (state, path) = test_state("history-retention-policy-failure");
+            let session = state.session().await;
+            history_retention_records(&session, 3).await;
+            session.fail_next_history_retention_write(fault);
+            let response =
+                history_retention_save(&state, &session, history_retention_policy(1)).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = response_body_json(response).await;
+            assert_eq!(
+                body["code"],
+                match fault {
+                    crate::session::WorkspaceWriteFault::BeforeReplacement =>
+                        "RETENTION_NOT_COMMITTED",
+                    _ => "RETENTION_COMMIT_UNCERTAIN",
+                }
+            );
+            for _ in 0..20 {
+                session.store.notify_retention_work();
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(session.store.len().await, 3);
+            assert_eq!(
+                crate::history_retention::snapshot(&session, false, false, None)
+                    .await
+                    .status
+                    .blocked_reason,
+                Some(crate::history_retention::HistoryRetentionBlockedReason::PersistenceError)
+            );
+            let persisted: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(session.storage_dir().join("state.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                persisted["runtime"]["http_history_retention"]["mode"],
+                match fault {
+                    crate::session::WorkspaceWriteFault::BeforeReplacement => "off",
+                    _ => "keep_newest",
+                }
+            );
+            let retry = history_retention_save(&state, &session, history_retention_policy(1)).await;
+            assert_eq!(retry.status(), StatusCode::OK);
+            history_retention_wait_count(&session, 1).await;
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_retention_durable_replay_sources_protected_and_removed_tab_wakes_worker() {
+        let (state, path) = test_state("history-retention-protected");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 3).await;
+        let mut workspace = session.workspace.snapshot().await;
+        workspace.replay.tabs = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| crate::workspace::ReplayTabState {
+                id: format!("tab-{index}"),
+                source_transaction_id: Some(*id),
+                ..Default::default()
+            })
+            .collect();
+        workspace.replay.active_tab_id = Some("tab-0".into());
+        state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let status = crate::history_retention::snapshot(&session, false, false, None)
+            .await
+            .status;
+        assert_eq!((status.total_count, status.protected_count), (3, 3));
+        assert_eq!(
+            status.blocked_reason,
+            Some(crate::history_retention::HistoryRetentionBlockedReason::ProtectedRecords)
+        );
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let operation_guard = operation_lock.lock().await;
+        let mut workspace = session.workspace.snapshot().await;
+        workspace.replay.tabs.truncate(1);
+        state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        drop(operation_guard);
+        history_retention_wait_count(&session, 1).await;
+        assert!(session.store.get(ids[0]).await.is_some());
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_late_workspace_save_keeps_deleted_source_absent() {
+        let (state, path) = test_state("history-retention-late-workspace-save");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 3).await;
+        let deleted_source = ids[0];
+        let survivor = ids[2];
+        let draft = "GET /late-save HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut unsaved = session.workspace.snapshot().await;
+        unsaved.session_id = Some(session.id());
+        unsaved.replay.tabs.push(crate::workspace::ReplayTabState {
+            id: "saved-after-source-deletion".into(),
+            tab_type: "http".into(),
+            source_transaction_id: Some(deleted_source),
+            request_text: draft.into(),
+            ..Default::default()
+        });
+        unsaved.replay.active_tab_id = Some("saved-after-source-deletion".into());
+
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        history_retention_wait_count(&session, 1).await;
+        assert!(session.store.get(deleted_source).await.is_none());
+        assert!(session.store.get(survivor).await.is_some());
+
+        // Use the ordinary save handler, including its shared operation lock and
+        // mutation-safe persistence. Saving a reference does not recreate a row.
+        let response = super::update_workspace_state(State(state.clone()), Json(unsaved)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: crate::workspace::WorkspaceStateSnapshot = response_json(response).await;
+        assert_eq!(saved.replay.tabs.len(), 1);
+        assert_eq!(saved.replay.tabs[0].request_text, draft);
+        assert_eq!(
+            saved.replay.tabs[0].source_transaction_id,
+            Some(deleted_source)
+        );
+        assert_eq!(session.store.len().await, 1);
+        assert!(session.store.get(deleted_source).await.is_none());
+
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let operation_guard = operation_lock.lock().await;
+        let status = crate::history_retention::snapshot(&session, false, false, None).await;
+        assert_eq!(status.status.protected_count, 0);
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert!(!reloaded.scanner.get_config().await.enabled);
+        let restored = reloaded.workspace.snapshot().await;
+        assert_eq!(restored.replay.tabs.len(), 1);
+        assert_eq!(restored.replay.tabs[0].request_text, draft);
+        assert_eq!(
+            restored.replay.tabs[0].source_transaction_id,
+            Some(deleted_source)
+        );
+        assert_eq!(reloaded.store.len().await, 1);
+        assert!(reloaded.store.get(deleted_source).await.is_none());
+        assert!(reloaded.store.get(survivor).await.is_some());
+        drop(reloaded);
+        drop(operation_guard);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_disable_and_raise_are_rechecked_between_chunks() {
+        for disable in [true, false] {
+            let (state, path) = test_state("history-retention-chunks");
+            let session = state.session().await;
+            history_retention_records(&session, 300).await;
+            let (entered, resume) = session.history_retention.pause_after_next_chunk();
+            assert_eq!(
+                history_retention_save(&state, &session, history_retention_policy(1))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.store.len().await, 44);
+            let policy = if disable {
+                crate::history_retention::HistoryRetentionPolicy::Off
+            } else {
+                history_retention_policy(100)
+            };
+            assert_eq!(
+                history_retention_save(&state, &session, policy)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            resume.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while session.store.retention_compaction_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(session.store.len().await, 44);
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_retention_uncertain_read_only_workspace_survives_promotion() {
+        let (state, path) = test_state("history-retention-promotion");
+        let config = state.config.clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let session = state.session_context_for_id(inactive.id).await.unwrap();
+        history_retention_records(&session, 3).await;
+        drop(session);
+        drop(state);
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state
+            .read_session_context_for_id(inactive.id)
+            .await
+            .unwrap();
+        assert!(!session.retention_writable());
+        session.fail_next_workspace_write(crate::session::WorkspaceWriteFault::AfterReplacement);
+        let operation_lock = state.session_operation_lock(inactive.id).await;
+        let guard = operation_lock.lock().await;
+        let workspace = session.workspace.snapshot().await;
+        assert!(matches!(
+            state
+                .replace_workspace_state_and_persist(&session, workspace)
+                .await,
+            Err(crate::workspace::WorkspaceReplaceError::CommittedButUncertain(_))
+        ));
+        assert!(state.workspace_retention_is_uncertain(inactive.id));
+        drop(guard);
+        let read = state
+            .read_session_context_for_id(inactive.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            history_retention_save(&state, &read, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let promoted = state.session_context_for_id(inactive.id).await.unwrap();
+        assert!(promoted.retention_writable());
+        for _ in 0..15 {
+            promoted.store.notify_retention_work();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(promoted.store.len().await, 3);
+        assert_eq!(crate::history_retention::snapshot(&promoted, true, false, None).await.status.blocked_reason, Some(crate::history_retention::HistoryRetentionBlockedReason::WorkspaceDurabilityUncertain));
+        // A GET is not proof of fsync and must not lift the session-ID gate.
+        let response = super::get_history_retention(
+            State(state.clone()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(inactive.id),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.workspace_retention_is_uncertain(inactive.id));
+        let guard = operation_lock.lock().await;
+        state
+            .replace_workspace_state_and_persist(&promoted, promoted.workspace.snapshot().await)
+            .await
+            .unwrap();
+        drop(guard);
+        history_retention_wait_count(&promoted, 1).await;
+        assert_eq!(state.session().await.store.len().await, 0);
+        drop(promoted);
+        drop(read);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn history_retention_uncertain_policy_survives_canonical_context_replacement() {
+        let (state, path) = test_state("history-retention-policy-context");
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let session = state.session_context_for_id(inactive.id).await.unwrap();
+        history_retention_records(&session, 3).await;
+        session.fail_next_history_retention_write(
+            crate::session::WorkspaceWriteFault::AfterReplacement,
+        );
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(state.retention_persistence_is_uncertain(inactive.id));
+        let reloaded = state.sessions.load_context_read_only(inactive.id).unwrap();
+        let operation_lock = state.session_operation_lock(inactive.id).await;
+        let guard = operation_lock.lock().await;
+        state
+            .replace_workspace_state_and_persist(&reloaded, reloaded.workspace.snapshot().await)
+            .await
+            .unwrap();
+        drop(guard);
+        let replacement = state.session_context_for_id(inactive.id).await.unwrap();
+        assert!(!Arc::ptr_eq(&session, &replacement));
+        for _ in 0..15 {
+            replacement.store.notify_retention_work();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(replacement.store.len().await, 3);
+        let response = super::get_history_retention(
+            State(state.clone()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(inactive.id),
+            }),
+        )
+        .await;
+        let current: crate::history_retention::HistoryRetentionSnapshot =
+            response_json(response).await;
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(crate::history_retention::HistoryRetentionBlockedReason::PersistenceError)
+        );
+        assert_eq!(
+            history_retention_save(&state, &replacement, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        history_retention_wait_count(&replacement, 1).await;
+        drop(replacement);
+        drop(reloaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_new_durable_replay_reference_wins_between_chunks() {
+        let (state, path) = test_state("history-retention-replay-race");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 300).await;
+        let (entered, resume) = session.history_retention.pause_after_next_chunk();
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let protected = ids[256];
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let guard = operation_lock.lock().await;
+        let mut workspace = session.workspace.snapshot().await;
+        workspace
+            .replay
+            .tabs
+            .push(crate::workspace::ReplayTabState {
+                id: "saved-between-chunks".into(),
+                tab_type: "http".into(),
+                source_transaction_id: Some(protected),
+                ..Default::default()
+            });
+        workspace.replay.active_tab_id = Some("saved-between-chunks".into());
+        state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        drop(guard);
+        resume.send(()).unwrap();
+        history_retention_wait_count(&session, 1).await;
+        assert!(session.store.get(protected).await.is_some());
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_malformed_persisted_policy_preserves_unrelated_state() {
+        let (state, path) = test_state("history-retention-malformed-policy");
+        let session = state.session().await;
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(false),
+                scope_patterns: Some(vec!["example.com".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        session.persist().await.unwrap();
+        let file = session.storage_dir().join("state.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        value["runtime"]["http_history_retention"] =
+            serde_json::json!({"mode":"future_unsupported","max_entries":-1});
+        std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let read = state.sessions.load_context_read_only(session.id()).unwrap();
+        let runtime = read.runtime.snapshot().await;
+        assert_eq!(
+            runtime.http_history_retention,
+            crate::history_retention::HistoryRetentionPolicy::Off
+        );
+        assert!(!runtime.http_capture_enabled);
+        assert_eq!(runtime.scope_patterns, ["example.com"]);
+        assert!(file.is_file());
+        drop(read);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_runtime_update_cannot_bypass_policy_cas() {
+        let (state, path) = test_state("history-retention-runtime-bypass");
+        let session = state.session().await;
+        let update:crate::runtime::RuntimeSettingsUpdate=serde_json::from_value(serde_json::json!({"http_capture_enabled":false,"http_history_retention":{"mode":"keep_newest","max_entries":1}})).unwrap();
+        session.runtime.update(update).await.unwrap();
+        assert_eq!(
+            session.runtime.history_retention_policy().await,
+            crate::history_retention::HistoryRetentionPolicy::Off
+        );
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_revision_prevents_aba_survives_restart_and_noop_is_stable() {
+        use crate::history_retention::{
+            history_retention_config_token, HistoryRetentionPolicy, HistoryRetentionSnapshot,
+        };
+        let (state, path) = test_state("history-retention-revision");
+        let session = state.session().await;
+        let initial = crate::history_retention::snapshot(&session, false, false, None).await;
+        assert_eq!(initial.config_revision, "0");
+        let enabled: HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, history_retention_policy(10)).await,
+        )
+        .await;
+        assert_eq!(enabled.config_revision, "1");
+        assert_eq!(enabled.changed, Some(true));
+        let disabled: HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, HistoryRetentionPolicy::Off).await,
+        )
+        .await;
+        assert_eq!(disabled.config_revision, "2");
+        assert_ne!(initial.config_token, disabled.config_token);
+        let query = super::SessionWriteQuery {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+        };
+        let stale = super::update_history_retention(
+            State(state.clone()),
+            Query(query.clone()),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some(initial.config_token),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let foreign = super::update_history_retention(
+            State(state.clone()),
+            Query(query),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some(history_retention_config_token(
+                    Uuid::new_v4(),
+                    &HistoryRetentionPolicy::Off,
+                    2,
+                )),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::CONFLICT);
+        let noop: HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, HistoryRetentionPolicy::Off).await,
+        )
+        .await;
+        assert_eq!(noop.changed, Some(false));
+        assert_eq!(noop.config_token, disabled.config_token);
+        assert_eq!(noop.config_revision, "2");
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        let (policy, revision) = reloaded.runtime.history_retention_config().await;
+        assert_eq!(revision, 2);
+        assert_eq!(
+            history_retention_config_token(session.id(), &policy, revision),
+            noop.config_token
+        );
+        drop(reloaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_revision_unknown_ack_is_visible_and_retry_keeps_revision() {
+        let (state, path) = test_state("history-retention-revision-uncertain");
+        let session = state.session().await;
+        session.fail_next_history_retention_write(
+            crate::session::WorkspaceWriteFault::AfterReplacement,
+        );
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(10))
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let current: crate::history_retention::HistoryRetentionSnapshot = response_json(
+            super::get_history_retention(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(session.id()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(current.config_revision, "1");
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(crate::history_retention::HistoryRetentionBlockedReason::PersistenceError)
+        );
+        let confirmed: crate::history_retention::HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, history_retention_policy(10)).await,
+        )
+        .await;
+        assert_eq!(confirmed.config_revision, "1");
+        assert_eq!(confirmed.config_token, current.config_token);
+        assert_eq!(confirmed.changed, Some(false));
+        assert_eq!(confirmed.status.blocked_reason, None);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_revision_exhaustion_rejects_changes_but_preserves_noop() {
+        let (state, path) = test_state("history-retention-revision-max");
+        let session = state.session().await;
+        session
+            .runtime
+            .set_history_retention_policy(history_retention_policy(10), u64::MAX)
+            .await;
+        let response = history_retention_save(
+            &state,
+            &session,
+            crate::history_retention::HistoryRetentionPolicy::Off,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value = response_body_json(response).await;
+        assert_eq!(value["code"], "RETENTION_REVISION_EXHAUSTED");
+        let current: crate::history_retention::HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, history_retention_policy(10)).await,
+        )
+        .await;
+        assert_eq!(current.config_revision, u64::MAX.to_string());
+        assert_eq!(current.changed, Some(false));
+        let loaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert_eq!(
+            loaded.runtime.history_retention_config().await,
+            (history_retention_policy(10), u64::MAX)
+        );
+        drop(loaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_invalid_revision_fails_off_without_discarding_other_state() {
+        let (state, path) = test_state("history-retention-invalid-revision");
+        let session = state.session().await;
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        session.persist().await.unwrap();
+        let file = session.storage_dir().join("state.json");
+        for invalid in [
+            serde_json::json!("bad"),
+            serde_json::Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            value["runtime"]["http_history_retention"] =
+                serde_json::json!({"mode":"keep_newest","max_entries":1});
+            value["runtime"]["http_history_retention_revision"] = invalid;
+            std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+            let loaded = state.sessions.load_context_read_only(session.id()).unwrap();
+            assert_eq!(
+                loaded.runtime.history_retention_config().await,
+                (
+                    crate::history_retention::HistoryRetentionPolicy::Off,
+                    u64::MAX
+                )
+            );
+            assert!(!loaded.runtime.http_capture_enabled().await);
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn history_retention_many_later_inserts_do_not_rewrite_each_time() {
+        let (state, path) = test_state("history-retention-coalesced");
+        let session = state.session().await;
+        history_retention_records(&session, 3).await;
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        history_retention_wait_count(&session, 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.store.retention_compaction_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .history_retention
+                .compactions_started
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        for index in 0..20 {
+            let record = TransactionRecord::http(
+                chrono::Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "example.com".into(),
+                format!("/later-{index}"),
+                Some(200),
+                1,
+                MessageRecord::from_headers_and_body(&HeaderMap::new(), b"fixture", 4096),
+                None,
+                vec![],
+                None,
+                None,
+            );
+            session.store.insert(record).await;
+            history_retention_wait_count(&session, 1).await;
+        }
+        assert!(session.store.retention_compaction_pending());
+        assert_eq!(
+            session
+                .history_retention
+                .compactions_started
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn history_retention_read_only_restart_reports_uncompacted_tombstones() {
+        let (state, path) = test_state("history-retention-restart-status");
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let session = state.session_context_for_id(inactive.id).await.unwrap();
+        let ids = history_retention_records(&session, 3).await;
+        let operation_lock = state.session_operation_lock(inactive.id).await;
+        let guard = operation_lock.lock().await;
+        // Direct primitive creates only a deletion journal after the full fixture
+        // snapshot, so read-only recovery never runs a scanner or inserts traffic.
+        let outcome = session
+            .store
+            .trim_retention(1, &std::collections::HashSet::new(), 256)
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_ids.len(), 2);
+        let read = state.sessions.load_context_read_only(inactive.id).unwrap();
+        assert_eq!(read.store.len().await, 1);
+        assert!(read.store.retention_compaction_pending());
+        let status = crate::history_retention::snapshot(&read, false, false, None).await;
+        assert!(status.status.disk_cleanup_pending);
+        assert!(status.status.pending);
+        assert!(read.store.get(ids[2]).await.is_some());
+        let reloaded = state.sessions.load_context(inactive.id).unwrap();
+        assert_eq!(reloaded.store.len().await, 1);
+        assert!(!reloaded.store.retention_compaction_pending());
+        assert_eq!(
+            reloaded
+                .store
+                .get(ids[2])
+                .await
+                .unwrap()
+                .request
+                .body_preview,
+            "synthetic history body 2"
+        );
+        drop(reloaded);
+        drop(read);
+        drop(guard);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 

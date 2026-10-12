@@ -69,6 +69,14 @@ sniper-cli call saved.v1.session.rename --input '{"session_id":"00000000-0000-00
 sniper-cli --output compact call saved.v1.operation.get --input '{"operation_id":"22222222-2222-2222-2222-222222222222"}'
 ```
 
+### Opt-in HTTP history retention
+
+`capture http retention get [--session-id <uuid>]` reads saved policy and cleanup metadata. `capture http retention set (--off|--max-entries N) [--session-id <uuid>]` requires `--yes`; `--dry-run` is fully offline and shows the exact policy without predicting deletion counts. Canonical names are `capture.http.retention.get` and `capture.http.retention.set`; call input uses `off: true` or integer `max_entries` (1–4294967295), plus optional `session_id`.
+
+Off is the default and preserves existing traffic. Enabling keep-newest is a destructive opt-in: get explicit user approval before allowing automatic permanent deletion. N is a soft total-history target, including protected rows; oldest unprotected excess rows are removed first. In-progress records and source originals referenced by durably saved HTTP Replay tabs remain protected, even unpinned tabs. Totals may exceed N. Unsaved browser state does not establish protection.
+
+The CLI pins one session, fetches its policy-configuration token, and sends one compare-and-swap write. Prefer an explicit UUID. Saved-policy acknowledgement (`changed`) is separate from status (`pending`, `disk_cleanup_pending`, `blocked_reason`); it does not prove cleanup or disk reclamation is finished. After an uncertain write, deliberately inspect `capture http retention get --session-id <the same UUID>`; never automatically retry, switch sessions, or treat a lost response as no change. Off stops further automatic record deletion; pending disk reclamation for already-deleted records may finish. It does not restore deleted history.
+
 ### Existing saved-data commands
 
 Use the existing commands below when the requested operation is outside v1 or the installed version does not support v1. Their raw success output and retry semantics do not acquire the v1 receipt contract.

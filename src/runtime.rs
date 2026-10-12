@@ -25,6 +25,13 @@ pub struct RuntimeSettingsSnapshot {
     /// forwarding exactly as before; only the history stops filling.
     #[serde(default = "default_true")]
     pub http_capture_enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_history_retention_for_load")]
+    pub http_history_retention: crate::history_retention::HistoryRetentionPolicy,
+    #[serde(
+        default = "default_history_retention_revision",
+        deserialize_with = "deserialize_history_retention_revision_for_load"
+    )]
+    pub http_history_retention_revision: Option<u64>,
     #[serde(default)]
     pub scope_patterns: Vec<String>,
     /// Hosts taken back out of scope. Applied after the include list, and on their
@@ -47,6 +54,44 @@ pub struct RuntimeSettingsSnapshot {
     pub oast_polling_interval_secs: u64,
     #[serde(default, deserialize_with = "deserialize_oast_provider_for_load")]
     pub oast_provider: crate::oast::OastProvider,
+}
+
+fn default_history_retention_revision() -> Option<u64> {
+    Some(0)
+}
+
+fn deserialize_history_retention_revision_for_load<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // An invalid marker is kept distinct from a valid exhausted revision. It
+    // disables retention without reviving an old legacy CAS token.
+    let revision = value.as_u64();
+    if revision.is_none() {
+        tracing::warn!(
+            "invalid saved HTTP history retention revision; automatic retention disabled"
+        );
+    }
+    Ok(revision)
+}
+
+fn deserialize_history_retention_for_load<'de, D>(
+    deserializer: D,
+) -> std::result::Result<crate::history_retention::HistoryRetentionPolicy, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match serde_json::from_value(value) {
+        Ok(policy) => policy,
+        Err(_) => {
+            tracing::warn!("invalid saved HTTP history retention policy; using off");
+            Default::default()
+        }
+    })
 }
 
 fn deserialize_oast_provider_for_load<'de, D>(
@@ -86,6 +131,8 @@ impl Default for RuntimeSettingsSnapshot {
             intercept_enabled: false,
             websocket_capture_enabled: true,
             http_capture_enabled: true,
+            http_history_retention: Default::default(),
+            http_history_retention_revision: Some(0),
             scope_patterns: Vec::new(),
             excluded_scope_patterns: Vec::new(),
             passthrough_hosts: Vec::new(),
@@ -112,6 +159,9 @@ impl RuntimeSettingsSnapshot {
     }
 
     pub fn sanitized_for_load(mut self) -> Self {
+        if self.http_history_retention_revision.is_none() {
+            self.http_history_retention = Default::default();
+        }
         self.excluded_scope_patterns = normalize_bounded_scope_patterns(
             "excluded scope pattern",
             std::mem::take(&mut self.excluded_scope_patterns),
@@ -301,6 +351,32 @@ impl RuntimeSettings {
         let mut current = self.inner.write().await;
         *current = snapshot.sanitized_for_load();
         current.clone()
+    }
+
+    pub async fn history_retention_policy(
+        &self,
+    ) -> crate::history_retention::HistoryRetentionPolicy {
+        self.inner.read().await.http_history_retention.clone()
+    }
+
+    pub async fn history_retention_config(
+        &self,
+    ) -> (crate::history_retention::HistoryRetentionPolicy, u64) {
+        let current = self.inner.read().await;
+        (
+            current.http_history_retention.clone(),
+            current.http_history_retention_revision.unwrap_or(u64::MAX),
+        )
+    }
+
+    pub(crate) async fn set_history_retention_policy(
+        &self,
+        policy: crate::history_retention::HistoryRetentionPolicy,
+        revision: u64,
+    ) {
+        let mut current = self.inner.write().await;
+        current.http_history_retention = policy;
+        current.http_history_retention_revision = Some(revision);
     }
 
     pub async fn intercept_enabled(&self) -> bool {
