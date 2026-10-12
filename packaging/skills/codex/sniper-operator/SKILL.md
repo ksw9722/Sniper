@@ -104,6 +104,35 @@ Offsets are not full-body or wire offsets. Literal references do not prove calls
 followed links, ownership, or service dependencies; never add them to observed
 traffic counts or silently infer an architecture.
 
+For an explicitly requested comparison of retained socket observations, use
+`scope service-map socket-peer-matches --session-id <active-session-uuid>
+--evidence-id <returned-token>`
+(`target.service_map.socket_peer_matches.get`). The exact source must already
+have an eligible recorded direct-route address. This read never enables capture
+or accepts an arbitrary IP, hostname, or URL. It matches the stored address
+family, IP and port exactly; different ports, proxy routes, unknown routes and
+interface-ambiguous addresses are not grouped. No DNS, TLS, body, header or
+upstream request is performed. Existing retained observations can be inspected
+while capture is Off.
+
+Check the retained-versus-considered row counts, latest-sequence window,
+`source.in_window`, fixed reasons, output bounds and per-origin sample omissions.
+The default is 10,000 retained rows and the hard maximum is 50,000; at most 100
+origin groups, three exact samples per group and 256 KiB are returned. The anchor
+is separate from other matching-row counts. Duplicate UUID rows count separately.
+Do not invent omitted distinct-origin totals or treat `no_matches` as covering
+uninspected rows. Scope matching uses the original captured host.
+
+The GUI can explicitly show one temporary group with a distinct observed endpoint
+node and undirected observation links. It performs no additional read. An origin
+outside the default map is captured in this inspection; its matching-row count
+is not full-session traffic. Every sample uses its exact token for source
+verification, without a UUID fallback. Stale history/session/scope invalidates
+the result; no automatic rescan or persistent aggregate follows. Equal retained
+address values, including imported history, do not prove the same physical
+endpoint, origin ownership or a backend relationship. Socket addresses may reveal
+internal infrastructure; consider this before sharing explicit inspection output.
+
 For explicitly requested retained response-header relationships, use
 `scope service-map link-declarations --session-id <active-session-uuid>
 --evidence-id <returned-token>` (`target.service_map.link_declarations.get`).

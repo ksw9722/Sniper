@@ -467,6 +467,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_link_declarations),
         )
         .route(
+            "/api/target/service-map/socket-peer-matches",
+            get(get_target_service_map_socket_peer_matches),
+        )
+        .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
         )
@@ -5378,6 +5382,16 @@ struct ServiceMapBodyEvidenceQuery {
     evidence_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapSocketPeerMatchesQuery {
+    session_id: Uuid,
+    evidence_id: String,
+    #[serde(default)]
+    in_scope_only: bool,
+    max_records: Option<usize>,
+}
+
 const TECHNOLOGY_CATALOG_HEADER: &str = "x-sniper-technology-catalog-version";
 const INVALID_TECHNOLOGY_CATALOG: &str = "invalid technology catalog version header";
 
@@ -5673,6 +5687,98 @@ async fn get_target_service_map_link_declarations_impl(
             reason,
         ))
         .into_response();
+    }
+    Json(result).into_response()
+}
+
+async fn get_target_service_map_socket_peer_matches(
+    State(state): State<Arc<AppState>>,
+    query: Result<
+        Query<ServiceMapSocketPeerMatchesQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid socket-peer-matches query").into_response()
+        }
+    };
+    get_target_service_map_socket_peer_matches_impl(
+        State(state),
+        Query(query),
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_socket_peer_matches_impl(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapSocketPeerMatchesQuery>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> Response {
+    use crate::service_map_peer_matches::ServiceMapSocketPeerMatches;
+    if !crate::service_map_peer_matches::is_canonical_evidence_id(&query.evidence_id) {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    let max_records = query
+        .max_records
+        .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
+    if !(1..=crate::service_map::MAX_RECORDS).contains(&max_records) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "max_records must be between 1 and 50000",
+        )
+            .into_response();
+    }
+    let missing = |reason| {
+        Json(ServiceMapSocketPeerMatches::missing(
+            query.session_id,
+            query.evidence_id.clone(),
+            query.in_scope_only,
+            max_records,
+            reason,
+        ))
+        .into_response()
+    };
+    // Active-only: no saved-context load, activation, worker, or persistence.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return missing("inactive_session");
+    }
+    let (include, exclude) = session.runtime.scope_lists().await;
+    let result = session
+        .store
+        .service_map_socket_peer_matches(
+            session.id(),
+            &query.evidence_id,
+            query.in_scope_only,
+            max_records,
+            &include,
+            &exclude,
+        )
+        .await;
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    // Same narrow revision check used by metadata-only Link inspection. Body
+    // storage availability must never invalidate already-retained peer evidence.
+    let row_status = session
+        .store
+        .service_map_link_source_status(session.id(), &query.evidence_id)
+        .await;
+    let active = state.active_session_for_read().await;
+    if !Arc::ptr_eq(&active, &session) || !state.sessions.contains_session(session.id()) {
+        return missing("session_source_changed");
+    }
+    if let Err(reason) = row_status {
+        return missing(reason);
     }
     Json(result).into_response()
 }
@@ -15934,6 +16040,215 @@ mod tests {
         drop(active);
         drop(state);
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    fn test_socket_peer_record() -> TransactionRecord {
+        let mut record = test_replay_response_record("/PRIVATE_PATH?token=PRIVATE_QUERY", 200);
+        record.host = "example.com".into();
+        record.observed_socket_peer = Some(crate::model::ObservedSocketPeer::from_remote_addr(
+            record.started_at,
+            crate::model::ObservedSocketPeerRoute::Direct,
+            Some("198.51.100.7:443".parse().unwrap()),
+        ));
+        record
+    }
+
+    #[tokio::test]
+    async fn peer_matches_api_strict_query_and_default_peer_privacy() {
+        let (state, data_dir) = test_state("sniper-peer-matches-query");
+        let active = state.active_session_for_read().await;
+        active.store.insert(test_socket_peer_record()).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let base = format!("?session_id={}&evidence_id={token}", active.id());
+        for query in [
+            String::new(),
+            format!("?session_id={}", active.id()),
+            format!("?evidence_id={token}"),
+            format!("{base}&max_records=0"),
+            format!("{base}&max_records=50001"),
+            format!("{base}&max_records=null"),
+            format!("{base}&in_scope_only=null"),
+            format!("{base}&in_scope_only=1"),
+            format!("{base}&address=PRIVATE_QUERY"),
+            format!("{base}&session_id={}", active.id()),
+            format!("?session_id={}&evidence_id=PRIVATE_QUERY", active.id()),
+            format!(
+                "?session_id={}&evidence_id={}",
+                active.id(),
+                token.replace('-', "")
+            ),
+        ] {
+            let (status, text) = api_route_response(
+                state.clone(),
+                reqwest::Method::GET,
+                &format!("/api/target/service-map/socket-peer-matches{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            assert!(!text.contains("PRIVATE_QUERY"));
+        }
+        let (status, text) = api_route_response(
+            state.clone(),
+            reqwest::Method::GET,
+            &format!("/api/target/service-map/socket-peer-matches{base}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let result: crate::service_map_peer_matches::ServiceMapSocketPeerMatches =
+            serde_json::from_str(&text).unwrap();
+        assert!(result.available && result.complete);
+        assert_eq!(result.status, "no_matches");
+        assert!(result.validate_response(active.id(), &token, false, 10_000));
+        assert!(!text.contains("PRIVATE_PATH") && !text.contains("PRIVATE_QUERY"));
+        for url in [
+            format!("/api/target/service-map?session_id={}", active.id()),
+            format!("/api/target/service-map/evidence{base}"),
+        ] {
+            let (status, text) =
+                api_route_response(state.clone(), reqwest::Method::GET, &url, None).await;
+            assert_eq!(status, reqwest::StatusCode::OK);
+            assert!(!text.contains("198.51.100.7") && !text.contains("socket_peer"));
+        }
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn peer_matches_api_inactive_is_read_only_without_saved_context_loading() {
+        let (state, data_dir) = test_state("sniper-peer-matches-inactive");
+        let active = state.active_session_for_read().await;
+        active.store.insert(test_socket_peer_record()).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive peer fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                (
+                    p.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&p).unwrap(),
+                        std::fs::metadata(&p).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let result: crate::service_map_peer_matches::ServiceMapSocketPeerMatches = response_json(
+            super::get_target_service_map_socket_peer_matches(
+                State(state.clone()),
+                Ok(Query(super::ServiceMapSocketPeerMatchesQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                    in_scope_only: false,
+                    max_records: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result.reasons, ["inactive_session"]);
+        assert!(result.peer.is_none() && result.snapshot.is_none());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                (
+                    p.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&p).unwrap(),
+                        std::fs::metadata(&p).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn peer_matches_api_revalidates_source_and_active_session_before_publication() {
+        for change in ["session", "mutation", "deletion"] {
+            let (state, data_dir) = test_state("sniper-peer-matches-publication");
+            let active = state.active_session_for_read().await;
+            let record = test_socket_peer_record();
+            let id = record.id;
+            active.store.insert(record).await;
+            let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+                .evidence_id
+                .clone();
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = active.id();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_socket_peer_matches_impl(
+                    State(read_state),
+                    Query(super::ServiceMapSocketPeerMatchesQuery {
+                        session_id,
+                        evidence_id: token,
+                        in_scope_only: false,
+                        max_records: Some(10),
+                    }),
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match change {
+                "session" => {
+                    state
+                        .create_session(Some("New peer fixture".into()))
+                        .await
+                        .unwrap();
+                    "session_source_changed"
+                }
+                "mutation" => {
+                    active
+                        .store
+                        .update_record(id, |r| r.observed_socket_peer = None)
+                        .await
+                        .unwrap();
+                    "record_changed"
+                }
+                _ => {
+                    active.store.delete_ids(&[id]).await.unwrap();
+                    "record_missing"
+                }
+            };
+            resume.send(()).unwrap();
+            let result: crate::service_map_peer_matches::ServiceMapSocketPeerMatches =
+                response_json(reading.await.unwrap()).await;
+            assert_eq!(result.reasons, [expected]);
+            assert!(!result.available && !result.complete);
+            assert!(
+                result.peer.is_none()
+                    && result.source.is_none()
+                    && result.snapshot.is_none()
+                    && result.origins.is_empty()
+            );
+            assert_eq!(result.counts, Default::default());
+            drop(active);
+            drop(state);
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
     }
 
     #[tokio::test]

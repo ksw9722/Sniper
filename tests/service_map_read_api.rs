@@ -1191,3 +1191,329 @@ async fn retained_link_declarations_api_and_cli_are_metadata_only_and_exact() {
     drop(state);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_peer_matches_api_and_cli_preserve_exact_sources_and_private_defaults() {
+    let dir = std::env::temp_dir().join(format!("sniper-peer-matches-{}", Uuid::new_v4()));
+    let state = Arc::new(
+        AppState::new(AppConfig {
+            data_dir: dir.clone(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 1024,
+        })
+        .unwrap(),
+    );
+    let session = state.session().await;
+    let session_id = session.id();
+    assert!(
+        !session
+            .runtime
+            .snapshot()
+            .await
+            .upstream_peer_capture_enabled
+    );
+    let make = |host: &str, path: &str, route: ObservedSocketPeerRoute, address: Option<&str>| {
+        let mut record = row(path);
+        record.host = host.into();
+        record.observed_socket_peer = Some(ObservedSocketPeer::from_remote_addr(
+            record.started_at,
+            route,
+            address.map(|value| value.parse().unwrap()),
+        ));
+        record
+    };
+    let address = "192.0.2.80:443";
+    let seed = make(
+        "source.allowed.example.com",
+        "/peer/source?key=SYNTHETIC_PRIVATE",
+        ObservedSocketPeerRoute::Direct,
+        Some(address),
+    );
+    let duplicate = seed.id;
+    let mut records = vec![seed];
+    for index in 0..4 {
+        let mut matching = make(
+            "target.allowed.example.com",
+            &format!("/peer/match/{index}"),
+            ObservedSocketPeerRoute::Direct,
+            Some(address),
+        );
+        matching.id = duplicate;
+        records.push(matching);
+    }
+    records.push(make(
+        "target.excluded.example.com",
+        "/peer/excluded",
+        ObservedSocketPeerRoute::Direct,
+        Some(address),
+    ));
+    records.push(make(
+        "port.allowed.example.com",
+        "/peer/port",
+        ObservedSocketPeerRoute::Direct,
+        Some("192.0.2.80:8443"),
+    ));
+    records.push(make(
+        "proxy.allowed.example.com",
+        "/peer/proxy",
+        ObservedSocketPeerRoute::HttpProxy,
+        Some(address),
+    ));
+    let mut unrecorded = row("/peer/unrecorded");
+    unrecorded.observed_socket_peer = None;
+    records.push(unrecorded);
+    records.push(make(
+        "unavailable.allowed.example.com",
+        "/peer/unavailable",
+        ObservedSocketPeerRoute::Direct,
+        None,
+    ));
+    records.push(make(
+        "latest.allowed.example.com",
+        "/peer/latest",
+        ObservedSocketPeerRoute::Direct,
+        Some(address),
+    ));
+    for record in records {
+        session.store.insert(record).await;
+    }
+    session.persist().await.unwrap();
+    let mut events = session.store.subscribe();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let app = sniper::api::router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let map = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id":session_id}),
+    )
+    .await;
+    assert_eq!(map["snapshot"]["retained_rows"], 11);
+    assert!(!map.to_string().contains("192.0.2.80"));
+    let token_for = |path: &str| {
+        map["origins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|origin| origin["endpoints"].as_array().unwrap())
+            .find(|endpoint| endpoint["path"] == path)
+            .unwrap()["evidence"][0]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let seed_token = token_for("/peer/source");
+    let proxy_token = token_for("/peer/proxy");
+    let port_token = token_for("/peer/port");
+    let excluded_token = token_for("/peer/excluded");
+    let ordinary_evidence = read(
+        &dir,
+        &api,
+        "target.service_map.evidence.get",
+        json!({"session_id":session_id,"evidence_id":seed_token}),
+    )
+    .await;
+    assert!(ordinary_evidence.get("socket_peer").is_none());
+    assert!(!ordinary_evidence.to_string().contains("192.0.2.80"));
+
+    // Retained metadata and exact duplicate-row identity must not depend on the
+    // latest UUID's body file or locator, even when grouping several rows.
+    let storage = session.storage_dir().join("transactions.ndjson");
+    let held = session.storage_dir().join("synthetic-peer-body-file-held");
+    std::fs::rename(&storage, &held).unwrap();
+    let result = read(
+        &dir,
+        &api,
+        "target.service_map.socket_peer_matches.get",
+        json!({"session_id":session_id,"evidence_id":seed_token}),
+    )
+    .await;
+    assert_eq!(result["available"], true);
+    assert_eq!(result["status"], "matched");
+    assert_eq!(result["complete"], false);
+    assert_eq!(result["reasons"], json!(["sample_limit"]));
+    assert_eq!(result["source"]["sequence"], "1");
+    assert_eq!(result["source"]["in_window"], true);
+    assert_eq!(
+        result["peer"]["address"],
+        json!({"ip":"192.0.2.80","port":443})
+    );
+    assert_eq!(result["snapshot"]["considered_rows"], 11);
+    assert_eq!(result["counts"]["matching_rows"], 6);
+    assert_eq!(result["counts"]["returned_matching_rows"], 6);
+    assert_eq!(result["counts"]["non_direct_rows"], 1);
+    assert_eq!(result["counts"]["different_peer_rows"], 1);
+    assert_eq!(result["counts"]["not_recorded_rows"], 1);
+    assert_eq!(result["counts"]["unavailable_observation_rows"], 1);
+    assert_eq!(result["counts"]["sample_rows"], 5);
+    assert_eq!(result["counts"]["omitted_sample_rows"], 1);
+    assert_eq!(result["origins"].as_array().unwrap().len(), 3);
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 262144);
+    for forbidden in [
+        "SYNTHETIC_PRIVATE",
+        "body_preview",
+        "authorization",
+        "scope_patterns",
+        "/peer/",
+    ] {
+        assert!(!result.to_string().contains(forbidden), "{forbidden}");
+    }
+    let group = result["origins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|origin| origin["origin"] == "https://target.allowed.example.com")
+        .unwrap();
+    assert_eq!(group["matching_rows"], 4);
+    assert_eq!(group["omitted_samples"], 1);
+    let samples = group["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 3);
+    for sample in samples {
+        let token = sample["evidence_id"].as_str().unwrap();
+        assert_ne!(token, seed_token);
+        assert_eq!(token.split('.').last().unwrap(), duplicate.to_string());
+        let exact = read(
+            &dir,
+            &api,
+            "target.service_map.evidence.get",
+            json!({"session_id":session_id,"evidence_id":token,"include_socket_peer":true}),
+        )
+        .await;
+        assert_eq!(exact["available"], true);
+        assert_eq!(exact["row"]["evidence_id"], token);
+        assert_eq!(exact["row"]["sequence"], sample["sequence"]);
+        assert_eq!(exact["row"]["origin"], group["origin"]);
+        assert_eq!(
+            exact["socket_peer"]["observation"]["observed_at"],
+            sample["observed_at"]
+        );
+        assert_eq!(
+            exact["socket_peer"]["observation"]["address"],
+            result["peer"]["address"]
+        );
+    }
+    std::fs::rename(&held, &storage).unwrap();
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    let window = read(
+        &dir,
+        &api,
+        "target.service_map.socket_peer_matches.get",
+        json!({"session_id":session_id,"evidence_id":seed_token,"max_records":1}),
+    )
+    .await;
+    assert_eq!(window["source"]["in_window"], false);
+    assert_eq!(window["snapshot"]["retained_rows"], 11);
+    assert_eq!(window["snapshot"]["considered_rows"], 1);
+    assert_eq!(window["counts"]["matching_rows"], 1);
+    assert_eq!(
+        window["origins"][0]["origin"],
+        "https://latest.allowed.example.com"
+    );
+    assert_eq!(
+        window["reasons"],
+        json!(["max_records", "source_outside_window"])
+    );
+    let empty = read(
+        &dir,
+        &api,
+        "target.service_map.socket_peer_matches.get",
+        json!({"session_id":session_id,"evidence_id":port_token}),
+    )
+    .await;
+    assert_eq!(empty["status"], "no_matches");
+    assert_eq!(empty["complete"], true);
+    assert_eq!(empty["counts"]["matching_rows"], 0);
+    let proxy = read(
+        &dir,
+        &api,
+        "target.service_map.socket_peer_matches.get",
+        json!({"session_id":session_id,"evidence_id":proxy_token}),
+    )
+    .await;
+    assert_eq!(proxy["status"], "unavailable");
+    assert_eq!(proxy["reasons"], json!(["non_direct_observation"]));
+    assert!(proxy["peer"].is_null() && proxy["source"].is_null() && proxy["snapshot"].is_null());
+
+    session
+        .runtime
+        .update(sniper::runtime::RuntimeSettingsUpdate {
+            scope_patterns: Some(vec!["*.allowed.example.com".into()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let scoped = read(
+        &dir,
+        &api,
+        "target.service_map.socket_peer_matches.get",
+        json!({"session_id":session_id,"evidence_id":seed_token,"in_scope_only":true}),
+    )
+    .await;
+    assert_eq!(scoped["counts"]["matching_rows"], 5);
+    assert_eq!(scoped["counts"]["scope_excluded_rows"], 1);
+    assert_eq!(scoped["origins"].as_array().unwrap().len(), 2);
+    assert!(scoped["origins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|group| group["in_scope"] == true));
+    let outside = read(
+        &dir,
+        &api,
+        "target.service_map.socket_peer_matches.get",
+        json!({"session_id":session_id,"evidence_id":excluded_token,"in_scope_only":true}),
+    )
+    .await;
+    assert_eq!(outside["reasons"], json!(["source_out_of_scope"]));
+    assert!(outside["peer"].is_null());
+    assert!(
+        !session
+            .runtime
+            .snapshot()
+            .await
+            .upstream_peer_capture_enabled
+    );
+    let inspect = format!("{api}/api/target/service-map/socket-peer-matches?session_id={session_id}&evidence_id={seed_token}");
+    for suffix in [
+        "&ip=SYNTHETIC_PRIVATE",
+        "&max_records=0",
+        "&in_scope_only=null",
+        "&max_records=1&max_records=2",
+    ] {
+        let response = client
+            .get(format!("{inspect}{suffix}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(!response.text().await.unwrap().contains("SYNTHETIC_PRIVATE"));
+    }
+    // Deletion acknowledgement counts distinct selected UUIDs, while the
+    // retained matching counts above count all five duplicate rows.
+    assert_eq!(session.store.delete_ids(&[duplicate]).await.unwrap(), 1);
+    let stale: Value = client
+        .get(inspect)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stale["status"], "unavailable");
+    assert_eq!(stale["reasons"], json!(["record_missing"]));
+    assert!(stale["peer"].is_null() && stale["origins"].as_array().unwrap().is_empty());
+    server.abort();
+    drop(session);
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}

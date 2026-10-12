@@ -1502,6 +1502,144 @@ impl TransactionStore {
         }
     }
 
+    /// Explicit retained peer equality. There is no body/locator dependency,
+    /// global peer index, traffic hydration, or ordinary-map projection here.
+    pub async fn service_map_socket_peer_matches(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        in_scope_only: bool,
+        max_records: usize,
+        include: &[String],
+        exclude: &[String],
+    ) -> crate::service_map_peer_matches::ServiceMapSocketPeerMatches {
+        self.service_map_socket_peer_matches_impl(
+            session_id,
+            id,
+            in_scope_only,
+            max_records,
+            include,
+            exclude,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn service_map_socket_peer_matches_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        in_scope_only: bool,
+        max_records: usize,
+        include: &[String],
+        exclude: &[String],
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_peer_matches::ServiceMapSocketPeerMatches {
+        use crate::service_map_peer_matches::{
+            canonical_evidence_key, inspect_retained, ServiceMapSocketPeerMatches,
+        };
+        let max_records = max_records.clamp(1, crate::service_map::MAX_RECORDS);
+        let missing = |reason| {
+            ServiceMapSocketPeerMatches::missing(
+                session_id,
+                id.into(),
+                in_scope_only,
+                max_records,
+                reason,
+            )
+        };
+        let Some(key) = canonical_evidence_key(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        if !crate::scope::PreparedScope::within_limits(
+            include,
+            exclude,
+            crate::service_map_peer_matches::MAX_SCOPE_PATTERN_ENTRIES,
+            crate::service_map_peer_matches::MAX_SCOPE_PATTERN_BYTES,
+        ) {
+            return missing("scope_work_limit");
+        }
+        let generation = self.saved_cursor_generation;
+        let inner = Arc::clone(&self.inner);
+        let evidence_id = id.to_owned();
+        let include = include.to_vec();
+        let exclude = exclude.to_vec();
+        // Bounded CPU work runs off the async executor. One read lock fixes row
+        // membership and revisions. Nonmatching rows cause no string copies.
+        let task = tokio::task::spawn_blocking(move || {
+            // Scope lists are bounded by runtime settings. Normalize once off
+            // lock; dense include/exclude lists must not allocate per row/pattern.
+            let Some(prepared_scope) = crate::scope::PreparedScope::try_new(
+                &include,
+                &exclude,
+                crate::service_map_peer_matches::MAX_SCOPE_PATTERN_ENTRIES,
+                crate::service_map_peer_matches::MAX_SCOPE_PATTERN_BYTES,
+            ) else {
+                return ServiceMapSocketPeerMatches::missing(
+                    session_id,
+                    evidence_id,
+                    in_scope_only,
+                    max_records,
+                    "scope_work_limit",
+                );
+            };
+            drop(include);
+            drop(exclude);
+            let result = {
+                let locked = inner.blocking_read();
+                let source = match service_map_row_index(&locked, &key) {
+                    Ok(index) => &locked.entries[index],
+                    Err(reason) => {
+                        return ServiceMapSocketPeerMatches::missing(
+                            session_id,
+                            evidence_id,
+                            in_scope_only,
+                            max_records,
+                            reason,
+                        )
+                    }
+                };
+                inspect_retained(
+                    session_id,
+                    generation,
+                    &evidence_id,
+                    source,
+                    locked
+                        .entries
+                        .iter()
+                        .zip(locked.body_generations.iter().copied())
+                        .rev(),
+                    max_records,
+                    in_scope_only,
+                    &prepared_scope,
+                )
+            };
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("after_snapshot");
+            }
+            match service_map_row_index(&inner.blocking_read(), &key) {
+                Ok(_) => result,
+                Err(reason) => ServiceMapSocketPeerMatches::missing(
+                    session_id,
+                    evidence_id,
+                    in_scope_only,
+                    max_records,
+                    reason,
+                ),
+            }
+        });
+        task.await
+            .unwrap_or_else(|_| missing("peer_inspection_failed"))
+    }
+
     /// Metadata-only exact-row inspection. Body storage is deliberately absent
     /// from both acquisition and publication checks, even for duplicate UUIDs.
     pub async fn service_map_link_declarations(
@@ -4313,6 +4451,902 @@ pub(crate) mod tests {
                     .service_map_html_generators_impl(session, &token, Some(hook))
                     .await
             })
+        }
+
+        fn peer_record(host: &str, sequence: u64, address: &str) -> TransactionRecord {
+            let mut row = body_record("PRIVATE_RESPONSE_BODY", sequence);
+            row.host = host.into();
+            row.path = "/PRIVATE_PATH?token=PRIVATE_QUERY".into();
+            row.observed_socket_peer = Some(crate::model::ObservedSocketPeer::from_remote_addr(
+                row.started_at + chrono::Duration::milliseconds(sequence as i64),
+                crate::model::ObservedSocketPeerRoute::Direct,
+                Some(address.parse().unwrap()),
+            ));
+            row
+        }
+
+        #[tokio::test]
+        async fn peer_matches_compare_typed_family_route_port_and_diagnostic_buckets() {
+            use crate::model::{ObservedSocketPeerReason, ObservedSocketPeerRoute, TrafficKind};
+            let source = peer_record("source.example.com", 1, "198.51.100.7:443");
+            let mut rows = vec![
+                source.clone(),
+                peer_record("other.example.com", 2, "198.51.100.7:443"),
+            ];
+            for (seq, address) in [
+                (3, "198.51.100.8:443"),
+                (4, "198.51.100.7:8443"),
+                (5, "[::ffff:198.51.100.7]:443"),
+            ] {
+                rows.push(peer_record("different.example.com", seq, address));
+            }
+            for (seq, route) in [
+                (6, ObservedSocketPeerRoute::HttpProxy),
+                (7, ObservedSocketPeerRoute::SocksProxy),
+                (8, ObservedSocketPeerRoute::Unknown),
+            ] {
+                let mut row = source.clone();
+                row.sequence = seq;
+                row.id = Uuid::new_v4();
+                row.observed_socket_peer.as_mut().unwrap().route = route;
+                rows.push(row);
+            }
+            let mut row = source.clone();
+            row.sequence = 9;
+            row.observed_socket_peer = None;
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 10;
+            row.observed_socket_peer.as_mut().unwrap().address = None;
+            row.observed_socket_peer.as_mut().unwrap().reason =
+                Some(ObservedSocketPeerReason::RemoteAddrUnavailable);
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 11;
+            row.observed_socket_peer.as_mut().unwrap().reason =
+                Some(ObservedSocketPeerReason::RemoteAddrUnavailable);
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 12;
+            row.kind = TrafficKind::Tunnel;
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 13;
+            row.method = "CONNECT".into();
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 14;
+            row.status = Some(101);
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 15;
+            row.host = "user:PRIVATE_CREDENTIAL@example.com".into();
+            rows.push(row);
+            let (store, dir) = fixture_store(&rows, false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 100, &[], &[])
+                .await;
+            assert!(result.available && !result.complete);
+            assert_eq!(result.counts.matching_rows, 1);
+            assert_eq!(result.counts.different_peer_rows, 3);
+            assert_eq!(result.counts.non_direct_rows, 3);
+            assert_eq!(result.counts.not_recorded_rows, 1);
+            assert_eq!(result.counts.unavailable_observation_rows, 1);
+            assert_eq!(result.counts.invalid_observation_rows, 1);
+            assert_eq!(result.counts.non_http_rows, 3);
+            assert_eq!(result.counts.invalid_metadata_rows, 1);
+            assert_eq!(result.reasons, ["invalid_metadata"]);
+            assert_eq!(result.origins[0].origin, "https://other.example.com");
+            assert!(result.validate_response(session, &id, false, 100));
+            let text = serde_json::to_string(&result).unwrap();
+            for secret in [
+                "PRIVATE_RESPONSE_BODY",
+                "PRIVATE_PATH",
+                "PRIVATE_QUERY",
+                "PRIVATE_CREDENTIAL",
+            ] {
+                assert!(!text.contains(secret));
+            }
+            let map = crate::service_map::build(
+                session,
+                store.service_map_snapshot(session, 100).await,
+                100,
+                false,
+                None,
+                &[],
+                &[],
+            );
+            let ordinary = serde_json::to_string(&map).unwrap();
+            assert!(!ordinary.contains("198.51.100.7") && !ordinary.contains("socket_peer"));
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_reject_unusable_seed_addresses_and_source_contexts() {
+            use crate::model::{ObservedSocketPeerReason, ObservedSocketPeerRoute};
+            for address in [
+                "0.0.0.0:443",
+                "0.1.2.3:443",
+                "169.254.1.2:443",
+                "224.1.2.3:443",
+                "255.255.255.255:443",
+                "240.0.0.1:443",
+                "198.51.100.7:0",
+                "[::]:443",
+                "[ff02::1]:443",
+                "[fe80::1]:443",
+                "[::ffff:169.254.1.2]:443",
+                "[::ffff:0.1.2.3]:443",
+                "[::ffff:224.1.2.3]:443",
+            ] {
+                let row = peer_record("example.com", 1, address);
+                let store = TransactionStore::from_records(vec![row]);
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                    .await;
+                assert_eq!(result.reasons, ["invalid_observation"], "{address}");
+                assert!(
+                    result.peer.is_none() && result.source.is_none() && result.origins.is_empty()
+                );
+                assert!(result.validate_response(session, &id, false, 10));
+            }
+            for reason in [
+                "observation_not_recorded",
+                "observation_unavailable",
+                "non_direct_observation",
+                "unsupported_source_context",
+                "metadata_unavailable",
+            ] {
+                let mut row = peer_record("example.com", 1, "198.51.100.7:443");
+                match reason {
+                    "observation_not_recorded" => row.observed_socket_peer = None,
+                    "observation_unavailable" => {
+                        let o = row.observed_socket_peer.as_mut().unwrap();
+                        o.address = None;
+                        o.reason = Some(ObservedSocketPeerReason::RemoteAddrUnavailable);
+                    }
+                    "non_direct_observation" => {
+                        row.observed_socket_peer.as_mut().unwrap().route =
+                            ObservedSocketPeerRoute::Unknown
+                    }
+                    "unsupported_source_context" => row.status = Some(101),
+                    _ => row.host = "x".repeat(513),
+                }
+                let store = TransactionStore::from_records(vec![row]);
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                    .await;
+                assert_eq!(result.reasons, [reason]);
+                assert!(result.validate_response(session, &id, false, 10));
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_duplicate_tokens_missing_bodies_and_reopened_generations() {
+            let first = peer_record("older.example.com", 1, "[::ffff:198.51.100.7]:443");
+            let mut second = peer_record("newer.example.com", 2, "[::ffff:198.51.100.7]:443");
+            second.id = first.id;
+            let (store, dir) = fixture_store(&[first.clone(), second.clone()], true).await;
+            let session = Uuid::new_v4();
+            let first_token = token(&store, session, 1).await;
+            let second_token = token(&store, session, 2).await;
+            fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            {
+                let mut inner = store.inner.write().await;
+                for id in [&first_token, &second_token] {
+                    inner
+                        .unresolved_body_generations
+                        .insert(EvidenceKey::parse(id).unwrap().revision);
+                }
+            }
+            for (seed, sample) in [(&first_token, &second_token), (&second_token, &first_token)] {
+                let result = store
+                    .service_map_socket_peer_matches(session, seed, false, 10, &[], &[])
+                    .await;
+                assert!(result.available && result.complete);
+                assert_eq!(result.origins[0].samples[0].evidence_id, *sample);
+                assert!(result.validate_response(session, seed, false, 10));
+            }
+            let reopened = TransactionStore::from_records(vec![second, first]);
+            assert_eq!(
+                reopened
+                    .service_map_socket_peer_matches(session, &first_token, false, 10, &[], &[])
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            assert_eq!(
+                store
+                    .service_map_socket_peer_matches(
+                        Uuid::new_v4(),
+                        &first_token,
+                        false,
+                        10,
+                        &[],
+                        &[]
+                    )
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            assert_eq!(
+                store
+                    .service_map_socket_peer_matches(session, "bad", false, 10, &[], &[])
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_scope_uses_original_authority_and_discloses_seed_outside_window() {
+            let rows = [
+                peer_record("0x7f000001", 1, "127.0.0.1:443"),
+                peer_record("outside.example.com", 2, "127.0.0.1:443"),
+                peer_record("0x7f000001", 3, "127.0.0.1:443"),
+            ];
+            let (store, dir) = fixture_store(&rows, false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let include = vec!["0x7f000001".into()];
+            let result = store
+                .service_map_socket_peer_matches(session, &id, true, 2, &include, &[])
+                .await;
+            assert!(result.available && !result.complete);
+            assert!(!result.source.as_ref().unwrap().in_window);
+            assert_eq!(result.source.as_ref().unwrap().origin, "https://127.0.0.1");
+            assert_eq!(result.counts.scope_excluded_rows, 1);
+            assert_eq!(result.counts.matching_rows, 1);
+            assert_eq!(result.reasons, ["max_records", "source_outside_window"]);
+            assert!(result.validate_response(session, &id, true, 2));
+            let mut normalized = peer_record("127.0.0.1", 4, "127.0.0.1:443");
+            normalized.id = Uuid::new_v4();
+            store.insert(normalized).await;
+            let all = store
+                .service_map_socket_peer_matches(session, &id, false, 10, &include, &[])
+                .await;
+            let canonical_group = all
+                .origins
+                .iter()
+                .find(|g| g.origin == "https://127.0.0.1")
+                .unwrap();
+            assert!(
+                canonical_group.in_scope,
+                "group scope is OR across original authorities"
+            );
+            assert_eq!(canonical_group.matching_rows, 2);
+            assert!(all.validate_response(session, &id, false, 10));
+            let excluded = store
+                .service_map_socket_peer_matches(session, &id, true, 2, &[], &include)
+                .await;
+            assert_eq!(excluded.reasons, ["source_out_of_scope"]);
+            assert!(excluded.peer.is_none());
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_snapshot_fences_source_changes_without_body_identity_checks() {
+            for mutation in ["delete", "retention", "peer", "path"] {
+                let row = peer_record("example.com", 1, "198.51.100.7:443");
+                let (store, dir) = fixture_store(&[row.clone()], false).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier("after_snapshot");
+                let reading_store = store.clone();
+                let reading_id = id.clone();
+                let reading = tokio::spawn(async move {
+                    reading_store
+                        .service_map_socket_peer_matches_impl(
+                            session,
+                            &reading_id,
+                            false,
+                            10,
+                            &[],
+                            &[],
+                            Some(hook),
+                        )
+                        .await
+                });
+                tokio::time::timeout(WaitDuration::from_secs(10), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let expected = match mutation {
+                    "delete" => {
+                        store.delete_ids(&[row.id]).await.unwrap();
+                        "record_missing"
+                    }
+                    "retention" => {
+                        store.trim_retention(0, &HashSet::new(), 10).await.unwrap();
+                        "record_missing"
+                    }
+                    "peer" => {
+                        store
+                            .update_record(row.id, |r| r.observed_socket_peer = None)
+                            .await
+                            .unwrap();
+                        "record_changed"
+                    }
+                    _ => {
+                        store
+                            .update_record(row.id, |r| r.path = "/changed".into())
+                            .await
+                            .unwrap();
+                        "record_changed"
+                    }
+                };
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert_eq!(result.reasons, [expected]);
+                assert!(result.peer.is_none() && result.origins.is_empty());
+                assert_eq!(result.counts, Default::default());
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_caps_count_rows_without_unbounded_origin_sets() {
+            for long_host in [false, true] {
+                let mut rows = vec![peer_record("source.example.com", 1, "198.51.100.7:443")];
+                for index in 0..500 {
+                    let host = if long_host {
+                        format!(
+                            "{}.{}.{}.n{index}.example.com",
+                            "a".repeat(63),
+                            "b".repeat(63),
+                            "c".repeat(63)
+                        )
+                    } else {
+                        format!("n{index}.example.com")
+                    };
+                    for _ in 0..if long_host { 5 } else { 1 } {
+                        rows.push(peer_record(
+                            &host,
+                            rows.len() as u64 + 1,
+                            "198.51.100.7:443",
+                        ));
+                    }
+                }
+                let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10_000, &[], &[])
+                    .await;
+                assert_eq!(
+                    result.counts.matching_rows,
+                    if long_host { 2500 } else { 500 }
+                );
+                assert!(result.counts.omitted_matching_rows > 0);
+                assert!(result.origins.len() <= 100);
+                assert!(result.origins.iter().all(|g| g.samples.len() <= 3));
+                assert!(result.reasons.iter().any(|r| r
+                    == if long_host {
+                        "projection_byte_limit"
+                    } else {
+                        "origin_group_limit"
+                    }));
+                assert!(
+                    serde_json::to_vec(&result).unwrap().len()
+                        <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES
+                );
+                assert!(result.validate_response(session, &id, false, 10_000));
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_high_cardinality_lock_duration_is_measured_with_bounded_work() {
+            const ROWS: usize = 1000;
+            let mut rows = Vec::new();
+            for index in 0..ROWS {
+                let mut row = peer_record(
+                    &format!("n{index}.example.com"),
+                    index as u64 + 1,
+                    "198.51.100.7:443",
+                );
+                row.response.as_mut().unwrap().headers = vec![
+                    HeaderRecord {
+                        name: "X-Private".into(),
+                        value: "H".repeat(4096)
+                    };
+                    8
+                ];
+                row.path = "/PRIVATE_OVERSIZED_PATH".repeat(1000);
+                rows.push(row);
+            }
+            let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let prepared_scope = crate::scope::PreparedScope::new(&[], &[]);
+            let locked = store.inner.read().await;
+            let started = std::time::Instant::now();
+            let result = crate::service_map_peer_matches::inspect_retained(
+                session,
+                store.saved_cursor_generation,
+                &id,
+                &locked.entries[0],
+                locked
+                    .entries
+                    .iter()
+                    .zip(locked.body_generations.iter().copied())
+                    .rev(),
+                500,
+                false,
+                &prepared_scope,
+            );
+            let lock_duration = started.elapsed();
+            drop(locked);
+            let serialized = serde_json::to_vec(&result).unwrap();
+            eprintln!("recorded peer snapshot: retained_rows={ROWS}, considered_rows={}, matching_rows={}, returned_groups={}, exact_samples={}, projected_bytes={}, measured_read_lock_duration={lock_duration:?}, retained_header_bytes={}",result.snapshot.as_ref().unwrap().considered_rows,result.counts.matching_rows,result.origins.len(),result.counts.sample_rows,serialized.len(),ROWS*8*4096);
+            assert_eq!(result.snapshot.as_ref().unwrap().considered_rows, 500);
+            assert_eq!(result.counts.matching_rows, 500);
+            assert_eq!(result.origins.len(), 100);
+            assert_eq!(result.counts.sample_rows, 100);
+            assert!(result.validate_response(session, &id, false, 500));
+            assert!(serialized.len() <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES);
+        }
+
+        #[tokio::test]
+        async fn peer_matches_response_validator_rejects_inconsistent_or_unbound_results() {
+            let rows = [
+                peer_record("source.example.com", 1, "198.51.100.7:443"),
+                peer_record("other.example.com", 2, "198.51.100.7:443"),
+            ];
+            let (store, dir) = fixture_store(&rows, false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &id, false, 10));
+            for change in 0..10 {
+                let mut changed = result.clone();
+                match change {
+                    0 => changed.counts.matching_rows = usize::MAX,
+                    1 => changed.origins[0].samples[0].evidence_id = id.clone(),
+                    2 => changed.source.as_mut().unwrap().in_window = false,
+                    3 => {
+                        changed.origins[0].origin =
+                            "https://user:PRIVATE@example.com/path?token=PRIVATE".into()
+                    }
+                    4 => {
+                        changed.peer.as_mut().unwrap().route =
+                            crate::model::ObservedSocketPeerRoute::HttpProxy
+                    }
+                    5 => changed.snapshot.as_mut().unwrap().generation = Uuid::new_v4(),
+                    6 => changed.origins[0].samples[0].sequence = "02".into(),
+                    7 => changed.origins[0].omitted_samples = 1,
+                    8 => changed.reasons = vec!["PRIVATE_ERROR".into()],
+                    _ => {
+                        let duplicate = changed.origins[0].samples[0].clone();
+                        changed.origins[0].samples.push(duplicate);
+                    }
+                }
+                assert!(
+                    !changed.validate_response(session, &id, false, 10),
+                    "case={change}"
+                );
+            }
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_reject_noncanonical_tokens_and_impossible_window_extrema() {
+            let rows = [
+                peer_record("source.example.com", 10, "198.51.100.7:443"),
+                peer_record("other.example.com", 11, "198.51.100.7:443"),
+            ];
+            let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 10).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &id, false, 10));
+            for field in [1, 2, 4, 5] {
+                for uppercase in [false, true] {
+                    let mut fields: Vec<String> = id.split('.').map(str::to_owned).collect();
+                    fields[field] = if uppercase {
+                        fields[field].to_uppercase()
+                    } else {
+                        fields[field].replace('-', "")
+                    };
+                    let alias = fields.join(".");
+                    if alias == id {
+                        continue;
+                    }
+                    assert!(!crate::service_map_peer_matches::is_canonical_evidence_id(
+                        &alias
+                    ));
+                    let rejected = store
+                        .service_map_socket_peer_matches(session, &alias, false, 10, &[], &[])
+                        .await;
+                    assert_eq!(rejected.reasons, ["invalid_evidence_id"]);
+                }
+            }
+            let mut alias = result.clone();
+            let sample = &mut alias.origins[0].samples[0];
+            let mut fields: Vec<String> =
+                sample.evidence_id.split('.').map(str::to_owned).collect();
+            fields[4] = fields[4].replace('-', "");
+            sample.evidence_id = fields.join(".");
+            assert!(!alias.validate_response(session, &id, false, 10));
+            let mut padded: Vec<String> = id.split('.').map(str::to_owned).collect();
+            padded[3].insert(0, '0');
+            assert!(!crate::service_map_peer_matches::is_canonical_evidence_id(
+                &padded.join(".")
+            ));
+            for extra_unknown_row in [false, true] {
+                let mut changed = result.clone();
+                let window = changed.snapshot.as_mut().unwrap();
+                window.oldest_considered_sequence = Some("1".into());
+                window.latest_considered_sequence = Some("100".into());
+                if extra_unknown_row {
+                    window.considered_rows += 1;
+                    window.retained_rows += 1;
+                    changed.counts.different_peer_rows += 1;
+                }
+                assert!(!changed.validate_response(session, &id, false, 10));
+            }
+            let single = TransactionStore::from_records(vec![peer_record(
+                "source.example.com",
+                10,
+                "198.51.100.7:443",
+            )]);
+            let single_id = token(&single, session, 10).await;
+            let mut result = single
+                .service_map_socket_peer_matches(session, &single_id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &single_id, false, 10));
+            result.snapshot.as_mut().unwrap().oldest_considered_sequence = Some("1".into());
+            assert!(!result.validate_response(session, &single_id, false, 10));
+        }
+
+        #[tokio::test]
+        async fn peer_matches_validator_requires_truthful_projection_and_sample_limits() {
+            let mut rows = vec![peer_record("source.example.com", 1, "198.51.100.7:443")];
+            for index in 0..100 {
+                let host = format!(
+                    "{}.{}.n{index:03}.example.com",
+                    "a".repeat(63),
+                    "b".repeat(30)
+                );
+                for _ in 0..5 {
+                    rows.push(peer_record(
+                        &host,
+                        rows.len() as u64 + 1,
+                        "198.51.100.7:443",
+                    ));
+                }
+            }
+            let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 10_000, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &id, false, 10_000));
+            assert!(result
+                .origins
+                .iter()
+                .any(|g| g.samples.len() < 3 && g.omitted_samples > 0));
+            for reason in ["projection_byte_limit", "sample_limit"] {
+                let mut changed = result.clone();
+                changed.reasons.retain(|r| r != reason);
+                assert!(
+                    !changed.validate_response(session, &id, false, 10_000),
+                    "missing {reason}"
+                );
+            }
+            // A group omission may justify the byte reason, but cannot hide a
+            // sample omission when one more fixed-size sample still fits.
+            let mut impossible_sample = result.clone();
+            let full_group = impossible_sample
+                .origins
+                .iter_mut()
+                .find(|group| group.samples.len() == 3)
+                .unwrap();
+            full_group.samples.pop();
+            full_group.omitted_samples += 1;
+            impossible_sample.counts.sample_rows -= 1;
+            impossible_sample.counts.omitted_sample_rows += 1;
+            assert!(!impossible_sample.validate_response(session, &id, false, 10_000));
+            let small = TransactionStore::from_records(vec![
+                peer_record("other.example.com", 2, "198.51.100.7:443"),
+                peer_record("source.example.com", 1, "198.51.100.7:443"),
+            ]);
+            let small_id = token(&small, session, 1).await;
+            let mut impossible = small
+                .service_map_socket_peer_matches(session, &small_id, false, 10, &[], &[])
+                .await;
+            impossible.complete = false;
+            impossible.reasons = vec!["projection_byte_limit".into()];
+            impossible.origins[0].samples.clear();
+            impossible.origins[0].omitted_samples = 1;
+            impossible.counts.sample_rows = 0;
+            impossible.counts.omitted_sample_rows = 1;
+            assert!(!impossible.validate_response(session, &small_id, false, 10));
+            let time_rows = (1..=5)
+                .map(|seq| {
+                    peer_record(
+                        if seq == 1 {
+                            "source.example.com"
+                        } else {
+                            "other.example.com"
+                        },
+                        seq,
+                        "198.51.100.7:443",
+                    )
+                })
+                .rev()
+                .collect();
+            let times = TransactionStore::from_records(time_rows);
+            let times_id = token(&times, session, 1).await;
+            let mut result = times
+                .service_map_socket_peer_matches(session, &times_id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &times_id, false, 10));
+            assert_eq!(result.origins[0].omitted_samples, 1);
+            result.origins[0].first_observed_at -= chrono::Duration::days(1);
+            result.origins[0].last_observed_at += chrono::Duration::days(1);
+            assert!(!result.validate_response(session, &times_id, false, 10));
+        }
+
+        #[tokio::test]
+        async fn peer_matches_fifty_thousand_rows_measure_bounded_metadata_scan() {
+            const ROWS: usize = 50_000;
+            for distribution in ["same_origin", "distinct_origins", "different_peer"] {
+                let rows = (0..ROWS)
+                    .map(|index| {
+                        let host = if distribution == "distinct_origins" {
+                            format!("n{index}.example.com")
+                        } else {
+                            "same.example.com".into()
+                        };
+                        let mut row = peer_record(
+                            &host,
+                            index as u64 + 1,
+                            if distribution == "different_peer" && index > 0 {
+                                "198.51.100.8:443"
+                            } else {
+                                "198.51.100.7:443"
+                            },
+                        );
+                        row.path = "/".into();
+                        row.response.as_mut().unwrap().body_preview.clear();
+                        row.response.as_mut().unwrap().body_size = 0;
+                        row
+                    })
+                    .rev()
+                    .collect();
+                let store = TransactionStore::from_records(rows);
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let prepared_scope = crate::scope::PreparedScope::new(&[], &[]);
+                for max_records in [10_000, ROWS] {
+                    let locked = store.inner.read().await;
+                    let started = std::time::Instant::now();
+                    let result = crate::service_map_peer_matches::inspect_retained(
+                        session,
+                        store.saved_cursor_generation,
+                        &id,
+                        &locked.entries[0],
+                        locked
+                            .entries
+                            .iter()
+                            .zip(locked.body_generations.iter().copied())
+                            .rev(),
+                        max_records,
+                        false,
+                        &prepared_scope,
+                    );
+                    let lock_duration = started.elapsed();
+                    drop(locked);
+                    let bytes = serde_json::to_vec(&result).unwrap().len();
+                    eprintln!("recorded peer microbenchmark: distribution={distribution}, retained_rows={ROWS}, considered_rows={max_records}, matching_rows={}, groups={}, samples={}, projected_bytes={bytes}, measured_read_lock_duration={lock_duration:?}", result.counts.matching_rows, result.origins.len(), result.counts.sample_rows);
+                    assert_eq!(
+                        result.snapshot.as_ref().unwrap().considered_rows,
+                        max_records
+                    );
+                    assert_eq!(
+                        result.counts.matching_rows,
+                        if distribution == "different_peer" {
+                            0
+                        } else {
+                            max_records - usize::from(max_records == ROWS)
+                        }
+                    );
+                    assert!(result.validate_response(session, &id, false, max_records));
+                    assert!(result.origins.len() <= 100 && result.counts.sample_rows <= 300);
+                    assert!(bytes <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_dense_scope_measures_preparation_outside_snapshot_lock() {
+            const ROWS: usize = 50_000;
+            let rows = (0..ROWS)
+                .map(|index| {
+                    let mut row = peer_record(
+                        &format!("n{index}.example.com"),
+                        index as u64 + 1,
+                        "198.51.100.7:443",
+                    );
+                    row.path = "/".into();
+                    row.response.as_mut().unwrap().body_preview.clear();
+                    row.response.as_mut().unwrap().body_size = 0;
+                    row
+                })
+                .rev()
+                .collect();
+            let store = TransactionStore::from_records(rows);
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            for shape in ["short_exact", "long_exact", "wildcard"] {
+                let mut include = (0..499)
+                    .map(|i| match shape {
+                        "long_exact" => format!("include-{i}.{}.example.com", "a".repeat(470)),
+                        "wildcard" => format!("*never-included-{i}*"),
+                        _ => format!("include-{i}.unmatched.example.com"),
+                    })
+                    .collect::<Vec<_>>();
+                include.push("*.example.com".into());
+                let exclude = (0..500)
+                    .map(|i| match shape {
+                        "long_exact" => format!("exclude-{i}.{}.example.com", "b".repeat(470)),
+                        "wildcard" => format!("*never-excluded-{i}*"),
+                        _ => format!("exclude-{i}.unmatched.example.com"),
+                    })
+                    .collect::<Vec<_>>();
+                assert!(include
+                    .iter()
+                    .chain(exclude.iter())
+                    .all(|pattern| pattern.len() <= 512));
+                let prepared_at = std::time::Instant::now();
+                let prepared_scope = crate::scope::PreparedScope::new(&include, &exclude);
+                let preparation = prepared_at.elapsed();
+                for max_records in [10_000, ROWS] {
+                    let locked = store.inner.read().await;
+                    let started = std::time::Instant::now();
+                    let result = crate::service_map_peer_matches::inspect_retained(
+                        session,
+                        store.saved_cursor_generation,
+                        &id,
+                        &locked.entries[0],
+                        locked
+                            .entries
+                            .iter()
+                            .zip(locked.body_generations.iter().copied())
+                            .rev(),
+                        max_records,
+                        true,
+                        &prepared_scope,
+                    );
+                    let lock_duration = started.elapsed();
+                    drop(locked);
+                    let bytes = serde_json::to_vec(&result).unwrap().len();
+                    eprintln!("recorded peer dense-scope microbenchmark: shape={shape}, include=500, exclude=500, retained_rows={ROWS}, considered_rows={max_records}, matching_rows={}, preparation_outside_lock={preparation:?}, measured_read_lock_duration={lock_duration:?}, projected_bytes={bytes}",result.counts.matching_rows);
+                    if shape == "wildcard" {
+                        assert_eq!(result.reasons, ["scope_work_limit"]);
+                        assert!(
+                            !result.available
+                                && result.source.is_none()
+                                && result.peer.is_none()
+                                && result.snapshot.is_none()
+                        );
+                        assert!(result.origins.is_empty());
+                        assert_eq!(
+                            result.counts,
+                            crate::service_map_peer_matches::SocketPeerMatchCounts::default()
+                        );
+                    } else {
+                        assert_eq!(
+                            result.counts.matching_rows,
+                            max_records - usize::from(max_records == ROWS)
+                        );
+                        assert!(
+                            result.source.as_ref().unwrap().in_scope
+                                && result.origins.iter().all(|group| group.in_scope)
+                        );
+                    }
+                    assert!(result.validate_response(session, &id, true, max_records));
+                    assert!(bytes <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_scope_work_limit_discards_all_partial_metadata() {
+            let host = format!(
+                "{}.{}.{}.{}.example.com",
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(63)
+            );
+            let rows = (1..=50_000)
+                .map(|sequence| {
+                    let mut row = peer_record(&host, sequence, "198.51.100.7:443");
+                    row.response.as_mut().unwrap().body_preview.clear();
+                    row.response.as_mut().unwrap().body_size = 0;
+                    row
+                })
+                .rev()
+                .collect();
+            let store = TransactionStore::from_records(rows);
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let include = vec!["*.example.com".into(); 500];
+            let exclude = (0..500)
+                .map(|i| format!("{}z{i}*", "*a".repeat(240)))
+                .collect::<Vec<_>>();
+            let prepared =
+                crate::scope::PreparedScope::try_new(&include, &exclude, 500, 512).unwrap();
+            for max_records in [10_000, 50_000] {
+                for scope_only in [false, true] {
+                    let locked = store.inner.read().await;
+                    let started = std::time::Instant::now();
+                    let result = crate::service_map_peer_matches::inspect_retained(
+                        session,
+                        store.saved_cursor_generation,
+                        &id,
+                        &locked.entries[0],
+                        locked
+                            .entries
+                            .iter()
+                            .zip(locked.body_generations.iter().copied())
+                            .rev(),
+                        max_records,
+                        scope_only,
+                        &prepared,
+                    );
+                    let elapsed = started.elapsed();
+                    drop(locked);
+                    eprintln!("recorded peer long-glob work-bound microbenchmark: patterns500+500, host_bytes={}, rows={max_records}, scope_only={scope_only}, read_lock={elapsed:?}",host.len());
+                    assert_eq!(result.reasons, ["scope_work_limit"]);
+                    assert!(
+                        !result.available
+                            && result.peer.is_none()
+                            && result.source.is_none()
+                            && result.snapshot.is_none()
+                            && result.origins.is_empty()
+                    );
+                    assert_eq!(
+                        result.counts,
+                        crate::service_map_peer_matches::SocketPeerMatchCounts::default()
+                    );
+                    assert!(result.validate_response(session, &id, scope_only, max_records));
+                    let json = serde_json::to_string(&result).unwrap();
+                    assert!(
+                        !json.contains(&host)
+                            && !json.contains("198.51.100.7")
+                            && !json.contains("PRIVATE")
+                    );
+                }
+            }
+            for (include, exclude) in [
+                (vec!["*".into(); 501], vec![]),
+                (vec![], vec!["x".repeat(513)]),
+            ] {
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10, &include, &exclude)
+                    .await;
+                assert_eq!(result.reasons, ["scope_work_limit"]);
+                assert!(result.validate_response(session, &id, false, 10));
+            }
         }
 
         fn link_record(origin: &str, sequence: u64) -> TransactionRecord {

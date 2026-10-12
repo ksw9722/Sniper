@@ -42,6 +42,7 @@ use sniper::{
     service_map_body::ServiceMapBodyReferences,
     service_map_html::ServiceMapHtmlGenerators,
     service_map_links::ServiceMapLinkDeclarations,
+    service_map_peer_matches::ServiceMapSocketPeerMatches,
     service_map_technology::CatalogVersion,
     session::{validate_session_creation_name, SessionSummary},
     skills,
@@ -55,6 +56,7 @@ use uuid::Uuid;
 
 const SERVICE_MAP_CATALOG_HEADER: &str = "X-Sniper-Technology-Catalog-Version";
 const SERVICE_MAP_LEGACY_CATALOG_WARNING: &str = "Warning: Service Map API returned legacy technology catalog v1; technology coverage is limited to v1.";
+const SERVICE_MAP_PEER_SCOPE_WORK_WARNING: &str = "Warning: Recorded socket peer scope matching exceeded the work limit; use a smaller --max-records window or deliberately simplify scope rules. No retries or settings changes were made.";
 
 const DEFAULT_READ_LIST_LIMIT: usize = 100;
 const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
@@ -914,6 +916,27 @@ enum ServiceMapCommand {
         after_help = "Requires the current active session UUID and exact-row evidence token. Reads bounded retained response headers for GET or HEAD status 200 only; no bodies, inactive-session loading, target requests, automatic/batch reads, retries, redirects, or fallback. Fixed relation catalog 1 recognizes service-doc, service-desc, describedby, and preconnect. Partial or unsupported inspection does not mean no declarations exist. Origins and retained-header UTF-8 spans describe literal declarations, not verified calls, ownership, or connections."
     )]
     LinkDeclarations(ServiceMapLinkDeclarationsArgs),
+    /// Explicitly compare recorded direct socket peers for one exact retained source row.
+    #[command(
+        after_help = "Requires the current active session UUID and unchanged exact-row evidence token. Compares only retained direct-route source, address family, IP and port observations in a bounded latest-row window. No arbitrary IP/host/URL input, target requests, discovery, capture changes, inactive loading, body/header reads, retries, redirects, or fallback. Counts are retained rows, including duplicate transaction UUIDs, and exclude the source. Inspect source.in_window, timestamps, reasons and omissions. Equal recorded peer values do not prove a shared physical endpoint, deployment, ownership, or origin IP."
+    )]
+    SocketPeerMatches(ServiceMapSocketPeerMatchesArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapSocketPeerMatchesArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained source row.
+    #[arg(long, value_parser = parse_service_map_peer_evidence_id)]
+    evidence_id: String,
+    /// Include only rows matching the active session's current shared scope matcher.
+    #[arg(long)]
+    in_scope_only: bool,
+    /// Bound the latest retained rows considered, excluding the source from match counts.
+    #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
+    max_records: usize,
 }
 
 #[derive(Args, Debug)]
@@ -994,6 +1017,16 @@ fn parse_service_map_max_records(value: &str) -> std::result::Result<usize, Stri
         return Err("max-records must be between 1 and 50000".into());
     }
     Ok(value)
+}
+
+fn parse_service_map_peer_evidence_id(value: &str) -> std::result::Result<String, String> {
+    if !sniper::service_map_peer_matches::is_canonical_evidence_id(value) {
+        return Err(
+            "evidence-id must be a complete unchanged canonical v1 token returned by Service Map"
+                .into(),
+        );
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_service_map_evidence_id(value: &str) -> std::result::Result<String, String> {
@@ -2519,6 +2552,9 @@ impl TargetCommand {
                 Some(ServiceMapCommand::LinkDeclarations(_)) => {
                     "target.service_map.link_declarations.get"
                 }
+                Some(ServiceMapCommand::SocketPeerMatches(_)) => {
+                    "target.service_map.socket_peer_matches.get"
+                }
                 None => "target.service_map.get",
             },
             TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
@@ -3683,6 +3719,137 @@ fn service_map_link_declarations_output_schema() -> Value {
     schema
 }
 
+fn service_map_socket_peer_matches_output_schema() -> Value {
+    use sniper::service_map_peer_matches::{
+        ACQUISITION_REASONS, MAX_HOST_BYTES, MAX_ORIGIN_GROUPS, MAX_PROJECTION_BYTES,
+        MAX_SAMPLES_PER_ORIGIN, MAX_SCHEME_BYTES, MAX_SCOPE_PATTERN_BYTES,
+        MAX_SCOPE_PATTERN_ENTRIES, MAX_SCOPE_WORK_UNITS, PARTIAL_REASONS,
+    };
+    let uuid_pattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+    let uuid = json!({"type":"string","format":"uuid","pattern":format!("^{uuid_pattern}$")});
+    let token = json!({"type":"string","pattern":format!("^v1\\.{uuid_pattern}\\.{uuid_pattern}\\.(0|[1-9][0-9]{{0,19}})\\.{uuid_pattern}\\.{uuid_pattern}$")});
+    let sequence = json!({"type":"string","pattern":"^(0|[1-9][0-9]{0,19})$","description":"Canonical decimal uint64, checked without floating-point conversion and bound to the exact evidence token."});
+    let timestamp = json!({"type":"string","format":"date-time"});
+    let origin = json!({"type":"string","description":"Bounded canonical HTTP(S) origin only; no credentials, path, query, fragment or raw rejected values."});
+    let boolean = json!({"type":"boolean"});
+    let count = json!({"type":"integer","minimum":0,"maximum":50000});
+    let count_names = [
+        "non_http_rows",
+        "not_recorded_rows",
+        "unavailable_observation_rows",
+        "non_direct_rows",
+        "invalid_observation_rows",
+        "different_peer_rows",
+        "invalid_metadata_rows",
+        "scope_excluded_rows",
+        "matching_rows",
+        "returned_matching_rows",
+        "omitted_matching_rows",
+        "sample_rows",
+        "omitted_sample_rows",
+    ];
+    let counts = service_map_object(Value::Object(
+        count_names
+            .iter()
+            .map(|name| ((*name).into(), count.clone()))
+            .collect(),
+    ));
+    let zero_counts = service_map_object(Value::Object(
+        count_names
+            .iter()
+            .map(|name| ((*name).into(), json!({"type":"integer","enum":[0]})))
+            .collect(),
+    ));
+    let mut peer = service_map_object(json!({
+        "source":{"type":"string","enum":["http_response_remote_addr"]},
+        "route":{"type":"string","enum":["direct"]},
+        "address_family":{"type":"string","enum":["ipv4","ipv6"]},
+        "address":service_map_object(json!({
+            "ip":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535}
+        }))
+    }));
+    peer["oneOf"] = json!([
+        {"properties":{"address_family":{"enum":["ipv4"]},"address":{"properties":{"ip":{"format":"ipv4"}}}}},
+        {"properties":{"address_family":{"enum":["ipv6"]},"address":{"properties":{"ip":{"format":"ipv6"}}}}}
+    ]);
+    peer["description"] = json!("Canonical IP serialization and permitted unicast address classes are additionally validated at runtime. IPv4 and mapped IPv6 remain distinct. This is a recorded observation key, never a physical endpoint, ownership, deployment or origin-IP finding.");
+    let source = service_map_object(json!({
+        "evidence_id":token,"sequence":sequence,"origin":origin,
+        "started_at":timestamp,"observed_at":timestamp,"in_scope":boolean,"in_window":boolean
+    }));
+    let snapshot = service_map_object(json!({
+        "id":uuid,"generation":uuid,"captured_at":timestamp,
+        "window_order":{"type":"string","enum":["latest_retained_sequence"]},
+        "retained_rows":{"type":"integer","minimum":1,"maximum":9007199254740991u64},
+        "considered_rows":{"type":"integer","minimum":1,"maximum":50000},
+        "oldest_considered_sequence":{"anyOf":[{"type":"null"},sequence]},
+        "latest_considered_sequence":{"anyOf":[{"type":"null"},sequence]}
+    }));
+    let sample = service_map_object(json!({
+        "evidence_id":token,"sequence":sequence,"started_at":timestamp,"observed_at":timestamp
+    }));
+    let group = service_map_object(json!({
+        "origin":origin,"in_scope":boolean,"matching_rows":{"type":"integer","minimum":1,"maximum":50000},
+        "first_observed_at":timestamp,"last_observed_at":timestamp,
+        "samples":{"type":"array","maxItems":MAX_SAMPLES_PER_ORIGIN,"items":sample},
+        "omitted_samples":count
+    }));
+    let reasons: Vec<_> = ACQUISITION_REASONS
+        .iter()
+        .chain(PARTIAL_REASONS)
+        .copied()
+        .collect();
+    let mut schema = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":token,
+        "available":boolean,"status":{"type":"string","enum":["matched","no_matches","unavailable"]},
+        "complete":boolean,"reasons":{"type":"array","maxItems":PARTIAL_REASONS.len(),"items":{"type":"string","enum":reasons}},
+        "in_scope_only":boolean,"coverage":{"type":"string","enum":["retained_direct_socket_peer_equality"]},
+        "peer":{"anyOf":[{"type":"null"},peer]},
+        "source":{"anyOf":[{"type":"null"},source]},
+        "snapshot":{"anyOf":[{"type":"null"},snapshot]},
+        "counts":counts,"origins":{"type":"array","maxItems":MAX_ORIGIN_GROUPS,"items":group},
+        "limits":service_map_object(json!({
+            "max_records":{"type":"integer","minimum":1,"maximum":50000},
+            "origin_groups":{"type":"integer","enum":[MAX_ORIGIN_GROUPS]},
+            "samples_per_origin":{"type":"integer","enum":[MAX_SAMPLES_PER_ORIGIN]},
+            "projection_bytes":{"type":"integer","enum":[MAX_PROJECTION_BYTES]},
+            "host_bytes":{"type":"integer","enum":[MAX_HOST_BYTES]},
+            "scheme_bytes":{"type":"integer","enum":[MAX_SCHEME_BYTES]},
+            "scope_pattern_entries":{"type":"integer","enum":[MAX_SCOPE_PATTERN_ENTRIES]},
+            "scope_pattern_bytes":{"type":"integer","enum":[MAX_SCOPE_PATTERN_BYTES]},
+            "scope_work_units":{"type":"integer","enum":[MAX_SCOPE_WORK_UNITS]}
+        }))
+    }));
+    schema["oneOf"] = json!([
+        {"properties":{
+            "available":{"enum":[true]},"status":{"enum":["matched","no_matches"]},
+            "peer":{"type":"object"},"source":{"type":"object"},"snapshot":{"type":"object","properties":{
+                "oldest_considered_sequence":{"type":"string"},"latest_considered_sequence":{"type":"string"}
+            }},"reasons":{"items":{"enum":PARTIAL_REASONS}}
+        },"allOf":[
+            {"oneOf":[
+                {"properties":{"complete":{"enum":[true]},"reasons":{"enum":[[]]}}},
+                {"properties":{"complete":{"enum":[false]},"reasons":{"minItems":1}}}
+            ]},
+            {"oneOf":[
+                {"properties":{"status":{"enum":["matched"]},"counts":{"properties":{"matching_rows":{"minimum":1}}}}},
+                {"properties":{"status":{"enum":["no_matches"]},"origins":{"enum":[[]]},"counts":{"properties":{
+                    "matching_rows":{"enum":[0]},"returned_matching_rows":{"enum":[0]},"omitted_matching_rows":{"enum":[0]},
+                    "sample_rows":{"enum":[0]},"omitted_sample_rows":{"enum":[0]}
+                }}}}
+            ]}
+        ]},
+        {"properties":{
+            "available":{"enum":[false]},"status":{"enum":["unavailable"]},"complete":{"enum":[false]},
+            "reasons":{"minItems":1,"maxItems":1,"items":{"enum":ACQUISITION_REASONS}},
+            "peer":{"type":"null"},"source":{"type":"null"},"snapshot":{"type":"null"},
+            "counts":zero_counts,"origins":{"enum":[[]]}
+        }}
+    ]);
+    schema["description"] = json!("Explicit exact-source passive comparison. All nullable fields must be present. Runtime additionally validates session/token/generation/uint64 bindings, canonical IP/UUID/origin strings, sorted unique reasons/origins, descending unique sample sequences, window/counter partition, and honest cap/omission relationships. Counts classify considered rows excluding the source; duplicate transaction UUIDs are distinct rows. Samples bind to a containing group's time range; actual captured-origin membership is verified only by a later explicit exact-evidence read. Unavailable responses expose no peer/source/snapshot/groups. Partial coverage never means there are no other matches. Recorded observation times do not describe occupancy or connection duration. Scope preparation and matching are bounded by the fixed scope limits; scope_work_limit discards the whole inspection with no partial counts or source data. The encoded response is at most 262144 bytes.");
+    schema
+}
+
 fn service_map_output_schema(operation: &str) -> Option<Value> {
     if !matches!(
         operation,
@@ -3691,8 +3858,12 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             | "target.service_map.body_references.get"
             | "target.service_map.html_generators.get"
             | "target.service_map.link_declarations.get"
+            | "target.service_map.socket_peer_matches.get"
     ) {
         return None;
+    }
+    if operation == "target.service_map.socket_peer_matches.get" {
+        return Some(service_map_socket_peer_matches_output_schema());
     }
     if operation == "target.service_map.link_declarations.get" {
         return Some(service_map_link_declarations_output_schema());
@@ -3900,6 +4071,15 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."}
             }
         })),
+        "target.service_map.socket_peer_matches.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. This read never loads or activates an inactive session."),
+                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged exact source-row token from Service Map. Never an IP, hostname, URL or transaction UUID."},
+                "in_scope_only":{"type":"boolean","default":false,"description":"Filter with the existing shared scope matcher on captured host spelling. Omission selects false; null is invalid."},
+                "max_records":{"type":"integer","minimum":1,"maximum":50000,"default":10000,"description":"Latest retained rows considered, including the source when in-window. Counts of matches exclude the source. Omission selects 10000; null is invalid."}
+            }
+        })),
         "target.service_map.body_references.get"
         | "target.service_map.html_generators.get"
         | "target.service_map.link_declarations.get" => Some(json!({
@@ -3970,6 +4150,18 @@ fn service_map_link_declarations_path(args: &ServiceMapLinkDeclarationsArgs) -> 
     )
 }
 
+fn service_map_socket_peer_matches_path(args: &ServiceMapSocketPeerMatchesArgs) -> String {
+    let query = encode_query(vec![
+        ("evidence_id".into(), args.evidence_id.clone()),
+        ("in_scope_only".into(), args.in_scope_only.to_string()),
+        ("max_records".into(), args.max_records.to_string()),
+    ]);
+    session_query_path(
+        &format!("/api/target/service-map/socket-peer-matches?{query}"),
+        Some(args.session_id),
+    )
+}
+
 fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
     vec![
         op(
@@ -4007,6 +4199,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["session_id", "evidence_id"],
             vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "target.service_map.socket_peer_matches.get",
+            "scope service-map socket-peer-matches --session-id <uuid> --evidence-id <token> [--in-scope-only] [--max-records <1..50000>]",
+            "Explicitly compare equal recorded direct-route socket source/address-family/IP/port observations for one exact active-session source row. Bounded latest retained window; row counts include duplicate transaction UUIDs and exclude the source. One feature GET after existing identity checks; no target traffic, capture changes, discovery, body/header reads, inactive loading, retries, redirects, or fallback. Inspect source.in_window, recorded times, limits, partial reasons, origin-group and sample omissions. Equal recorded values do not establish physical endpoint identity, deployment, ownership, or origin IP. Default map/evidence output is unchanged.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","in_scope_only":false,"max_records":10000})],
         ),
         op(
             "target.service_map.evidence.get",
@@ -4782,6 +4983,9 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "target.service_map.body_references.get"
         | "target.service_map.html_generators.get"
         | "target.service_map.link_declarations.get" => &["session_id", "evidence_id"],
+        "target.service_map.socket_peer_matches.get" => {
+            &["session_id", "evidence_id", "in_scope_only", "max_records"]
+        }
         "scope.get" => &["session_id"],
         "scope.set" => &[
             "session_id",
@@ -4970,6 +5174,10 @@ fn command_input_preview(command: &Command) -> Value {
                 }),
                 Some(ServiceMapCommand::LinkDeclarations(args)) => json!({
                     "session_id": args.session_id,"evidence_id":args.evidence_id,
+                }),
+                Some(ServiceMapCommand::SocketPeerMatches(args)) => json!({
+                    "session_id":args.session_id,"evidence_id":args.evidence_id,
+                    "in_scope_only":args.in_scope_only,"max_records":args.max_records,
                 }),
                 None => json!({
                     "session_id": args.session_id,
@@ -5369,6 +5577,9 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 }
                 Some(ServiceMapCommand::LinkDeclarations(args)) => {
                     api_preview("GET", service_map_link_declarations_path(args), None)
+                }
+                Some(ServiceMapCommand::SocketPeerMatches(args)) => {
+                    api_preview("GET", service_map_socket_peer_matches_path(args), None)
                 }
                 None => service_map_catalog_api_preview(
                     service_map_path(args, args.session_id),
@@ -5865,8 +6076,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             | "target.service_map.body_references.get"
             | "target.service_map.html_generators.get"
             | "target.service_map.link_declarations.get"
+            | "target.service_map.socket_peer_matches.get"
     ) {
-        if command.operation_name() == "target.service_map.link_declarations.get" {
+        if command.operation_name() == "target.service_map.socket_peer_matches.get" {
+            notes.push("Explicit recorded direct socket peer equality inspection only. Requires an already active session and an unchanged exact source-row token. One feature GET after identity checks; no arbitrary address input, target requests, capture/settings changes, discovery, body/header reads, inactive loading, retries, redirects, or fallback.");
+            notes.push("Counts are rows, including duplicate transaction UUIDs, within a latest retained sequence window and exclude the source. Inspect source.in_window, recorded timestamps, diagnostics, origin-group and sample omissions. Equal source/address-family/IP/port values do not prove a shared physical endpoint, deployment, ownership, or origin IP. Samples may become stale; no UUID-only fallback is permitted.");
+        } else if command.operation_name() == "target.service_map.link_declarations.get" {
             notes.push("Explicit one-row retained response-header inspection only, with fixed relation catalog 1. Requires an already active session and retained GET/HEAD status 200 metadata. One inspection GET after identity checks, with no body reads, inactive loading, target requests, automatic/batch reads, retries, redirects, fallback, or technology-catalog selector.");
             notes.push("Only canonical origins, fixed relation names, bounded counters and original retained-header UTF-8 spans are returned. Multiple relations may share a member. Partial/unsupported does not mean no declarations exist; completeness applies only to the fixed literal grammar. Declarations do not establish calls, ownership, availability, or connections.");
         } else if command.operation_name() == "target.service_map.html_generators.get" {
@@ -6384,6 +6599,43 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                         ServiceMapHtmlGeneratorsArgs {
                             session_id: call_required(operation, input, "session_id")?,
                             evidence_id,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    technology_catalog_version: 2,
+                }),
+            }
+        }
+        "target.service_map.socket_peer_matches.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id = parse_service_map_peer_evidence_id(&evidence_id)
+                .map_err(|message| anyhow!(message))?;
+            let in_scope_only = match input.get("in_scope_only") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| anyhow!("field `in_scope_only` must be a boolean"))?,
+            };
+            let max_records = match input.get("max_records") {
+                None => 10_000,
+                Some(value) => value
+                    .as_u64()
+                    .filter(|value| (1..=50_000).contains(value))
+                    .ok_or_else(|| {
+                        anyhow!("field `max_records` must be an integer between 1 and 50000")
+                    })? as usize,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::SocketPeerMatches(
+                        ServiceMapSocketPeerMatchesArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                            in_scope_only,
+                            max_records,
                         },
                     )),
                     session_id: None,
@@ -7509,6 +7761,7 @@ async fn run(cli: Cli) -> Result<()> {
                     | "target.service_map.body_references.get"
                     | "target.service_map.html_generators.get"
                     | "target.service_map.link_declarations.get"
+                    | "target.service_map.socket_peer_matches.get"
                     | "capture.http.upstream_peer.get"
                     | "capture.http.upstream_peer.set"
             ) {
@@ -8307,6 +8560,15 @@ async fn service_map_get_with_catalog<T: DeserializeOwned>(
             }.into());
         }
         if status == StatusCode::NOT_FOUND
+            && path.starts_with("/api/target/service-map/socket-peer-matches?")
+        {
+            return Err(ServiceMapCliError {
+                code: "UNSUPPORTED_FEATURE",
+                message: "The selected API does not support recorded socket peer matches; update the app to use this feature",
+                status: Some(404),
+            }.into());
+        }
+        if status == StatusCode::NOT_FOUND
             && path.starts_with("/api/target/service-map/link-declarations?")
         {
             return Err(ServiceMapCliError {
@@ -8329,6 +8591,32 @@ async fn service_map_get_with_catalog<T: DeserializeOwned>(
             status: Some(status.as_u16()),
         }
         .into());
+    }
+    if path.starts_with("/api/target/service-map/socket-peer-matches?") {
+        use sniper::service_map_peer_matches::MAX_PROJECTION_BYTES;
+        let invalid = || {
+            service_map_error(
+                "INVALID_RESPONSE",
+                "The selected API returned invalid or oversized recorded socket peer matches",
+            )
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_PROJECTION_BYTES as u64)
+        {
+            return Err(invalid());
+        }
+        // Bound the encoded response before JSON allocation, including chunked
+        // responses which cannot be checked from Content-Length alone.
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+            if chunk.len() > MAX_PROJECTION_BYTES.saturating_sub(bytes.len()) {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return serde_json::from_slice(&bytes).map_err(|_| invalid());
     }
     response.json().await.map_err(|_| {
         service_map_error(
@@ -9236,6 +9524,50 @@ fn validate_service_map_link_declarations_response(
     Ok(())
 }
 
+async fn read_service_map_socket_peer_matches(
+    api: &ApiClient,
+    args: &ServiceMapSocketPeerMatchesArgs,
+) -> Result<ServiceMapSocketPeerMatches> {
+    let client = service_map_read_client()?;
+    let raw: Value =
+        service_map_get(api, &client, &service_map_socket_peer_matches_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid recorded socket peer match envelope",
+        )
+    };
+    let result: ServiceMapSocketPeerMatches =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    let typed = serde_json::to_value(&result).map_err(|_| invalid())?;
+    // Shape checks require explicit nullable keys. Compare only identities that
+    // must be canonical; valid RFC3339 timestamp offsets may normalize in serde.
+    if !service_map_html_response_shape(&raw, &typed)
+        || raw["session_id"] != args.session_id.to_string()
+        || raw["evidence_id"] != args.evidence_id
+        || raw.pointer("/snapshot/id") != typed.pointer("/snapshot/id")
+        || raw.pointer("/snapshot/generation") != typed.pointer("/snapshot/generation")
+        || raw.pointer("/peer/address/ip") != typed.pointer("/peer/address/ip")
+        || !result.validate_response(
+            args.session_id,
+            &args.evidence_id,
+            args.in_scope_only,
+            args.max_records,
+        )
+    {
+        return Err(invalid());
+    }
+    if !result.available
+        && result
+            .reasons
+            .iter()
+            .any(|reason| reason == "scope_work_limit")
+    {
+        eprintln!("{SERVICE_MAP_PEER_SCOPE_WORK_WARNING}");
+    }
+    Ok(result)
+}
+
 async fn read_service_map_link_declarations(
     api: &ApiClient,
     args: &ServiceMapLinkDeclarationsArgs,
@@ -9347,6 +9679,10 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             }
             Some(ServiceMapCommand::LinkDeclarations(args)) => {
                 let result = read_service_map_link_declarations(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::SocketPeerMatches(args)) => {
+                let result = read_service_map_socket_peer_matches(&api, args).await?;
                 print_session_read_json(&result, args.session_id)
             }
             None => {

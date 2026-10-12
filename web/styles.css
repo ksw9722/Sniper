@@ -7551,3 +7551,15 @@ button.utility-button.replay-tab-add {
 .service-map-edge.preconnect-hint, .service-map-line.preconnect-hint { stroke-dasharray: 3 3; }
 .service-map-line.link-declaration { border-top-style: double; }
 .service-map-line.preconnect-hint { border-top-style: dashed; opacity: 0.65; }
+
+/* Explicit, temporary recorded address observations; never service-call arrows. */
+.service-map-edge.peer-observation { stroke-dasharray: 2 5; stroke-linecap: round; }
+.service-map-line.peer-observation { border-top-style: dotted; border-top-color: var(--text-soft); }
+.service-map-card.service-map-peer-address { border: 2px solid var(--text-soft); border-radius: 4px; padding: 9px; background: var(--panel-code); cursor: default; }
+.service-map-peer-address .service-map-card-symbol { border-radius: 4px; }
+.service-map-peer-origin { border-top: 1px solid var(--line); margin-top: 12px; }
+.service-map-peer-origin .service-map-evidence-button span { overflow-wrap: anywhere; }
+.service-map-peer-origin .service-map-evidence-button:disabled { opacity: .65; cursor: default; }
+.service-map-peer-coverage { margin-top: 3px; }
+.service-map-peer-coverage summary { cursor: pointer; color: var(--text-soft); }
+.service-map-peer-coverage[open] { max-height: 160px; overflow: auto; }

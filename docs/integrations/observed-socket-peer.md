@@ -128,9 +128,44 @@ and must not be presented as proof of a direct route or failed connection.
 
 Stale, edited, deleted, cross-session, and ambiguous duplicate-ID evidence fails
 closed with the ordinary evidence unavailability response and no peer envelope.
-There is no UUID-only detail fallback, automatic capture activation, aggregation,
-IP edge, origin-IP claim, or relationship traversal. A setting being On now does
+There is no UUID-only detail fallback, automatic capture activation, default
+aggregation, origin-IP claim, or relationship traversal. A setting being On now does
 not establish that an older row was eligible.
+
+## Explicit retained equality inspection
+
+After selecting an exact row, `target.service_map.socket_peer_matches.get` can
+compare its usable recorded **direct** observation with a bounded window of
+other rows in the same active session. The corresponding command is
+`sniper-cli scope service-map socket-peer-matches --session-id <active-session-uuid> --evidence-id <returned-token>`;
+the API is GET `/api/target/service-map/socket-peer-matches` with those same
+required fields. It accepts no IP, hostname or network-discovery input.
+
+The comparison includes recorded source, route, address family, IP and port.
+Proxy/unknown routes and absent/unusable addresses do not establish matches.
+IPv4 and mapped IPv6 stay distinct. A source outside the selected latest-record
+window is explicitly disclosed, while an out-of-scope source under scope-only
+inspection returns unavailable. The seed is not counted as another matching row.
+
+Results show at most 100 captured origin groups and three exact samples per
+origin, within 256 KiB. Other matching rows and omissions are counted inside a
+10,000-row default window (50,000 maximum); omitted distinct-origin totals are
+never guessed. Complex scope comparisons have a fixed logical-work budget;
+`scope_work_limit` returns unavailable without partial counts. A smaller latest-row
+window or deliberately simpler scope rules can help; no automatic retry occurs.
+Sample provenance includes exact token, retained sequence,
+request start and recorded observation timestamps. Time ranges summarize
+recorded responses; they do not establish continuous occupancy or connection
+counts. The default map remains peer-free. Optional visual grouping is temporary
+and follows an explicit inspection and display action.
+
+This metadata-only read does not enable capture, contact hosts, read body files
+or headers, activate saved sessions, or persist an index. Exact seed revision and
+active context are revalidated before publication. It remains a point-in-time
+snapshot; samples can later become unavailable and never use UUID-only fallback.
+Equal observations establish neither ownership nor physical endpoint identity,
+service calls, shared deployment or a backend chain. See the
+[full matching, limits and count contract](service-map.md#explicit-recorded-socket-peer-matches).
 
 ## Retention and disclosure
 

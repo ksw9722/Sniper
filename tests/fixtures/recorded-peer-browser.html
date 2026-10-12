@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'none'; font-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; worker-src 'none'; manifest-src 'none'">
+  <title>Recorded peer matches · offline production UI fixture</title>
+  <link rel="stylesheet" href="../../web/styles.css">
+  <link rel="stylesheet" href="recorded-peer-browser.css">
+  <script src="../../web/service-map.js" defer></script>
+  <script src="recorded-peer-browser.js" defer></script>
+</head>
+<body>
+  <div class="fixture-shell">
+    <header class="fixture-controls">
+      <div class="fixture-title"><strong id="targetServiceMapTab">Recorded socket peer matches</strong><span>Synthetic browser QA · real production controller and styles · no app bootstrap</span></div>
+      <div class="fixture-actions">
+        <label>Scenario <select id="fixtureScenario">
+          <option value="normal">Normal · absent origin + duplicate UUID</option>
+          <option value="many">Many origins · exercise 24-node cap</option>
+          <option value="partial">Partial · source outside window + omitted sample</option>
+          <option value="none">No matching rows</option>
+          <option value="unavailable">Exact source unavailable</option>
+          <option value="scope_work_limit">Scope work limit · preserve verified source</option>
+          <option value="invalid">Malformed response · reject closed</option>
+        </select></label>
+        <button class="secondary-action" id="fixtureReset">Load scenario</button>
+        <button class="secondary-action" id="fixtureSource">1. Inspect source</button>
+        <button class="secondary-action" id="fixtureMatches">2. Find recorded matches</button>
+        <button class="secondary-action" id="fixtureShow">3. Show on map</button>
+        <button class="secondary-action" id="fixtureClear">Clear overlay</button>
+        <button class="secondary-action" id="fixtureAbsent">Inspect absent-origin sample</button>
+        <button class="secondary-action" id="fixtureValidate">Validate fixture DTOs</button>
+      </div>
+      <details class="fixture-lifecycle">
+        <summary>Lifecycle, stale response, and exact-row controls</summary>
+        <div class="fixture-actions">
+          <button class="secondary-action" id="fixtureDirty">Retained row changed</button>
+          <button class="secondary-action" id="fixtureInvalidate">History invalidated</button>
+          <button class="secondary-action" id="fixtureGeneration">Change generation</button>
+          <button class="secondary-action" id="fixtureChangedMatch">Next peer read: source changed</button>
+          <button class="secondary-action" id="fixtureScopeWorkLimit">Next peer read: scope work limit</button>
+          <button class="secondary-action" id="fixtureSession">Switch session</button>
+          <button class="secondary-action" id="fixtureDisconnect">Disconnect event stream</button>
+          <button class="secondary-action" id="fixtureReconnect">Reconnect + refresh</button>
+          <button class="secondary-action" id="fixtureHide">Hide map</button>
+          <label><input type="checkbox" id="fixtureDelay"> Hold next peer response</label>
+          <button class="secondary-action" id="fixtureRelease">Release held responses</button>
+          <label><input type="checkbox" id="fixtureMissingSample"> Sample has become unavailable</label>
+        </div>
+        <p>A held response deliberately ignores abort, proving that the controller rejects late work. The sample switch returns unavailable for the exact token only, without UUID fallback.</p>
+      </details>
+      <div class="fixture-status"><output id="fixtureCounters" aria-live="polite"></output><output id="fixtureEvidenceState" aria-live="polite"></output><output id="fixtureResult" role="status">Loading real production controller…</output></div>
+    </header>
+          <section class="service-map-workspace" id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab">
+            <div class="service-map-toolbar">
+              <div class="service-map-view-controls" id="serviceMapViewControls" role="group" aria-label="Service map view">
+                <button class="service-map-mode" id="serviceMapAllOrigins" type="button" aria-pressed="true">All origins</button>
+                <button class="service-map-mode" id="serviceMapDirectRelations" type="button" aria-pressed="false" title="Pin the selected origin and show only its direct metadata neighbors">Direct relations</button>
+                <button class="secondary-action hidden" id="serviceMapFocusSelection" type="button">Focus selection</button>
+              </div>
+              <div class="service-map-zoom-controls" id="serviceMapZoomControls" role="group" aria-label="Map zoom">
+                <button class="secondary-action" id="serviceMapZoomFit" type="button" title="Fit displayed origins in the map">Fit</button>
+                <button class="secondary-action" id="serviceMapZoomOut" type="button" aria-label="Zoom out">−</button>
+                <button class="secondary-action service-map-zoom-reset" id="serviceMapZoomReset" type="button" aria-label="Zoom 100%. Reset to 100%" title="Reset zoom to 100%">100%</button>
+                <button class="secondary-action" id="serviceMapZoomIn" type="button" aria-label="Zoom in">+</button>
+              </div>
+              <label class="service-map-scope"><input id="serviceMapScopeOnly" type="checkbox" /> In scope only</label>
+              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
+              <button class="secondary-action" id="serviceMapRefresh" type="button">Refresh</button>
+            </div>
+            <div class="service-map-status" id="serviceMapStatus" role="status" aria-live="polite"></div>
+            <div class="service-map-content" id="serviceMapContent">
+              <section class="service-map-graph" aria-label="Captured service origins">
+                <div class="service-map-body-overlay hidden" id="serviceMapBodyOverlay" aria-label="Temporary retained observation or reference" aria-live="polite"></div>
+                <div class="service-map-viewport" id="serviceMapViewport" tabindex="0" aria-label="Service map. Plus or minus to zoom, zero to reset, F to fit."><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
+                <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect instruction <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer header declaration <span class="service-map-line dotted" aria-hidden="true"></span>Body URL reference <span class="service-map-line link-declaration" aria-hidden="true"></span>Link declaration <span class="service-map-line preconnect-hint" aria-hidden="true"></span>Preconnect hint <span class="service-map-line peer-observation" aria-hidden="true"></span>Recorded address observation · no confirmed calls<span id="serviceMapGraphBounds"></span><details class="service-map-bounds-details hidden" id="serviceMapBoundsDetails"><summary>Relation details</summary><p id="serviceMapGraphDiagnostics"></p></details></div>
+              </section>
+              <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
+            </div>
+            <section class="service-map-api-catalog hidden" id="serviceMapApiCatalog" aria-label="Observed API paths"></section>
+            <footer class="service-map-notice">Passive retained evidence only. Browser initiators, origin-IP associations and TLS certificate identities are unavailable. Inspect one retained response, then choose Show references on map for a temporary Direct relations overlay. Observed socket peers start in exact source evidence. Find matching recorded peer explicitly, then Show recorded address group for temporary undirected observations. A body, Link or recorded-address view replaces the previous temporary visualization. References and header clues do not establish calls or ownership. Pause HTTP recording manually for steadier inspection; traffic still passes through and other history changes can still clear this view.</footer>
+          </section>
+    <details class="fixture-log"><summary>Stub request log and synthetic identity</summary><p id="fixtureIdentity"></p><ol id="fixtureRequests"></ol></details>
+  </div>
+</body>
+</html>

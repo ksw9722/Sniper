@@ -1,0 +1,18 @@
+{
+  "fixture": "Recorded socket peer matches \u00b7 synthetic actual-code browser QA",
+  "production_controller": "web/service-map.js",
+  "production_styles": "web/styles.css",
+  "production_dom": "targetServiceMapPanel extracted from web/index.html",
+  "app_bootstrap": false,
+  "networking": "CSP connect-src none; controller uses a closed stub request adapter",
+  "sha256": {
+    "web/service-map.js": "d9b56a7a6b0889db71276a4b3b7d4480212338f3982722c6bb6bb4b606bfa87c",
+    "web/styles.css": "fd364580fafb84e8c401612b75b860bce76115211edda99748cf24c28dd4cdf3",
+    "web/index.html": "3afe426c13f89407bcb60a9df8b3df5a76c1b15391eaeffed71dfd90afb7fede",
+    "tests/fixtures/recorded-peer-browser.html": "1ff6f9fa25ffcac24af7043d13d47ce5b576773b6204fcf83648dd80bbf6ea25",
+    "tests/fixtures/recorded-peer-browser.js": "7469f2a9e7ed7e201025794ee12e924f0e6bc32b7ae9bee35b859ea6ff637ed3",
+    "tests/fixtures/recorded-peer-browser.css": "bd3e48a0ef7d9354b35118fe19dc408ff989d9aadc05dec7051938df99a0f2b0",
+    "tests/fixtures/recorded-peer-browser-manifest.py": "69ef6c2c6da3e28884748e9d8a4355ebc440f406929c746d0367dc5df685e383",
+    "tests/fixtures/recorded-peer-browser.README.md": "4c6259a9c185ad419c46ea8c8caa54b7d7f7b042bd60a2ce1b92f53faadfce8a"
+  }
+}

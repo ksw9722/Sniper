@@ -1,0 +1,21 @@
+/* Fixture chrome only. The map itself uses the production stylesheet unchanged. */
+body { overflow: auto; user-select: text; -webkit-user-select: text; }
+.fixture-shell { min-height: 100vh; display: grid; grid-template-rows: auto minmax(540px, 1fr) auto; }
+.fixture-controls { padding: 12px 16px 8px; border-bottom: 1px solid var(--line); background: var(--panel-code); }
+.fixture-title, .fixture-actions, .fixture-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.fixture-title { margin-bottom: 10px; }
+.fixture-title strong { font-size: 16px; color: var(--point); }
+.fixture-title span, .fixture-lifecycle p, .fixture-log { color: var(--text-dim); font-size: 11px; }
+.fixture-actions { margin-bottom: 8px; }
+.fixture-actions label { display: inline-flex; align-items: center; gap: 5px; }
+.fixture-actions select { max-width: 310px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text); }
+.fixture-lifecycle summary, .fixture-log summary { cursor: pointer; }
+.fixture-lifecycle[open] summary { margin-bottom: 8px; }
+.fixture-status { padding-top: 6px; font-size: 11px; }
+#fixtureCounters { color: var(--text-soft); font-family: var(--mono); }
+#fixtureResult { color: var(--point); }
+#targetServiceMapPanel { min-height: 540px; height: max(540px, calc(100vh - 190px)); box-sizing: border-box; }
+.fixture-log { padding: 6px 16px 12px; }
+.fixture-log p, .fixture-log li { overflow-wrap: anywhere; font-family: var(--mono); }
+.fixture-log ol { max-height: 200px; overflow: auto; }
+@media (max-width: 780px) { #targetServiceMapPanel { height: 900px; } .fixture-actions select { max-width: 230px; } }

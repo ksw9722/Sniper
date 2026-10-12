@@ -326,9 +326,116 @@ query parameter. No peer is returned for stale or unavailable evidence.
 Capture is independently Off by default and requires an explicit active-session
 settings save. This read never enables it, backfills rows, probes, or activates a
 session. A socket peer can be a proxy, CDN or shared endpoint, not proof of origin
-ownership or a backend chain. No aggregate peer map or IP edges are added. Retained
+ownership or a backend chain. The default map has no peer fields or IP edges. Retained
 observations are included in session files, exports and full-record JSON; Off
 does not erase them. See [the complete capture and evidence contract](observed-socket-peer.md).
+
+## Explicit recorded socket peer matches
+
+A selected exact row can explicitly inspect other retained ordinary HTTP rows
+whose recorded direct socket observation has the same source, route, address
+family, IP and port. This separate active-session-only read is available as:
+
+```bash
+sniper-cli scope service-map socket-peer-matches --session-id <active-session-uuid> --evidence-id <returned-token>
+sniper-cli scope service-map socket-peer-matches --session-id <active-session-uuid> --evidence-id <returned-token> --in-scope-only --max-records 10000
+sniper-cli call target.service_map.socket_peer_matches.get --input '{"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"<returned-token>"}'
+sniper-cli schema input target.service_map.socket_peer_matches.get
+sniper-cli schema output target.service_map.socket_peer_matches.get
+```
+
+GET `/api/target/service-map/socket-peer-matches` requires `session_id` and
+`evidence_id`. Optional `in_scope_only` defaults to false and `max_records` to
+10,000 (maximum 50,000, minimum 1). Unknown fields, duplicates, nulls, malformed
+booleans and arbitrary IP/hostname filters are rejected with fixed errors that
+do not repeat supplied data. The operation neither activates nor loads an
+inactive saved session. It never turns capture on, changes settings, performs a
+request, reads DNS/TLS, reads bodies/headers, or persists a peer index.
+
+The schema-version-1 response has `available`, `status` (`matched`, `no_matches`
+or `unavailable`), `complete`, `reasons`, the exact source token, a typed `peer`
+key, a `source`, a point-in-time `snapshot`, diagnostic `counts`, `origins` and
+`limits`. An unavailable response clears peer/source/snapshot/groups and counts.
+The default map and default evidence shapes are unchanged.
+
+- The seed is separate from matching-row counts. `source.in_window` says whether
+  it falls inside the latest retained-sequence window; an older retained seed
+  remains inspectable, with `source_outside_window` and `max_records` disclosed.
+- Only other matching rows form origin groups, including other rows with the
+  seed's own origin. Each group gives its matching-row count, min/max recorded
+  observation timestamps, and up to three exact token samples. These are
+  response observations, never connection counts or continuous occupancy.
+- Duplicate transaction UUIDs retain separate exact tokens and sequences.
+  Origin groups absent from the default map are captured origins in this
+  inspection; no total traffic count is inferred for them.
+- Scope is frozen once and uses the existing matcher on the original captured
+  host spelling, exactly like the default map. An out-of-scope seed with
+  `in_scope_only=true` returns `source_out_of_scope`. Other equal rows outside
+  scope count as exclusions. A returned group's `in_scope` is true if any of its
+  represented rows is in scope.
+- `retained_rows` and `considered_rows` distinguish the whole retained store from
+  the bounded latest-sequence window. Non-source diagnostic buckets are disjoint:
+  non-HTTP, not recorded, unavailable observation, non-direct, invalid observation,
+  different peer, invalid metadata, scope excluded, and matching. They sum to
+  considered rows minus the seed when the seed is in the window.
+- `matching_rows = returned_matching_rows + omitted_matching_rows`.
+  `returned_matching_rows` is the sum of group counts; `sample_rows` and
+  `omitted_sample_rows` sum samples and omissions for returned groups. There is
+  no claimed count of distinct omitted origins.
+
+Limits are 100 groups, three samples per group, a conservative 256-KiB projection
+budget, a 512-byte captured host and an eight-byte scheme. Typed observations are
+compared before bounded origin projection; no full Service Map row, technology
+catalog, path or header clues are projected. A group may have zero samples after
+the byte budget fills. Rows after the group cap still contribute exact matching
+and omission counts within the window; no unbounded distinct-origin set is kept.
+Groups/reasons are lexically sorted, samples descend by retained sequence, and
+sequence values remain decimal strings. Partial reasons are `max_records`,
+`source_outside_window`, `invalid_metadata`, `origin_group_limit`,
+`projection_byte_limit` and `sample_limit`. Completeness covers only this
+retained-data projection, not infrastructure discovery.
+
+Scope patterns are prepared outside the store lock, with at most 500 entries
+per include/exclude list and 512 bytes per pattern. Exact normalized patterns
+use an in-memory set; suffix and glob comparisons share an 8,388,608-unit
+request budget across the seed and candidate rows. Each patterned comparison
+is charged the normalized host bytes plus normalized pattern bytes plus 16
+before matching. This is a deterministic logical-work bound, not a wall-clock
+promise. `limits.scope_pattern_entries`, `limits.scope_pattern_bytes` and
+`limits.scope_work_units` disclose these fixed bounds. If preparation or work
+exceeds a bound, the whole inspection is `unavailable` with
+`scope_work_limit`, cleared source/peer/snapshot/groups and zero counters.
+No partial counts or guessed scope decisions are published. Consider a smaller
+`max_records` window or deliberately simpler scope rules; clients never retry
+or alter settings automatically.
+
+A direct usable unicast observation is required. CONNECT, tunnel and status-101
+upgrade rows are excluded. Proxy/unknown routes, unrecorded observations,
+missing addresses and invalid metadata remain diagnostics. Zero ports,
+unspecified, multicast, link-local, broadcast/reserved IPv4 and IPv4 0/8
+addresses are ineligible, including mapped IPv6 equivalents. Private and loopback
+unicast addresses are eligible. IPv4 and IPv4-mapped IPv6 remain different
+families and never match each other. Address strings use canonical Rust IP
+serialization.
+
+The store freezes membership and revisions under its read lock and revalidates
+the seed after scanning; API publication rechecks that seed and the same active
+session context. The explicit scan runs off the async executor, but its read
+lock can briefly delay store writes. Keep the 10,000-row default for a smaller
+inspection; choosing the optional 50,000-row maximum increases bounded work
+and possible write contention. This operation is not a nonblocking background
+index. This is a revalidated snapshot, not an atomic-through-delivery
+claim. Sample tokens can subsequently become stale. Exact sample inspection
+must check the returned token, origin and observation; unavailable evidence
+never falls back to UUID-only lookup. Because this operation needs only a safe
+captured authority, a malformed or oversized path can still make ordinary exact
+Service Map evidence return `metadata_unavailable`. Missing body files do not
+prevent peer matching.
+
+Equal socket observations do not establish ownership, physical endpoint identity,
+shared deployment, service dependencies, backend chains or a current IP address.
+The optional UI grouping is temporary and must be explicitly shown after
+inspection; it does not enable capture or alter the default inventory.
 
 ## Explicit one-row response-body references
 

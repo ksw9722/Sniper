@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn packaged_service_map_guidance_keeps_html_inspection_explicit() {
+    fn packaged_service_map_guidance_keeps_supplementary_inspection_explicit() {
         let section = |template: &str| {
             template
                 .split_once("## Passive Service Map")
@@ -287,6 +287,12 @@ mod tests {
             "scope service-map html-generators",
             "target.service_map.html_generators.get",
             "target.service_map.link_declarations.get",
+            "target.service_map.socket_peer_matches.get",
+            "never enables capture",
+            "Scope matching uses the original captured host",
+            "Duplicate UUID rows count separately",
+            "undirected observation links",
+            "Socket addresses may reveal",
             "only response headers, never body files or linked resources",
             "Show explicitly replaces the one",
             "not original wire ordering",
@@ -300,7 +306,7 @@ mod tests {
         ] {
             assert!(
                 guidance.contains(term),
-                "missing passive HTML guidance: {term}"
+                "missing passive supplementary guidance: {term}"
             );
         }
     }

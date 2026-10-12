@@ -233,6 +233,149 @@
     return validIp ? { ...normalized, ip, port: address.port } : { status: "invalid" };
   }
 
+  const PEER_MATCH_LIMITS = Object.freeze({ max_records: 10000, origin_groups: 100, samples_per_origin: 3, projection_bytes: 262144, host_bytes: 512, scheme_bytes: 8, scope_pattern_entries: 500, scope_pattern_bytes: 512, scope_work_units: 8388608 });
+  const PEER_MATCH_REASONS = Object.freeze({
+    invalid_evidence_id: "The exact evidence token is invalid", session_mismatch: "The source session changed", stale_generation: "Retained history changed",
+    record_missing: "The source row is no longer retained", record_changed: "The source row changed", inactive_session: "Only the active session can be inspected",
+    session_source_changed: "The active source changed", unsupported_source_context: "This source is not an ordinary captured HTTP row",
+    observation_not_recorded: "No peer was recorded for this source", observation_unavailable: "The recorded source address is unavailable",
+    non_direct_observation: "Proxy and unknown routes are diagnostics only", invalid_observation: "The recorded source address is not eligible for matching",
+    metadata_unavailable: "The captured source origin could not be verified", source_out_of_scope: "The source is excluded by In scope only",
+    scope_work_limit: "Scope matching reached the inspection work limit. Narrow the scope rules or use a smaller latest-row window in the CLI.",
+    peer_inspection_failed: "The retained peer inspection is unavailable", max_records: "Newest-row window limit reached",
+    source_outside_window: "The source is outside the considered candidate window", invalid_metadata: "Some matching rows have unusable origin metadata",
+    origin_group_limit: "Origin-group result limit reached", projection_byte_limit: "Result byte limit reached", sample_limit: "Exact source samples were omitted",
+  });
+  const PEER_PARTIAL_REASONS = new Set(["max_records", "source_outside_window", "invalid_metadata", "origin_group_limit", "projection_byte_limit", "sample_limit"]);
+  const PEER_COUNT_FIELDS = ["non_http_rows", "not_recorded_rows", "unavailable_observation_rows", "non_direct_rows", "invalid_observation_rows", "different_peer_rows", "invalid_metadata_rows", "scope_excluded_rows", "matching_rows", "returned_matching_rows", "omitted_matching_rows", "sample_rows", "omitted_sample_rows"];
+  const PEER_PRIVACY = "Matches retained address values. Shared addresses and imported history do not establish the same physical endpoint or origin ownership. Addresses may reveal internal infrastructure.";
+  const PEER_NODE_ID = "recorded-socket-peer";
+  function peerAddressKey(ip) {
+    if (typeof ip !== "string" || ip.length > 45) return null;
+    if (/^(0|[1-9]\d{0,2})(?:\.(0|[1-9]\d{0,2})){3}$/.test(ip) && ip.split(".").every((part) => Number(part) <= 255)) return { family: "ipv4", ip, v4: ip.split(".").map(Number) };
+    if (!ip.includes(":") || !/^[0-9a-fA-F:.]+$/.test(ip)) return null;
+    try {
+      const canonical = new URL(`http://[${ip}]/`).hostname.slice(1, -1);
+      const parts = canonical.split("::"), left = parts[0] ? parts[0].split(":") : [], right = parts[1] ? parts[1].split(":") : [];
+      const words = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right].map((part) => parseInt(part, 16));
+      if (words.length !== 8 || words.some((word) => !Number.isInteger(word))) return null;
+      const mapped = words.slice(0, 5).every((word) => word === 0) && words[5] === 65535;
+      const v4 = mapped ? [words[6] >> 8, words[6] & 255, words[7] >> 8, words[7] & 255] : null;
+      return { family: "ipv6", ip: canonical, wire: mapped ? `::ffff:${v4.join(".")}` : canonical, words, v4 };
+    } catch (_) { return null; }
+  }
+  function usableSocketPeer(peer) {
+    if (peer?.status !== "observed" || peer.route !== "direct" || peer.source !== "http_response_remote_addr"
+      || !Number.isInteger(peer.port) || peer.port < 1 || peer.port > 65535 || observationTime(peer.observedAt) === null) return false;
+    const key = peerAddressKey(peer.ip);
+    if (!key) return false;
+    if (key.v4) return key.v4[0] !== 0 && key.v4[0] < 224 && !(key.v4[0] === 169 && key.v4[1] === 254);
+    return key.words.some(Boolean) && (key.words[0] & 0xff00) !== 0xff00 && (key.words[0] & 0xffc0) !== 0xfe80;
+  }
+  function peerEquals(peer, recorded) {
+    const left = peerAddressKey(peer?.address?.ip), right = peerAddressKey(recorded?.ip);
+    return usableSocketPeer(recorded) && left && right && left.family === peer.address_family && left.family === right.family
+      && left.ip === right.ip && peer.address.port === recorded.port && peer.route === recorded.route && peer.source === recorded.source;
+  }
+  const validPeerEvidence = (value, sessionId, generation) => validTechnologyEvidence(value, sessionId, generation) && value === value.toLowerCase();
+  function normalizePeerMatches(payload, sessionId, evidenceId, row, recordedPeer, scopeOnly, generation) {
+    const invalid = () => { throw new Error("Invalid recorded socket peer matches"); };
+    const uuid = (value) => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+    const integer = (value, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && value >= 0 && value <= max;
+    const sequence = (value) => typeof value === "string" && /^(?:0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 18446744073709551615n;
+    const origin = (value) => typeof value === "string" && value.length <= 544 && value === safeOrigin(value);
+    if (!exactFields(payload, ["schema_version", "session_id", "evidence_id", "available", "status", "complete", "reasons", "in_scope_only", "coverage", "peer", "source", "snapshot", "counts", "origins", "limits"])
+      || payload.schema_version !== 1 || payload.session_id !== sessionId || payload.evidence_id !== evidenceId
+      || !validPeerEvidence(evidenceId, sessionId, generation) || payload.in_scope_only !== scopeOnly
+      || payload.coverage !== "retained_direct_socket_peer_equality" || typeof payload.available !== "boolean" || typeof payload.complete !== "boolean"
+      || !["matched", "no_matches", "unavailable"].includes(payload.status)
+      || !Array.isArray(payload.reasons) || new Set(payload.reasons).size !== payload.reasons.length
+      || payload.reasons.length > 6 || payload.reasons.some((reason, index) => typeof reason !== "string" || !Object.hasOwn(PEER_MATCH_REASONS, reason) || index && payload.reasons[index - 1] >= reason)
+      || !exactFields(payload.counts, PEER_COUNT_FIELDS) || PEER_COUNT_FIELDS.some((field) => !integer(payload.counts[field]))
+      || !exactFields(payload.limits, Object.keys(PEER_MATCH_LIMITS)) || Object.entries(PEER_MATCH_LIMITS).some(([key, value]) => payload.limits[key] !== value)
+      || !Array.isArray(payload.origins) || payload.origins.length > PEER_MATCH_LIMITS.origin_groups) invalid();
+    if (!payload.available) {
+      if (payload.status !== "unavailable" || payload.complete || payload.reasons.length !== 1 || payload.reasons.some((reason) => PEER_PARTIAL_REASONS.has(reason))
+        || payload.reasons[0] === "source_out_of_scope" && !scopeOnly
+        || payload.peer !== null || payload.source !== null || payload.snapshot !== null || payload.origins.length || PEER_COUNT_FIELDS.some((field) => payload.counts[field] !== 0)) invalid();
+      return { ...payload, reasons: [...payload.reasons], origins: [], counts: { ...payload.counts }, limits: { ...payload.limits } };
+    }
+    const source = payload.source, snapshot = payload.snapshot, peer = payload.peer, counts = payload.counts;
+    if (payload.status === "unavailable" || payload.complete !== (payload.reasons.length === 0) || payload.reasons.some((reason) => !PEER_PARTIAL_REASONS.has(reason))
+      || !exactFields(peer, ["source", "route", "address_family", "address"]) || !exactFields(peer.address, ["ip", "port"])
+      || peer.source !== "http_response_remote_addr" || peer.route !== "direct" || !peerEquals(peer, recordedPeer)
+      || peer.address.ip !== (peerAddressKey(peer.address.ip).wire || peerAddressKey(peer.address.ip).ip)
+      || !exactFields(source, ["evidence_id", "sequence", "origin", "started_at", "observed_at", "in_scope", "in_window"])
+      || source.evidence_id !== evidenceId || source.sequence !== row.sequence || source.sequence !== evidenceId.split(".")[3]
+      || source.origin !== row.origin || !origin(source.origin) || source.started_at !== row.started_at || observationTime(source.started_at) === null
+      || source.observed_at !== recordedPeer.observedAt || typeof source.in_scope !== "boolean" || typeof source.in_window !== "boolean" || scopeOnly && !source.in_scope
+      || !exactFields(snapshot, ["id", "generation", "captured_at", "window_order", "retained_rows", "considered_rows", "oldest_considered_sequence", "latest_considered_sequence"])
+      || !uuid(snapshot.id) || snapshot.generation !== generation || !uuid(snapshot.generation) || observationTime(snapshot.captured_at) === null
+      || snapshot.window_order !== "latest_retained_sequence" || !integer(snapshot.retained_rows) || !integer(snapshot.considered_rows, PEER_MATCH_LIMITS.max_records)
+      || snapshot.considered_rows !== Math.min(snapshot.retained_rows, PEER_MATCH_LIMITS.max_records)
+      || !snapshot.retained_rows || !snapshot.considered_rows
+      || !sequence(snapshot.oldest_considered_sequence) || !sequence(snapshot.latest_considered_sequence)
+      || BigInt(snapshot.oldest_considered_sequence) > BigInt(snapshot.latest_considered_sequence)
+      || snapshot.considered_rows === 1 && snapshot.oldest_considered_sequence !== snapshot.latest_considered_sequence
+      || BigInt(snapshot.considered_rows) > BigInt(snapshot.latest_considered_sequence) - BigInt(snapshot.oldest_considered_sequence) + 1n
+      || BigInt(source.sequence) > BigInt(snapshot.latest_considered_sequence)
+      || snapshot.considered_rows === snapshot.retained_rows && !source.in_window
+      || source.in_window !== (BigInt(source.sequence) >= BigInt(snapshot.oldest_considered_sequence) && BigInt(source.sequence) <= BigInt(snapshot.latest_considered_sequence))
+      || payload.reasons.includes("source_outside_window") === source.in_window
+      || payload.reasons.includes("max_records") !== (snapshot.retained_rows > snapshot.considered_rows)
+      || payload.reasons.includes("invalid_metadata") !== (counts.invalid_metadata_rows > 0)
+      || PEER_COUNT_FIELDS.some((key) => counts[key] > snapshot.considered_rows)
+      || counts.returned_matching_rows + counts.omitted_matching_rows !== counts.matching_rows
+      || (payload.status === "matched") !== (counts.matching_rows > 0)
+      || PEER_COUNT_FIELDS.slice(0, 9).reduce((sum, key) => sum + counts[key], 0) !== snapshot.considered_rows - (source.in_window ? 1 : 0)
+      || scopeOnly === false && counts.scope_excluded_rows !== 0) invalid();
+    const seenOrigins = new Set(), seenTokens = new Set([evidenceId]), seenSequences = new Set([source.sequence]);
+    const origins = payload.origins.map((group, groupIndex) => {
+      const first = observationTime(group?.first_observed_at), last = observationTime(group?.last_observed_at);
+      if (!exactFields(group, ["origin", "in_scope", "matching_rows", "first_observed_at", "last_observed_at", "samples", "omitted_samples"])
+        || !origin(group.origin) || seenOrigins.has(group.origin) || groupIndex && payload.origins[groupIndex - 1].origin >= group.origin || typeof group.in_scope !== "boolean" || scopeOnly && !group.in_scope
+        || !integer(group.matching_rows, counts.matching_rows) || !group.matching_rows || first === null || last === null || first > last
+        || !Array.isArray(group.samples) || group.samples.length > Math.min(3, group.matching_rows)
+        || group.omitted_samples !== group.matching_rows - group.samples.length) invalid();
+      seenOrigins.add(group.origin);
+      const samples = group.samples.map((sample, sampleIndex) => {
+        const at = observationTime(sample?.observed_at);
+        if (!exactFields(sample, ["evidence_id", "sequence", "started_at", "observed_at"])
+          || !validPeerEvidence(sample.evidence_id, sessionId, generation) || sample.sequence !== sample.evidence_id.split(".")[3]
+          || seenTokens.has(sample.evidence_id) || seenSequences.has(sample.sequence)
+          || sampleIndex && BigInt(group.samples[sampleIndex - 1].sequence) <= BigInt(sample.sequence) || observationTime(sample.started_at) === null || at === null || at < first || at > last
+          || BigInt(sample.sequence) < BigInt(snapshot.oldest_considered_sequence) || BigInt(sample.sequence) > BigInt(snapshot.latest_considered_sequence)) invalid();
+        seenTokens.add(sample.evidence_id); seenSequences.add(sample.sequence);
+        return Object.freeze({ ...sample });
+      });
+      const knownTimes = new Set(samples.map((sample) => observationTime(sample.observed_at).toString()));
+      const missingTimes = new Set([first.toString(), last.toString()].filter((value) => !knownTimes.has(value))).size;
+      if (missingTimes > group.omitted_samples) invalid();
+      if (!group.omitted_samples && (samples.reduce((min, item) => observationTime(item.observed_at) < min ? observationTime(item.observed_at) : min, last) !== first
+        || samples.reduce((max, item) => observationTime(item.observed_at) > max ? observationTime(item.observed_at) : max, first) !== last)) invalid();
+      return Object.freeze({ ...group, samples: Object.freeze(samples) });
+    });
+    const knownWindowRows = seenSequences.size - (source.in_window ? 0 : 1);
+    const unknownWindowRows = snapshot.considered_rows - knownWindowRows;
+    const missingEndpoints = new Set([snapshot.oldest_considered_sequence, snapshot.latest_considered_sequence].filter((value) => !seenSequences.has(value))).size;
+    if (missingEndpoints > unknownWindowRows) invalid();
+    const admittedBytes = 8192 + origins.reduce((sum, group) => sum + group.origin.length * 12 + 512, 0) + counts.sample_rows * 1024;
+    const remainingBytes = PEER_MATCH_LIMITS.projection_bytes - admittedBytes;
+    const byteRejectedSample = origins.some((group) => group.samples.length < 3 && group.omitted_samples > 0);
+    if (remainingBytes < 0 || byteRejectedSample && remainingBytes >= 1024 || payload.reasons.includes("origin_group_limit") && (origins.length !== PEER_MATCH_LIMITS.origin_groups || !counts.omitted_matching_rows)
+      || payload.reasons.includes("sample_limit") !== origins.some((group) => group.samples.length === 3 && group.omitted_samples > 0)
+      || byteRejectedSample && !payload.reasons.includes("projection_byte_limit")
+      || payload.reasons.includes("projection_byte_limit") && !(counts.omitted_matching_rows > 0 && remainingBytes < 7040 || byteRejectedSample && remainingBytes < 1024)
+      || JSON.stringify(payload).length > PEER_MATCH_LIMITS.projection_bytes
+      || origins.reduce((sum, group) => sum + group.matching_rows, 0) !== counts.returned_matching_rows
+      || origins.reduce((sum, group) => sum + group.samples.length, 0) !== counts.sample_rows
+      || origins.reduce((sum, group) => sum + group.omitted_samples, 0) !== counts.omitted_sample_rows
+      || counts.omitted_matching_rows > 0 && !payload.reasons.some((reason) => ["origin_group_limit", "projection_byte_limit"].includes(reason))
+      || counts.omitted_sample_rows > 0 && !payload.reasons.some((reason) => ["sample_limit", "projection_byte_limit"].includes(reason))) invalid();
+    return Object.freeze({ ...payload, source: Object.freeze({ ...source }), peer: Object.freeze({ ...peer, address: Object.freeze({ ...peer.address }) }),
+      snapshot: Object.freeze({ ...snapshot }), reasons: Object.freeze([...payload.reasons]), counts: Object.freeze({ ...counts }), origins: Object.freeze(origins), limits: Object.freeze({ ...payload.limits }) });
+  }
+
   function normalizeBodyReferences(payload, sessionId, evidenceId, row) {
     const invalid = () => { throw new Error("Invalid retained body-reference response"); };
     const integer = (value, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && value >= 0 && value <= max;
@@ -646,6 +789,20 @@
     }
     return { nodes: visible, edges, edgeCount, slots, geometry, width, height: Math.max(geometry.padding * 2 + geometry.cardHeight, ...visible.map((origin) => origin.y + geometry.cardHeight + geometry.padding)) };
   }
+
+  function peerGraphLayout(origins, sourceOrigin, geometry = GRAPH_GEOMETRY) {
+    // This visualization contains observations only. No metadata or domain-to-
+    // domain arrows are carried over from the normal service map.
+    const ordered = [...origins.filter((item) => item.origin === sourceOrigin), ...origins.filter((item) => item.origin !== sourceOrigin)].slice(0, MAX_CARDS - 1);
+    const width = geometry.padding * 2 + geometry.columnPitch + geometry.cardWidth;
+    const endpoint = { origin: PEER_NODE_ID, endpointNode: true, x: geometry.padding, y: geometry.padding };
+    const nodes = [endpoint, ...ordered.map((item, index) => ({ ...item, x: geometry.padding + geometry.columnPitch, y: geometry.padding + index * geometry.rowPitch }))];
+    const x1 = endpoint.x + geometry.cardWidth, y1 = endpoint.y + geometry.cardHeight / 2;
+    const edges = nodes.slice(1, MAX_EDGES + 1).map((item) => ({ source: item.origin, target: PEER_NODE_ID, relationship: "recorded_peer_observation", label: "Recorded address observation", undirected: true,
+      path: `M ${x1} ${y1} C ${(x1 + item.x) / 2} ${y1}, ${(x1 + item.x) / 2} ${item.y + geometry.cardHeight / 2}, ${item.x} ${item.y + geometry.cardHeight / 2}` }));
+    return { nodes, edges, edgeCount: ordered.length, slots: new Map(), geometry, width,
+      height: Math.max(geometry.padding * 2 + geometry.cardHeight, ...nodes.map((item) => item.y + geometry.cardHeight + geometry.padding)) };
+  }
   function* metadataRelations(origins) {
     for (const origin of origins) {
       for (const link of origin.header_links) yield {
@@ -668,6 +825,7 @@
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
+      peerMatches: null, peerMatchesSource: null, peerMatchesLoading: false, peerMatchesError: "", peerMatchesRequestId: 0, peerEvidenceBinding: null,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       bodyReferencesSource: null, bodyReferenceOverlay: null, bodyOverlayNotice: "",
       relationshipKind: "body", linkDeclarations: null, linkDeclarationsSource: null, linkDeclarationsError: "",
@@ -677,6 +835,7 @@
     let abort = null;
     let evidenceAbort = null;
     let bodyReferencesAbort = null;
+    let peerMatchesAbort = null;
     let htmlGeneratorsAbort = null;
     let detailRender = null;
     let visible = false;
@@ -795,6 +954,8 @@
     function findOrigin(id) {
       if (!id) return null;
       const existing = graphOrigins().find((origin) => origin.origin === id);
+      const peerOrigin = peerOverlayOrigins().find((origin) => origin.origin === id);
+      if (peerOrigin) return existing?.captured ? { ...existing, peerGroup: peerOrigin.peerGroup, peerSource: peerOrigin.peerSource } : peerOrigin;
       if (existing) return existing;
       if (state.extraOriginSnapshot === state.snapshot && state.extraOriginId === id && state.extraOriginOverlay === state.bodyReferenceOverlay) return state.extraOrigin;
       // A direct neighbor can be outside the All origins reference-card budget.
@@ -822,7 +983,7 @@
     }
     function overlayReferences() {
       const overlay = state.bodyReferenceOverlay;
-      return overlay ? overlay.kind === "link" ? overlay.scan.observations : overlay.scan.references : [];
+      return overlay && overlay.kind !== "peer" ? overlay.kind === "link" ? overlay.scan.observations : overlay.scan.references : [];
     }
     function overlayEdges() {
       const overlay = state.bodyReferenceOverlay, seen = new Set();
@@ -843,7 +1004,9 @@
     function clearOverlay(notice = "") {
       if (!state.bodyReferenceOverlay) return false;
       if (state.bodyReferenceOverlay.kind === "link") notice = notice.replace("body references", "Link references");
+      if (state.bodyReferenceOverlay.kind === "peer") notice = notice.replace("body references", "recorded address group");
       state.bodyReferenceOverlay = null;
+      if (state.peerEvidenceBinding) cancelEvidence();
       state.neighborhoodOverlay = null;
       state.neighborhoodSnapshot = null;
       state.neighborhoodAnchor = null;
@@ -854,6 +1017,7 @@
       state.extraOrigin = null;
       state.layoutSlots = new Map();
       state.bodyOverlayNotice = notice;
+      if (state.anchorOrigin && !findOrigin(state.anchorOrigin)) state.anchorOrigin = null;
       if (state.selectedOrigin && !findOrigin(state.selectedOrigin)) {
         cancelEvidence();
         state.selectedOrigin = null;
@@ -863,6 +1027,7 @@
       return true;
     }
     function clearBodyReferenceOverlay() {
+      cancelPeerMatches();
       const cleared = clearOverlay(state.bodyReferenceOverlay?.kind === "link" ? "Temporary Link references cleared. Showing loaded metadata only." : "Temporary body references cleared. Showing loaded metadata only.");
       render();
       return cleared;
@@ -898,6 +1063,7 @@
       return true;
     }
     function directNeighborhood() {
+      if (state.bodyReferenceOverlay?.kind === "peer") return null;
       if (!state.anchorOrigin || !state.snapshot) {
         state.neighborhoodSnapshot = null; state.neighborhoodAnchor = null; state.neighborhood = null;
         return null;
@@ -939,6 +1105,7 @@
         if (state.anchorOrigin || !selectedOrigin()) return;
         state.anchorOrigin = state.selectedOrigin;
       } else {
+        cancelPeerMatches();
         clearOverlay("Temporary body references cleared by All origins.");
         state.anchorOrigin = null;
       }
@@ -948,12 +1115,203 @@
     function focusSelection() {
       if (state.sessionId !== getSessionId()) { reset(); return; }
       if (!state.anchorOrigin || !selectedOrigin()) return;
-      if (state.anchorOrigin !== state.selectedOrigin) clearOverlay("Temporary body references cleared when the pinned origin changed.");
+      if (state.anchorOrigin !== state.selectedOrigin) {
+        cancelPeerMatches();
+        clearOverlay("Temporary body references cleared when the pinned origin changed.");
+      }
       if (!selectedOrigin()) { render(); return; }
       state.anchorOrigin = state.selectedOrigin;
       state.modeNotice = "";
       render();
     }
+
+    function peerSnapshotKey(snapshot = state.snapshot) {
+      if (!snapshot) return null;
+      // Response IDs/timestamps change on every map poll. Freeze only retained
+      // projection identity; event/history epochs cover edits at equal counts.
+      const { id, captured_at, ...bounds } = snapshot.snapshot;
+      return JSON.stringify([bounds, snapshot.origins]);
+    }
+    function peerSourceIsCurrent(source, snapshot = state.snapshot) {
+      return !!source && source.sessionId === getSessionId() && source.sessionId === state.sessionId
+        && source.generation === snapshot?.snapshot.generation && source.historyVersion === state.historyVersion
+        && source.scopeOnly === state.scopeOnly && source.mapKey === peerSnapshotKey(snapshot);
+    }
+    function peerOverlayOrigins() {
+      const overlay = state.bodyReferenceOverlay;
+      if (overlay?.kind !== "peer") return [];
+      const scan = overlay.scan, ids = [scan.source.origin, ...scan.origins.map((group) => group.origin)];
+      return [...new Set(ids)].map((id) => {
+        const group = scan.origins.find((item) => item.origin === id);
+        return { ...referenceOrigin(id), captured: true, peerInspectionOnly: true, in_scope: id === scan.source.origin ? scan.source.in_scope : group.in_scope,
+          peerGroup: group || null, peerSource: id === scan.source.origin, request_count: 0 };
+      });
+    }
+    function peerSampleBinding(id, origin) {
+      const overlay = state.bodyReferenceOverlay;
+      if (overlay?.kind !== "peer" || !peerSourceIsCurrent(overlay.source) || state.peerUnavailableTokens?.has(id)) return null;
+      const scan = overlay.scan;
+      const sample = scan.source.evidence_id === id && scan.source.origin === origin ? scan.source
+        : scan.origins.find((group) => group.origin === origin)?.samples.find((item) => item.evidence_id === id);
+      return sample ? Object.freeze({ overlay, snapshotId: scan.snapshot.id, seedId: scan.evidence_id, origin, sample }) : null;
+    }
+    function peerBindingIsCurrent(binding) {
+      if (!binding || binding.overlay !== state.bodyReferenceOverlay || binding.overlay?.kind !== "peer"
+        || !visible || !getEventStreamReady() || state.error || state.stale || !peerSourceIsCurrent(binding.overlay.source)
+        || binding.snapshotId !== binding.overlay.scan.snapshot.id || binding.seedId !== binding.overlay.scan.evidence_id) return false;
+      return peerSampleBinding(binding.sample.evidence_id, binding.origin)?.sample === binding.sample;
+    }
+    function handlePeerSampleUnavailable(binding) {
+      if (state.bodyReferenceOverlay !== binding.overlay) return;
+      if (binding.sample.evidence_id === binding.seedId) {
+        clearOverlay("Temporary recorded address group cleared: the exact inspected source is unavailable or changed.");
+        cancelPeerMatches();
+      } else {
+        if (!state.peerUnavailableTokens) state.peerUnavailableTokens = new Set();
+        state.peerUnavailableTokens.add(binding.sample.evidence_id);
+        state.peerEvidenceBinding = null;
+        state.evidenceError = "This matched sample is unavailable or changed. The shown counts remain a point-in-time inspection; other exact samples can still be checked. Inspect again to obtain new samples.";
+      }
+    }
+    function cancelPeerMatches() {
+      state.peerMatchesRequestId += 1;
+      peerMatchesAbort?.abort();
+      peerMatchesAbort = null;
+      state.peerMatches = null;
+      state.peerMatchesSource = null;
+      state.peerMatchesLoading = false;
+      state.peerMatchesError = "";
+    }
+    async function loadPeerMatches() {
+      const row = state.evidence, peer = state.socketPeer, sessionId = getSessionId(), generation = state.snapshot?.snapshot.generation;
+      if (!visible || state.view !== "service-map" || !getEventStreamReady() || state.error || state.stale || state.sessionId !== sessionId
+        || !row || row.evidence_id !== state.evidenceId || state.evidenceLoading || state.peerMatchesLoading || !usableSocketPeer(peer)
+        || !validTechnologyEvidence(row.evidence_id, sessionId, generation) || row.sequence !== row.evidence_id.split(".")[3]
+        || row.record_id !== row.evidence_id.split(".")[5] || safeOrigin(row.origin) !== row.origin || observationTime(row.started_at) === null
+        || !(state.peerEvidenceBinding ? peerBindingIsCurrent(state.peerEvidenceBinding) : evidenceItems(selectedOrigin()).some((item) => item.id === row.evidence_id))) return false;
+      const source = Object.freeze({ sessionId, generation, evidenceId: row.evidence_id, origin: row.origin, sequence: row.sequence,
+        method: row.method, path: safePath(row.path), startedAt: row.started_at, observedAt: peer.observedAt,
+        historyVersion: state.historyVersion, scopeOnly: state.scopeOnly, mapKey: peerSnapshotKey() });
+      cancelPeerMatches();
+      const requestId = ++state.peerMatchesRequestId, selected = state.selectedOrigin;
+      const current = () => requestId === state.peerMatchesRequestId && visible && state.view === "service-map" && getEventStreamReady()
+        && !state.error && !state.stale && row === state.evidence && peer === state.socketPeer && state.evidenceId === source.evidenceId
+        && selected === state.selectedOrigin && peerSourceIsCurrent(source);
+      state.peerMatchesSource = source;
+      state.peerMatchesLoading = true;
+      peerMatchesAbort = new AbortController();
+      renderDetail();
+      let unsupportedServer = false;
+      try {
+        const params = new URLSearchParams({ session_id: sessionId, evidence_id: source.evidenceId, in_scope_only: String(source.scopeOnly), max_records: String(PEER_MATCH_LIMITS.max_records) });
+        const response = await request(`/api/target/service-map/socket-peer-matches?${params}`, { signal: peerMatchesAbort.signal });
+        unsupportedServer = response.status === 404;
+        if (!response.ok) throw new Error("Recorded peer matches unavailable");
+        const payload = await response.json();
+        if (!current()) return false;
+        state.peerMatches = normalizePeerMatches(payload, sessionId, source.evidenceId, row, peer, source.scopeOnly, generation);
+        state.peerMatchesLoading = false;
+        peerMatchesAbort = null;
+        const invalidIdentity = !state.peerMatches.available && state.peerMatches.reasons.find((reason) => ["stale_generation", "record_missing", "record_changed", "inactive_session", "session_source_changed"].includes(reason));
+        if (invalidIdentity) {
+          if (state.bodyReferenceOverlay?.source.evidenceId === source.evidenceId) {
+            clearOverlay("Temporary visualization cleared: the exact inspected source is no longer current.");
+          }
+          // Authoritative identity loss invalidates the current verified row,
+          // its peer and every supplementary inspection, even when the row was
+          // reached through the normal default-map evidence allowlist.
+          cancelEvidence();
+          state.evidenceError = `Source unavailable. ${PEER_MATCH_REASONS[invalidIdentity]}. Refresh the map and choose current exact evidence.`;
+          state.detailTab = "evidence";
+          render();
+        } else renderDetail();
+        return true;
+      } catch (_) {
+        if (!current()) return false;
+        state.peerMatchesLoading = false;
+        peerMatchesAbort = null;
+        state.peerMatches = null;
+        state.peerMatchesError = unsupportedServer ? "This server does not support matching recorded socket peers. No matching inspection was performed."
+          : "Could not verify matching recorded socket peers. Retry explicitly, or refresh the map and select the exact source again.";
+        renderDetail();
+        return false;
+      }
+    }
+    function showPeerMatchesOnMap() {
+      const scan = state.peerMatches, source = state.peerMatchesSource;
+      if (!visible || state.view !== "service-map" || !getEventStreamReady() || state.error || state.stale || !scan?.available
+        || !peerSourceIsCurrent(source) || state.evidenceId !== source.evidenceId || state.selectedOrigin !== source.origin) return false;
+      // Inspection and visualization are independent. Replacing the shown view
+      // uses only this frozen response and never performs another read.
+      clearOverlay();
+      state.bodyReferenceOverlay = Object.freeze({ kind: "peer", source, scan });
+      state.peerUnavailableTokens = new Set();
+      state.selectedOrigin = source.origin;
+      state.anchorOrigin = source.origin;
+      state.endpointIndex = null;
+      state.endpointSelection = null;
+      state.bodyOverlayNotice = "";
+      state.modeNotice = "";
+      state.layoutSlots = new Map();
+      render();
+      return true;
+    }
+    function peerCountsMarkup(scan) {
+      if (!scan?.available) return "";
+      const counts = scan.counts;
+      return `<p>${scan.complete ? "Complete considered-window equality inspection" : "Partial retained-history inspection"} · ${scan.snapshot.considered_rows.toLocaleString()} rows considered / ${scan.snapshot.retained_rows.toLocaleString()} retained · ${counts.matching_rows.toLocaleString()} other matching rows</p><p>${scan.origins.length} returned origin groups · ${counts.returned_matching_rows.toLocaleString()} represented matching rows · ${counts.omitted_matching_rows.toLocaleString()} matching rows omitted by result caps · ${counts.sample_rows} exact samples · ${counts.omitted_sample_rows} samples omitted within returned groups.</p><p>Candidate sequences ${escape(scan.snapshot.oldest_considered_sequence)}–${escape(scan.snapshot.latest_considered_sequence)}. Source ${scan.source.in_window ? "is inside" : "is outside"} this window and is counted separately.</p>${scan.reasons.length ? `<p>${scan.reasons.map((reason) => escape(PEER_MATCH_REASONS[reason])).join(" · ")}</p>` : ""}`;
+    }
+    function peerMatchesMarkup() {
+      const scan = state.peerMatches, source = state.peerMatchesSource;
+      const ready = usableSocketPeer(state.socketPeer);
+      const disabled = !ready || !visible || !getEventStreamReady() || !!state.error || state.stale || state.evidenceLoading || state.peerMatchesLoading;
+      const showDisabled = !scan?.available || !peerSourceIsCurrent(source) || source.evidenceId !== state.evidenceId || disabled;
+      return `<section class="service-map-body-references service-map-peer-matches" aria-label="Matching recorded socket peers" aria-busy="${state.peerMatchesLoading}"><h4>Matching recorded socket peers</h4><p class="service-map-muted">Explicit inspection of retained direct-route observations with equal source, address family, IP and port. No new capture, DNS, connection or remote request.</p><button class="secondary-action" type="button" data-service-peer-matches="inspect" data-service-focus="peer:inspect" ${disabled ? "disabled" : ""}>${state.peerMatchesLoading ? "Finding matching recorded peers…" : "Find matching recorded peer"}</button>${!ready ? '<p class="service-map-muted">Only a usable, recorded direct-route address can seed this inspection. Proxy, unknown, unavailable and excluded address observations remain diagnostics only.</p>' : ""}${state.peerMatchesError ? `<p class="service-map-error" role="status">${escape(state.peerMatchesError)}</p>` : ""}${scan ? `<div class="service-map-body-reference-result" role="status">${scan.available ? `<p>${scan.status === "no_matches" ? "No other matching rows in this considered, filtered window." : "Matching retained observations found."}</p>${peerCountsMarkup(scan)}` : `<p>Inspection unavailable. ${scan.reasons.map((reason) => escape(PEER_MATCH_REASONS[reason])).join(" · ")}</p>`}</div>` : ""}${scan?.available && scan.origins.length ? `<ul class="service-map-body-reference-list">${scan.origins.map((group) => `<li><span class="service-map-body-reference-origin">${escape(group.origin)}</span><span>${group.matching_rows} matching rows · ${group.samples.length} exact samples</span><span>Recorded first: ${escape(group.first_observed_at)} · last: ${escape(group.last_observed_at)}</span></li>`).join("")}</ul>` : ""}<button class="secondary-action" type="button" data-service-show-peer-matches="show" data-service-focus="peer:show" ${showDisabled ? "disabled" : ""}>Show recorded address group</button><p class="service-map-muted">Show replaces the one temporary visualization using this response, with no additional read. Observation timestamps are discrete recorded facts, not connection counts or continuous endpoint occupancy.</p><p class="service-map-muted">${PEER_PRIVACY}</p>${scan?.available ? `<details class="service-map-body-reference-limits"><summary data-service-focus="peer:limits">Coverage and omissions</summary><p>Other considered rows: ${scan.counts.non_http_rows} non-HTTP · ${scan.counts.not_recorded_rows} not recorded · ${scan.counts.unavailable_observation_rows} unavailable · ${scan.counts.non_direct_rows} non-direct · ${scan.counts.invalid_observation_rows} unusable observations · ${scan.counts.different_peer_rows} different peer · ${scan.counts.invalid_metadata_rows} invalid origin metadata · ${scan.counts.scope_excluded_rows} scope excluded.</p><p>Limits: ${PEER_MATCH_LIMITS.max_records.toLocaleString()} newest retained rows · 100 origin groups · 3 samples per origin · 256 KiB result. Unreturned distinct origins are not counted. Exact samples can change after this point-in-time inspection and are verified again when opened.</p></details>` : ""}</section>`;
+    }
+    function peerOriginMarkup(origin) {
+      const overlay = state.bodyReferenceOverlay;
+      if (overlay?.kind !== "peer" || !origin.peerSource && !origin.peerGroup) return "";
+      const samples = [...(origin.peerSource ? [overlay.scan.source] : []), ...(origin.peerGroup?.samples || [])];
+      return `<section class="service-map-peer-origin"><h4>${origin.peerInspectionOnly ? "Captured in this peer inspection" : "Recorded address observations"}</h4><p class="service-map-muted">${origin.peerInspectionOnly ? "This origin is outside the default metadata projection. " : ""}${origin.peerSource ? "The source observation is counted separately. " : ""}${origin.peerGroup?.matching_rows || 0} other matching rows in this inspection; these are not full-session traffic totals.</p>${origin.peerGroup ? `<p class="service-map-muted">First recorded: ${escape(origin.peerGroup.first_observed_at)} · Last recorded: ${escape(origin.peerGroup.last_observed_at)} · ${origin.peerGroup.omitted_samples} exact samples omitted. These times do not imply continuous occupancy.</p>` : ""}<div class="service-map-evidence-list">${samples.map((sample) => `<button class="service-map-evidence-button" type="button" data-service-peer-origin="${escape(origin.origin)}" data-service-peer-evidence="${escape(sample.evidence_id)}" data-service-focus="peer-sample:${escape(sample.evidence_id)}" ${state.peerUnavailableTokens?.has(sample.evidence_id) ? "disabled" : ""}><span>${sample.evidence_id === overlay.scan.evidence_id ? "Inspected source" : "Matched sample"} · sequence ${escape(sample.sequence)}<br>Recorded ${escape(sample.observed_at)}</span><span>${state.peerUnavailableTokens?.has(sample.evidence_id) ? "Unavailable" : "Verify source ›"}</span></button>`).join("") || '<p class="service-map-muted">No exact sample was returned for this origin. Its represented matching-row count remains available.</p>'}</div></section>`;
+    }
+    function renderPeerGraph() {
+      const overlay = state.bodyReferenceOverlay, scan = overlay.scan, query = state.query.trim().toLowerCase();
+      const allOrigins = peerOverlayOrigins(), source = allOrigins[0];
+      const matching = [source, ...allOrigins.slice(1).filter((item) => !query || item.origin.toLowerCase().includes(query))];
+      const textSize = doc?.documentElement && typeof root.getComputedStyle === "function" ? Number.parseFloat(root.getComputedStyle(doc.documentElement).getPropertyValue("--ui-root-size")) : 12;
+      const layout = peerGraphLayout(matching, source.origin, graphGeometry(textSize));
+      currentLayout = layout;
+      applyGraphScale();
+      els.boundsDetails?.classList.toggle("hidden", false);
+      els.mapControls?.classList.toggle("hidden", false);
+      els.allOrigins?.setAttribute("aria-pressed", "false");
+      els.directRelations?.setAttribute("aria-pressed", "true");
+      if (els.directRelations) els.directRelations.disabled = true;
+      if (els.focusSelection) {
+        els.focusSelection.classList.toggle("hidden", false);
+        els.focusSelection.disabled = !selectedOrigin() || state.selectedOrigin === source.origin;
+        els.focusSelection.title = "Clear this group and pin the selected origin in Direct relations";
+      }
+      const times = [scan.source.observed_at, ...scan.origins.flatMap((group) => [group.first_observed_at, group.last_observed_at])].sort((a, b) => observationTime(a) < observationTime(b) ? -1 : observationTime(a) > observationTime(b) ? 1 : 0);
+      const address = `${scan.peer.address_family === "ipv6" ? `[${scan.peer.address.ip}]` : scan.peer.address.ip}:${scan.peer.address.port}`;
+      const edges = layout.edges.map((edge) => `<path class="service-map-edge peer-observation ${edge.source === state.selectedOrigin ? "selected" : ""}" data-relationship="recorded_peer_observation" d="${edge.path}"><title>${escape(edge.source)} · Recorded direct address observation · ${escape(address)} · undirected</title></path>`).join("");
+      const compactTime = (value) => value.replace("T", " ").replace(/\.\d+/, "").replace(/Z$/, " UTC");
+      const cards = layout.nodes.map((item) => {
+        if (item.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(address)}" style="left:${item.x}px;top:${item.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(address)}">${escape(address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${scan.peer.address_family.toUpperCase()}</span><span class="service-map-card-meta" title="${escape(times[0])}">First: ${escape(compactTime(times[0]))}</span><span class="service-map-card-meta" title="${escape(times.at(-1))}">Last: ${escape(compactTime(times.at(-1)))}</span></span></div>`;
+        const selected = item.origin === state.selectedOrigin, pinned = item.origin === source.origin;
+        const inDefault = state.snapshot.origins.some((origin) => origin.origin === item.origin);
+        return `<button class="service-map-card peer-captured ${selected ? "selected" : ""} ${pinned ? "pinned" : ""}" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="origin:${escape(item.origin)}" aria-current="${selected}" style="left:${item.x}px;top:${item.y}px"><span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(item.origin)}">${escape(new URL(item.origin).host)}</strong><span class="service-map-card-scheme">${pinned ? "Pinned inspected source" : "Captured matching origin"}</span><span class="service-map-card-meta" title="${inDefault ? "Also in the default metadata projection" : "Captured in this peer inspection; outside the default metadata projection"}">${inDefault ? "Also in default projection" : "Captured in peer inspection"}</span><span class="service-map-card-meta">${pinned ? "Source + " : ""}${item.peerGroup?.matching_rows || 0} ${pinned ? "other " : ""}matching rows</span></span><span class="service-map-scope-dot ${item.in_scope ? "in-scope" : ""}" title="${item.in_scope ? "In scope" : "Out of scope"}"></span></button>`;
+      }).join("");
+      replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout" style="--service-map-card-width:${layout.geometry.cardWidth}px;--service-map-card-height:${layout.geometry.cardHeight}px;--service-map-line-height:${layout.geometry.lineHeight};width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>${cards}</div></div>`);
+      const shown = new Set(layout.nodes.slice(1).map((item) => item.origin));
+      const queryHidden = allOrigins.length - matching.length, capHidden = matching.length - shown.size;
+      const queryRows = allOrigins.filter((item) => !matching.includes(item)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
+      const capRows = matching.filter((item) => !shown.has(item.origin)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
+      const shownRows = allOrigins.filter((item) => shown.has(item.origin)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
+      els.graphBounds.textContent = `${shown.size} / ${allOrigins.length} returned origins shown + 1 recorded address node · ${layout.edges.length} undirected observation spokes · ${shownRows} other matching rows represented · ${queryHidden} origins / ${queryRows} rows hidden by query · ${capHidden} origins / ${capRows} rows omitted by 24-node display cap${query && !source.origin.toLowerCase().includes(query) ? " · Pinned source remains visible outside query" : ""}${state.selectedOrigin && !shown.has(state.selectedOrigin) ? " · Selected origin is outside this display; inspector retained" : ""}`;
+      if (els.graphDiagnostics) els.graphDiagnostics.textContent = `Recorded address group only. Source and address node are reserved within the 24-node cap (at most 23 origins); inclusive edge cap 40. ${scan.counts.omitted_matching_rows} matching rows omitted by API result caps; unreturned distinct origins are not counted. ${scan.complete ? "Complete" : "Partial"} inspection, ${scan.snapshot.considered_rows} / ${scan.snapshot.retained_rows} retained rows considered. Observation times describe recorded facts, not connections or continuous occupancy. ${PEER_PRIVACY}`;
+    }
+
     function cancelBodyReferences() {
       state.bodyReferencesRequestId += 1;
       bodyReferencesAbort?.abort();
@@ -976,6 +1334,8 @@
       state.htmlGeneratorsError = "";
     }
     function cancelEvidence() {
+      cancelPeerMatches();
+      state.peerEvidenceBinding = null;
       cancelHtmlGenerators();
       cancelBodyReferences();
       state.evidenceRequestId += 1;
@@ -1025,6 +1385,7 @@
         clearOverlay("Temporary body references cleared by Refresh. Inspect and show references again when ready.");
         cancelBodyReferences();
         cancelHtmlGenerators();
+        cancelPeerMatches();
       }
       abort?.abort();
       abort = new AbortController();
@@ -1041,11 +1402,12 @@
         if (!response.ok) throw new Error("Service map unavailable");
         const snapshot = normalizeSnapshot(await response.json(), sessionId);
         if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
-        if (state.bodyReferenceOverlay && !(state.bodyReferenceOverlay.kind === "link" ? htmlGeneratorSourceIsRetained(state.bodyReferenceOverlay.source, snapshot) : sourceIsRetained(state.bodyReferenceOverlay.source, snapshot))) {
+        if (state.bodyReferenceOverlay && !(state.bodyReferenceOverlay.kind === "peer" ? peerSourceIsCurrent(state.bodyReferenceOverlay.source, snapshot) : state.bodyReferenceOverlay.kind === "link" ? htmlGeneratorSourceIsRetained(state.bodyReferenceOverlay.source, snapshot) : sourceIsRetained(state.bodyReferenceOverlay.source, snapshot))) {
           clearOverlay("Temporary body references cleared: the exact source is absent or retained history changed.");
         }
         if (state.snapshot && (state.snapshot.snapshot.generation !== snapshot.snapshot.generation
           || state.snapshot.technologyCatalogVersion !== snapshot.technologyCatalogVersion)) cancelEvidence();
+        if (state.peerMatchesSource && !peerSourceIsCurrent(state.peerMatchesSource, snapshot)) cancelPeerMatches();
         if (state.linkDeclarationsSource && !htmlGeneratorSourceIsRetained(state.linkDeclarationsSource, snapshot)) cancelBodyReferences();
         if (state.htmlGeneratorsSource && !htmlGeneratorSourceIsRetained(state.htmlGeneratorsSource, snapshot)) cancelHtmlGenerators();
         state.snapshot = snapshot;
@@ -1072,7 +1434,7 @@
           state.endpointIndex = index < 0 ? null : index;
           if (index < 0) { state.endpointSelection = null; cancelEvidence(); }
         }
-        if (state.evidenceId && !evidenceItems(origin).some((item) => item.id === state.evidenceId)) cancelEvidence();
+        if (state.evidenceId && !(state.peerEvidenceBinding ? peerBindingIsCurrent(state.peerEvidenceBinding) : evidenceItems(origin).some((item) => item.id === state.evidenceId))) cancelEvidence();
         state.loading = false;
         render();
         return true;
@@ -1082,6 +1444,7 @@
         cancelBodyReferences();
         cancelHtmlGenerators();
         state.loading = false;
+        cancelPeerMatches();
         state.error = state.snapshot ? "Refresh failed. Showing the previous snapshot; use Refresh to retry." : "Could not load the service map. Use Refresh to retry.";
         render();
         return false;
@@ -1104,13 +1467,28 @@
       return items;
     }
     async function loadEvidence(id) {
+      // Preserve the ordinary evidence guard. When a default-map token is also
+      // in the shown peer response, additionally revalidate its observation.
+      if (!evidenceItems(selectedOrigin()).some((item) => item.id === id)) return false;
+      return loadEvidenceInternal(id, peerSampleBinding(id, state.selectedOrigin));
+    }
+    async function loadPeerEvidence(id, originId) {
+      const binding = peerSampleBinding(id, originId);
+      if (!binding) return false;
+      selectOrigin(originId);
+      if (state.selectedOrigin !== originId) return false;
+      return loadEvidenceInternal(id, binding);
+    }
+    async function loadEvidenceInternal(id, peerBinding) {
       const origin = selectedOrigin();
-      if (!evidenceItems(origin).some((item) => item.id === id)) return false;
+      if (peerBinding ? !peerBindingIsCurrent(peerBinding) || peerBinding.sample.evidence_id !== id || peerBinding.origin !== origin?.origin
+        : !evidenceItems(origin).some((item) => item.id === id)) return false;
       cancelEvidence();
+      state.peerEvidenceBinding = peerBinding;
       const requestId = ++state.evidenceRequestId;
       const sessionId = getSessionId();
       const selected = state.selectedOrigin;
-      const overlaySource = () => state.bodyReferenceOverlay?.source.evidenceId === id
+      const overlaySource = () => state.bodyReferenceOverlay?.kind !== "peer" && state.bodyReferenceOverlay?.source.evidenceId === id
         && state.bodyReferenceOverlay.source.origin === selected ? state.bodyReferenceOverlay.source : null;
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
       state.evidenceId = id;
@@ -1132,16 +1510,24 @@
           || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.record_id || "") || typeof row.sequence !== "string" || !/^[0-9]+$/.test(row.sequence)
           || typeof row.method !== "string" || typeof row.path !== "string"
           || endpoint && (row.method !== endpoint.method || safePath(row.path) !== endpoint.path))) throw new Error("Evidence row changed");
+        const normalizedPeer = result.available ? normalizeSocketPeer(result.socket_peer) : null;
+        if (peerBinding && (!peerBindingIsCurrent(peerBinding) || result.available && (row.origin !== peerBinding.origin
+          || row.sequence !== peerBinding.sample.sequence || row.sequence !== id.split(".")[3] || row.record_id !== id.split(".")[5]
+          || row.started_at !== peerBinding.sample.started_at || normalizedPeer?.observedAt !== peerBinding.sample.observed_at
+          || !peerEquals(peerBinding.overlay.scan.peer, normalizedPeer)))) throw new Error("Recorded peer source changed");
         const source = overlaySource();
         if (result.available && source && (row.method !== source.method || safePath(row.path) !== source.path
           || row.sequence !== source.sequence || row.started_at !== source.startedAt)) throw new Error("Overlay source changed");
         state.evidence = result.available === true ? normalizeEvidenceObservations(row, catalogVersion) : null;
         state.evidenceCatalogVersion = state.evidence ? catalogVersion : null;
         state.evidenceLegacyCatalog = !!state.evidence && catalogVersion !== TECHNOLOGY_CATALOG_VERSION;
-        state.socketPeer = state.evidence ? normalizeSocketPeer(result.socket_peer) : null;
+        state.socketPeer = state.evidence ? normalizedPeer : null;
         state.evidenceError = state.evidence ? "" : "Source unavailable. The retained row may have changed or been removed. Refresh the map to select current evidence.";
         state.evidenceLoading = false;
-        if (!state.evidence && source) {
+        if (!state.evidence && peerBinding) {
+          handlePeerSampleUnavailable(peerBinding);
+          render();
+        } else if (!state.evidence && source) {
           clearOverlay("Temporary body references cleared: the exact inspected source is no longer available.");
           render();
         } else renderDetail();
@@ -1156,7 +1542,10 @@
         cancelHtmlGenerators();
         state.evidenceLoading = false;
         state.evidenceError = "Source unavailable. The exact retained row could not be verified. Refresh the map and try again.";
-        if (overlaySource()) {
+        if (peerBinding) {
+          handlePeerSampleUnavailable(peerBinding);
+          render();
+        } else if (overlaySource()) {
           clearOverlay("Temporary body references cleared: the exact inspected source could not be verified.");
           render();
         } else renderDetail();
@@ -1364,6 +1753,7 @@
       els.panel.setAttribute("aria-busy", String(state.loading));
     }
     function renderGraph() {
+      if (state.bodyReferenceOverlay?.kind === "peer") { renderPeerGraph(); return; }
       const selected = selectedOrigin();
       const direct = directNeighborhood();
       const query = state.query.trim().toLowerCase();
@@ -1521,7 +1911,7 @@
         : result.status === "unavailable" ? "Retained response metadata is unavailable. No Link declarations were inspected."
           : result.observations.length ? `${result.observations.length} retained Link declaration${result.observations.length === 1 ? "" : "s"} · ${new Set(result.observations.map((item) => item.target_origin)).size} target origins`
             : result.complete ? "No supported Link declarations found in the inspected retained headers." : "No supported Link declarations are available from the inspected prefix; coverage is partial.";
-      return `<div aria-busy="${state.bodyReferencesLoading}"><p class="service-map-muted">Optional inspection of this exact response’s retained Link headers. GET or HEAD with status 200 only. Declarations and preconnect hints do not prove requests, calls, ownership or deployed services.</p><button class="secondary-action" type="button" data-service-link-declarations="inspect" data-service-focus="relationships:inspect" ${disabled ? "disabled" : ""}>${label}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting retained response headers locally…</p>' : ""}${state.linkDeclarationsError ? `<p class="service-map-error" role="status">${escape(state.linkDeclarationsError)}</p>` : ""}${result ? `<div class="service-map-body-reference-result" role="status"><p>${escape(message)}</p>${scanned ? `<p>${result.complete ? "Complete supported-grammar inspection" : "Partial retained-header inspection"} · ${result.counts.headers_inspected} / ${result.retained_header_count} retained headers inspected · ${result.counts.header_bytes_admitted} name/value bytes admitted</p>` : ""}${result.reasons.length ? `<p>${result.reasons.map((reason) => escape(LINK_REASONS[reason])).join(" · ")}</p>` : ""}</div>` : ""}${result?.observations.length ? linkObservationsMarkup(result.observations) : ""}${scanned && source ? relationshipSourceMarkup(source, result, "link") : ""}<button class="secondary-action" type="button" data-service-show-link-declarations="show" data-service-focus="relationships:show" aria-pressed="${showing}" ${showDisabled ? "disabled" : ""}>${state.bodyReferenceOverlay ? "Replace shown references" : "Show references on map"}</button><p class="service-map-muted">${scanned && !hasNeighbors ? result.observations.length ? "Only the source origin was declared; self-links are not drawn." : "There are no declared target origins to show on the map." : "Show pins this exact source in Direct relations. One temporary body-or-Link overlay at a time; no additional read."}</p><details class="service-map-body-reference-limits"><summary data-service-focus="relationships:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) targets for service-doc, service-desc, describedby and preconnect only. Complete means this bounded grammar, not every relationship or dependency. Origins are text, never fetched; no URL resolution, DNS, probes or body reads. Source spans refer to retained header value UTF-8 bytes, not original wire offsets.</p><p>Headers: 128 · Name/value bytes: 32,768 · Link field: 4,096 bytes · Target: 4,096 bytes · Candidates: 128 · Parameters and relation tokens per member: 32 each · Observations: 32 · Target origin: 268 bytes.</p>${scanned ? `<p>${result.counts.link_fields_inspected} Link fields · ${result.counts.candidates_inspected} candidates · ${result.counts.members_framed} framed members · ${result.counts.parameters_inspected} parameters · ${result.counts.relation_tokens_inspected} relation tokens · ${result.counts.unknown_relation_tokens_inspected} unknown relation tokens inspected. Counts describe inspected input only; uninspected declarations are not counted.</p>` : ""}</details></div>`;
+      return `<div aria-busy="${state.bodyReferencesLoading}"><p class="service-map-muted">Optional inspection of this exact response’s retained Link headers. GET or HEAD with status 200 only. Declarations and preconnect hints do not prove requests, calls, ownership or deployed services.</p><button class="secondary-action" type="button" data-service-link-declarations="inspect" data-service-focus="relationships:inspect" ${disabled ? "disabled" : ""}>${label}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting retained response headers locally…</p>' : ""}${state.linkDeclarationsError ? `<p class="service-map-error" role="status">${escape(state.linkDeclarationsError)}</p>` : ""}${result ? `<div class="service-map-body-reference-result" role="status"><p>${escape(message)}</p>${scanned ? `<p>${result.complete ? "Complete supported-grammar inspection" : "Partial retained-header inspection"} · ${result.counts.headers_inspected} / ${result.retained_header_count} retained headers inspected · ${result.counts.header_bytes_admitted} name/value bytes admitted</p>` : ""}${result.reasons.length ? `<p>${result.reasons.map((reason) => escape(LINK_REASONS[reason])).join(" · ")}</p>` : ""}</div>` : ""}${result?.observations.length ? linkObservationsMarkup(result.observations) : ""}${scanned && source ? relationshipSourceMarkup(source, result, "link") : ""}<button class="secondary-action" type="button" data-service-show-link-declarations="show" data-service-focus="relationships:show" aria-pressed="${showing}" ${showDisabled ? "disabled" : ""}>${state.bodyReferenceOverlay ? "Replace shown references" : "Show references on map"}</button><p class="service-map-muted">${scanned && !hasNeighbors ? result.observations.length ? "Only the source origin was declared; self-links are not drawn." : "There are no declared target origins to show on the map." : "Show pins this exact source in Direct relations. One temporary visualization at a time; no additional read."}</p><details class="service-map-body-reference-limits"><summary data-service-focus="relationships:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) targets for service-doc, service-desc, describedby and preconnect only. Complete means this bounded grammar, not every relationship or dependency. Origins are text, never fetched; no URL resolution, DNS, probes or body reads. Source spans refer to retained header value UTF-8 bytes, not original wire offsets.</p><p>Headers: 128 · Name/value bytes: 32,768 · Link field: 4,096 bytes · Target: 4,096 bytes · Candidates: 128 · Parameters and relation tokens per member: 32 each · Observations: 32 · Target origin: 268 bytes.</p>${scanned ? `<p>${result.counts.link_fields_inspected} Link fields · ${result.counts.candidates_inspected} candidates · ${result.counts.members_framed} framed members · ${result.counts.parameters_inspected} parameters · ${result.counts.relation_tokens_inspected} relation tokens · ${result.counts.unknown_relation_tokens_inspected} unknown relation tokens inspected. Counts describe inspected input only; uninspected declarations are not counted.</p>` : ""}</details></div>`;
     }
     function htmlGeneratorsMarkup() {
       const result = state.htmlGenerators, scanned = result?.status === "scanned";
@@ -1545,6 +1935,7 @@
       const overlay = state.bodyReferenceOverlay;
       if (!overlay) return "";
       const { source, scan } = overlay;
+      if (overlay.kind === "peer") return `<p class="service-map-overlay-source" title="${escape(overlay.scan.source.origin)} · Source sequence ${escape(overlay.scan.source.sequence)}">${escape(overlay.scan.source.origin)} · Source sequence ${escape(overlay.scan.source.sequence)}</p><p>${overlay.scan.complete ? "Complete considered window" : "Partial inspection"} · ${overlay.scan.snapshot.considered_rows} / ${overlay.scan.snapshot.retained_rows} retained rows considered · ${overlay.scan.counts.matching_rows} other matching rows</p><details class="service-map-peer-coverage"><summary data-service-focus="peer:coverage">Inspection coverage and privacy</summary>${peerCountsMarkup(overlay.scan)}<p>${PEER_PRIVACY}</p><p>Recorded timestamps do not imply connection counts or continuous endpoint occupancy.</p></details>`;
       if (overlay.kind === "link") return `${relationshipSourceMarkup(source, scan, "link")}${scan.reasons.length ? `<p class="service-map-muted">${scan.reasons.map((reason) => escape(LINK_REASONS[reason])).join(" · ")}</p>` : ""}`;
       return `<p class="service-map-overlay-source" title="${escape(`${source.method} ${source.origin}${source.path}`)}">${escape(source.method)} ${escape(source.origin)}${escape(source.path)}</p><p>Sequence ${escape(source.sequence)} · ${escape(source.startedAt)} · ${scan.complete ? "Complete" : "Partial"} retained-preview scan</p>${!scan.complete ? `<p class="service-map-muted">${scan.reasons.map((reason) => escape(BODY_REFERENCE_REASONS[reason] || reason.replace(/_/g, " "))).join(" · ")}${scan.omitted_reference_occurrences ? ` · ${scan.omitted_reference_occurrences} reference occurrence(s) omitted` : ""}</p>` : ""}`;
     }
@@ -1552,6 +1943,10 @@
       if (!els.overlayStatus) return;
       const overlay = state.bodyReferenceOverlay;
       els.overlayStatus.classList.toggle("hidden", !overlay && !state.bodyOverlayNotice);
+      if (overlay?.kind === "peer") {
+        replace(els.overlayStatus, `<div><strong>Temporary recorded address group</strong>${overlayProvenanceMarkup()}<p>Undirected observation spokes only. Changes to retained history clear this view.</p></div><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-peer-origin="${escape(overlay.scan.source.origin)}" data-service-peer-evidence="${escape(overlay.scan.evidence_id)}" data-service-focus="peer:source">View inspected source</button><button class="secondary-action" type="button" data-service-clear-body-references="clear" data-service-focus="peer:clear">Clear recorded address group</button></div>`);
+        return;
+      }
       replace(els.overlayStatus, overlay ? `<div><strong>${overlay.kind === "link" ? "Temporary Response Link references" : "Temporary body URL references"}</strong>${overlayProvenanceMarkup()}<p>Literal references only; no confirmed requests. Changes to history clear this view.</p></div><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-relation-origin="${escape(overlay.source.origin)}" data-service-relation-evidence="${escape(overlay.source.evidenceId)}" data-service-focus="body-references:source">View inspected source</button><button class="secondary-action" type="button" data-service-clear-body-references="clear" data-service-focus="body-references:clear">Clear ${overlay.kind === "link" ? "Link" : "body"} references</button></div>` : `<p role="status">${escape(state.bodyOverlayNotice)}</p>`);
     }
     function socketPeerMarkup() {
@@ -1567,7 +1962,7 @@
         const address = peer.status === "observed" ? `${peer.ip.includes(":") ? `[${peer.ip}]` : peer.ip}:${peer.port}` : "Unavailable at response headers";
         content = `<dl><dt>Observed socket peer</dt><dd>${escape(address)}</dd><dt>Route used</dt><dd>${escape(route)}</dd><dt>Response headers observed at</dt><dd>${escape(peer.observedAt)}</dd><dt>Source</dt><dd>HTTP client response remote address</dd></dl><p class="service-map-muted">This may identify an upstream proxy or internal address. It does not establish the origin’s IP address, DNS identity, or TLS certificate identity.</p>`;
       }
-      return `<section class="service-map-socket-peer" aria-label="Upstream socket peer">${heading}${content}</section>`;
+      return `<section class="service-map-socket-peer" aria-label="Upstream socket peer">${heading}${content}</section>${peerMatchesMarkup()}`;
     }
     function technologyMarkup(items, origin = null) {
       if (!items.length) return "";
@@ -1584,11 +1979,15 @@
       const items = evidenceItems(origin);
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
       const row = state.evidence;
+      const peerOnlySource = !!row && !!state.peerEvidenceBinding && !items.some((item) => item.id === row.evidence_id);
+      const supplementaryMarkup = peerOnlySource
+        ? '<p class="service-map-muted">Body URL, response Link and retained HTML generator inspections are unavailable for this source outside the default metadata projection. Its exact source metadata, recorded header observations and socket peer remain available here.</p>'
+        : htmlGeneratorsMarkup() + relationshipsMarkup();
       const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${state.evidenceLegacyCatalog ? `<p class="service-map-muted">${LEGACY_CATALOG_NOTICE}</p>` : ""}${technologyMarkup(row.technology_observations)}<p>Exact retained source verified for this read.</p></div>` : "";
       return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
-        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? socketPeerMarkup() + htmlGeneratorsMarkup() + relationshipsMarkup() : ""}
-        <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || '<p class="service-map-muted">No source samples are available in this bounded snapshot.</p>'}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
+        ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${peerOriginMarkup(origin)}${row ? socketPeerMarkup() + supplementaryMarkup : ""}
+        <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || `<p class="service-map-muted">${origin.peerInspectionOnly ? "No default-map samples are loaded for this origin; use the exact peer-inspection samples above." : "No source samples are available in this bounded snapshot."}</p>`}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
         ${!endpoint ? technologyMarkup(origin.technology_observations, origin) + relationshipMarkup(origin) : ""}
         ${!endpoint && origin.technology_clues.length ? `<h4>Observed header clues</h4><p class="service-map-muted">${origin.technology_clues.map((clue) => escape(clue.name)).join(", ")} · response headers only</p>` : ""}`;
     }
@@ -1622,6 +2021,10 @@
     function renderDetail() {
       const origin = selectedOrigin();
       if (!origin) { replaceDetail('<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
+      if (origin.peerInspectionOnly) {
+        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(origin.origin)}">${escape(new URL(origin.origin).host)}</h3><p>${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header><div class="service-map-detail-body">${evidenceMarkup(origin)}</div>`);
+        return;
+      }
       if (!origin.captured) {
         const bodyReference = overlayReferences().some((item) => item.target_origin === origin.origin);
         replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in loaded declarations${bodyReference ? state.bodyReferenceOverlay.kind === "link" ? " or the temporary Link declarations" : " or the temporary body URL references" : ""}. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${bodyReference ? `<h4>${state.bodyReferenceOverlay.kind === "link" ? "Retained Link declaration" : "Literal body URL reference"}</h4>${overlayProvenanceMarkup()}<p class="service-map-muted">This reference does not prove a request, call, or service ownership.</p>` : ""}${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
@@ -1632,7 +2035,7 @@
       const start = state.detailPage * API_PAGE_SIZE;
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. An optional observed socket peer is shown only in exact source evidence.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. Optional socket peers start in exact source evidence; explicit recorded matches can be shown as a temporary group.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
     }
     function renderCatalog() {
       const entries = filteredOrigins().flatMap((origin) => origin.endpoints.map((endpoint, index) => ({ origin, endpoint, index })));
@@ -1654,7 +2057,10 @@
       const button = event.target.closest("button");
       if (!button || !els.panel.contains(button)) return;
       const data = button.dataset;
-      if (data.serviceRelationOrigin) {
+      if (data.servicePeerEvidence && data.servicePeerOrigin) loadPeerEvidence(data.servicePeerEvidence, data.servicePeerOrigin);
+      else if (data.servicePeerMatches) loadPeerMatches();
+      else if (data.serviceShowPeerMatches) showPeerMatchesOnMap();
+      else if (data.serviceRelationOrigin) {
         selectOrigin(data.serviceRelationOrigin);
         state.detailTab = "evidence";
         if (data.serviceRelationEvidence) loadEvidence(data.serviceRelationEvidence);
@@ -1719,7 +2125,7 @@
     });
     render();
     return {
-      refresh, reset, selectOrigin, setZoom, fitGraph, loadEvidence, loadBodyReferences, loadLinkDeclarations, loadHtmlGenerators, setRelationshipKind, showBodyReferencesOnMap, showLinkDeclarationsOnMap, clearBodyReferenceOverlay,
+      refresh, reset, selectOrigin, setZoom, fitGraph, loadEvidence, loadPeerEvidence, loadPeerMatches, showPeerMatchesOnMap, loadBodyReferences, loadLinkDeclarations, loadHtmlGenerators, setRelationshipKind, showBodyReferencesOnMap, showLinkDeclarationsOnMap, clearBodyReferenceOverlay,
       displayChanged() { renderGraph(); },
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
@@ -1737,7 +2143,8 @@
         if (!value || view !== "service-map") {
           clearOverlay("Temporary body references cleared because the map was hidden.");
           cancelBodyReferences();
-        cancelHtmlGenerators();
+          cancelHtmlGenerators();
+          cancelPeerMatches();
         }
         visible = value;
         state.view = view;
@@ -1772,5 +2179,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

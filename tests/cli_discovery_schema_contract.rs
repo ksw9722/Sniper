@@ -589,6 +589,7 @@ mod history_fixture {
         settings_override: Mutex<Option<Value>>,
         payload: Mutex<Value>,
         read_status: Mutex<u16>,
+        chunked_payload: Mutex<bool>,
         requests: Mutex<Vec<RecordedRequest>>,
     }
 
@@ -616,6 +617,7 @@ mod history_fixture {
                 settings_override: Mutex::new(None),
                 payload: Mutex::new(json!([])),
                 read_status: Mutex::new(200),
+                chunked_payload: Mutex::new(false),
                 requests: Mutex::new(Vec::new()),
             });
             let app = Router::new()
@@ -707,9 +709,16 @@ mod history_fixture {
         let data = payload.get("data").unwrap_or(&payload);
         let legacy = expected_code == 0
             && data.get("technology_catalog_version").is_none()
-            && (data.get("snapshot").is_some() || data["source"] == "captured_http_metadata");
+            && (data.pointer("/snapshot/window_order") == Some(&json!("newest_capture_sequence"))
+                || data["source"] == "captured_http_metadata");
+        let scope_work_limited = expected_code == 0
+            && data["coverage"] == "retained_direct_socket_peer_equality"
+            && data["available"] == false
+            && data["reasons"] == json!(["scope_work_limit"]);
         let expected = if legacy {
             "Warning: Service Map API returned legacy technology catalog v1; technology coverage is limited to v1.\n"
+        } else if scope_work_limited {
+            "Warning: Recorded socket peer scope matching exceeded the work limit; use a smaller --max-records window or deliberately simplify scope rules. No retries or settings changes were made.\n"
         } else {
             ""
         };
@@ -763,10 +772,17 @@ mod history_fixture {
             "/api/transactions" | "/api/transactions-page" => {
                 Json(state.payload.lock().unwrap().clone()).into_response()
             }
-            "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" | "/api/target/service-map/html-generators" | "/api/target/service-map/link-declarations" => {
+            "/api/target/service-map" | "/api/target/service-map/evidence" | "/api/target/service-map/body-references" | "/api/target/service-map/html-generators" | "/api/target/service-map/link-declarations" | "/api/target/service-map/socket-peer-matches" => {
                 let status = StatusCode::from_u16(*state.read_status.lock().unwrap()).unwrap();
-                let mut response =
-                    (status, Json(state.payload.lock().unwrap().clone())).into_response();
+                let payload = state.payload.lock().unwrap().clone();
+                let mut response = if *state.chunked_payload.lock().unwrap() {
+                    let chunks: Vec<_> = payload.to_string().as_bytes().chunks(1024)
+                        .map(|chunk| Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(chunk)))
+                        .collect();
+                    (status, Body::from_stream(futures_util::stream::iter(chunks))).into_response()
+                } else {
+                    (status, Json(payload)).into_response()
+                };
                 if status.is_redirection() {
                     response
                         .headers_mut()
@@ -2656,6 +2672,1065 @@ mod history_fixture {
             assert_eq!(result["error"]["code"], "INVALID_INPUT");
             assert!(mock.state.requests.lock().unwrap().is_empty());
         }
+    }
+
+    const PEER_MATCH_OPERATION: &str = "target.service_map.socket_peer_matches.get";
+    const PEER_MATCH_PATH: &str = "/api/target/service-map/socket-peer-matches";
+
+    fn peer_match_token(sequence: u64) -> String {
+        BODY_REFERENCE_TOKEN.replace("9007199254740993", &sequence.to_string())
+    }
+
+    fn peer_match_payload(status: &str) -> Value {
+        let sequence = 9_007_199_254_740_993u64;
+        let matched = status == "matched";
+        let mut payload = json!({
+            "schema_version":1,"session_id":Uuid::nil(),"evidence_id":BODY_REFERENCE_TOKEN,
+            "available":status != "unavailable","status":status,"complete":status != "unavailable",
+            "reasons":[],"in_scope_only":false,"coverage":"retained_direct_socket_peer_equality",
+            "peer":{"source":"http_response_remote_addr","route":"direct","address_family":"ipv4","address":{"ip":"192.0.2.12","port":443}},
+            "source":{"evidence_id":BODY_REFERENCE_TOKEN,"sequence":sequence.to_string(),"origin":"https://example.com",
+                "started_at":"2026-10-12T00:00:00Z","observed_at":"2026-10-12T00:00:01Z","in_scope":true,"in_window":true},
+            "snapshot":{"id":"11111111-1111-1111-1111-111111111111","generation":"22222222-2222-2222-2222-222222222222",
+                "captured_at":"2026-10-12T00:01:00Z","window_order":"latest_retained_sequence",
+                "retained_rows":if matched {2} else {1},"considered_rows":if matched {2} else {1},
+                "oldest_considered_sequence":sequence.to_string(),"latest_considered_sequence":(sequence+u64::from(matched)).to_string()},
+            "counts":{"non_http_rows":0,"not_recorded_rows":0,"unavailable_observation_rows":0,"non_direct_rows":0,
+                "invalid_observation_rows":0,"different_peer_rows":0,"invalid_metadata_rows":0,"scope_excluded_rows":0,
+                "matching_rows":usize::from(matched),"returned_matching_rows":usize::from(matched),"omitted_matching_rows":0,
+                "sample_rows":usize::from(matched),"omitted_sample_rows":0},
+            "origins":if matched {json!([{"origin":"https://other.example.com","in_scope":true,"matching_rows":1,
+                "first_observed_at":"2026-10-12T00:00:03Z","last_observed_at":"2026-10-12T00:00:03Z",
+                "samples":[{"evidence_id":peer_match_token(sequence+1),"sequence":(sequence+1).to_string(),
+                    "started_at":"2026-10-12T00:00:02Z","observed_at":"2026-10-12T00:00:03Z"}],"omitted_samples":0}])} else {json!([])},
+            "limits":{"max_records":10000,"origin_groups":100,"samples_per_origin":3,"projection_bytes":262144,"host_bytes":512,"scheme_bytes":8,
+                "scope_pattern_entries":500,"scope_pattern_bytes":512,"scope_work_units":8388608}
+        });
+        if status == "unavailable" {
+            payload["reasons"] = json!(["inactive_session"]);
+            for key in ["peer", "source", "snapshot"] {
+                payload[key] = Value::Null;
+            }
+        }
+        payload
+    }
+
+    async fn check_peer_match_payload(
+        mock: &MockApi,
+        payload: Value,
+        token: &str,
+        scoped: bool,
+        max_records: usize,
+        expected_code: i32,
+    ) -> Value {
+        *mock.state.payload.lock().unwrap() = payload.clone();
+        let session = Uuid::nil().to_string();
+        let limit = max_records.to_string();
+        let mut args = vec![
+            "scope",
+            "service-map",
+            "socket-peer-matches",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            token,
+            "--max-records",
+            &limit,
+        ];
+        if scoped {
+            args.push("--in-scope-only");
+        }
+        let result = mock.command_with_code(&args, expected_code).await;
+        mock.assert_reads(
+            PEER_MATCH_PATH,
+            &[
+                ("evidence_id", token),
+                ("in_scope_only", if scoped { "true" } else { "false" }),
+                ("max_records", &limit),
+            ],
+        );
+        if expected_code == 0 {
+            let typed: sniper::service_map_peer_matches::ServiceMapSocketPeerMatches =
+                serde_json::from_value(payload).unwrap();
+            assert_eq!(result, serde_json::to_value(typed).unwrap());
+        } else {
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        }
+        result
+    }
+
+    #[test]
+    fn service_map_peer_matches_discovery_and_dry_run_are_explicit_and_offline() {
+        let spec = super::spec(PEER_MATCH_OPERATION);
+        let session = Uuid::nil().to_string();
+        assert_eq!(spec["side_effect"], "read");
+        assert_eq!(spec["requires_confirmation"], false);
+        assert_eq!(
+            spec["input_schema"]["required"],
+            json!(["session_id", "evidence_id"])
+        );
+        assert_eq!(spec["input_schema"]["additionalProperties"], false);
+        assert_eq!(
+            spec["input_schema"]["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            super::cli(&["schema", "input", PEER_MATCH_OPERATION], 0)["schema"],
+            spec["input_schema"]
+        );
+        assert_eq!(
+            super::cli(&["examples", PEER_MATCH_OPERATION], 0)["examples"],
+            spec["examples"]
+        );
+        let _ = output_schema(PEER_MATCH_OPERATION);
+        for (scoped, limit) in [(false, 10000), (true, 1), (false, 50000)] {
+            let input = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN,"in_scope_only":scoped,"max_records":limit});
+            let called = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    PEER_MATCH_OPERATION,
+                    "--input",
+                    &input.to_string(),
+                ],
+                0,
+            );
+            for noun in ["scope", "target"] {
+                let limit = limit.to_string();
+                let mut args = vec![
+                    "--dry-run",
+                    noun,
+                    "service-map",
+                    "socket-peer-matches",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                    "--max-records",
+                    &limit,
+                ];
+                if scoped {
+                    args.push("--in-scope-only");
+                }
+                let direct = super::cli(&args, 0);
+                assert_eq!(direct, called["data"]);
+                assert_eq!(direct["input"], input);
+                assert_eq!(direct["api"]["method"], "GET");
+                assert_eq!(direct["api"]["body"], Value::Null);
+                assert!(direct["api"].get("headers").is_none());
+                let path = direct["api"]["path"].as_str().unwrap();
+                assert!(path.starts_with(&format!("{PEER_MATCH_PATH}?")));
+                let query: BTreeMap<_, _> =
+                    url::form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+                        .into_owned()
+                        .collect();
+                assert_eq!(
+                    query,
+                    BTreeMap::from([
+                        ("session_id".into(), session.clone()),
+                        ("evidence_id".into(), BODY_REFERENCE_TOKEN.into()),
+                        ("in_scope_only".into(), scoped.to_string()),
+                        ("max_records".into(), limit)
+                    ])
+                );
+            }
+        }
+        let minimal = json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN});
+        let preview = super::cli(
+            &[
+                "--dry-run",
+                "call",
+                PEER_MATCH_OPERATION,
+                "--input",
+                &minimal.to_string(),
+            ],
+            0,
+        );
+        assert_eq!(preview["data"]["input"]["in_scope_only"], false);
+        assert_eq!(preview["data"]["input"]["max_records"], 10000);
+        for (field, values) in [
+            (
+                "session_id",
+                vec![Value::Null, json!("SYNTHETIC_PRIVATE_VALUE")],
+            ),
+            (
+                "evidence_id",
+                vec![
+                    Value::Null,
+                    json!("https://example.com/?SYNTHETIC_PRIVATE_VALUE"),
+                    json!(Uuid::nil()),
+                ],
+            ),
+            ("in_scope_only", vec![Value::Null, json!("true"), json!(1)]),
+            (
+                "max_records",
+                vec![
+                    Value::Null,
+                    json!(0),
+                    json!(50001),
+                    json!(-1),
+                    json!(1.0),
+                    json!("1"),
+                ],
+            ),
+        ] {
+            for value in values {
+                let mut input = minimal.clone();
+                input[field] = value;
+                let error = super::cli(
+                    &[
+                        "--dry-run",
+                        "call",
+                        PEER_MATCH_OPERATION,
+                        "--input",
+                        &input.to_string(),
+                    ],
+                    2,
+                );
+                assert_eq!(error["error"]["code"], "INVALID_INPUT");
+                assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            }
+        }
+        for field in ["session_id", "evidence_id"] {
+            let mut input = minimal.clone();
+            input.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                super::cli(
+                    &[
+                        "--dry-run",
+                        "call",
+                        PEER_MATCH_OPERATION,
+                        "--input",
+                        &input.to_string()
+                    ],
+                    2
+                )["error"]["code"],
+                "INVALID_INPUT"
+            );
+        }
+        for field in [
+            "origin",
+            "ip",
+            "host",
+            "url",
+            "technology_catalog_version",
+            "include_socket_peer",
+            "capture_enabled",
+        ] {
+            let mut input = minimal.clone();
+            input[field] = json!("SYNTHETIC_PRIVATE_VALUE");
+            let error = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    PEER_MATCH_OPERATION,
+                    "--input",
+                    &input.to_string(),
+                ],
+                2,
+            );
+            assert_eq!(error["error"]["code"], "INVALID_INPUT");
+            assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        }
+        for noun in ["scope", "target"] {
+            for flag in [
+                "--origin",
+                "--ip",
+                "--host",
+                "--url",
+                "--technology-catalog-version",
+                "--include-socket-peer",
+            ] {
+                let error = super::cli(
+                    &[
+                        "--dry-run",
+                        noun,
+                        "service-map",
+                        "socket-peer-matches",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        BODY_REFERENCE_TOKEN,
+                        flag,
+                        "SYNTHETIC_PRIVATE_VALUE",
+                    ],
+                    2,
+                );
+                assert_eq!(error["error"]["code"], "INVALID_INPUT");
+                assert!(!error.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            }
+            for flags in [
+                vec!["--session-id", session.as_str()],
+                vec!["--evidence-id", BODY_REFERENCE_TOKEN],
+            ] {
+                let mut args = vec!["--dry-run", noun, "service-map", "socket-peer-matches"];
+                args.extend(flags);
+                assert_eq!(super::cli(&args, 2)["error"]["code"], "INVALID_INPUT");
+            }
+            for flags in [
+                vec!["--max-records", "1"],
+                vec!["--in-scope-only"],
+                vec!["--session-id", session.as_str()],
+                vec!["--origin", "https://example.com"],
+                vec!["--technology-catalog-version", "1"],
+            ] {
+                let mut args = vec!["--dry-run", noun, "service-map"];
+                args.extend(flags);
+                args.extend([
+                    "socket-peer-matches",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ]);
+                assert_eq!(super::cli(&args, 2)["error"]["code"], "INVALID_INPUT");
+            }
+            let help = std::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
+                .args([noun, "service-map", "socket-peer-matches", "--help"])
+                .output()
+                .unwrap();
+            assert!(help.status.success());
+            let text = String::from_utf8(help.stdout).unwrap();
+            for required in [
+                "active session",
+                "physical endpoint",
+                "--evidence-id",
+                "--max-records",
+                "--in-scope-only",
+            ] {
+                assert!(text.contains(required), "{text}");
+            }
+        }
+        for operation in ["target.service_map.get", "target.service_map.evidence.get"] {
+            let schema = output_schema(operation);
+            for private in ["peer", "socket_peer_matches", "recorded_peer_matches"] {
+                assert!(schema["properties"].get(private).is_none());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_states_scopes_families_uint64_and_duplicate_uuid_rows() {
+        let mock = MockApi::new().await;
+        let schema = output_schema(PEER_MATCH_OPERATION);
+        for status in ["matched", "no_matches", "unavailable"] {
+            let payload = peer_match_payload(status);
+            assert_schema(&payload, &schema);
+            check_peer_match_payload(
+                &mock,
+                payload.clone(),
+                BODY_REFERENCE_TOKEN,
+                false,
+                10000,
+                0,
+            )
+            .await;
+            let input =
+                json!({"session_id":Uuid::nil(),"evidence_id":BODY_REFERENCE_TOKEN}).to_string();
+            let called = mock
+                .command(&["call", PEER_MATCH_OPERATION, "--input", &input])
+                .await;
+            assert_eq!(called["data"], payload);
+            assert_eq!(called["meta"]["session_id"], Uuid::nil().to_string());
+            mock.assert_reads(
+                PEER_MATCH_PATH,
+                &[
+                    ("evidence_id", BODY_REFERENCE_TOKEN),
+                    ("in_scope_only", "false"),
+                    ("max_records", "10000"),
+                ],
+            );
+        }
+        for reason in sniper::service_map_peer_matches::ACQUISITION_REASONS {
+            let scoped = *reason == "source_out_of_scope";
+            let mut payload = peer_match_payload("unavailable");
+            payload["reasons"] = json!([reason]);
+            payload["in_scope_only"] = json!(scoped);
+            assert_schema(&payload, &schema);
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, scoped, 10000, 0).await;
+        }
+        for sequence in [0, u64::MAX] {
+            let token = peer_match_token(sequence);
+            let mut payload = peer_match_payload("no_matches");
+            payload["evidence_id"] = json!(token);
+            payload["source"]["evidence_id"] = json!(token);
+            payload["source"]["sequence"] = json!(sequence.to_string());
+            payload["snapshot"]["oldest_considered_sequence"] = json!(sequence.to_string());
+            payload["snapshot"]["latest_considered_sequence"] = json!(sequence.to_string());
+            assert_schema(&payload, &schema);
+            check_peer_match_payload(&mock, payload, &token, false, 10000, 0).await;
+        }
+        for address in [
+            "2001:db8::12",
+            "::ffff:192.0.2.12",
+            "127.0.0.1",
+            "10.0.0.12",
+        ] {
+            let mut payload = peer_match_payload("matched");
+            payload["peer"]["address"]["ip"] = json!(address);
+            payload["peer"]["address_family"] = json!(if address.contains(':') {
+                "ipv6"
+            } else {
+                "ipv4"
+            });
+            assert_schema(&payload, &schema);
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 0).await;
+        }
+        let mut payload = peer_match_payload("matched");
+        payload["in_scope_only"] = json!(true);
+        check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, true, 10000, 0).await;
+        let mut payload = peer_match_payload("matched");
+        payload["source"]["started_at"] = json!("2026-10-12T01:00:00+01:00");
+        check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 0).await;
+        // Same transaction UUID and revision, different retained sequence: two
+        // rows remain distinct and never collapse to a UUID lookup.
+        let payload = peer_match_payload("matched");
+        let source = payload["source"]["evidence_id"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .collect::<Vec<_>>();
+        let sample = payload["origins"][0]["samples"][0]["evidence_id"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .collect::<Vec<_>>();
+        assert_eq!(source[5], sample[5]);
+        assert_ne!(source[3], sample[3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_window_diagnostics_and_honest_omissions() {
+        let mock = MockApi::new().await;
+        let schema = output_schema(PEER_MATCH_OPERATION);
+        let seed = 9_007_199_254_740_993u64;
+        let mut outside = peer_match_payload("matched");
+        outside["complete"] = json!(false);
+        outside["reasons"] = json!(["max_records", "source_outside_window"]);
+        outside["source"]["in_window"] = json!(false);
+        outside["limits"]["max_records"] = json!(1);
+        outside["snapshot"]["considered_rows"] = json!(1);
+        outside["snapshot"]["oldest_considered_sequence"] = json!((seed + 1).to_string());
+        assert_schema(&outside, &schema);
+        check_peer_match_payload(&mock, outside, BODY_REFERENCE_TOKEN, false, 1, 0).await;
+        let mut invalid = peer_match_payload("matched");
+        invalid["complete"] = json!(false);
+        invalid["reasons"] = json!(["invalid_metadata"]);
+        invalid["counts"]["invalid_metadata_rows"] = json!(1);
+        invalid["snapshot"]["retained_rows"] = json!(3);
+        invalid["snapshot"]["considered_rows"] = json!(3);
+        invalid["snapshot"]["latest_considered_sequence"] = json!((seed + 2).to_string());
+        assert_schema(&invalid, &schema);
+        check_peer_match_payload(&mock, invalid, BODY_REFERENCE_TOKEN, false, 10000, 0).await;
+        for diagnostic in [
+            "non_http_rows",
+            "not_recorded_rows",
+            "unavailable_observation_rows",
+            "non_direct_rows",
+            "invalid_observation_rows",
+            "different_peer_rows",
+        ] {
+            let mut payload = peer_match_payload("no_matches");
+            payload["counts"][diagnostic] = json!(1);
+            payload["snapshot"]["retained_rows"] = json!(2);
+            payload["snapshot"]["considered_rows"] = json!(2);
+            payload["snapshot"]["latest_considered_sequence"] = json!((seed + 1).to_string());
+            assert_schema(&payload, &schema);
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 0).await;
+        }
+        let mut scoped = peer_match_payload("no_matches");
+        scoped["in_scope_only"] = json!(true);
+        scoped["counts"]["scope_excluded_rows"] = json!(1);
+        scoped["snapshot"]["retained_rows"] = json!(2);
+        scoped["snapshot"]["considered_rows"] = json!(2);
+        scoped["snapshot"]["latest_considered_sequence"] = json!((seed + 1).to_string());
+        assert_schema(&scoped, &schema);
+        check_peer_match_payload(&mock, scoped, BODY_REFERENCE_TOKEN, true, 10000, 0).await;
+        let mut sampled = peer_match_payload("matched");
+        sampled["complete"] = json!(false);
+        sampled["reasons"] = json!(["sample_limit"]);
+        sampled["snapshot"]["retained_rows"] = json!(5);
+        sampled["snapshot"]["considered_rows"] = json!(5);
+        sampled["snapshot"]["latest_considered_sequence"] = json!((seed + 4).to_string());
+        sampled["counts"]["matching_rows"] = json!(4);
+        sampled["counts"]["returned_matching_rows"] = json!(4);
+        sampled["counts"]["sample_rows"] = json!(3);
+        sampled["counts"]["omitted_sample_rows"] = json!(1);
+        sampled["origins"][0]["matching_rows"] = json!(4);
+        sampled["origins"][0]["omitted_samples"] = json!(1);
+        let sample = sampled["origins"][0]["samples"][0].clone();
+        sampled["origins"][0]["samples"] = Value::Array(
+            (2..=4)
+                .rev()
+                .map(|offset| {
+                    let mut row = sample.clone();
+                    row["evidence_id"] = json!(peer_match_token(seed + offset));
+                    row["sequence"] = json!((seed + offset).to_string());
+                    row
+                })
+                .collect(),
+        );
+        assert_schema(&sampled, &schema);
+        check_peer_match_payload(&mock, sampled, BODY_REFERENCE_TOKEN, false, 10000, 0).await;
+        let mut capped = peer_match_payload("matched");
+        capped["complete"] = json!(false);
+        capped["reasons"] = json!(["origin_group_limit"]);
+        capped["snapshot"]["retained_rows"] = json!(102);
+        capped["snapshot"]["considered_rows"] = json!(102);
+        capped["snapshot"]["latest_considered_sequence"] = json!((seed + 101).to_string());
+        capped["counts"]["matching_rows"] = json!(101);
+        capped["counts"]["returned_matching_rows"] = json!(100);
+        capped["counts"]["omitted_matching_rows"] = json!(1);
+        capped["counts"]["sample_rows"] = json!(100);
+        let group = capped["origins"][0].clone();
+        capped["origins"] = Value::Array(
+            (0..100)
+                .map(|index| {
+                    let mut group = group.clone();
+                    group["origin"] = json!(format!("https://g{index:03}.example.com"));
+                    group["samples"][0]["evidence_id"] = json!(peer_match_token(seed + index + 1));
+                    group["samples"][0]["sequence"] = json!((seed + index + 1).to_string());
+                    group
+                })
+                .collect(),
+        );
+        assert_schema(&capped, &schema);
+        check_peer_match_payload(&mock, capped, BODY_REFERENCE_TOKEN, false, 10000, 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_reject_misbound_private_and_dishonest_responses() {
+        let mock = MockApi::new().await;
+        let seed = 9_007_199_254_740_993u64;
+        for (path, value) in [
+            ("/schema_version", json!(2)),
+            ("/session_id", json!("11111111-1111-1111-1111-111111111111")),
+            ("/evidence_id", json!(peer_match_token(seed + 1))),
+            ("/coverage", json!("origin_ownership")),
+            ("/available", json!(false)),
+            ("/status", json!("no_matches")),
+            ("/complete", json!(false)),
+            ("/reasons", json!(["SYNTHETIC_PRIVATE_VALUE"])),
+            ("/in_scope_only", json!(true)),
+            ("/peer/source", json!("dns_lookup")),
+            ("/peer/route", json!("http_proxy")),
+            ("/peer/address_family", json!("ipv6")),
+            ("/peer/address/ip", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/peer/address/port", json!(0)),
+            ("/peer/address/port", json!(65536)),
+            ("/source/evidence_id", json!(peer_match_token(seed + 1))),
+            ("/source/sequence", json!(seed)),
+            ("/source/sequence", json!("09007199254740993")),
+            ("/source/sequence", json!("18446744073709551616")),
+            (
+                "/source/origin",
+                json!("https://example.com/private?SYNTHETIC_PRIVATE_VALUE"),
+            ),
+            ("/source/started_at", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/source/observed_at", json!("invalid")),
+            ("/source/in_window", json!(false)),
+            (
+                "/snapshot/generation",
+                json!("11111111-1111-1111-1111-111111111111"),
+            ),
+            (
+                "/snapshot/id",
+                json!("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
+            ),
+            ("/snapshot/window_order", json!("oldest_first")),
+            ("/snapshot/retained_rows", json!(0)),
+            ("/snapshot/retained_rows", json!(9007199254740992u64)),
+            ("/snapshot/considered_rows", json!(3)),
+            ("/snapshot/oldest_considered_sequence", Value::Null),
+            (
+                "/snapshot/latest_considered_sequence",
+                json!((seed - 1).to_string()),
+            ),
+            ("/counts/matching_rows", json!(2)),
+            ("/counts/returned_matching_rows", json!(2)),
+            ("/counts/omitted_matching_rows", json!(1)),
+            ("/counts/sample_rows", json!(0)),
+            ("/counts/omitted_sample_rows", json!(1)),
+            ("/counts/invalid_metadata_rows", json!(1)),
+            ("/counts/non_direct_rows", json!(50001)),
+            ("/counts/scope_excluded_rows", json!(1)),
+            (
+                "/origins/0/origin",
+                json!("https://user:SYNTHETIC_PRIVATE_VALUE@example.com"),
+            ),
+            ("/origins/0/matching_rows", json!(2)),
+            ("/origins/0/omitted_samples", json!(1)),
+            (
+                "/origins/0/first_observed_at",
+                json!("2026-10-12T00:00:04Z"),
+            ),
+            (
+                "/origins/0/samples/0/evidence_id",
+                json!(BODY_REFERENCE_TOKEN),
+            ),
+            ("/origins/0/samples/0/sequence", json!("9007199254740995")),
+            (
+                "/origins/0/samples/0/observed_at",
+                json!("2026-10-12T00:00:04Z"),
+            ),
+            ("/limits/max_records", json!(1)),
+            ("/limits/origin_groups", json!(101)),
+            ("/limits/samples_per_origin", json!(4)),
+            ("/limits/projection_bytes", json!(262145)),
+            ("/limits/host_bytes", json!(513)),
+            ("/limits/scheme_bytes", json!(9)),
+        ] {
+            let mut payload = peer_match_payload("matched");
+            *payload.pointer_mut(path).unwrap() = value;
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        }
+        for address in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "169.254.1.2",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:0.1.2.3",
+            "::ffff:169.254.1.2",
+            "2001:0DB8:0:0:0:0:0:1",
+        ] {
+            let mut payload = peer_match_payload("matched");
+            payload["peer"]["address"]["ip"] = json!(address);
+            payload["peer"]["address_family"] = json!(if address.contains(':') {
+                "ipv6"
+            } else {
+                "ipv4"
+            });
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        }
+        for reason in [
+            "sample_limit",
+            "origin_group_limit",
+            "projection_byte_limit",
+            "max_records",
+            "source_outside_window",
+            "invalid_metadata",
+        ] {
+            let mut payload = peer_match_payload("matched");
+            payload["complete"] = json!(false);
+            payload["reasons"] = json!([reason]);
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        }
+        for bad_token in [
+            peer_match_token(seed + 1).replace(
+                "22222222-2222-2222-2222-222222222222",
+                "11111111-1111-1111-1111-111111111111",
+            ),
+            peer_match_token(seed + 1).replacen(
+                "00000000-0000-0000-0000-000000000000",
+                "11111111-1111-1111-1111-111111111111",
+                1,
+            ),
+            peer_match_token(seed + 1).replace(
+                "33333333-3333-3333-3333-333333333333",
+                "SYNTHETIC_PRIVATE_VALUE",
+            ),
+        ] {
+            let mut payload = peer_match_payload("matched");
+            payload["origins"][0]["samples"][0]["evidence_id"] = json!(bad_token);
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        }
+        for path in ["/source/in_scope", "/origins/0/in_scope"] {
+            let mut payload = peer_match_payload("matched");
+            payload["in_scope_only"] = json!(true);
+            *payload.pointer_mut(path).unwrap() = json!(false);
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, true, 10000, 5).await;
+        }
+        let mut duplicate = peer_match_payload("matched");
+        let sample = duplicate["origins"][0]["samples"][0].clone();
+        duplicate["origins"][0]["samples"]
+            .as_array_mut()
+            .unwrap()
+            .push(sample);
+        check_peer_match_payload(&mock, duplicate, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_require_exact_keys_and_explicit_nulls() {
+        let mock = MockApi::new().await;
+        let schema = output_schema(PEER_MATCH_OPERATION);
+        for status in ["matched", "unavailable"] {
+            let payload = peer_match_payload(status);
+            assert_schema(&payload, &schema);
+            let mut paths = vec!["", "/counts", "/limits"];
+            if status == "matched" {
+                paths.extend([
+                    "/peer",
+                    "/peer/address",
+                    "/source",
+                    "/snapshot",
+                    "/origins/0",
+                    "/origins/0/samples/0",
+                ]);
+            }
+            for path in paths {
+                let fields = payload.pointer(path).unwrap().as_object().unwrap();
+                for key in fields.keys() {
+                    let mut missing = payload.clone();
+                    missing
+                        .pointer_mut(path)
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(key);
+                    assert!(
+                        !super::matches_schema(&missing, &schema),
+                        "missing {path}/{key}"
+                    );
+                    check_peer_match_payload(&mock, missing, BODY_REFERENCE_TOKEN, false, 10000, 5)
+                        .await;
+                }
+                let mut extra = payload.clone();
+                extra
+                    .pointer_mut(path)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(
+                        "private_raw_content".into(),
+                        json!("SYNTHETIC_PRIVATE_VALUE"),
+                    );
+                assert!(!super::matches_schema(&extra, &schema));
+                check_peer_match_payload(&mock, extra, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+            }
+        }
+        for (path, value) in [
+            ("/peer", peer_match_payload("matched")["peer"].clone()),
+            ("/source", peer_match_payload("matched")["source"].clone()),
+            (
+                "/snapshot",
+                peer_match_payload("matched")["snapshot"].clone(),
+            ),
+            ("/origins", peer_match_payload("matched")["origins"].clone()),
+            ("/counts/matching_rows", json!(1)),
+            ("/complete", json!(true)),
+            ("/status", json!("matched")),
+            ("/reasons", json!([])),
+            ("/reasons", json!(["inactive_session", "record_missing"])),
+        ] {
+            let mut payload = peer_match_payload("unavailable");
+            *payload.pointer_mut(path).unwrap() = value;
+            assert!(!super::matches_schema(&payload, &schema));
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_bound_bytes_and_never_retry_redirect_or_echo_errors() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "target",
+            "service-map",
+            "socket-peer-matches",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        for (status, code, exit) in [
+            (404, "UNSUPPORTED_FEATURE", 5),
+            (301, "REDIRECT_REFUSED", 5),
+            (302, "REDIRECT_REFUSED", 5),
+            (307, "REDIRECT_REFUSED", 5),
+            (308, "REDIRECT_REFUSED", 5),
+            (401, "HTTP_STATUS_ERROR", 5),
+            (503, "HTTP_STATUS_ERROR", 6),
+        ] {
+            *mock.state.read_status.lock().unwrap() = status;
+            *mock.state.payload.lock().unwrap() = json!({"error":"SYNTHETIC_PRIVATE_VALUE"});
+            let result = mock.command_with_code(&args, exit).await;
+            assert_eq!(result["error"]["code"], code);
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                PEER_MATCH_PATH,
+                &[
+                    ("evidence_id", BODY_REFERENCE_TOKEN),
+                    ("in_scope_only", "false"),
+                    ("max_records", "10000"),
+                ],
+            );
+        }
+        *mock.state.read_status.lock().unwrap() = 200;
+        for chunked in [false, true] {
+            *mock.state.chunked_payload.lock().unwrap() = chunked;
+            let mut oversized = peer_match_payload("matched");
+            oversized["private_raw_content"] = json!("SYNTHETIC_PRIVATE_VALUE".repeat(15000));
+            check_peer_match_payload(&mock, oversized, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+            check_peer_match_payload(
+                &mock,
+                peer_match_payload("matched"),
+                BODY_REFERENCE_TOKEN,
+                false,
+                10000,
+                0,
+            )
+            .await;
+        }
+        *mock.state.settings_status.lock().unwrap() = 302;
+        let result = mock.command_with_code(&args, 5).await;
+        assert_eq!(result["error"]["code"], "REDIRECT_REFUSED");
+        let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/settings");
+        *mock.state.settings_status.lock().unwrap() = 200;
+        *mock.state.settings_override.lock().unwrap() =
+            Some(json!({"error":"SYNTHETIC_PRIVATE_VALUE"}));
+        let result = mock.command_with_code(&args, 5).await;
+        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+        let requests = std::mem::take(&mut *mock.state.requests.lock().unwrap());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/settings");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_validate_group_sample_order_and_unique_sequences() {
+        let mock = MockApi::new().await;
+        let seed = 9_007_199_254_740_993u64;
+        let mut grouped = peer_match_payload("matched");
+        grouped["snapshot"]["retained_rows"] = json!(3);
+        grouped["snapshot"]["considered_rows"] = json!(3);
+        grouped["snapshot"]["latest_considered_sequence"] = json!((seed + 2).to_string());
+        for key in ["matching_rows", "returned_matching_rows", "sample_rows"] {
+            grouped["counts"][key] = json!(2);
+        }
+        let mut second = grouped["origins"][0].clone();
+        grouped["origins"][0]["origin"] = json!("https://a.example.com");
+        second["origin"] = json!("https://b.example.com");
+        second["samples"][0]["evidence_id"] = json!(peer_match_token(seed + 2));
+        second["samples"][0]["sequence"] = json!((seed + 2).to_string());
+        grouped["origins"].as_array_mut().unwrap().push(second);
+        assert_schema(&grouped, &output_schema(PEER_MATCH_OPERATION));
+        check_peer_match_payload(
+            &mock,
+            grouped.clone(),
+            BODY_REFERENCE_TOKEN,
+            false,
+            10000,
+            0,
+        )
+        .await;
+        let mut reversed = grouped.clone();
+        reversed["origins"].as_array_mut().unwrap().reverse();
+        check_peer_match_payload(&mock, reversed, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        let mut repeated = grouped.clone();
+        repeated["origins"][1]["origin"] = repeated["origins"][0]["origin"].clone();
+        check_peer_match_payload(&mock, repeated, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        for new_revision in [false, true] {
+            let mut repeated = grouped.clone();
+            repeated["origins"][1]["samples"][0] = repeated["origins"][0]["samples"][0].clone();
+            if new_revision {
+                repeated["origins"][1]["samples"][0]["evidence_id"] =
+                    json!(peer_match_token(seed + 1).replace(
+                        "33333333-3333-3333-3333-333333333333",
+                        "44444444-4444-4444-4444-444444444444"
+                    ));
+            }
+            check_peer_match_payload(&mock, repeated, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        }
+        let newer = grouped["origins"][1]["samples"][0].clone();
+        grouped["origins"].as_array_mut().unwrap().pop();
+        grouped["origins"][0]["matching_rows"] = json!(2);
+        grouped["origins"][0]["samples"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, newer);
+        check_peer_match_payload(
+            &mock,
+            grouped.clone(),
+            BODY_REFERENCE_TOKEN,
+            false,
+            10000,
+            0,
+        )
+        .await;
+        grouped["origins"][0]["samples"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        check_peer_match_payload(&mock, grouped, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        let mut outside = peer_match_payload("matched");
+        outside["complete"] = json!(false);
+        outside["source"]["in_window"] = json!(false);
+        outside["limits"]["max_records"] = json!(1);
+        outside["snapshot"]["considered_rows"] = json!(1);
+        outside["snapshot"]["oldest_considered_sequence"] = json!((seed + 1).to_string());
+        for reasons in [
+            json!(["source_outside_window", "max_records"]),
+            json!(["max_records", "max_records", "source_outside_window"]),
+        ] {
+            outside["reasons"] = reasons;
+            check_peer_match_payload(&mock, outside.clone(), BODY_REFERENCE_TOKEN, false, 1, 5)
+                .await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_reject_noncanonical_source_and_sample_tokens() {
+        let session = Uuid::nil().to_string();
+        let mock = MockApi::new().await;
+        let sequence = 9_007_199_254_740_994u64;
+        let sample = peer_match_token(sequence);
+        let noncanonical = |token: &str| {
+            vec![
+                token.replace(
+                    "22222222-2222-2222-2222-222222222222",
+                    "22222222222222222222222222222222",
+                ),
+                token.replace(
+                    "33333333-3333-3333-3333-333333333333",
+                    "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                ),
+                token.replace(".900719925474099", ".0900719925474099"),
+            ]
+        };
+        for token in noncanonical(BODY_REFERENCE_TOKEN) {
+            let input = json!({"session_id":session,"evidence_id":token});
+            let called = super::cli(
+                &[
+                    "--dry-run",
+                    "call",
+                    PEER_MATCH_OPERATION,
+                    "--input",
+                    &input.to_string(),
+                ],
+                2,
+            );
+            assert_eq!(called["error"]["code"], "INVALID_INPUT");
+            assert!(!called.to_string().contains(&token));
+            for noun in ["scope", "target"] {
+                let direct = super::cli(
+                    &[
+                        "--dry-run",
+                        noun,
+                        "service-map",
+                        "socket-peer-matches",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        &token,
+                    ],
+                    2,
+                );
+                assert_eq!(direct["error"]["code"], "INVALID_INPUT");
+                assert!(!direct.to_string().contains(&token));
+            }
+        }
+        for token in noncanonical(&sample) {
+            let mut payload = peer_match_payload("matched");
+            payload["origins"][0]["samples"][0]["evidence_id"] = json!(token);
+            check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_peer_matches_scope_work_limit_is_unavailable_with_fixed_warning() {
+        let mock = MockApi::new().await;
+        let schema = output_schema(PEER_MATCH_OPERATION);
+        let mut settings = mock.state.settings.clone();
+        settings["scope_patterns"] = json!(["SYNTHETIC_PRIVATE_SCOPE_VALUE"]);
+        *mock.state.settings_override.lock().unwrap() = Some(settings);
+        for (scoped, max_records) in [(false, 10000usize), (true, 1usize)] {
+            let mut payload = peer_match_payload("unavailable");
+            payload["reasons"] = json!(["scope_work_limit"]);
+            payload["in_scope_only"] = json!(scoped);
+            payload["limits"]["max_records"] = json!(max_records);
+            assert_schema(&payload, &schema);
+            let direct = check_peer_match_payload(
+                &mock,
+                payload.clone(),
+                BODY_REFERENCE_TOKEN,
+                scoped,
+                max_records,
+                0,
+            )
+            .await;
+            assert!(!direct.to_string().contains("SYNTHETIC_PRIVATE_SCOPE_VALUE"));
+            assert_eq!(direct["status"], "unavailable");
+            assert_eq!(direct["complete"], false);
+            assert_eq!(direct["origins"], json!([]));
+            for name in ["source", "peer", "snapshot"] {
+                assert_eq!(direct[name], Value::Null);
+            }
+            assert!(direct["counts"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| value.as_u64() == Some(0)));
+            let input = json!({"session_id":Uuid::nil(),"evidence_id":BODY_REFERENCE_TOKEN,
+                "in_scope_only":scoped,"max_records":max_records})
+            .to_string();
+            let called = mock
+                .command(&["call", PEER_MATCH_OPERATION, "--input", &input])
+                .await;
+            assert_eq!(called["data"], payload);
+            assert_eq!(called["warnings"], json!([]));
+            assert!(!called.to_string().contains("SYNTHETIC_PRIVATE_SCOPE_VALUE"));
+            mock.assert_reads(
+                PEER_MATCH_PATH,
+                &[
+                    ("evidence_id", BODY_REFERENCE_TOKEN),
+                    ("in_scope_only", if scoped { "true" } else { "false" }),
+                    ("max_records", &max_records.to_string()),
+                ],
+            );
+        }
+        for (field, fixed) in [
+            ("scope_pattern_entries", 500usize),
+            ("scope_pattern_bytes", 512usize),
+            ("scope_work_units", 8_388_608usize),
+        ] {
+            assert_eq!(
+                schema["properties"]["limits"]["properties"][field]["enum"],
+                json!([fixed])
+            );
+            assert!(schema["properties"]["limits"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field)));
+            for missing in [false, true] {
+                let mut payload = peer_match_payload("unavailable");
+                payload["reasons"] = json!(["scope_work_limit"]);
+                if missing {
+                    payload["limits"].as_object_mut().unwrap().remove(field);
+                } else {
+                    payload["limits"][field] = json!(fixed + 1);
+                }
+                assert!(!super::matches_schema(&payload, &schema));
+                check_peer_match_payload(&mock, payload, BODY_REFERENCE_TOKEN, false, 10000, 5)
+                    .await;
+            }
+        }
+        let mut partial = peer_match_payload("matched");
+        partial["complete"] = json!(false);
+        partial["reasons"] = json!(["scope_work_limit"]);
+        assert!(!super::matches_schema(&partial, &schema));
+        check_peer_match_payload(&mock, partial, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        let mut echoed = peer_match_payload("unavailable");
+        echoed["reasons"] = json!(["scope_work_limit"]);
+        echoed["scope_pattern"] = json!("SYNTHETIC_PRIVATE_SCOPE_VALUE");
+        assert!(!super::matches_schema(&echoed, &schema));
+        let rejected =
+            check_peer_match_payload(&mock, echoed, BODY_REFERENCE_TOKEN, false, 10000, 5).await;
+        assert!(!rejected
+            .to_string()
+            .contains("SYNTHETIC_PRIVATE_SCOPE_VALUE"));
     }
 
     fn link_declarations_payload(status: &str) -> Value {
