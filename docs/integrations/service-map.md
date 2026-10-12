@@ -13,6 +13,10 @@ stable card layout with origin search, scope filtering, viewport scrolling, and
 an APIs/Evidence inspector. There is no force layout, drag editing, or pan/zoom
 engine in this version. The renderer is separate from metadata normalization and
 layout calculation so it can be replaced without changing the read contract.
+The navigation strip follows the existing compact Capture-tab sizing. Long
+origin, method, and path previews stay bounded; their full text remains available
+in accessible text and hover titles, and selected endpoint evidence shows the
+complete query-free path.
 
 The graph displays at most 24 cards and 40 arrows. It keeps at most 100 additional
 reference-only candidate cards; those cards mean no captured rows are shown in
@@ -25,7 +29,12 @@ Selecting a card or API entry only changes the local view. Viewing source reads
 safe metadata from Sniper's exact-row evidence endpoint. Map and APIs never load
 the legacy whole-history Paths response. Removal and retention events invalidate
 displayed counts and evidence; other history changes label the previous snapshot
-until the next bounded read completes.
+until the next bounded read completes. Exact method/path selection survives a
+refresh only while that endpoint remains in the result; source verification is
+cleared when its snapshot is invalidated. Local origin search keeps the inspector
+and labels a selected origin outside the filter or card limit. Redirect
+relationship rows include the query-free target path so different destinations
+on the same origin remain distinguishable.
 
 ## Read through the CLI
 

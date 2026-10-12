@@ -92,20 +92,28 @@ async fn service_map_real_read_routes_and_cli_keep_duplicate_rows_and_stale_evid
     let app = sniper::api::router(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let asset = client
-        .get(format!("{api}/service-map.js"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(asset.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        asset.headers()["content-type"],
-        "application/javascript; charset=utf-8"
-    );
-    assert_eq!(
-        asset.text().await.unwrap(),
-        include_str!("../web/service-map.js")
-    );
+    for (path, content_type, expected) in [
+        (
+            "/service-map.js",
+            "application/javascript; charset=utf-8",
+            include_str!("../web/service-map.js"),
+        ),
+        (
+            "/styles.css",
+            "text/css; charset=utf-8",
+            include_str!("../web/styles.css"),
+        ),
+        (
+            "/",
+            "text/html; charset=utf-8",
+            include_str!("../web/index.html"),
+        ),
+    ] {
+        let asset = client.get(format!("{api}{path}")).send().await.unwrap();
+        assert_eq!(asset.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(asset.headers()["content-type"], content_type, "{path}");
+        assert_eq!(asset.text().await.unwrap(), expected, "{path}");
+    }
     let map = read(
         &dir,
         &api,

@@ -118,7 +118,7 @@
   function createController({ elements: els, getSessionId, request, document: doc = root.document }) {
     const state = {
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
-      query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null,
+      query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, page: 0, detailPage: 0,
       historyVersion: 0, stale: false,
@@ -175,7 +175,7 @@
         });
         origin.redirects.forEach((redirect) => {
           reference(redirect.target_origin, origin, "Redirect instruction from");
-          relation({ sourceOrigin: origin.origin, targetOrigin: redirect.target_origin, capturedOrigin: origin.origin, label: "Redirect instruction", evidence: redirect.evidence[0] || "" });
+          relation({ sourceOrigin: origin.origin, targetOrigin: redirect.target_origin, targetPath: redirect.target_path, capturedOrigin: origin.origin, label: "Redirect instruction", evidence: redirect.evidence[0] || "" });
         });
       });
       state.graphSnapshot = state.snapshot;
@@ -204,15 +204,20 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        selectionInitialized: false, endpointIndex: null, loading: false, error: "", page: 0, detailPage: 0, stale: false });
+        selectionInitialized: false, endpointIndex: null, endpointSelection: null, loading: false, error: "", page: 0, detailPage: 0, stale: false });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
-      if (!graphOrigins().some((item) => item.origin === origin)) return;
+      const item = graphOrigins().find((item) => item.origin === origin);
+      if (!item || endpointIndex !== null && (!Number.isSafeInteger(endpointIndex) || !item.endpoints[endpointIndex])) return;
       if (state.selectedOrigin !== origin || state.endpointIndex !== endpointIndex) cancelEvidence();
       state.selectedOrigin = origin;
       state.selectionInitialized = true;
       state.endpointIndex = endpointIndex;
+      const endpoint = endpointIndex === null ? null : item.endpoints[endpointIndex];
+      // Keep only the exact identity when invalidation clears all displayed data.
+      // An array index cannot safely survive scope filtering or history removal.
+      state.endpointSelection = endpoint ? { method: endpoint.method, path: endpoint.path } : null;
       state.detailPage = 0;
       state.detailTab = endpointIndex === null ? "apis" : "evidence";
       render();
@@ -237,7 +242,6 @@
         if (!response.ok) throw new Error("Service map unavailable");
         const snapshot = normalizeSnapshot(await response.json(), sessionId);
         if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
-        const previousEndpoint = state.endpointIndex === null ? null : selectedOrigin()?.endpoints[state.endpointIndex];
         state.snapshot = snapshot;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
@@ -249,13 +253,14 @@
           cancelEvidence();
           state.selectedOrigin = state.selectionInitialized ? null : state.order[0] || null;
           state.endpointIndex = null;
+          state.endpointSelection = null;
         }
         if (state.selectedOrigin) state.selectionInitialized = true;
         const origin = selectedOrigin();
-        if (previousEndpoint) {
-          const index = origin?.endpoints.findIndex((endpoint) => endpoint.method === previousEndpoint.method && endpoint.path === previousEndpoint.path) ?? -1;
+        if (state.endpointSelection) {
+          const index = origin?.endpoints.findIndex((endpoint) => endpoint.method === state.endpointSelection.method && endpoint.path === state.endpointSelection.path) ?? -1;
           state.endpointIndex = index < 0 ? null : index;
-          if (index < 0) cancelEvidence();
+          if (index < 0) { state.endpointSelection = null; cancelEvidence(); }
         }
         if (state.evidenceId && !evidenceItems(origin).some((item) => item.id === state.evidenceId)) cancelEvidence();
         state.loading = false;
@@ -307,7 +312,7 @@
           || result.source !== "captured_http_metadata" || typeof result.available !== "boolean") throw new Error("Evidence source changed");
         const row = result.row;
         if (result.available && (!row || row.evidence_id !== id || safeOrigin(row.origin) !== selected
-          || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.record_id || "") || !/^[0-9]+$/.test(row.sequence || "")
+          || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.record_id || "") || typeof row.sequence !== "string" || !/^[0-9]+$/.test(row.sequence)
           || typeof row.method !== "string" || typeof row.path !== "string"
           || endpoint && (row.method !== endpoint.method || safePath(row.path) !== endpoint.path))) throw new Error("Evidence row changed");
         state.evidence = result.available === true ? row : null;
@@ -350,9 +355,13 @@
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
       const layout = graphLayout(origins, state.order, state.layoutSlots);
       state.layoutSlots = layout.slots;
+      const selected = selectedOrigin();
+      const selectionNotice = !selected || layout.nodes.some((origin) => origin.origin === selected.origin) ? "" : origins.some((origin) => origin.origin === selected.origin)
+        ? `Selected origin is outside the ${MAX_CARDS}-card display; inspector retained.`
+        : "Selected origin is outside this filter; inspector retained.";
       if (!origins.length) {
         replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly ? "Change the origin filter or turn off In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
-        els.graphBounds.textContent = "";
+        els.graphBounds.textContent = selectionNotice;
         return;
       }
       const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.relationship !== "redirect_instruction" ? "header-declaration" : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" d="${edge.path}" marker-end="url(#service-map-arrow)"><title>${escape(edge.source)} → ${escape(edge.target)} · ${escape(edge.label)} declaration</title></path>`).join("");
@@ -365,24 +374,24 @@
         </button>`;
       }).join("");
       replace(els.canvas, `<div class="service-map-layout" style="width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}</svg>${cards}</div>`);
-      els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}`;
+      els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}`;
     }
     function endpointButton(endpoint, origin, index, catalog = false) {
       const method = endpoint.method;
       const tone = method.toUpperCase() === "GET" ? "get" : method.toUpperCase() === "POST" ? "post" : "other";
-      return `<button class="service-map-api-row ${state.selectedOrigin === origin.origin && state.endpointIndex === index ? "selected" : ""}" type="button" data-service-endpoint="${index}" data-service-origin="${escape(origin.origin)}" data-service-focus="api:${escape(JSON.stringify([origin.origin, endpoint.method, endpoint.path]))}"><span class="service-map-method ${tone}">${escape(method)}</span><span class="service-map-api-copy">${catalog ? `<small>${escape(origin.origin)}</small>` : ""}<span>${escape(endpoint.path)}</span></span><span class="service-map-api-count">${endpoint.request_count.toLocaleString()}<span class="service-map-chevron" aria-hidden="true">›</span></span></button>`;
+      return `<button class="service-map-api-row ${state.selectedOrigin === origin.origin && state.endpointIndex === index ? "selected" : ""}" type="button" data-service-endpoint="${index}" data-service-origin="${escape(origin.origin)}" data-service-focus="api:${escape(JSON.stringify([origin.origin, endpoint.method, endpoint.path]))}"><span class="service-map-method ${tone}" title="${escape(method)}">${escape(method)}</span><span class="service-map-api-copy">${catalog ? `<small title="${escape(origin.origin)}">${escape(origin.origin)}</small>` : ""}<span title="${escape(endpoint.path)}">${escape(endpoint.path)}</span></span><span class="service-map-api-count">${endpoint.request_count.toLocaleString()}<span class="service-map-chevron" aria-hidden="true">›</span></span></button>`;
     }
     function relationshipMarkup(origin) {
       const group = state.relationsByOrigin?.get(origin.origin);
       if (!group?.items.length) return "";
-      return `<h4>Metadata relationships</h4><p class="service-map-muted">Header declarations and redirect instructions do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${group.items.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}</span><span>${item.evidence ? "View source ›" : "Inspect ›"}</span></button>`).join("")}</div>${group.omitted ? `<p class="service-map-muted">${group.omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
+      return `<h4>Metadata relationships</h4><p class="service-map-muted">Header declarations and redirect instructions do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${group.items.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}</span><span>${item.evidence ? "View source ›" : "Inspect ›"}</span></button>`).join("")}</div>${group.omitted ? `<p class="service-map-muted">${group.omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
     }
     function evidenceMarkup(origin) {
       const items = evidenceItems(origin);
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
       const row = state.evidence;
       const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul><p>Exact retained source verified for this read.</p></div>` : "";
-      return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
+      return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
         ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}
         <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || '<p class="service-map-muted">No source samples are available in this bounded snapshot.</p>'}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
@@ -393,13 +402,13 @@
       const origin = selectedOrigin();
       if (!origin) { replace(els.detail, '<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
       if (!origin.captured) {
-        replace(els.detail, `<header class="service-map-detail-header"><div><h3>${escape(new URL(origin.origin).host)}</h3><p>${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in captured metadata within this snapshot. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
+        replace(els.detail, `<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in captured metadata within this snapshot. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
         return;
       }
       const pageCount = Math.max(1, Math.ceil(origin.endpoints.length / API_PAGE_SIZE));
       state.detailPage = Math.min(state.detailPage, pageCount - 1);
       const start = state.detailPage * API_PAGE_SIZE;
-      replace(els.detail, `<header class="service-map-detail-header"><div><h3>${escape(new URL(origin.origin).host)}</h3><p>${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
+      replace(els.detail, `<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
         <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, IP or certificate association is available.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
     }
@@ -431,7 +440,7 @@
         selectOrigin(data.serviceOrigin, Number(data.serviceEndpoint));
         if (state.view === "apis") { state.view = "service-map"; onViewChange?.("service-map"); render(); }
       } else if (data.serviceOrigin) selectOrigin(data.serviceOrigin);
-      else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; if (state.detailTab === "apis") state.endpointIndex = null; renderDetail(); }
+      else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; if (state.detailTab === "apis") { state.endpointIndex = null; state.endpointSelection = null; } renderDetail(); }
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
       else if (data.servicePage !== undefined) { state.page = Math.max(0, Number(data.servicePage) || 0); renderCatalog(); els.catalog.scrollTop = 0; }
       else if (data.serviceDetailPage !== undefined) { state.detailPage = Math.max(0, Number(data.serviceDetailPage) || 0); renderDetail(); }
@@ -443,7 +452,7 @@
       if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
       state.detailTab = event.key === "Home" ? "apis" : event.key === "End" ? "evidence" : state.detailTab === "apis" ? "evidence" : "apis";
-      if (state.detailTab === "apis") state.endpointIndex = null;
+      if (state.detailTab === "apis") { state.endpointIndex = null; state.endpointSelection = null; }
       renderDetail();
       const next = [...els.detail.querySelectorAll('[role="tab"][data-service-detail-tab]')].find((button) => button.dataset.serviceDetailTab === state.detailTab);
       next?.focus();
@@ -454,6 +463,7 @@
       state.scopeOnly = els.scope.checked;
       state.page = 0;
       state.snapshot = null;
+      state.endpointIndex = null;
       cancelEvidence();
       refresh({ force: true });
     });
@@ -485,6 +495,7 @@
         abort?.abort();
         state.loading = false;
         state.snapshot = null;
+        state.endpointIndex = null;
         cancelEvidence();
         render();
         return refresh({ force: true });

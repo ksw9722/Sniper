@@ -128,6 +128,7 @@ for (const [name, change] of [
   ['wrong origin', value => { value.row.origin = originB; }],
   ['wrong method', value => { value.row.method = 'POST'; }],
   ['wrong path', value => { value.row.path = '/other'; }],
+  ['numeric sequence without exact decimal string', value => { value.row.sequence = 9007199254740993; }],
   ['wrong source type', value => { value.source = 'unverified'; }],
 ]) test(`evidence rejects ${name} without fallback to UUID detail`, async () => {
   const f = fixture(); await f.load(); f.controller.selectOrigin(originA, 0);
@@ -192,9 +193,9 @@ test('graph layout has an explicit edge cap and only supported metadata relation
 
 test('stable focus keys use exact origin/method/path rather than a mutable row index', async () => {
   const f = fixture(); await f.load(snapshot([origin(originA, [endpoint('/a'), endpoint('/z', 'get')])]));
-  const before = f.els.catalog.innerHTML.match(/data-service-focus="([^"]+)"[^>]*><span class="service-map-method get">get/)[1];
+  const before = f.els.catalog.innerHTML.match(/data-service-focus="([^"]+)"[^>]*><span class="service-map-method get"[^>]*>get/)[1];
   await f.load(snapshot([origin(originA, [endpoint('/new'), endpoint('/a'), endpoint('/z', 'get')])]));
-  const after = f.els.catalog.innerHTML.match(/data-service-focus="([^"]+)"[^>]*><span class="service-map-method get">get/)[1];
+  const after = f.els.catalog.innerHTML.match(/data-service-focus="([^"]+)"[^>]*><span class="service-map-method get"[^>]*>get/)[1];
   assert.equal(before, after); assert.match(after, /\/z/);
 });
 test('filtered/bounded referenced cards do not assert the origin was never captured', async () => {
@@ -309,4 +310,115 @@ test('unchanged include/exclude rules do not invalidate an in-flight map', async
   assert.equal(f.requests.at(-1).options.signal.aborted, false);
   f.requests.at(-1).resolve(response(snapshot())); await pending;
   assert.notEqual(f.state.snapshot, null);
+});
+
+for (const transition of ['scope filter', 'history invalidation']) test(`${transition} preserves exact endpoint identity through an empty snapshot`, async () => {
+  const f = fixture();
+  await f.load(snapshot([origin(originA, [endpoint('/first'), endpoint('/selected', 'get', 'selected')])]));
+  f.controller.selectOrigin(originA, 1);
+  const oldEvidence = f.controller.loadEvidence('selected');
+  let refresh;
+  if (transition === 'scope filter') {
+    f.els.scope.checked = true;
+    f.els.scope.dispatch('change');
+  } else refresh = f.controller.invalidate();
+  assert.equal(f.state.snapshot, null);
+  assert.equal(f.state.evidence, null);
+  f.requests[1].resolve(response(evidence('selected', originA, { row: { ...evidence().row, evidence_id: 'selected', method: 'get', path: '/selected' } })));
+  await oldEvidence;
+  assert.equal(f.state.evidence, null, 'old source cannot return during the invalidated snapshot');
+  f.requests.at(-1).resolve(response(snapshot([origin(originA, [endpoint('/selected', 'GET'), endpoint('/other'), endpoint('/selected', 'get', 'selected')])])));
+  if (refresh) await refresh; else await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.endpointIndex, 2);
+  assert.match(f.els.detail.innerHTML, /service-map-endpoint-summary[^]*?>get<\/span><strong>\/selected<\/strong>/);
+  assert.equal(f.state.evidence, null, 'a refreshed selection does not claim a newly verified source');
+});
+
+test('invalidating a removed endpoint clears its selection instead of selecting the replacement index', async () => {
+  const f = fixture(); await f.load(snapshot([origin(originA, [endpoint('/selected')])]));
+  f.controller.selectOrigin(originA, 0);
+  const refresh = f.controller.invalidate();
+  f.requests.at(-1).resolve(response(snapshot([origin(originA, [endpoint('/replacement')])])));
+  await refresh;
+  assert.equal(f.state.endpointIndex, null);
+  assert.doesNotMatch(f.els.detail.innerHTML, /service-map-endpoint-summary/);
+});
+
+test('origin search keeps selected exact evidence and explains when its card is filtered out', async () => {
+  const f = fixture(); await f.load(); f.controller.selectOrigin(originA, 0);
+  const pending = f.controller.loadEvidence('evidence-one');
+  f.requests.at(-1).resolve(response(evidence())); await pending;
+  const verified = f.state.evidence;
+  for (const query of ['api.example.com', 'no-matching.example.com']) {
+    f.els.search.value = query; f.els.search.dispatch('input');
+    assert.equal(f.state.selectedOrigin, originA);
+    assert.equal(f.state.evidence, verified);
+    assert.match(f.els.detail.innerHTML, /Verified retained source/);
+    assert.match(f.els.graphBounds.textContent, /Selected origin is outside this filter/);
+  }
+  f.els.search.value = ''; f.els.search.dispatch('input');
+  assert.doesNotMatch(f.els.graphBounds.textContent, /outside this filter/);
+  assert.equal(f.requests.length, 2, 'origin search never fetches new metadata');
+});
+
+test('selection beyond the card cap remains inspectable and explains the display limit', async () => {
+  const f = fixture(), origins = Array.from({ length: 30 }, (_, i) => origin(`https://node${String(i).padStart(2, '0')}.example.com`));
+  await f.load(snapshot(origins));
+  f.controller.selectOrigin(origins.at(-1).origin, 0);
+  assert.equal((f.els.canvas.innerHTML.match(/data-service-origin=/g) || []).length, 24);
+  assert.match(f.els.graphBounds.textContent, /Selected origin is outside the 24-card display/);
+  assert.match(f.els.detail.innerHTML, /node29.example.com/);
+});
+
+test('redirect relationships distinguish exact target paths and have distinct stable focus keys', async () => {
+  const f = fixture(), source = origin(originA);
+  source.redirects = ['/first?secret=omitted', '/second'].map((target_path, i) => ({ target_origin: originB, target_path, relationship: 'redirect_instruction', evidence: [`redirect-${i}`] }));
+  await f.load(snapshot([source]));
+  f.controller.selectOrigin(originA);
+  assert.match(f.els.detail.innerHTML, /api.example.com\/first/);
+  assert.match(f.els.detail.innerHTML, /api.example.com\/second/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /secret=omitted/);
+  const keys = [...f.els.detail.innerHTML.matchAll(/data-service-focus="(relation:[^"]+)"/g)].map(match => match[1]);
+  assert.equal(keys.length, 2);
+  assert.equal(new Set(keys).size, 2);
+});
+
+test('long captured and reference-only origins retain full identities behind bounded header previews', async () => {
+  const host = `${['a'.repeat(50), 'b'.repeat(50), 'c'.repeat(50), 'd'.repeat(50)].join('.')}.example.com`;
+  const fullOrigin = `https://${host}`;
+  for (const captured of [true, false]) {
+    const f = fixture(), owner = origin(captured ? fullOrigin : originA);
+    if (!captured) owner.header_links = [{ source_origin: fullOrigin, relationship: 'origin_header', source: 'request_header_declaration', evidence: [] }];
+    await f.load(snapshot([owner])); f.controller.selectOrigin(fullOrigin);
+    assert.ok(f.els.detail.innerHTML.includes(`<h3 title="${host}">${host}</h3>`));
+    assert.ok(f.els.detail.innerHTML.includes(`<p title="${fullOrigin}">${fullOrigin}</p>`));
+  }
+});
+
+test('bounded API previews preserve full escaped method and exact path in text and titles', async () => {
+  const f = fixture(), method = 'EXPERIMENTAL_METHOD_WITH_32_CHARS!'.slice(0, 32);
+  assert.equal(method.length, 32);
+  const exactPath = `/catalog/${'long-segment-'.repeat(22)}"quoted"&<safe>`;
+  const escapedPath = exactPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  await f.load(snapshot([origin(originA, [endpoint(exactPath, method)])]));
+  for (const html of [f.els.detail.innerHTML, f.els.catalog.innerHTML]) {
+    assert.ok(html.includes(`title="${method}">${method}</span>`));
+    assert.ok(html.includes(`<span title="${escapedPath}">${escapedPath}</span>`));
+    assert.doesNotMatch(html, /<safe>|title="[^"]*"quoted"/);
+  }
+  f.controller.selectOrigin(originA, 0);
+  assert.ok(f.els.detail.innerHTML.includes(`<strong>${escapedPath}</strong>`), 'the selected endpoint body keeps the complete path');
+});
+
+test('map preview styles bound headers and long method/path rows without removing their text', () => {
+  const styles = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  const header = styles.match(/\.service-map-detail-header h3\s*\{([^}]+)\}/)[1];
+  assert.match(header, /-webkit-line-clamp:\s*2/);
+  assert.match(header, /max-height:\s*2\.6em/);
+  const method = styles.match(/\.service-map-api-row \.service-map-method\s*\{([^}]+)\}/)[1];
+  assert.match(method, /max-width:\s*min\(8em,\s*32%\)/);
+  const pathPreview = styles.match(/\.service-map-api-copy > span\s*\{([^}]+)\}/)[1];
+  assert.match(pathPreview, /-webkit-line-clamp:\s*2/);
+  assert.match(pathPreview, /max-height:\s*2\.8em/);
+  assert.match(styles, /\.service-map-detail-header p, \.service-map-api-copy > small\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/);
 });
