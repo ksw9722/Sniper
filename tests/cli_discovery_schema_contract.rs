@@ -1148,6 +1148,885 @@ mod history_fixture {
             "source":"captured_http_metadata","row":if available {row} else {Value::Null}})
     }
 
+    fn technology_observation_payload() -> Value {
+        json!({
+            "product_id":"nginx","name":"nginx","catalog_category":"web_server",
+            "reported_version":"1.24.0","version_status":"reported",
+            "source":"response_header","strength":"literal_declaration","header_name":"server",
+            "header_index":0,"product_span":{"start":0,"end":5},
+            "version_span":{"start":6,"end":12},
+            "offset_basis":"retained_header_value_utf8","rule_id":"server.nginx.v1"
+        })
+    }
+
+    fn technology_evidence_payload() -> Value {
+        let mut payload = evidence_payload(true);
+        payload["row"]["technology_observations"] = json!([technology_observation_payload()]);
+        payload
+    }
+
+    fn technology_map_payload() -> Value {
+        let mut payload = map_payload();
+        payload["snapshot"]["generation"] = json!("22222222-2222-2222-2222-222222222222");
+        for (name, cap) in [
+            ("technology_observations_per_row", 8),
+            ("technology_observations_per_origin", 32),
+            ("technology_observations", 2000),
+            ("technology_version_bytes", 32),
+            ("technology_token_candidates_per_row", 128),
+        ] {
+            payload["snapshot"]["limits"][name] = json!(cap);
+        }
+        payload["origins"][0]["technology_observations"] = json!([{
+            "product_id":"nginx","name":"nginx","catalog_category":"web_server",
+            "reported_version":"1.24.0","version_status":"reported",
+            "source":"response_header","strength":"literal_declaration","header_name":"server",
+            "row_count":1,"first_seen":"2026-10-12T06:00:00Z","last_seen":"2026-10-12T06:00:00Z",
+            "evidence":[BODY_REFERENCE_TOKEN]
+        }]);
+        payload
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_extensions_preserve_old_servers_and_both_envelopes() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        for exact_row in [false, true] {
+            let operation = if exact_row {
+                "target.service_map.evidence.get"
+            } else {
+                "target.service_map.get"
+            };
+            let path = if exact_row {
+                "/api/target/service-map/evidence"
+            } else {
+                "/api/target/service-map"
+            };
+            let schema = output_schema(operation);
+            let mut empty = if exact_row {
+                evidence_payload(true)
+            } else {
+                map_payload()
+            };
+            let pointer = if exact_row {
+                "/row/technology_observations"
+            } else {
+                "/origins/0/technology_observations"
+            };
+            if exact_row {
+                empty["row"]["technology_observations"] = json!([]);
+            } else {
+                empty["origins"][0]["technology_observations"] = json!([]);
+            }
+            let payloads = if exact_row {
+                vec![evidence_payload(true), empty, technology_evidence_payload()]
+            } else {
+                vec![map_payload(), empty, technology_map_payload()]
+            };
+            for payload in payloads {
+                *mock.state.payload.lock().unwrap() = payload.clone();
+                let args = if exact_row {
+                    vec![
+                        "scope",
+                        "service-map-evidence",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        BODY_REFERENCE_TOKEN,
+                    ]
+                } else {
+                    vec!["scope", "service-map", "--session-id", &session]
+                };
+                let direct = mock.command(&args).await;
+                assert_eq!(direct, payload);
+                assert_schema(&direct, &schema);
+                assert_eq!(direct.pointer(pointer), payload.pointer(pointer));
+                let query = if exact_row {
+                    vec![("evidence_id", BODY_REFERENCE_TOKEN)]
+                } else {
+                    vec![("in_scope_only", "false"), ("max_records", "10000")]
+                };
+                mock.assert_reads(path, &query);
+                let input = if exact_row {
+                    json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN})
+                } else {
+                    json!({"session_id":session})
+                }
+                .to_string();
+                let called = mock.command(&["call", operation, "--input", &input]).await;
+                assert_eq!(called["data"], direct);
+                assert_eq!(called["meta"]["session_id"], session);
+                mock.assert_reads(path, &query);
+            }
+        }
+    }
+
+    #[test]
+    fn service_map_technology_schemas_follow_the_fixed_catalog_and_nullable_contract() {
+        let row_schema = output_schema("target.service_map.evidence.get");
+        let schema = &row_schema["properties"]["row"]["anyOf"][1]["properties"]
+            ["technology_observations"]["items"];
+        for entry in sniper::service_map_technology::CATALOG {
+            let mut observation = technology_observation_payload();
+            observation["product_id"] = json!(entry.product_id);
+            observation["name"] = json!(entry.name);
+            observation["catalog_category"] = json!(entry.catalog_category);
+            observation["header_name"] = json!(entry.header_name);
+            observation["rule_id"] = json!(entry.rule_id);
+            observation["product_span"]["end"] = json!(entry.literal.len());
+            observation["version_span"] =
+                json!({"start":entry.literal.len()+1,"end":entry.literal.len()+7});
+            if entry.product_id == "apache_coyote" {
+                observation["reported_version"] = Value::Null;
+                observation["version_span"] = Value::Null;
+                observation["version_status"] = json!("non_product_version");
+            }
+            assert_schema(&observation, schema);
+            for status in ["not_reported", "unsupported_format"] {
+                observation["reported_version"] = Value::Null;
+                observation["version_span"] = Value::Null;
+                observation["version_status"] = json!(status);
+                assert_eq!(
+                    super::matches_schema(&observation, schema),
+                    entry.rule_id != "server.jetty_parenthesized.v1" || status != "not_reported"
+                );
+            }
+        }
+        for field in [
+            "reported_version",
+            "version_span",
+            "rule_id",
+            "header_index",
+        ] {
+            let mut missing = technology_observation_payload();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!super::matches_schema(&missing, schema), "{field}");
+        }
+        for version in [
+            "",
+            "1..2",
+            "1.2.",
+            "1.2beta",
+            "１.２",
+            "123456789012345678901234567890123",
+        ] {
+            let mut invalid = technology_observation_payload();
+            invalid["reported_version"] = json!(version);
+            assert!(!super::matches_schema(&invalid, schema), "{version}");
+        }
+        let mut invalid = technology_observation_payload();
+        invalid["raw_header"] = json!("SYNTHETIC_PRIVATE_VALUE");
+        assert!(!super::matches_schema(&invalid, schema));
+        invalid = technology_observation_payload();
+        invalid["version_span"] = Value::Null;
+        assert!(!super::matches_schema(&invalid, schema));
+        invalid = technology_observation_payload();
+        invalid["product_id"] = json!("apache_http_server");
+        assert!(!super::matches_schema(&invalid, schema));
+        let map_schema = output_schema("target.service_map.get");
+        for (name, _) in [
+            ("technology_observations_per_row", 8),
+            ("technology_observations_per_origin", 32),
+            ("technology_observations", 2000),
+            ("technology_version_bytes", 32),
+            ("technology_token_candidates_per_row", 128),
+        ] {
+            let mut invalid = technology_map_payload();
+            invalid["snapshot"]["limits"][name] = json!(999);
+            assert!(!super::matches_schema(&invalid, &map_schema), "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_rows_reject_malformed_or_private_extensions() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let base = technology_evidence_payload();
+        let mut invalids = Vec::new();
+        for (pointer, value) in [
+            ("/product_id", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/name", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/catalog_category", json!("origin_server")),
+            ("/catalog_category", json!("connector")),
+            ("/source", json!("response_body")),
+            ("/strength", json!("verified")),
+            ("/header_name", json!("Server")),
+            ("/header_name", json!("set-cookie")),
+            ("/rule_id", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/rule_id", json!("server.php.v1")),
+            ("/offset_basis", json!("unicode_characters")),
+            ("/header_index", json!(128)),
+            ("/header_index", json!(-1)),
+            ("/product_span/start", json!(5)),
+            ("/product_span/end", json!(4097)),
+            ("/product_span/end", json!(4)),
+            ("/version_span/start", json!(5)),
+            ("/version_span/end", json!(4097)),
+            ("/version_span/end", json!(11)),
+            ("/version_span", Value::Null),
+            ("/reported_version", Value::Null),
+            ("/reported_version", json!("1.24.0-SYNTHETIC_PRIVATE_VALUE")),
+            (
+                "/reported_version",
+                json!("123456789012345678901234567890123"),
+            ),
+            ("/version_status", json!("not_reported")),
+            ("/version_status", json!("inferred")),
+            ("/version_status", json!("non_product_version")),
+        ] {
+            let mut payload = base.clone();
+            *payload["row"]["technology_observations"][0]
+                .pointer_mut(pointer)
+                .unwrap() = value;
+            invalids.push(payload);
+        }
+        for field in ["reported_version", "version_span", "product_id", "rule_id"] {
+            let mut payload = base.clone();
+            payload["row"]["technology_observations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            invalids.push(payload);
+        }
+        let mut payload = base.clone();
+        payload["row"]["technology_observations"][0]["raw_header"] =
+            json!("SYNTHETIC_PRIVATE_VALUE");
+        invalids.push(payload);
+        let mut payload = base.clone();
+        payload["row"]["technology_observations"][0]["product_span"]["raw"] =
+            json!("SYNTHETIC_PRIVATE_VALUE");
+        invalids.push(payload);
+        for value in [
+            Value::Null,
+            json!({}),
+            json!(vec![technology_observation_payload(); 9]),
+        ] {
+            let mut payload = base.clone();
+            payload["row"]["technology_observations"] = value;
+            invalids.push(payload);
+        }
+        let mut payload = base.clone();
+        payload["row"]["technology_observations"] = json!([
+            technology_observation_payload(),
+            technology_observation_payload()
+        ]);
+        invalids.push(payload);
+        let mut payload = base.clone();
+        payload["row"]["metadata_complete"] = json!(false);
+        payload["row"]["omitted"] = json!(["technology_observations_limit"]);
+        invalids.push(payload);
+        for (index, payload) in invalids.into_iter().enumerate() {
+            *mock.state.payload.lock().unwrap() = payload;
+            let input =
+                json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN}).to_string();
+            let args = if index % 2 == 0 {
+                vec!["call", "target.service_map.evidence.get", "--input", &input]
+            } else {
+                vec![
+                    "scope",
+                    "service-map-evidence",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ]
+            };
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "case {index}");
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_aggregates_reject_misbound_counts_limits_and_conflicts() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let base = technology_map_payload();
+        let mut invalids = Vec::new();
+        for (pointer, value) in [
+            ("/product_id", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/name", json!("Apache")),
+            ("/catalog_category", json!("connector")),
+            ("/header_name", json!("x-generator")),
+            ("/source", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/strength", json!("verified")),
+            ("/reported_version", json!("SYNTHETIC_PRIVATE_VALUE")),
+            ("/reported_version", Value::Null),
+            ("/version_status", json!("unsupported_format")),
+            ("/row_count", json!(0)),
+            ("/row_count", json!(3)),
+            ("/first_seen", json!("2026-10-12T05:59:59Z")),
+            ("/last_seen", json!("2026-10-12T06:00:01Z")),
+            ("/evidence", json!([])),
+            (
+                "/evidence",
+                json!([BODY_REFERENCE_TOKEN, BODY_REFERENCE_TOKEN]),
+            ),
+            (
+                "/evidence",
+                json!([BODY_REFERENCE_TOKEN.replace("v1.00000000", "v1.11111111")]),
+            ),
+            (
+                "/evidence",
+                json!([BODY_REFERENCE_TOKEN.replace("22222222-2222", "11111111-2222")]),
+            ),
+        ] {
+            let mut payload = base.clone();
+            *payload["origins"][0]["technology_observations"][0]
+                .pointer_mut(pointer)
+                .unwrap() = value;
+            invalids.push(payload);
+        }
+        for field in ["reported_version", "header_name", "row_count"] {
+            let mut payload = base.clone();
+            payload["origins"][0]["technology_observations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            invalids.push(payload);
+        }
+        for (field, value) in [
+            ("rule_id", json!("server.nginx.v1")),
+            ("product_span", json!({"start":0,"end":5})),
+            ("raw_header", json!("SYNTHETIC_PRIVATE_VALUE")),
+        ] {
+            let mut payload = base.clone();
+            payload["origins"][0]["technology_observations"][0][field] = value;
+            invalids.push(payload);
+        }
+        for name in [
+            "technology_observations_per_row",
+            "technology_observations_per_origin",
+            "technology_observations",
+            "technology_version_bytes",
+            "technology_token_candidates_per_row",
+        ] {
+            for value in [json!(999), Value::Null] {
+                let mut payload = base.clone();
+                payload["snapshot"]["limits"][name] = value;
+                invalids.push(payload);
+            }
+        }
+        for value in [
+            Value::Null,
+            json!({}),
+            json!(vec![
+                base["origins"][0]["technology_observations"][0].clone();
+                33
+            ]),
+        ] {
+            let mut payload = base.clone();
+            payload["origins"][0]["technology_observations"] = value;
+            invalids.push(payload);
+        }
+        let mut payload = base.clone();
+        let duplicate = payload["origins"][0]["technology_observations"][0].clone();
+        payload["origins"][0]["technology_observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        invalids.push(payload);
+        for reason in [
+            "technology_observations_per_origin_limit",
+            "technology_observations_map_limit",
+        ] {
+            let mut payload = base.clone();
+            payload["snapshot"]["complete"] = json!(false);
+            payload["snapshot"]["stopped_by"] = json!([reason]);
+            invalids.push(payload);
+        }
+        for (index, payload) in invalids.into_iter().enumerate() {
+            *mock.state.payload.lock().unwrap() = payload;
+            let input = json!({"session_id":session}).to_string();
+            let args = if index % 2 == 0 {
+                vec!["call", "target.service_map.get", "--input", &input]
+            } else {
+                vec!["scope", "service-map", "--session-id", &session]
+            };
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "case {index}");
+            assert_eq!(result["error"]["retryable"], false);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map",
+                &[("in_scope_only", "false"), ("max_records", "10000")],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_statuses_conflicting_versions_and_caps_remain_explicit() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let schema = output_schema("target.service_map.evidence.get");
+        let mut cases = Vec::new();
+        for status in ["not_reported", "unsupported_format"] {
+            let mut payload = technology_evidence_payload();
+            let observation = &mut payload["row"]["technology_observations"][0];
+            observation["version_status"] = json!(status);
+            observation["reported_version"] = Value::Null;
+            observation["version_span"] = Value::Null;
+            cases.push(payload);
+        }
+        let mut coyote = technology_evidence_payload();
+        let observation = &mut coyote["row"]["technology_observations"][0];
+        observation["product_id"] = json!("apache_coyote");
+        observation["name"] = json!("Apache-Coyote");
+        observation["catalog_category"] = json!("connector");
+        observation["rule_id"] = json!("server.apache_coyote.v1");
+        observation["product_span"]["end"] = json!(13);
+        observation["version_status"] = json!("non_product_version");
+        observation["reported_version"] = Value::Null;
+        observation["version_span"] = Value::Null;
+        cases.push(coyote);
+        let mut long_version = technology_evidence_payload();
+        long_version["row"]["technology_observations"][0]["reported_version"] =
+            json!("12345678901234567890123456789012");
+        long_version["row"]["technology_observations"][0]["version_span"]["end"] = json!(38);
+        cases.push(long_version);
+        let mut capped = technology_evidence_payload();
+        capped["row"]["technology_observations"] = json!((0..8)
+            .map(|index| {
+                let mut observation = technology_observation_payload();
+                observation["header_index"] = json!(index);
+                observation
+            })
+            .collect::<Vec<_>>());
+        capped["row"]["metadata_complete"] = json!(false);
+        capped["row"]["omitted"] = json!(["technology_observations_limit"]);
+        cases.push(capped);
+        for payload in cases {
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let result = mock
+                .command(&[
+                    "scope",
+                    "service-map-evidence",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ])
+                .await;
+            assert_eq!(result, payload);
+            assert_schema(&result, &schema);
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        let mut mixed = technology_map_payload();
+        let mut other = mixed["origins"][0]["technology_observations"][0].clone();
+        other["reported_version"] = json!("1.25.0");
+        other["evidence"] =
+            json!([BODY_REFERENCE_TOKEN.replace("9007199254740993", "9007199254740994")]);
+        mixed["origins"][0]["technology_observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(other);
+        *mock.state.payload.lock().unwrap() = mixed.clone();
+        let result = mock
+            .command(&["scope", "service-map", "--session-id", &session])
+            .await;
+        assert_eq!(result, mixed);
+        assert_schema(&result, &output_schema("target.service_map.get"));
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_shared_sequences_require_one_exact_row_token() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let mut base = technology_map_payload();
+        let mut other = base["origins"][0]["technology_observations"][0].clone();
+        other["reported_version"] = json!("1.25.0");
+        base["origins"][0]["technology_observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(other);
+        // One retained row can explicitly declare different product/version
+        // tuples. Reusing its identical evidence token remains valid.
+        *mock.state.payload.lock().unwrap() = base.clone();
+        let result = mock
+            .command(&["scope", "service-map", "--session-id", &session])
+            .await;
+        assert_eq!(result, base);
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+        for field in [4, 5] {
+            let mut fields: Vec<_> = BODY_REFERENCE_TOKEN.split('.').collect();
+            fields[field] = "44444444-4444-4444-4444-444444444444";
+            let conflicting_token = fields.join(".");
+            for pointer in [
+                "/origins/0/technology_observations/1/evidence/0",
+                "/origins/0/endpoints/0/evidence/0",
+                "/origins/0/technology_clues/0/evidence/0",
+                "/origins/0/redirects/0/evidence/0",
+                "/origins/0/header_links/0/evidence/0",
+            ] {
+                let mut payload = base.clone();
+                *payload.pointer_mut(pointer).unwrap() = json!(conflicting_token);
+                *mock.state.payload.lock().unwrap() = payload;
+                let input = json!({"session_id":session}).to_string();
+                let result = mock
+                    .command_with_code(&["call", "target.service_map.get", "--input", &input], 5)
+                    .await;
+                assert_eq!(
+                    result["error"]["code"], "INVALID_RESPONSE",
+                    "{pointer} field {field}"
+                );
+                assert_eq!(result["error"]["retryable"], false);
+                assert!(!result.to_string().contains(&conflicting_token));
+                mock.assert_reads(
+                    "/api/target/service-map",
+                    &[("in_scope_only", "false"), ("max_records", "10000")],
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_row_spans_are_disjoint_half_open_ranges() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        for (product_start, version_start, header_index, valid) in [
+            (1, 7, 0, false),  // Product overlaps the preceding product.
+            (8, 14, 0, false), // Product overlaps the preceding version.
+            (0, 6, 0, false),  // Duplicate source positions are overlapping too.
+            (0, 6, 1, true),   // Distinct response headers have distinct byte bases.
+            (12, 18, 0, true), // A half-open endpoint may touch the next start.
+            (13, 19, 0, true), // Ordinary separated tokens remain valid.
+        ] {
+            let mut payload = technology_evidence_payload();
+            let mut second = technology_observation_payload();
+            second["product_span"] = json!({"start":product_start,"end":product_start+5});
+            second["version_span"] = json!({"start":version_start,"end":version_start+6});
+            second["header_index"] = json!(header_index);
+            payload["row"]["technology_observations"]
+                .as_array_mut()
+                .unwrap()
+                .push(second);
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let result = mock
+                .command_with_code(
+                    &[
+                        "scope",
+                        "service-map-evidence",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        BODY_REFERENCE_TOKEN,
+                    ],
+                    if valid { 0 } else { 5 },
+                )
+                .await;
+            if valid {
+                assert_eq!(result, payload);
+            } else {
+                assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+                assert_eq!(result["error"]["retryable"], false);
+            }
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_token_budget_preserves_partial_results_without_claiming_products(
+    ) {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        for exact_row in [false, true] {
+            let operation = if exact_row {
+                "target.service_map.evidence.get"
+            } else {
+                "target.service_map.get"
+            };
+            let path = if exact_row {
+                "/api/target/service-map/evidence"
+            } else {
+                "/api/target/service-map"
+            };
+            let schema = output_schema(operation);
+            for count in [0, 1, 8] {
+                let mut payload = if exact_row {
+                    technology_evidence_payload()
+                } else {
+                    technology_map_payload()
+                };
+                if exact_row {
+                    payload["row"]["technology_observations"] = json!((0..count)
+                        .map(|index| {
+                            let mut observation = technology_observation_payload();
+                            observation["header_index"] = json!(index);
+                            observation
+                        })
+                        .collect::<Vec<_>>());
+                    payload["row"]["metadata_complete"] = json!(false);
+                    payload["row"]["omitted"] = if count == 8 {
+                        json!([
+                            "technology_token_scan_limit",
+                            "technology_observations_limit"
+                        ])
+                    } else {
+                        json!(["technology_token_scan_limit"])
+                    };
+                } else {
+                    let original = payload["origins"][0]["technology_observations"][0].clone();
+                    payload["origins"][0]["technology_observations"] = json!((0..count)
+                        .map(|index| {
+                            let mut observation = original.clone();
+                            observation["reported_version"] = json!(format!("{}.0", index + 1));
+                            observation
+                        })
+                        .collect::<Vec<_>>());
+                    payload["snapshot"]["complete"] = json!(false);
+                    payload["snapshot"]["stopped_by"] = json!(["technology_token_scan_limit"]);
+                }
+                for call in [false, true] {
+                    *mock.state.payload.lock().unwrap() = payload.clone();
+                    let input = if exact_row {
+                        json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN})
+                    } else {
+                        json!({"session_id":session})
+                    }
+                    .to_string();
+                    let args = if call {
+                        vec!["call", operation, "--input", &input]
+                    } else if exact_row {
+                        vec![
+                            "scope",
+                            "service-map-evidence",
+                            "--session-id",
+                            &session,
+                            "--evidence-id",
+                            BODY_REFERENCE_TOKEN,
+                        ]
+                    } else {
+                        vec!["scope", "service-map", "--session-id", &session]
+                    };
+                    let result = mock.command(&args).await;
+                    let data = if call { &result["data"] } else { &result };
+                    assert_eq!(data, &payload);
+                    assert_schema(data, &schema);
+                    let query = if exact_row {
+                        vec![("evidence_id", BODY_REFERENCE_TOKEN)]
+                    } else {
+                        vec![("in_scope_only", "false"), ("max_records", "10000")]
+                    };
+                    mock.assert_reads(path, &query);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_token_budget_rejects_invalid_limits_and_false_completeness() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let mut invalid_maps = Vec::new();
+        for value in [
+            json!(0),
+            json!(127),
+            json!(129),
+            Value::Null,
+            json!("SYNTHETIC_PRIVATE_VALUE"),
+        ] {
+            let mut payload = technology_map_payload();
+            payload["snapshot"]["limits"]["technology_token_candidates_per_row"] = value;
+            invalid_maps.push(payload);
+        }
+        let mut payload = technology_map_payload();
+        payload["origins"][0]["technology_observations"] = json!([]);
+        payload["snapshot"]["stopped_by"] = json!(["technology_token_scan_limit"]);
+        invalid_maps.push(payload);
+        for payload in invalid_maps {
+            *mock.state.payload.lock().unwrap() = payload;
+            let result = mock
+                .command_with_code(&["scope", "service-map", "--session-id", &session], 5)
+                .await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map",
+                &[("in_scope_only", "false"), ("max_records", "10000")],
+            );
+        }
+        for absent in [false, true] {
+            let mut payload = technology_evidence_payload();
+            if absent {
+                payload["row"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("technology_observations");
+            } else {
+                payload["row"]["technology_observations"] = json!([]);
+            }
+            payload["row"]["omitted"] = json!(["technology_token_scan_limit"]);
+            *mock.state.payload.lock().unwrap() = payload;
+            let input =
+                json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN}).to_string();
+            let result = mock
+                .command_with_code(
+                    &["call", "target.service_map.evidence.get", "--input", &input],
+                    5,
+                )
+                .await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            mock.assert_reads(
+                "/api/target/service-map/evidence",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+        // The parser-work budget is independent of the observation cap. It
+        // cannot justify reporting that eight observations were retained.
+        let mut payload = technology_evidence_payload();
+        payload["row"]["technology_observations"] = json!([]);
+        payload["row"]["metadata_complete"] = json!(false);
+        payload["row"]["omitted"] = json!([
+            "technology_token_scan_limit",
+            "technology_observations_limit"
+        ]);
+        *mock.state.payload.lock().unwrap() = payload;
+        let result = mock
+            .command_with_code(
+                &[
+                    "scope",
+                    "service-map-evidence",
+                    "--session-id",
+                    &session,
+                    "--evidence-id",
+                    BODY_REFERENCE_TOKEN,
+                ],
+                5,
+            )
+            .await;
+        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+        mock.assert_reads(
+            "/api/target/service-map/evidence",
+            &[("evidence_id", BODY_REFERENCE_TOKEN)],
+        );
+        // Intermediate servers may omit the new cap while exposing observations.
+        let mut payload = technology_map_payload();
+        payload["snapshot"]["limits"]
+            .as_object_mut()
+            .unwrap()
+            .remove("technology_token_candidates_per_row");
+        *mock.state.payload.lock().unwrap() = payload.clone();
+        let result = mock
+            .command(&["scope", "service-map", "--session-id", &session])
+            .await;
+        assert_eq!(result, payload);
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+    }
+
+    fn technology_map_at_cap(total: usize) -> Value {
+        let mut payload = technology_map_payload();
+        let original = payload["origins"][0].clone();
+        let mut origins = Vec::new();
+        let mut rows = 0usize;
+        let mut remaining = total;
+        while remaining > 0 {
+            let count = remaining.min(32);
+            let index = origins.len();
+            let mut origin = original.clone();
+            let host = format!("origin-{index}.example.com");
+            origin["origin"] = json!(format!("https://{host}"));
+            origin["host"] = json!(host);
+            let row_count = count.div_ceil(8);
+            rows += row_count;
+            origin["request_count"] = json!(row_count);
+            origin["endpoints"][0]["request_count"] = json!(row_count);
+            let token =
+                BODY_REFERENCE_TOKEN.replace("9007199254740993", &(index * 4 + 1).to_string());
+            for field in ["endpoints", "technology_clues", "redirects", "header_links"] {
+                origin[field][0]["evidence"] = json!([token]);
+            }
+            origin["technology_observations"] = json!((0..count)
+                .map(|item| {
+                    let mut observation = original["technology_observations"][0].clone();
+                    observation["reported_version"] = json!(format!("{}.0", item + 1));
+                    observation["evidence"] = json!([BODY_REFERENCE_TOKEN
+                        .replace("9007199254740993", &(index * 4 + item / 8 + 1).to_string())]);
+                    observation
+                })
+                .collect::<Vec<_>>());
+            origins.push(origin);
+            remaining -= count;
+        }
+        payload["snapshot"]["origin_count"] = json!(origins.len());
+        payload["snapshot"]["endpoint_count"] = json!(origins.len());
+        for field in [
+            "retained_rows",
+            "considered_rows",
+            "projected_rows",
+            "included_rows",
+        ] {
+            payload["snapshot"][field] = json!(rows);
+        }
+        payload["origins"] = json!(origins);
+        payload
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_technology_global_budget_and_origin_binding_fail_closed() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        for (total, valid) in [(32, true), (2000, true), (2001, false)] {
+            let mut payload = technology_map_at_cap(total);
+            if valid {
+                payload["snapshot"]["complete"] = json!(false);
+                payload["snapshot"]["stopped_by"] = json!([if total == 32 {
+                    "technology_observations_per_origin_limit"
+                } else {
+                    "technology_observations_map_limit"
+                }]);
+            }
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let result = mock
+                .command_with_code(
+                    &["scope", "service-map", "--session-id", &session],
+                    if valid { 0 } else { 5 },
+                )
+                .await;
+            if valid {
+                assert_eq!(result, payload);
+            } else {
+                assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+            }
+            mock.assert_reads(
+                "/api/target/service-map",
+                &[("in_scope_only", "false"), ("max_records", "10000")],
+            );
+        }
+        let mut payload = technology_map_at_cap(40);
+        let token = payload["origins"][0]["technology_observations"][0]["evidence"][0].clone();
+        payload["origins"][1]["technology_observations"][0]["evidence"] = json!([token]);
+        *mock.state.payload.lock().unwrap() = payload;
+        let result = mock
+            .command_with_code(&["scope", "service-map", "--session-id", &session], 5)
+            .await;
+        assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+        mock.assert_reads(
+            "/api/target/service-map",
+            &[("in_scope_only", "false"), ("max_records", "10000")],
+        );
+    }
+
     const BODY_REFERENCE_TOKEN: &str = "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000";
 
     fn peer_evidence_payload(status: &str, ip: &str, route: &str) -> Value {

@@ -10,8 +10,17 @@ create a persistent graph or change the active session.
 
 Scope keeps four views: Rules, Service Map, APIs, and Paths. Service Map uses a
 stable card layout with origin search, scope filtering, viewport scrolling, and
-an APIs/Evidence inspector. There is no force layout, drag editing, or pan/zoom
-engine in this version. The renderer is separate from metadata normalization and
+an APIs/Evidence inspector. Compact 220×104px cards at the default 12px Display
+text size share their geometry with all arrow attachments. Larger Display text
+grows card height and row spacing together (146px cards at 20px), retaining
+legible line boxes, aligned arrows, selection, and the chosen zoom. Fit, minus, the percentage/reset button, and plus scale
+only the graph from 10% to 200%; the inspector and Scope navigation retain their
+normal size. Fit is a one-shot action for the displayed cards, bounded by those
+scale limits. Polling and resizing never refit or change the chosen zoom. Plus
+and minus preserve the viewport center where scroll bounds allow. With the map
+viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. Zooming is
+local and preserves selection, exact-source reads, and temporary body overlays.
+There is no force layout or drag editing in this version. The renderer is separate from metadata normalization and
 layout calculation so it can be replaced without changing the read contract.
 The navigation strip follows the existing compact Capture-tab sizing. Long
 origin, method, and path previews stay bounded; their full text remains available
@@ -137,6 +146,104 @@ are never read to build or refresh the map or its metadata evidence. A separate,
 explicit one-row retained-preview read is described below. It does not enrich the
 default inventory automatically. Do not fill unavailable gaps using hostname
 guesses or present them as collected evidence.
+
+## Reported header products and versions
+
+New servers add optional `technology_observations` arrays beside the unchanged
+legacy `technology_clues`, both on observed origins and exact evidence rows.
+An absent extension means the server does not supply this contract; an empty
+array means no supported literal declaration was retained in that projection.
+The map's `schema_version` remains 1. Existing clients may ignore the extension;
+new clients must continue to accept older responses without it.
+
+These observations read only response headers already retained with the row.
+They do not read a body, send a request, enable collection, change scope or
+settings, resolve DNS, infer an address or TLS identity, or assess vulnerabilities.
+Headers can be spoofed, stale, suppressed, or supplied by an intermediary.
+Treat a numeric version as a **reported version**, never a verified installation
+or an authoritative current version. Catalog categories such as `web_server`,
+`application_server`, `language_runtime`, `edge_service`, `cms`, `connector`, and
+`unknown` are product labels, not observed physical WEB/WAS or backend roles.
+
+The fixed header/product allowlist is:
+
+- `Server`: nginx, Apache, Caddy, Cloudflare, Microsoft-IIS, Envoy, PHP, Jetty,
+  Apache-Coyote, and the literal two-word declaration Apache Tomcat
+- `X-Powered-By`: PHP, Express, and ASP.NET, at the beginning of the value
+- `X-Generator`: WordPress and Drupal, at the beginning of the value
+
+Matching is ASCII case-insensitive, with complete product-name boundaries.
+`Server` can supply several whitespace-separated products. Nested and escaped
+HTTP comments are skipped, including product-like words inside them. A product
+concatenated directly after a comment or `Jetty(...)` is not promoted into an
+additional observation. Arbitrary header names, unknown products, hostnames,
+body strings, and product-name substrings are not evidence. The legacy clues
+still use their original leading-product extraction; a new observation need
+not have a matching legacy clue.
+
+Versions use `/` after the product, `Jetty(version)`, or whitespace after a
+supported `X-Generator` product. Only a complete nonempty ASCII numeric token
+or dot-separated numeric components is accepted, at most 32 UTF-8 bytes.
+Suffixes such as `1.2-custom`, `9.4.51.v20230217`, arbitrary strings, empty
+components, and overlong values never become a shortened numeric version.
+The explicit `version_status` is:
+
+- `reported`: `reported_version` contains the complete accepted numeric value
+- `not_reported`: the supported literal declaration has no version separator
+- `unsupported_format`: a declared version does not fit the supported grammar;
+  `reported_version` is null, and no rejected text is returned
+- `non_product_version`: a numeric Apache-Coyote connector declaration is not an
+  installed product version; `reported_version` is null
+
+In particular, `Apache-Coyote/1.1` means an Apache-Coyote connector declaration.
+It never becomes Tomcat 1.1. Only a literal Apache Tomcat declaration produces
+the `apache_tomcat` catalog entry. Unsupported Jetty release suffixes are explicit
+unsupported formats, not silently reduced to a numeric prefix.
+
+Each exact-row observation includes stable `product_id`, `name`,
+`catalog_category`, nullable `reported_version`, `version_status`, fixed
+`source: "response_header"` and `strength: "literal_declaration"`, lowercase
+`header_name`, and a fixed allowlisted `rule_id`. Its zero-based `header_index`
+addresses the original retained response-header array, including unrelated and
+duplicate headers. `product_span` and nullable `version_span` have integer
+`start` and exclusive `end` positions with
+`offset_basis: "retained_header_value_utf8"`. These are byte offsets into the
+original retained value, including leading whitespace and Unicode comments,
+not character positions, normalized values, or original wire bytes. Only
+accepted reported versions have a version span. Raw headers, comments, snippets,
+unrecognized tokens, and rejected version strings are never returned.
+
+Origin observations aggregate by product, header name, reported version, and
+version status. Each has `row_count`, `first_seen`, `last_seen`, and up to three
+exact evidence tokens. Repeated identical declarations within one row count
+once; separate retained rows count separately even when transaction UUIDs repeat.
+The timestamps are the minimum and maximum start times of contributing rows.
+Conflicting versions remain separate entries. Sorting does not choose a highest,
+newest, or authoritative version. Use an entry's exact evidence token to inspect
+its retained source row under the normal freshness checks below.
+
+The optional limit fields are `technology_observations_per_row: 8`,
+`technology_observations_per_origin: 32`, `technology_observations: 2000`, and
+`technology_version_bytes: 32`, plus `technology_token_candidates_per_row: 128`.
+The token-work budget is shared across the eligible response headers in one row.
+Product candidates, unknown or malformed tokens, and comments all consume it;
+whitespace does not. One complete product declaration includes its attached
+version, and a nested HTTP comment is one comment candidate. An unseparated
+malformed suffix after a comment or `Jetty(...)` is a separate candidate to skip,
+never a new product. Candidates are not shortened to fit a remaining budget.
+Exactly 128 inspected candidates at the end is complete; a further uninspected
+candidate adds `technology_token_scan_limit` to row `omitted` and map
+`snapshot.stopped_by`. A partial row can therefore contain zero observations.
+This work cap does not stop the existing legacy clue or redirect-header scan.
+The existing combined 128-header, 32-KiB
+header-byte, 4-KiB header-value, and 8-MiB metadata-projection budgets still apply.
+Excess row observations add `technology_observations_limit` to row `omitted`
+and map `snapshot.stopped_by`. Origin/map tuple caps report
+`technology_observations_per_origin_limit` or `technology_observations_map_limit`
+in `stopped_by`. Counts and times for retained tuples continue updating after
+aggregate caps; other map metadata continues projecting. Counts still cover
+only bounded projected observations, so row/token/header/window omissions must remain
+visible. No automatic larger scan follows a partial result.
 
 ## Completeness and freshness
 

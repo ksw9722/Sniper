@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../web/service-map.js'), 'utf8');
-const context = vm.createContext({ URL, URLSearchParams, AbortController, console });
+const resizeObservers = [];
+const context = vm.createContext({ URL, URLSearchParams, AbortController, console, getComputedStyle: element => ({ getPropertyValue: name => element.style.values[name] || "" }), ResizeObserver: class { constructor(callback) { this.callback = callback; resizeObservers.push(this); } observe(element) { this.element = element; } } });
 vm.runInContext(source, context);
 const map = context.SniperServiceMap;
 const originA = 'https://app.example.com';
@@ -25,7 +26,8 @@ function node() {
   const handlers = new Map(), classes = new Set();
   let html = '', replacements = 0;
   return {
-    value: '', checked: false, disabled: false, dataset: {}, attributes: {}, textContent: '', scrollTop: 0,
+    value: '', checked: false, disabled: false, dataset: {}, attributes: {}, textContent: '', scrollTop: 0, scrollLeft: 0, clientWidth: 0, clientHeight: 0,
+    style: { values: {}, setProperty(name, value) { this.values[name] = value; } },
     classList: { toggle(name, value) { if (value) classes.add(name); else classes.delete(name); }, contains: name => classes.has(name) },
     setAttribute(name, value) { this.attributes[name] = value; },
     addEventListener(name, callback) { handlers.set(name, callback); },
@@ -38,8 +40,10 @@ function node() {
 function fixture() {
   let session = 'session-one';
   const requests = [];
-  const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus'].map(name => [name, node()]));
-  const document = { activeElement: null, body: {}, querySelector: () => null };
+  const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
+  els.viewport.clientWidth = 620; els.viewport.clientHeight = 500;
+  const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
+  document.documentElement.style.setProperty("--ui-root-size", "12px");
   const controller = map.createController({ elements: els, getSessionId: () => session, document, request(url, options) { const pending = deferred(); requests.push({ url, options, ...pending }); return pending.promise; } });
   controller.setVisible(true);
   return { controller, els, requests, document, state: controller.getState(), setSession(value) { session = value; }, async load(payload = snapshot()) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
@@ -1385,10 +1389,10 @@ test('opposite-direction metadata and body links use seven bounded, non-overpain
   assert.equal(layout.edges.length, 7);
   const offsets = layout.edges.map(edge => {
     const source = layout.nodes.find(node => node.origin === edge.source);
-    return Number(edge.path.match(/^M [-\d.]+ ([-\d.]+)/)[1]) - source.y - 72;
+    return Number(edge.path.match(/^M [-\d.]+ ([-\d.]+)/)[1]) - source.y - map.GRAPH_GEOMETRY.cardHeight / 2;
   });
   assert.equal(new Set(offsets).size, 7);
-  assert.ok(offsets.every(value => Math.abs(value) <= 36));
+  assert.ok(offsets.every(value => Math.abs(value) <= map.GRAPH_GEOMETRY.cardHeight * 0.3 + 0.001));
   assert.equal(layout.edges.filter(edge => edge.source === originA).length, 4);
   assert.equal(layout.edges.filter(edge => edge.source === originB).length, 3);
 });
@@ -1408,10 +1412,10 @@ test('overlay direct star keeps the pinned source opposite every incoming and ou
 });
 
 function assertFixedCanvasContainsGeometry(layout) {
-  assert.equal(layout.width, 720, 'loop routing must not enlarge the horizontal scroll surface');
+  assert.equal(layout.width, 568, 'loop routing must not enlarge the compact horizontal scroll surface');
   for (const node of layout.nodes) {
-    assert.ok(node.x >= 0 && node.x + 276 <= layout.width);
-    assert.ok(node.y >= 0 && node.y + 160 <= layout.height);
+    assert.ok(node.x >= 0 && node.x + map.GRAPH_GEOMETRY.cardWidth <= layout.width);
+    assert.ok(node.y >= 0 && node.y + map.GRAPH_GEOMETRY.cardHeight <= layout.height);
   }
   for (const edge of layout.edges) {
     const points = edge.path.match(/-?\d+(?:\.\d+)?/g).map(Number);
@@ -1510,4 +1514,531 @@ test('nested evidence observations retain only display fields while exact row id
   const substituted = f.controller.loadEvidence('evidence-one'); value.row.path = '/another-row';
   f.requests.at(-1).resolve(response(value)); assert.equal(await substituted, false);
   assert.equal(f.state.evidence, null); assert.match(f.els.detail.innerHTML, /Source unavailable/);
+});
+
+// Strict header-only extension contracts. These fixtures contain catalog
+// metadata and byte positions, never raw response headers or retained bodies.
+const technologySession = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const technologyGeneration = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const technologyRevision = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const technologyTime = '2026-10-12T01:00:00Z';
+const technologyLast = '2026-10-12T02:00:00Z';
+const technologyToken = (sequence = '1') => `v1.${technologySession}.${technologyGeneration}.${sequence}.${technologyRevision}.${recordId}`;
+const technologyProducts = [
+  ['nginx', 'nginx', 'web_server', 'nginx', 'server'],
+  ['apache_http_server', 'Apache', 'web_server', 'Apache', 'server'],
+  ['caddy', 'Caddy', 'web_server', 'Caddy', 'server'],
+  ['cloudflare', 'Cloudflare', 'edge_service', 'Cloudflare', 'server'],
+  ['microsoft_iis', 'Microsoft IIS', 'web_server', 'Microsoft-IIS', 'server'],
+  ['envoy', 'Envoy', 'edge_service', 'Envoy', 'server'],
+  ['php', 'PHP', 'language_runtime', 'PHP', 'server'],
+  ['jetty', 'Jetty', 'application_server', 'Jetty', 'server'],
+  ['apache_coyote', 'Apache-Coyote', 'connector', 'Apache-Coyote', 'server'],
+  ['apache_tomcat', 'Apache Tomcat', 'application_server', 'Apache Tomcat', 'server'],
+  ['php', 'PHP', 'language_runtime', 'PHP', 'x-powered-by'],
+  ['express', 'Express', 'application_framework', 'Express', 'x-powered-by'],
+  ['asp_net', 'ASP.NET', 'application_framework', 'ASP.NET', 'x-powered-by'],
+  ['wordpress', 'WordPress', 'cms', 'WordPress', 'x-generator'],
+  ['drupal', 'Drupal', 'cms', 'Drupal', 'x-generator'],
+];
+function technologyRow(product = technologyProducts[0], version = '1.26.2', patch = {}) {
+  const [product_id, name, catalog_category, literal, header_name] = product;
+  return { product_id, name, catalog_category, reported_version: version, version_status: version === null ? 'not_reported' : 'reported', source: 'response_header', strength: 'literal_declaration', header_name, header_index: 0,
+    product_span: { start: 0, end: literal.length }, version_span: version === null ? null : { start: literal.length + 1, end: literal.length + 1 + version.length }, offset_basis: 'retained_header_value_utf8', rule_id: `${header_name.replaceAll('-', '_')}.${product_id}.v1`, ...patch };
+}
+function technologyAggregate(row = technologyRow(), patch = {}) {
+  const { header_index, product_span, version_span, offset_basis, rule_id, ...base } = row;
+  return { ...base, row_count: 1, first_seen: technologyTime, last_seen: technologyTime, evidence: [technologyToken()], ...patch };
+}
+function technologySnapshot(items = [technologyAggregate()]) {
+  const item = { ...origin(originA, [endpoint('/users', 'GET', technologyToken())]), first_seen: technologyTime, last_seen: technologyLast, technology_observations: items };
+  return snapshot([item], technologySession, { generation: technologyGeneration });
+}
+function technologyEvidence(items = [technologyRow()], id = technologyToken()) {
+  const value = evidence(id, originA, { session_id: technologySession });
+  Object.assign(value.row, { sequence: id.split('.')[3], technology_observations: items });
+  return value;
+}
+async function technologyFixture(payload = technologySnapshot()) {
+  const f = fixture(); f.setSession(technologySession); await f.load(payload); return f;
+}
+async function resolveTechnologySource(f, value = technologyEvidence()) {
+  const pending = f.controller.loadEvidence(value.evidence_id); f.requests.at(-1).resolve(response(value)); return pending;
+}
+
+test('old-server absence and new empty technology arrays remain independently compatible with legacy clues', async () => {
+  const f = fixture(); const value = snapshot(); value.origins[0].technology_clues = [{ name: 'nginx', header_name: 'server', source: 'response_header', confidence: 'observed_header', evidence: ['evidence-one'] }];
+  await f.load(value); f.controller.selectOrigin(originA);
+  assert.equal(f.state.snapshot.origins[0].technology_observations.length, 0);
+  const pending = f.controller.loadEvidence('evidence-one'); f.requests.at(-1).resolve(response(evidence())); assert.equal(await pending, true);
+  assert.equal(f.state.evidence.technology_observations.length, 0); assert.match(f.els.detail.innerHTML, /Observed header clues/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Header-reported technologies|Reported version/);
+  value.origins[0].technology_observations = []; await f.load(value);
+  assert.equal(f.state.snapshot.origins[0].technology_observations.length, 0);
+});
+
+test('all exact catalog products, both PHP headers and complete numeric versions normalize without product invention', () => {
+  for (const product of technologyProducts) {
+    const row = technologyRow(product, product[0] === 'apache_coyote' ? null : '10.2.003');
+    const parsed = map.normalizeRowTechnologies([row]);
+    assert.equal(JSON.stringify(parsed[0]), JSON.stringify(row));
+    assert.equal(map.normalizeSnapshot(technologySnapshot([technologyAggregate(row)]), technologySession).origins[0].technology_observations[0].product_id, product[0]);
+  }
+  for (const version of ['0', '001', '2.4.62', '1'.repeat(32)]) assert.equal(map.normalizeRowTechnologies([technologyRow(undefined, version)])[0].reported_version, version);
+});
+
+test('Apache plus PHP remains two source observations with explicit byte provenance and no inferred stack relationship', async () => {
+  const apache = technologyRow(technologyProducts[1], '2.4.62'), php = technologyRow(technologyProducts[6], '8.3.12', { product_span: { start: 14, end: 17 }, version_span: { start: 18, end: 24 } });
+  const f = await technologyFixture(technologySnapshot([technologyAggregate(apache), technologyAggregate(php)]));
+  assert.match(f.els.detail.innerHTML, /Apache.*Reported version: 2\.4\.62/s); assert.match(f.els.detail.innerHTML, /PHP.*Reported version: 8\.3\.12/s);
+  assert.match(f.els.detail.innerHTML, /Catalog: Web server/); assert.match(f.els.detail.innerHTML, /Catalog: Language runtime/);
+  assert.equal(f.requests.length, 1); assert.equal(await resolveTechnologySource(f, technologyEvidence([apache, php])), true);
+  assert.match(f.els.detail.innerHTML, /UTF-8 product bytes 14–17 · Version bytes 18–24/);
+  assert.match(f.els.detail.innerHTML, /Response header index 0 \(zero-based\)/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /WEB.?→.?WAS|vulnerable|raw_header|<a\b|href=/);
+  assert.equal(f.requests.length, 2); assert.doesNotMatch(f.requests.map(r => r.url).join(' '), /body-references|transactions|replay|scan|capture/);
+});
+
+test('conflicting versions stay separate with per-observation source/time and exact View source navigation', async () => {
+  const first = technologyAggregate(technologyRow(undefined, '1.24.0'));
+  const second = technologyAggregate(technologyRow(undefined, '1.26.2'), { first_seen: technologyLast, last_seen: technologyLast, evidence: [technologyToken('2')] });
+  const f = await technologyFixture(technologySnapshot([first, second]));
+  assert.equal(f.state.snapshot.origins[0].technology_observations.length, 2);
+  assert.match(f.els.detail.innerHTML, /Reported version: 1\.24\.0/); assert.match(f.els.detail.innerHTML, /Reported version: 1\.26\.2/);
+  assert.match(f.els.detail.innerHTML, /First: 2026-10-12T02:00:00Z/);
+  assert.match(f.els.detail.innerHTML, /Source: server response header/);
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceRelationOrigin: originA, serviceRelationEvidence: technologyToken('2') } }) } });
+  assert.equal(f.requests.length, 2); assert.equal(new URL(f.requests.at(-1).url, originA).searchParams.get('evidence_id'), technologyToken('2'));
+  f.requests.at(-1).resolve(response(technologyEvidence([technologyRow()], technologyToken('2')))); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.evidence.sequence, '2'); assert.equal(f.state.detailTab, 'evidence');
+  assert.equal(f.state.snapshot.origins[0].technology_observations.length, 2);
+  assert.doesNotMatch(f.requests.map(r => r.url).join(' '), /body-references|transactions/);
+});
+
+for (const [status, product, expected] of [
+  ['not_reported', technologyProducts[0], 'unknown (not reported)'],
+  ['unsupported_format', technologyProducts[0], 'unknown (unsupported format)'],
+  ['non_product_version', technologyProducts[8], 'unknown (non-product version)'],
+]) test(`reported-version status is honest in aggregate and exact source: ${status}`, async () => {
+  const row = technologyRow(product, null, { version_status: status });
+  const f = await technologyFixture(technologySnapshot([technologyAggregate(row)]));
+  assert.ok(f.els.detail.innerHTML.includes(expected));
+  assert.equal(await resolveTechnologySource(f, technologyEvidence([row])), true);
+  assert.ok(f.els.detail.innerHTML.includes(expected)); assert.equal(f.state.evidence.technology_observations[0].reported_version, null);
+});
+
+test('Unicode prefixes use retained UTF-8 byte offsets and header index rather than JS character positions', () => {
+  const prefixBytes = Buffer.byteLength('é 🛰 ', 'utf8');
+  const row = technologyRow(undefined, '1.26.2', { header_index: 127, product_span: { start: prefixBytes, end: prefixBytes + 5 }, version_span: { start: prefixBytes + 6, end: prefixBytes + 12 } });
+  const value = map.normalizeRowTechnologies([row])[0];
+  assert.equal(value.product_span.start, 8); assert.equal(value.header_index, 127); assert.equal(value.offset_basis, 'retained_header_value_utf8');
+  assert.equal(JSON.stringify(value).includes('🛰'), false);
+});
+
+test('Jetty parenthesized rule and whitespace-separated generator versions preserve supported span semantics', () => {
+  const jetty = technologyRow(technologyProducts[7], '12.0.9', { rule_id: 'server.jetty_parenthesized.v1' });
+  const generator = technologyRow(technologyProducts[13], '6.6', { header_index: 1, product_span: { start: 8, end: 17 }, version_span: { start: 20, end: 23 } });
+  assert.equal(map.normalizeRowTechnologies([jetty, generator]).length, 2);
+});
+
+const malformedTechnologyRows = [
+  ['null entry', rows => { rows[0] = null; }],
+  ['non-array extension', rows => rows.splice(0)],
+  ['invented product', rows => { rows[0].product_id = 'custom_webserver'; }],
+  ['injected display name', rows => { rows[0].name = '<img src=x onerror=bad>'; }],
+  ['mismatched catalog', rows => { rows[0].catalog_category = 'application_server'; }],
+  ['invented catalog', rows => { rows[0].catalog_category = '__proto__'; }],
+  ['request header source', rows => { rows[0].source = 'request_header'; }],
+  ['inferred strength', rows => { rows[0].strength = 'confirmed'; }],
+  ['unknown status', rows => { rows[0].version_status = 'verified'; }],
+  ['private header name', rows => { rows[0].header_name = 'authorization'; }],
+  ['wrong header case', rows => { rows[0].header_name = 'Server'; }],
+  ['wrong product/header pair', rows => { rows[0].header_name = 'x-generator'; }],
+  ['negative header index', rows => { rows[0].header_index = -1; }],
+  ['excess header index', rows => { rows[0].header_index = 128; }],
+  ['fractional header index', rows => { rows[0].header_index = 1.5; }],
+  ['string header index', rows => { rows[0].header_index = '0'; }],
+  ['negative span', rows => { rows[0].product_span = { start: -1, end: 4 }; }],
+  ['fractional span', rows => { rows[0].product_span = { start: 0.5, end: 5.5 }; }],
+  ['oversized span', rows => { rows[0].product_span = { start: 4092, end: 4097 }; }],
+  ['wrong token length', rows => { rows[0].product_span.end = 6; }],
+  ['empty span', rows => { rows[0].product_span.end = 0; }],
+  ['injected nested span field', rows => { rows[0].product_span.raw_header = 'must-not-publish'; }],
+  ['missing version', rows => { delete rows[0].reported_version; }],
+  ['missing nullable span', rows => { delete rows[0].version_span; }],
+  ['reported null version', rows => { rows[0].reported_version = null; }],
+  ['reported null span', rows => { rows[0].version_span = null; }],
+  ['overlapping version span', rows => { rows[0].version_span = { start: 1, end: 7 }; }],
+  ['non-adjacent server version', rows => { rows[0].version_span = { start: 7, end: 13 }; }],
+  ['wrong version span length', rows => { rows[0].version_span.end += 1; }],
+  ['UTF-16 offset basis', rows => { rows[0].offset_basis = 'utf16'; }],
+  ['arbitrary rule', rows => { rows[0].rule_id = 'body.nginx.v1'; }],
+  ['Jetty rule for nginx', rows => { rows[0].rule_id = 'server.jetty_parenthesized.v1'; }],
+  ['raw header extension', rows => { rows[0].raw_header = 'must-not-publish'; }],
+  ['empty numeric version', rows => { rows[0].reported_version = ''; }],
+  ['truncated suffix version', rows => { rows[0].reported_version = '1.26.2-beta'; }],
+  ['Unicode digits', rows => { rows[0].reported_version = '１.２'; }],
+  ['Unicode payload', rows => { rows[0].reported_version = '1.26.2🛰'; }],
+  ['leading dot', rows => { rows[0].reported_version = '.1.26'; }],
+  ['trailing dot', rows => { rows[0].reported_version = '1.26.'; }],
+  ['empty component', rows => { rows[0].reported_version = '1..26'; }],
+  ['oversized version', rows => { rows[0].reported_version = '1'.repeat(33); rows[0].version_span.end = 39; }],
+  ['status-null mismatch', rows => { rows[0].version_status = 'not_reported'; }],
+  ['Coyote product-version claim', rows => { rows[0] = technologyRow(technologyProducts[8]); }],
+  ['non-product nginx version', rows => { rows[0] = technologyRow(undefined, null, { version_status: 'non_product_version' }); }],
+  ['Jetty parenthesized bare status', rows => { rows[0] = technologyRow(technologyProducts[7], null, { rule_id: 'server.jetty_parenthesized.v1' }); }],
+  ['duplicate source position', rows => { rows.push({ ...rows[0] }); }],
+  ['row observation cap', rows => { rows.splice(0, 1, ...Array.from({ length: 9 }, (_, header_index) => technologyRow(undefined, '1.26.2', { header_index }))); }],
+];
+for (const [name, change] of malformedTechnologyRows) test(`malformed reported technology fails closed before exact source publication: ${name}`, async () => {
+  const f = await technologyFixture(), value = technologyEvidence(); change(value.row.technology_observations);
+  if (name === 'non-array extension') value.row.technology_observations = {};
+  assert.equal(await resolveTechnologySource(f, value), false);
+  assert.equal(f.state.evidence, null); assert.equal(f.state.socketPeer, null); assert.match(f.els.detail.innerHTML, /Source unavailable/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /must-not-publish|<img|Verified retained source|１\.２|1\.26\.2🛰/);
+  assert.equal(await f.controller.loadBodyReferences(), false); assert.equal(f.requests.length, 2);
+});
+
+for (const [name, change] of [
+  ['null extension', value => { value.origins[0].technology_observations = null; }],
+  ['missing nullable version', value => { delete value.origins[0].technology_observations[0].reported_version; }],
+  ['empty evidence', value => { value.origins[0].technology_observations[0].evidence = []; }],
+  ['oversized evidence', value => { value.origins[0].technology_observations[0].evidence = [1, 2, 3, 4].map(i => technologyToken(String(i))); }],
+  ['duplicate evidence', value => { value.origins[0].technology_observations[0].evidence = [technologyToken(), technologyToken()]; value.origins[0].technology_observations[0].row_count = 2; }],
+  ['evidence from other session', value => { value.origins[0].technology_observations[0].evidence = [technologyToken().replace(technologySession, recordId)]; }],
+  ['evidence from other generation', value => { value.origins[0].technology_observations[0].evidence = [technologyToken().replace(technologyGeneration, recordId)]; }],
+  ['oversized sequence', value => { value.origins[0].technology_observations[0].evidence = [technologyToken('18446744073709551616')]; }],
+  ['noncanonical sequence', value => { value.origins[0].technology_observations[0].evidence = [technologyToken('01')]; }],
+  ['injected token', value => { value.origins[0].technology_observations[0].evidence = ['<script>bad</script>']; }],
+  ['zero rows', value => { value.origins[0].technology_observations[0].row_count = 0; }],
+  ['excess rows', value => { value.origins[0].technology_observations[0].row_count = 3; }],
+  ['fractional rows', value => { value.origins[0].technology_observations[0].row_count = 0.5; }],
+  ['inverted observation times', value => { value.origins[0].technology_observations[0].first_seen = technologyLast; }],
+  ['outside origin times', value => { value.origins[0].technology_observations[0].first_seen = '2026-10-11T01:00:00Z'; }],
+  ['injected timestamp', value => { value.origins[0].technology_observations[0].last_seen = '<img onerror=bad>'; }],
+  ['raw header field', value => { value.origins[0].technology_observations[0].raw_header = 'must-not-publish'; }],
+  ['row-only span', value => { value.origins[0].technology_observations[0].product_span = { start: 0, end: 5 }; }],
+  ['duplicate aggregate identity', value => { value.origins[0].technology_observations.push({ ...value.origins[0].technology_observations[0] }); }],
+  ['per-origin cap', value => { value.origins[0].technology_observations = Array.from({ length: 33 }, (_, i) => technologyAggregate(technologyRow(undefined, String(i)))); }],
+]) test(`malformed origin reported technology is rejected before map publication: ${name}`, async () => {
+  const f = await technologyFixture(), previous = f.state.snapshot, payload = technologySnapshot(); change(payload);
+  await f.load(payload); assert.equal(f.state.snapshot, previous); assert.match(f.els.status.textContent, /Refresh failed/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /must-not-publish|<img|<script>/);
+});
+
+test('aggregate extension caps permit 32 per origin and 2000 overall but reject the next observation', () => {
+  const items = Array.from({ length: 32 }, (_, index) => technologyAggregate(technologyRow(undefined, String(index))));
+  const payload = technologySnapshot(items), base = payload.origins[0];
+  payload.origins = Array.from({ length: 63 }, (_, i) => ({ ...base, origin: `https://node${i}.example.com`, endpoints: [], technology_observations: (i === 62 ? items.slice(0, 16) : items).map(item => ({ ...item, evidence: [technologyToken(String(i + 1))] })) }));
+  assert.equal(map.normalizeSnapshot(payload, technologySession).origins.reduce((n, item) => n + item.technology_observations.length, 0), 2000);
+  payload.origins[62].technology_observations = items.slice(0, 17).map(item => ({ ...item, evidence: [technologyToken('63')] }));
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+});
+
+test('row technology cap omission is honest and mandatory metadata completeness remains coherent', async () => {
+  const items = Array.from({ length: 8 }, (_, header_index) => technologyRow(undefined, '1.26.2', { header_index }));
+  const f = await technologyFixture(), value = technologyEvidence(items);
+  value.row.metadata_complete = false; value.row.omitted = ['technology_observations_limit'];
+  assert.equal(await resolveTechnologySource(f, value), true); assert.match(f.els.detail.innerHTML, /technology_observations_limit/);
+  value.row.technology_observations.pop(); assert.equal(await resolveTechnologySource(f, value), false);
+  value.row.technology_observations = []; value.row.omitted = []; assert.equal(await resolveTechnologySource(f, value), false);
+});
+
+test('header evidence polls preserve exact source; observation removal clears it even when another version remains', async () => {
+  const payload = technologySnapshot([technologyAggregate(), technologyAggregate(technologyRow(undefined, '1.24.0'), { evidence: [technologyToken('2')] })]);
+  const f = await technologyFixture(payload);
+  assert.equal(await resolveTechnologySource(f, technologyEvidence([technologyRow(undefined, '1.24.0')], technologyToken('2'))), true);
+  const exact = f.state.evidence, count = f.requests.length, replacements = f.els.detail.replacements;
+  await f.load(payload); assert.equal(f.state.evidence, exact); assert.equal(f.els.detail.replacements, replacements); assert.equal(f.requests.length, count + 1);
+  await f.load(technologySnapshot()); assert.equal(f.state.evidence, null); assert.equal(f.state.evidenceId, null);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source|Reported version: 1\.24\.0/);
+});
+
+for (const transition of ['selection', 'session', 'deletion', 'generation', 'dirty', 'disconnect']) test(`late header evidence cannot republish after ${transition}`, async () => {
+  const payload = technologySnapshot(); payload.origins.push({ ...origin(originB), first_seen: technologyTime, last_seen: technologyLast });
+  const f = await technologyFixture(payload), pending = f.controller.loadEvidence(technologyToken()), request = f.requests.at(-1);
+  if (transition === 'selection') f.controller.selectOrigin(originB);
+  if (transition === 'session') { f.setSession(recordId); f.controller.reset(); }
+  if (transition === 'deletion') { const refresh = f.controller.invalidate(); const empty = technologySnapshot(); empty.origins = []; f.requests.at(-1).resolve(response(empty)); await refresh; }
+  if (transition === 'generation') { const next = technologySnapshot([]); next.snapshot.generation = recordId; await f.load(next); }
+  if (transition === 'dirty') f.controller.markDirty();
+  if (transition === 'disconnect') f.controller.disconnect();
+  request.resolve(response(technologyEvidence())); assert.equal(await pending, false); assert.equal(f.state.evidence, null);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source|UTF-8 product bytes/);
+  assert.equal(f.requests.some(r => /body-references|transactions|replay|scan|capture/.test(r.url)), false);
+});
+
+test('aggregate time windows retain nanosecond precision and reject impossible calendar dates', () => {
+  const payload = technologySnapshot(), item = payload.origins[0].technology_observations[0];
+  payload.origins[0].first_seen = '2026-10-12T01:00:00.000000002Z';
+  item.first_seen = '2026-10-12T01:00:00.000000001Z'; item.last_seen = '2026-10-12T01:00:00.000000003Z';
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+  item.first_seen = '2026-10-12T01:00:00.000000002Z';
+  assert.equal(map.normalizeSnapshot(payload, technologySession).origins[0].technology_observations.length, 1);
+  payload.origins[0].first_seen = '2026-02-01T00:00:00Z'; item.first_seen = '2026-02-30T00:00:00Z';
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+});
+
+test('technology source samples reject distinct revisions of one sequence and sequence reuse across origins', () => {
+  const payload = technologySnapshot(), item = payload.origins[0].technology_observations[0];
+  item.row_count = 2; item.evidence.push(technologyToken().replace(technologyRevision, recordId));
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+  item.evidence.pop();
+  payload.origins.push({ ...payload.origins[0], origin: originB });
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+});
+
+for (const [key, value] of Object.entries({ technology_observations_per_row: 8, technology_observations_per_origin: 32, technology_observations: 2000, technology_version_bytes: 32 })) test(`optional technology limit is verified when present: ${key}`, () => {
+  const payload = technologySnapshot(); payload.snapshot.limits[key] = value;
+  assert.equal(map.normalizeSnapshot(payload, technologySession).origins.length, 1);
+  payload.snapshot.limits[key] = value + 1;
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+});
+
+for (const field of ['revision', 'record']) test(`different aggregate tuples cannot reuse a sequence with a different ${field} token`, () => {
+  const changedToken = field === 'revision' ? technologyToken().replace(technologyRevision, recordId) : technologyToken().replace(recordId, '22222222-2222-4222-8222-222222222222');
+  const payload = technologySnapshot([technologyAggregate(), technologyAggregate(technologyRow(undefined, '1.24.0'), { evidence: [changedToken] })]);
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+  payload.origins[0].technology_observations[1].evidence = [technologyToken()];
+  assert.equal(map.normalizeSnapshot(payload, technologySession).origins[0].technology_observations.length, 2);
+});
+
+for (const collection of ['endpoints', 'technology_clues', 'redirects', 'header_links']) test(`new header observations retain exact token identity with legacy ${collection} sources`, () => {
+  const payload = technologySnapshot(), item = payload.origins[0];
+  item[collection] = [{ evidence: [technologyToken().replace(technologyRevision, recordId)] }];
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+});
+
+test('one retained response header index cannot claim multiple header names while multi-product Server remains valid', () => {
+  const first = technologyRow();
+  const second = technologyRow(technologyProducts[10], '8.3', { product_span: { start: 14, end: 17 }, version_span: { start: 18, end: 21 } });
+  assert.throws(() => map.normalizeRowTechnologies([first, second]), /Invalid retained technology observations/);
+  second.header_name = 'server'; second.rule_id = 'server.php.v1';
+  assert.equal(map.normalizeRowTechnologies([first, second]).length, 2);
+});
+
+test('nonidentical product and version spans cannot overlap within one retained header value', () => {
+  const nginx = technologyRow();
+  for (const start of [3, 8]) {
+    const php = technologyRow(technologyProducts[6], '8.3', { product_span: { start, end: start + 3 }, version_span: { start: start + 4, end: start + 7 } });
+    assert.throws(() => map.normalizeRowTechnologies([nginx, php]), /Invalid retained technology observations/);
+  }
+  const wordpress = technologyRow(technologyProducts[13], '6.6', { version_span: { start: 20, end: 23 } });
+  const drupal = technologyRow(technologyProducts[14], '9.1', { product_span: { start: 10, end: 16 }, version_span: { start: 21, end: 24 } });
+  assert.throws(() => map.normalizeRowTechnologies([wordpress, drupal]), /Invalid retained technology observations/);
+  drupal.product_span = { start: 9, end: 15 }; drupal.version_span = { start: 23, end: 26 };
+  assert.equal(map.normalizeRowTechnologies([wordpress, drupal]).length, 2, 'half-open ranges may share endpoints');
+  drupal.header_index = 1; drupal.product_span = { start: 0, end: 6 }; drupal.version_span = { start: 7, end: 10 };
+  assert.equal(map.normalizeRowTechnologies([wordpress, drupal]).length, 2, 'different header values have independent byte ranges');
+});
+
+
+test('compact cards and arrow attachments share geometry at every scale', async () => {
+  const f = fixture(), a = origin(originA), b = origin(originB);
+  a.redirects = [redirect(originB)]; await f.load(snapshot([a, b]));
+  const geometry = map.GRAPH_GEOMETRY;
+  assert.equal(geometry.cardWidth, 220); assert.equal(geometry.cardHeight, 104);
+  assert.equal(geometry.rowPitch, 124); assert.equal(geometry.columnPitch, 300);
+  const layout = map.graphLayout(f.state.snapshot.origins, f.state.order);
+  assertFixedCanvasContainsGeometry(layout);
+  const points = layout.edges[0].path.match(/-?\d+(?:\.\d+)?/g).map(Number);
+  const from = layout.nodes.find(node => node.origin === originA), to = layout.nodes.find(node => node.origin === originB);
+  assert.equal(points[0], from.x + geometry.cardWidth); assert.equal(points[1], from.y + geometry.cardHeight / 2);
+  assert.equal(points[6], to.x); assert.equal(points[7], to.y + geometry.cardHeight / 2);
+  assert.match(f.els.canvas.innerHTML, /--service-map-card-width:220px;--service-map-card-height:104px/);
+  for (const scale of [0.1, 0.5, 1, 2]) {
+    f.controller.setZoom(scale);
+    assert.equal(f.els.canvas.style.values['--service-map-scaled-width'], `${layout.width * scale}px`);
+    assert.equal(f.els.canvas.style.values['--service-map-scaled-height'], `${layout.height * scale}px`);
+    assert.equal(f.els.canvas.style.values['--service-map-scale'], String(scale));
+  }
+});
+
+test('zoom and Fit never replace graph or inspector, alter selection, abort evidence, or issue reads', async () => {
+  const f = fixture(); await f.load(); f.controller.selectOrigin(originA, 0);
+  const pending = f.controller.loadEvidence('evidence-one'), read = f.requests.at(-1);
+  const before = { canvas: f.els.canvas.replacements, detail: f.els.detail.replacements, slots: JSON.stringify([...f.state.layoutSlots]), requests: f.requests.length, evidenceRequestId: f.state.evidenceRequestId };
+  const focused = { dataset: { serviceFocus: 'origin:synthetic' } }; f.document.activeElement = focused;
+  for (const name of ['zoomOut', 'zoomIn', 'zoomFit', 'zoomReset']) f.els[name].dispatch('click');
+  assert.equal(f.state.selectedOrigin, originA); assert.equal(f.state.endpointIndex, 0);
+  assert.equal(f.state.evidenceRequestId, before.evidenceRequestId); assert.equal(read.options.signal.aborted, false);
+  assert.equal(f.els.canvas.replacements, before.canvas); assert.equal(f.els.detail.replacements, before.detail);
+  assert.equal(f.requests.length, before.requests); assert.equal(JSON.stringify([...f.state.layoutSlots]), before.slots);
+  assert.equal(f.document.activeElement, focused);
+  read.resolve(response(evidence())); await pending; assert.ok(f.state.evidence);
+});
+
+test('zoom preserves pinned overlay, native inspector state, and an in-flight body read', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f); clickOverlay(f);
+  const overlay = f.state.bodyReferenceOverlay, view = nativeInspectorModel(f);
+  view().limits.open = true; view().body.scrollTop = 180; view().list.scrollTop = 80;
+  f.document.activeElement = view().summary;
+  const pending = f.controller.loadBodyReferences(), read = f.requests.at(-1);
+  const requestCount = f.requests.length, generation = f.state.bodyReferencesRequestId, inspector = f.els.detail.replacements;
+  f.controller.setZoom(0.6); f.controller.fitGraph(); f.controller.setZoom(1);
+  assert.equal(f.state.bodyReferenceOverlay, overlay); assert.equal(f.state.anchorOrigin, originA);
+  assert.equal(f.state.bodyReferencesRequestId, generation); assert.equal(read.options.signal.aborted, false);
+  assert.equal(f.els.detail.replacements, inspector); assert.equal(f.requests.length, requestCount);
+  assert.equal(view().limits.open, true); assert.equal(view().body.scrollTop, 180);
+  read.resolve(response(bodyReferences())); await pending;
+  assert.equal(f.state.bodyReferenceOverlay, overlay); assert.ok(f.state.bodyReferences);
+});
+
+test('plus and minus preserve the viewport center with bounded scale and reset', async () => {
+  const f = fixture(); await f.load(snapshot(Array.from({ length: 24 }, (_, i) => origin(`https://node${i}.example.com`))));
+  f.els.viewport.clientWidth = 300; f.els.viewport.clientHeight = 300;
+  f.els.viewport.scrollLeft = 120; f.els.viewport.scrollTop = 480;
+  f.els.zoomIn.dispatch('click'); assert.equal(f.state.zoomScale, 1.1);
+  assert.ok(Math.abs(f.els.viewport.scrollLeft - 147) < 0.001);
+  assert.ok(Math.abs(f.els.viewport.scrollTop - 543) < 0.001);
+  f.els.zoomOut.dispatch('click'); assert.equal(f.state.zoomScale, 1);
+  assert.ok(Math.abs(f.els.viewport.scrollLeft - 120) < 0.001);
+  assert.ok(Math.abs(f.els.viewport.scrollTop - 480) < 0.001);
+  f.controller.setZoom(99); assert.equal(f.state.zoomScale, 2); assert.equal(f.els.zoomIn.disabled, true);
+  f.controller.setZoom(-10); assert.equal(f.state.zoomScale, 0.1); assert.equal(f.els.zoomOut.disabled, true);
+  assert.equal(f.els.viewport.scrollLeft, 0); assert.equal(f.els.viewport.scrollTop, 0);
+  f.els.zoomReset.dispatch('click'); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomReset.textContent, '100%');
+  assert.equal(f.controller.setZoom(NaN), false); assert.equal(f.controller.setZoom(Infinity), false);
+});
+
+test('Fit is safe for empty, one-origin, and dense maps and never changes display caps', async () => {
+  const f = fixture(); await f.load(snapshot([]));
+  assert.equal(f.controller.fitGraph(), false); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomFit.disabled, true);
+  await f.load(snapshot([origin(originA)])); f.controller.fitGraph(); assert.equal(f.state.zoomScale, 1);
+  const nodes = Array.from({ length: 30 }, (_, i) => origin(`https://node${i}.example.com`));
+  nodes.forEach(node => { node.redirects = nodes.filter(other => other !== node).map(other => redirect(other.origin)); });
+  await f.load(snapshot(nodes)); const html = f.els.canvas.innerHTML;
+  f.controller.fitGraph(); assert.ok(f.state.zoomScale >= 0.1 && f.state.zoomScale < 1);
+  assert.equal((html.match(/data-service-origin=/g) || []).length, 24); assert.equal((html.match(/data-relationship=/g) || []).length, 40);
+  assert.ok(Number.parseFloat(f.els.canvas.style.values['--service-map-scaled-width']) <= f.els.viewport.clientWidth);
+  assert.ok(Number.parseFloat(f.els.canvas.style.values['--service-map-scaled-height']) <= f.els.viewport.clientHeight);
+  assert.equal(f.els.canvas.innerHTML, html); assert.match(f.els.graphBounds.textContent, /24 \/ 30.*40 \/ /);
+});
+
+test('zero-size, hidden, and API views cannot change zoom; resize and polling never refit', async () => {
+  const f = fixture(); await f.load(); f.controller.setZoom(0.7);
+  const observer = resizeObservers.at(-1); assert.equal(observer.element, f.els.viewport);
+  f.els.viewport.clientWidth = 0; observer.callback(); assert.equal(f.els.zoomFit.disabled, true);
+  assert.equal(f.controller.fitGraph(), false); assert.equal(f.controller.setZoom(1.5), false);
+  f.els.viewport.clientWidth = 350; observer.callback(); assert.equal(f.els.zoomFit.disabled, false); assert.equal(f.state.zoomScale, 0.7);
+  f.controller.setVisible(false); assert.equal(f.controller.setZoom(1.5), false);
+  f.controller.setVisible(true, 'apis'); assert.equal(f.controller.fitGraph(), false); assert.equal(f.els.zoomControls.classList.contains('hidden'), true);
+  f.controller.setVisible(true, 'service-map'); assert.equal(f.state.zoomScale, 0.7);
+  const count = f.requests.length, replacements = f.els.canvas.replacements;
+  await f.load(); assert.equal(f.state.zoomScale, 0.7); assert.equal(f.requests.length, count + 1);
+  assert.equal(f.els.canvas.replacements, replacements);
+  f.els.viewport.clientHeight = 0; observer.callback(); assert.equal(f.controller.setZoom(1), false);
+  f.els.viewport.clientHeight = 800; observer.callback(); assert.equal(f.state.zoomScale, 0.7);
+  f.setSession('session-two'); f.controller.reset(); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomFit.disabled, true);
+});
+
+test('map keyboard shortcuts are local and accessible toolbar controls use native buttons', async () => {
+  const f = fixture(); await f.load(); let prevented = 0;
+  const press = (key, extra = {}) => f.els.viewport.dispatch('keydown', { key, preventDefault() { prevented++; }, ...extra });
+  press('+'); assert.equal(f.state.zoomScale, 1.1); press('-'); assert.equal(f.state.zoomScale, 1);
+  press('='); assert.equal(f.state.zoomScale, 1.1); press('0'); assert.equal(f.state.zoomScale, 1);
+  press('F'); assert.equal(f.state.zoomScale, 1); assert.equal(prevented, 5);
+  for (const extra of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { target: f.els.search }]) press('+', extra);
+  press('ArrowDown'); assert.equal(prevented, 5); assert.equal(f.requests.length, 1);
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  for (const id of ['serviceMapZoomFit', 'serviceMapZoomOut', 'serviceMapZoomReset', 'serviceMapZoomIn']) assert.match(html, new RegExp(`<button[^>]+id="${id}"[^>]+type="button"`));
+  assert.match(html, /id="serviceMapViewport" tabindex="0" aria-label=/);
+});
+
+
+test('display text geometry keeps compact defaults and grows card, pitch, and arrows together at 20px', () => {
+  const base = map.graphGeometry(12), large = map.graphGeometry(20);
+  assert.equal(base.cardHeight, 104); assert.equal(base.rowPitch, 124);
+  assert.equal(large.cardWidth, 220); assert.equal(large.cardHeight, 146); assert.equal(large.rowPitch, 166);
+  for (const size of [8, 12, 14, 16, 18, 20]) {
+    const geometry = map.graphGeometry(size), title = Math.max(10, size - 1), small = Math.max(9, size - 2);
+    assert.ok(geometry.cardHeight >= (title + small * 3) * geometry.lineHeight + 36);
+    assert.equal(geometry.rowPitch - geometry.cardHeight, 20);
+    const a = origin(originA), b = origin(originB), c = origin('https://assets.example.com');
+    a.redirects = [redirect(b.origin)]; b.redirects = [redirect(c.origin)]; c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
+    const layout = map.graphLayout([a, b, c], [a.origin, b.origin, c.origin], new Map(), null, [], geometry);
+    assert.equal(layout.width, 568);
+    for (const node of layout.nodes) assert.ok(node.y + geometry.cardHeight + geometry.padding <= layout.height);
+    for (const edge of layout.edges) {
+      const points = edge.path.match(/-?\d+(?:\.\d+)?/g).map(Number);
+      const from = layout.nodes.find(node => node.origin === edge.source), to = layout.nodes.find(node => node.origin === edge.target);
+      assert.ok(points[1] > from.y && points[1] < from.y + geometry.cardHeight);
+      assert.ok(points[7] > to.y && points[7] < to.y + geometry.cardHeight);
+      for (let i = 0; i < points.length; i += 2) {
+        assert.ok(points[i] >= 8 && points[i] <= layout.width - 8);
+        assert.ok(points[i + 1] >= 8 && points[i + 1] <= layout.height - 8);
+      }
+    }
+  }
+});
+
+test('12 to 20 to 12 display change keeps overlay, exact selection, inspector, slots, zoom and reads intact', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f); clickOverlay(f); f.controller.setZoom(0.7);
+  const overlay = f.state.bodyReferenceOverlay, evidenceRow = f.state.evidence, source = f.state.bodyReferencesSource;
+  const slots = JSON.stringify([...f.state.layoutSlots]), requests = f.requests.length, inspector = f.els.detail.replacements;
+  const defaultHeight = f.els.canvas.style.values['--service-map-scaled-height'];
+  for (const size of [20, 12]) {
+    f.document.documentElement.style.setProperty('--ui-root-size', `${size}px`); f.controller.displayChanged();
+    const geometry = map.graphGeometry(size);
+    assert.match(f.els.canvas.innerHTML, new RegExp(`--service-map-card-height:${geometry.cardHeight}px`));
+    assert.equal(f.state.zoomScale, 0.7); assert.equal(f.state.bodyReferenceOverlay, overlay);
+    assert.equal(f.state.evidence, evidenceRow); assert.equal(f.state.bodyReferencesSource, source);
+    assert.equal(f.state.selectedOrigin, originA); assert.equal(f.state.endpointIndex, 0);
+    assert.equal(f.requests.length, requests); assert.equal(f.els.detail.replacements, inspector);
+    assert.equal(JSON.stringify([...f.state.layoutSlots]), slots);
+    if (size === 20) assert.ok(parseFloat(f.els.canvas.style.values['--service-map-scaled-height']) > parseFloat(defaultHeight));
+    else assert.equal(f.els.canvas.style.values['--service-map-scaled-height'], defaultHeight);
+  }
+});
+
+test('Display settings notify the existing map and graph line boxes follow shared font-aware geometry', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8'), css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  assert.match(app, /function applyDisplaySettingsState[\s\S]*?targetServiceMapController\?\.displayChanged\?\.\(\)/);
+  for (const selector of ['.service-map-card-copy strong', '.service-map-card-scheme, .service-map-card-meta', '.service-map-clues > span']) {
+    const rule = css.slice(css.indexOf(selector), css.indexOf('}', css.indexOf(selector)));
+    assert.match(rule, /line-height: var\(--service-map-line-height\)/);
+  }
+});
+
+for (const value of [0, 127, 129, 128.5, '128', null]) test(`optional technology token-candidate limit rejects unsupported value: ${JSON.stringify(value)}`, () => {
+  const payload = technologySnapshot(); payload.snapshot.limits.technology_token_candidates_per_row = value;
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+});
+
+test('128 technology token candidates is a supported optional limit and old-server absence stays valid', () => {
+  const payload = technologySnapshot(); payload.snapshot.limits.technology_token_candidates_per_row = 128;
+  assert.equal(map.normalizeSnapshot(payload, technologySession).origins.length, 1);
+  delete payload.snapshot.limits.technology_token_candidates_per_row;
+  delete payload.origins[0].technology_observations;
+  assert.equal(map.normalizeSnapshot(payload, technologySession).origins[0].technology_observations.length, 0);
+});
+
+for (const items of [[], [technologyRow()]]) test(`token-budget partial scan is honest with ${items.length} observations and needs no body read`, async () => {
+  const payload = technologySnapshot(items.map(row => technologyAggregate(row)));
+  Object.assign(payload.snapshot, { complete: false, stopped_by: ['technology_token_scan_limit'], omitted_rows: 1 });
+  payload.snapshot.limits.technology_token_candidates_per_row = 128;
+  const f = await technologyFixture(payload), value = technologyEvidence(items);
+  Object.assign(value.row, { metadata_complete: false, omitted: ['technology_token_scan_limit'] });
+  assert.match(f.els.status.textContent, /Incomplete: technology_token_scan_limit/);
+  assert.match(f.els.status.textContent, /Header technology scan partial: token candidate limit reached/);
+  assert.equal(await resolveTechnologySource(f, value), true);
+  assert.equal(f.state.evidence.technology_observations.length, items.length);
+  assert.match(f.els.detail.innerHTML, /Header technology scan is partial: token candidate limit reached/);
+  assert.match(f.els.detail.innerHTML, /Additional declarations may be omitted/);
+  if (!items.length) assert.doesNotMatch(f.els.detail.innerHTML, /Header-reported technologies|No technologies|No products/);
+  assert.equal(f.requests.length, 2); assert.equal(f.requests.some(request => /body-references|transactions|replay|scan|capture/.test(request.url)), false);
+});
+
+for (const complete of [true, undefined, null, 'false']) test(`candidate-limited map rejects false completeness: ${String(complete)}`, () => {
+  const payload = technologySnapshot([]); payload.snapshot.stopped_by = ['technology_token_scan_limit'];
+  if (complete === undefined) delete payload.snapshot.complete; else payload.snapshot.complete = complete;
+  assert.throws(() => map.normalizeSnapshot(payload, technologySession), /Invalid retained technology observations/);
+});
+
+for (const extension of [true, false]) test(`candidate-limited exact row rejects metadata_complete true with extension ${extension ? 'present' : 'absent'}`, async () => {
+  const f = await technologyFixture(), value = technologyEvidence([]);
+  value.row.omitted = ['technology_token_scan_limit'];
+  if (!extension) delete value.row.technology_observations;
+  assert.equal(await resolveTechnologySource(f, value), false); assert.equal(f.state.evidence, null);
+  assert.match(f.els.detail.innerHTML, /Source unavailable/);
 });

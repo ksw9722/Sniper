@@ -7,6 +7,8 @@
   const MAX_REFERENCE_CARDS = 100;
   const MAX_REFERENCE_SOURCES = 30;
   const API_PAGE_SIZE = 50;
+  const GRAPH_GEOMETRY = Object.freeze({ cardWidth: 220, cardHeight: 104, columnPitch: 300, rowPitch: 124, padding: 24, loopInset: 8, lineHeight: 1.5 });
+  const ZOOM_LIMITS = Object.freeze({ min: 0.1, max: 2, step: 0.1 });
   const BODY_REFERENCE_LIMITS = Object.freeze({ scan_bytes: 262144, serialized_row_bytes: 2097152, origins: 100, candidates: 4096, candidate_bytes: 4096, offsets_per_origin: 5 });
   const BODY_REFERENCE_REASONS = {
     capture_preview_truncated: "Capture preview is truncated", scan_prefix_truncated: "Scan prefix limit reached",
@@ -34,6 +36,120 @@
       return ["http:", "https:"].includes(url.protocol) ? url.origin : "";
     } catch (_) { return ""; }
   }
+  // This closed catalog mirrors the passive header extractor. Display names and
+  // categories never come from arbitrary header text or describe deployed roles.
+  const TECHNOLOGY_CATALOG = new Map([
+    ["nginx", ["nginx", "web_server", "nginx", ["server"]]],
+    ["apache_http_server", ["Apache", "web_server", "Apache", ["server"]]],
+    ["caddy", ["Caddy", "web_server", "Caddy", ["server"]]],
+    ["cloudflare", ["Cloudflare", "edge_service", "Cloudflare", ["server"]]],
+    ["microsoft_iis", ["Microsoft IIS", "web_server", "Microsoft-IIS", ["server"]]],
+    ["envoy", ["Envoy", "edge_service", "Envoy", ["server"]]],
+    ["php", ["PHP", "language_runtime", "PHP", ["server", "x-powered-by"]]],
+    ["jetty", ["Jetty", "application_server", "Jetty", ["server"]]],
+    ["apache_coyote", ["Apache-Coyote", "connector", "Apache-Coyote", ["server"]]],
+    ["apache_tomcat", ["Apache Tomcat", "application_server", "Apache Tomcat", ["server"]]],
+    ["express", ["Express", "application_framework", "Express", ["x-powered-by"]]],
+    ["asp_net", ["ASP.NET", "application_framework", "ASP.NET", ["x-powered-by"]]],
+    ["wordpress", ["WordPress", "cms", "WordPress", ["x-generator"]]],
+    ["drupal", ["Drupal", "cms", "Drupal", ["x-generator"]]],
+  ]);
+  const TECHNOLOGY_FIELDS = ["product_id", "name", "catalog_category", "reported_version", "version_status", "source", "strength", "header_name"];
+  const TECHNOLOGY_CATEGORIES = { web_server: "Web server", edge_service: "Edge service", language_runtime: "Language runtime", application_server: "Application server", connector: "Connector", application_framework: "Application framework", cms: "CMS" };
+  const technologyInteger = (value, max) => Number.isSafeInteger(value) && value >= 0 && value <= max;
+  const exactFields = (value, fields) => value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === fields.length && fields.every((field) => Object.prototype.hasOwnProperty.call(value, field));
+  const invalidTechnology = () => { throw new Error("Invalid retained technology observations"); };
+  function observationTime(value) {
+    const parts = typeof value === "string" && value.length <= 40
+      && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+    if (!parts) return null;
+    const [, year, month, day, hour, minute, second, fraction = ""] = parts;
+    const leap = Number(year) % 4 === 0 && (Number(year) % 100 !== 0 || Number(year) % 400 === 0);
+    const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (Number(month) < 1 || Number(month) > 12 || Number(day) < 1 || Number(day) > monthDays[Number(month) - 1]
+      || Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59) return null;
+    const milliseconds = Date.parse(value.replace(/\.\d+(?=Z|[+-])/, ""));
+    // Retained timestamps can carry nanoseconds. Keep that precision when
+    // proving an observation stays inside its origin's retained time window.
+    return Number.isFinite(milliseconds) ? BigInt(milliseconds) * 1000000n + BigInt(fraction.padEnd(9, "0")) : null;
+  }
+  function technologyBase(item) {
+    const catalog = TECHNOLOGY_CATALOG.get(item?.product_id);
+    if (!catalog || item.name !== catalog[0] || item.catalog_category !== catalog[1] || !catalog[3].includes(item.header_name)
+      || item.source !== "response_header" || item.strength !== "literal_declaration"
+      || !["reported", "not_reported", "unsupported_format", "non_product_version"].includes(item.version_status)
+      || item.version_status === "non_product_version" && item.product_id !== "apache_coyote"
+      || item.version_status === "reported" && (item.product_id === "apache_coyote" || typeof item.reported_version !== "string"
+        || item.reported_version.length > 32 || !/^[0-9]+(?:\.[0-9]+)*$/.test(item.reported_version))
+      || item.version_status !== "reported" && item.reported_version !== null) invalidTechnology();
+    return Object.fromEntries(TECHNOLOGY_FIELDS.map((field) => [field, item[field]]));
+  }
+  function technologyList(value, max) {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.length > max) invalidTechnology();
+    return value;
+  }
+  function normalizeRowTechnologies(value) {
+    const positions = new Set(), headers = new Map(), headerSpans = new Map();
+    return technologyList(value, 8).map((item) => {
+      if (!exactFields(item, [...TECHNOLOGY_FIELDS, "header_index", "product_span", "version_span", "offset_basis", "rule_id"])) invalidTechnology();
+      const base = technologyBase(item), catalog = TECHNOLOGY_CATALOG.get(item.product_id);
+      const span = (value) => exactFields(value, ["start", "end"]) && technologyInteger(value.start, 4096)
+        && technologyInteger(value.end, 4096) && value.start < value.end;
+      const rule = `${item.header_name.replaceAll("-", "_")}.${item.product_id}.v1`;
+      if (!technologyInteger(item.header_index, 127) || item.offset_basis !== "retained_header_value_utf8"
+        || !span(item.product_span) || item.product_span.end - item.product_span.start !== catalog[2].length
+        || item.rule_id !== rule && !(item.product_id === "jetty" && item.rule_id === "server.jetty_parenthesized.v1")
+        || item.rule_id === "server.jetty_parenthesized.v1" && !["reported", "unsupported_format"].includes(item.version_status)
+        || item.version_status === "reported" && (!span(item.version_span) || item.version_span.start <= item.product_span.end
+          || item.version_span.end - item.version_span.start !== item.reported_version.length
+          || item.header_name !== "x-generator" && item.version_span.start !== item.product_span.end + 1)
+        || item.version_status !== "reported" && item.version_span !== null) invalidTechnology();
+      const position = JSON.stringify([item.header_index, item.product_span.start, item.product_span.end]);
+      if (positions.has(position) || headers.has(item.header_index) && headers.get(item.header_index) !== item.header_name) invalidTechnology();
+      const spans = [item.product_span, ...(item.version_span ? [item.version_span] : [])];
+      const previousSpans = headerSpans.get(item.header_index) || [];
+      if (spans.some((span) => previousSpans.some((previous) => span.start < previous.end && previous.start < span.end))) invalidTechnology();
+      positions.add(position);
+      headers.set(item.header_index, item.header_name);
+      headerSpans.set(item.header_index, [...previousSpans, ...spans]);
+      return { ...base, header_index: item.header_index, product_span: { ...item.product_span },
+        version_span: item.version_span ? { ...item.version_span } : null, offset_basis: item.offset_basis, rule_id: item.rule_id };
+    });
+  }
+  function validTechnologyEvidence(value, sessionId, generation) {
+    if (typeof value !== "string" || value.length > 200) return false;
+    const fields = value.split("."), uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    return fields.length === 6 && fields[0] === "v1" && fields[1] === sessionId && fields[2] === generation
+      && [fields[1], fields[2], fields[4], fields[5]].every((field) => uuid.test(field))
+      && /^(?:0|[1-9][0-9]{0,19})$/.test(fields[3]) && BigInt(fields[3]) <= 18446744073709551615n;
+  }
+  function normalizeOriginTechnologies(origin, sessionId, generation) {
+    const keys = new Set();
+    return technologyList(origin?.technology_observations, 32).map((item) => {
+      if (!exactFields(item, [...TECHNOLOGY_FIELDS, "row_count", "first_seen", "last_seen", "evidence"])) invalidTechnology();
+      const base = technologyBase(item), first = observationTime(item.first_seen), last = observationTime(item.last_seen);
+      const originFirst = observationTime(origin.first_seen), originLast = observationTime(origin.last_seen);
+      if (!technologyInteger(origin.request_count, 50000) || !technologyInteger(item.row_count, origin.request_count) || !item.row_count
+        || first === null || last === null || first > last
+        || originFirst === null || originLast === null || first < originFirst || last > originLast
+        || !Array.isArray(item.evidence) || !item.evidence.length || item.evidence.length > Math.min(3, item.row_count)
+        || new Set(item.evidence).size !== item.evidence.length
+        || item.evidence.some((id) => !validTechnologyEvidence(id, sessionId, generation))
+        || new Set(item.evidence.map((id) => id.split(".")[3])).size !== item.evidence.length) invalidTechnology();
+      const key = JSON.stringify([item.product_id, item.header_name, item.reported_version, item.version_status]);
+      if (keys.has(key)) invalidTechnology();
+      keys.add(key);
+      return { ...base, row_count: item.row_count, first_seen: item.first_seen, last_seen: item.last_seen, evidence: [...item.evidence] };
+    });
+  }
+  function technologyVersion(item) {
+    return item.version_status === "reported" ? `Reported version: ${item.reported_version}`
+      : item.version_status === "unsupported_format" ? "Reported version: unknown (unsupported format)"
+        : item.version_status === "non_product_version" ? "Reported version: unknown (non-product version)"
+          : "Reported version: unknown (not reported)";
+  }
   function normalizeEvidenceObservations(row) {
     const invalid = () => { throw new Error("Invalid retained source observations"); };
     const text = (value, limit) => typeof value === "string" && value.length > 0 && value.length <= limit;
@@ -60,7 +176,11 @@
       if (!origin(row.redirect.target_origin) || !text(row.redirect.target_path, 2048)) invalid();
       redirect = { target_origin: safeOrigin(row.redirect.target_origin), target_path: safePath(row.redirect.target_path) };
     }
-    return { ...row, technology_clues, header_links, redirect, omitted: [...omitted] };
+    const technology_observations = normalizeRowTechnologies(row.technology_observations);
+    if (row.technology_observations !== undefined && (row.metadata_complete !== (omitted.length === 0)
+      || omitted.includes("technology_observations_limit") && technology_observations.length !== 8)
+      || omitted.includes("technology_token_scan_limit") && row.metadata_complete !== false) invalidTechnology();
+    return { ...row, technology_clues, technology_observations, header_links, redirect, omitted: [...omitted] };
   }
   function normalizeSocketPeer(payload) {
     // This extension is independently optional on older servers. Only typed
@@ -137,14 +257,41 @@
     if (payload?.schema_version !== 1 || payload.session_id !== sessionId || !payload.snapshot || !Array.isArray(payload.origins)) {
       throw new Error("Invalid service map response");
     }
+    for (const [key, limit] of Object.entries({ technology_observations_per_row: 8, technology_observations_per_origin: 32, technology_observations: 2000, technology_version_bytes: 32, technology_token_candidates_per_row: 128 })) {
+      if (payload.snapshot.limits?.[key] !== undefined && payload.snapshot.limits[key] !== limit) invalidTechnology();
+    }
+    if (array(payload.snapshot.stopped_by).includes("technology_token_scan_limit") && payload.snapshot.complete !== false) invalidTechnology();
+    let technologyCount = 0;
+    const technologySources = new Map();
+    const technologies = payload.origins.map((item) => {
+      const observations = normalizeOriginTechnologies(item, sessionId, payload.snapshot.generation);
+      technologyCount += observations.length;
+      if (technologyCount > 2000) invalidTechnology();
+      for (const observation of observations) for (const id of observation.evidence) {
+        const sequence = id.split(".")[3], previous = technologySources.get(sequence);
+        if (previous && (previous.origin !== item.origin || previous.id !== id)) invalidTechnology();
+        technologySources.set(sequence, { origin: item.origin, id });
+      }
+      return observations;
+    });
+    // The same retained sequence must retain one complete token identity across
+    // new observations and legacy evidence collections, including record revision.
+    for (const item of payload.origins) {
+      for (const source of [...array(item?.endpoints), ...array(item?.technology_clues), ...array(item?.redirects), ...array(item?.header_links)]) {
+        for (const id of array(source?.evidence)) {
+          const previous = typeof id === "string" && technologySources.get(id.split(".")[3]);
+          if (previous && (previous.origin !== item.origin || previous.id !== id)) invalidTechnology();
+        }
+      }
+    }
     const seen = new Set();
-    const origins = payload.origins.flatMap((item) => {
+    const origins = payload.origins.flatMap((item, index) => {
       const origin = safeOrigin(item?.origin);
       if (!origin || seen.has(origin)) return [];
       seen.add(origin);
       return [{
         origin, captured: true, in_scope: item.in_scope === true, request_count: count(item.request_count),
-        first_seen: item.first_seen, last_seen: item.last_seen,
+        first_seen: item.first_seen, last_seen: item.last_seen, technology_observations: technologies[index],
         endpoints: array(item.endpoints).map((endpoint) => ({
           method: String(endpoint.method || "?"), path: safePath(endpoint.path), path_group: safePath(endpoint.path_group || endpoint.path),
           request_count: count(endpoint.request_count), statuses: array(endpoint.statuses), content_types: array(endpoint.content_types),
@@ -170,8 +317,16 @@
     const previousIds = new Set(previous);
     return [...previous.filter((id) => ids.has(id)), ...[...ids].filter((id) => !previousIds.has(id)).sort()];
   }
-  function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = []) {
-    const width = 720;
+  function graphGeometry(textSize = 12) {
+    const size = Math.max(8, Math.min(20, Number.isFinite(textSize) ? textSize : 12));
+    // Four text rows, three gaps, two card paddings/borders, and clue borders.
+    // Larger Display text must grow the graph as well as its text, otherwise
+    // fixed compact rows clip glyphs and leave SVG arrows at the wrong height.
+    const cardHeight = Math.max(GRAPH_GEOMETRY.cardHeight, Math.ceil((Math.max(10, size - 1) + 3 * Math.max(9, size - 2)) * GRAPH_GEOMETRY.lineHeight + 36));
+    return { ...GRAPH_GEOMETRY, cardHeight, rowPitch: cardHeight + GRAPH_GEOMETRY.rowPitch - GRAPH_GEOMETRY.cardHeight };
+  }
+  function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = [], geometry = GRAPH_GEOMETRY) {
+    const width = geometry.padding * 2 + geometry.columnPitch + geometry.cardWidth;
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
@@ -215,7 +370,7 @@
       while ([...slots.values()].some((slot) => slot.column === column && slot.row === row)) row += 1;
       slots.set(origin.origin, { column, row });
     }
-    const visible = visibleOrigins.map((origin) => ({ ...origin, x: 32 + slots.get(origin.origin).column * 380, y: 36 + slots.get(origin.origin).row * 184 }));
+    const visible = visibleOrigins.map((origin) => ({ ...origin, x: geometry.padding + slots.get(origin.origin).column * geometry.columnPitch, y: geometry.padding + slots.get(origin.origin).row * geometry.rowPitch }));
     const positions = new Map(visible.map((origin) => [origin.origin, origin]));
     const edges = [];
     const seen = new Set();
@@ -238,19 +393,20 @@
       const pair = JSON.stringify([edge.source, edge.target].sort());
       const pairIndex = pairCounts.get(pair) || 0;
       pairCounts.set(pair, pairIndex + 1);
-      const offset = [0, -12, 12, -24, 24, -36, 36][Math.min(pairIndex, 6)];
+      const lane = geometry.cardHeight / 10;
+      const offset = [0, -1, 1, -2, 2, -3, 3][Math.min(pairIndex, 6)] * lane;
       const toRight = target.x > source.x;
       const sameColumn = target.x === source.x;
-      const x1 = source.x + (sameColumn ? 276 : toRight ? 276 : 0);
-      const x2 = target.x + (sameColumn ? 276 : toRight ? 0 : 276);
-      const y1 = source.y + 72 + offset;
-      const y2 = target.y + 72 + offset;
+      const x1 = source.x + (sameColumn ? geometry.cardWidth : toRight ? geometry.cardWidth : 0);
+      const x2 = target.x + (sameColumn ? geometry.cardWidth : toRight ? 0 : geometry.cardWidth);
+      const y1 = source.y + geometry.cardHeight / 2 + offset;
+      const y2 = target.y + geometry.cardHeight / 2 + offset;
       // Keep right-column loops inside the SVG, with room for stroke and markers.
       // Attachment offsets still distinguish typed links without widening cards.
-      const bend = sameColumn ? Math.min(x1 + 32 + Math.abs(offset), width - 8) : (x1 + x2) / 2;
+      const bend = sameColumn ? Math.min(x1 + geometry.padding + Math.abs(offset), width - geometry.loopInset) : (x1 + x2) / 2;
       edges.push({ ...edge, path: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}` });
     }
-    return { nodes: visible, edges, edgeCount, slots, width, height: Math.max(400, ...visible.map((origin) => origin.y + 174)) };
+    return { nodes: visible, edges, edgeCount, slots, geometry, width, height: Math.max(geometry.padding * 2 + geometry.cardHeight, ...visible.map((origin) => origin.y + geometry.cardHeight + geometry.padding)) };
   }
   function* metadataRelations(origins) {
     for (const origin of origins) {
@@ -264,7 +420,7 @@
       };
     }
   }
-  const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], redirects: [], header_links: [], references: [], referencesOmitted: 0 });
+  const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], redirects: [], header_links: [], references: [], referencesOmitted: 0 });
   function createController({ elements: els, getSessionId, getEventStreamReady = () => true, request, document: doc = root.document }) {
     const state = {
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
@@ -273,13 +429,65 @@
       evidenceLoading: false, evidenceError: "", evidenceId: null, socketPeer: null, page: 0, detailPage: 0,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       bodyReferencesSource: null, bodyReferenceOverlay: null, bodyOverlayNotice: "",
-      historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "",
+      historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
     };
     let abort = null;
     let evidenceAbort = null;
     let bodyReferencesAbort = null;
     let detailRender = null;
     let visible = false;
+    let currentLayout = null;
+    function viewportSize() {
+      return { width: Number(els.viewport?.clientWidth) || 0, height: Number(els.viewport?.clientHeight) || 0 };
+    }
+    function zoomAvailable() {
+      const size = viewportSize();
+      return visible && state.view === "service-map" && !!currentLayout?.nodes.length && size.width > 0 && size.height > 0;
+    }
+    function updateZoomControls() {
+      const available = zoomAvailable();
+      els.zoomControls?.classList.toggle("hidden", state.view === "apis");
+      if (els.zoomFit) els.zoomFit.disabled = !available;
+      if (els.zoomOut) els.zoomOut.disabled = !available || state.zoomScale <= ZOOM_LIMITS.min;
+      if (els.zoomIn) els.zoomIn.disabled = !available || state.zoomScale >= ZOOM_LIMITS.max;
+      if (els.zoomReset) {
+        els.zoomReset.disabled = !available;
+        els.zoomReset.textContent = `${Math.round(state.zoomScale * 100)}%`;
+        els.zoomReset.setAttribute("aria-label", `Zoom ${Math.round(state.zoomScale * 100)}%. Reset to 100%`);
+      }
+    }
+    function applyGraphScale() {
+      // Mutating the canvas variables leaves card DOM, focus, inspector and
+      // in-flight exact-source reads untouched, including during polling.
+      if (currentLayout && els.canvas.style) {
+        els.canvas.style.setProperty("--service-map-scale", String(state.zoomScale));
+        els.canvas.style.setProperty("--service-map-scaled-width", `${currentLayout.width * state.zoomScale}px`);
+        els.canvas.style.setProperty("--service-map-scaled-height", `${currentLayout.height * state.zoomScale}px`);
+      }
+      updateZoomControls();
+    }
+    function setZoom(value, { fit = false } = {}) {
+      if (!zoomAvailable() || !Number.isFinite(value)) return false;
+      const viewport = els.viewport, size = viewportSize();
+      const previous = state.zoomScale;
+      const next = Math.max(ZOOM_LIMITS.min, Math.min(ZOOM_LIMITS.max, (fit ? Math.floor(value * 10000) : Math.round(value * 10000)) / 10000));
+      // The canvas centers a small graph. Include that inset when preserving
+      // the point under the viewport center across either scrollbar boundary.
+      const centerX = (viewport.scrollLeft + size.width / 2 - Math.max(0, (size.width - currentLayout.width * previous) / 2)) / previous;
+      const centerY = (viewport.scrollTop + size.height / 2 - Math.max(0, (size.height - currentLayout.height * previous) / 2)) / previous;
+      state.zoomScale = next;
+      applyGraphScale();
+      const scaledWidth = currentLayout.width * next, scaledHeight = currentLayout.height * next;
+      const nextSize = viewportSize();
+      viewport.scrollLeft = fit ? 0 : Math.max(0, Math.min(scaledWidth - nextSize.width, centerX * next + Math.max(0, (nextSize.width - scaledWidth) / 2) - nextSize.width / 2));
+      viewport.scrollTop = fit ? 0 : Math.max(0, Math.min(scaledHeight - nextSize.height, centerY * next + Math.max(0, (nextSize.height - scaledHeight) / 2) - nextSize.height / 2));
+      return true;
+    }
+    function fitGraph() {
+      if (!zoomAvailable()) return false;
+      const size = viewportSize();
+      return setZoom(Math.min(1, size.width / currentLayout.width, size.height / currentLayout.height), { fit: true });
+    }
     function replace(element, html) {
       if (!element || element.innerHTML === html) return;
       const focused = doc?.activeElement;
@@ -378,7 +586,7 @@
       if (!source || source.sessionId !== getSessionId() || source.sessionId !== state.sessionId
         || typeof source.generation !== "string" || !source.generation || source.generation !== snapshot?.snapshot.generation) return false;
       const origin = snapshot.origins.find((item) => item.origin === source.origin);
-      return !!origin && [...origin.endpoints, ...origin.technology_clues, ...origin.redirects, ...origin.header_links]
+      return !!origin && [...origin.endpoints, ...origin.technology_clues, ...origin.technology_observations, ...origin.redirects, ...origin.header_links]
         .some((item) => item.evidence.includes(source.evidenceId));
     }
     function clearOverlay(notice = "") {
@@ -521,7 +729,7 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        selectionInitialized: false, endpointIndex: null, endpointSelection: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "" });
+        selectionInitialized: false, endpointIndex: null, endpointSelection: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
@@ -617,6 +825,7 @@
       else {
         origin.endpoints.forEach((item) => add(item.evidence, `${item.method} ${item.path}`));
         origin.technology_clues.forEach((item) => add(item.evidence, `${item.name} · header clue`));
+        origin.technology_observations.forEach((item) => add(item.evidence, `${item.name} · ${technologyVersion(item)}`));
         origin.redirects.forEach((item) => add(item.evidence, `Redirect instruction → ${item.target_origin}`));
         origin.header_links.forEach((item) => add(item.evidence, `${item.relationship === "origin_header" ? "Origin" : "Referer"} header: ${item.source_origin}`));
       }
@@ -733,6 +942,7 @@
         status += snapshot.complete === true ? " · Complete retained snapshot" : ` · Incomplete: ${array(snapshot.stopped_by).join(", ") || "projection bounds reached"}`;
         status += ` · ${count(snapshot.included_rows)} included / ${count(snapshot.excluded_rows)} excluded / ${count(snapshot.omitted_rows)} omitted among analyzed`;
         status += ` · Newest capture-sequence window: ${snapshot.oldest_considered_at || "unknown"} to ${snapshot.latest_considered_at || "unknown"}`;
+        if (array(snapshot.stopped_by).includes("technology_token_scan_limit")) status += " · Header technology scan partial: token candidate limit reached";
         if (state.scopeOnly) status += " · In scope only";
         if (state.stale) status += " · History changed: counts are from the previous snapshot";
         if (state.snapshot.warningCount) status += ` · ${state.snapshot.warningCount} metadata notice(s)`;
@@ -753,8 +963,12 @@
       const order = direct ? [direct.anchor.origin, ...neighborOrder.filter((id) => direct.bodyIds.has(id)), ...neighborOrder.filter((id) => !direct.bodyIds.has(id))] : state.order;
       const filterKey = JSON.stringify([query, state.scopeOnly, state.sessionId, state.anchorOrigin]);
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
-      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin, direct ? overlayEdges() : []);
+      const textSize = doc?.documentElement && typeof root.getComputedStyle === "function"
+        ? Number.parseFloat(root.getComputedStyle(doc.documentElement).getPropertyValue("--ui-root-size")) : 12;
+      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin, direct ? overlayEdges() : [], graphGeometry(textSize));
       state.layoutSlots = layout.slots;
+      currentLayout = layout.nodes.length ? layout : null;
+      applyGraphScale();
       els.boundsDetails?.classList.toggle("hidden", !direct);
       if (!direct && els.graphDiagnostics) els.graphDiagnostics.textContent = "";
       els.mapControls?.classList.toggle("hidden", state.view === "apis");
@@ -788,7 +1002,7 @@
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
       }).join("");
-      replace(els.canvas, `<div class="service-map-layout" style="width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}</svg>${cards}</div>`);
+      replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout" style="--service-map-card-width:${layout.geometry.cardWidth}px;--service-map-card-height:${layout.geometry.cardHeight}px;--service-map-line-height:${layout.geometry.lineHeight};width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}</svg>${cards}</div></div>`);
       if (direct) {
         const counts = direct.counts;
         const shownBodyArrows = layout.edges.filter((edge) => edge.relationship === "body_url_reference").length;
@@ -895,16 +1109,27 @@
       }
       return `<section class="service-map-socket-peer" aria-label="Upstream socket peer">${heading}${content}</section>`;
     }
+    function technologyMarkup(items, origin = null) {
+      if (!items.length) return "";
+      const rows = items.map((item) => {
+        const detail = origin
+          ? `${item.row_count} retained row${item.row_count === 1 ? "" : "s"} · First: ${item.first_seen} · Last: ${item.last_seen}`
+          : `Response header index ${item.header_index} (zero-based) · Retained header value: UTF-8 product bytes ${item.product_span.start}–${item.product_span.end}${item.version_span ? ` · Version bytes ${item.version_span.start}–${item.version_span.end}` : ""} (end exclusive)`;
+        const sources = origin ? `<div class="service-map-evidence-list">${item.evidence.map((id, index) => `<button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(origin.origin)}" data-service-relation-evidence="${escape(id)}" data-service-focus="technology:${escape(JSON.stringify([item.product_id, item.header_name, item.reported_version, item.version_status, id]))}"><span>${escape(item.name)} · ${escape(technologyVersion(item))}</span><span>View source${item.evidence.length > 1 ? ` ${index + 1}` : ""} ›</span></button>`).join("")}</div>` : "";
+        return `<li><strong>${escape(item.name)}</strong> · ${escape(technologyVersion(item))}<p class="service-map-muted">Catalog: ${escape(TECHNOLOGY_CATEGORIES[item.catalog_category])} · Source: ${escape(item.header_name)} response header · Literal declaration</p><p class="service-map-muted">${escape(detail)}</p>${sources}</li>`;
+      }).join("");
+      return `<section class="service-map-technologies" aria-label="Header-reported technologies"><h4>Header-reported technologies</h4><p class="service-map-muted">Literal declarations from retained response headers. Versions are reported, not verified. Catalog categories describe product types only; deployment roles, ownership and vulnerabilities are unverified.</p><ul class="service-map-references">${rows}</ul></section>`;
+    }
     function evidenceMarkup(origin) {
       const items = evidenceItems(origin);
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
       const row = state.evidence;
-      const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul><p>Exact retained source verified for this read.</p></div>` : "";
+      const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${technologyMarkup(row.technology_observations)}<p>Exact retained source verified for this read.</p></div>` : "";
       return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
         ${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${row ? socketPeerMarkup() + bodyReferencesMarkup() : ""}
         <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || '<p class="service-map-muted">No source samples are available in this bounded snapshot.</p>'}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
-        ${!endpoint ? relationshipMarkup(origin) : ""}
+        ${!endpoint ? technologyMarkup(origin.technology_observations, origin) + relationshipMarkup(origin) : ""}
         ${!endpoint && origin.technology_clues.length ? `<h4>Observed header clues</h4><p class="service-map-muted">${origin.technology_clues.map((clue) => escape(clue.name)).join(", ")} · response headers only</p>` : ""}`;
     }
     function replaceDetail(html) {
@@ -944,7 +1169,7 @@
       const start = state.detailPage * API_PAGE_SIZE;
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. An optional observed socket peer is shown only in exact source evidence.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${state.detailTab === "evidence" ? evidenceMarkup(origin) : `<p class="service-map-muted">${origin.endpoints.length ? `${start + 1}–${Math.min(start + API_PAGE_SIZE, origin.endpoints.length)} of ${origin.endpoints.length}` : "No"} observed method/path combinations. Paths are not inferred API definitions.</p><div class="service-map-api-list">${origin.endpoints.slice(start, start + API_PAGE_SIZE).map((endpoint, index) => endpointButton(endpoint, origin, start + index)).join("")}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. An optional observed socket peer is shown only in exact source evidence.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">View evidence</button></div>`}</div>`);
     }
     function renderCatalog() {
       const entries = filteredOrigins().flatMap((origin) => origin.endpoints.map((endpoint, index) => ({ origin, endpoint, index })));
@@ -995,6 +1220,20 @@
       const next = [...els.detail.querySelectorAll('[role="tab"][data-service-detail-tab]')].find((button) => button.dataset.serviceDetailTab === state.detailTab);
       next?.focus();
     });
+    els.zoomFit?.addEventListener("click", fitGraph);
+    els.zoomOut?.addEventListener("click", () => setZoom(state.zoomScale - ZOOM_LIMITS.step));
+    els.zoomReset?.addEventListener("click", () => setZoom(1));
+    els.zoomIn?.addEventListener("click", () => setZoom(state.zoomScale + ZOOM_LIMITS.step));
+    els.viewport?.addEventListener("keydown", (event) => {
+      if (event.target !== els.viewport || event.ctrlKey || event.metaKey || event.altKey) return;
+      const handled = event.key === "+" || event.key === "=" ? setZoom(state.zoomScale + ZOOM_LIMITS.step)
+        : event.key === "-" ? setZoom(state.zoomScale - ZOOM_LIMITS.step)
+        : event.key === "0" ? setZoom(1) : event.key.toLowerCase() === "f" ? fitGraph() : false;
+      if (handled) event.preventDefault();
+    });
+    // Resize only refreshes control availability; Fit is an explicit one-shot
+    // action, so resizing or polling cannot silently change the user's zoom.
+    if (els.viewport && typeof root.ResizeObserver === "function") new root.ResizeObserver(updateZoomControls).observe(els.viewport);
     els.refresh.addEventListener("click", () => refresh({ force: true }));
     els.allOrigins?.addEventListener("click", () => setMapMode(false));
     els.directRelations?.addEventListener("click", () => setMapMode(true));
@@ -1011,7 +1250,8 @@
     });
     render();
     return {
-      refresh, reset, selectOrigin, loadEvidence, loadBodyReferences, showBodyReferencesOnMap, clearBodyReferenceOverlay,
+      refresh, reset, selectOrigin, setZoom, fitGraph, loadEvidence, loadBodyReferences, showBodyReferencesOnMap, clearBodyReferenceOverlay,
+      displayChanged() { renderGraph(); },
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
         if (signature(previous) === signature(next)) return false;
@@ -1062,5 +1302,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeBodyReferences, normalizeSocketPeer, BODY_REFERENCE_LIMITS, stableOrder, graphLayout, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS };
+  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeSocketPeer, BODY_REFERENCE_LIMITS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+use crate::service_map_technology::{
+    self as technology, TechnologyAggregate, TechnologyObservation,
+};
 use crate::{model::TransactionRecord, scope};
 
 pub const DEFAULT_MAX_RECORDS: usize = 10_000;
@@ -37,6 +40,36 @@ pub struct ServiceMapLimits {
     pub redirects_per_origin: usize,
     pub header_links_per_origin: usize,
     pub technology_clues_per_row: usize,
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_observations_per_row: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_observations_per_origin: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_observations: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_version_bytes: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_token_candidates_per_row: Option<usize>,
     pub statuses_per_endpoint: usize,
     pub content_types_per_endpoint: usize,
     pub path_bytes: usize,
@@ -59,6 +92,11 @@ impl ServiceMapLimits {
             redirects_per_origin: MAX_REDIRECTS_PER_ORIGIN,
             header_links_per_origin: MAX_HEADER_LINKS_PER_ORIGIN,
             technology_clues_per_row: MAX_TECHNOLOGY_CLUES_PER_ROW,
+            technology_observations_per_row: Some(technology::MAX_OBSERVATIONS_PER_ROW),
+            technology_observations_per_origin: Some(technology::MAX_OBSERVATIONS_PER_ORIGIN),
+            technology_observations: Some(technology::MAX_OBSERVATIONS),
+            technology_version_bytes: Some(technology::MAX_VERSION_BYTES),
+            technology_token_candidates_per_row: Some(technology::MAX_TOKEN_CANDIDATES_PER_ROW),
             statuses_per_endpoint: 32,
             content_types_per_endpoint: 16,
             path_bytes: MAX_PATH_BYTES,
@@ -123,6 +161,12 @@ pub struct ServiceOrigin {
     pub last_seen: DateTime<Utc>,
     pub endpoints: Vec<ServiceEndpoint>,
     pub technology_clues: Vec<TechnologyClue>,
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_observations: Option<Vec<TechnologyAggregate>>,
     pub redirects: Vec<RedirectInstruction>,
     pub header_links: Vec<HeaderLink>,
 }
@@ -206,10 +250,25 @@ pub struct ServiceMapRow {
     pub content_type: Option<String>,
     pub is_websocket: bool,
     pub technology_clues: Vec<HeaderClue>,
+    #[serde(
+        default,
+        deserialize_with = "optional_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub technology_observations: Option<Vec<TechnologyObservation>>,
     pub redirect: Option<RedirectTarget>,
     pub header_links: Vec<HeaderLinkSource>,
     pub metadata_complete: bool,
     pub omitted: Vec<String>,
+}
+
+/// Extensions may be absent on old servers, but a present null is malformed.
+fn optional_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -450,6 +509,7 @@ pub(crate) fn project_record(record: &TransactionRecord, id: String) -> Option<S
             .and_then(mime),
         is_websocket: false,
         technology_clues: vec![],
+        technology_observations: Some(vec![]),
         redirect: None,
         header_links: vec![],
         metadata_complete: true,
@@ -532,6 +592,7 @@ pub(crate) fn project_record(record: &TransactionRecord, id: String) -> Option<S
     };
     let mut header_bytes = request_header_bytes;
     let mut locations = Vec::new();
+    let mut technology_budget = technology::TokenScanBudget::default();
     for (index, header) in response.headers.iter().enumerate() {
         header_bytes = header_bytes
             .saturating_add(header.name.len())
@@ -547,6 +608,15 @@ pub(crate) fn project_record(record: &TransactionRecord, id: String) -> Option<S
             continue;
         }
         let header_name = header.name.to_ascii_lowercase();
+        if technology::observe_header(
+            &header_name,
+            &header.value,
+            index,
+            row.technology_observations.as_mut().unwrap(),
+            &mut technology_budget,
+        ) {
+            row.omitted.push("technology_observations_limit".into());
+        }
         if header_name == "location" {
             locations.push(header.value.as_str());
         }
@@ -584,6 +654,9 @@ pub(crate) fn project_record(record: &TransactionRecord, id: String) -> Option<S
                 }
             }
         }
+    }
+    if technology_budget.omitted {
+        row.omitted.push("technology_token_scan_limit".into());
     }
     if record
         .status
@@ -717,6 +790,7 @@ pub(crate) fn build(
     let mut stopped_by = snapshot.stopped_by;
     let mut origins = BTreeMap::<String, ServiceOrigin>::new();
     let mut endpoint_indexes = BTreeMap::<(String, String, String), usize>::new();
+    let mut technology_observation_count = 0usize;
     let mut included_rows = 0;
     let mut excluded_rows = 0;
     let mut omitted_rows = snapshot.omitted_rows;
@@ -751,6 +825,7 @@ pub(crate) fn build(
                 last_seen: row.started_at,
                 endpoints: vec![],
                 technology_clues: vec![],
+                technology_observations: Some(vec![]),
                 redirects: vec![],
                 header_links: vec![],
             });
@@ -821,6 +896,51 @@ pub(crate) fn build(
                 });
             }
         }
+        let observations = origin.technology_observations.as_mut().unwrap();
+        let mut row_tuples = BTreeSet::new();
+        for observation in row.technology_observations.into_iter().flatten() {
+            let key = (
+                observation.product_id.clone(),
+                observation.header_name.clone(),
+                observation.reported_version.clone(),
+                observation.version_status,
+            );
+            if !row_tuples.insert(key) {
+                continue;
+            }
+            if let Some(existing) = observations.iter_mut().find(|existing| {
+                existing.product_id == observation.product_id
+                    && existing.header_name == observation.header_name
+                    && existing.reported_version == observation.reported_version
+                    && existing.version_status == observation.version_status
+            }) {
+                // A cardinality cap must not stop counts for retained tuples.
+                existing.row_count += 1;
+                existing.first_seen = existing.first_seen.min(row.started_at);
+                existing.last_seen = existing.last_seen.max(row.started_at);
+                sample(&mut existing.evidence, &row.evidence_id);
+            } else if observations.len() >= technology::MAX_OBSERVATIONS_PER_ORIGIN {
+                stopped_by.insert("technology_observations_per_origin_limit".into());
+            } else if technology_observation_count >= technology::MAX_OBSERVATIONS {
+                stopped_by.insert("technology_observations_map_limit".into());
+            } else {
+                observations.push(TechnologyAggregate {
+                    product_id: observation.product_id,
+                    name: observation.name,
+                    catalog_category: observation.catalog_category,
+                    reported_version: observation.reported_version,
+                    version_status: observation.version_status,
+                    source: observation.source,
+                    strength: observation.strength,
+                    header_name: observation.header_name,
+                    row_count: 1,
+                    first_seen: row.started_at,
+                    last_seen: row.started_at,
+                    evidence: vec![row.evidence_id.clone()],
+                });
+                technology_observation_count += 1;
+            }
+        }
         for link in row.header_links {
             if let Some(existing) = origin.header_links.iter_mut().find(|r| {
                 r.source_origin == link.source_origin && r.relationship == link.relationship
@@ -867,6 +987,22 @@ pub(crate) fn build(
         origin
             .technology_clues
             .sort_by(|a, b| (&a.name, &a.header_name).cmp(&(&b.name, &b.header_name)));
+        if let Some(observations) = &mut origin.technology_observations {
+            observations.sort_by(|a, b| {
+                (
+                    &a.product_id,
+                    &a.header_name,
+                    &a.reported_version,
+                    a.version_status,
+                )
+                    .cmp(&(
+                        &b.product_id,
+                        &b.header_name,
+                        &b.reported_version,
+                        b.version_status,
+                    ))
+            });
+        }
         origin.header_links.sort_by(|a, b| {
             (&a.source_origin, &a.relationship).cmp(&(&b.source_origin, &b.relationship))
         });
@@ -965,6 +1101,12 @@ mod tests {
         assert_eq!(origin.origin, "https://example.com");
         assert_eq!(origin.endpoints[0].path, "/login");
         assert_eq!(origin.technology_clues[0].name, "nginx");
+        let observation = &origin.technology_observations.as_ref().unwrap()[0];
+        assert_eq!(
+            observation.version_status,
+            technology::VersionStatus::UnsupportedFormat
+        );
+        assert!(observation.reported_version.is_none());
         assert_eq!(
             origin.redirects[0].target_origin,
             "https://other.example.com"
@@ -1613,6 +1755,7 @@ mod tests {
         let mut row = record("/metadata-only");
         row.request.body_preview.clear();
         row.response.as_mut().unwrap().body_preview.clear();
+        row.response.as_mut().unwrap().headers = headers(&[("Server", "Jetty(12.0.1)")]);
         let id = row.id;
         let store = TransactionStore::from_located_records_with_journal(
             vec![row],
@@ -1634,7 +1777,14 @@ mod tests {
             .service_map_evidence(session, &snapshot.rows[0].evidence_id)
             .await;
         assert!(evidence.available);
-        assert_eq!(evidence.row.unwrap().path, "/metadata-only");
+        let row = evidence.row.unwrap();
+        assert_eq!(row.path, "/metadata-only");
+        assert_eq!(
+            row.technology_observations.as_ref().unwrap()[0]
+                .reported_version
+                .as_deref(),
+            Some("12.0.1")
+        );
         assert!(!dir.join("transactions.ndjson").exists());
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
@@ -1750,5 +1900,401 @@ mod tests {
         assert_eq!(all.origins[0].request_count, 2);
         assert!(all.origins[0].in_scope);
         assert!(!serde_json::to_string(&all).unwrap().contains("scope_host"));
+    }
+
+    fn technology_record(host: &str, version: usize) -> TransactionRecord {
+        let mut row = record("/technology");
+        row.host = host.into();
+        row.response.as_mut().unwrap().headers =
+            headers(&[("Server", &format!("nginx/{version}.1"))]);
+        row
+    }
+
+    #[tokio::test]
+    async fn service_map_technology_aggregates_distinct_rows_without_selecting_a_version() {
+        let mut first = record("/a");
+        first.started_at = Utc::now() - chrono::Duration::hours(2);
+        first.response.as_mut().unwrap().headers = headers(&[
+            ("Server", " \t(한글) nginx/1.24.0 nginx/1.24.0"),
+            ("SERVER", "nginx/1.24.0"),
+            ("X-Powered-By", "PHP/8.3.1"),
+        ]);
+        let mut second = first.clone();
+        second.path = "/b".into();
+        second.started_at += chrono::Duration::hours(1);
+        second.response.as_mut().unwrap().headers = headers(&[
+            ("Server", "nginx/1.24.0 nginx/1.25.3 PHP/8.3.1"),
+            ("Server", "nginx/SECRET_VERSION_SENTINEL"),
+        ]);
+        let session = Uuid::new_v4();
+        let store = TransactionStore::from_records(vec![second.clone(), first.clone()]);
+        let snapshot = store.service_map_snapshot(session, 10).await;
+        let first_row = snapshot.rows.iter().find(|row| row.path == "/a").unwrap();
+        let row_observations = first_row.technology_observations.as_ref().unwrap();
+        assert_eq!(row_observations.len(), 4);
+        assert_eq!(row_observations[2].header_index, 1);
+        let exact = store
+            .service_map_evidence(session, &first_row.evidence_id)
+            .await;
+        assert_eq!(
+            serde_json::to_value(exact.row.unwrap().technology_observations).unwrap(),
+            serde_json::to_value(&first_row.technology_observations).unwrap()
+        );
+        for row in &snapshot.rows {
+            let exact = store.service_map_evidence(session, &row.evidence_id).await;
+            assert!(!serde_json::to_string(&exact).unwrap().contains("SENTINEL"));
+        }
+        let result = build(session, snapshot, 10, false, None, &[], &[]);
+        let observations = result.origins[0].technology_observations.as_ref().unwrap();
+        assert_eq!(observations.len(), 5);
+        assert!(observations.iter().all(TechnologyAggregate::is_valid));
+        let repeated = observations
+            .iter()
+            .find(|o| o.reported_version.as_deref() == Some("1.24.0"))
+            .unwrap();
+        assert_eq!(repeated.row_count, 2);
+        assert_eq!(repeated.evidence.len(), 2);
+        assert_ne!(repeated.evidence[0], repeated.evidence[1]);
+        assert_eq!(repeated.first_seen, first.started_at);
+        assert_eq!(repeated.last_seen, second.started_at);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|o| o.product_id == "php")
+                .count(),
+            2
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|o| o.product_id == "nginx")
+                .count(),
+            3
+        );
+        assert!(!serde_json::to_string(&result).unwrap().contains("SENTINEL"));
+        // Existing legacy extraction still recognizes only the leading Server product.
+        assert_eq!(result.origins[0].technology_clues.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn service_map_technology_row_limit_preserves_explicit_omissions() {
+        let mut row = record("/bounded");
+        row.response.as_mut().unwrap().headers = headers(&[("Server", &"nginx/1.2 ".repeat(9))]);
+        let session = Uuid::new_v4();
+        let store = TransactionStore::from_records(vec![row]);
+        let snapshot = store.service_map_snapshot(session, 10).await;
+        let projected = &snapshot.rows[0];
+        assert_eq!(
+            projected.technology_observations.as_ref().unwrap().len(),
+            technology::MAX_OBSERVATIONS_PER_ROW
+        );
+        assert!(!projected.metadata_complete);
+        assert!(projected
+            .omitted
+            .contains(&"technology_observations_limit".into()));
+        let evidence = store
+            .service_map_evidence(session, &projected.evidence_id)
+            .await;
+        assert!(evidence
+            .row
+            .unwrap()
+            .omitted
+            .contains(&"technology_observations_limit".into()));
+        let result = build(session, snapshot, 10, false, None, &[], &[]);
+        assert!(!result.snapshot.complete);
+        assert!(result
+            .snapshot
+            .stopped_by
+            .contains(&"technology_observations_limit".into()));
+        assert_eq!(
+            result.origins[0].technology_observations.as_ref().unwrap()[0].row_count,
+            1
+        );
+    }
+
+    #[test]
+    fn service_map_technology_ignores_request_headers_and_resident_body_text() {
+        let mut record = record("/metadata-only");
+        record.request.headers = headers(&[("Server", "nginx/1.2"), ("X-Powered-By", "PHP/8.3")]);
+        record.response.as_mut().unwrap().body_preview = "Server: Apache/2.4.62 PHP/8.3.1".into();
+        let projected = project_record(&record, "test".into()).unwrap();
+        assert!(projected.technology_clues.is_empty());
+        assert!(projected.technology_observations.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_map_technology_origin_cap_keeps_counting_retained_tuples() {
+        let mut records: Vec<_> = (0..technology::MAX_OBSERVATIONS_PER_ORIGIN + 3)
+            .map(|version| technology_record("example.com", version))
+            .collect();
+        records.extend((0..4).map(|_| technology_record("example.com", 0)));
+        let result = map(records).await;
+        let observations = result.origins[0].technology_observations.as_ref().unwrap();
+        assert_eq!(observations.len(), technology::MAX_OBSERVATIONS_PER_ORIGIN);
+        assert!(result
+            .snapshot
+            .stopped_by
+            .contains(&"technology_observations_per_origin_limit".into()));
+        let retained = observations
+            .iter()
+            .find(|o| o.reported_version.as_deref() == Some("0.1"))
+            .unwrap();
+        assert_eq!(retained.row_count, 5);
+        assert_eq!(retained.evidence.len(), MAX_EVIDENCE);
+        assert!(retained.is_valid());
+        assert_eq!(
+            result.snapshot.included_rows,
+            technology::MAX_OBSERVATIONS_PER_ORIGIN + 7
+        );
+    }
+
+    #[tokio::test]
+    async fn service_map_technology_global_cap_keeps_other_metadata_and_retained_counts() {
+        let mut records: Vec<_> = (0..technology::MAX_OBSERVATIONS + 3)
+            .map(|index| technology_record(&format!("{}.example.com", index / 8), index % 8))
+            .collect();
+        records.push(technology_record("0.example.com", 0));
+        let result = map(records).await;
+        assert_eq!(
+            result
+                .origins
+                .iter()
+                .map(|o| o.technology_observations.as_ref().unwrap().len())
+                .sum::<usize>(),
+            technology::MAX_OBSERVATIONS
+        );
+        assert!(result
+            .snapshot
+            .stopped_by
+            .contains(&"technology_observations_map_limit".into()));
+        assert!(!result
+            .snapshot
+            .stopped_by
+            .contains(&"metadata_bytes".into()));
+        assert_eq!(
+            result.snapshot.included_rows,
+            technology::MAX_OBSERVATIONS + 4
+        );
+        let retained = result
+            .origins
+            .iter()
+            .find(|o| o.host == "0.example.com")
+            .unwrap()
+            .technology_observations
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|o| o.reported_version.as_deref() == Some("0.1"))
+            .unwrap();
+        assert_eq!(retained.row_count, 2);
+        assert!(retained.is_valid());
+        assert_eq!(result.snapshot.origin_count, 251);
+    }
+
+    #[tokio::test]
+    async fn service_map_technology_extensions_are_optional_but_present_null_is_invalid() {
+        let result = map(vec![record("/old")]).await;
+        let mut json = serde_json::to_value(&result).unwrap();
+        json["origins"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("technology_observations");
+        for key in [
+            "technology_observations_per_row",
+            "technology_observations_per_origin",
+            "technology_observations",
+            "technology_version_bytes",
+            "technology_token_candidates_per_row",
+        ] {
+            json["snapshot"]["limits"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        }
+        let old: ServiceMap = serde_json::from_value(json.clone()).unwrap();
+        assert!(old.origins[0].technology_observations.is_none());
+        assert!(old.snapshot.limits.technology_observations.is_none());
+        json["origins"][0]["technology_observations"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ServiceMap>(json).is_err());
+        let row = project_record(&record("/old"), "test".into()).unwrap();
+        let mut json = serde_json::to_value(row).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("technology_observations");
+        assert!(serde_json::from_value::<ServiceMapRow>(json.clone())
+            .unwrap()
+            .technology_observations
+            .is_none());
+        json["technology_observations"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ServiceMapRow>(json).is_err());
+    }
+
+    #[tokio::test]
+    async fn service_map_technology_token_limit_is_explicit_without_truncating_legacy_metadata() {
+        let mut row = record("/bounded-tokens");
+        row.status = Some(302);
+        row.response.as_mut().unwrap().headers = headers(&[
+            (
+                "Server",
+                &"x ".repeat(technology::MAX_TOKEN_CANDIDATES_PER_ROW),
+            ),
+            ("Server", "nginx/1.2"),
+            ("Location", "/next"),
+            ("X-Powered-By", "PHP/8.3.1"),
+        ]);
+        let session = Uuid::new_v4();
+        let store = TransactionStore::from_records(vec![row]);
+        let snapshot = store.service_map_snapshot(session, 10).await;
+        let projected = &snapshot.rows[0];
+        assert!(!projected.metadata_complete);
+        assert_eq!(projected.omitted, vec!["technology_token_scan_limit"]);
+        assert!(projected
+            .technology_observations
+            .as_ref()
+            .unwrap()
+            .is_empty());
+        assert_eq!(projected.technology_clues.len(), 2);
+        assert_eq!(projected.redirect.as_ref().unwrap().target_path, "/next");
+        let evidence = store
+            .service_map_evidence(session, &projected.evidence_id)
+            .await;
+        assert_eq!(
+            evidence.row.unwrap().omitted,
+            vec!["technology_token_scan_limit"]
+        );
+        let result = build(session, snapshot, 10, false, None, &[], &[]);
+        assert!(!result.snapshot.complete);
+        assert_eq!(
+            result.snapshot.stopped_by,
+            vec!["technology_token_scan_limit"]
+        );
+        assert_eq!(result.snapshot.included_rows, 1);
+        assert_eq!(
+            result.snapshot.limits.technology_token_candidates_per_row,
+            Some(128)
+        );
+        assert_eq!(result.origins[0].technology_clues.len(), 2);
+        assert_eq!(result.origins[0].redirects.len(), 1);
+
+        let mut exact = record("/exact-budget");
+        exact.response.as_mut().unwrap().headers = headers(&[
+            (
+                "Server",
+                &"x ".repeat(technology::MAX_TOKEN_CANDIDATES_PER_ROW - 1),
+            ),
+            ("X-Powered-By", "PHP/8.3.1"),
+            ("Server", " \t "),
+            ("Location", "/not-a-redirect"),
+        ]);
+        let result = map(vec![exact]).await;
+        assert!(result.snapshot.complete);
+        assert!(result.snapshot.stopped_by.is_empty());
+        assert_eq!(
+            result.origins[0].technology_observations.as_ref().unwrap()[0]
+                .reported_version
+                .as_deref(),
+            Some("8.3.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_map_technology_snapshot_scan_work_is_measured_and_bounded() {
+        const ROWS: usize = 1_000;
+        // Eight 4090-byte values plus their six-byte names use exactly the
+        // existing 32-KiB row budget. Unknown one-byte tokens exercise parser
+        // work that does not increase the serialized-metadata byte counter.
+        let dense_value = "x ".repeat((MAX_HEADER_VALUE_BYTES - 6) / 2);
+        let dense_headers = headers(&[("Server", dense_value.as_str()); 8]);
+        assert_eq!(
+            dense_headers
+                .iter()
+                .map(|header| header.name.len() + header.value.len())
+                .sum::<usize>(),
+            MAX_HEADER_BYTES
+        );
+        let ordinary_headers = headers(&[
+            ("Server", "Apache/2.4.62 (Unix) PHP/8.3.1"),
+            ("X-Powered-By", "Express/4.21.2"),
+        ]);
+        // Each iteration owns and drops its store before allocating the next,
+        // keeping retained synthetic header data around 32 MiB at peak.
+        for (scenario, response_headers, observations_per_row, expected_partial) in [
+            ("dense_unknown_tokens", dense_headers, 0, true),
+            ("ordinary_explicit_products", ordinary_headers, 3, false),
+        ] {
+            let header_bytes_per_row = response_headers
+                .iter()
+                .map(|header| header.name.len() + header.value.len())
+                .sum::<usize>();
+            let records = (0..ROWS)
+                .map(|_| {
+                    let mut row = record("/scan-work");
+                    row.request.body_preview = "REQUEST_BODY_SENTINEL".into();
+                    let response = row.response.as_mut().unwrap();
+                    response.body_preview = "RESPONSE_BODY_SENTINEL Jetty(99.99)".into();
+                    response.headers = response_headers.clone();
+                    row
+                })
+                .collect();
+            // No journal, storage directory, locators, app, or target is involved.
+            let store = TransactionStore::from_records(records);
+            let session = Uuid::new_v4();
+            let started = std::time::Instant::now();
+            let snapshot = store.service_map_snapshot(session, ROWS).await;
+            let elapsed = started.elapsed();
+            let projected_bytes = snapshot
+                .rows
+                .iter()
+                .map(|row| {
+                    let serialized = serde_json::to_string(row).unwrap();
+                    assert!(!serialized.contains("BODY_SENTINEL"));
+                    assert!(!serialized.contains("body_preview"));
+                    assert!(!serialized.contains("99.99"));
+                    assert_eq!(
+                        row.technology_observations.as_ref().unwrap().len(),
+                        observations_per_row
+                    );
+                    assert_eq!(row.metadata_complete, !expected_partial);
+                    assert_eq!(
+                        row.omitted.contains(&"technology_token_scan_limit".into()),
+                        expected_partial
+                    );
+                    serialized.len()
+                })
+                .sum::<usize>();
+            eprintln!(
+                "service-map header scan {scenario}: retained_rows={}, considered_rows={}, projected_rows={}, retained_header_bytes={}, projected_bytes={}, snapshot_elapsed={elapsed:?}",
+                snapshot.retained_rows,
+                snapshot.considered_rows,
+                snapshot.rows.len(),
+                ROWS * header_bytes_per_row,
+                projected_bytes,
+            );
+            assert_eq!(snapshot.retained_rows, ROWS);
+            assert_eq!(snapshot.considered_rows, ROWS);
+            assert_eq!(snapshot.rows.len(), ROWS);
+            assert_eq!(snapshot.omitted_rows, 0);
+            // Row reasons enter aggregate completeness in build(), while the
+            // snapshot's own limits still describe the retained row window.
+            assert!(snapshot.stopped_by.is_empty());
+            assert!(projected_bytes <= MAX_METADATA_BYTES);
+            let result = build(session, snapshot, ROWS, false, None, &[], &[]);
+            assert_eq!(result.snapshot.complete, !expected_partial);
+            assert_eq!(
+                result
+                    .snapshot
+                    .stopped_by
+                    .contains(&"technology_token_scan_limit".into()),
+                expected_partial
+            );
+            assert_eq!(result.snapshot.included_rows, ROWS);
+            assert_eq!(result.origins[0].request_count, ROWS);
+            assert!(result.origins[0]
+                .technology_observations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|observation| observation.row_count == ROWS));
+        }
     }
 }

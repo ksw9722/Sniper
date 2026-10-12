@@ -1404,6 +1404,12 @@
                 <button class="service-map-mode" id="serviceMapDirectRelations" type="button" aria-pressed="false" title="Pin the selected origin and show only its direct metadata neighbors">Direct relations</button>
                 <button class="secondary-action hidden" id="serviceMapFocusSelection" type="button">Focus selection</button>
               </div>
+              <div class="service-map-zoom-controls" id="serviceMapZoomControls" role="group" aria-label="Map zoom">
+                <button class="secondary-action" id="serviceMapZoomFit" type="button" title="Fit displayed origins in the map">Fit</button>
+                <button class="secondary-action" id="serviceMapZoomOut" type="button" aria-label="Zoom out">−</button>
+                <button class="secondary-action service-map-zoom-reset" id="serviceMapZoomReset" type="button" aria-label="Zoom 100%. Reset to 100%" title="Reset zoom to 100%">100%</button>
+                <button class="secondary-action" id="serviceMapZoomIn" type="button" aria-label="Zoom in">+</button>
+              </div>
               <label class="service-map-scope"><input id="serviceMapScopeOnly" type="checkbox" /> In scope only</label>
               <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
               <button class="secondary-action" id="serviceMapRefresh" type="button">Refresh</button>
@@ -1412,7 +1418,7 @@
             <div class="service-map-content" id="serviceMapContent">
               <section class="service-map-graph" aria-label="Captured service origins">
                 <div class="service-map-body-overlay hidden" id="serviceMapBodyOverlay" aria-label="Temporary body reference source" aria-live="polite"></div>
-                <div class="service-map-viewport" id="serviceMapViewport"><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
+                <div class="service-map-viewport" id="serviceMapViewport" tabindex="0" aria-label="Service map. Plus or minus to zoom, zero to reset, F to fit."><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
                 <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect instruction <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer header declaration <span class="service-map-line dotted" aria-hidden="true"></span>Body URL reference · no confirmed calls<span id="serviceMapGraphBounds"></span><details class="service-map-bounds-details hidden" id="serviceMapBoundsDetails"><summary>Relation details</summary><p id="serviceMapGraphDiagnostics"></p></details></div>
               </section>
               <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>

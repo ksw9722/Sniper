@@ -3306,6 +3306,93 @@ fn service_map_object(properties: Value) -> Value {
     json!({"type":"object","additionalProperties":false,"required":required,"properties":properties})
 }
 
+// Keep product identities tied to the parser's fixed catalog. Header values and
+// arbitrary server declarations must never become output-schema alternatives.
+fn service_map_technology_schema(exact_row: bool) -> Value {
+    use sniper::service_map_technology::{CATALOG, MAX_OBSERVATIONS_PER_ROW, MAX_VERSION_BYTES};
+    let span = service_map_object(json!({
+        "start":{"type":"integer","minimum":0,"maximum":4095},
+        "end":{"type":"integer","minimum":1,"maximum":4096}
+    }));
+    let numeric_version = json!({
+        "type":"string",
+        "allOf":[
+            {"pattern":"^[0-9]+(?:\\.[0-9]+)*$"},
+            {"pattern":format!("^[0-9.]{{1,{MAX_VERSION_BYTES}}}$")}
+        ]
+    });
+    let mut schema = service_map_object(json!({
+        "product_id":{"type":"string"},"name":{"type":"string"},
+        "catalog_category":{"type":"string","enum":["web_server","application_server","application_framework","language_runtime","cms","edge_service","connector","unknown"]},
+        "reported_version":{"anyOf":[{"type":"null"},numeric_version]},
+        "version_status":{"type":"string","enum":["reported","not_reported","unsupported_format","non_product_version"]},
+        "source":{"type":"string","enum":["response_header"]},
+        "strength":{"type":"string","enum":["literal_declaration"]},
+        "header_name":{"type":"string"}
+    }));
+    let properties = schema["properties"].as_object_mut().unwrap();
+    if exact_row {
+        properties.extend([
+            (
+                "header_index".into(),
+                json!({"type":"integer","minimum":0,"maximum":127}),
+            ),
+            ("product_span".into(), span.clone()),
+            (
+                "version_span".into(),
+                json!({"anyOf":[{"type":"null"},span]}),
+            ),
+            (
+                "offset_basis".into(),
+                json!({"type":"string","enum":["retained_header_value_utf8"]}),
+            ),
+            ("rule_id".into(), json!({"type":"string"})),
+        ]);
+    } else {
+        properties.extend([
+            ("row_count".into(), json!({"type":"integer","minimum":1,"maximum":50000})),
+            ("first_seen".into(), json!({"type":"string","format":"date-time"})),
+            ("last_seen".into(), json!({"type":"string","format":"date-time"})),
+            ("evidence".into(), json!({"type":"array","minItems":1,"maxItems":3,"items":{
+                "type":"string","pattern":"^v1\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}\\.(0|[1-9][0-9]{0,19})\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}$"
+            }})),
+        ]);
+    }
+    let required: Vec<_> = properties.keys().cloned().collect();
+    schema["required"] = json!(required);
+    let catalog: Vec<_> = CATALOG.iter().map(|entry| {
+        let mut fields = json!({
+            "product_id":{"enum":[entry.product_id]},"name":{"enum":[entry.name]},
+            "catalog_category":{"enum":[entry.catalog_category]},
+            "header_name":{"enum":[entry.header_name]},
+            "version_status":{"enum":if serde_json::to_value(entry.catalog_category).unwrap() == "connector" {
+                json!(["not_reported","unsupported_format","non_product_version"])
+            } else if exact_row && entry.rule_id == "server.jetty_parenthesized.v1" {
+                json!(["reported","unsupported_format"])
+            } else {
+                json!(["reported","not_reported","unsupported_format"])
+            }}
+        });
+        if exact_row {
+            fields["rule_id"] = json!({"enum":[entry.rule_id]});
+        }
+        json!({"properties":fields})
+    }).collect();
+    schema["allOf"] = json!([
+        {"anyOf":catalog},
+        {"oneOf":[
+            {"properties":{"version_status":{"enum":["reported"]},"reported_version":{"type":"string"}}},
+            {"properties":{"version_status":{"enum":["not_reported","unsupported_format","non_product_version"]},"reported_version":{"type":"null"}}}
+        ]}
+    ]);
+    if exact_row {
+        schema["allOf"][1]["oneOf"][0]["properties"]["version_span"] = json!({"type":"object"});
+        schema["allOf"][1]["oneOf"][1]["properties"]["version_span"] = json!({"type":"null"});
+        schema["description"] = json!(format!("Literal allowlisted response-header declaration with UTF-8 byte spans. At most {MAX_OBSERVATIONS_PER_ROW} per exact retained row; no inferred software identity."));
+    }
+    schema
+}
+
 fn service_map_output_schema(operation: &str) -> Option<Value> {
     if !matches!(
         operation,
@@ -3371,7 +3458,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         return Some(schema);
     }
     if operation == "target.service_map.evidence.get" {
-        let row = service_map_object(json!({
+        let mut row = service_map_object(json!({
             "evidence_id":string,"record_id":uuid,
             "sequence":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
             "started_at":timestamp,"method":string,"origin":string,"host":string,
@@ -3383,6 +3470,9 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             "header_links":{"type":"array","items":header_link},
             "metadata_complete":boolean,"omitted":strings
         }));
+        row["properties"]["technology_observations"] = json!({
+            "type":"array","maxItems":8,"items":service_map_technology_schema(true)
+        });
         let mut schema = service_map_object(json!({
             "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":string,
             "available":boolean,"reason":{"type":["string","null"]},
@@ -3427,7 +3517,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         .as_array_mut()
         .unwrap()
         .extend([json!("source"), json!("evidence")]);
-    let origin = service_map_object(json!({
+    let mut origin = service_map_object(json!({
         "origin":string,"host":string,"scheme":{"type":"string","enum":["http","https"]},
         "port":port,"in_scope":boolean,"request_count":count,"first_seen":timestamp,"last_seen":timestamp,
         "endpoints":{"type":"array","items":endpoint},
@@ -3442,6 +3532,9 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         }))},
         "header_links":{"type":"array","items":links}
     }));
+    origin["properties"]["technology_observations"] = json!({
+        "type":"array","maxItems":32,"items":service_map_technology_schema(false)
+    });
     let mut limits = serde_json::Map::new();
     for field in [
         "max_records",
@@ -3464,6 +3557,16 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     ] {
         limits.insert(field.into(), json!({"type":"integer","minimum":1}));
     }
+    let mut limits = service_map_object(Value::Object(limits));
+    for (name, cap) in [
+        ("technology_observations_per_row", 8),
+        ("technology_observations_per_origin", 32),
+        ("technology_observations", 2000),
+        ("technology_version_bytes", 32),
+        ("technology_token_candidates_per_row", 128),
+    ] {
+        limits["properties"][name] = json!({"type":"integer","enum":[cap]});
+    }
     let snapshot = service_map_object(json!({
         "id":uuid,"generation":uuid,"captured_at":timestamp,
         "first_retained_started_at":nullable_timestamp,"last_retained_started_at":nullable_timestamp,
@@ -3471,7 +3574,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "oldest_considered_at":nullable_timestamp,"latest_considered_at":nullable_timestamp,
         "retained_rows":count,"considered_rows":count,"non_http_rows":count,"projected_rows":count,"included_rows":count,
         "excluded_rows":count,"omitted_rows":count,"origin_count":count,"endpoint_count":count,
-        "complete":boolean,"stopped_by":strings,"limits":service_map_object(Value::Object(limits))
+        "complete":boolean,"stopped_by":strings,"limits":limits
     }));
     Some(service_map_object(json!({
         "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
@@ -7781,6 +7884,165 @@ fn service_map_safe_origin(origin: &str) -> bool {
     sniper::service_map::canonical_origin(origin).as_deref() == Some(origin)
 }
 
+fn service_map_technology_response_valid(result: &ServiceMap) -> bool {
+    use sniper::service_map_technology::{
+        MAX_OBSERVATIONS, MAX_OBSERVATIONS_PER_ORIGIN, MAX_OBSERVATIONS_PER_ROW,
+        MAX_TOKEN_CANDIDATES_PER_ROW, MAX_VERSION_BYTES,
+    };
+    let limits = &result.snapshot.limits;
+    if ![
+        (
+            limits.technology_observations_per_row,
+            MAX_OBSERVATIONS_PER_ROW,
+        ),
+        (
+            limits.technology_observations_per_origin,
+            MAX_OBSERVATIONS_PER_ORIGIN,
+        ),
+        (limits.technology_observations, MAX_OBSERVATIONS),
+        (limits.technology_version_bytes, MAX_VERSION_BYTES),
+        (
+            limits.technology_token_candidates_per_row,
+            MAX_TOKEN_CANDIDATES_PER_ROW,
+        ),
+    ]
+    .into_iter()
+    .all(|(actual, expected)| actual.is_none_or(|value| value == expected))
+    {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut row_sources = std::collections::HashMap::new();
+    let session = result.session_id.to_string();
+    let generation = result.snapshot.generation.to_string();
+    for origin in &result.origins {
+        let Some(observations) = &origin.technology_observations else {
+            continue;
+        };
+        total = total.saturating_add(observations.len());
+        if total > MAX_OBSERVATIONS || observations.len() > MAX_OBSERVATIONS_PER_ORIGIN {
+            return false;
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for observation in observations {
+            let mut rows = std::collections::HashSet::new();
+            if !observation.is_valid()
+                || observation.row_count > origin.request_count
+                || observation.first_seen < origin.first_seen
+                || observation.last_seen > origin.last_seen
+                || !keys.insert((
+                    observation.product_id.as_str(),
+                    observation.header_name.as_str(),
+                    observation.reported_version.as_deref(),
+                    observation.version_status,
+                ))
+                || !observation.evidence.iter().all(|token| {
+                    if parse_service_map_evidence_id(token).is_err() {
+                        return false;
+                    }
+                    let fields: Vec<_> = token.split('.').collect();
+                    fields[1] == session
+                        && fields[2] == generation
+                        && rows.insert(fields[3])
+                        && row_sources
+                            .insert(fields[3], (token.as_str(), origin.origin.as_str()))
+                            .is_none_or(|previous| {
+                                previous == (token.as_str(), origin.origin.as_str())
+                            })
+                })
+            {
+                return false;
+            }
+        }
+    }
+    // Existing evidence may sample a different subset of rows. When a sequence
+    // is shared, it must identify the same retained row revision everywhere.
+    for origin in &result.origins {
+        let evidence = origin
+            .endpoints
+            .iter()
+            .flat_map(|item| &item.evidence)
+            .chain(
+                origin
+                    .technology_clues
+                    .iter()
+                    .flat_map(|item| &item.evidence),
+            )
+            .chain(origin.redirects.iter().flat_map(|item| &item.evidence))
+            .chain(origin.header_links.iter().flat_map(|item| &item.evidence));
+        for token in evidence {
+            let fields: Vec<_> = token.split('.').collect();
+            if fields.len() == 6
+                && row_sources
+                    .get(fields[3])
+                    .is_some_and(|expected| *expected != (token.as_str(), origin.origin.as_str()))
+            {
+                return false;
+            }
+        }
+    }
+    (!result
+        .snapshot
+        .stopped_by
+        .iter()
+        .any(|reason| reason == "technology_observations_map_limit")
+        || total == MAX_OBSERVATIONS)
+        && (!result
+            .snapshot
+            .stopped_by
+            .iter()
+            .any(|reason| reason == "technology_observations_per_origin_limit")
+            || result.origins.iter().any(|origin| {
+                origin
+                    .technology_observations
+                    .as_ref()
+                    .is_some_and(|items| items.len() == MAX_OBSERVATIONS_PER_ORIGIN)
+            }))
+}
+
+fn service_map_row_technology_valid(row: &sniper::service_map::ServiceMapRow) -> bool {
+    use sniper::service_map_technology::MAX_OBSERVATIONS_PER_ROW;
+    if row.metadata_complete
+        && row
+            .omitted
+            .iter()
+            .any(|reason| reason == "technology_token_scan_limit")
+    {
+        return false;
+    }
+    let Some(observations) = &row.technology_observations else {
+        return true;
+    };
+    let mut ranges = std::collections::HashMap::<usize, Vec<(usize, usize)>>::new();
+    let mut headers = std::collections::HashMap::new();
+    observations.len() <= MAX_OBSERVATIONS_PER_ROW
+        && row.metadata_complete == row.omitted.is_empty()
+        && (!row
+            .omitted
+            .iter()
+            .any(|reason| reason == "technology_observations_limit")
+            || observations.len() == MAX_OBSERVATIONS_PER_ROW)
+        && observations.iter().all(|observation| {
+            observation.is_valid()
+                && std::iter::once(observation.product_span)
+                    .chain(observation.version_span)
+                    .all(|span| {
+                        let retained = ranges.entry(observation.header_index).or_default();
+                        if retained
+                            .iter()
+                            .any(|(start, end)| span.start < *end && *start < span.end)
+                        {
+                            return false;
+                        }
+                        retained.push((span.start, span.end));
+                        true
+                    })
+                && headers
+                    .insert(observation.header_index, observation.header_name.as_str())
+                    .is_none_or(|name| name == observation.header_name)
+        })
+}
+
 fn validate_service_map_response(
     result: &ServiceMap,
     args: &ServiceMapArgs,
@@ -7788,6 +8050,7 @@ fn validate_service_map_response(
 ) -> Result<()> {
     let snapshot = &result.snapshot;
     let valid = result.schema_version == 1
+        && service_map_technology_response_valid(result)
         && result.session_id == session_id
         && result.in_scope_only == args.in_scope_only
         && result.origin_filter == args.origin
@@ -7867,6 +8130,7 @@ fn validate_service_map_evidence_response(
                 && service_map_safe_origin(&row.origin)
                 && matches!(row.scheme.as_str(), "http" | "https")
                 && service_map_safe_path(&row.path)
+                && service_map_row_technology_valid(row)
                 && row.redirect.as_ref().is_none_or(|redirect| {
                     service_map_safe_origin(&redirect.target_origin)
                         && service_map_safe_path(&redirect.target_path)

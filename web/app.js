@@ -14711,6 +14711,12 @@ function initializeTargetWorkspace() {
       directRelations: document.getElementById("serviceMapDirectRelations"),
       focusSelection: document.getElementById("serviceMapFocusSelection"),
       canvas: document.getElementById("serviceMapCanvas"),
+      viewport: document.getElementById("serviceMapViewport"),
+      zoomControls: document.getElementById("serviceMapZoomControls"),
+      zoomFit: document.getElementById("serviceMapZoomFit"),
+      zoomOut: document.getElementById("serviceMapZoomOut"),
+      zoomReset: document.getElementById("serviceMapZoomReset"),
+      zoomIn: document.getElementById("serviceMapZoomIn"),
       graphBounds: document.getElementById("serviceMapGraphBounds"),
       boundsDetails: document.getElementById("serviceMapBoundsDetails"),
       graphDiagnostics: document.getElementById("serviceMapGraphDiagnostics"),
@@ -20763,6 +20769,7 @@ function applyDisplaySettingsState(settings = state.displaySettings) {
   document.body.dataset.theme = settings.theme;
   document.body.dataset.uiFont = settings.uiFont;
   document.body.dataset.monoFont = settings.monoFont;
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.displayChanged?.();
 }
 
 function isUiSettingsLoadSnapshot(snapshot) {
