@@ -7375,7 +7375,19 @@ button.utility-button.replay-tab-add {
 .target-shell > .panel-card { margin: 12px; min-height: 0; }
 .target-shell > #targetPathsPanel { display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .service-map-workspace { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; padding: 12px; gap: 10px; }
-.service-map-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-height: var(--control-h); padding: 0 3px; }
+.service-map-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-height: var(--control-h); padding: 0 3px; position: relative; }
+.service-map-product-filters { min-width: 0; }
+.service-map-product-filters > summary { padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 7px; cursor: pointer; color: var(--text-soft); }
+.service-map-product-filters.has-filter > summary { color: var(--point); border-color: var(--point-border); }
+.service-map-product-filters > summary:focus-visible { outline: 2px solid var(--point); outline-offset: 2px; }
+.service-map-product-filter-panel { position: absolute; z-index: 8; right: 3px; top: calc(100% + 4px); box-sizing: border-box; width: min(560px, calc(100% - 6px)); max-height: min(70vh, 360px); overflow: auto; padding: 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel-elevated); box-shadow: 0 4px 18px rgba(0,0,0,.2); }
+.service-map-product-filter-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 8px; align-items: end; }
+.service-map-product-filter-controls label { display: grid; gap: 5px; min-width: 0; color: var(--text-soft); font-size: var(--font-xs); }
+.service-map-product-filter-controls select { width: 100%; min-width: 0; max-width: 100%; text-overflow: ellipsis; }
+.service-map-product-filter-panel p { margin: 8px 0 0; overflow-wrap: anywhere; }
+.service-map-products > span { min-width: 0; flex: 0 1 auto; }
+.service-map-products > .service-map-products-more { flex: 0 0 auto; }
+@media (max-width: 560px) { .service-map-product-filter-controls { grid-template-columns: minmax(0, 1fr); } .service-map-product-filter-controls > button { justify-self: start; } }
 .service-map-zoom-controls { display: inline-flex; align-items: center; gap: 3px; }
 .service-map-zoom-controls > button { padding: 5px 8px; min-width: 29px; }
 .service-map-zoom-controls > .service-map-zoom-reset { min-width: 49px; font-variant-numeric: tabular-nums; }

@@ -45,6 +45,48 @@ and labels a selected origin outside the filter or card limit. Redirect
 relationship rows include the query-free target path so different destinations
 on the same origin remain distinguishable.
 
+## Reported products and local origin filters
+
+Origin cards summarize at most two products from the loaded, validated response-
+header observations, with `+N` for further products. Full hover titles and the
+inspector retain each literal version, unknown reason, header source, timestamp
+and exact evidence link separately. Missing product/version metadata is labeled
+unavailable; a present empty observation list says no declarations are loaded.
+Neither means that a product is absent. Legacy catalog v1 coverage remains
+explicit. Legacy clue strings and optional HTML-generator inspections are not
+converted into origin product aggregates.
+
+The collapsed **Products / versions** toolbar disclosure filters only loaded
+origins. Product IDs and reported version strings use exact equality. `1`, `01`
+and `1.0` remain different; no version is chosen as newest or installed. Multiple
+reported versions means two or more distinct literal values for the same product
+within one origin. Known and unknown observations can coexist without creating
+a version conflict. Unknown-version filters require the corresponding explicit
+observation status; missing metadata does not match them. Both selected fields
+must match the same product. Changing the product never silently clears the
+version; a disappeared choice remains selected with an unavailable/zero-match
+notice. Options do not depend on origin search.
+
+These filters affect All origins, direct neighbors, and the global API catalog's
+origin membership. Catalog paths belong to matching origins; this does not prove
+that each path reported the product/version. The selected inspector and its local
+method/path filters remain independent, with an outside-filter notice. Direct
+anchors and peer inspected sources stay pinned as labeled context, excluded from
+matching-origin counts. Reference-only and peer-only origins cannot inherit a
+source's technology. Peer cards use only their exact origin's default loaded
+aggregate and label that metadata unavailable when there is no such aggregate;
+peer inspection counts remain separate from default-map counts.
+
+Product filters issue no reads and cancel no pending exact-source, body, Link,
+HTML-generator or peer inspection. They preserve selection, temporary overlays,
+graph mode, zoom and exact endpoint page anchors. Clearing a filter can return
+the catalog to its still-loaded anchor. Same-session refresh, invalidation and
+scope changes retain filters; changing the session clears them. Existing source
+and generation invalidation rules still apply. Display details partition loaded,
+query-hidden, product-hidden, matching and display-cap-omitted origins. Server
+projection omissions remain separate; unloaded products and distinct origins are
+not counted or inferred. The primary summary keeps nonzero omissions visible.
+
 ## Loaded endpoint navigation and filters
 
 Both API lists share local exact, case-sensitive method selection and literal,
@@ -110,7 +152,7 @@ sniper-cli call target.service_map.get --input '{"session_id":"00000000-0000-000
 
 The UUID in the JSON example is synthetic. Select a real session deliberately
 from session discovery. `target` remains an alias for the `scope` command group.
-All five Service Map operations have `side_effect: "read"` and need no `--yes`.
+All Service Map operations have `side_effect: "read"` and need no `--yes`.
 `--dry-run` describes the local API request without contacting it.
 
 `session_id` is optional for the map: omission or null resolves the active session

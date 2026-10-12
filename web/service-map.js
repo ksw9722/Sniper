@@ -179,6 +179,44 @@
         : item.version_status === "non_product_version" ? "Reported version: unknown (non-product version)"
           : "Reported version: unknown (not reported)";
   }
+  const PRODUCT_VERSION_OPTIONS = Object.freeze([
+    ["multiple", "Multiple reported versions"],
+    ["status:not_reported", "Unknown: not reported"],
+    ["status:unsupported_format", "Unknown: unsupported format"],
+    ["status:non_product_version", "Unknown: non-product version"],
+  ]);
+  function reportedProducts(origin) {
+    // Only validated default-map aggregates participate. Missing metadata and
+    // exact-source inspections must never turn into an origin-level claim.
+    if (!origin?.technology_observations_present) return [];
+    const products = new Map();
+    for (const item of origin.technology_observations) {
+      if (!products.has(item.product_id)) products.set(item.product_id, { id: item.product_id, name: item.name, versions: new Set(), statuses: new Set(), observations: [] });
+      const product = products.get(item.product_id);
+      if (item.version_status === "reported") product.versions.add(item.reported_version);
+      else product.statuses.add(item.version_status);
+      product.observations.push(item);
+    }
+    return [...products.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  }
+  function productMatches(origin, productId = "", version = "") {
+    if (!productId && !version) return true;
+    return reportedProducts(origin).some((product) => (!productId || product.id === productId)
+      && (!version || version === "multiple" && product.versions.size > 1
+        || version.startsWith("reported:") && product.versions.has(version.slice(9))
+        || version.startsWith("status:") && product.statuses.has(version.slice(7))));
+  }
+  function productSummaryMarkup(origin) {
+    const products = reportedProducts(origin);
+    if (!products.length) {
+      const label = origin.peerInspectionOnly ? "Default product metadata unavailable"
+        : origin.technology_observations_present ? "No loaded product declarations" : "Product/version metadata unavailable";
+      return `<span class="service-map-clues service-map-products" title="${escape(label)}"><span>${escape(label)}</span></span>`;
+    }
+    const full = (product) => "Header-reported declarations; versions unverified.\n" + product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`).join("\n");
+    const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : " · version unknown"}${product.versions.size && product.statuses.size ? " + unknown" : ""}`;
+    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" title="${escape(products.slice(2).map(full).join("\n"))}">+${products.length - 2}</span>` : ""}</span>`;
+  }
   function normalizeEvidenceObservations(row, catalogVersion) {
     const invalid = () => { throw new Error("Invalid retained source observations"); };
     const text = (value, limit) => typeof value === "string" && value.length > 0 && value.length <= limit;
@@ -690,6 +728,7 @@
       return [{
         origin, captured: true, in_scope: item.in_scope === true, request_count: count(item.request_count),
         first_seen: item.first_seen, last_seen: item.last_seen, technology_observations: technologies[index],
+        technology_observations_present: Object.prototype.hasOwnProperty.call(item, "technology_observations"),
         endpoints: array(item.endpoints).map((endpoint) => ({
           method: String(endpoint.method || "?"), path: safePath(endpoint.path), path_group: safePath(endpoint.path_group || endpoint.path),
           request_count: count(endpoint.request_count), statuses: array(endpoint.statuses), content_types: array(endpoint.content_types),
@@ -834,15 +873,16 @@
       };
     }
   }
-  const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], redirects: [], header_links: [], references: [], referencesOmitted: 0 });
+  const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
   function createController({ elements: els, getSessionId, getEventStreamReady = () => true, request: sendRequest, document: doc = root.document }) {
     // A local retained-data read must not turn an API redirect into another
     // request. Enforce this for every map/inspector read, preserving its signal.
     const request = (path, options) => sendRequest(path, { ...options, redirect: "error" });
+    const productFilterContainer = els.productFilters || els.panel.querySelector?.("#serviceMapProductFilters");
     const state = {
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
-      endpointMethod: "", endpointPath: "", pageAnchor: null, detailPageAnchor: null,
+      endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       peerMatches: null, peerMatchesSource: null, peerMatchesLoading: false, peerMatchesError: "", peerMatchesRequestId: 0, peerEvidenceBinding: null,
@@ -972,9 +1012,47 @@
       state.graphOriginsCache = [...origins.values()];
       return state.graphOriginsCache;
     }
-    function filteredOrigins() {
+    function originFilterStages(origins) {
       const query = state.query.trim().toLowerCase();
-      return graphOrigins().filter((origin) => (!state.scopeOnly || origin.in_scope || !origin.captured) && (!query || origin.origin.toLowerCase().includes(query)));
+      const searched = origins.filter((origin) => !query || origin.origin.toLowerCase().includes(query));
+      const matching = searched.filter((origin) => productMatches(origin, state.productId, state.productVersion));
+      return { loaded: origins, searched, matching, queryHidden: origins.length - searched.length, productHidden: searched.length - matching.length };
+    }
+    function filteredOrigins() {
+      return originFilterStages(graphOrigins().filter((origin) => !state.scopeOnly || origin.in_scope || !origin.captured)).matching;
+    }
+    function setProductFilter(kind, value) {
+      if (!["product", "version", "clear"].includes(kind)) return;
+      if (kind === "clear") { state.productId = ""; state.productVersion = ""; }
+      else if (kind === "product") {
+        if (value && !TECHNOLOGY_CATALOG_V2.has(value)) return;
+        state.productId = value || "";
+      } else {
+        if (value && !PRODUCT_VERSION_OPTIONS.some(([key]) => key === value)
+          && !(typeof value === "string" && value.length <= 41 && /^reported:[0-9]+(?:\.[0-9]+)*$/.test(value))) return;
+        state.productVersion = value || "";
+      }
+      // Product filters change membership, never source identity or pending
+      // reads. Retain exact catalog anchors and the independent inspector page.
+      if (state.snapshot) reconcileEndpointPages();
+      render();
+    }
+    function renderProductFilters() {
+      if (!productFilterContainer) return;
+      const all = (state.snapshot?.origins || []).flatMap(reportedProducts);
+      const products = new Map(all.map((product) => [product.id, product.name]));
+      const selected = all.filter((product) => !state.productId || product.id === state.productId);
+      const versions = new Set(selected.flatMap((product) => [...product.versions]));
+      const options = new Map([["", "Any version/status"], ...PRODUCT_VERSION_OPTIONS,
+        ...[...versions].sort().map((version) => [`reported:${version}`, `Reported: ${version}`])]);
+      const unavailableProduct = !!state.productId && !products.has(state.productId);
+      const unavailableVersion = !!state.productVersion && !(state.snapshot?.origins || []).some((origin) => productMatches(origin, state.productId, state.productVersion));
+      if (state.productId) products.set(state.productId, TECHNOLOGY_CATALOG_V2.get(state.productId)[0]);
+      if (state.productVersion.startsWith("reported:") && !options.has(state.productVersion)) options.set(state.productVersion, `Reported: ${state.productVersion.slice(9)} (unavailable)`);
+      replace(productFilterContainer, `<div class="service-map-product-filter-controls"><label>Product (exact)<select data-service-product-filter="product" data-service-focus="products:product" aria-describedby="serviceMapProductHelp"><option value="">All products</option>${[...products].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([id, name]) => `<option value="${escape(id)}" ${state.productId === id ? "selected" : ""}>${escape(name)}${unavailableProduct && state.productId === id ? " (unavailable)" : ""}</option>`).join("")}</select></label><label>Version/status (exact)<select data-service-product-filter="version" data-service-focus="products:version" title="${escape(options.get(state.productVersion))}" aria-describedby="serviceMapProductHelp">${[...options].map(([id, name]) => `<option value="${escape(id)}" ${state.productVersion === id ? "selected" : ""}>${escape(name)}</option>`).join("")}</select></label><button class="secondary-action" type="button" data-service-product-filter-clear="true" data-service-focus="products:clear" ${!state.productId && !state.productVersion ? "disabled" : ""}>Clear</button></div><p id="serviceMapProductHelp" class="service-map-muted">Loaded response-header declarations only. Product and version/status match the same product. Versions are literal and unverified. Options are independent of origin search.</p>${unavailableProduct || unavailableVersion ? '<p class="service-map-filter-notice" role="status">Selected product/version is unavailable in the loaded snapshot. Filters retained; zero matching origins.</p>' : ""}`);
+      productFilterContainer.parentElement?.classList.toggle("has-filter", !!state.productId || !!state.productVersion);
+      const summary = productFilterContainer.parentElement?.querySelector("summary");
+      if (summary) summary.textContent = state.productId || state.productVersion ? "Products / versions · active" : "Products / versions";
     }
     function findOrigin(id) {
       if (!id) return null;
@@ -1168,7 +1246,9 @@
       const scan = overlay.scan, ids = [scan.source.origin, ...scan.origins.map((group) => group.origin)];
       return [...new Set(ids)].map((id) => {
         const group = scan.origins.find((item) => item.origin === id);
-        return { ...referenceOrigin(id), captured: true, peerInspectionOnly: true, in_scope: id === scan.source.origin ? scan.source.in_scope : group.in_scope,
+        const aggregate = state.snapshot?.origins.find((origin) => origin.origin === id);
+        return { ...referenceOrigin(id), captured: true, peerInspectionOnly: !aggregate,
+          technology_observations: aggregate?.technology_observations || [], technology_observations_present: aggregate?.technology_observations_present === true, in_scope: id === scan.source.origin ? scan.source.in_scope : group.in_scope,
           peerGroup: group || null, peerSource: id === scan.source.origin, request_count: 0 };
       });
     }
@@ -1302,7 +1382,8 @@
     function renderPeerGraph() {
       const overlay = state.bodyReferenceOverlay, scan = overlay.scan, query = state.query.trim().toLowerCase();
       const allOrigins = peerOverlayOrigins(), source = allOrigins[0];
-      const matching = [source, ...allOrigins.slice(1).filter((item) => !query || item.origin.toLowerCase().includes(query))];
+      const stages = originFilterStages(allOrigins.slice(1));
+      const matching = [source, ...stages.matching];
       const textSize = doc?.documentElement && typeof root.getComputedStyle === "function" ? Number.parseFloat(root.getComputedStyle(doc.documentElement).getPropertyValue("--ui-root-size")) : 12;
       const layout = peerGraphLayout(matching, source.origin, graphGeometry(textSize));
       currentLayout = layout;
@@ -1325,16 +1406,27 @@
         if (item.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(address)}" style="left:${item.x}px;top:${item.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(address)}">${escape(address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${scan.peer.address_family.toUpperCase()}</span><span class="service-map-card-meta" title="${escape(times[0])}">First: ${escape(compactTime(times[0]))}</span><span class="service-map-card-meta" title="${escape(times.at(-1))}">Last: ${escape(compactTime(times.at(-1)))}</span></span></div>`;
         const selected = item.origin === state.selectedOrigin, pinned = item.origin === source.origin;
         const inDefault = state.snapshot.origins.some((origin) => origin.origin === item.origin);
-        return `<button class="service-map-card peer-captured ${selected ? "selected" : ""} ${pinned ? "pinned" : ""}" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="origin:${escape(item.origin)}" aria-current="${selected}" style="left:${item.x}px;top:${item.y}px"><span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(item.origin)}">${escape(new URL(item.origin).host)}</strong><span class="service-map-card-scheme">${pinned ? "Pinned inspected source" : "Captured matching origin"}</span><span class="service-map-card-meta" title="${inDefault ? "Also in the default metadata projection" : "Captured in this peer inspection; outside the default metadata projection"}">${inDefault ? "Also in default projection" : "Captured in peer inspection"}</span><span class="service-map-card-meta">${pinned ? "Source + " : ""}${item.peerGroup?.matching_rows || 0} ${pinned ? "other " : ""}matching rows</span></span><span class="service-map-scope-dot ${item.in_scope ? "in-scope" : ""}" title="${item.in_scope ? "In scope" : "Out of scope"}"></span></button>`;
+        return `<button class="service-map-card peer-captured ${selected ? "selected" : ""} ${pinned ? "pinned" : ""}" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="origin:${escape(item.origin)}" aria-current="${selected}" style="left:${item.x}px;top:${item.y}px"><span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(item.origin)}">${escape(new URL(item.origin).host)}</strong><span class="service-map-card-scheme" title="${inDefault ? "Also in the default metadata projection; products use this exact origin’s default aggregate" : "Captured in this peer inspection; default product metadata unavailable"}">${pinned ? "Pinned inspected source" : inDefault ? "Also in default projection" : "Captured in peer inspection"}</span>${productSummaryMarkup(item)}<span class="service-map-card-meta">${pinned ? "Source + " : ""}${item.peerGroup?.matching_rows || 0} ${pinned ? "other " : ""}matching rows</span></span><span class="service-map-scope-dot ${item.in_scope ? "in-scope" : ""}" title="${item.in_scope ? "In scope" : "Out of scope"}"></span></button>`;
       }).join("");
       replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout" style="--service-map-card-width:${layout.geometry.cardWidth}px;--service-map-card-height:${layout.geometry.cardHeight}px;--service-map-line-height:${layout.geometry.lineHeight};width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>${cards}</div></div>`);
       const shown = new Set(layout.nodes.slice(1).map((item) => item.origin));
-      const queryHidden = allOrigins.length - matching.length, capHidden = matching.length - shown.size;
-      const queryRows = allOrigins.filter((item) => !matching.includes(item)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
+      const queryHidden = stages.queryHidden, productHidden = stages.productHidden, capHidden = matching.length - shown.size;
+      const productRows = stages.searched.filter((item) => !stages.matching.includes(item)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
+      const queryRows = stages.loaded.filter((item) => !stages.searched.includes(item)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
       const capRows = matching.filter((item) => !shown.has(item.origin)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
-      const shownRows = allOrigins.filter((item) => shown.has(item.origin)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
-      els.graphBounds.textContent = `${shown.size} / ${allOrigins.length} returned origins shown + 1 recorded address node · ${layout.edges.length} undirected observation spokes · ${shownRows} other matching rows represented · ${queryHidden} origins / ${queryRows} rows hidden by query · ${capHidden} origins / ${capRows} rows omitted by 24-node display cap${query && !source.origin.toLowerCase().includes(query) ? " · Pinned source remains visible outside query" : ""}${state.selectedOrigin && !shown.has(state.selectedOrigin) ? " · Selected origin is outside this display; inspector retained" : ""}`;
-      if (els.graphDiagnostics) els.graphDiagnostics.textContent = `Recorded address group only. Source and address node are reserved within the 24-node cap (at most 23 origins); inclusive edge cap 40. ${scan.counts.omitted_matching_rows} matching rows omitted by API result caps; unreturned distinct origins are not counted. ${scan.complete ? "Complete" : "Partial"} inspection, ${scan.snapshot.considered_rows} / ${scan.snapshot.retained_rows} retained rows considered. Observation times describe recorded facts, not connections or continuous occupancy. ${PEER_PRIVACY}`;
+      const shownRows = stages.matching.filter((item) => shown.has(item.origin)).reduce((sum, item) => sum + (item.peerGroup?.matching_rows || 0), 0);
+      els.graphBounds.textContent = [
+        `${shown.size} / ${allOrigins.length} returned origins shown + 1 recorded address node`,
+        `${layout.edges.length} undirected observation spokes · ${shownRows} peer-match rows in shown matching origins`,
+        source.peerGroup?.matching_rows ? `${source.peerGroup.matching_rows} peer-match rows in pinned context (separate)` : "",
+        queryHidden ? `${queryHidden} origins / ${queryRows} rows hidden by query` : "",
+        productHidden ? `${productHidden} origins / ${productRows} rows hidden by products/versions` : "",
+        state.productId || state.productVersion ? `${stages.matching.length} matching origins (source excluded)` : "",
+        capHidden ? `${capHidden} origins / ${capRows} rows omitted by 24-node display cap` : "",
+        query && !source.origin.toLowerCase().includes(query) || !productMatches(source, state.productId, state.productVersion) ? "Pinned source remains visible outside filters (context only)" : "",
+        state.selectedOrigin && !shown.has(state.selectedOrigin) ? "Selected origin is outside this display; inspector retained" : "",
+      ].filter(Boolean).join(" · ");
+      if (els.graphDiagnostics) els.graphDiagnostics.textContent = `Recorded address group only. ${stages.loaded.length} other loaded returned origins → ${queryHidden} query-hidden → ${productHidden} product/version-hidden → ${stages.matching.length} matching → ${capHidden} display-cap omitted. Pinned source is context, excluded from matching origins; its ${source.peerGroup?.matching_rows || 0} other matching rows are counted separately from filtered origin matches. Products use only an exact origin’s loaded default aggregate, not the peer source or samples. Source and address node are reserved within the 24-node cap (at most 23 origins); inclusive edge cap 40. ${scan.counts.omitted_matching_rows} matching rows omitted by API result caps; unreturned distinct origins are not counted. ${scan.complete ? "Complete" : "Partial"} inspection, ${scan.snapshot.considered_rows} / ${scan.snapshot.retained_rows} retained rows considered. Observation times describe recorded facts, not connections or continuous occupancy. ${PEER_PRIVACY}`;
     }
 
     function cancelBodyReferences() {
@@ -1381,7 +1473,7 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
+        selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
@@ -1789,11 +1881,12 @@
       const selected = selectedOrigin();
       const direct = directNeighborhood();
       const query = state.query.trim().toLowerCase();
-      const matchingNeighbors = direct?.neighbors.filter((origin) => !query || origin.origin.toLowerCase().includes(query)) || [];
-      const origins = direct ? [direct.anchor, ...matchingNeighbors] : filteredOrigins();
+      const stages = originFilterStages(direct ? direct.neighbors : graphOrigins().filter((origin) => !state.scopeOnly || origin.in_scope || !origin.captured));
+      const matchingNeighbors = direct ? stages.matching : [];
+      const origins = direct ? [direct.anchor, ...matchingNeighbors] : stages.matching;
       const neighborOrder = direct ? stableOrder(state.order, matchingNeighbors) : [];
       const order = direct ? [direct.anchor.origin, ...neighborOrder.filter((id) => direct.bodyIds.has(id)), ...neighborOrder.filter((id) => !direct.bodyIds.has(id))] : state.order;
-      const filterKey = JSON.stringify([query, state.scopeOnly, state.sessionId, state.anchorOrigin]);
+      const filterKey = JSON.stringify([query, state.productId, state.productVersion, state.scopeOnly, state.sessionId, state.anchorOrigin]);
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
       const textSize = doc?.documentElement && typeof root.getComputedStyle === "function"
         ? Number.parseFloat(root.getComputedStyle(doc.documentElement).getPropertyValue("--ui-root-size")) : 12;
@@ -1801,8 +1894,9 @@
       state.layoutSlots = layout.slots;
       currentLayout = layout.nodes.length ? layout : null;
       applyGraphScale();
-      els.boundsDetails?.classList.toggle("hidden", !direct);
-      if (!direct && els.graphDiagnostics) els.graphDiagnostics.textContent = "";
+      els.boundsDetails?.classList.toggle("hidden", !state.snapshot);
+      if (!direct && els.graphDiagnostics) els.graphDiagnostics.textContent = state.snapshot
+        ? `${stages.loaded.length} loaded origins · ${stages.queryHidden} query-hidden · ${stages.productHidden} product/version-hidden · ${stages.matching.length} matching · ${layout.nodes.length} shown · ${Math.max(0, stages.matching.length - layout.nodes.length)} omitted by ${MAX_CARDS}-card cap. Counts describe only loaded origins and reference cards; server projection omissions and omitted reference declarations are separate. Unloaded products and distinct origins are not counted.` : "";
       els.mapControls?.classList.toggle("hidden", state.view === "apis");
       els.allOrigins?.setAttribute("aria-pressed", String(!state.anchorOrigin));
       els.directRelations?.setAttribute("aria-pressed", String(!!state.anchorOrigin));
@@ -1820,8 +1914,8 @@
           ? `Selected origin is outside the ${MAX_REFERENCE_CARDS}-reference-card limit; inspector retained.`
           : "Selected origin is outside this filter; inspector retained.";
       if (!origins.length) {
-        replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly ? "Change the origin filter or turn off In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
-        els.graphBounds.textContent = [state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
+        replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly || state.productId || state.productVersion ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly || state.productId || state.productVersion ? "Change the origin search, product/version filters or In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
+        els.graphBounds.textContent = ["0 matching origins", stages.queryHidden ? `${stages.queryHidden} hidden by query` : "", stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "", state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
       }
       const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}" d="${edge.path}" marker-end="url(#service-map-arrow)"><title>${escape(edge.source)} → ${escape(edge.target)} · ${escape(edge.label)} · ${edge.relationship}</title></path>`).join("");
@@ -1830,7 +1924,7 @@
         const url = new URL(origin.origin);
         const pinned = origin.origin === state.anchorOrigin;
         return `<button class="service-map-card ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""} ${pinned ? "pinned" : ""}" type="button" data-service-origin="${escape(origin.origin)}" data-service-focus="origin:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
-          <span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong><span class="service-map-card-scheme">${escape(url.protocol.slice(0, -1))} · ${pinned ? "pinned anchor" : origin.captured ? "captured origin" : "referenced origin"}</span><span class="service-map-clues">${origin.technology_clues.slice(0, 2).map((clue) => `<span title="Observed response header; not verified architecture">${escape(clue.name)} · header clue</span>`).join("")}</span><span class="service-map-card-meta">${origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : direct?.bodyIds.has(origin.origin) ? state.bodyReferenceOverlay?.kind === "link" ? "Link declaration · no captured rows" : "Body URL reference · no captured rows" : "Referenced only in this snapshot"}</span></span>
+          <span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong><span class="service-map-card-scheme">${escape(url.protocol.slice(0, -1))} · ${pinned ? "pinned anchor" : origin.captured ? "captured origin" : "referenced origin"}</span>${productSummaryMarkup(origin)}<span class="service-map-card-meta">${origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : direct?.bodyIds.has(origin.origin) ? state.bodyReferenceOverlay?.kind === "link" ? "Link declaration · no captured rows" : "Body URL reference · no captured rows" : "Referenced only in this snapshot"}</span></span>
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
       }).join("");
@@ -1846,7 +1940,7 @@
         const visibleIds = new Set(layout.nodes.map((origin) => origin.origin));
         const availableBodyArrows = overlayEdges().filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)).length;
         const availableMetadataArrows = layout.edgeCount - availableBodyArrows;
-        const queryHidden = direct.neighbors.length - matchingNeighbors.length;
+        const queryHidden = stages.queryHidden, productHidden = stages.productHidden;
         const capOmitted = Math.max(0, matchingNeighbors.length - (MAX_CARDS - 1));
         const incomplete = state.snapshot.snapshot.complete !== true || array(state.snapshot.snapshot.stopped_by).length > 0;
         const outsideQuery = query && !direct.anchor.origin.toLowerCase().includes(query);
@@ -1856,9 +1950,12 @@
           state.bodyReferenceOverlay ? `${metadataArrows} metadata / ${overlayCount} ${linkOverlay ? "Link" : "body URL"} links` : "",
           state.bodyReferenceOverlay ? `${shownBodyArrows} / ${overlayCount} ${linkOverlay ? "Link" : "body"} arrows shown` : "",
           queryHidden ? `${queryHidden} hidden by query` : "",
+          productHidden ? `${productHidden} hidden by products/versions` : "",
+          state.productId || state.productVersion ? `${matchingNeighbors.length} matching neighbors · pinned anchor is context only` : "",
           capOmitted ? `${capOmitted} omitted by ${MAX_CARDS}-card cap` : "",
           layout.edgeCount > MAX_EDGES ? `${layout.edgeCount - MAX_EDGES} arrows omitted by ${MAX_EDGES}-arrow cap` : "",
           outsideQuery ? "Pinned anchor is outside the search query and remains visible." : "",
+          !productMatches(direct.anchor, state.productId, state.productVersion) ? "Pinned anchor remains visible outside product/version filters (context only)." : "",
           !direct.anchor.captured ? "Reference-only anchor; no captured rows shown." : "",
           !direct.neighbors.length ? "No direct neighbors appear in loaded metadata; others may exist." : "",
           incomplete ? "Known neighborhood is incomplete; see snapshot bounds above." : "",
@@ -1866,7 +1963,7 @@
         ];
         const diagnostics = [
           `Direct relations · ${direct.neighbors.length} known direct neighbors in loaded metadata${state.bodyReferenceOverlay ? linkOverlay ? " and temporary Link declarations (unique union)" : " and temporary body references (unique union)" : ""}`,
-          `${layout.nodes.length - 1} shown · ${queryHidden} query-hidden · ${capOmitted} omitted by ${MAX_CARDS}-card cap (anchor included)`,
+          `${direct.neighbors.length} loaded neighbors · ${queryHidden} query-hidden · ${productHidden} product/version-hidden · ${matchingNeighbors.length} matching · ${layout.nodes.length - 1} shown · ${capOmitted} omitted by ${MAX_CARDS}-card cap (anchor included). Pinned anchor is context, excluded from matching counts`,
           `Non-self distinct typed links: ${counts.incoming} incoming / ${counts.outgoing} outgoing · ${counts.redirect_instruction} redirect / ${counts.origin_header} Origin / ${counts.referer_header} Referer${state.bodyReferenceOverlay ? linkOverlay ? Object.values(LINK_RELATIONS).map((item) => ` / ${counts[item.type] || 0} ${item.type}`).join("") : ` / ${counts.body_url_reference} body_url_reference` : ""}`,
           `${layout.edges.length} / ${layout.edgeCount} arrows between displayed cards (cap ${MAX_EDGES}) · ${direct.edgeCount - layout.edgeCount} links outside displayed cards`,
           ...(state.bodyReferenceOverlay ? [
@@ -1879,7 +1976,7 @@
         ];
         els.graphBounds.textContent = summary.filter(Boolean).join(" · ");
         if (els.graphDiagnostics) els.graphDiagnostics.textContent = diagnostics.join(" · ");
-      } else els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
+      } else els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${stages.queryHidden ? ` · ${stages.queryHidden} hidden by query` : ""}${stages.productHidden ? ` · ${stages.productHidden} hidden by products/versions` : ""}${origins.length > layout.nodes.length ? ` · ${origins.length - layout.nodes.length} omitted by ${MAX_CARDS}-card cap` : ""}${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
     }
     function endpointMatches(endpoint) {
       return (!state.endpointMethod || endpoint.method === state.endpointMethod) && endpoint.path.includes(state.endpointPath);
@@ -1900,7 +1997,12 @@
       ]) {
         const index = entries.findIndex((entry) => sameEndpoint(entry, state[anchorKey]));
         state[pageKey] = Math.min(index < 0 ? state[pageKey] : Math.floor(index / API_PAGE_SIZE), Math.max(0, Math.ceil(entries.length / API_PAGE_SIZE) - 1));
-        if (index < 0) state[anchorKey] = entries[state[pageKey] * API_PAGE_SIZE] ? endpointIdentity(entries[state[pageKey] * API_PAGE_SIZE]) : null;
+        // A local origin filter can hide an otherwise retained catalog anchor.
+        // Keep it so clearing the filter returns to that exact endpoint; a
+        // genuinely removed endpoint still adopts the clamped fallback page.
+        const hiddenLoadedAnchor = pageKey === "page" && loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false)
+          .some((entry) => sameEndpoint(entry, state[anchorKey]));
+        if (index < 0 && !hiddenLoadedAnchor) state[anchorKey] = entries[state[pageKey] * API_PAGE_SIZE] ? endpointIdentity(entries[state[pageKey] * API_PAGE_SIZE]) : null;
       }
     }
     function setEndpointFilter(kind, value) {
@@ -1927,12 +2029,13 @@
       const selected = state.endpointSelection || (state.evidence?.origin === origin.origin ? state.evidence : null);
       const notices = [];
       if (selected && !endpointMatches(selected)) notices.push("Selected endpoint is outside the loaded endpoint filters. Its inspector selection and evidence are preserved.");
+      if (!productMatches(origin, state.productId, state.productVersion)) notices.push("Selected origin is outside the product/version filters. Its inspector and exact evidence remain open.");
       const query = state.query.trim().toLowerCase();
       if (query && !origin.origin.toLowerCase().includes(query)) notices.push("Selected origin is outside the origin search. Its inspector remains open.");
       return notices.length ? `<p class="service-map-filter-notice" role="status">${notices.join(" ")}</p>` : "";
     }
-    function endpointCoverageMarkup(matching, loaded, start, hiddenOrigins = 0) {
-      return `<p class="service-map-muted service-map-endpoint-counts" role="status">${matching ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, matching)} / ${matching.toLocaleString()} matching · ${loaded.toLocaleString()} loaded · ${(loaded - hiddenOrigins - matching).toLocaleString()} hidden by endpoint filters${hiddenOrigins ? ` · ${hiddenOrigins.toLocaleString()} hidden by origin search` : ""}.</p><p class="service-map-muted">Counts cover loaded method/path combinations only. Server scope and projection omissions are separate in the snapshot summary above; this is not an exhaustive endpoint inventory.</p>`;
+    function endpointCoverageMarkup(matching, loaded, start, hiddenOrigins = 0, hiddenProducts = 0) {
+      return `<p class="service-map-muted service-map-endpoint-counts" role="status">${matching ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, matching)} / ${matching.toLocaleString()} matching · ${loaded.toLocaleString()} loaded · ${(loaded - hiddenOrigins - hiddenProducts - matching).toLocaleString()} hidden by endpoint filters${hiddenProducts ? ` · ${hiddenProducts.toLocaleString()} hidden by origin products/versions` : ""}${hiddenOrigins ? ` · ${hiddenOrigins.toLocaleString()} hidden by origin search` : ""}.</p><p class="service-map-muted">Counts cover loaded method/path combinations only. Server scope and projection omissions are separate in the snapshot summary above; this is not an exhaustive endpoint inventory.</p>`;
     }
     function endpointButton(endpoint, origin, index, catalog = false) {
       const method = endpoint.method;
@@ -2050,7 +2153,7 @@
       return `<section class="service-map-socket-peer" aria-label="Upstream socket peer">${heading}${content}</section>${peerMatchesMarkup()}`;
     }
     function technologyMarkup(items, origin = null) {
-      if (!items.length) return "";
+      if (!items.length) return origin ? `<p class="service-map-muted service-map-product-coverage">${origin.technology_observations_present ? "No loaded product declarations." : origin.peerInspectionOnly ? "Default product metadata unavailable. Exact peer samples do not provide a default origin aggregate." : "Product/version metadata unavailable for this origin."} Missing or empty observations do not prove that a product is absent.</p>` : "";
       const rows = items.map((item) => {
         const detail = origin
           ? `${item.row_count} retained row${item.row_count === 1 ? "" : "s"} · First: ${item.first_seen} · Last: ${item.last_seen}`
@@ -2107,12 +2210,12 @@
       const origin = selectedOrigin();
       if (!origin) { replaceDetail('<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
       if (origin.peerInspectionOnly) {
-        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(origin.origin)}">${escape(new URL(origin.origin).host)}</h3><p>${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header><div class="service-map-detail-body">${evidenceMarkup(origin)}</div>`);
+        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(origin.origin)}">${escape(new URL(origin.origin).host)}</h3><p>${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header><div class="service-map-detail-body">${endpointSelectionNotice(origin)}${evidenceMarkup(origin)}</div>`);
         return;
       }
       if (!origin.captured) {
         const bodyReference = overlayReferences().some((item) => item.target_origin === origin.origin);
-        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in loaded declarations${bodyReference ? state.bodyReferenceOverlay.kind === "link" ? " or the temporary Link declarations" : " or the temporary body URL references" : ""}. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${bodyReference ? `<h4>${state.bodyReferenceOverlay.kind === "link" ? "Retained Link declaration" : "Literal body URL reference"}</h4>${overlayProvenanceMarkup()}<p class="service-map-muted">This reference does not prove a request, call, or service ownership.</p>` : ""}${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
+        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body">${endpointSelectionNotice(origin)}<h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in loaded declarations${bodyReference ? state.bodyReferenceOverlay.kind === "link" ? " or the temporary Link declarations" : " or the temporary body URL references" : ""}. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${bodyReference ? `<h4>${state.bodyReferenceOverlay.kind === "link" ? "Retained Link declaration" : "Literal body URL reference"}</h4>${overlayProvenanceMarkup()}<p class="service-map-muted">This reference does not prove a request, call, or service ownership.</p>` : ""}${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
         return;
       }
       const entries = loadedEndpointEntries([origin]);
@@ -2125,8 +2228,10 @@
         <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, origin-IP association or certificate identity is available. Optional socket peers start in exact source evidence; explicit recorded matches can be shown as a temporary group.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
     function renderCatalog() {
-      const loaded = loadedEndpointEntries(state.snapshot?.origins || [], false);
-      const originEntries = loadedEndpointEntries(filteredOrigins(), false);
+      const loaded = loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false);
+      const stages = originFilterStages((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope));
+      const searchedEntries = loadedEndpointEntries(stages.searched, false);
+      const originEntries = loadedEndpointEntries(stages.matching, false);
       const entries = originEntries.filter(({ endpoint }) => endpointMatches(endpoint));
       const pages = Math.max(1, Math.ceil(entries.length / API_PAGE_SIZE));
       // Invalidation temporarily removes the snapshot. Keep the previous page
@@ -2134,10 +2239,11 @@
       if (state.snapshot) state.page = Math.min(state.page, pages - 1);
       const start = state.page * API_PAGE_SIZE;
       if (!state.pageAnchor && entries[start]) state.pageAnchor = endpointIdentity(entries[start]);
-      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3><p>Method/path combinations from retained HTTP history. Query strings are omitted; no endpoint is probed.</p></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(entries.length, loaded.length, start, loaded.length - originEntries.length)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ origin, endpoint, index }) => endpointButton(endpoint, origin, index, true)).join("") || `<p class="empty-copy">${state.loading ? "Loading retained API paths…" : "No loaded endpoints match these filters and origin search."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${entries.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, entries.length)} / ${entries.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
+      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3><p>Method/path combinations belonging to matching origins. Origin products/versions do not prove that each endpoint reported them. Query strings are omitted; no endpoint is probed.</p></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(entries.length, loaded.length, start, loaded.length - searchedEntries.length, searchedEntries.length - originEntries.length)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ origin, endpoint, index }) => endpointButton(endpoint, origin, index, true)).join("") || `<p class="empty-copy">${state.loading ? "Loading retained API paths…" : "No loaded endpoints match these filters, origin search and origin products/versions."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${entries.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, entries.length)} / ${entries.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
     }
     function render() {
       renderStatus();
+      renderProductFilters();
       renderOverlayStatus();
       renderGraph();
       renderDetail();
@@ -2167,6 +2273,7 @@
       } else if (data.serviceOrigin) selectOrigin(data.serviceOrigin);
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; renderDetail(); }
       else if (data.serviceEndpointFilterClear) setEndpointFilter("clear");
+      else if (data.serviceProductFilterClear) setProductFilter("clear");
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
       else if (data.serviceBodyReferences) loadBodyReferences();
       else if (data.serviceLinkDeclarations) loadLinkDeclarations();
@@ -2180,7 +2287,8 @@
     let onViewChange = null;
     els.panel.addEventListener("click", handleClick);
     els.panel.addEventListener("change", (event) => {
-      if (event.target?.dataset?.serviceRelationshipKind) setRelationshipKind(event.target.value);
+      if (event.target?.dataset?.serviceProductFilter) setProductFilter(event.target.dataset.serviceProductFilter, event.target.value);
+      else if (event.target?.dataset?.serviceRelationshipKind) setRelationshipKind(event.target.value);
       else if (event.target?.dataset?.serviceEndpointFilter === "method") setEndpointFilter("method", event.target.value);
     });
     els.panel.addEventListener("input", (event) => {
@@ -2225,7 +2333,7 @@
     });
     render();
     return {
-      refresh, reset, selectOrigin, setZoom, fitGraph, loadEvidence, loadPeerEvidence, loadPeerMatches, showPeerMatchesOnMap, loadBodyReferences, loadLinkDeclarations, loadHtmlGenerators, setRelationshipKind, showBodyReferencesOnMap, showLinkDeclarationsOnMap, clearBodyReferenceOverlay,
+      refresh, reset, selectOrigin, setProductFilter, setZoom, fitGraph, loadEvidence, loadPeerEvidence, loadPeerMatches, showPeerMatchesOnMap, loadBodyReferences, loadLinkDeclarations, loadHtmlGenerators, setRelationshipKind, showBodyReferencesOnMap, showLinkDeclarationsOnMap, clearBodyReferenceOverlay,
       displayChanged() { renderGraph(); },
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
@@ -2279,5 +2387,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);
