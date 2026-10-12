@@ -5516,6 +5516,245 @@ mod history_fixture {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_body_references_preserve_canonical_partial_and_absent_states() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "body-references",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        let mut cases = Vec::new();
+        let mut empty = body_references_payload("scanned");
+        empty["retained_preview_bytes"] = json!(0);
+        empty["scanned_bytes"] = json!(0);
+        empty["candidates_scanned"] = json!(0);
+        empty["references"] = json!([]);
+        cases.push(empty);
+        for reason in [
+            "candidate_bytes",
+            "candidate_limit",
+            "offset_limit",
+            "scan_prefix_truncated",
+        ] {
+            let mut payload = body_references_payload("scanned");
+            payload["status"] = json!("partial");
+            payload["complete"] = json!(false);
+            payload["reasons"] = json!([reason]);
+            match reason {
+                "candidate_limit" => {
+                    payload["candidates_scanned"] = json!(4096);
+                    payload["scanned_bytes"] = json!(262144);
+                    payload["retained_preview_bytes"] = json!(262144);
+                }
+                "offset_limit" => {
+                    payload["candidates_scanned"] = json!(6);
+                    payload["references"][0]["occurrences"] = json!(6);
+                    payload["references"][0]["preview_byte_offsets"] = json!([0, 10, 20, 30, 40]);
+                    payload["references"][0]["omitted_offsets"] = json!(1);
+                }
+                "scan_prefix_truncated" => {
+                    // Resident previews may exceed the serialized disk-read cap;
+                    // the UTF-8 boundary can shorten the offered prefix by 3 bytes.
+                    payload["scan_prefix_truncated"] = json!(true);
+                    payload["scanned_bytes"] = json!(262141);
+                    payload["retained_preview_bytes"] = json!(3000000);
+                }
+                _ => {}
+            }
+            cases.push(payload);
+        }
+        for reason in [
+            "invalid_evidence_id",
+            "session_mismatch",
+            "stale_generation",
+            "record_missing",
+            "record_changed",
+            "body_identity_unverifiable",
+            "body_storage_unavailable",
+            "body_read_failed",
+            "serialized_row_limit",
+            "malformed_retained_row",
+            "response_unavailable",
+            "retained_preview_unavailable",
+            "unsupported_metadata",
+            "metadata_limit",
+            "unsupported_content_type",
+            "unsupported_body_encoding",
+            "unsupported_content_encoding",
+            "body_scan_failed",
+            "inactive_session",
+            "session_source_changed",
+            "metadata_unavailable",
+        ] {
+            let mut payload = body_references_payload(
+                if reason.starts_with("unsupported_") || reason == "metadata_limit" {
+                    "unsupported"
+                } else {
+                    "unavailable"
+                },
+            );
+            payload["reasons"] = json!([reason]);
+            // Optional fields accept null as well as omission and are omitted
+            // from printed output by the existing typed response contract.
+            for field in [
+                "source_origin",
+                "source_sequence",
+                "source_started_at",
+                "retained_preview_bytes",
+            ] {
+                payload[field] = Value::Null;
+            }
+            cases.push(payload);
+        }
+        for mut payload in cases {
+            payload["raw_body"] = json!("SYNTHETIC_PRIVATE_VALUE");
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let result = mock.command(&args).await;
+            payload.as_object_mut().unwrap().remove("raw_body");
+            for field in [
+                "source_origin",
+                "source_sequence",
+                "source_started_at",
+                "retained_preview_bytes",
+            ] {
+                if payload.get(field).is_some_and(Value::is_null) {
+                    payload.as_object_mut().unwrap().remove(field);
+                }
+            }
+            assert_eq!(result, payload);
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/body-references",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_body_references_reject_inconsistent_reason_state_and_cap_envelopes() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let args = [
+            "scope",
+            "service-map",
+            "body-references",
+            "--session-id",
+            &session,
+            "--evidence-id",
+            BODY_REFERENCE_TOKEN,
+        ];
+        let mut cases = Vec::new();
+        for (status, overrides) in [
+            ("partial", json!({"reasons":["record_missing"]})),
+            ("partial", json!({"reasons":["SYNTHETIC_PRIVATE_VALUE"]})),
+            (
+                "partial",
+                json!({"reasons":["candidate_bytes","candidate_bytes"]}),
+            ),
+            (
+                "partial",
+                json!({"reasons":["capture_preview_truncated","candidate_bytes"]}),
+            ),
+            (
+                "partial",
+                json!({"reasons":["candidate_limit","capture_preview_truncated"]}),
+            ),
+            (
+                "partial",
+                json!({"reasons":["candidate_bytes","capture_preview_truncated"],"candidates_scanned":0,"references":[]}),
+            ),
+            ("partial", json!({"capture_preview_truncated":false})),
+            ("partial", json!({"reasons":["candidate_bytes"]})),
+            (
+                "partial",
+                json!({"reasons":["capture_preview_truncated","scan_prefix_truncated"]}),
+            ),
+            (
+                "partial",
+                json!({"scan_prefix_truncated":true,"scanned_bytes":262144,"retained_preview_bytes":3000000}),
+            ),
+            (
+                "partial",
+                json!({"reasons":["capture_preview_truncated","scan_prefix_truncated"],"scan_prefix_truncated":true}),
+            ),
+            (
+                "partial",
+                json!({"reasons":["capture_preview_truncated","scan_prefix_truncated"],"scan_prefix_truncated":true,"retained_preview_bytes":101}),
+            ),
+            ("partial", json!({"retained_preview_bytes":101})),
+            (
+                "partial",
+                json!({"reasons":["capture_preview_truncated","origin_limit"]}),
+            ),
+            (
+                "partial",
+                json!({"reasons":["capture_preview_truncated","origin_limit"],"omitted_reference_occurrences":1,"candidates_scanned":3}),
+            ),
+            (
+                "partial",
+                json!({"omitted_reference_occurrences":1,"candidates_scanned":3}),
+            ),
+            (
+                "partial",
+                json!({"reasons":["capture_preview_truncated","offset_limit"]}),
+            ),
+            (
+                "partial",
+                json!({"candidates_scanned":6,"references":[{"target_origin":"https://cdn.example.com","occurrences":6,"preview_byte_offsets":[0,10,20,30,40],"omitted_offsets":1}]}),
+            ),
+            ("unavailable", json!({"reasons":[]})),
+            (
+                "unavailable",
+                json!({"reasons":["capture_preview_truncated"]}),
+            ),
+            (
+                "unavailable",
+                json!({"reasons":["record_missing","record_missing"]}),
+            ),
+            ("unavailable", json!({"capture_preview_truncated":true})),
+            ("unavailable", json!({"scan_prefix_truncated":true})),
+            (
+                "unavailable",
+                json!({"source_origin":"https://example.com"}),
+            ),
+            ("unavailable", json!({"source_sequence":"9007199254740993"})),
+            (
+                "unavailable",
+                json!({"source_started_at":"2026-10-12T06:00:00Z"}),
+            ),
+            ("unavailable", json!({"retained_preview_bytes":100})),
+            ("unsupported", json!({"reasons":["candidate_limit"]})),
+            ("unsupported", json!({"reasons":["record_missing"]})),
+            (
+                "unavailable",
+                json!({"reasons":["unsupported_content_type"]}),
+            ),
+        ] {
+            let mut payload = body_references_payload(status);
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(overrides.as_object().unwrap().clone());
+            cases.push(payload);
+        }
+        for payload in cases {
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            let result = mock.command_with_code(&args, 5).await;
+            assert_eq!(result["error"]["code"], "INVALID_RESPONSE", "{payload}");
+            assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+            mock.assert_reads(
+                "/api/target/service-map/body-references",
+                &[("evidence_id", BODY_REFERENCE_TOKEN)],
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_map_body_reference_http_failures_do_not_retry_follow_or_echo() {
         let mock = MockApi::new().await;
         let session = Uuid::nil().to_string();

@@ -8996,13 +8996,22 @@ fn validate_service_map_body_references_response(
     };
     let token_fields: Vec<_> = args.evidence_id.split('.').collect();
     let token_valid = parse_service_map_evidence_id(&args.evidence_id).is_ok();
-    let known_reasons = [
+    let partial_reasons = [
         "capture_preview_truncated",
         "scan_prefix_truncated",
         "candidate_limit",
         "candidate_bytes",
         "origin_limit",
         "offset_limit",
+    ];
+    let unsupported_reasons = [
+        "unsupported_metadata",
+        "metadata_limit",
+        "unsupported_content_type",
+        "unsupported_body_encoding",
+        "unsupported_content_encoding",
+    ];
+    let unavailable_reasons = [
         "invalid_evidence_id",
         "session_mismatch",
         "stale_generation",
@@ -9015,23 +9024,41 @@ fn validate_service_map_body_references_response(
         "malformed_retained_row",
         "response_unavailable",
         "retained_preview_unavailable",
-        "unsupported_metadata",
-        "metadata_limit",
-        "unsupported_content_type",
-        "unsupported_body_encoding",
-        "unsupported_content_encoding",
         "body_scan_failed",
         "inactive_session",
         "session_source_changed",
         "metadata_unavailable",
     ];
+    let has_reason = |reason: &str| result.reasons.iter().any(|value| value == reason);
+    // An acquisition failure cannot authenticate references from a partial scan.
+    // Both failure constructors clear their source metadata and scan counters.
     let status_valid = match result.status.as_str() {
-        "scanned" => result.available && result.complete && result.reasons.is_empty(),
-        "partial" => result.available && !result.complete && !result.reasons.is_empty(),
+        "scanned" | "partial" => {
+            result.available
+                && result.complete == (result.status == "scanned")
+                && result.complete == result.reasons.is_empty()
+                && result.reasons.len() <= partial_reasons.len()
+                && result
+                    .reasons
+                    .iter()
+                    .all(|reason| partial_reasons.contains(&reason.as_str()))
+                && result.reasons.windows(2).all(|pair| pair[0] < pair[1])
+        }
         "unsupported" | "unavailable" => {
             !result.available
                 && !result.complete
-                && !result.reasons.is_empty()
+                && result.reasons.len() == 1
+                && if result.status == "unsupported" {
+                    unsupported_reasons.contains(&result.reasons[0].as_str())
+                } else {
+                    unavailable_reasons.contains(&result.reasons[0].as_str())
+                }
+                && result.source_origin.is_none()
+                && result.source_sequence.is_none()
+                && result.source_started_at.is_none()
+                && result.retained_preview_bytes.is_none()
+                && !result.capture_preview_truncated
+                && !result.scan_prefix_truncated
                 && result.references.is_empty()
                 && result.scanned_bytes == 0
                 && result.candidates_scanned == 0
@@ -9068,10 +9095,6 @@ fn validate_service_map_body_references_response(
         && status_valid
         && token_valid
         && result
-            .reasons
-            .iter()
-            .all(|reason| known_reasons.contains(&reason.as_str()))
-        && result
             .source_origin
             .as_deref()
             .is_none_or(service_map_safe_origin)
@@ -9100,16 +9123,29 @@ fn validate_service_map_body_references_response(
             .candidates_scanned
             .saturating_sub(result.omitted_reference_occurrences)
         && (!result.available
-            || !result.capture_preview_truncated
-            || result
-                .reasons
-                .iter()
-                .any(|reason| reason == "capture_preview_truncated"))
-        && (!result.scan_prefix_truncated
-            || result
-                .reasons
-                .iter()
-                .any(|reason| reason == "scan_prefix_truncated"))
+            || (has_reason("capture_preview_truncated") == result.capture_preview_truncated
+                && has_reason("scan_prefix_truncated") == result.scan_prefix_truncated
+                && result.scan_prefix_truncated
+                    == result
+                        .retained_preview_bytes
+                        .is_some_and(|bytes| result.scanned_bytes < bytes)
+                && result.retained_preview_bytes.is_some_and(|bytes| {
+                    if bytes <= MAX_SCAN_BYTES {
+                        result.scanned_bytes == bytes
+                    } else {
+                        (MAX_SCAN_BYTES - 3..=MAX_SCAN_BYTES).contains(&result.scanned_bytes)
+                    }
+                })
+                && (!has_reason("candidate_limit")
+                    || result.candidates_scanned == MAX_CANDIDATES)
+                && (!has_reason("candidate_bytes") || result.candidates_scanned > 0)
+                && has_reason("origin_limit") == (result.omitted_reference_occurrences > 0)
+                && (!has_reason("origin_limit") || result.references.len() == MAX_ORIGINS)
+                && has_reason("offset_limit")
+                    == result
+                        .references
+                        .iter()
+                        .any(|reference| reference.omitted_offsets > 0)))
         && result.limits.scan_bytes == MAX_SCAN_BYTES
         && result.limits.serialized_row_bytes == MAX_SERIALIZED_ROW_BYTES
         && result.limits.origins == MAX_ORIGINS

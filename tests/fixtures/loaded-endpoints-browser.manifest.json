@@ -6,7 +6,7 @@
   "app_bootstrap": false,
   "networking": "CSP connect-src none and closed synthetic request adapter",
   "sha256": {
-    "web/service-map.js": "8094cebc4dca89eecdbf90c9414e848af2c1666a58c39d7b5d8829c855b61f08",
+    "web/service-map.js": "143a35b259ec8e67e349768f16712b5076d60c14927206e8c7cada435c928e26",
     "web/styles.css": "5a6925b868f56c4fd8e86be5441d880f2b0f458c25b815b8284aac3bcf5863d5",
     "web/index.html": "3afe426c13f89407bcb60a9df8b3df5a76c1b15391eaeffed71dfd90afb7fede",
     "tests/fixtures/loaded-endpoints-browser.html": "07090124d8e9da994b424196e9265d1cb07a76e1b790327f190d6eff0d64f361",

@@ -25,7 +25,11 @@
     unsupported_content_type: "Only retained HTML and JavaScript text previews are supported",
     unsupported_body_encoding: "The retained preview is not UTF-8 text",
     unsupported_content_encoding: "The retained response encoding is unsupported", body_scan_failed: "The retained preview could not be inspected",
+    session_source_changed: "The active session source changed", metadata_unavailable: "Retained response metadata is unavailable",
   };
+  const BODY_REFERENCE_PARTIAL_REASONS = new Set(["capture_preview_truncated", "scan_prefix_truncated", "candidate_limit", "candidate_bytes", "origin_limit", "offset_limit"]);
+  const BODY_REFERENCE_UNSUPPORTED_REASONS = new Set(["unsupported_metadata", "metadata_limit", "unsupported_content_type", "unsupported_body_encoding", "unsupported_content_encoding"]);
+  const BODY_REFERENCE_UNAVAILABLE_REASONS = new Set(Object.keys(BODY_REFERENCE_REASONS).filter((reason) => !BODY_REFERENCE_PARTIAL_REASONS.has(reason) && !BODY_REFERENCE_UNSUPPORTED_REASONS.has(reason)));
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char]);
   const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const array = (value) => Array.isArray(value) ? value : [];
@@ -386,18 +390,22 @@
       || payload.available !== scanned || payload.complete !== (payload.status === "scanned")
       || payload.coverage !== "literal_absolute_http_urls" || payload.offset_basis !== "retained_utf8_preview"
       || !Array.isArray(payload.references) || payload.references.length > BODY_REFERENCE_LIMITS.origins
-      || !Array.isArray(payload.reasons) || payload.reasons.length > 32
-      || payload.reasons.some((reason) => typeof reason !== "string" || !/^[a-z_]{1,80}$/.test(reason))
+      || !Array.isArray(payload.reasons)
+      || (scanned ? payload.reasons.length > BODY_REFERENCE_PARTIAL_REASONS.size
+        || payload.reasons.some((reason, index, reasons) => !BODY_REFERENCE_PARTIAL_REASONS.has(reason) || index > 0 && reasons[index - 1] >= reason)
+        : payload.reasons.length !== 1 || !(payload.status === "unsupported" ? BODY_REFERENCE_UNSUPPORTED_REASONS : BODY_REFERENCE_UNAVAILABLE_REASONS).has(payload.reasons[0]))
       || !Object.entries(BODY_REFERENCE_LIMITS).every(([key, value]) => payload.limits?.[key] === value)
       || !integer(payload.scanned_bytes, BODY_REFERENCE_LIMITS.scan_bytes)
       || !integer(payload.candidates_scanned, BODY_REFERENCE_LIMITS.candidates)
       || !integer(payload.omitted_reference_occurrences, payload.candidates_scanned)
       || typeof payload.capture_preview_truncated !== "boolean" || typeof payload.scan_prefix_truncated !== "boolean") invalid();
-    if ((scanned || payload.source_origin !== undefined) && (!canonical(payload.source_origin) || payload.source_origin !== row.origin)
-      || (scanned || payload.source_sequence !== undefined) && (typeof payload.source_sequence !== "string" || payload.source_sequence !== row.sequence)
-      || (scanned || payload.source_started_at !== undefined) && (typeof payload.source_started_at !== "string" || payload.source_started_at !== row.started_at)
+    if (scanned && (!canonical(payload.source_origin) || payload.source_origin !== row.origin)
+      || scanned && (typeof payload.source_sequence !== "string" || payload.source_sequence !== row.sequence)
+      || scanned && (typeof payload.source_started_at !== "string" || payload.source_started_at !== row.started_at)
       || scanned && (!integer(payload.retained_preview_bytes) || payload.scanned_bytes > payload.retained_preview_bytes)
-      || !scanned && (payload.references.length || payload.scanned_bytes || payload.candidates_scanned || payload.omitted_reference_occurrences)
+      || !scanned && (payload.references.length || payload.scanned_bytes || payload.candidates_scanned || payload.omitted_reference_occurrences
+        || payload.capture_preview_truncated || payload.scan_prefix_truncated
+        || [payload.source_origin, payload.source_sequence, payload.source_started_at, payload.retained_preview_bytes].some((value) => value != null))
       || payload.status === "scanned" && (payload.reasons.length || payload.capture_preview_truncated || payload.scan_prefix_truncated || payload.omitted_reference_occurrences)
       || payload.status === "partial" && !payload.reasons.length) invalid();
     const seen = new Set();
@@ -405,7 +413,7 @@
     const references = payload.references.map((item) => {
       if (!canonical(item?.target_origin) || seen.has(item.target_origin)
         || !integer(item.occurrences, payload.candidates_scanned) || !item.occurrences
-        || !Array.isArray(item.preview_byte_offsets) || !item.preview_byte_offsets.length || item.preview_byte_offsets.length > BODY_REFERENCE_LIMITS.offsets_per_origin
+        || !Array.isArray(item.preview_byte_offsets) || item.preview_byte_offsets.length !== Math.min(item.occurrences, BODY_REFERENCE_LIMITS.offsets_per_origin)
         || !integer(item.omitted_offsets, item.occurrences) || item.occurrences !== item.preview_byte_offsets.length + item.omitted_offsets
         || payload.status === "scanned" && item.omitted_offsets
         || item.preview_byte_offsets.some((offset, index, offsets) => !integer(offset) || offset >= payload.scanned_bytes || index > 0 && offset <= offsets[index - 1])) invalid();
@@ -414,6 +422,17 @@
       return { target_origin: item.target_origin, occurrences: item.occurrences, preview_byte_offsets: [...item.preview_byte_offsets], omitted_offsets: item.omitted_offsets };
     });
     if (occurrences > payload.candidates_scanned) invalid();
+    const has = (reason) => payload.reasons.includes(reason);
+    if (scanned && (has("capture_preview_truncated") !== payload.capture_preview_truncated
+      || has("scan_prefix_truncated") !== payload.scan_prefix_truncated
+      || payload.scan_prefix_truncated !== (payload.scanned_bytes < payload.retained_preview_bytes)
+      || (payload.retained_preview_bytes <= BODY_REFERENCE_LIMITS.scan_bytes ? payload.scanned_bytes !== payload.retained_preview_bytes
+        : payload.scanned_bytes < BODY_REFERENCE_LIMITS.scan_bytes - 3)
+      || has("candidate_limit") && payload.candidates_scanned !== BODY_REFERENCE_LIMITS.candidates
+      || has("candidate_bytes") && !payload.candidates_scanned
+      || has("origin_limit") !== (payload.omitted_reference_occurrences > 0)
+      || has("origin_limit") && references.length !== BODY_REFERENCE_LIMITS.origins
+      || has("offset_limit") !== references.some((item) => item.omitted_offsets > 0))) invalid();
     // Keep a bounded allowlist. Unexpected payload fields, including body content,
     // never become inspector state or markup.
     return { status: payload.status, complete: payload.complete, reasons: [...payload.reasons], references,

@@ -290,5 +290,6 @@ test('actual backend-serialized synthetic envelope matches the UI contract', () 
 test('a body inspection reporting exact source loss clears a shown Link overlay', async () => {
   const f = await displayedLink(); f.controller.setRelationshipKind('body');
   const value = scan(); Object.assign(value, { available: false, status: 'unavailable', complete: false, reasons: ['record_missing'], references: [], scanned_bytes: 0, candidates_scanned: 0 });
+  for (const key of ['source_origin', 'source_sequence', 'source_started_at', 'retained_preview_bytes']) delete value[key];
   await f.inspect(value); assert.equal(f.state.bodyReferenceOverlay, null);
 });

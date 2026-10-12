@@ -929,6 +929,8 @@ for (const [name, change] of [
   ['raw content in reason', p => { p.reasons = ['https://private.example.com/raw']; }],
   ['truncated scan called complete', p => { p.capture_preview_truncated = true; }],
   ['partial without reason', p => { p.status = 'partial'; p.complete = false; }],
+  ['partial with acquisition failure', p => { p.status = 'partial'; p.complete = false; p.reasons = ['record_missing']; }],
+  ['partial with unknown lowercase reason', p => { p.status = 'partial'; p.complete = false; p.reasons = ['synthetic_private_value']; }],
   ['unsupported with references', p => { p.status = 'unsupported'; p.available = false; p.complete = false; }],
 ]) test(`retained body-reference validation rejects ${name}`, async () => {
   const f = await verifiedBodyFixture(), p = bodyReferences(); change(p);
@@ -991,7 +993,7 @@ test('partial output exposes truncation, omissions, long origins and full indepe
   const f = await verifiedBodyFixture(), longOrigin = `https://${['a'.repeat(50), 'b'.repeat(50), 'c'.repeat(50), 'd'.repeat(50)].join('.')}.example.com`;
   const refs = Array.from({ length: 100 }, (_, i) => ({ target_origin: i ? `https://reference${i}.example.com` : longOrigin, occurrences: 7, preview_byte_offsets: [1, 25, 55, 80, 140], omitted_offsets: 2 }));
   await resolveBodyReferences(f, bodyReferences({ status: 'partial', complete: false,
-    reasons: ['capture_preview_truncated', 'scan_prefix_truncated', 'candidate_limit', 'origin_limit', 'offset_limit'],
+    reasons: ['candidate_limit', 'capture_preview_truncated', 'offset_limit', 'origin_limit', 'scan_prefix_truncated'],
     retained_preview_bytes: 300000, scanned_bytes: 262144, candidates_scanned: 4096, omitted_reference_occurrences: 30,
     capture_preview_truncated: true, scan_prefix_truncated: true, references: refs }));
   assert.equal(f.state.bodyReferences.references.length, 100);
