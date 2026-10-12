@@ -1144,7 +1144,7 @@ mod history_fixture {
             "technology_clues":[],"redirect":null,"header_links":[],"metadata_complete":true,"omitted":[]
         });
         json!({"schema_version":1,"session_id":Uuid::nil(),"evidence_id":"v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000",
-            "available":available,"reason":if available {Value::Null} else {json!("store_generation_changed")},
+            "available":available,"reason":if available {Value::Null} else {json!("stale_generation")},
             "source":"captured_http_metadata","row":if available {row} else {Value::Null}})
     }
 
@@ -1687,6 +1687,66 @@ mod history_fixture {
                 "/api/target/service-map/evidence",
                 &[("evidence_id", "v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000")],
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_evidence_unavailable_reasons_are_known_codes_and_private() {
+        let mock = MockApi::new().await;
+        let session = Uuid::nil().to_string();
+        let schema = output_schema("target.service_map.evidence.get");
+        for (reason, valid) in [
+            ("invalid_evidence_id", true),
+            ("session_mismatch", true),
+            ("stale_generation", true),
+            ("record_missing", true),
+            ("record_changed", true),
+            ("metadata_unavailable", true),
+            ("session_source_changed", true),
+            ("", false),
+            ("unknown_reason", false),
+            ("store_generation_changed", false),
+            ("SYNTHETIC_PRIVATE_VALUE diagnostic", false),
+            (
+                "https://user:SYNTHETIC_PRIVATE_VALUE@example.com/?token=SYNTHETIC_PRIVATE_VALUE",
+                false,
+            ),
+        ] {
+            let mut payload = evidence_payload(false);
+            payload["reason"] = json!(reason);
+            *mock.state.payload.lock().unwrap() = payload.clone();
+            for call in [false, true] {
+                let input =
+                    json!({"session_id":session,"evidence_id":BODY_REFERENCE_TOKEN}).to_string();
+                let args = if call {
+                    vec!["call", "target.service_map.evidence.get", "--input", &input]
+                } else {
+                    vec![
+                        "scope",
+                        "service-map-evidence",
+                        "--session-id",
+                        &session,
+                        "--evidence-id",
+                        BODY_REFERENCE_TOKEN,
+                    ]
+                };
+                let result = mock
+                    .command_with_code(&args, if valid { 0 } else { 5 })
+                    .await;
+                if valid {
+                    let data = if call { &result["data"] } else { &result };
+                    assert_eq!(data, &payload);
+                    assert_schema(data, &schema);
+                } else {
+                    assert_eq!(result["error"]["code"], "INVALID_RESPONSE");
+                    assert_eq!(result["error"]["retryable"], false);
+                    assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_VALUE"));
+                }
+                mock.assert_reads(
+                    "/api/target/service-map/evidence",
+                    &[("evidence_id", BODY_REFERENCE_TOKEN)],
+                );
+            }
         }
     }
 

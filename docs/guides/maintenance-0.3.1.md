@@ -213,3 +213,17 @@ transaction summary outputs remain unchanged. No probes, backfill, aggregate IP
 map, or origin-ownership inference is added. Observations persist in session
 files, exports and full-record JSON, and Off does not erase them. See the
 [observed socket peer contract](../integrations/observed-socket-peer.md).
+
+## Passive Service Map robustness
+
+Same-column metadata relationship arrows now stay inside the fixed map canvas,
+including reciprocal typed links. Malformed nested source observations show a
+safe unavailable state instead of breaking the inspector; a later valid exact
+source read can recover normally.
+
+Socket-peer CLI settings discovery uses the same passive identity checks as
+Service Map reads. It preserves malformed runtime-state files, creates no
+recovery lock or quarantine, redacts invalid API addresses and rejected argument
+values, and refuses redirects and retries. Settings writes still require the explicit confirmation and
+session-bound configuration token. Exact evidence unavailability accepts only
+known protocol reason codes, so unexpected diagnostic text is not printed.

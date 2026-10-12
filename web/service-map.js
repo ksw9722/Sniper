@@ -34,6 +34,34 @@
       return ["http:", "https:"].includes(url.protocol) ? url.origin : "";
     } catch (_) { return ""; }
   }
+  function normalizeEvidenceObservations(row) {
+    const invalid = () => { throw new Error("Invalid retained source observations"); };
+    const text = (value, limit) => typeof value === "string" && value.length > 0 && value.length <= limit;
+    const origin = (value) => text(value, 1024) && !!safeOrigin(value);
+    const list = (value, limit) => {
+      if (value === undefined) return [];
+      if (!Array.isArray(value) || value.length > limit) invalid();
+      return value;
+    };
+    // Validate the small per-row projection before publishing it. A malformed
+    // nested observation must not leave a row that crashes every inspector render.
+    const technology_clues = list(row.technology_clues, 8).map((clue) => {
+      if (!clue || !text(clue.name, 128) || !text(clue.header_name, 128)) invalid();
+      return { name: clue.name, header_name: clue.header_name };
+    });
+    const header_links = list(row.header_links, 2).map((link) => {
+      if (!link || !origin(link.source_origin) || !["origin_header", "referer_header"].includes(link.relationship)) invalid();
+      return { source_origin: safeOrigin(link.source_origin), relationship: link.relationship };
+    });
+    const omitted = list(row.omitted, 32);
+    if (omitted.some((reason) => !text(reason, 80))) invalid();
+    let redirect = null;
+    if (row.redirect !== undefined && row.redirect !== null) {
+      if (!origin(row.redirect.target_origin) || !text(row.redirect.target_path, 2048)) invalid();
+      redirect = { target_origin: safeOrigin(row.redirect.target_origin), target_path: safePath(row.redirect.target_path) };
+    }
+    return { ...row, technology_clues, header_links, redirect, omitted: [...omitted] };
+  }
   function normalizeSocketPeer(payload) {
     // This extension is independently optional on older servers. Only typed
     // socket observations enter the inspector; arbitrary record fields never do.
@@ -143,6 +171,7 @@
     return [...previous.filter((id) => ids.has(id)), ...[...ids].filter((id) => !previousIds.has(id)).sort()];
   }
   function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = []) {
+    const width = 720;
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
@@ -216,10 +245,12 @@
       const x2 = target.x + (sameColumn ? 276 : toRight ? 0 : 276);
       const y1 = source.y + 72 + offset;
       const y2 = target.y + 72 + offset;
-      const bend = sameColumn ? x1 + 32 + Math.abs(offset) : (x1 + x2) / 2;
+      // Keep right-column loops inside the SVG, with room for stroke and markers.
+      // Attachment offsets still distinguish typed links without widening cards.
+      const bend = sameColumn ? Math.min(x1 + 32 + Math.abs(offset), width - 8) : (x1 + x2) / 2;
       edges.push({ ...edge, path: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}` });
     }
-    return { nodes: visible, edges, edgeCount, slots, width: 720, height: Math.max(400, ...visible.map((origin) => origin.y + 174)) };
+    return { nodes: visible, edges, edgeCount, slots, width, height: Math.max(400, ...visible.map((origin) => origin.y + 174)) };
   }
   function* metadataRelations(origins) {
     for (const origin of origins) {
@@ -622,7 +653,7 @@
         const source = overlaySource();
         if (result.available && source && (row.method !== source.method || safePath(row.path) !== source.path
           || row.sequence !== source.sequence || row.started_at !== source.startedAt)) throw new Error("Overlay source changed");
-        state.evidence = result.available === true ? row : null;
+        state.evidence = result.available === true ? normalizeEvidenceObservations(row) : null;
         state.socketPeer = state.evidence ? normalizeSocketPeer(result.socket_peer) : null;
         state.evidenceError = state.evidence ? "" : "Source unavailable. The retained row may have changed or been removed. Refresh the map to select current evidence.";
         state.evidenceLoading = false;
@@ -633,6 +664,9 @@
         return !!state.evidence;
       } catch (_) {
         if (requestId !== state.evidenceRequestId || sessionId !== getSessionId() || selected !== state.selectedOrigin) return false;
+        state.evidence = null;
+        state.socketPeer = null;
+        cancelBodyReferences();
         state.evidenceLoading = false;
         state.evidenceError = "Source unavailable. The exact retained row could not be verified. Refresh the map and try again.";
         if (overlaySource()) {

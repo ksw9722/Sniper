@@ -1406,3 +1406,108 @@ test('overlay direct star keeps the pinned source opposite every incoming and ou
   f.controller.selectOrigin(originB); assert.equal(JSON.stringify([...f.state.layoutSlots]), slots);
   await f.load(snapshot([a, b])); assert.equal(JSON.stringify([...f.state.layoutSlots]), slots);
 });
+
+function assertFixedCanvasContainsGeometry(layout) {
+  assert.equal(layout.width, 720, 'loop routing must not enlarge the horizontal scroll surface');
+  for (const node of layout.nodes) {
+    assert.ok(node.x >= 0 && node.x + 276 <= layout.width);
+    assert.ok(node.y >= 0 && node.y + 160 <= layout.height);
+  }
+  for (const edge of layout.edges) {
+    const points = edge.path.match(/-?\d+(?:\.\d+)?/g).map(Number);
+    assert.equal(points.length, 8);
+    // A cubic stays inside its control-point hull. Endpoint clearance also
+    // includes the existing 8×8 arrow marker, regardless of its orientation.
+    for (let i = 0; i < points.length; i += 2) {
+      assert.ok(points[i] >= 8 && points[i] <= layout.width - 8, edge.path);
+      assert.ok(points[i + 1] >= 8 && points[i + 1] <= layout.height - 8, edge.path);
+    }
+    for (const i of [0, 6]) assert.ok(points[i] >= 9 && points[i] <= layout.width - 9, edge.path);
+    assert.notEqual(edge.source, edge.target, 'self links remain excluded');
+  }
+}
+
+test('metadata chain keeps three typed right-column curves within the unchanged fixed canvas', () => {
+  const a = origin('https://a.example.com'), b = origin('https://b.example.com'), c = origin('https://c.example.com');
+  a.redirects = [redirect(b.origin)]; b.redirects = [redirect(c.origin)];
+  c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
+  const data = map.normalizeSnapshot(snapshot([a, b, c]), 'session-one');
+  const order = [a.origin, b.origin, c.origin];
+  const layout = map.graphLayout(data.origins, order);
+  assert.equal(layout.slots.get(b.origin).column, 1); assert.equal(layout.slots.get(c.origin).column, 1);
+  assert.equal(layout.edges.length, 4); assert.equal(new Set(layout.edges.map(edge => edge.path)).size, 4);
+  assert.deepEqual([...new Set(layout.edges.map(edge => edge.relationship))].sort(), ['origin_header', 'redirect_instruction', 'referer_header']);
+  assertFixedCanvasContainsGeometry(layout);
+  const refreshed = map.graphLayout(data.origins, order, layout.slots);
+  assert.deepEqual([...refreshed.slots], [...layout.slots]);
+  assertFixedCanvasContainsGeometry(refreshed);
+});
+
+test('reciprocal metadata curves and direct relations remain unclipped without body overlays or self arrows', () => {
+  const a = origin('https://a.example.com'), b = origin('https://b.example.com'), c = origin('https://c.example.com');
+  a.redirects = [redirect(b.origin)]; b.redirects = [redirect(c.origin), redirect(b.origin)]; c.redirects = [redirect(b.origin)];
+  b.header_links = [header(c.origin), header(c.origin, 'referer_header'), header(b.origin)];
+  c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
+  const data = map.normalizeSnapshot(snapshot([a, b, c]), 'session-one');
+  for (const anchor of [null, b.origin]) {
+    const layout = map.graphLayout(data.origins, [a.origin, b.origin, c.origin], new Map(), anchor);
+    assert.equal(layout.edges.length, 7); assert.equal(layout.edgeCount, 7);
+    assert.equal(layout.edges.filter(edge => edge.source !== a.origin).length, 6);
+    assert.equal(new Set(layout.edges.map(edge => edge.path)).size, 7);
+    assertFixedCanvasContainsGeometry(layout);
+  }
+});
+
+for (const [name, patch] of [
+  ['null header clue', { technology_clues: [null] }],
+  ['null header link', { header_links: [null] }],
+  ['non-array clues', { technology_clues: {} }],
+  ['over-cap clues', { technology_clues: Array.from({ length: 9 }, () => ({ name: 'nginx', header_name: 'server' })) }],
+  ['over-cap header declarations', { header_links: Array.from({ length: 3 }, () => ({ source_origin: originB, relationship: 'origin_header' })) }],
+  ['object clue name', { technology_clues: [{ name: {}, header_name: 'server' }] }],
+  ['unsupported declaration', { header_links: [{ source_origin: originB, relationship: 'invented_call' }] }],
+  ['malformed redirect', { redirect: { target_origin: originB, target_path: null } }],
+  ['non-text omission', { omitted: [null] }],
+]) test(`malformed evidence observations fail closed and recover without poisoned inspector state: ${name}`, async () => {
+  const f = fixture(); await f.load(); f.controller.selectOrigin(originA, 0);
+  const pending = f.controller.loadEvidence('evidence-one'), value = evidence();
+  Object.assign(value.row, patch);
+  value.socket_peer = { status: 'observed', observation: { source: 'http_response_remote_addr', route: 'direct', observed_at: '2026-10-12T01:00:00Z', address: { ip: '192.0.2.10', port: 443 }, reason: null } };
+  f.requests.at(-1).resolve(response(value));
+  assert.equal(await pending, false);
+  assert.equal(f.state.evidence, null); assert.equal(f.state.socketPeer, null);
+  assert.match(f.els.detail.innerHTML, /Source unavailable/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source|192\.0\.2\.10|invented_call/);
+  assert.equal(await f.controller.loadBodyReferences(), false); assert.equal(f.requests.length, 2);
+  assert.doesNotThrow(() => f.controller.setVisible(true));
+  const retry = f.controller.loadEvidence('evidence-one'); f.requests.at(-1).resolve(response(evidence()));
+  assert.equal(await retry, true); assert.match(f.els.detail.innerHTML, /Verified retained source/);
+});
+
+test('evidence render failure clears a published row and peer before rendering the safe error state', async () => {
+  const f = fixture(); await f.load(); f.controller.selectOrigin(originA);
+  const descriptor = Object.getOwnPropertyDescriptor(f.els.detail, 'innerHTML');
+  let failOnce = true;
+  Object.defineProperty(f.els.detail, 'innerHTML', { get: descriptor.get, set(value) {
+    if (failOnce && value.includes('Verified retained source')) { failOnce = false; throw new Error('Synthetic render failure'); }
+    descriptor.set.call(this, value);
+  } });
+  const pending = f.controller.loadEvidence('evidence-one');
+  f.requests.at(-1).resolve(response(evidence('evidence-one', originA, { socket_peer: { status: 'not_recorded', observation: null } })));
+  assert.equal(await pending, false); assert.equal(f.state.evidence, null); assert.equal(f.state.socketPeer, null);
+  assert.match(f.els.detail.innerHTML, /Source unavailable/); assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source/);
+  assert.doesNotThrow(() => f.controller.setVisible(true));
+});
+
+test('nested evidence observations retain only display fields while exact row identity stays checked first', async () => {
+  const f = fixture(); await f.load(); f.controller.selectOrigin(originA, 0);
+  const pending = f.controller.loadEvidence('evidence-one'), value = evidence();
+  Object.assign(value.row, { technology_clues: [{ name: 'nginx', header_name: 'server', raw_header: 'never-copy' }],
+    header_links: [{ source_origin: originB, relationship: 'origin_header', raw_header: 'never-copy' }],
+    redirect: { target_origin: originB, target_path: '/next?secret=hidden', raw_header: 'never-copy' } });
+  f.requests.at(-1).resolve(response(value)); assert.equal(await pending, true);
+  assert.doesNotMatch(JSON.stringify(f.state.evidence), /never-copy|secret=hidden/);
+  const substituted = f.controller.loadEvidence('evidence-one'); value.row.path = '/another-row';
+  f.requests.at(-1).resolve(response(value)); assert.equal(await substituted, false);
+  assert.equal(f.state.evidence, null); assert.match(f.els.detail.innerHTML, /Source unavailable/);
+});

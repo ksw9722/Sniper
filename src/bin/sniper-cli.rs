@@ -6828,8 +6828,12 @@ async fn main() {
             });
             // Some clap diagnostics render rejected OS strings lossily. Keep
             // those argument bytes out of JSON and the stderr fallback alike.
-            let error = if operation.starts_with("target.service_map.") {
-                clap::Error::raw(error.kind(), "Invalid Service Map arguments; inspect the command's --help or input schema. Argument values are omitted.")
+            let error = if operation.starts_with("target.service_map.")
+                || matches!(
+                    operation.as_str(),
+                    "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+                ) {
+                clap::Error::raw(error.kind(), "Invalid command arguments; inspect the command's --help or input schema. Argument values are omitted.")
             } else if raw_args.iter().any(|arg| arg.to_str().is_none()) {
                 clap::Error::raw(
                     clap::error::ErrorKind::InvalidUtf8,
@@ -6971,6 +6975,8 @@ async fn run(cli: Cli) -> Result<()> {
                 "target.service_map.get"
                     | "target.service_map.evidence.get"
                     | "target.service_map.body_references.get"
+                    | "capture.http.upstream_peer.get"
+                    | "capture.http.upstream_peer.set"
             ) {
                 discover_service_map_api(api_override).await?
             } else {
@@ -7873,7 +7879,18 @@ fn validate_service_map_evidence_response(
                         )
                 })
         }
-        (false, None, Some(reason)) => !reason.is_empty(),
+        // Backend absence reasons are fixed protocol codes, never diagnostic
+        // text. Reject unknown values rather than echoing captured data here.
+        (false, None, Some(reason)) => matches!(
+            reason,
+            "invalid_evidence_id"
+                | "session_mismatch"
+                | "stale_generation"
+                | "record_missing"
+                | "record_changed"
+                | "metadata_unavailable"
+                | "session_source_changed"
+        ),
         _ => false,
     };
     let peer_valid = match result.socket_peer.as_ref() {

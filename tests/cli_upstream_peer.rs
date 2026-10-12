@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use sniper::upstream_peer_settings::config_token;
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -38,6 +38,7 @@ enum Reply {
 }
 #[derive(Default)]
 struct Faults {
+    discovery: Option<Reply>,
     get: Option<Reply>,
     post: Option<Reply>,
 }
@@ -108,7 +109,10 @@ impl Fixture {
                 let reply = {
                     let faults = server_faults.lock().unwrap();
                     match (request.method.as_str(), request.path.as_str()) {
-                        ("GET", "/api/settings") => Reply::Json(settings.clone()),
+                        ("GET", "/api/settings") => faults
+                            .discovery
+                            .clone()
+                            .unwrap_or_else(|| Reply::Json(settings.clone())),
                         ("GET", PATH) => faults
                             .get
                             .clone()
@@ -143,36 +147,13 @@ impl Fixture {
         }
     }
     async fn run(&self, args: &[&str]) -> (i32, Value) {
-        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
-        cmd.env_clear()
-            .env("HOME", self.root.join("home"))
-            .env("USERPROFILE", self.root.join("home"))
-            .env("SNIPER_DATA_DIR", self.root.join("data"))
-            .current_dir(&self.root)
-            .args(["--output", "compact", "--api", &self.api])
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            cmd.env("SystemRoot", root);
-        }
-        let output = tokio::time::timeout(Duration::from_secs(8), cmd.output())
-            .await
-            .expect("settings command stalled")
-            .unwrap();
-        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let result = command_with_discovery(&self.root, Some(&self.api), None, args).await;
         assert_eq!(
             std::fs::read_dir(&self.root).unwrap().count(),
             0,
             "CLI wrote files"
         );
-        (
-            output.status.code().unwrap(),
-            serde_json::from_slice(&output.stdout).unwrap(),
-        )
+        result
     }
     async fn invoke(&self, call: bool, enabled: Option<bool>, flag: Option<&str>) -> (i32, Value) {
         let mut args = if call {
@@ -242,6 +223,44 @@ impl Fixture {
         );
     }
 }
+async fn command_with_discovery(
+    root: &Path,
+    api: Option<&str>,
+    env_api: Option<&str>,
+    args: &[&str],
+) -> (i32, Value) {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
+    cmd.env_clear()
+        .env("HOME", root.join("home"))
+        .env("USERPROFILE", root.join("home"))
+        .env("SNIPER_DATA_DIR", root.join("data"))
+        .current_dir(root)
+        .args(["--output", "compact"]);
+    if let Some(api) = api {
+        cmd.args(["--api", api]);
+    }
+    if let Some(api) = env_api {
+        cmd.env("SNIPER_API_ADDR", api);
+    }
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(8), cmd.output())
+        .await
+        .expect("settings command stalled")
+        .unwrap();
+    assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    (
+        output.status.code().unwrap(),
+        serde_json::from_slice(&output.stdout).unwrap(),
+    )
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
@@ -265,6 +284,261 @@ fn assert_failure(result: (i32, Value), code: &str, outcome: &str) {
     assert_eq!(result.1["error"]["retryable"], false);
     assert_eq!(result.1["error"]["details"]["outcome"], outcome);
     assert!(!result.1.to_string().contains(PRIVATE));
+}
+
+fn discovery_args(call: bool, write: bool) -> Vec<String> {
+    let mut input = json!({"session_id":SESSION});
+    if write {
+        input["enabled"] = json!(true);
+    }
+    let mut args: Vec<String> = if call {
+        vec![
+            "call".into(),
+            if write {
+                "capture.http.upstream_peer.set"
+            } else {
+                "capture.http.upstream_peer.get"
+            }
+            .into(),
+            "--input".into(),
+            input.to_string(),
+        ]
+    } else {
+        vec![
+            "capture".into(),
+            "http".into(),
+            "upstream-peer".into(),
+            if write { "set" } else { "get" }.into(),
+            "--session-id".into(),
+            SESSION.into(),
+        ]
+    };
+    if write {
+        if !call {
+            args.extend(["--enabled".into(), "true".into()]);
+        }
+        args.push("--yes".into());
+    }
+    args
+}
+
+fn assert_discovery_failure(result: (i32, Value), code: &str) {
+    assert_ne!(result.0, 0, "{result:?}");
+    assert_eq!(result.1["error"]["code"], code, "{result:?}");
+    assert_eq!(result.1["error"]["retryable"], false);
+    assert!(!result.1.to_string().contains(PRIVATE));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_parse_errors_redact_values_and_preserve_canonical_operations() {
+    let fixture = Fixture::new(false, 0).await;
+    let invalid_session = json!({"session_id":PRIVATE}).to_string();
+    let invalid_enabled = json!({"session_id":SESSION,"enabled":PRIVATE}).to_string();
+    for (operation, args) in [
+        (
+            "capture.http.upstream_peer.get",
+            vec![
+                "capture",
+                "http",
+                "upstream-peer",
+                "get",
+                "--session-id",
+                PRIVATE,
+            ],
+        ),
+        (
+            "capture.http.upstream_peer.set",
+            vec![
+                "capture",
+                "http",
+                "upstream-peer",
+                "set",
+                "--session-id",
+                PRIVATE,
+                "--enabled",
+                "true",
+            ],
+        ),
+        (
+            "capture.http.upstream_peer.set",
+            vec![
+                "capture",
+                "http",
+                "upstream-peer",
+                "set",
+                "--session-id",
+                SESSION,
+                "--enabled",
+                PRIVATE,
+            ],
+        ),
+        (
+            "capture.http.upstream_peer.get",
+            vec![
+                "call",
+                "capture.http.upstream_peer.get",
+                "--input",
+                "{}",
+                "--synthetic-private-diagnostic",
+            ],
+        ),
+        (
+            "capture.http.upstream_peer.set",
+            vec![
+                "call",
+                "--input",
+                "{}",
+                "capture.http.upstream_peer.set",
+                "--synthetic-private-diagnostic",
+            ],
+        ),
+        (
+            "capture.http.upstream_peer.get",
+            vec![
+                "call",
+                "capture.http.upstream_peer.get",
+                "--input",
+                &invalid_session,
+                "--dry-run",
+            ],
+        ),
+        (
+            "capture.http.upstream_peer.set",
+            vec![
+                "call",
+                "capture.http.upstream_peer.set",
+                "--input",
+                &invalid_enabled,
+                "--dry-run",
+            ],
+        ),
+    ] {
+        let result = fixture.run(&args).await;
+        assert_eq!(result.0, 2);
+        assert_eq!(result.1["operation"], operation);
+        assert_discovery_failure(result, "INVALID_INPUT");
+        assert!(fixture.take_requests().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_parse_redaction_preserves_help_and_version_output() {
+    let fixture = Fixture::new(false, 0).await;
+    for args in [
+        vec!["capture", "http", "upstream-peer", "get", "--help"],
+        vec!["capture", "http", "upstream-peer", "set", "--help"],
+        vec!["call", "--help"],
+        vec!["--version"],
+    ] {
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
+        cmd.env_clear()
+            .env("HOME", fixture.root.join("home"))
+            .env("USERPROFILE", fixture.root.join("home"))
+            .env("SNIPER_DATA_DIR", fixture.root.join("data"))
+            .current_dir(&fixture.root)
+            .args(["--output", "compact", "--api", &fixture.api])
+            .args(&args)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            cmd.env("SystemRoot", root);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(8), cmd.output())
+            .await
+            .expect("offline help/version stalled")
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if args == ["--version"] {
+            assert_eq!(
+                stdout.trim(),
+                format!("sniper-cli {}", env!("CARGO_PKG_VERSION"))
+            );
+        } else {
+            assert!(stdout.contains("Usage:"));
+            assert!(stdout.contains("--help"));
+        }
+        assert!(!stdout.contains("Argument values are omitted"));
+        assert!(fixture.take_requests().is_empty());
+        assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_discovery_preserves_corrupt_runtime_without_creating_lock_files() {
+    let fixture = Fixture::new(false, 0).await;
+    let data = fixture.root.join("data");
+    std::fs::create_dir(&data).unwrap();
+    let path = data.join("runtime-state.json");
+    let bytes = format!("{{{PRIVATE}").into_bytes();
+    std::fs::write(&path, &bytes).unwrap();
+    for call in [false, true] {
+        for write in [false, true] {
+            let args = discovery_args(call, write);
+            let args: Vec<_> = args.iter().map(String::as_str).collect();
+            assert_discovery_failure(
+                command_with_discovery(&fixture.root, None, None, &args).await,
+                "API_UNAVAILABLE",
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(&data).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 1);
+            assert!(fixture.take_requests().is_empty());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_discovery_invalid_addresses_are_redacted_without_fallback() {
+    let fixture = Fixture::new(false, 0).await;
+    let invalid = format!("http://[{PRIVATE}");
+    for call in [false, true] {
+        for write in [false, true] {
+            let args = discovery_args(call, write);
+            let args: Vec<_> = args.iter().map(String::as_str).collect();
+            for (api, env_api) in [
+                (Some(invalid.as_str()), None),
+                (None, Some(invalid.as_str())),
+            ] {
+                assert_discovery_failure(
+                    command_with_discovery(&fixture.root, api, env_api, &args).await,
+                    "INVALID_INPUT",
+                );
+                assert!(fixture.take_requests().is_empty());
+                assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_discovery_refuses_redirects_and_never_retries_or_reads_settings() {
+    let fixture = Fixture::new(false, 0).await;
+    for call in [false, true] {
+        for write in [false, true] {
+            for (reply, code) in [
+                (Reply::Redirect, "REDIRECT_REFUSED"),
+                (Reply::Http(503, PRIVATE.into()), "HTTP_STATUS_ERROR"),
+                (Reply::Disconnect, "API_UNAVAILABLE"),
+                (Reply::Incomplete, "INVALID_RESPONSE"),
+            ] {
+                fixture.faults.lock().unwrap().discovery = Some(reply);
+                let args = discovery_args(call, write);
+                let args: Vec<_> = args.iter().map(String::as_str).collect();
+                assert_discovery_failure(fixture.run(&args).await, code);
+                assert_eq!(
+                    fixture.take_requests(),
+                    [Request {
+                        method: "GET".into(),
+                        path: "/api/settings".into(),
+                        query: BTreeMap::new(),
+                        body: None,
+                    }]
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
