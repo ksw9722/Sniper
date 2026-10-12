@@ -116,14 +116,14 @@
     const previousIds = new Set(previous);
     return [...previous.filter((id) => ids.has(id)), ...[...ids].filter((id) => !previousIds.has(id)).sort()];
   }
-  function graphLayout(origins, order, previousSlots = new Map(), anchor = null) {
+  function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = []) {
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
-    const connections = visibleOrigins.flatMap((origin) => [
+    const connections = [...bodyEdges.map((edge) => [edge.source, edge.target]), ...visibleOrigins.flatMap((origin) => [
       ...origin.redirects.map((redirect) => [origin.origin, redirect.target_origin]),
       ...origin.header_links.map((link) => [link.source_origin, origin.origin]),
-    ]).filter(([source, target]) => source !== target && visibleIds.has(source) && visibleIds.has(target) && (!anchor || source === anchor || target === anchor));
+    ])].filter(([source, target]) => source !== target && visibleIds.has(source) && visibleIds.has(target) && (!anchor || source === anchor || target === anchor));
     const incoming = new Set(connections.map(([, target]) => target));
     const outgoing = new Set(connections.map(([source]) => source));
     let left = visibleOrigins.filter((origin) => outgoing.has(origin.origin) && !incoming.has(origin.origin));
@@ -139,6 +139,13 @@
         return ranks.length ? ranks.reduce((sum, rank) => sum + rank, 0) / ranks.length : 0;
       };
       left.sort((a, b) => averageTarget(a) - averageTarget(b) || a.origin.localeCompare(b.origin));
+    }
+    if (anchor && bodyEdges.length) {
+      // A temporary single-source overlay is a direct star. Keep every neighbor
+      // opposite the source so mixed incoming/outgoing declarations cannot
+      // become clipped same-column loops at the fixed canvas edge.
+      left = visibleOrigins.filter((origin) => origin.origin === anchor);
+      right = visibleOrigins.filter((origin) => origin.origin !== anchor);
     }
     if (anchor) {
       const pin = (items) => [...items.filter((origin) => origin.origin === anchor), ...items.filter((origin) => origin.origin !== anchor)];
@@ -158,10 +165,13 @@
     const edges = [];
     const seen = new Set();
     let edgeCount = 0;
-    const declaredEdges = visible.flatMap((origin) => [
+    // The explicit overlay gets the first arrow slots. Metadata remains distinct
+    // even when the same pair also occurs in a retained response body.
+    const declaredEdges = [...bodyEdges, ...visible.flatMap((origin) => [
       ...origin.redirects.map((redirect) => ({ source: origin.origin, target: redirect.target_origin, relationship: "redirect_instruction", label: "Redirect instruction" })),
       ...origin.header_links.map((link) => ({ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: link.relationship === "origin_header" ? "Origin header" : "Referer header" })),
-    ]);
+    ])];
+    const pairCounts = new Map();
     for (const edge of declaredEdges) {
       const source = positions.get(edge.source);
       const target = positions.get(edge.target);
@@ -170,13 +180,17 @@
       seen.add(key);
       edgeCount += 1;
       if (edges.length >= MAX_EDGES) continue;
+      const pair = JSON.stringify([edge.source, edge.target].sort());
+      const pairIndex = pairCounts.get(pair) || 0;
+      pairCounts.set(pair, pairIndex + 1);
+      const offset = [0, -12, 12, -24, 24, -36, 36][Math.min(pairIndex, 6)];
       const toRight = target.x > source.x;
       const sameColumn = target.x === source.x;
       const x1 = source.x + (sameColumn ? 276 : toRight ? 276 : 0);
       const x2 = target.x + (sameColumn ? 276 : toRight ? 0 : 276);
-      const y1 = source.y + 72;
-      const y2 = target.y + 72;
-      const bend = sameColumn ? x1 + 32 : (x1 + x2) / 2;
+      const y1 = source.y + 72 + offset;
+      const y2 = target.y + 72 + offset;
+      const bend = sameColumn ? x1 + 32 + Math.abs(offset) : (x1 + x2) / 2;
       edges.push({ ...edge, path: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}` });
     }
     return { nodes: visible, edges, edgeCount, slots, width: 720, height: Math.max(400, ...visible.map((origin) => origin.y + 174)) };
@@ -194,13 +208,14 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, request, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, request, document: doc = root.document }) {
     const state = {
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       loading: false, error: "", requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, page: 0, detailPage: 0,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
+      bodyReferencesSource: null, bodyReferenceOverlay: null, bodyOverlayNotice: "",
       historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "",
     };
     let abort = null;
@@ -272,10 +287,12 @@
       if (!id) return null;
       const existing = graphOrigins().find((origin) => origin.origin === id);
       if (existing) return existing;
-      if (state.extraOriginSnapshot === state.snapshot && state.extraOriginId === id) return state.extraOrigin;
+      if (state.extraOriginSnapshot === state.snapshot && state.extraOriginId === id && state.extraOriginOverlay === state.bodyReferenceOverlay) return state.extraOrigin;
       // A direct neighbor can be outside the All origins reference-card budget.
       // Its inspector still uses only loaded declarations and the usual pane caps.
       const item = referenceOrigin(id), group = { items: [], omitted: 0 }, seen = new Set();
+      const bodyReference = state.bodyReferenceOverlay?.scan.references.find((reference) => reference.target_origin === id);
+      if (bodyReference) item.references.push({ origin: state.bodyReferenceOverlay.source.origin, label: "Literal body URL reference from" });
       for (const relation of metadataRelations(state.snapshot?.origins || [])) {
         if (relation.sourceOrigin !== id && relation.targetOrigin !== id) continue;
         if (group.items.length < MAX_REFERENCE_SOURCES) group.items.push(relation); else group.omitted += 1;
@@ -286,23 +303,93 @@
         if (item.references.length < MAX_REFERENCE_SOURCES) item.references.push({ origin: relation.capturedOrigin, label }); else item.referencesOmitted += 1;
       }
       state.extraOriginSnapshot = state.snapshot; state.extraOriginId = id;
-      state.extraOrigin = group.items.length ? item : null;
+      state.extraOriginOverlay = state.bodyReferenceOverlay;
+      state.extraOrigin = group.items.length || bodyReference ? item : null;
       if (group.items.length) state.relationsByOrigin.set(id, group);
       return state.extraOrigin;
     }
     function selectedOrigin() {
       return findOrigin(state.selectedOrigin);
     }
+    function overlayEdges() {
+      const overlay = state.bodyReferenceOverlay;
+      return overlay ? overlay.scan.references.filter((reference) => reference.target_origin !== overlay.source.origin).map((reference) => ({
+        source: overlay.source.origin, target: reference.target_origin, relationship: "body_url_reference", label: "Literal body URL reference",
+      })) : [];
+    }
+    function sourceIsRetained(source, snapshot = state.snapshot) {
+      if (!source || source.sessionId !== getSessionId() || source.sessionId !== state.sessionId
+        || typeof source.generation !== "string" || !source.generation || source.generation !== snapshot?.snapshot.generation) return false;
+      const origin = snapshot.origins.find((item) => item.origin === source.origin);
+      return !!origin && [...origin.endpoints, ...origin.technology_clues, ...origin.redirects, ...origin.header_links]
+        .some((item) => item.evidence.includes(source.evidenceId));
+    }
+    function clearOverlay(notice = "") {
+      if (!state.bodyReferenceOverlay) return false;
+      state.bodyReferenceOverlay = null;
+      state.neighborhoodOverlay = null;
+      state.neighborhoodSnapshot = null;
+      state.neighborhoodAnchor = null;
+      state.neighborhood = null;
+      state.extraOriginOverlay = null;
+      state.extraOriginSnapshot = null;
+      state.extraOriginId = null;
+      state.extraOrigin = null;
+      state.layoutSlots = new Map();
+      state.bodyOverlayNotice = notice;
+      if (state.selectedOrigin && !findOrigin(state.selectedOrigin)) {
+        cancelEvidence();
+        state.selectedOrigin = null;
+        state.endpointIndex = null;
+        state.endpointSelection = null;
+      }
+      return true;
+    }
+    function clearBodyReferenceOverlay() {
+      const cleared = clearOverlay("Temporary body references cleared. Showing loaded metadata only.");
+      render();
+      return cleared;
+    }
+    function showBodyReferencesOnMap() {
+      if (state.sessionId !== getSessionId()) { reset(); return false; }
+      const scan = state.bodyReferences, source = state.bodyReferencesSource;
+      if (!visible || !getEventStreamReady() || state.error || state.stale || !scan || !["scanned", "partial"].includes(scan.status) || !sourceIsRetained(source)
+        || state.evidenceId !== source.evidenceId || state.selectedOrigin !== source.origin
+        || !scan.references.some((item) => item.target_origin !== source.origin)) return false;
+      clearOverlay();
+      // Copy only already-validated fields, never the response row or raw body.
+      // The overlay must survive an unrelated inspector selection unchanged.
+      const references = Object.freeze(scan.references.map((item) => Object.freeze({
+        target_origin: item.target_origin, occurrences: item.occurrences,
+        preview_byte_offsets: Object.freeze([...item.preview_byte_offsets]), omitted_offsets: item.omitted_offsets,
+      })));
+      state.bodyReferenceOverlay = Object.freeze({ source: Object.freeze({ ...source }), scan: Object.freeze({
+        status: scan.status, complete: scan.complete, reasons: Object.freeze([...scan.reasons]), references,
+        retained_preview_bytes: scan.retained_preview_bytes, scanned_bytes: scan.scanned_bytes,
+        candidates_scanned: scan.candidates_scanned, omitted_reference_occurrences: scan.omitted_reference_occurrences,
+        capture_preview_truncated: scan.capture_preview_truncated, scan_prefix_truncated: scan.scan_prefix_truncated,
+      }) });
+      state.bodyOverlayNotice = "";
+      state.layoutSlots = new Map();
+      state.modeNotice = "";
+      state.anchorOrigin = source.origin;
+      if (state.view !== "service-map") {
+        state.view = "service-map";
+        onViewChange?.("service-map");
+      }
+      render();
+      return true;
+    }
     function directNeighborhood() {
       if (!state.anchorOrigin || !state.snapshot) {
         state.neighborhoodSnapshot = null; state.neighborhoodAnchor = null; state.neighborhood = null;
         return null;
       }
-      if (state.neighborhoodSnapshot === state.snapshot && state.neighborhoodAnchor === state.anchorOrigin) return state.neighborhood;
+      if (state.neighborhoodSnapshot === state.snapshot && state.neighborhoodAnchor === state.anchorOrigin && state.neighborhoodOverlay === state.bodyReferenceOverlay) return state.neighborhood;
       const anchor = findOrigin(state.anchorOrigin);
       if (!anchor) return null;
       const ids = new Set(), seen = new Set();
-      const counts = { incoming: 0, outgoing: 0, redirect_instruction: 0, origin_header: 0, referer_header: 0 };
+      const counts = { incoming: 0, outgoing: 0, redirect_instruction: 0, origin_header: 0, referer_header: 0, body_url_reference: 0 };
       for (const relation of metadataRelations(state.snapshot.origins)) {
         const { sourceOrigin, targetOrigin, relationship } = relation;
         if (sourceOrigin === targetOrigin || sourceOrigin !== anchor.origin && targetOrigin !== anchor.origin) continue;
@@ -313,12 +400,20 @@
         counts[sourceOrigin === anchor.origin ? "outgoing" : "incoming"] += 1;
         counts[relationship] += 1;
       }
+      const bodyIds = new Set();
+      for (const edge of overlayEdges()) {
+        if (edge.source !== anchor.origin) continue;
+        ids.add(edge.target); bodyIds.add(edge.target);
+        seen.add(JSON.stringify([edge.source, edge.target, edge.relationship]));
+        counts.outgoing += 1; counts.body_url_reference += 1;
+      }
       // Count the full loaded snapshot, not the capped relationship inspector or
       // All origins reference cache. Only rendering is clipped to 24 cards/40 arrows.
       const byOrigin = new Map(graphOrigins().map((origin) => [origin.origin, origin]));
       const neighbors = [...ids].sort().map((id) => byOrigin.get(id) || referenceOrigin(id));
       state.neighborhoodSnapshot = state.snapshot; state.neighborhoodAnchor = state.anchorOrigin;
-      state.neighborhood = { anchor, neighbors, counts, edgeCount: seen.size };
+      state.neighborhoodOverlay = state.bodyReferenceOverlay;
+      state.neighborhood = { anchor, neighbors, counts, bodyIds, edgeCount: seen.size };
       return state.neighborhood;
     }
     function setMapMode(direct) {
@@ -326,13 +421,18 @@
       if (direct) {
         if (state.anchorOrigin || !selectedOrigin()) return;
         state.anchorOrigin = state.selectedOrigin;
-      } else state.anchorOrigin = null;
+      } else {
+        clearOverlay("Temporary body references cleared by All origins.");
+        state.anchorOrigin = null;
+      }
       state.modeNotice = "";
       render();
     }
     function focusSelection() {
       if (state.sessionId !== getSessionId()) { reset(); return; }
       if (!state.anchorOrigin || !selectedOrigin()) return;
+      if (state.anchorOrigin !== state.selectedOrigin) clearOverlay("Temporary body references cleared when the pinned origin changed.");
+      if (!selectedOrigin()) { render(); return; }
       state.anchorOrigin = state.selectedOrigin;
       state.modeNotice = "";
       render();
@@ -342,6 +442,7 @@
       bodyReferencesAbort?.abort();
       bodyReferencesAbort = null;
       state.bodyReferences = null;
+      state.bodyReferencesSource = null;
       state.bodyReferencesLoading = false;
       state.bodyReferencesError = "";
     }
@@ -356,6 +457,7 @@
       state.evidenceId = null;
     }
     function reset() {
+      clearOverlay("Temporary body references cleared because the session changed.");
       state.requestId += 1;
       abort?.abort();
       abort = null;
@@ -386,7 +488,10 @@
       if (!sessionId || state.loading && !force) return false;
       // The app polls every 1.2 seconds. A same-source background snapshot must
       // not erase an explicit inspection or continually abort its pending read.
-      if (force) cancelBodyReferences();
+      if (force) {
+        clearOverlay("Temporary body references cleared by Refresh. Inspect and show references again when ready.");
+        cancelBodyReferences();
+      }
       abort?.abort();
       abort = new AbortController();
       const requestId = ++state.requestId;
@@ -395,14 +500,16 @@
       state.loading = true;
       state.error = "";
       renderStatus();
-      if (!state.snapshot) render();
-      else if (force && state.detailTab === "evidence") renderDetail();
+      if (!state.snapshot || force) render();
       try {
         const params = new URLSearchParams({ session_id: sessionId, in_scope_only: String(scopeOnly), max_records: "10000" });
         const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal });
         if (!response.ok) throw new Error("Service map unavailable");
         const snapshot = normalizeSnapshot(await response.json(), sessionId);
         if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
+        if (state.bodyReferenceOverlay && !sourceIsRetained(state.bodyReferenceOverlay.source, snapshot)) {
+          clearOverlay("Temporary body references cleared: the exact source is absent or retained history changed.");
+        }
         if (state.snapshot && state.snapshot.snapshot.generation !== snapshot.snapshot.generation) cancelEvidence();
         state.snapshot = snapshot;
         state.stale = historyVersion !== state.historyVersion;
@@ -434,6 +541,8 @@
         return true;
       } catch (_) {
         if (requestId !== state.requestId || sessionId !== getSessionId()) return false;
+        clearOverlay("Temporary body references cleared because the current refresh failed.");
+        cancelBodyReferences();
         state.loading = false;
         state.error = state.snapshot ? "Refresh failed. Showing the previous snapshot; use Refresh to retry." : "Could not load the service map. Use Refresh to retry.";
         render();
@@ -462,6 +571,8 @@
       const requestId = ++state.evidenceRequestId;
       const sessionId = getSessionId();
       const selected = state.selectedOrigin;
+      const overlaySource = () => state.bodyReferenceOverlay?.source.evidenceId === id
+        && state.bodyReferenceOverlay.source.origin === selected ? state.bodyReferenceOverlay.source : null;
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
       state.evidenceId = id;
       state.evidenceLoading = true;
@@ -481,16 +592,25 @@
           || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.record_id || "") || typeof row.sequence !== "string" || !/^[0-9]+$/.test(row.sequence)
           || typeof row.method !== "string" || typeof row.path !== "string"
           || endpoint && (row.method !== endpoint.method || safePath(row.path) !== endpoint.path))) throw new Error("Evidence row changed");
+        const source = overlaySource();
+        if (result.available && source && (row.method !== source.method || safePath(row.path) !== source.path
+          || row.sequence !== source.sequence || row.started_at !== source.startedAt)) throw new Error("Overlay source changed");
         state.evidence = result.available === true ? row : null;
         state.evidenceError = state.evidence ? "" : "Source unavailable. The retained row may have changed or been removed. Refresh the map to select current evidence.";
         state.evidenceLoading = false;
-        renderDetail();
+        if (!state.evidence && source) {
+          clearOverlay("Temporary body references cleared: the exact inspected source is no longer available.");
+          render();
+        } else renderDetail();
         return !!state.evidence;
       } catch (_) {
         if (requestId !== state.evidenceRequestId || sessionId !== getSessionId() || selected !== state.selectedOrigin) return false;
         state.evidenceLoading = false;
         state.evidenceError = "Source unavailable. The exact retained row could not be verified. Refresh the map and try again.";
-        renderDetail();
+        if (overlaySource()) {
+          clearOverlay("Temporary body references cleared: the exact inspected source could not be verified.");
+          render();
+        } else renderDetail();
         return false;
       }
     }
@@ -504,8 +624,12 @@
       const requestId = ++state.bodyReferencesRequestId;
       const evidenceId = row.evidence_id;
       const selected = state.selectedOrigin;
+      const generation = state.snapshot?.snapshot.generation;
+      const readsOverlaySource = () => state.bodyReferenceOverlay?.source.evidenceId === evidenceId
+        && state.bodyReferenceOverlay.source.origin === selected;
       const current = () => requestId === state.bodyReferencesRequestId && visible && sessionId === getSessionId()
-        && sessionId === state.sessionId && selected === state.selectedOrigin && row === state.evidence && evidenceId === state.evidenceId;
+        && sessionId === state.sessionId && selected === state.selectedOrigin && row === state.evidence && evidenceId === state.evidenceId
+        && generation === state.snapshot?.snapshot.generation;
       state.bodyReferencesLoading = true;
       bodyReferencesAbort = new AbortController();
       renderDetail();
@@ -516,16 +640,24 @@
         const payload = await response.json();
         if (!current()) return false;
         state.bodyReferences = normalizeBodyReferences(payload, sessionId, evidenceId, row);
+        state.bodyReferencesSource = Object.freeze({ sessionId, generation, evidenceId, origin: safeOrigin(row.origin),
+          method: row.method, path: safePath(row.path), sequence: row.sequence, startedAt: row.started_at });
         state.bodyReferencesLoading = false;
         bodyReferencesAbort = null;
-        renderDetail();
+        if (!["scanned", "partial"].includes(state.bodyReferences.status) && readsOverlaySource()) {
+          clearOverlay("Temporary body references cleared: the inspected source preview is no longer available or supported.");
+          render();
+        } else renderDetail();
         return true;
       } catch (_) {
         if (!current()) return false;
         state.bodyReferencesLoading = false;
         bodyReferencesAbort = null;
         state.bodyReferencesError = "Could not verify retained body references. Retry explicitly, or refresh the map and select the source again.";
-        renderDetail();
+        if (readsOverlaySource()) {
+          clearOverlay("Temporary body references cleared: the inspected source preview could not be verified.");
+          render();
+        } else renderDetail();
         return false;
       }
     }
@@ -556,10 +688,11 @@
       const query = state.query.trim().toLowerCase();
       const matchingNeighbors = direct?.neighbors.filter((origin) => !query || origin.origin.toLowerCase().includes(query)) || [];
       const origins = direct ? [direct.anchor, ...matchingNeighbors] : filteredOrigins();
-      const order = direct ? [direct.anchor.origin, ...stableOrder(state.order, matchingNeighbors)] : state.order;
+      const neighborOrder = direct ? stableOrder(state.order, matchingNeighbors) : [];
+      const order = direct ? [direct.anchor.origin, ...neighborOrder.filter((id) => direct.bodyIds.has(id)), ...neighborOrder.filter((id) => !direct.bodyIds.has(id))] : state.order;
       const filterKey = JSON.stringify([query, state.scopeOnly, state.sessionId, state.anchorOrigin]);
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
-      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin);
+      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin, direct ? overlayEdges() : []);
       state.layoutSlots = layout.slots;
       els.boundsDetails?.classList.toggle("hidden", !direct);
       if (!direct && els.graphDiagnostics) els.graphDiagnostics.textContent = "";
@@ -584,19 +717,25 @@
         els.graphBounds.textContent = [state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
       }
-      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.relationship !== "redirect_instruction" ? "header-declaration" : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" d="${edge.path}" marker-end="url(#service-map-arrow)"><title>${escape(edge.source)} → ${escape(edge.target)} · ${escape(edge.label)} declaration</title></path>`).join("");
+      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}" d="${edge.path}" marker-end="url(#service-map-arrow)"><title>${escape(edge.source)} → ${escape(edge.target)} · ${escape(edge.label)} · ${edge.relationship}</title></path>`).join("");
       const cards = layout.nodes.map((origin) => {
         const selected = origin.origin === state.selectedOrigin;
         const url = new URL(origin.origin);
         const pinned = origin.origin === state.anchorOrigin;
         return `<button class="service-map-card ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""} ${pinned ? "pinned" : ""}" type="button" data-service-origin="${escape(origin.origin)}" data-service-focus="origin:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
-          <span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong><span class="service-map-card-scheme">${escape(url.protocol.slice(0, -1))} · ${pinned ? "pinned anchor" : origin.captured ? "captured origin" : "referenced origin"}</span><span class="service-map-clues">${origin.technology_clues.slice(0, 2).map((clue) => `<span title="Observed response header; not verified architecture">${escape(clue.name)} · header clue</span>`).join("")}</span><span class="service-map-card-meta">${origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : "Referenced only in this snapshot"}</span></span>
+          <span class="service-map-card-symbol" aria-hidden="true">${pinned ? "⊙" : "◎"}</span><span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong><span class="service-map-card-scheme">${escape(url.protocol.slice(0, -1))} · ${pinned ? "pinned anchor" : origin.captured ? "captured origin" : "referenced origin"}</span><span class="service-map-clues">${origin.technology_clues.slice(0, 2).map((clue) => `<span title="Observed response header; not verified architecture">${escape(clue.name)} · header clue</span>`).join("")}</span><span class="service-map-card-meta">${origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : direct?.bodyIds.has(origin.origin) ? "Body URL reference · no captured rows" : "Referenced only in this snapshot"}</span></span>
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
       }).join("");
       replace(els.canvas, `<div class="service-map-layout" style="width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}</svg>${cards}</div>`);
       if (direct) {
         const counts = direct.counts;
+        const shownBodyArrows = layout.edges.filter((edge) => edge.relationship === "body_url_reference").length;
+        const shownMetadataArrows = layout.edges.length - shownBodyArrows;
+        const metadataArrows = direct.edgeCount - counts.body_url_reference;
+        const visibleIds = new Set(layout.nodes.map((origin) => origin.origin));
+        const availableBodyArrows = overlayEdges().filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)).length;
+        const availableMetadataArrows = layout.edgeCount - availableBodyArrows;
         const queryHidden = direct.neighbors.length - matchingNeighbors.length;
         const capOmitted = Math.max(0, matchingNeighbors.length - (MAX_CARDS - 1));
         const incomplete = state.snapshot.snapshot.complete !== true || array(state.snapshot.snapshot.stopped_by).length > 0;
@@ -604,6 +743,8 @@
         const summary = [
           `${layout.nodes.length - 1} / ${direct.neighbors.length} known direct neighbors shown`,
           `${counts.incoming} incoming / ${counts.outgoing} outgoing links`,
+          state.bodyReferenceOverlay ? `${direct.edgeCount - counts.body_url_reference} metadata / ${counts.body_url_reference} body URL links` : "",
+          state.bodyReferenceOverlay ? `${shownBodyArrows} / ${counts.body_url_reference} body arrows shown` : "",
           queryHidden ? `${queryHidden} hidden by query` : "",
           capOmitted ? `${capOmitted} omitted by ${MAX_CARDS}-card cap` : "",
           layout.edgeCount > MAX_EDGES ? `${layout.edgeCount - MAX_EDGES} arrows omitted by ${MAX_EDGES}-arrow cap` : "",
@@ -614,12 +755,17 @@
           selectionNotice,
         ];
         const diagnostics = [
-          `Direct relations · ${direct.neighbors.length} known direct neighbors in loaded metadata`,
+          `Direct relations · ${direct.neighbors.length} known direct neighbors in loaded metadata${state.bodyReferenceOverlay ? " and temporary body references (unique union)" : ""}`,
           `${layout.nodes.length - 1} shown · ${queryHidden} query-hidden · ${capOmitted} omitted by ${MAX_CARDS}-card cap (anchor included)`,
-          `Non-self distinct typed links: ${counts.incoming} incoming / ${counts.outgoing} outgoing · ${counts.redirect_instruction} redirect / ${counts.origin_header} Origin / ${counts.referer_header} Referer`,
+          `Non-self distinct typed links: ${counts.incoming} incoming / ${counts.outgoing} outgoing · ${counts.redirect_instruction} redirect / ${counts.origin_header} Origin / ${counts.referer_header} Referer${state.bodyReferenceOverlay ? ` / ${counts.body_url_reference} body_url_reference` : ""}`,
           `${layout.edges.length} / ${layout.edgeCount} arrows between displayed cards (cap ${MAX_EDGES}) · ${direct.edgeCount - layout.edgeCount} links outside displayed cards`,
-          "Links count distinct origin pairs and metadata types, not requests or redirect paths. Incoming and outgoing are relative to the pinned anchor; self-links are excluded.",
-          "Loaded metadata only; no transitive links or confirmed calls.",
+          ...(state.bodyReferenceOverlay ? [
+            `Body URL typed arrows: ${shownBodyArrows} / ${counts.body_url_reference} shown · ${counts.body_url_reference - availableBodyArrows} outside displayed cards · ${availableBodyArrows - shownBodyArrows} omitted by arrow cap`,
+            `Metadata typed arrows: ${shownMetadataArrows} / ${metadataArrows} shown · ${metadataArrows - availableMetadataArrows} outside displayed cards · ${availableMetadataArrows - shownMetadataArrows} omitted by arrow cap`,
+            "Body targets and arrows take priority within the same 24-card and 40-arrow limits.",
+          ] : []),
+          "Links count distinct origin pairs and relationship types, not requests, URL occurrences or redirect paths. Incoming and outgoing are relative to the pinned anchor; self-links are excluded.",
+          state.bodyReferenceOverlay ? "Loaded metadata and one explicit retained-preview scan only; no transitive links or confirmed calls." : "Loaded metadata only; no transitive links or confirmed calls.",
         ];
         els.graphBounds.textContent = summary.filter(Boolean).join(" · ");
         if (els.graphDiagnostics) els.graphDiagnostics.textContent = diagnostics.join(" · ");
@@ -637,6 +783,16 @@
     }
     function bodyReferencesMarkup() {
       const result = state.bodyReferences;
+      const scanned = result?.status === "scanned" || result?.status === "partial";
+      const hasNeighbors = scanned && result.references.some((item) => item.target_origin !== state.bodyReferencesSource?.origin);
+      const showing = state.bodyReferenceOverlay?.source.evidenceId === state.bodyReferencesSource?.evidenceId
+        && state.bodyReferenceOverlay?.source.origin === state.bodyReferencesSource?.origin && !!state.bodyReferenceOverlay;
+      const showDisabled = !scanned || !hasNeighbors || !getEventStreamReady() || !!state.error || state.stale || !sourceIsRetained(state.bodyReferencesSource);
+      const showHint = !getEventStreamReady() ? "Wait for the session event connection before showing temporary references."
+        : state.error || state.stale ? "Wait for a current metadata snapshot, or use Refresh, before showing temporary references."
+        : scanned && !hasNeighbors ? result.references.length ? "Only the source origin was referenced; self-links are not drawn." : "There are no referenced origins to show on the map."
+        : scanned ? "Show pins this exact source in Direct relations. One temporary overlay at a time; no additional read."
+        : "Inspect a supported retained preview successfully before showing references on the map.";
       const buttonLabel = state.bodyReferencesLoading ? "Inspecting retained body references…" : state.bodyReferencesError || result?.status === "unavailable" ? "Retry retained body references" : result ? "Inspect retained body references again" : "Inspect retained body references";
       let summary = "";
       if (result) {
@@ -649,7 +805,19 @@
         summary = `<div class="service-map-body-reference-result" role="status"><p>${escape(message)}</p>${scanned ? `<p class="service-map-muted">${result.complete ? "Complete retained-preview scan" : "Partial retained-preview scan"} · ${result.scanned_bytes.toLocaleString()} / ${result.retained_preview_bytes.toLocaleString()} UTF-8 preview bytes inspected${result.omitted_reference_occurrences ? ` · ${result.omitted_reference_occurrences.toLocaleString()} reference occurrence(s) omitted` : ""}</p>` : ""}${result.reasons.length ? `<p class="service-map-muted">${result.reasons.map((reason) => escape(BODY_REFERENCE_REASONS[reason] || reason.replace(/_/g, " "))).join(" · ")}</p>` : ""}</div>
           ${result.references.length ? `<ul class="service-map-body-reference-list" aria-label="Literal URL reference origins">${result.references.map((item) => `<li><span class="service-map-body-reference-origin">${escape(item.target_origin)}</span><span>${item.occurrences.toLocaleString()} occurrence${item.occurrences === 1 ? "" : "s"} · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets.toLocaleString()} more offset(s) omitted` : ""}</span></li>`).join("")}</ul>` : ""}`;
       }
-      return `<section class="service-map-body-references" aria-label="Retained body references" aria-busy="${state.bodyReferencesLoading}"><h4>Retained body references</h4><p class="service-map-muted">Optional inspection of this exact response’s retained HTML or JavaScript preview. Active session only. A literal URL reference does not prove a request, call, or service ownership.</p><button class="secondary-action" type="button" data-service-body-references="inspect" data-service-focus="body-references:inspect" ${state.bodyReferencesLoading ? "disabled" : ""}>${buttonLabel}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting one retained preview locally…</p>' : ""}${state.bodyReferencesError ? `<p class="service-map-error" role="status">${escape(state.bodyReferencesError)}</p>` : ""}${summary}<details class="service-map-body-reference-limits"><summary data-service-focus="body-references:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) URLs only. Origins are text, never fetched. No script execution, relative URL resolution, or additional map relationships. Offsets are zero-based bytes relative to the retained UTF-8 preview, not the original response.</p><p>Scan: ${BODY_REFERENCE_LIMITS.scan_bytes.toLocaleString()} bytes · Serialized row read: ${BODY_REFERENCE_LIMITS.serialized_row_bytes.toLocaleString()} bytes · Origins: ${BODY_REFERENCE_LIMITS.origins} · URL candidates: ${BODY_REFERENCE_LIMITS.candidates.toLocaleString()} · Candidate: ${BODY_REFERENCE_LIMITS.candidate_bytes.toLocaleString()} bytes · Offsets per origin: ${BODY_REFERENCE_LIMITS.offsets_per_origin}.</p>${result ? `<p>${result.candidates_scanned.toLocaleString()} candidates inspected · Capture preview truncated: ${result.capture_preview_truncated ? "yes" : "no"} · Scan prefix truncated: ${result.scan_prefix_truncated ? "yes" : "no"}.</p>` : ""}</details></section>`;
+      return `<section class="service-map-body-references" aria-label="Retained body references" aria-busy="${state.bodyReferencesLoading}"><h4>Retained body references</h4><p class="service-map-muted">Optional inspection of this exact response’s retained HTML or JavaScript preview. Active session only. A literal URL reference does not prove a request, call, or service ownership.</p><button class="secondary-action" type="button" data-service-body-references="inspect" data-service-focus="body-references:inspect" ${state.bodyReferencesLoading ? "disabled" : ""}>${buttonLabel}</button>${state.bodyReferencesLoading ? '<p class="service-map-muted" role="status">Inspecting one retained preview locally…</p>' : ""}${state.bodyReferencesError ? `<p class="service-map-error" role="status">${escape(state.bodyReferencesError)}</p>` : ""}${summary}<button class="secondary-action" type="button" data-service-show-body-references="show" data-service-focus="body-references:show" aria-pressed="${showing}" aria-describedby="serviceMapBodyShowHint" ${showDisabled ? "disabled" : ""}>Show references on map</button><p class="service-map-muted" id="serviceMapBodyShowHint">${showHint}</p><details class="service-map-body-reference-limits"><summary data-service-focus="body-references:limits">Coverage and limits</summary><p>Literal absolute HTTP(S) URLs only. Origins are text, never fetched. No script execution or relative URL resolution. Only Show references on map adds temporary Direct relations. Offsets are zero-based bytes relative to the retained UTF-8 preview, not the original response.</p><p>Scan: ${BODY_REFERENCE_LIMITS.scan_bytes.toLocaleString()} bytes · Serialized row read: ${BODY_REFERENCE_LIMITS.serialized_row_bytes.toLocaleString()} bytes · Origins: ${BODY_REFERENCE_LIMITS.origins} · URL candidates: ${BODY_REFERENCE_LIMITS.candidates.toLocaleString()} · Candidate: ${BODY_REFERENCE_LIMITS.candidate_bytes.toLocaleString()} bytes · Offsets per origin: ${BODY_REFERENCE_LIMITS.offsets_per_origin}.</p>${result ? `<p>${result.candidates_scanned.toLocaleString()} candidates inspected · Capture preview truncated: ${result.capture_preview_truncated ? "yes" : "no"} · Scan prefix truncated: ${result.scan_prefix_truncated ? "yes" : "no"}.</p>` : ""}</details></section>`;
+    }
+    function overlayProvenanceMarkup() {
+      const overlay = state.bodyReferenceOverlay;
+      if (!overlay) return "";
+      const { source, scan } = overlay;
+      return `<p class="service-map-overlay-source" title="${escape(`${source.method} ${source.origin}${source.path}`)}">${escape(source.method)} ${escape(source.origin)}${escape(source.path)}</p><p>Sequence ${escape(source.sequence)} · ${escape(source.startedAt)} · ${scan.complete ? "Complete" : "Partial"} retained-preview scan</p>${!scan.complete ? `<p class="service-map-muted">${scan.reasons.map((reason) => escape(BODY_REFERENCE_REASONS[reason] || reason.replace(/_/g, " "))).join(" · ")}${scan.omitted_reference_occurrences ? ` · ${scan.omitted_reference_occurrences} reference occurrence(s) omitted` : ""}</p>` : ""}`;
+    }
+    function renderOverlayStatus() {
+      if (!els.overlayStatus) return;
+      const overlay = state.bodyReferenceOverlay;
+      els.overlayStatus.classList.toggle("hidden", !overlay && !state.bodyOverlayNotice);
+      replace(els.overlayStatus, overlay ? `<div><strong>Temporary body URL references</strong>${overlayProvenanceMarkup()}<p>Literal references only; no confirmed requests. Changes to history clear this view.</p></div><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-relation-origin="${escape(overlay.source.origin)}" data-service-relation-evidence="${escape(overlay.source.evidenceId)}" data-service-focus="body-references:source">View inspected source</button><button class="secondary-action" type="button" data-service-clear-body-references="clear" data-service-focus="body-references:clear">Clear body references</button></div>` : `<p role="status">${escape(state.bodyOverlayNotice)}</p>`);
     }
     function evidenceMarkup(origin) {
       const items = evidenceItems(origin);
@@ -691,7 +859,8 @@
       const origin = selectedOrigin();
       if (!origin) { replaceDetail('<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
       if (!origin.captured) {
-        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in captured metadata within this snapshot. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
+        const bodyReference = state.bodyReferenceOverlay?.scan.references.some((item) => item.target_origin === origin.origin);
+        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body"><h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in loaded declarations${bodyReference ? " or the temporary body URL references" : ""}. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${bodyReference ? `<h4>Literal body URL reference</h4>${overlayProvenanceMarkup()}<p class="service-map-muted">This reference does not prove a request, call, or service ownership.</p>` : ""}${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
         return;
       }
       const pageCount = Math.max(1, Math.ceil(origin.endpoints.length / API_PAGE_SIZE));
@@ -710,6 +879,7 @@
     }
     function render() {
       renderStatus();
+      renderOverlayStatus();
       renderGraph();
       renderDetail();
       renderCatalog();
@@ -732,6 +902,8 @@
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; if (state.detailTab === "apis") { state.endpointIndex = null; state.endpointSelection = null; } renderDetail(); }
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
       else if (data.serviceBodyReferences) loadBodyReferences();
+      else if (data.serviceShowBodyReferences) showBodyReferencesOnMap();
+      else if (data.serviceClearBodyReferences) clearBodyReferenceOverlay();
       else if (data.servicePage !== undefined) { state.page = Math.max(0, Number(data.servicePage) || 0); renderCatalog(); els.catalog.scrollTop = 0; }
       else if (data.serviceDetailPage !== undefined) { state.detailPage = Math.max(0, Number(data.serviceDetailPage) || 0); renderDetail(); }
     }
@@ -753,6 +925,7 @@
     els.focusSelection?.addEventListener("click", focusSelection);
     els.search.addEventListener("input", () => { state.query = els.search.value; state.page = 0; render(); });
     els.scope.addEventListener("change", () => {
+      clearOverlay("Temporary body references cleared because the scope filter changed.");
       state.scopeOnly = els.scope.checked;
       state.page = 0;
       state.snapshot = null;
@@ -762,28 +935,43 @@
     });
     render();
     return {
-      refresh, reset, selectOrigin, loadEvidence, loadBodyReferences,
+      refresh, reset, selectOrigin, loadEvidence, loadBodyReferences, showBodyReferencesOnMap, clearBodyReferenceOverlay,
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
         if (signature(previous) === signature(next)) return false;
         return this.invalidate();
       },
       markDirty() {
+        clearOverlay("Temporary body references cleared because retained history changed. Inspect and show references again when ready.");
         state.historyVersion += 1;
         state.stale = true;
         cancelEvidence();
-        renderStatus();
-        if (state.detailTab === "evidence") renderDetail();
+        render();
       },
       setVisible(value, view = state.view) {
-        if (!value) cancelBodyReferences();
+        if (!value || view !== "service-map") {
+          clearOverlay("Temporary body references cleared because the map was hidden.");
+          cancelBodyReferences();
+        }
         visible = value;
         state.view = view;
         if (state.sessionId !== getSessionId()) reset();
         render();
       },
       setViewChange(callback) { onViewChange = callback; },
+      disconnect() {
+        clearOverlay("Temporary body references cleared because the session event connection was lost.");
+        state.requestId += 1;
+        state.historyVersion += 1;
+        abort?.abort();
+        abort = null;
+        state.loading = false;
+        state.stale = true;
+        cancelEvidence();
+        render();
+      },
       invalidate() {
+        clearOverlay("Temporary body references cleared because history or scope was invalidated.");
         state.requestId += 1;
         state.historyVersion += 1;
         abort?.abort();

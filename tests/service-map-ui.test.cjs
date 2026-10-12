@@ -38,7 +38,7 @@ function node() {
 function fixture() {
   let session = 'session-one';
   const requests = [];
-  const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus'].map(name => [name, node()]));
   const document = { activeElement: null, body: {}, querySelector: () => null };
   const controller = map.createController({ elements: els, getSessionId: () => session, document, request(url, options) { const pending = deferred(); requests.push({ url, options, ...pending }); return pending.promise; } });
   controller.setVisible(true);
@@ -1173,6 +1173,207 @@ test('same exact source keeps native inspector state when its selected endpoint 
 
 test('metadata map footer distinguishes explicit body inspection from map-wide extraction', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-  assert.match(html, /Body references require explicit inspection of one retained response; they are not added to this map\./);
+  assert.match(html, /Inspect one retained response, then choose Show references on map for a temporary Direct relations overlay\./);
+  assert.match(html, /Pause HTTP recording manually for steadier inspection/);
+  assert.doesNotMatch(html, /they are not added to this map/);
   assert.doesNotMatch(html, /Response-body reference extraction is deferred/);
+});
+
+function clickOverlay(f, action = 'show') {
+  const dataset = action === 'show' ? { serviceShowBodyReferences: 'show' } : { serviceClearBodyReferences: 'clear' };
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset }) } });
+}
+function bodyTargets(ids) {
+  return ids.map((target_origin, i) => ({ target_origin, occurrences: 1, preview_byte_offsets: [i + 1], omitted_offsets: 0 }));
+}
+async function inspectSource(f, id = 'evidence-one', source = originA, extra = {}) {
+  f.controller.selectOrigin(source);
+  const read = f.controller.loadEvidence(id); f.requests.at(-1).resolve(response(evidence(id, source, extra))); await read;
+}
+
+test('explicit Show and Clear are local, keep All origins default, and remove only a selected overlay-only target', async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f);
+  assert.equal(f.state.anchorOrigin, null); assert.equal(f.state.bodyReferenceOverlay, null);
+  assert.doesNotMatch(f.els.canvas.innerHTML, /assets.example.com/);
+  const reads = f.requests.length; clickOverlay(f);
+  assert.equal(f.state.anchorOrigin, originA);
+  assert.equal(f.state.bodyReferenceOverlay.source.evidenceId, 'evidence-one');
+  assert.equal(f.els.allOrigins.attributes['aria-pressed'], 'false');
+  assert.deepEqual(new Set(cardIds(f)), new Set([originA, 'https://assets.example.com']));
+  assert.match(f.els.canvas.innerHTML, /data-relationship="body_url_reference"/);
+  f.controller.selectOrigin('https://assets.example.com');
+  assert.equal(f.state.bodyReferences, null, 'inspector is independent from the copied overlay');
+  assert.match(f.els.detail.innerHTML, /Literal body URL reference/);
+  assert.match(f.els.detail.innerHTML, /Sequence 9007199254740993/);
+  clickOverlay(f, 'clear');
+  assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(f.state.selectedOrigin, null);
+  assert.equal(f.state.anchorOrigin, originA);
+  assert.match(f.els.detail.innerHTML, /Select an origin/);
+  assert.match(f.els.overlayStatus.innerHTML, /Showing loaded metadata only/);
+  assert.deepEqual(cardIds(f), [originA]);
+  assert.equal(f.requests.length, reads);
+  assert.equal(f.controller.showBodyReferencesOnMap(), false, 'clearing cannot resurrect discarded inspector data');
+});
+
+test('overlay owns an immutable allowlisted exact source, safe provenance, and partial scan copy', async () => {
+  const f = fixture(); await f.load();
+  const row = { ...evidence().row, path: '/users?private=secret#fragment', private_header: 'never-copy' };
+  await inspectSource(f, 'evidence-one', originA, { row });
+  const payload = bodyReferences({ status: 'partial', complete: false, reasons: ['capture_preview_truncated'], capture_preview_truncated: true,
+    raw_url: 'https://user:password@assets.example.com/private?secret=1', raw_body: 'never-copy' });
+  await resolveBodyReferences(f, payload); clickOverlay(f);
+  const overlay = f.state.bodyReferenceOverlay;
+  assert.equal(overlay.source.sequence, '9007199254740993');
+  assert.equal(overlay.source.path, '/users');
+  assert.equal(overlay.source.sessionId, 'session-one'); assert.equal(overlay.source.generation, 'generation-one');
+  for (const item of [overlay, overlay.source, overlay.scan, overlay.scan.references, overlay.scan.references[0], overlay.scan.references[0].preview_byte_offsets, overlay.scan.reasons]) assert.equal(Object.isFrozen(item), true);
+  assert.doesNotMatch(JSON.stringify(overlay), /secret|password|never-copy|private_header|raw_url|raw_body/);
+  assert.match(f.els.overlayStatus.innerHTML, /Partial retained-preview scan/);
+  assert.match(f.els.overlayStatus.innerHTML, /2026-10-12T01:00:00Z/);
+  assert.doesNotMatch(f.els.overlayStatus.innerHTML, /secret|fragment/);
+  f.state.bodyReferences.references[0].target_origin = 'https://mutated.example.com';
+  f.state.evidence.path = '/different'; payload.references[0].preview_byte_offsets[0] = 10;
+  f.controller.selectOrigin(originB);
+  assert.equal(f.state.bodyReferenceOverlay, overlay);
+  assert.equal(overlay.scan.references[0].target_origin, 'https://assets.example.com');
+  assert.equal(overlay.scan.references[0].preview_byte_offsets[0], 24);
+  assert.equal(overlay.source.path, '/users');
+});
+
+for (const [name, refs, hint] of [
+  ['zero', [], /There are no referenced origins/],
+  ['self-only', bodyTargets([originA]), /Only the source origin was referenced; self-links are not drawn/],
+]) test(`${name} scan disables Show with useful copy and never creates an overlay`, async () => {
+  const f = await verifiedBodyFixture();
+  await resolveBodyReferences(f, bodyReferences({ candidates_scanned: refs.length, references: refs }));
+  assert.match(f.els.detail.innerHTML, /data-service-show-body-references="show"[^>]*disabled/);
+  assert.match(f.els.detail.innerHTML, hint);
+  const reads = f.requests.length; clickOverlay(f);
+  assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(f.state.anchorOrigin, null);
+  assert.equal(f.requests.length, reads);
+});
+
+test('100 body origins retain the source and prioritize 23 reference cards with honest unique counts', async () => {
+  const f = fixture(), source = origin(originA);
+  source.redirects = Array.from({ length: 100 }, (_, i) => redirect(`https://metadata${String(i).padStart(3, '0')}.example.com`));
+  await f.load(snapshot([source])); await inspectSource(f);
+  const refs = bodyTargets(Array.from({ length: 100 }, (_, i) => `https://body${String(i).padStart(3, '0')}.example.com`));
+  await resolveBodyReferences(f, bodyReferences({ references: refs, candidates_scanned: 100 })); clickOverlay(f);
+  assert.equal(cardIds(f).length, 24); assert.equal(cardIds(f)[0], originA);
+  assert.ok(cardIds(f).slice(1).every(id => id.includes('body')));
+  assert.match(boundsText(f), /200 known direct neighbors/);
+  assert.match(boundsText(f), /100 metadata \/ 100 body URL links/);
+  assert.match(boundsText(f), /177 omitted by 24-card cap/);
+  assert.equal((f.els.canvas.innerHTML.match(/data-relationship="body_url_reference"/g) || []).length, 23);
+  assert.equal(f.state.graphOriginsCache.length, 101, 'body targets do not consume the 100 metadata reference slots');
+  f.els.search.value = 'body099'; f.els.search.dispatch('input');
+  assert.deepEqual(cardIds(f), [originA, refs[99].target_origin]);
+  f.controller.selectOrigin(refs[99].target_origin);
+  assert.match(f.els.detail.innerHTML, /Literal body URL reference/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /sampled HTTP rows|sampled rows|API paths/);
+  assert.doesNotMatch(f.els.catalog.innerHTML, /body099/);
+  clickOverlay(f, 'clear'); assert.equal(f.state.selectedOrigin, null);
+  assert.equal(f.requests.length, 3);
+});
+
+test('body, Origin, Referer and redirect arrows keep unique types and bounded distinct curves under 40 arrows', async () => {
+  const f = fixture(), source = origin(originA), peers = Array.from({ length: 23 }, (_, i) => origin(`https://peer${String(i).padStart(2, '0')}.example.com`));
+  peers.forEach(peer => { peer.header_links = [header(originA), header(originA, 'referer_header')]; source.redirects.push(redirect(peer.origin)); });
+  await f.load(snapshot([source, ...peers])); await inspectSource(f);
+  await resolveBodyReferences(f, bodyReferences({ references: bodyTargets(peers.map(item => item.origin)), candidates_scanned: 23 })); clickOverlay(f);
+  assert.match(boundsText(f), /23 known direct neighbors/);
+  assert.match(boundsText(f), /69 metadata \/ 23 body URL links/);
+  assert.match(boundsText(f), /40 \/ 92 arrows/);
+  assert.match(boundsText(f), /52 arrows omitted by 40-arrow cap/);
+  const arrows = [...f.els.canvas.innerHTML.matchAll(/<path class="service-map-edge ([^"]*)" data-relationship="([^"]+)" d="([^"]+)"[^>]*><title>([^<]+)<\/title>/g)];
+  assert.equal(arrows.length, 40);
+  assert.equal(arrows.filter(item => item[2] === 'body_url_reference').length, 23);
+  f.els.search.value = 'peer00'; f.els.search.dispatch('input');
+  const pair = [...f.els.canvas.innerHTML.matchAll(/<path class="service-map-edge ([^"]*)" data-relationship="([^"]+)" d="([^"]+)"[^>]*><title>([^<]+)<\/title>/g)];
+  assert.equal(pair.length, 4);
+  assert.equal(new Set(pair.map(item => item[3])).size, 4, 'same directed pair has distinct bounded curves');
+  assert.equal(new Set(pair.map(item => item[2])).size, 4);
+  f.controller.selectOrigin(peers[0].origin);
+  assert.match(f.els.detail.innerHTML, /2 sampled HTTP rows/);
+  const reads = f.requests.length; clickOverlay(f, 'clear');
+  assert.equal(f.state.selectedOrigin, peers[0].origin, 'captured target persists after Clear');
+  assert.equal(f.requests.length, reads);
+});
+
+test('Show pins a source beyond the All origins card cap and search without transferring to inspected targets', async () => {
+  const f = fixture(), origins = Array.from({ length: 30 }, (_, i) => origin(`https://node${String(i).padStart(2, '0')}.example.com`));
+  const source = origins.at(-1).origin;
+  await f.load(snapshot(origins)); await inspectSource(f, 'evidence-one', source);
+  await resolveBodyReferences(f, bodyReferences({ source_origin: source }));
+  f.els.search.value = 'assets'; f.els.search.dispatch('input'); clickOverlay(f);
+  assert.deepEqual(cardIds(f), [source, 'https://assets.example.com']);
+  assert.match(boundsText(f), /Pinned anchor is outside the search query/);
+  const overlay = f.state.bodyReferenceOverlay;
+  f.controller.selectOrigin('https://assets.example.com');
+  assert.equal(f.state.anchorOrigin, source); assert.equal(f.state.bodyReferenceOverlay, overlay);
+  f.els.search.value = 'missing'; f.els.search.dispatch('input');
+  assert.deepEqual(cardIds(f), [source]); assert.match(boundsText(f), /1 hidden by query/);
+  assert.equal(f.requests.length, 3);
+});
+
+for (const [name, clear] of [
+  ['All origins', f => f.els.allOrigins.dispatch('click')],
+  ['repin', f => { f.controller.selectOrigin(originB); f.els.focusSelection.dispatch('click'); }],
+  ['hidden map', f => f.controller.setVisible(false)],
+  ['standalone APIs', f => f.controller.setVisible(true, 'apis')],
+  ['transaction event', f => f.controller.markDirty()],
+  ['disconnect', f => f.controller.disconnect()],
+]) test(`${name} clears the overlay immediately without a body read or automatic recreation`, async () => {
+  const f = await verifiedBodyFixture(); await resolveBodyReferences(f); clickOverlay(f);
+  const reads = f.requests.length; clear(f);
+  assert.equal(f.state.bodyReferenceOverlay, null);
+  assert.doesNotMatch(f.els.canvas.innerHTML, /body_url_reference/);
+  assert.match(f.els.overlayStatus.innerHTML, /Temporary body references cleared/);
+  f.controller.setVisible(true, 'service-map');
+  assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(f.requests.length, reads);
+});
+
+test('manual Clear preserves native inspector disclosure, focus and nested scroll', async () => {
+  const f = await verifiedBodyFixture(), view = nativeInspectorModel(f);
+  await resolveBodyReferences(f); clickOverlay(f);
+  view().limits.open = true; view().body.scrollTop = 170; view().list.scrollTop = 65;
+  f.document.activeElement = view().summary;
+  clickOverlay(f, 'clear');
+  assert.equal(view().limits.open, true); assert.equal(view().body.scrollTop, 170); assert.equal(view().list.scrollTop, 65);
+  assert.equal(f.document.activeElement, view().summary);
+  assert.equal(f.state.bodyReferences.status, 'scanned');
+  assert.equal(f.requests.length, 3);
+});
+
+test('opposite-direction metadata and body links use seven bounded, non-overpainting attachment offsets', () => {
+  const a = origin(originA), b = origin(originB);
+  a.redirects = [redirect(originB)]; b.redirects = [redirect(originA)];
+  a.header_links = [header(originB), header(originB, 'referer_header')];
+  b.header_links = [header(originA), header(originA, 'referer_header')];
+  const data = map.normalizeSnapshot(snapshot([a, b]), 'session-one');
+  const layout = map.graphLayout(data.origins, [originA, originB], new Map(), originA,
+    [{ source: originA, target: originB, relationship: 'body_url_reference', label: 'Literal body URL reference' }]);
+  assert.equal(layout.edges.length, 7);
+  const offsets = layout.edges.map(edge => {
+    const source = layout.nodes.find(node => node.origin === edge.source);
+    return Number(edge.path.match(/^M [-\d.]+ ([-\d.]+)/)[1]) - source.y - 72;
+  });
+  assert.equal(new Set(offsets).size, 7);
+  assert.ok(offsets.every(value => Math.abs(value) <= 36));
+  assert.equal(layout.edges.filter(edge => edge.source === originA).length, 4);
+  assert.equal(layout.edges.filter(edge => edge.source === originB).length, 3);
+});
+
+test('overlay direct star keeps the pinned source opposite every incoming and outgoing neighbor', async () => {
+  const f = fixture(), a = origin(originA), b = origin(originB);
+  a.header_links = [header(originB)]; a.redirects = [redirect(originB)];
+  b.header_links = [header(originA), header(originA, 'referer_header')];
+  await f.load(snapshot([a, b])); await inspectSource(f);
+  await resolveBodyReferences(f, bodyReferences({ references: bodyTargets([originB, 'https://assets.example.com']), candidates_scanned: 2 }));
+  clickOverlay(f);
+  assert.equal(f.state.layoutSlots.get(originA).column, 0);
+  for (const id of cardIds(f).filter(id => id !== originA)) assert.equal(f.state.layoutSlots.get(id).column, 1);
+  const slots = JSON.stringify([...f.state.layoutSlots]);
+  f.controller.selectOrigin(originB); assert.equal(JSON.stringify([...f.state.layoutSlots]), slots);
+  await f.load(snapshot([a, b])); assert.equal(JSON.stringify([...f.state.layoutSlots]), slots);
 });

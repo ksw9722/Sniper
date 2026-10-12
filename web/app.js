@@ -950,6 +950,7 @@ let sortHeaders = Array.from(document.querySelectorAll(".sort-header"));
 let historyColumnHandles = Array.from(document.querySelectorAll(".column-resize-handle"));
 
 let targetServiceMapController = null;
+let targetServiceMapEventStreamReady = () => false;
 let refreshTimer = null;
 let auxTimer = null;
 let eventSource = null;
@@ -7807,6 +7808,7 @@ function connectEvents() {
   const eventWorkspaceGeneration = workspaceStateGeneration;
   const ownsHistoryEvents = () => eventSource === eventStreamOwner
     && eventWorkspaceGeneration === workspaceStateGeneration && eventSessionId === currentSessionId();
+  targetServiceMapEventStreamReady = () => ownsHistoryEvents() && eventStreamOwner.readyState === 1;
   let openedOnce = false;
 
   eventSource.onopen = () => {
@@ -7937,6 +7939,10 @@ function connectEvents() {
   });
 
   eventSource.onerror = () => {
+    if (!ownsHistoryEvents()) return;
+    // A disconnected event stream cannot prove that a retained evidence source
+    // stayed unchanged. Drop temporary body-reference state without re-reading.
+    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.disconnect();
     els.liveStatus.textContent = "Retrying";
     els.liveStatus.classList.remove("online");
   };
@@ -14476,14 +14482,18 @@ function initializeTargetWorkspace() {
       graphBounds: document.getElementById("serviceMapGraphBounds"),
       boundsDetails: document.getElementById("serviceMapBoundsDetails"),
       graphDiagnostics: document.getElementById("serviceMapGraphDiagnostics"),
+      overlayStatus: document.getElementById("serviceMapBodyOverlay"),
       detail: document.getElementById("serviceMapDetail"),
       content: document.getElementById("serviceMapContent"),
       catalog: document.getElementById("serviceMapApiCatalog"),
     },
     getSessionId: currentSessionId,
+    getEventStreamReady: () => targetServiceMapEventStreamReady(),
     request: (path, options) => fetch(path, options),
   });
-  targetServiceMapController.setViewChange(setActiveTargetView);
+  // Inspector-to-map navigation already owns a verified snapshot. Keep the
+  // explicit temporary-reference action local instead of issuing another read.
+  targetServiceMapController.setViewChange((view) => setActiveTargetView(view, { refresh: false }));
   const tabs = Array.from(document.querySelectorAll("[data-target-view]"));
   tabs.forEach((tab, index) => {
     tab.addEventListener("click", () => setActiveTargetView(tab.dataset.targetView));
@@ -14502,7 +14512,7 @@ function initializeTargetWorkspace() {
   setActiveTargetView(state.activeTargetView || "service-map");
 }
 
-function setActiveTargetView(view) {
+function setActiveTargetView(view, { refresh = true } = {}) {
   state.activeTargetView = ["rules", "service-map", "apis", "paths"].includes(view) ? view : "service-map";
   for (const tab of document.querySelectorAll("[data-target-view]")) {
     const selected = tab.dataset.targetView === state.activeTargetView;
@@ -14517,8 +14527,9 @@ function setActiveTargetView(view) {
   mapPanel?.classList.toggle("hidden", !mapVisible);
   mapPanel?.setAttribute("aria-labelledby", state.activeTargetView === "apis" ? "targetApisTab" : "targetServiceMapTab");
   targetServiceMapController?.setVisible(state.activeTool === "target" && mapVisible, state.activeTargetView);
-  if (state.activeTool === "target" && mapVisible) targetServiceMapController?.refresh();
-  else if (state.activeTool === "target" && currentSessionId()) loadTargetSiteMap().catch((error) => console.error(error));
+  if (state.activeTool === "target" && mapVisible) {
+    if (refresh) targetServiceMapController?.refresh();
+  } else if (state.activeTool === "target" && currentSessionId()) loadTargetSiteMap().catch((error) => console.error(error));
 }
 
 function renderTarget() {

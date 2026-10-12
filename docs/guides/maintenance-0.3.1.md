@@ -22,6 +22,15 @@ and retained-preview offsets with separate capture/prefix truncation and cap
 reasons. References do not establish calls or ownership. The default map and
 metadata evidence still read no bodies, and nothing sends target requests.
 
+The GUI can explicitly show one completed or partial body-reference result as a
+temporary Direct relations overlay. Its pinned source and dotted arrows keep
+literal references separate from traffic counts; the source method/path and
+preview coverage remain visible. It adds no API or CLI operation, automatic read,
+or persistence. All origins and the API catalog remain metadata-only. History or
+source invalidation clears the overlay, including new transaction events; it is
+not automatically restored. See the
+[overlay lifecycle and display limits](../integrations/service-map.md#temporary-body-reference-overlay-gui-only).
+
 ## Predictable CLI contracts
 
 - Discovery, examples, and schemas describe the corrected saved-data and local

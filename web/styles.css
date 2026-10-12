@@ -7387,7 +7387,8 @@ button.utility-button.replay-tab-add {
 .service-map-status { color: var(--text-dim); font-size: var(--font-xs); min-height: 16px; padding: 0 4px; overflow-wrap: anywhere; }
 .service-map-content { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(280px, 34%); gap: 12px; min-width: 0; min-height: 0; }
 .service-map-graph, .service-map-detail, .service-map-api-catalog { border: 1px solid var(--line-strong); border-radius: var(--radius-lg); min-width: 0; min-height: 0; background: linear-gradient(135deg, var(--bg-glow), transparent 65%), var(--panel); }
-.service-map-graph { display: grid; grid-template-rows: minmax(0, 1fr) auto; overflow: hidden; }
+.service-map-graph { display: flex; flex-direction: column; overflow: hidden; }
+.service-map-graph > .service-map-viewport { flex: 1; }
 .service-map-viewport { min-width: 0; min-height: 0; overflow: auto; }
 .service-map-canvas { min-height: 100%; display: grid; align-content: center; justify-content: center; min-width: max-content; }
 .service-map-layout { position: relative; flex-shrink: 0; }
@@ -7518,3 +7519,11 @@ button.utility-button.replay-tab-add {
 .service-map-body-reference-limits { color: var(--text-dim); font-size: var(--font-xs); line-height: 1.5; margin-top: 10px; overflow-wrap: anywhere; }
 .service-map-body-reference-limits summary { cursor: pointer; }
 .service-map-body-reference-limits p { margin: 8px 0 0; }
+.service-map-edge.body-reference { stroke-dasharray: 1 6; stroke-linecap: round; }
+.service-map-line.dotted { border-top-style: dotted; border-top-color: var(--text-soft); }
+.service-map-body-overlay { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--point-soft); font-size: var(--font-xs); line-height: 1.5; min-width: 0; }
+.service-map-body-overlay > div { flex: 1; min-width: 180px; }
+.service-map-body-overlay p { margin: 3px 0 0; overflow-wrap: anywhere; }
+.service-map-body-overlay > .service-map-overlay-actions { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 1 auto; min-width: 0; }
+.service-map-overlay-source { font-family: var(--mono); overflow-wrap: anywhere; }
+.service-map-body-overlay .service-map-overlay-source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

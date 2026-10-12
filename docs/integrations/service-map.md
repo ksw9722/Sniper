@@ -1,10 +1,10 @@
 # Passive retained-history Service Map (unreleased)
 
-Service Map is a read-only view of metadata already retained by one Sniper
-session. It builds the same inventory for the Scope UI and CLI. Opening or
-refreshing it never probes an origin, starts a scan, replays a request, follows a
-redirect, crawls a page, or asks an agent to explore a target. It does not create a
-persistent graph or change the active session.
+Service Map's default inventory is a read-only view of metadata already retained
+by one Sniper session. It builds the same inventory for the Scope UI and CLI.
+Opening or refreshing it never probes an origin, starts a scan, replays a request,
+follows a redirect, crawls a page, or asks an agent to explore a target. It does not
+create a persistent graph or change the active session.
 
 ## Scope workspace
 
@@ -43,7 +43,10 @@ local view of the origins directly connected to a chosen anchor by loaded
 Origin/Referer declarations or redirect instructions. It does not traverse
 multiple hops or infer service calls. Selecting a different card changes the
 inspector; an explicit Focus selection action changes the pinned anchor.
-Returning to All origins keeps the inspector selection.
+An explicit temporary body-reference overlay can add references from one
+already-inspected response, as described below. Returning to All origins clears
+that overlay and keeps the inspector selection only if it still belongs to the
+metadata inventory.
 
 The anchor is included before the 24-card display cap. Local origin search
 filters its neighbors while keeping the anchor visible; the view labels an
@@ -201,7 +204,8 @@ The Scope inspector offers an explicit action for the selected evidence row.
 Selecting or expanding an origin, API, relationship, or evidence item does not
 read bodies. Body-reference results stay separate from observed traffic and
 header-derived links. Closing or changing the selection/session invalidates a
-pending inspector response.
+pending inspector response. A completed result does not change the graph unless
+the operator separately chooses **Show references on map**.
 
 The reader inspects only the retained response preview of UTF-8 HTML or
 JavaScript. Supported media types, ignoring case and parameters, are `text/html`,
@@ -267,6 +271,73 @@ further candidates beyond the candidate cap have unknown reference coverage.
 Reasons name each applicable cap or unsupported/unavailable state. No automatic
 larger read follows a partial result. Even `complete: true` describes only this
 supported literal grammar within one retained preview, never all runtime calls.
+
+## Temporary body-reference overlay (GUI only)
+
+After **View source** has verified one exact retained row, use **Inspect retained
+body references** to inspect that response's supported preview. A successful
+`scanned` or `partial` result with at least one other origin enables **Show
+references on map**. A zero-reference or self-only result remains visible in the
+inspector but cannot create an overlay; unsupported, unavailable, or unverified
+results cannot be mapped.
+
+**Show references on map** opens Direct relations, pins the inspected response's
+source origin, and adds its references to the loaded metadata neighbors. It uses
+only the already-returned, bounded result: showing, selecting, searching, and
+clearing the overlay perform no further body read or target request. Nothing is
+scanned automatically. Only one overlay exists at a time, in memory for the
+current session; it is not written to saved workspace or session data.
+
+The source method and query-free path, exact retained-row provenance, and
+complete or partial retained-preview coverage remain visible. A partial scan
+stays labeled partial even when the metadata inventory is complete. Dotted
+**body URL reference** arrows point from that response's origin to referenced
+origins. Repeated literal occurrences are reference counts, never request counts.
+These arrows do not prove a request, runtime call, followed link, service
+ownership, or dependency. Target origins remain text and are never fetched.
+
+A target already present as a captured origin keeps its actual metadata and
+sampled traffic count. A target present only in the inspected preview is
+reference-only: no captured traffic, endpoint, or scope membership is invented.
+That label does not establish that the origin has never been captured. The
+overlay does not enrich All origins, the API catalog, header-derived links, or
+the metadata/CLI result. The existing body-reference CLI output is unchanged;
+there is no additional command or API endpoint for this GUI action.
+
+The overlay keeps at most 100 referenced origins from the bounded scan. Self
+references are excluded from the graph. The pinned source counts toward the
+existing 24-card limit, and body arrows share the 40-arrow limit with metadata
+arrows. Search can hide neighbors while retaining the source. Read the reported
+query-hidden, card-cap, and arrow omissions; graph omissions are separate from
+the scanner's omitted reference occurrences and unknown coverage beyond its
+limits. Selecting a referenced target changes the inspector without moving or
+reassigning the pinned source.
+
+Use **Clear body references** to return to metadata-only Direct relations. The
+overlay also clears on returning to All origins, focusing a different anchor,
+hiding/leaving Service Map, a forced refresh, scope or session changes, source
+loss or revision, snapshot generation changes, refresh failure, or disconnect.
+Every transaction event clears it: insert and update events are not
+distinguishable here, so even newly appended traffic invalidates the overlay.
+Retention, removals, and event gaps likewise invalidate it. An ordinary unchanged
+metadata poll preserves it only while the original session, store generation,
+source origin, and exact evidence token remain present. Another token with the
+same transaction UUID or method/path is not a substitute; a token falling out of
+the bounded evidence sample also clears the overlay. Later polls, delayed scan
+responses, and reopening the map never restore it automatically.
+Showing a new overlay is disabled while the session's event stream is connecting
+or disconnected, or the current metadata snapshot is stale or failed to refresh.
+Metadata polling alone does not restore event readiness; the owned event stream
+must reconnect and the source must be verified again.
+
+For steadier inspection during live traffic, manually pause HTTP recording with
+the **Capturing** control in Capture before verifying and inspecting the source.
+Traffic still passes through the proxy. Pausing is not a snapshot freeze:
+already-started recorded streams may finish updating, and explicit replay sends
+and WebSocket upgrades can still add HTTP history rows. Let in-flight operations
+finish before showing the overlay; other history changes can still clear it.
+Resume recording when ready. Showing an overlay never pauses or resumes recording
+for you.
 
 ## Local API
 

@@ -89,6 +89,12 @@ flowchart LR
   - returns canonical origins and retained-preview offsets, with explicit limits
     and unsupported/unavailable states; it performs no target requests and never
     augments the default metadata projection automatically
+- `web/service-map.js`
+  - renders the metadata inventory and exact-source inspector without loading
+    whole-history bodies
+  - can explicitly project one already-inspected response's literal origins into
+    a temporary Direct relations overlay; this GUI-only, session-local state
+    changes no captured counts or API catalog and is never persisted
 - `src/api.rs`
   - exposes record/detail APIs
   - serves the lightweight desktop UI

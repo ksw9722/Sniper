@@ -229,6 +229,16 @@ byte offsets, with truncation and limits; literal references do not prove calls
 or ownership. The session must already be active. Default map/evidence reads
 remain metadata-only, with no automatic body reads or target requests.
 
+In the GUI, **Show references on map** can place an already-inspected response's
+non-self references on a temporary **Direct relations** overlay. Dotted arrows
+mean literal body references; they add no captured traffic or API counts. The
+source method/path and retained-preview coverage remain visible. This explicit,
+in-memory action makes no further read and leaves All origins and the API catalog
+metadata-only. **Clear body references**, leaving the map, or a history/source
+invalidation removes it; it is never saved or restored automatically. The CLI
+body-reference output is unchanged. See
+[temporary overlay behavior and limits](docs/integrations/service-map.md#temporary-body-reference-overlay-gui-only).
+
 ## CLI
 
 For the current development branch, see the
