@@ -91,11 +91,17 @@ server error bodies. Unrecognized, duplicate or mismatched markers use a fixed
 generic error; older servers need not supply a marker. Successful legacy/v1/v2
 response shapes and catalog negotiation are unchanged.
 
+While Service Map or APIs is open, the GUI rereads retained metadata every
+1.2 seconds, skipping overlapping reads. Background reads keep the Reload label,
+button geometry, empty-state content and progress presentation steady. The compact
+Reload button remains available for an explicit reread or recovery after failure;
+initial and manual loads still show a busy state. It does not make target requests.
+
 After a failed refresh, the GUI visibly pauses background reads and offers
-**Refresh**. Any retained previous map is labeled stale. A source/scope/history
+**Reload**. Any retained previous map is labeled stale. A source/scope/history
 conflict clears verified evidence and supplementary overlays. History events,
 reconnects and leaving/reopening the view do not silently restart paused reads.
-An explicit Refresh or actual scope/session change can resume them. Local origin,
+An explicit Reload or actual scope/session change can resume them. Local origin,
 product, method and path filters remain read-free and do not clear the pause.
 The CLI reports a fixed failure once without retrying. Its codes are
 `SERVICE_MAP_BUSY`, `SERVICE_MAP_SCOPE_WORK_LIMIT`,

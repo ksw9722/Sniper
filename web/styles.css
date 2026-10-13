@@ -7367,15 +7367,15 @@ button.utility-button.replay-tab-add {
   background: rgba(255, 255, 255, 0.02);
   border-bottom: 1px solid var(--line);
 }
-/* Reuse Capture's sub-tab geometry, including its compact-height breakpoint.
-   An independent title/tab scale made this navigation row taller than the app. */
-.target-workspace-header h2 { margin: 0; font-size: var(--font-sm); font-weight: 600; }
+/* Reuse Capture's sub-tab geometry, including its compact-height breakpoint. */
 .target-tabs { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; }
 .target-passive-label { margin-left: auto; color: var(--text-dim); font-size: var(--font-xs); white-space: nowrap; }
 .target-shell > .panel-card { margin: 12px; min-height: 0; }
 .target-shell > #targetPathsPanel { display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .service-map-workspace { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; padding: 12px; gap: 10px; }
 .service-map-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-height: var(--control-h); padding: 0 3px; position: relative; }
+.service-map-reload { flex: 0 0 auto; min-height: var(--control-h); padding: 4px 14px; font-size: var(--font-xs); border-radius: 6px; white-space: nowrap; }
+.service-map-reload.service-map-background-refresh:disabled { opacity: 1; cursor: default; }
 .service-map-product-filters { min-width: 0; }
 .service-map-product-filters > summary { padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 7px; cursor: pointer; color: var(--text-soft); }
 .service-map-product-filters.has-filter > summary { color: var(--point); border-color: var(--point-border); }

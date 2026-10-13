@@ -49,6 +49,19 @@ function fixture() {
   return { controller, els, requests, document, state: controller.getState(), setSession(value) { session = value; }, async load(payload = snapshot()) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
 }
 
+test('map Reload uses the standard compact toolbar sizing and a fixed label', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  assert.match(html, /<button class="secondary-action service-map-reload" id="serviceMapRefresh"[^>]*>Reload<\/button>/);
+  const compact = css.match(/\.service-map-reload \{([^}]+)\}/)?.[1];
+  const standard = css.match(/\.toolbar-actions \.secondary-action \{([^}]+)\}/)?.[1];
+  assert.ok(compact); assert.ok(standard);
+  for (const declaration of ['min-height: var(--control-h);', 'padding: 4px 14px;', 'font-size: var(--font-xs);', 'border-radius: 6px;']) {
+    assert.ok(compact.includes(declaration)); assert.ok(standard.includes(declaration));
+  }
+  assert.match(compact, /flex: 0 0 auto;/); assert.match(compact, /white-space: nowrap;/);
+  assert.match(css, /\.service-map-reload\.service-map-background-refresh:disabled \{[^}]*opacity: 1;/);
+});
 test('map is lazy: construction/hidden refresh cause no request', async () => {
   const f = fixture(); f.controller.setVisible(false); await f.controller.refresh();
   assert.equal(f.requests.length, 0); assert.equal(f.state.snapshot, null);
@@ -148,21 +161,90 @@ test('unavailable source is honest and repeated evidence clicks latest-win', asy
   f.requests[1].resolve(response(evidence())); await a;
   assert.equal(f.state.evidence, null); assert.match(f.state.evidenceError, /Source unavailable/);
 });
-test('background refresh leaves retained metadata summary unchanged while button and busy state show progress', async () => {
+test('background refresh keeps Reload label and presentation stable while retaining its request guard', async () => {
   const f = fixture(); await f.load();
   const summary = f.els.status.textContent, canvasReplacements = f.els.canvas.replacements;
   for (let i = 0; i < 3; i += 1) {
-    const pending = f.controller.refresh();
+    const pending = pollRealTargetMap(f);
     assert.equal(f.els.status.textContent, summary, 'polling must not add a line or move the graph');
-    assert.doesNotMatch(f.els.status.textContent, /Refreshing/);
-    assert.equal(f.els.refresh.textContent, 'Refreshing…');
-    assert.equal(f.els.refresh.disabled, true); assert.equal(f.els.panel.attributes['aria-busy'], 'true');
+    assert.doesNotMatch(f.els.status.textContent, /Reloading/);
+    assert.equal(f.els.refresh.textContent, 'Reload');
+    assert.equal(f.els.refresh.disabled, true); assert.equal(f.els.panel.attributes['aria-busy'], 'false');
+    assert.equal(f.els.refresh.classList.contains('service-map-background-refresh'), true);
+    assert.equal(f.els.refresh.classList.contains('is-working'), false);
     assert.equal(f.els.canvas.replacements, canvasReplacements);
     f.requests.at(-1).resolve(response(snapshot())); await pending;
     assert.equal(f.els.status.textContent, summary);
-    assert.equal(f.els.refresh.textContent, 'Refresh');
+    assert.equal(f.els.refresh.textContent, 'Reload');
     assert.equal(f.els.refresh.disabled, false); assert.equal(f.els.panel.attributes['aria-busy'], 'false');
   }
+});
+test('loaded empty map and catalog remain unchanged through background polls and local redraws', async () => {
+  const f = fixture(); await f.load(snapshot([]));
+  const canvas = f.els.canvas.innerHTML, catalog = f.els.catalog.innerHTML;
+  const replacements = [f.els.canvas.replacements, f.els.catalog.replacements];
+  for (let i = 0; i < 3; i++) {
+    const task = pollRealTargetMap(f);
+    f.controller.setVisible(true);
+    assert.equal(f.els.canvas.innerHTML, canvas);
+    assert.equal(f.els.catalog.innerHTML, catalog);
+    assert.deepEqual([f.els.canvas.replacements, f.els.catalog.replacements], replacements);
+    assert.equal(f.els.refresh.textContent, 'Reload');
+    f.requests.at(-1).resolve(response(snapshot([]))); await task;
+    assert.deepEqual([f.els.canvas.replacements, f.els.catalog.replacements], replacements);
+  }
+});
+test('initial and manual Reload keep the label fixed, show busy state and resume automatic reads', async () => {
+  const f = fixture(); const initial = f.controller.refresh();
+  assert.equal(f.els.refresh.textContent, 'Reload');
+  assert.equal(f.els.panel.attributes['aria-busy'], 'true');
+  assert.equal(f.els.refresh.classList.contains('is-working'), true);
+  f.requests.at(-1).resolve(response(snapshot())); await initial;
+  const manual = f.els.refresh.dispatch('click');
+  assert.equal(f.els.refresh.textContent, 'Reload');
+  assert.equal(f.els.refresh.disabled, true);
+  assert.equal(f.els.refresh.classList.contains('service-map-background-refresh'), false);
+  assert.equal(f.els.refresh.classList.contains('is-working'), true);
+  assert.equal(f.els.panel.attributes['aria-busy'], 'true');
+  assert.equal(await f.controller.refresh(), false);
+  assert.equal(f.requests.length, 2);
+  f.requests.at(-1).resolve(response(snapshot())); await manual;
+  assert.equal(f.els.refresh.disabled, false);
+  assert.equal(f.els.refresh.classList.contains('is-working'), false);
+  assert.equal(f.els.panel.attributes['aria-busy'], 'false');
+  await f.load(); assert.equal(f.requests.length, 3);
+});
+for (const outcome of ['resolve', 'reject']) test(`late background ${outcome} cannot change newer manual Reload presentation`, async () => {
+  const f = fixture(); await f.load();
+  const background = f.controller.refresh(), old = f.requests.at(-1);
+  const manual = f.controller.refresh({ force: true, retry: true });
+  if (outcome === 'resolve') old.resolve(response(snapshot()));
+  else old.reject(new Error('Superseded background read'));
+  await background;
+  assert.equal(f.els.refresh.textContent, 'Reload');
+  assert.equal(f.els.refresh.disabled, true);
+  assert.equal(f.els.refresh.classList.contains('service-map-background-refresh'), false);
+  assert.equal(f.els.refresh.classList.contains('is-working'), true);
+  assert.equal(f.els.panel.attributes['aria-busy'], 'true');
+  f.requests.at(-1).resolve(response(snapshot())); await manual;
+  assert.equal(f.els.refresh.disabled, false);
+  assert.equal(f.els.refresh.classList.contains('is-working'), false);
+  assert.equal(f.els.panel.attributes['aria-busy'], 'false');
+});
+for (const boundary of ['reset', 'disconnect']) test(`${boundary} clears pending Reload presentation without a late response restoring it`, async () => {
+  const f = fixture(); await f.load();
+  const pending = f.controller.refresh({ force: true, retry: true });
+  f.controller[boundary]();
+  const assertIdle = () => {
+    assert.equal(f.els.refresh.textContent, 'Reload');
+    assert.equal(f.els.refresh.disabled, false);
+    assert.equal(f.els.refresh.classList.contains('service-map-background-refresh'), false);
+    assert.equal(f.els.refresh.classList.contains('is-working'), false);
+    assert.equal(f.els.panel.attributes['aria-busy'], 'false');
+  };
+  assertIdle();
+  f.requests.at(-1).resolve(response(snapshot())); await pending;
+  assertIdle();
 });
 test('refresh progress change preserves initial loading, stale summary and failure semantics', async () => {
   const f = fixture(); const initial = f.controller.refresh();
@@ -172,10 +254,10 @@ test('refresh progress change preserves initial loading, stale summary and failu
   assert.match(stale, /History changed: counts are from the previous snapshot/);
   const pending = f.controller.refresh(); assert.equal(f.els.status.textContent, stale);
   f.requests.at(-1).reject(new Error('Synthetic refresh failure')); await pending;
-  assert.match(f.els.status.textContent, /Refresh failed.*previous snapshot/);
+  assert.match(f.els.status.textContent, /Reload failed.*previous snapshot/);
   assert.match(f.els.status.textContent, /Stale snapshot/);
   assert.equal(f.els.status.classList.contains('service-map-error'), true);
-  assert.equal(f.els.refresh.textContent, 'Refresh'); assert.equal(f.els.refresh.disabled, false);
+  assert.equal(f.els.refresh.textContent, 'Reload'); assert.equal(f.els.refresh.disabled, false);
 });
 test('network errors keep prior map explicitly labelled; no payload text leaks', async () => {
   const f = fixture(); await f.load(); const pending = f.controller.refresh();
@@ -700,7 +782,7 @@ test('dirty and refresh-failure states keep the stable anchor and label previous
   const pending = f.controller.refresh(); f.requests.at(-1).reject(new Error('fixture failure')); await pending;
   assert.equal(f.state.anchorOrigin, originA);
   assert.equal(JSON.stringify([...f.state.layoutSlots]), slots);
-  assert.match(f.els.status.textContent, /Refresh failed/);
+  assert.match(f.els.status.textContent, /Reload failed/);
   assert.equal(f.requests.length, 2);
 });
 
@@ -1748,7 +1830,7 @@ for (const [name, change] of [
   ['per-origin cap', value => { value.origins[0].technology_observations = Array.from({ length: 33 }, (_, i) => technologyAggregate(technologyRow(undefined, String(i)))); }],
 ]) test(`malformed origin reported technology is rejected before map publication: ${name}`, async () => {
   const f = await technologyFixture(), previous = f.state.snapshot, payload = technologySnapshot(); change(payload);
-  await f.load(payload); assert.equal(f.state.snapshot, previous); assert.match(f.els.status.textContent, /Refresh failed/);
+  await f.load(payload); assert.equal(f.state.snapshot, previous); assert.match(f.els.status.textContent, /Reload failed/);
   assert.doesNotMatch(f.els.detail.innerHTML, /must-not-publish|<img|<script>/);
 });
 
@@ -2125,7 +2207,7 @@ for (const marker of [undefined, null, '2', '1', 0, 1, 3, 2.5, true, {}, [], [2]
     const previous = f.state.snapshot, pending = f.controller.refresh();
     const payload = technologySnapshot(); payload.technology_catalog_version = marker;
     f.requests.at(-1).resolve(response(payload)); assert.equal(await pending, false);
-    assert.equal(f.requests.length, 2); assert.equal(f.state.snapshot, previous); assert.match(f.state.error, /Refresh failed/);
+    assert.equal(f.requests.length, 2); assert.equal(f.state.snapshot, previous); assert.match(f.state.error, /Reload failed/);
   });
   test(`exact source rejects present malformed or mismatched catalog marker without retry: ${JSON.stringify(marker)}`, async () => {
     const f = await technologyFixture(withCatalog(technologySnapshot()));
@@ -2657,11 +2739,11 @@ for (const read of passiveReads) {
   });
 }
 
-test('initial metadata redirect refusal leaves an empty map and an enabled manual Refresh', async () => {
+test('initial metadata redirect refusal leaves an empty map and an enabled manual Reload', async () => {
   const f = fixture(), pending = f.controller.refresh();
   assert.equal(f.requests[0].options.redirect, 'error'); f.requests[0].reject(new TypeError('PRIVATE_ERROR'));
   assert.equal(await pending, false); assert.equal(f.requests.length, 1); assert.equal(f.state.snapshot, null);
-  assert.match(f.els.status.textContent, /Could not load the service map\. Automatic refresh paused\. Use Refresh to retry/);
+  assert.match(f.els.status.textContent, /Could not load the service map\. Automatic refresh paused\. Use Reload to retry/);
   assert.equal(f.els.refresh.disabled, false); assert.doesNotMatch(f.els.status.textContent, /PRIVATE_ERROR/);
   f.els.refresh.dispatch('click'); assert.equal(f.requests.length, 2);
   f.requests[1].resolve(response(snapshot())); await new Promise(resolve => setImmediate(resolve));
@@ -2721,7 +2803,7 @@ async function rejectMap(f, status = 429, marker = 'busy', headers) {
   const task = f.controller.refresh(); f.requests.at(-1).resolve(boundedMapError(status, marker, headers));
   assert.equal(await task, false);
 }
-for (const [status, marker, message] of boundedMapFailures) test(`ordinary map ${marker} keeps a stale map and pauses real polling until one manual Refresh`, async () => {
+for (const [status, marker, message] of boundedMapFailures) test(`ordinary map ${marker} keeps a stale map and pauses real polling until one manual Reload`, async () => {
   const f = await htmlGeneratorFixture(), previous = f.state.snapshot, verified = f.state.evidence;
   await resolveBodyReferences(f, bodyReferences({ session_id: technologySession, evidence_id: technologyToken(), source_sequence: '1' }));
   assert.equal(f.controller.showBodyReferencesOnMap(), true);
@@ -2730,7 +2812,7 @@ for (const [status, marker, message] of boundedMapFailures) test(`ordinary map $
   await rejectMap(f, status, marker);
   assert.equal(f.state.snapshot, previous); assert.equal(f.state.stale, true); assert.equal(f.state.refreshPaused, true);
   assert.ok(f.state.error.startsWith(message)); assert.match(f.els.status.textContent, /previous snapshot as stale/);
-  assert.equal(f.els.refresh.textContent, 'Refresh'); assert.equal(f.els.refresh.disabled, false);
+  assert.equal(f.els.refresh.textContent, 'Reload'); assert.equal(f.els.refresh.disabled, false);
   assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(f.state.bodyReferences, null); assert.equal(f.state.htmlGenerators, null);
   assert.equal(f.state.evidence, status === 409 ? null : verified);
   if (status === 409) { assert.equal(f.state.evidenceId, null); assert.equal(f.state.socketPeer, null); }
@@ -2752,20 +2834,20 @@ for (const [name, status, marker, headers] of [
   ['leading whitespace', 429, ' busy'], ['no Headers object', 429, undefined, {}],
 ]) test(`ordinary map ${name} uses fixed generic text without reading the body`, async () => {
   const f = fixture(); await f.load(); await rejectMap(f, status, marker, headers);
-  assert.equal(f.state.error, 'Refresh failed.');
-  assert.match(f.els.status.textContent, /^Refresh failed\. Automatic refresh paused\. Showing the previous snapshot as stale; use Refresh to retry\./);
+  assert.equal(f.state.error, 'Reload failed.');
+  assert.match(f.els.status.textContent, /^Reload failed\. Automatic refresh paused\. Showing the previous snapshot as stale; use Reload to retry\./);
   const before = f.requests.length; await pollRealTargetMap(f); assert.equal(f.requests.length, before);
   assert.doesNotMatch(f.els.status.textContent, /PRIVATE_ERROR|scope_changed/);
 });
 test('native Headers joins duplicated markers and cannot satisfy the single-token contract', async () => {
   const headers = new Headers(); headers.append('x-sniper-service-map-error', 'busy'); headers.append('x-sniper-service-map-error', 'busy');
   const f = fixture(); await f.load(); await rejectMap(f, 429, null, headers);
-  assert.match(f.state.error, /^Refresh failed\./);
+  assert.match(f.state.error, /^Reload failed\./);
 });
 for (const [status, marker, message] of boundedMapFailures) test(`initial ${marker} failure is explicit, empty, paused and manually retryable`, async () => {
   const f = fixture(); await rejectMap(f, status, marker);
   assert.equal(f.state.snapshot, null); assert.equal(f.state.refreshPaused, true);
-  assert.equal(f.els.status.textContent, `${message} Automatic refresh paused. Use Refresh to retry.`);
+  assert.equal(f.els.status.textContent, `${message} Automatic refresh paused. Use Reload to retry.`);
   assert.equal(f.els.refresh.disabled, false); await f.controller.refresh(); assert.equal(f.requests.length, 1);
 });
 test('paused map local origin/product/version/method/path filters add zero reads and preserve exact selection', async () => {
@@ -2794,7 +2876,7 @@ for (const boundary of ['visibility', 'apis', 'force-only navigation', 'unchange
   if (boundary === 'history invalidation' || boundary === 'disconnect/reconnect') {
     assert.equal(f.state.snapshot, null);
     assert.doesNotMatch(f.els.status.textContent, /Showing the previous snapshot|rows considered/);
-    assert.match(f.els.status.textContent, /Automatic refresh paused\. Use Refresh to retry\./);
+    assert.match(f.els.status.textContent, /Automatic refresh paused\. Use Reload to retry\./);
   }
 });
 for (const boundary of ['scope rules', 'scope checkbox', 'session reset', 'session detection']) test(`actual ${boundary} clears pause and permits one normal map read`, async () => {

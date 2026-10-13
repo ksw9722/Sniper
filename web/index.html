@@ -1367,7 +1367,6 @@
 
         <section class="target-shell hidden" id="targetShell">
           <header class="target-workspace-header">
-            <h2>Scope</h2>
             <div class="target-tabs" role="tablist" aria-label="Scope views">
               <button class="sub-tab target-tab" id="targetRulesTab" type="button" data-target-view="rules" role="tab" aria-selected="false" aria-controls="targetRulesPanel">Rules</button>
               <button class="sub-tab target-tab active" id="targetServiceMapTab" type="button" data-target-view="service-map" role="tab" aria-selected="true" aria-controls="targetServiceMapPanel">Service Map</button>
@@ -1413,7 +1412,7 @@
               <label class="service-map-scope"><input id="serviceMapScopeOnly" type="checkbox" /> In scope only</label>
               <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
               <details class="service-map-product-filters"><summary>Products / versions</summary><div id="serviceMapProductFilters" class="service-map-product-filter-panel"></div></details>
-              <button class="secondary-action" id="serviceMapRefresh" type="button">Refresh</button>
+              <button class="secondary-action service-map-reload" id="serviceMapRefresh" type="button" title="Reload retained HTTP metadata. This view updates automatically while open.">Reload</button>
             </div>
             <div class="service-map-status" id="serviceMapStatus" role="status" aria-live="polite"></div>
             <div class="service-map-content" id="serviceMapContent">

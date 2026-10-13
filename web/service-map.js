@@ -31,8 +31,8 @@
     invalid_evidence_id: "Source verification unavailable for this evidence token; verify again.",
     session_mismatch: "Source session does not match; verify again.",
     stale_generation: "Retained history changed; verify again.",
-    record_missing: "The source row is no longer retained. Refresh the map to select current evidence.",
-    record_changed: "The source row changed. Refresh the map to select current evidence.",
+    record_missing: "The source row is no longer retained. Reload the map to select current evidence.",
+    record_changed: "The source row changed. Reload the map to select current evidence.",
     session_source_changed: "Session context changed; verify again.",
   });
   const INACTIVE_SESSION_NOTICE = "This session must be active for supplementary inspection. Switch to it again, then verify the source.";
@@ -912,7 +912,7 @@
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null,
-      loading: false, error: "", refreshPaused: false, requestId: 0, evidenceRequestId: 0, evidence: null,
+      loading: false, backgroundLoading: false, error: "", refreshPaused: false, requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       peerMatches: null, peerMatchesSource: null, peerMatchesLoading: false, peerMatchesError: "", peerMatchesRequestId: 0, peerEvidenceBinding: null,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
@@ -1531,7 +1531,7 @@
       abort = null;
       cancelEvidence();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
-        inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
+        inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
@@ -1563,7 +1563,7 @@
       // The app polls every 1.2 seconds. A same-source background snapshot must
       // not erase an explicit inspection or continually abort its pending read.
       if (force) {
-        clearOverlay("Temporary body references cleared by Refresh. Inspect and show references again when ready.");
+        clearOverlay("Temporary body references cleared by Reload. Inspect and show references again when ready.");
         cancelBodyReferences();
         cancelHtmlGenerators();
         cancelPeerMatches();
@@ -1573,6 +1573,7 @@
       const requestId = ++state.requestId;
       const scopeOnly = state.scopeOnly;
       const historyVersion = state.historyVersion;
+      state.backgroundLoading = !!state.snapshot && !force;
       state.loading = true;
       state.error = "";
       renderStatus();
@@ -1637,7 +1638,7 @@
         // failure into an automatic retry loop, including with older servers.
         state.refreshPaused = true;
         state.stale = true;
-        state.error = failure?.message || (state.snapshot ? "Refresh failed." : "Could not load the service map.");
+        state.error = failure?.message || (state.snapshot ? "Reload failed." : "Could not load the service map.");
         render();
         return false;
       }
@@ -1714,7 +1715,7 @@
         state.evidenceCatalogVersion = state.evidence ? catalogVersion : null;
         state.evidenceLegacyCatalog = !!state.evidence && catalogVersion !== TECHNOLOGY_CATALOG_VERSION;
         state.socketPeer = state.evidence ? normalizedPeer : null;
-        state.evidenceError = state.evidence ? "" : "Source unavailable. The retained row may have changed or been removed. Refresh the map to select current evidence.";
+        state.evidenceError = state.evidence ? "" : "Source unavailable. The retained row may have changed or been removed. Reload the map to select current evidence.";
         state.evidenceLoading = false;
         if (!state.evidence && peerBinding) {
           handlePeerSampleUnavailable(peerBinding);
@@ -1733,7 +1734,7 @@
         cancelBodyReferences();
         cancelHtmlGenerators();
         state.evidenceLoading = false;
-        state.evidenceError = "Source unavailable. The exact retained row could not be verified. Refresh the map and try again.";
+        state.evidenceError = "Source unavailable. The exact retained row could not be verified. Reload the map and try again.";
         if (peerBinding) {
           handlePeerSampleUnavailable(peerBinding);
           render();
@@ -1926,13 +1927,17 @@
       // A deletion/gap can clear the retained snapshot while refresh is paused.
       // Derive this suffix now so it never claims cleared data is still shown.
       const error = state.refreshPaused && state.error
-        ? `${state.error} Automatic refresh paused. ${snapshot ? "Showing the previous snapshot as stale; use Refresh to retry." : "Use Refresh to retry."}` : state.error;
+        ? `${state.error} Automatic refresh paused. ${snapshot ? "Showing the previous snapshot as stale; use Reload to retry." : "Use Reload to retry."}` : state.error;
       if (activeInspectionsBlocked()) status += ` · ${INACTIVE_SESSION_NOTICE}`;
       els.status.textContent = error ? `${error}${snapshot ? ` ${status}` : ""}` : status;
       els.status.classList.toggle("service-map-error", !!state.error);
       els.refresh.disabled = state.loading;
-      els.refresh.textContent = state.loading ? "Refreshing…" : "Refresh";
-      els.panel.setAttribute("aria-busy", String(state.loading));
+      // Polling must not resize or dim the toolbar every 1.2 seconds. Keep the
+      // request guard, but reserve visible progress for initial/manual loads.
+      els.refresh.textContent = "Reload";
+      els.refresh.classList.toggle("service-map-background-refresh", state.loading && state.backgroundLoading);
+      els.refresh.classList.toggle("is-working", state.loading && !state.backgroundLoading);
+      els.panel.setAttribute("aria-busy", String(state.loading && !state.backgroundLoading));
     }
     function renderGraph() {
       if (state.bodyReferenceOverlay?.kind === "peer") { renderPeerGraph(); return; }
@@ -1972,7 +1977,7 @@
           ? `Selected origin is outside the ${MAX_REFERENCE_CARDS}-reference-card limit; inspector retained.`
           : "Selected origin is outside this filter; inspector retained.";
       if (!origins.length) {
-        replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly || state.productId || state.productVersion ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly || state.productId || state.productVersion ? "Change the origin search, product/version filters or In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
+        replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading && !state.snapshot ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly || state.productId || state.productVersion ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly || state.productId || state.productVersion ? "Change the origin search, product/version filters or In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
         els.graphBounds.textContent = ["0 matching origins", stages.queryHidden ? `${stages.queryHidden} hidden by query` : "", stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "", state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
       }
@@ -2118,7 +2123,7 @@
         && state.bodyReferenceOverlay?.source.origin === state.bodyReferencesSource?.origin && !!state.bodyReferenceOverlay;
       const showDisabled = activeInspectionsBlocked() || !scanned || !hasNeighbors || !getEventStreamReady() || !!state.error || state.stale || !sourceIsRetained(state.bodyReferencesSource);
       const showHint = !getEventStreamReady() ? "Wait for the session event connection before showing temporary references."
-        : state.error || state.stale ? "Wait for a current metadata snapshot, or use Refresh, before showing temporary references."
+        : state.error || state.stale ? "Wait for a current metadata snapshot, or use Reload, before showing temporary references."
         : scanned && !hasNeighbors ? result.references.length ? "Only the source origin was referenced; self-links are not drawn." : "There are no referenced origins to show on the map."
         : scanned ? "Show pins this exact source in Direct relations. One temporary overlay at a time; no additional read."
         : "Inspect a supported retained preview successfully before showing references on the map.";
@@ -2298,7 +2303,7 @@
       if (state.snapshot) state.page = Math.min(state.page, pages - 1);
       const start = state.page * API_PAGE_SIZE;
       if (!state.pageAnchor && entries[start]) state.pageAnchor = endpointIdentity(entries[start]);
-      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3><p>Method/path combinations belonging to matching origins. Origin products/versions do not prove that each endpoint reported them. Query strings are omitted; no endpoint is probed.</p></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(entries.length, loaded.length, start, loaded.length - searchedEntries.length, searchedEntries.length - originEntries.length)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ origin, endpoint, index }) => endpointButton(endpoint, origin, index, true)).join("") || `<p class="empty-copy">${state.loading ? "Loading retained API paths…" : "No loaded endpoints match these filters, origin search and origin products/versions."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${entries.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, entries.length)} / ${entries.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
+      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3><p>Method/path combinations belonging to matching origins. Origin products/versions do not prove that each endpoint reported them. Query strings are omitted; no endpoint is probed.</p></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(entries.length, loaded.length, start, loaded.length - searchedEntries.length, searchedEntries.length - originEntries.length)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ origin, endpoint, index }) => endpointButton(endpoint, origin, index, true)).join("") || `<p class="empty-copy">${state.loading && !state.snapshot ? "Loading retained API paths…" : "No loaded endpoints match these filters, origin search and origin products/versions."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${entries.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, entries.length)} / ${entries.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
     }
     function render() {
       renderStatus();

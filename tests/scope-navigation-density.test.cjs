@@ -28,15 +28,19 @@ test('Scope tabs share existing sub-tab styling without Capture handlers', () =>
   assert.match(app, /querySelectorAll\("\.sub-tab\[data-proxy-tab\]"\)/);
 });
 
-test('Scope heading and strip add no vertical padding or enlarged title', () => {
+test('Scope strip omits the duplicate title and keeps accessible navigation labels', () => {
+  assert.doesNotMatch(header, /<h[1-6]\b[^>]*>\s*Scope\s*<\/h[1-6]>/);
+  assert.match(html, /<button class="main-tab" data-tool="target">Scope<\/button>/);
+  assert.match(header, /role="tablist" aria-label="Scope views"/);
+  assert.match(html, /id="targetRulesPanel" role="tabpanel" aria-labelledby="targetRulesTab"/);
+  assert.match(html, /id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab"/);
+});
+
+test('Scope strip keeps compact height and adds no vertical padding', () => {
   const strip = rule('.target-workspace-header');
   assert.match(strip, /padding:\s*0 8px;/);
   assert.match(strip, /min-height:\s*24px;/);
   assert.doesNotMatch(strip, /(?:^|;)\s*(?:height|padding-top|padding-bottom):/);
-  const title = rule('.target-workspace-header h2');
-  assert.match(title, /margin:\s*0;/);
-  assert.match(title, /font-size:\s*var\(--font-sm\);/);
-  assert.match(title, /font-weight:\s*600;/);
   assert.doesNotMatch(css, /\.target-tab(?:\.active)?\s*\{/);
 });
 
