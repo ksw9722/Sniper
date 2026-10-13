@@ -18502,6 +18502,21 @@ function wireReplayTabDragReorder(tabElement, id) {
 function renderReplayTabs(options = {}) {
   const preserveScrollLeft = options.keepScroll ? els.replayTabStrip.scrollLeft : null;
   const sortedTabs = getReplayTabVisualOrder();
+  const renamingTab = sortedTabs.find((tab) => tab.id === state.replayRenamingTabId);
+  const renameInput = renamingTab && els.replayTabStrip.querySelector(
+    `.replay-tab[data-replay-tab-id="${CSS.escape(renamingTab.id)}"] .replay-tab-name-input`,
+  );
+  const renameOwner = renameInput?._replayRenameOwner;
+  if (renameOwner && renameOwner.tab === renamingTab
+    && renameOwner.sessionId === currentSessionId()
+    && renameOwner.generation === workspaceStateGeneration
+    && renameOwner.activeTabId === state.activeReplayTabId) {
+    // Status callbacks can redraw the strip while its only copy of a name draft
+    // is in this input. Keep the node (and IME/selection) alive until commit or
+    // cancel; the final render will also pick up deferred tab additions/order.
+    for (const tab of sortedTabs) refreshReplayTabLabel(tab.id);
+    return;
+  }
 
   els.replayTabStrip.innerHTML = sortedTabs
     .map((tab) => {
@@ -18574,8 +18589,23 @@ function renderReplayTabs(options = {}) {
       }
     }, { capture: true });
     if (nameInput) {
+      const owner = nameInput._replayRenameOwner = {
+        tab: state.replayTabs.find((tab) => tab.id === id),
+        sessionId: currentSessionId(),
+        generation: workspaceStateGeneration,
+        activeTabId: state.activeReplayTabId,
+      };
+      const ownsRename = () => state.replayRenamingTabId === id
+        && owner.sessionId === currentSessionId()
+        && owner.generation === workspaceStateGeneration
+        && owner.activeTabId === state.activeReplayTabId
+        && state.replayTabs.includes(owner.tab)
+        && els.replayTabStrip.querySelector(
+          `.replay-tab[data-replay-tab-id="${CSS.escape(id)}"] .replay-tab-name-input`,
+        ) === nameInput;
       nameInput.addEventListener("click", (event) => event.stopPropagation());
       nameInput.addEventListener("keydown", (event) => {
+        if (!ownsRename()) return;
         // Composition keys edit the label, rather than commit or cancel it.
         if (event.isComposing) return;
         if (event.key === "Enter") {
@@ -18588,10 +18618,10 @@ function renderReplayTabs(options = {}) {
         }
       });
       nameInput.addEventListener("blur", () => {
-        commitReplayTabRename(id, nameInput.value);
+        if (ownsRename()) commitReplayTabRename(id, nameInput.value);
       });
       requestAnimationFrame(() => {
-        if (state.replayRenamingTabId === id) {
+        if (ownsRename()) {
           nameInput.focus();
           nameInput.select();
         }

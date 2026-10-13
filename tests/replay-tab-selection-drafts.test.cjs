@@ -21,7 +21,7 @@ function setup() {
     'beginReplayTabRename', 'commitReplayTabRename', 'toggleReplayTabPin',
     'syncReplayRequestTextFromEditor', 'clearReplayResponseForDraftChange', 'syncReplayToolbar',
     'parseEditableRawRequest', 'splitRawHttpMessage', 'parseReplayHttpVersionToken',
-    'headerValue', 'editableRequestBodyLength', 'validateRawHttpBodyFraming', 'renderReplayTabs',
+    'headerValue', 'editableRequestBodyLength', 'validateRawHttpBodyFraming', 'renderReplayTabs', 'refreshReplayTabLabel',
   ]) vm.runInContext(source(name), f.context);
   for (const input of [f.els.replayHostInput, f.els.replayPortInput]) {
     input.listeners = {};
@@ -64,13 +64,15 @@ function setup() {
       return row;
     });
   } });
+  f.animationFrames = [];
   Object.assign(f.context, {
     Element, CSS: { escape: value => value }, escapeHtml: value => String(value),
     replayTabAutoLabel: tab => tab.customLabel, replayTabLabel: tab => tab.customLabel,
     replayTabTooltipLabel: (tab, label) => label,
-    wireReplayTabDragReorder() {}, scrollActiveReplayTabIntoView() {}, requestAnimationFrame() {},
+    wireReplayTabDragReorder() {}, scrollActiveReplayTabIntoView() {},
+    requestAnimationFrame(callback) { f.animationFrames.push(callback); },
     getActiveModalAction: () => null, canNavigateReplayHistory: () => false,
-    refreshReplayTabLabel() {}, updateReplaySearchPane() {}, renderReplayEmptyResponse() {}, renderReplayViewContent() {},
+    updateReplaySearchPane() {}, renderReplayEmptyResponse() {}, renderReplayViewContent() {},
     TextDecoder, renderEditableHexHtml: () => '<hex>', bindHexByteHandlers() {}, clearTimeout() {}, setTimeout: () => 1,
   });
   f.flushes = 0; f.context.flushWorkspaceState = async () => { f.flushes++; };
@@ -455,3 +457,83 @@ for (const [index, label] of savedUnicodeLabels.entries()) {
     assert.equal(f.flushes, 1);
   });
 }
+
+
+for (const type of ['http', 'websocket']) test(`${type} rename keeps its live draft and selection through unrelated strip redraws`, () => {
+  const f = setup(); f.a.type = type;
+  const input = f.rename();
+  input.value = '한글 이름 in progress'; input.selectionStart = 2; input.selectionEnd = 7;
+  const savedLabel = f.a.customLabel;
+  f.b.customLabel = 'Updated other label';
+  for (let index = 0; index < 3; index++) f.context.renderReplayTabs();
+  assert.equal(f.row(f.a.id).name, input, 'passive redraw must retain the actual editor node');
+  assert.equal(f.document.activeElement, input);
+  assert.equal(input.value, '한글 이름 in progress');
+  assert.equal(input.selectionStart, 2); assert.equal(input.selectionEnd, 7);
+  assert.equal(f.a.customLabel, savedLabel, 'redraw must not commit the draft');
+  assert.equal(f.flushes, 0);
+  assert.equal(f.row(f.b.id).button.textContent, 'Updated other label');
+  input.listeners.keydown({ key: 'Enter', preventDefault() {} });
+  assert.equal(f.a.customLabel, '한글 이름 in progress');
+  assert.equal(f.state.replayRenamingTabId, null); assert.equal(f.flushes, 1);
+});
+
+test('redraw during rename retains Escape cancellation and paints deferred tabs afterward', () => {
+  const f = setup(), input = f.rename(), previous = f.a.customLabel;
+  const added = f.tab('added'); f.state.replayTabs.push(added);
+  f.context.renderReplayTabs();
+  assert.equal(f.row(f.a.id).name, input);
+  input.listeners.keydown({ key: 'Escape', preventDefault() {} });
+  assert.equal(f.a.customLabel, previous); assert.equal(f.flushes, 0);
+  assert.ok(f.row(added.id), 'closing the editor must paint deferred changes');
+  assert.equal(f.state.replayRenamingTabId, null);
+});
+
+for (const change of ['session', 'generation', 'tab identity']) test(`old rename callbacks cannot affect a newer ${change}`, () => {
+  const f = setup(), oldInput = f.rename();
+  if (change === 'session') f.state.activeSession = { id: 'session-b' };
+  else if (change === 'generation') f.context.workspaceStateGeneration++;
+  else f.state.replayTabs[0] = { ...f.a };
+  f.context.renderReplayTabs();
+  const newInput = f.row(f.a.id).name;
+  assert.notEqual(newInput, oldInput);
+  newInput.value = 'New draft'; newInput.focus();
+  const before = f.snapshot();
+  oldInput.value = 'Stale draft';
+  oldInput.listeners.blur();
+  oldInput.listeners.keydown({ key: 'Escape', preventDefault() {} });
+  f.animationFrames[0]();
+  assert.deepEqual(f.snapshot(), before, 'obsolete blur, keydown and animation callbacks must not settle or focus the new edit');
+});
+
+test('real rename blur after passive redraw still commits the latest draft exactly once', () => {
+  const f = setup(), input = f.rename(); input.value = 'Saved after refresh';
+  f.context.renderReplayTabs();
+  assert.equal(f.row(f.a.id).name, input);
+  input.listeners.blur(); input.listeners.blur();
+  assert.equal(f.a.customLabel, 'Saved after refresh');
+  assert.equal(f.state.replayRenamingTabId, null); assert.equal(f.flushes, 1);
+  assert.equal(f.row(f.a.id).name, null);
+});
+
+test('changing active tab invalidates old rename events before the strip redraw', () => {
+  const f = setup(), input = f.rename();
+  f.state.activeReplayTabId = f.b.id;
+  f.document.activeElement = f.els.replayPortInput;
+  const before = f.snapshot();
+  input.listeners.blur();
+  input.listeners.keydown({ key: 'Escape', preventDefault() {} });
+  f.animationFrames[0]();
+  assert.deepEqual(f.snapshot(), before);
+});
+
+test('reopening the same tab name invalidates the prior editor and its queued focus', () => {
+  const f = setup(), oldInput = f.rename();
+  oldInput.listeners.keydown({ key: 'Escape', preventDefault() {} });
+  const newInput = f.rename(); newInput.value = 'New attempt';
+  const before = f.snapshot();
+  oldInput.listeners.blur(); oldInput.listeners.keydown({ key: 'Escape', preventDefault() {} });
+  f.animationFrames[0]();
+  assert.deepEqual(f.snapshot(), before);
+  assert.equal(f.row(f.a.id).name, newInput);
+});
