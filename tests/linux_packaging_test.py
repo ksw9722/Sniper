@@ -184,6 +184,29 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only inert"):
             self.package()
 
+    def test_accepted_dependency_evidence_is_sealed_into_artifacts(self):
+        self.args.test_fixtures = False
+        self.rewrite_record(lambda record: record.update(test_fixture=False))
+        evidence = [{"kind": "test-evidence", "diagnostic": pkg.LIBC_DIVERSION_DIAGNOSTIC}]
+        with patch.object(pkg, "inspect_elf", return_value={"needed": ["libwebkit2gtk-4.1.so.0"]}), \
+                patch.object(pkg, "deb_dependencies", return_value=("libc6, libwebkit2gtk-4.1-0", evidence)):
+            output = self.package()
+        self.assertEqual(json.loads((output / "build-manifest.json").read_text())["dependency_diagnostics"], evidence)
+        with tarfile.open(next(output.glob("*.tar.gz"))) as archive:
+            member = next(member for member in archive.getmembers() if member.name.endswith("/build-manifest.json"))
+            self.assertEqual(json.load(archive.extractfile(member))["dependency_diagnostics"], evidence)
+        data = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(next(output.glob("*.deb")))])
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            member = archive.getmember("./usr/share/doc/sniper/build-manifest.json")
+            self.assertEqual(json.load(archive.extractfile(member))["dependency_diagnostics"], evidence)
+        spec = importlib.util.spec_from_file_location("evidence_inspector", ROOT / "packaging/linux/qualification/inspect_candidate.py")
+        inspector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inspector)
+        # The inspector compares every manifest field across all three copies.
+        inspected = inspector.inspect(output, pkg.digest(output / "build-manifest.json"))
+        self.assertEqual(inspected["dependency_resolution"], "installed-dpkg-metadata")
+        self.assertEqual(inspected["source"], SOURCE)
+
     def test_real_mode_rejects_fixture_record(self):
         self.args.test_fixtures = False
         with self.assertRaisesRegex(ValueError, "fixture mode"):
@@ -274,17 +297,17 @@ class PackagingTests(unittest.TestCase):
         work = self.root / "deps"
         work.mkdir()
         dependency = "shlibs:Depends=libc6 (>= 2.41), libwebkit2gtk-4.1-0 (>= 2.38)"
-        with patch.object(pkg, "run", return_value=dependency) as run:
+        with patch.object(pkg, "dependency_result", return_value=(dependency, [])) as run:
             result = pkg.deb_dependencies(work, pkg.inputs(self.binaries, True))
-        self.assertEqual(result, dependency.split("=", 1)[1])
-        command = run.call_args.args
+        self.assertEqual(result, (dependency.split("=", 1)[1], []))
+        command = run.call_args.args[0]
         self.assertEqual(command[0:2], ("dpkg-shlibdeps", "-O"))
         self.assertNotIn("--ignore-missing-info", command)
         self.assertEqual(sum(arg.startswith("-e") for arg in command), 3)
-        self.assertTrue(run.call_args.kwargs["clean_stderr"])
+        self.assertTrue(run.call_args.kwargs["installed"])
         second = self.root / "bad-deps"
         second.mkdir()
-        with patch.object(pkg, "run", return_value="shlibs:Depends=libc6"):
+        with patch.object(pkg, "dependency_result", return_value=("shlibs:Depends=libc6", [])):
             with self.assertRaisesRegex(ValueError, "complete native dependency"):
                 pkg.deb_dependencies(second, pkg.inputs(self.binaries, True))
 
@@ -298,12 +321,13 @@ class PackagingTests(unittest.TestCase):
         (database / "info/format").write_text("1\n")
         work = self.root / "deps-extracted"
         work.mkdir()
-        with patch.object(pkg, "run", return_value="shlibs:Depends=libc6, libwebkit2gtk-4.1-0") as run, \
+        with patch.object(pkg, "dependency_result", return_value=("shlibs:Depends=libc6, libwebkit2gtk-4.1-0", [])) as run, \
                 patch.object(pkg, "check_sysroot_libraries") as containment:
             pkg.deb_dependencies(work, pkg.inputs(self.binaries, True), sysroot, database)
         containment.assert_called_once()
-        self.assertIn("--admindir=" + str(database), run.call_args.args)
-        self.assertIn("-l" + str(sysroot / "usr/lib/x86_64-linux-gnu"), run.call_args.args)
+        self.assertIn("--admindir=" + str(database), run.call_args.args[0])
+        self.assertIn("-l" + str(sysroot / "usr/lib/x86_64-linux-gnu"), run.call_args.args[0])
+        self.assertFalse(run.call_args.kwargs["installed"])
         self.assertEqual((database / "status").read_text(), "fixture package metadata")
         self.assertEqual(list(sysroot.rglob("*")), [sysroot / "usr", sysroot / "usr/lib", sysroot / "usr/lib/x86_64-linux-gnu"])
         self.args.sysroot = str(sysroot)
@@ -589,6 +613,111 @@ class GitOwnershipContractsTests(unittest.TestCase):
         self.assertNotIn("LATER-PACKAGING", invalid.stdout)
 
 
+
+class LibcDiversionTests(unittest.TestCase):
+    # Copied verbatim from CI run 38345012771; this is not a permissive pattern.
+    diagnostic = (
+        "dpkg-shlibdeps: warning: diversions involved - output may be incorrect\n"
+        " diversion by libc6 from: /lib64/ld-linux-x86-64.so.2\n"
+        "dpkg-shlibdeps: warning: diversions involved - output may be incorrect\n"
+        " diversion by libc6 to: /lib64/ld-linux-x86-64.so.2.usr-is-merged\n"
+    )
+
+    def invoke(self, stderr, installed=True, code=0):
+        command = ("dpkg-shlibdeps", "-O", "--warnings=symbol-not-found",
+                   "-e/stage/usr/bin/sniper", "-e/stage/usr/bin/sniper-cli", "-e/stage/usr/bin/sniper-desktop")
+        result = subprocess.CompletedProcess(command, code, "shlibs:Depends=libc6, libwebkit2gtk-4.1-0\n", stderr)
+        with patch.object(pkg.subprocess, "run", return_value=result) as process, \
+                patch.object(pkg, "verified_libc_diversion", return_value={"verified": True}) as verify, \
+                contextlib.redirect_stderr(io.StringIO()):
+            answer = pkg.dependency_result(command, Path("/inert-stage"), installed)
+            process.assert_called_once_with(command, cwd=Path("/inert-stage"), env=pkg.ENV,
+                                            text=True, capture_output=True, check=False)
+            return answer, verify.call_count
+
+    def test_exact_installed_warning_retains_evidence_and_command(self):
+        self.assertEqual(pkg.LIBC_DIVERSION_DIAGNOSTIC, self.diagnostic)
+        (output, evidence), count = self.invoke(self.diagnostic)
+        self.assertEqual(output, "shlibs:Depends=libc6, libwebkit2gtk-4.1-0")
+        self.assertEqual(evidence, [{"verified": True}])
+        self.assertEqual(count, 1)
+        self.assertEqual(self.invoke("")[0][1], [])
+
+    def test_unknown_partial_modified_repeated_and_combined_diagnostics_fail(self):
+        missing = "dpkg-shlibdeps: warning: symbol __libc_start_main@GLIBC_2.34 used by sniper found in none of the libraries\n"
+        plugin = "dpkg-shlibdeps: warning: binary sniper contains an unresolvable reference to symbol __libc_start_main: it's probably a plugin\n"
+        for diagnostic in (missing, plugin, "unknown\n", self.diagnostic + missing, missing + self.diagnostic,
+                           self.diagnostic + plugin, self.diagnostic + "unknown\n", self.diagnostic * 2,
+                           self.diagnostic.replace("by libc6", "by other"), self.diagnostic.replace("/lib64/", "/tmp/"),
+                           "\n".join(self.diagnostic.splitlines()[:2]) + "\n", self.diagnostic.rstrip(), " \n"):
+            with self.subTest(diagnostic=diagnostic), self.assertRaisesRegex(ValueError, "dependency tooling emitted diagnostics"):
+                self.invoke(diagnostic)
+
+    def test_extracted_mode_and_nonzero_exit_never_accept_warning(self):
+        with self.assertRaisesRegex(ValueError, "dependency tooling emitted diagnostics"):
+            self.invoke(self.diagnostic, installed=False)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.invoke(self.diagnostic, code=1)
+
+    def verification(self, change=None):
+        loader = Path(pkg.LIBC_CANONICAL_LOADER)
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<HH", header, 16, 3, 62)
+        content = bytes(header)
+        checksum = hashlib.md5(content, usedforsecurity=False).hexdigest()
+        values = {"--listpackage": "libc6", "--truename": pkg.LIBC_DIVERSION,
+                  "--show": "install ok installed\tamd64\t2.41-12+deb13u4",
+                  "--search": "libc6:amd64: " + str(loader),
+                  "--control-show": checksum + "  " + str(loader).lstrip("/") + "\n"}
+        change = change or {}
+        values.update(change.get("values", {}))
+        def command(*args, **kwargs):
+            self.assertTrue(kwargs["clean_stderr"])
+            self.assertIn(args[0], {"dpkg-divert", "dpkg-query"})
+            self.assertNotIn("--add", args)
+            return values[args[1]]
+        def resolve(path, **kwargs):
+            return Path(change.get("resolved", str(loader)))
+        with patch.object(pkg, "run", side_effect=command), patch.object(pkg, "check_host_overrides"), \
+                patch.object(Path, "resolve", resolve), patch.object(Path, "exists", return_value=change.get("destination", False)), \
+                patch.object(Path, "is_symlink", return_value=change.get("dangling_destination", False)), \
+                patch.object(Path, "lstat", return_value=argparse.Namespace(st_mode=change.get("mode", 0o100755))), \
+                patch.object(Path, "read_bytes", return_value=change.get("content", content)), \
+                patch.object(Path, "open", return_value=io.BytesIO(change.get("content", content))), \
+                patch.object(pkg, "digest", return_value="a" * 64):
+            return pkg.verified_libc_diversion()
+
+    def test_official_diversion_records_readonly_identity_and_checksum(self):
+        evidence = self.verification()
+        self.assertEqual(evidence["diagnostic"], self.diagnostic)
+        self.assertEqual(evidence["canonical_loader"], pkg.LIBC_CANONICAL_LOADER)
+        self.assertEqual(evidence["loader_sha256"], "a" * 64)
+        self.assertTrue(evidence["destination_absent"])
+
+    def test_diversion_owner_target_destination_and_status_mismatches_fail(self):
+        changes = [{"values": {"--listpackage": value}} for value in ("LOCAL", "other", "", "libc6:amd64")]
+        changes += [{"values": {"--truename": "/tmp/unexpected"}}, {"destination": True}, {"dangling_destination": True}]
+        changes += [{"values": {"--show": value}} for value in ("install ok unpacked\tamd64\t2.41", "install ok installed\ti386\t2.41", "install ok installed\tamd64\t")]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.verification(change)
+
+    def test_canonical_file_type_elf_owner_and_checksums_must_match(self):
+        changes = [{"resolved": "/tmp/loader"}, {"mode": 0o120777}, {"content": b"not ELF"},
+                   {"values": {"--search": "other: " + pkg.LIBC_CANONICAL_LOADER}},
+                   {"values": {"--search": "libc6:amd64: " + pkg.LIBC_CANONICAL_LOADER + "\nother: " + pkg.LIBC_CANONICAL_LOADER}},
+                   {"values": {"--control-show": ""}}, {"values": {"--control-show": "0" * 32 + "  " + pkg.LIBC_CANONICAL_LOADER.lstrip("/")}}]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.verification(change)
+
+    def test_readonly_validation_command_errors_remain_fatal(self):
+        with patch.object(pkg, "check_host_overrides"), patch.object(pkg, "run", side_effect=subprocess.CalledProcessError(2, "dpkg-divert")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                pkg.verified_libc_diversion()
+
+
 class NativeDependencyRegressionTests(unittest.TestCase):
     @unittest.skipUnless(all(os.environ.get(name) for name in (
         "SNIPER_PACKAGING_NATIVE_BINARIES", "SNIPER_PACKAGING_SYSROOT", "SNIPER_PACKAGING_DPKG_ADMINDIR")),
@@ -612,12 +741,25 @@ class NativeDependencyRegressionTests(unittest.TestCase):
             baseline.mkdir()
             diagnostics = io.StringIO()
             with contextlib.redirect_stderr(diagnostics):
-                depends = pkg.deb_dependencies(baseline, staged, sysroot, database)
+                depends, evidence = pkg.deb_dependencies(baseline, staged, sysroot, database)
+            self.assertEqual(evidence, [])
             self.assertEqual(diagnostics.getvalue(), "")
             self.assertIn("libc6", depends)
             self.assertIn("libwebkit2gtk-4.1-0", depends)
             private = root / "private-db"
             shutil.copytree(database, private)
+            # Reproduce the official diagnostic using only a fresh private
+            # database. The installed database and loader are never changed.
+            diversion = private / "diversions"
+            diversion.write_text(pkg.LIBC_LOADER + "\n" + pkg.LIBC_DIVERSION + "\nlibc6\n")
+            reproduced = root / "diversion"
+            reproduced.mkdir()
+            diagnostics = io.StringIO()
+            with contextlib.redirect_stderr(diagnostics):
+                with self.assertRaisesRegex(ValueError, "dependency tooling emitted diagnostics"):
+                    pkg.deb_dependencies(reproduced, staged, sysroot, private)
+            self.assertEqual(diagnostics.getvalue(), pkg.LIBC_DIVERSION_DIAGNOSTIC)
+            diversion.unlink()
             damaged = private / "info/libc6:amd64.symbols"
             lines = damaged.read_text().splitlines(keepends=True)
             removed = [line for line in lines if line.startswith(" __libc_start_main@GLIBC_2.34 ")]

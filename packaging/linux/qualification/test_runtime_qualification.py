@@ -121,7 +121,7 @@ class LifecycleSequenceTests(unittest.TestCase):
 
 
 class LoaderDiagnosticTests(unittest.TestCase):
-    def exercise(self, bad_output=False):
+    def exercise(self, bad_output=False, ownership_problem=None):
         calls = []
         loader = "/lib64/ld-linux-x86-64.so.2"
         inventory = {"elf": {name: {"interpreter": loader, "needed": ["libc.so.6"]} for name in ("sniper", "sniper-cli", "sniper-desktop")}}
@@ -132,8 +132,19 @@ class LoaderDiagnosticTests(unittest.TestCase):
             value = ""
             if argv[:2] == ("dpkg-query", "--search"):
                 value = "libc6:amd64: " + argv[-1] + "\n"
+                if argv[-1] == loader or ownership_problem == "diversion":
+                    value = ("diversion by libc6 from: /lib64/ld-linux-x86-64.so.2\n"
+                             "diversion by libc6 to: /lib64/ld-linux-x86-64.so.2.usr-is-merged\n") + value
+                elif ownership_problem == "wrong-file":
+                    value = "libc6:amd64: /usr/lib/unrelated.so\n"
+                elif ownership_problem == "multiple-owners":
+                    value += "other: " + argv[-1] + "\n"
+                elif ownership_problem == "duplicate":
+                    value += value
+                elif ownership_problem == "unknown":
+                    value += "unknown output\n"
             elif argv[:2] == ("dpkg-query", "--show"):
-                value = "install ok installed"
+                value = "install ok unpacked" if ownership_problem == "unpacked" else "install ok installed"
             elif "--program-headers" in argv:
                 value = "[Requesting program interpreter: " + loader + "]\n"
             elif "--dynamic" in argv:
@@ -142,7 +153,7 @@ class LoaderDiagnosticTests(unittest.TestCase):
                 value = "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0xabc)\n" + loader + " (0xdef)\nlinux-vdso.so.1 (0x123)\n"
                 if bad_output:
                     value += "missing.so => not found\n"
-            return subprocess.CompletedProcess(argv, 0, value, "")
+            return subprocess.CompletedProcess(argv, 0, value, "diagnostic\n" if ownership_problem == "stderr" else "")
         with patch.object(Path, "resolve", resolve), patch.object(Path, "is_file", return_value=True), patch.object(Path, "exists", return_value=False), patch.object(qa.subprocess, "run", side_effect=AssertionError("no process execution allowed")):
             qa.verify_loader_closures(inventory, command, Path("/synthetic-home"), Path("/synthetic-data"))
         return calls
@@ -152,6 +163,18 @@ class LoaderDiagnosticTests(unittest.TestCase):
         self.assertEqual({row[-1] for row in calls if "--list" in row}, {"/usr/bin/sniper", "/usr/bin/sniper-cli", "/usr/bin/sniper-desktop"})
         self.assertFalse(any(row[0].startswith("/usr/bin/sniper") for row in calls))
         self.assertTrue(all(row[0:2] == ("env", "-i") for row in calls if "--list" in row or "--verify" in row))
+
+    def test_official_diverted_alias_uses_only_canonical_ownership(self):
+        calls = self.exercise()
+        searches = [row for row in calls if row[:2] == ("dpkg-query", "--search")]
+        self.assertTrue(searches)
+        self.assertTrue(all(row[2] == "--" and row[-1].startswith("/usr/lib/") for row in searches))
+        self.assertFalse(any(row[-1] == "/lib64/ld-linux-x86-64.so.2" for row in searches))
+
+    def test_canonical_ownership_diagnostics_or_ambiguity_are_fatal(self):
+        for problem in ("diversion", "wrong-file", "multiple-owners", "duplicate", "unknown", "stderr", "unpacked"):
+            with self.subTest(problem=problem), self.assertRaises(ValueError):
+                self.exercise(ownership_problem=problem)
 
     def test_missing_library_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "loader dependency"):

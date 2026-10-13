@@ -160,10 +160,16 @@ verify the exact file set, hashes, permissions and root ownership before output.
 No arbitrary files from the binary directory are copied. Reusing an old build record after an edit or binary change fails closed.
 
 `dpkg-shlibdeps` derives Depends from the real linked ELF symbols and Debian
-package metadata. Missing dependency information and any diagnostic on stderr
-are fatal even if the tool exits successfully; unresolved strong symbols cannot
-be hidden by a superficially complete Depends line. No guessed fallback list or
-`--ignore-missing-info` is used. For an approved isolated extraction,
+package metadata. Missing dependency information and stderr diagnostics are
+fatal even if the tool exits successfully, with one installed-metadata exception:
+the exact Debian 13 libc6 DEP17 M8 loader-diversion diagnostic is accepted only
+after read-only diversion, package status/ownership, canonical ELF and package
+checksum checks. Its original text and validation evidence are recorded in
+`dependency_diagnostics` in each build manifest. Unknown, combined and
+missing-symbol diagnostics remain fatal; extracted-metadata mode accepts no
+stderr diagnostics. Unresolved strong symbols cannot be hidden by a superficially
+complete Depends line. No guessed fallback list or `--ignore-missing-info` is
+used. For an approved isolated extraction,
 `package` also accepts paired `--sysroot <root> --dpkg-admindir <private-db>`.
 The private database must contain official package status, symbols/shlibs and
 `.list` records mapping the actual absolute extracted library paths. Its

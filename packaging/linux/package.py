@@ -209,6 +209,64 @@ def check_sysroot_libraries(root, libraries, binaries, elf=None):
                 validate_elf_header(library)
 
 
+
+# Debian 13 libc6 preinst installs this DEP17 M8 no-rename protection. Keep
+# the exact dpkg-shlibdeps diagnostic visible and verify its installed meaning.
+LIBC_LOADER = "/lib64/ld-linux-x86-64.so.2"
+LIBC_CANONICAL_LOADER = "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+LIBC_DIVERSION = LIBC_LOADER + ".usr-is-merged"
+LIBC_DIVERSION_DIAGNOSTIC = (
+    "dpkg-shlibdeps: warning: diversions involved - output may be incorrect\n"
+    " diversion by libc6 from: /lib64/ld-linux-x86-64.so.2\n"
+    "dpkg-shlibdeps: warning: diversions involved - output may be incorrect\n"
+    " diversion by libc6 to: /lib64/ld-linux-x86-64.so.2.usr-is-merged\n"
+)
+
+
+def verified_libc_diversion():
+    check_host_overrides()
+    require(run("dpkg-divert", "--listpackage", LIBC_LOADER, clean_stderr=True) == "libc6",
+            "unexpected interpreter diversion owner")
+    require(run("dpkg-divert", "--truename", LIBC_LOADER, clean_stderr=True) == LIBC_DIVERSION,
+            "unexpected interpreter diversion destination")
+    destination = Path(LIBC_DIVERSION)
+    require(not destination.exists() and not destination.is_symlink(), "interpreter diversion destination exists")
+    status = run("dpkg-query", "--show", "--showformat=${Status}\t${Architecture}\t${Version}",
+                 "libc6:amd64", clean_stderr=True)
+    require(re.fullmatch(r"install ok installed\tamd64\t[^\s]+", status), "libc6:amd64 is not fully installed")
+    loader = Path(LIBC_CANONICAL_LOADER)
+    require(Path(LIBC_LOADER).resolve(strict=True) == loader and loader.resolve(strict=True) == loader,
+            "interpreter does not resolve to the canonical Debian amd64 loader")
+    require(stat.S_ISREG(loader.lstat().st_mode), "canonical interpreter is not a regular file")
+    validate_elf_header(loader)
+    require(run("dpkg-query", "--search", "--", str(loader), clean_stderr=True) == "libc6:amd64: " + str(loader),
+            "canonical interpreter must have sole libc6:amd64 ownership")
+    md5sums = run("dpkg-query", "--control-show", "libc6:amd64", "md5sums", clean_stderr=True)
+    checksums = [row.split()[0] for row in md5sums.splitlines()
+                 if len(row.split()) == 2 and row.split()[1] == str(loader).lstrip("/")]
+    require(len(checksums) == 1 and re.fullmatch(r"[0-9a-f]{32}", checksums[0]),
+            "canonical interpreter lacks one package checksum")
+    require(hashlib.md5(loader.read_bytes(), usedforsecurity=False).hexdigest() == checksums[0],
+            "canonical interpreter differs from installed libc6 checksum")
+    return {"kind": "debian13-libc6-dep17-m8", "diagnostic": LIBC_DIVERSION_DIAGNOSTIC,
+            "diversion_owner": "libc6", "from": LIBC_LOADER, "to": LIBC_DIVERSION,
+            "destination_absent": True, "libc6_status": status, "canonical_loader": str(loader),
+            "package_md5": checksums[0], "loader_sha256": digest(loader)}
+
+
+def dependency_result(command, work, installed):
+    result = subprocess.run(command, cwd=work, env=ENV, text=True, capture_output=True, check=False)
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
+    result.check_returncode()
+    evidence = []
+    if result.stderr:
+        require(installed and result.stderr == LIBC_DIVERSION_DIAGNOSTIC,
+                "dependency tooling emitted diagnostics; refusing to publish unresolved or ambiguous dependencies")
+        evidence.append(verified_libc_diversion())
+    return result.stdout.strip(), evidence
+
+
 def deb_dependencies(work, binaries, sysroot=None, admindir=None, elf=None):
     (work / "debian").mkdir()
     (work / "debian/control").write_text(
@@ -235,12 +293,13 @@ def deb_dependencies(work, binaries, sysroot=None, admindir=None, elf=None):
                 options.append("-l" + str(library))
         require(libraries, "sysroot has no native library directory")
         check_sysroot_libraries(root, libraries, binaries, elf)
-    result = run("dpkg-shlibdeps", "-O", "--warnings=symbol-not-found", *options,
-                 *("-e" + str(path) for path in binaries.values()), cwd=work, clean_stderr=True)
+    command = ("dpkg-shlibdeps", "-O", "--warnings=symbol-not-found", *options,
+               *("-e" + str(path) for path in binaries.values()))
+    result, evidence = dependency_result(command, work, installed=sysroot is None)
     matches = re.findall(r"^shlibs:Depends=(.+)$", result, re.MULTILINE)
     require(len(matches) == 1 and "libc6" in matches[0] and "libwebkit2gtk-4.1-0" in matches[0],
             "dpkg-shlibdeps did not identify the complete native dependency set")
-    return matches[0]
+    return matches[0], evidence
 
 
 def archive(root, destination, epoch):
@@ -340,16 +399,18 @@ def package(args):
         if elf:
             require("libwebkit2gtk-4.1.so.0" in elf["sniper-desktop"]["needed"], "desktop binary is not linked to WebKitGTK 4.1")
         depends = None
+        dependency_diagnostics = []
         if not args.archive_only and not args.test_fixtures:
             # dpkg requires a package staging root, even before control is written.
             # This temporary marker never enters the portable archive.
             marker = portable / "DEBIAN"
             marker.mkdir()
             try:
-                depends = deb_dependencies(work, staged_binaries, args.sysroot, args.dpkg_admindir, elf)
+                depends, dependency_diagnostics = deb_dependencies(work, staged_binaries, args.sysroot, args.dpkg_admindir, elf)
             finally:
                 marker.rmdir()
         manifest = {"build": build, "elf": elf, "debian_depends": depends,
+                    "dependency_diagnostics": dependency_diagnostics,
                     "qualification": "not-qualified", "display_candidate": "X11",
                     "system_libraries_bundled": False,
                     "dependency_resolution": "not-run" if depends is None else

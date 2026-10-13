@@ -80,24 +80,18 @@ def verify_loader_closures(inventory, command, home, custom_data):
     def owner(path):
         real = path.resolve(strict=True)
         require(real.is_file() and (str(real).startswith("/usr/lib/") or str(real).startswith("/lib/")), "library resolves outside distro paths")
-        candidates = [str(path), str(real)]
-        if str(real).startswith("/usr/lib/"):
-            candidates.append(str(real).removeprefix("/usr"))
-        matched = set()
-        for candidate in dict.fromkeys(candidates):
-            result = command("dpkg-query", "--search", candidate, allowed=(0, 1))
-            if result.returncode == 0:
-                for row in result.stdout.splitlines():
-                    if ": " not in row:
-                        continue
-                    package, owned = row.rsplit(": ", 1)
-                    if owned.startswith("/") and Path(owned).resolve() == real:
-                        require(re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::amd64)?", package), "ambiguous library ownership")
-                        status = command("dpkg-query", "--show", "--showformat=${Status}", package).stdout
-                        require(status == "install ok installed", "library owner is not fully installed")
-                        matched.add(package.split(":", 1)[0])
-        require(len(matched) == 1, "library must have one installed distro owner: " + str(real))
-        return matched.pop()
+        # Debian 13 ships libraries at canonical /usr locations. Query the
+        # resolved file only: alias searches can also report DEP17 diversions.
+        result = command("dpkg-query", "--search", "--", str(real))
+        require(not result.stderr.strip(), "library ownership diagnostic")
+        rows = result.stdout.splitlines()
+        require(len(rows) == 1 and ": " in rows[0], "library must have exactly one ownership row: " + str(real))
+        package, owned = rows[0].rsplit(": ", 1)
+        require(owned == str(real) and re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::amd64)?", package),
+                "ambiguous library ownership")
+        status = command("dpkg-query", "--show", "--showformat=${Status}", package)
+        require(not status.stderr.strip() and status.stdout == "install ok installed", "library owner is not fully installed")
+        return package.split(":", 1)[0]
 
     require(owner(loader) == "libc6", "interpreter must belong to installed libc6")
     for binary in ("sniper", "sniper-cli", "sniper-desktop"):
