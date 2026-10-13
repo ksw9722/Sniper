@@ -1,11 +1,27 @@
-# Sniper on Linux: qualification candidate
+# Sniper on Debian 13: x86_64, X11
 
-The first candidate is **Debian 13 (trixie), x86_64, X11**. These recipes and CI
-checks do not establish native desktop support. Actual WebKit window, resize,
-focus, lifecycle, persistence and Service Map checks on that target remain a
-separate qualification gate. There is no Linux support badge or release in this
-change. Ubuntu, other Debian versions, other distributions, ARM64, musl, native
-Wayland and XWayland are not qualified by a Debian 13 X11 build.
+**Debian 13 (trixie), x86_64, X11 is a supported development-branch target.**
+Use the unreleased `release/0.3.1` branch for source builds and CI candidates.
+There are **no published Linux release assets yet**. The crate and candidate
+filenames still use version `0.3.0`; the branch name is not a released version.
+Ubuntu, other Debian versions, other distributions, ARM, musl, native Wayland
+and XWayland are outside this qualification. These Linux checks make no new
+macOS qualification claim.
+
+The qualification baseline is source revision
+[`7720f15b43fe23d2808d5bc8aeffd02394b5c031`](https://github.com/sm1ee/Sniper/commit/7720f15b43fe23d2808d5bc8aeffd02394b5c031).
+Native checks used frozen binaries whose recorded executable inputs match both
+[`0ae4f9f722195a0cdd0ad083e23e8901eca03c9f`](https://github.com/sm1ee/Sniper/commit/0ae4f9f722195a0cdd0ad083e23e8901eca03c9f)
+and the qualification baseline above. Actual native GTK 3/WebKitGTK 4.1 checks
+covered window rendering and
+resize/restore, Service Map filters and exact retained-row evidence, native
+popup stability, pagination, session switching, persisted restart and CLI/API
+parity. Separate [exact-revision Linux CI](https://github.com/sm1ee/Sniper/actions/runs/38351782558)
+verified the package lifecycle in a disposable Debian 13 runtime. CI artifacts
+were built independently from the clean qualification baseline and are tied to
+their own package and manifest hashes.
+Native checks retained the default WebKit sandbox configuration without disabling it; renderer kernel restrictions were not independently enumerated. This is target qualification, not general sandbox
+certification.
 
 The binaries use system GTK 3, WebKitGTK **4.1 ABI**, JavaScriptCoreGTK 4.1,
 libsoup 3 and their transitive dependencies. No system libraries, WebKit helpers,
@@ -13,6 +29,35 @@ CA certificates or browser profiles are bundled. An archive is portable between
 matching, provisioned Debian 13 machines; it is not a self-contained Linux app.
 The build manifest records actual ELF dependencies and GLIBC symbol versions.
 A glibc version match alone does not establish another distro's compatibility.
+
+## Get the development source or CI artifacts
+
+For a new source checkout:
+
+```sh
+git clone --single-branch --branch release/0.3.1 https://github.com/sm1ee/Sniper.git
+cd Sniper
+git rev-parse HEAD
+```
+
+Follow [Build and record exact native inputs](#build-and-record-exact-native-inputs)
+for prerequisites, tests, binaries and packages. Record the exact commit you use;
+a branch can advance beyond the qualification baseline.
+
+For prebuilt candidates, open the repository's **Actions → Linux candidate**
+workflow and choose a successful run for the intended `release/0.3.1` commit.
+Both `debian13-x86_64` and `runtime-debian13-x86_64` jobs must pass. Download
+`sniper-debian13-x86_64-candidate` and
+`sniper-debian13-x86_64-runtime-evidence` from that same run. Inspect the build
+manifest's source revision, compiler/dependency versions and hashes; check that
+the runtime evidence's `PASS.json` identifies the same package and manifest
+SHA-256. Then verify the sidecar checksums before following the instructions
+below. CI artifacts may expire and are not published Linux releases.
+
+The packager deliberately records `qualification: "not-qualified"` in every
+artifact manifest: packaging alone cannot certify a particular build. Keep the
+separate exact-artifact lifecycle evidence with the download. Headless CI does
+not replace native desktop qualification or extend support to another target.
 
 ## Candidate artifacts and ownership
 
@@ -188,7 +233,7 @@ If only an archive can be checked, use `package --archive-only` and record the
 missing `.deb` dependency-resolution gate explicitly. The archive retains ELF
 requirements and the full build package manifest; no complete `.deb` claim follows.
 
-## Checks and remaining qualification
+## Checks and per-artifact qualification
 
 `tests/linux_packaging_test.py` uses inert, explicitly marked fixture bytes. The
 fixture flag requires those exact bytes; outputs contain `TEST-ONLY` in their
@@ -214,11 +259,24 @@ Without the three paths, this native-input regression is explicitly skipped;
 the deterministic diagnostic and containment tests still run.
 
 CI builds all three real binaries, runs Rust and frontend tests, creates both
-candidate artifacts, validates the desktop entry, and tests real package
-installation/removal only inside its disposable Debian container. It preserves a
-synthetic HOME sentinel. Artifacts are kept as CI artifacts only; there is no tag,
-release upload, deploy, self-update or supported-platform claim. Headless CI does
-not count as an actual WebKit desktop/display qualification.
+candidate artifacts and validates the desktop entry. A separate disposable
+Debian 13 runtime checks APT installation with declared dependencies, ELF loader
+diagnostics, exact payload ownership/hashes, removal, reinstallation and purge,
+while preserving synthetic user data.
+
+The runtime starts from official `debian:13-slim` with validation tools. Because
+that image excludes documentation by default, the qualification's initial APT
+install and dpkg reinstall each supply per-operation `--path-include` options
+for exactly four files: `/usr/share/doc/sniper/LICENSE`,
+`/usr/share/doc/sniper/README.md`, `/usr/share/doc/sniper/SHA256SUMS` and
+`/usr/share/doc/sniper/build-manifest.json`. This permits full-payload
+qualification while leaving inherited dpkg configuration unchanged; it does not
+create a persistent or general documentation-inclusion setting.
+
+Loader diagnostics do not test dynamically loaded plugins or WebKit
+subprocesses. Artifacts remain CI candidates only; the workflow creates no tag,
+release upload, deployment or self-update. Each run's evidence applies to its
+exact artifact hashes, not every future build.
 
 Primary references:
 - [Debian dpkg-shlibdeps](https://manpages.debian.org/trixie/dpkg-dev/dpkg-shlibdeps.1.en.html)

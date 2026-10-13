@@ -41,15 +41,20 @@ If you've used an intercepting proxy before, the workflow will be familiar. Snip
 Each installer ships with a `.sha256` beside it; check it with `Get-FileHash` before running,
 since releases are not yet code-signed.
 
-Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or extract a Windows ZIP built by `packaging/windows/make-zip.ps1` and open `sniper-desktop.exe`. Building from source requires the MSVC Rust toolchain. See [Windows setup and packaging](packaging/windows/README.md) for WebView2/runtime prerequisites, HTTPS certificates, CLI usage, and isolated testing. Windows x64 is the first port; Linux validation is still pending.
+Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or extract a Windows ZIP built by `packaging/windows/make-zip.ps1` and open `sniper-desktop.exe`. Building from source requires the MSVC Rust toolchain. See [Windows setup and packaging](packaging/windows/README.md) for WebView2/runtime prerequisites, HTTPS certificates, CLI usage, and isolated testing. Windows x64 is the first Windows target.
 
-### Linux qualification candidate
+### Linux: Debian 13 x86_64 on X11 (development branch)
 
-Debian 13 x86_64 on X11 is the first Linux qualification target. Native support
-is not yet claimed. See [Linux build and packaging](packaging/linux/README.md)
-for the candidate archive and `.deb`, system WebKitGTK requirements, explicit
-portable PATH setup, and remaining native desktop checks. No compatibility with
-Ubuntu, other distributions, or native Wayland is implied.
+**Debian 13 (trixie), x86_64, X11 is supported on the unreleased
+`release/0.3.1` development branch.** Build from that branch or use its exact-run
+CI candidate archive or `.deb`; there are **no published Linux release assets
+yet**. Candidate filenames currently use the crate version `0.3.0`, not the
+branch name.
+
+See [Linux source, CI artifacts and installation](packaging/linux/README.md)
+for the qualification boundary, system GTK 3/WebKitGTK 4.1 requirements,
+checksums and installation instructions. Ubuntu, other distributions or Debian
+versions, ARM, native Wayland and XWayland are outside this support claim.
 
 ### macOS
 
@@ -604,7 +609,7 @@ AI agents can drive the full workflow through CLI — capture, scope, replay, fu
 | UI server | `axum` serving embedded SPA |
 | Frontend | Vanilla **JS** + **CSS** — zero framework, zero build step |
 | Desktop shell | Native **WebView** (`wry`) |
-| Packaging | macOS `.app` + `.dmg`; Windows portable `.zip` with desktop, server and CLI |
+| Packaging | macOS `.app` + `.dmg`; Windows portable `.zip`; Debian 13 x86_64 development candidates (`.tar.gz` + `.deb`); each includes desktop, server and CLI |
 
 ## Build from source
 
