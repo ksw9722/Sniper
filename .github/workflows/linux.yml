@@ -56,12 +56,27 @@ jobs:
       - name: Record exact inputs and build candidate artifacts
         id: package
         run: |
+          set -euo pipefail
+          checkout="$(pwd -P)"
+          if [[ "$checkout" != "$GITHUB_WORKSPACE" ]]; then
+            echo 'Packaging checkout does not match GITHUB_WORKSPACE' >&2
+            exit 1
+          fi
+          # Trust only this container checkout and this step's Git child processes.
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=safe.directory
+          export GIT_CONFIG_VALUE_0="$checkout"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          if [[ ! "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+            echo 'Git returned an invalid source timestamp' >&2
+            exit 1
+          fi
           mkdir -p dist
           rustc --version --verbose > dist/linux-toolchain.txt
           dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\n' > dist/linux-debian-packages.tsv
           python3 -B packaging/linux/package.py record \
             --binaries-dir target/release --output dist/linux-build-record.json \
-            --source-date-epoch "$(git show -s --format=%ct HEAD)" \
+            --source-date-epoch "$source_date_epoch" \
             --toolchain-file dist/linux-toolchain.txt \
             --dependency-manifest dist/linux-debian-packages.tsv \
             --build-command 'cargo build --locked --release --bins'

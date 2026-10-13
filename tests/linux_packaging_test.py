@@ -435,6 +435,160 @@ class PackagingTests(unittest.TestCase):
             self.assertNotIn(forbidden, workflow)
 
 
+class GitOwnershipContractsTests(unittest.TestCase):
+    """Exercise Git's ownership gate without changing filesystem ownership."""
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="sniper-git-trust-", dir="/tmp")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.global_config = self.home / ".gitconfig"
+        self.global_config.write_text("[test]\n\tsentinel = unchanged\n")
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / "xdg"),
+                        GIT_CONFIG_GLOBAL=str(self.global_config), GIT_CONFIG_NOSYSTEM="1", LC_ALL="C")
+        self.repo = self.root / "trusted-checkout"
+        self.other = self.root / "other-checkout"
+        for repository in (self.repo, self.other):
+            repository.mkdir()
+            self.invoke("git", "init", "--quiet", "--initial-branch=main", cwd=repository).check_returncode()
+            (repository / "Cargo.lock").write_text("inert lock fixture\n")
+            scripts = repository / "packaging/linux"
+            scripts.mkdir(parents=True)
+            shutil.copyfile(ROOT / "packaging/linux/package.py", scripts / "package.py")
+            self.invoke("git", "add", ".", cwd=repository).check_returncode()
+            self.invoke("git", "-c", "user.name=Packaging Fixture", "-c", "user.email=test@example.com",
+                        "commit", "--quiet", "-m", "Create inert Git fixture", cwd=repository).check_returncode()
+        self.env["GITHUB_WORKSPACE"] = str(self.repo)
+        self.revision = self.invoke("git", "rev-parse", "HEAD").stdout.strip()
+        self.config_before = {path: path.read_bytes() for path in (
+            self.global_config, self.repo / ".git/config", self.other / ".git/config")}
+        self.ownership_before = {path: (path.stat().st_uid, path.stat().st_gid) for path in self.root.rglob("*")}
+
+    def tearDown(self):
+        for path, content in self.config_before.items():
+            self.assertEqual(path.read_bytes(), content, f"configuration changed: {path}")
+        self.assertFalse((self.home / "xdg").exists(), "Git wrote persistent XDG configuration")
+        for path, ownership in self.ownership_before.items():
+            self.assertEqual((path.stat().st_uid, path.stat().st_gid), ownership)
+
+    def invoke(self, *args, env=None, cwd=None):
+        return subprocess.run(args, env=self.env if env is None else env,
+                              cwd=self.repo if cwd is None else cwd,
+                              text=True, capture_output=True, check=False)
+
+    def simulated_owner(self, trusted=None):
+        env = {**self.env, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+        if trusted is not None:
+            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory", GIT_CONFIG_VALUE_0=str(trusted))
+        return env
+
+    def packaging_source_state(self, env):
+        script = (
+            "import importlib.util,json,sys; "
+            "spec=importlib.util.spec_from_file_location('fixture_package',sys.argv[1]); "
+            "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
+            "print(json.dumps(module.source_state()))"
+        )
+        return self.invoke(sys.executable, "-B", "-c", script,
+                           str(self.repo / "packaging/linux/package.py"), env=env)
+
+    def record_step(self):
+        workflow = (ROOT / ".github/workflows/linux.yml").read_text()
+        marker = "      - name: Record exact inputs and build candidate artifacts\n"
+        before, remaining = workflow.split(marker, 1)
+        step, after = remaining.split("      - uses: actions/upload-artifact@v4", 1)
+        return before, step, after
+
+    def epoch_prologue(self):
+        _, step, _ = self.record_step()
+        body = step.split("        run: |\n", 1)[1].split("          mkdir -p dist\n", 1)[0]
+        return "\n".join(line[10:] for line in body.splitlines()) + "\n"
+
+    def test_workflow_trust_is_step_scoped_and_exact(self):
+        before, step, after = self.record_step()
+        for line in ("          export GIT_CONFIG_COUNT=1", "          export GIT_CONFIG_KEY_0=safe.directory",
+                     '          export GIT_CONFIG_VALUE_0="$checkout"'):
+            self.assertIn(line + "\n", step)
+        self.assertNotIn("GIT_CONFIG_", before + after)
+        self.assertNotIn("${{ github.workspace }}", step)
+        self.assertIn('checkout="$(pwd -P)"', step)
+        self.assertIn('if [[ "$checkout" != "$GITHUB_WORKSPACE" ]]; then', step)
+        self.assertLess(step.index('if [[ "$checkout" != "$GITHUB_WORKSPACE" ]]; then'),
+                        step.index("export GIT_CONFIG_COUNT=1"))
+        self.assertNotIn("GIT_TEST_ASSUME_DIFFERENT_OWNER", before + step + after)
+        for forbidden in ("git config --global", "git config --system", "safe.directory '*'", "safe.directory=*", "chown ", "chmod "):
+            self.assertNotIn(forbidden, step)
+        self.assertIn('--source-date-epoch "$source_date_epoch"', step)
+        self.assertNotIn('--source-date-epoch "$(git', step)
+        self.assertTrue(self.epoch_prologue().startswith("set -euo pipefail\n"))
+
+    def test_ordinary_owned_git_remains_usable_without_override(self):
+        result = self.invoke("git", "rev-parse", "HEAD")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), self.revision)
+
+    def test_absent_or_wrong_trust_is_rejected_by_git_and_package_children(self):
+        for trusted in (None, self.other):
+            with self.subTest(trusted=trusted):
+                env = self.simulated_owner(trusted)
+                for result in (self.invoke("git", "rev-parse", "HEAD", env=env), self.packaging_source_state(env)):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("dubious ownership", result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+    def test_exact_trust_reaches_packaging_children_without_trusting_other_checkout(self):
+        env = self.simulated_owner(self.repo)
+        direct = self.invoke("git", "rev-parse", "HEAD", env=env)
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        self.assertEqual(direct.stdout.strip(), self.revision)
+        result = self.packaging_source_state(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(result.stdout)
+        self.assertEqual(state["revision"], self.revision)
+        self.assertFalse(state["dirty"])
+        self.assertEqual(state["cargo_lock_sha256"], pkg.digest(self.repo / "Cargo.lock"))
+        inventory = {"Cargo.lock": pkg.digest(self.repo / "Cargo.lock"),
+                     "packaging/linux/package.py": pkg.digest(self.repo / "packaging/linux/package.py")}
+        self.assertEqual(state["tree_sha256"], hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest())
+        unrelated = self.invoke("git", "rev-parse", "HEAD", env=env, cwd=self.other)
+        self.assertNotEqual(unrelated.returncode, 0)
+        self.assertIn("dubious ownership", unrelated.stderr)
+        # Returning to an untrusted process still rejects this checkout.
+        again = self.invoke("git", "rev-parse", "HEAD", env=self.simulated_owner())
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("dubious ownership", again.stderr)
+
+    def test_runtime_workspace_mismatch_fails_before_trust_or_packaging(self):
+        script = self.epoch_prologue() + "printf 'LATER-PACKAGING\\n'\n"
+        for workspace in (str(self.other), str(self.root / "host-workspace")):
+            with self.subTest(workspace=workspace):
+                env = {**self.simulated_owner(), "GITHUB_WORKSPACE": workspace}
+                result = self.invoke("bash", "-c", script, env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("checkout does not match GITHUB_WORKSPACE", result.stderr)
+                self.assertNotIn("LATER-PACKAGING", result.stdout)
+
+    def test_epoch_capture_fails_before_later_packaging_commands(self):
+        script = self.epoch_prologue() + "printf 'LATER-PACKAGING:%s\\n' \"$source_date_epoch\"\n"
+        success = self.invoke("bash", "-c", script, env=self.simulated_owner())
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertRegex(success.stdout, r"^LATER-PACKAGING:[0-9]+\n$")
+        empty = self.root / "empty-checkout"
+        empty.mkdir()
+        self.invoke("git", "init", "--quiet", "--initial-branch=main", cwd=empty).check_returncode()
+        env = {**self.simulated_owner(), "GITHUB_WORKSPACE": str(empty)}
+        failed = self.invoke("bash", "-c", script, env=env, cwd=empty)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fatal:", failed.stderr)
+        self.assertNotIn("LATER-PACKAGING", failed.stdout)
+        invalid = self.invoke("bash", "-c", "git() { printf 'not-an-epoch\\n'; }\n" + script)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("invalid source timestamp", invalid.stderr)
+        self.assertNotIn("LATER-PACKAGING", invalid.stdout)
+
+
 class NativeDependencyRegressionTests(unittest.TestCase):
     @unittest.skipUnless(all(os.environ.get(name) for name in (
         "SNIPER_PACKAGING_NATIVE_BINARIES", "SNIPER_PACKAGING_SYSROOT", "SNIPER_PACKAGING_DPKG_ADMINDIR")),
