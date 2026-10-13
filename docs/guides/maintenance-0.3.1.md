@@ -120,12 +120,11 @@ commands do not trigger it. Candidates come only from the local binary's bundle;
 there is no network fetch or agent reload. Only global dry run is argument-only
 and performs no filesystem inspection.
 Existing legacy installation can overwrite an installed skill and is never a
-recovery fallback. Linux exchange has native fixture coverage. The baseline
-macOS ARM64 swap adapter passed 80 focused tests in
-[hosted CI](https://github.com/sm1ee/Sniper/actions/runs/38414932831) at `875e3cc`;
-new automatic-update-layer native CI, Intel, user-device and GUI validation remain
-pending. Windows activation, rollback, result inspection and host-policy
-operations are unsupported.
+recovery fallback. Linux exchange has native fixture coverage. Hosted macOS 15
+ARM64 [focused policy/transaction tests and native desktop compilation](https://github.com/sm1ee/Sniper/actions/runs/38423109820)
+were verified at `e7cbe95`. Actual GUI behavior, Intel Macs and user-installed
+skills remain unverified. Windows activation, rollback, result inspection and
+host-policy operations are unsupported.
 
 See [safe skill maintenance](../integrations/skill-maintenance.md) for exact
 commands, confirmation requirements, refusal states and recovery limitations.

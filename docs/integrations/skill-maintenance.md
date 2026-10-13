@@ -147,13 +147,12 @@ last operation ID, while keeping automatic updates disabled. Receipts are local
 consistency records, not tamper-proof proof of authorship or trust.
 
 Apply saves durable transaction artifacts before exchanging active objects.
-Linux uses atomic exchange. The baseline macOS swap adapter at commit `875e3cc`
-passed 80 focused tests in hosted macOS 15.7.9 ARM64 CI with Rust 1.99.0
-([run 38414932831](https://github.com/sm1ee/Sniper/actions/runs/38414932831)).
-This does not cover Intel Macs, the user's device, GUI behavior, or the new
-automatic-update policy layer; native CI for that new layer is still pending.
-Windows activation,
-rollback and transaction-result inspection currently return
+Linux uses atomic exchange. Hosted macOS 15 ARM64 CI at `e7cbe95` verified
+128 focused transaction, policy and CLI tests, including native ACL fixtures,
+and native desktop compilation
+([run 38423109820](https://github.com/sm1ee/Sniper/actions/runs/38423109820)).
+These checks do not validate actual GUI behavior, Intel Macs or user-installed
+skills. Windows activation, rollback and transaction-result inspection return
 `platform_unsupported`. A filesystem that cannot provide the required exchange
 or metadata guarantees is refused; there is no overwrite fallback. Path checks
 are bounded observations, not a sandbox against malicious ancestor replacement.
@@ -321,11 +320,11 @@ paused policies never re-enable themselves. Disabling preserves active bytes and
 all recovery artifacts; it does not undo an already committed update.
 
 The same safe activation platform limits apply. Linux exchange has native fixture
-coverage. The baseline macOS ARM64 adapter has the hosted CI coverage linked
-above; the new automatic-update layer still awaits native macOS CI. Intel,
-user-device and GUI validation remain unverified. Windows host-policy operations
-are currently unsupported. Unsupported filesystems
-fail closed with no overwrite fallback. These checks are bounded observations,
+coverage. The hosted macOS 15 ARM64 checks linked above cover the automatic-update
+policy, transaction guards and desktop compilation. Actual GUI behavior, Intel
+Macs and user-installed skills remain unverified. Windows host-policy operations
+are currently unsupported. Unsupported filesystems fail closed with no overwrite
+fallback. These checks are bounded observations,
 not a sandbox against malicious concurrent ancestor replacement.
 
 ## Automation result handling

@@ -431,10 +431,11 @@ refused. Explicit `skills rollback-update --yes` uses that original apply ID to
 restore the bound baseline and preserves displaced objects. Unexpected changes
 can block rollback; there is no force-overwrite fallback.
 
-Linux exchange has native fixture coverage. The baseline macOS ARM64 swap
-adapter at `875e3cc` passed 80 focused hosted CI tests; native CI for the new
-automatic-update layer, Intel Macs, user-device and GUI validation remain pending.
-Windows activation, rollback and result inspection are unsupported. There is a cap of
+Linux exchange has native fixture coverage. Hosted macOS 15 ARM64
+[focused policy/transaction tests and native desktop compilation](https://github.com/sm1ee/Sniper/actions/runs/38423109820)
+were verified at `e7cbe95`. Actual GUI behavior, Intel Macs and user-installed
+skills remain unverified. Windows activation, rollback, result inspection and
+host-policy operations are unsupported. There is a cap of
 128 retained operations and no automatic pruning. Partial or corrupted preparation
 or markers require manual reconciliation while preserving all artifacts.
 The legacy `skills install --yes` can overwrite installations; never use it as

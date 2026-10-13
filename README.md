@@ -598,11 +598,11 @@ reject directory overrides. Re-enabling an existing policy requires its current
 background pass after its first idle event; no agent reload or network template
 fetch occurs. Uncertain attempts pause rather than silently retrying.
 
-Linux exchange is covered by native fixtures. The baseline macOS ARM64 swap
-adapter passed [hosted CI](https://github.com/sm1ee/Sniper/actions/runs/38414932831);
-new automatic-update-layer native CI, Intel, user-device and GUI validation are
-still pending. Windows activation, rollback, transaction-result inspection and
-host-policy operations are currently unsupported. See [safe skill maintenance](docs/integrations/skill-maintenance.md)
+Linux exchange is covered by native fixtures. Hosted macOS 15 ARM64
+[focused policy/transaction tests and native desktop compilation](https://github.com/sm1ee/Sniper/actions/runs/38423109820)
+were verified at `e7cbe95`. Actual GUI behavior, Intel Macs and user-installed
+skills remain unverified. Windows activation, rollback, transaction-result
+inspection and host-policy operations are currently unsupported. See [safe skill maintenance](docs/integrations/skill-maintenance.md)
 for the review workflow, confirmation requirements, recovery and platform limits.
 
 AI agents can drive the full workflow through CLI — capture, scope, replay, fuzz — no UI scraping needed.
