@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sniper
+Comment=Inspect web traffic in an authorized testing session
+Exec=sniper-desktop
+TryExec=sniper-desktop
+Icon=sniper
+Terminal=false
+Categories=Development;
+StartupNotify=true

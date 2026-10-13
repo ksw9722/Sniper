@@ -144,6 +144,38 @@ test("Windows copy describes user PATH rather than shell profiles", async () => 
   assert.match(f.nodes.cliPathDescription.textContent, /restart your terminal app/);
 });
 
+for (const registered of [false, true]) {
+  test(`Linux ${registered ? "available" : "unavailable"} CLI status stays read-only without onboarding`, async () => {
+    const f = fixture();
+    const message = registered
+      ? "This app's sniper-cli is available on the running app's PATH."
+      : "This app's sniper-cli is not on the running app's PATH. Use the package or portable archive.";
+    await f.ready({
+      ...AVAILABLE, platform: "linux", registered, can_install: false, should_prompt: false,
+      directory: "/fixture/portable/bin", message,
+    });
+    assert.equal(f.state.error, false);
+    assert.equal(f.state.status.platform, "linux");
+    assert.equal(f.state.status.registered, registered);
+    assert.equal(hidden(f.nodes.cliPathBanner), true);
+    assert.equal(f.nodes.installCliPathButton.disabled, true);
+    assert.equal(f.nodes.refreshCliPathButton.disabled, false);
+    assert.equal(f.nodes.installCliPathStatus.textContent, message);
+    assert.match(f.nodes.cliPathDescription.textContent, /running app's PATH.*differ from your terminal/);
+    assert.match(f.nodes.cliPathDescription.textContent, /Debian package.*portable archive/);
+    assert.match(f.nodes.cliPathDescription.textContent, /does not edit shell profiles on Linux/);
+    f.nodes.installCliPathButton.click();
+    await f.context.installCliPath();
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests[0].options.method, undefined);
+    f.nodes.refreshCliPathButton.click();
+    await nextTurn();
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.requests[1].url, "/api/cli-path");
+    assert.equal(f.requests[1].options.method, undefined);
+  });
+}
+
 for (const [name, overrides, installEnabled] of [
   ["registered", { registered: true }, false],
   ["unsupported", { platform: "unsupported", supported: false, can_install: false, directory: null }, false],

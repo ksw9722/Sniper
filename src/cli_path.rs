@@ -4,15 +4,20 @@
 use std::env;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
 use std::sync::Mutex;
 
 #[cfg(any(windows, test))]
 #[path = "cli_path_windows.rs"]
 mod windows;
 
+#[cfg(not(target_os = "linux"))]
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 const CHOICE_FILE: &str = "cli-path-choice.json";
+#[cfg(not(target_os = "linux"))]
 const WINDOWS_INSTALLER_MARKER: &str = ".sniper-installed";
+#[cfg(target_os = "linux")]
+const LINUX_CLI_PATH_INSTRUCTIONS: &str = "Install the Debian package to provide /usr/bin/sniper-cli, or use the portable archive's bin/sniper-cli by its full path and add that bin directory to your terminal's PATH yourself. Sniper does not edit shell profiles on Linux.";
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct CliPathInstall {
@@ -53,6 +58,85 @@ pub fn defer_cli_path(data_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("Could not save CLI choice: {e}"))
 }
 
+#[cfg(target_os = "linux")]
+pub fn cli_path_status(_data_dir: &Path) -> CliPathStatus {
+    let executable =
+        env::current_exe().map_err(|e| format!("Could not locate the running app: {e}"));
+    let search_dirs = env::var_os("PATH")
+        .map(|path| env::split_paths(&path).collect())
+        .unwrap_or_default();
+    linux_cli_path_status(executable, search_dirs)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cli_path_status(
+    executable: Result<PathBuf, String>,
+    search_dirs: Vec<PathBuf>,
+) -> CliPathStatus {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut status = CliPathStatus {
+        platform: "linux",
+        supported: true,
+        registered: false,
+        can_install: false,
+        should_prompt: false,
+        directory: None,
+        message: String::new(),
+    };
+    let result = (|| {
+        let executable = executable?;
+        let directory = executable
+            .parent()
+            .ok_or("Could not locate the app directory.")?;
+        status.directory = Some(directory.display().to_string());
+        let cli = directory.join("sniper-cli");
+        let Some(cli_metadata) = linux_executable_metadata(&cli) else {
+            return Err(format!(
+                "The sibling sniper-cli is missing or not executable at {}.",
+                cli.display()
+            ));
+        };
+        // PATH is ordered: a different executable earlier in it masks this
+        // copy. Do not inspect shell profiles or assume a login shell's PATH.
+        for directory in search_dirs {
+            let candidate = directory.join("sniper-cli");
+            let Some(metadata) = linux_executable_metadata(&candidate) else {
+                continue;
+            };
+            if (metadata.dev(), metadata.ino()) == (cli_metadata.dev(), cli_metadata.ino()) {
+                status.registered = true;
+                status.message = "This app's sniper-cli is available on the running app's PATH. A terminal may have a different PATH.".to_string();
+                return Ok(());
+            }
+            return Err(format!("Another sniper-cli at {} takes precedence on the running app's PATH. Resolve that PATH conflict to use this copy.", candidate.display()));
+        }
+        Err("This app's sniper-cli is not on the running app's PATH. A terminal may have a different PATH.".to_string())
+    })();
+    if let Err(error) = result {
+        status.message = format!("{error} {LINUX_CLI_PATH_INSTRUCTIONS}");
+    }
+    status
+}
+
+#[cfg(target_os = "linux")]
+fn linux_executable_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // Match execution permission for this process, including ACLs and noexec
+    // mounts, without executing the candidate. The CString lives through the call.
+    let executable = unsafe {
+        libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
+    };
+    executable.then_some(metadata)
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn cli_path_status(data_dir: &Path) -> CliPathStatus {
     let platform = if cfg!(target_os = "macos") {
         "macos"
@@ -102,6 +186,7 @@ pub fn cli_path_status(data_dir: &Path) -> CliPathStatus {
     status
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn should_offer_cli_path(
     can_install: bool,
     registered: bool,
@@ -113,6 +198,12 @@ fn should_offer_cli_path(
     can_install && !registered && !decided && !installed_by_setup
 }
 
+#[cfg(target_os = "linux")]
+pub fn install_cli_path() -> Result<CliPathInstall, String> {
+    Err(LINUX_CLI_PATH_INSTRUCTIONS.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn install_cli_path() -> Result<CliPathInstall, String> {
     let _guard = INSTALL_LOCK
         .lock()
@@ -130,6 +221,7 @@ pub fn install_cli_path() -> Result<CliPathInstall, String> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn bundled_cli_directory() -> Result<PathBuf, String> {
     if !cfg!(any(target_os = "macos", windows)) {
         return Err(
@@ -164,7 +256,7 @@ fn bundled_cli_directory() -> Result<PathBuf, String> {
     Ok(directory)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn home_dir() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -172,7 +264,7 @@ fn home_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME is not set.".to_string())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn shell_targets() -> Result<Vec<PathBuf>, String> {
     let home = home_dir()?;
     let zsh_dir = env::var_os("ZDOTDIR")
@@ -192,7 +284,7 @@ fn shell_targets() -> Result<Vec<PathBuf>, String> {
     Ok(targets)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn macos_search_dirs() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = env::var_os("PATH")
         .map(|path| env::split_paths(&path).collect())
@@ -205,7 +297,7 @@ fn macos_search_dirs() -> Vec<PathBuf> {
     paths
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -224,7 +316,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 fn managed_path_line(directory: &Path) -> Result<String, String> {
     let value = directory
         .to_str()
@@ -241,7 +333,7 @@ fn managed_path_line(directory: &Path) -> Result<String, String> {
     ))
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 fn inspect_macos(
     directory: &Path,
     targets: &[PathBuf],
@@ -276,7 +368,7 @@ fn inspect_macos(
     Ok((registered, None))
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 fn install_macos(
     directory: &Path,
     targets: &[PathBuf],
@@ -337,7 +429,7 @@ fn install_macos(
     Ok(result)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), all(test, unix)))]
 fn lock_profiles(home: &Path) -> Result<std::fs::File, String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -357,7 +449,7 @@ fn lock_profiles(home: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub(crate) fn should_install_cli_path(macos_dir: &std::path::Path) -> bool {
     let path = macos_dir.to_string_lossy();
     if macos_dir.starts_with("/Volumes") || path.contains("/AppTranslocation/") {
@@ -399,7 +491,7 @@ pub(crate) fn should_install_cli_path(macos_dir: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 pub(crate) fn load_shell_rc_contents(rc_path: &Path) -> std::io::Result<String> {
     match std::fs::metadata(rc_path) {
         Ok(metadata) if !metadata.is_file() => {
@@ -419,7 +511,7 @@ pub(crate) fn write_shell_rc_atomically(rc_path: &Path, contents: &str) -> std::
     PreparedShellRc::new(rc_path, contents, None)?.commit()
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 struct PreparedShellRc {
     rc_path: PathBuf,
     write_path: PathBuf,
@@ -427,7 +519,7 @@ struct PreparedShellRc {
     expected: Option<String>,
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 impl PreparedShellRc {
     fn new(rc_path: &Path, contents: &str, expected: Option<&str>) -> std::io::Result<Self> {
         let write_path = resolve_shell_rc_write_path(rc_path)?;
@@ -490,14 +582,14 @@ impl PreparedShellRc {
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 impl Drop for PreparedShellRc {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.tmp_path);
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 pub(crate) fn resolve_shell_rc_write_path(rc_path: &std::path::Path) -> std::io::Result<PathBuf> {
     match std::fs::symlink_metadata(rc_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(rc_path),
@@ -507,7 +599,7 @@ pub(crate) fn resolve_shell_rc_write_path(rc_path: &std::path::Path) -> std::io:
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 fn decode_shell_single_quote(value: &str) -> Option<String> {
     let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
     if inner.contains('\0') {
@@ -520,7 +612,7 @@ fn decode_shell_single_quote(value: &str) -> Option<String> {
     Some(decoded.replace('\0', "'"))
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 fn normalize_managed_path_line(line: &str) -> &str {
     // Only horizontal ASCII padding is ignored for ownership. A bare CR,
     // vertical whitespace, and Unicode whitespace remain meaningful bytes.
@@ -531,7 +623,7 @@ fn normalize_managed_path_line(line: &str) -> &str {
     line.trim_matches([' ', '\t'])
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 fn is_managed_path_line(line: &str) -> bool {
     let line = normalize_managed_path_line(line);
     if let Some(quoted) = line
@@ -553,7 +645,7 @@ fn is_managed_path_line(line: &str) -> bool {
     managed_path_line(Path::new(&directory)).is_ok_and(|expected| expected == line)
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 pub(crate) fn upsert_managed_path_line(
     contents: &str,
     export_line: &str,
@@ -598,7 +690,7 @@ pub(crate) fn upsert_managed_path_line(
     Ok(changed.then_some(updated))
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(all(not(windows), not(target_os = "linux")), test))]
 pub(crate) fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -633,6 +725,157 @@ mod tests {
     impl Drop for TempRoot {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+
+        fn status(directory: &Path, search_dirs: Vec<PathBuf>) -> CliPathStatus {
+            let status = linux_cli_path_status(Ok(directory.join("sniper-desktop")), search_dirs);
+            assert_eq!(status.platform, "linux");
+            assert!(status.supported);
+            assert!(!status.can_install);
+            assert!(!status.should_prompt);
+            status
+        }
+
+        #[test]
+        fn linux_package_sibling_on_path_is_available() {
+            let root = TempRoot::new();
+            let directory = root.cli("usr/bin");
+            let result = status(&directory, vec![directory.clone()]);
+            assert!(result.registered);
+            assert_eq!(result.directory, Some(directory.display().to_string()));
+            assert!(result.message.contains("running app's PATH"));
+            assert!(result
+                .message
+                .contains("terminal may have a different PATH"));
+        }
+
+        #[test]
+        fn linux_portable_sibling_off_path_gets_manual_instructions() {
+            let root = TempRoot::new();
+            let directory = root.cli("portable folder/bin");
+            let result = status(&directory, vec![]);
+            assert!(!result.registered);
+            assert!(result.message.contains("not on the running app's PATH"));
+            assert!(result.message.contains("Debian package"));
+            assert!(result.message.contains("portable archive"));
+            assert!(result.message.contains("does not edit shell profiles"));
+        }
+
+        #[test]
+        fn linux_path_precedence_reports_foreign_cli_without_hiding_it() {
+            let root = TempRoot::new();
+            let directory = root.cli("bundle/bin");
+            let foreign = root.cli("other/bin");
+            let result = status(&directory, vec![foreign.clone(), directory.clone()]);
+            assert!(!result.registered);
+            assert!(result.message.contains("takes precedence"));
+            assert!(result.message.contains(&foreign.display().to_string()));
+            assert!(status(&directory, vec![directory.clone(), foreign]).registered);
+        }
+
+        #[test]
+        fn linux_path_symlinks_and_hard_links_to_sibling_are_available() {
+            let root = TempRoot::new();
+            let directory = root.cli("bundle/bin");
+            for (name, hard_link) in [("symlink/bin", false), ("hardlink/bin", true)] {
+                let link_directory = root.0.join(name);
+                std::fs::create_dir_all(&link_directory).unwrap();
+                let link = link_directory.join("sniper-cli");
+                if hard_link {
+                    std::fs::hard_link(directory.join("sniper-cli"), link).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(directory.join("sniper-cli"), link).unwrap();
+                }
+                assert!(status(&directory, vec![link_directory]).registered);
+            }
+        }
+
+        #[test]
+        fn linux_path_ignores_missing_nonexecutable_and_nonregular_candidates() {
+            let root = TempRoot::new();
+            let directory = root.cli("bundle/bin");
+            let nonexecutable = root.cli("nonexecutable");
+            std::fs::set_permissions(
+                nonexecutable.join("sniper-cli"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            let nonregular = root.0.join("nonregular");
+            std::fs::create_dir_all(nonregular.join("sniper-cli")).unwrap();
+            let dangling = root.0.join("dangling");
+            std::fs::create_dir_all(&dangling).unwrap();
+            std::os::unix::fs::symlink(root.0.join("absent"), dangling.join("sniper-cli")).unwrap();
+            let mut search_dirs = vec![root.0.join("missing"), nonexecutable, nonregular, dangling];
+            assert!(!status(&directory, search_dirs.clone()).registered);
+            search_dirs.push(directory.clone());
+            assert!(status(&directory, search_dirs).registered);
+        }
+
+        #[test]
+        fn linux_missing_or_nonexecutable_sibling_is_not_registered_by_foreign_cli() {
+            let root = TempRoot::new();
+            let foreign = root.cli("other/bin");
+            let missing = root.0.join("missing/bin");
+            let nonexecutable = root.cli("nonexecutable/bin");
+            std::fs::set_permissions(
+                nonexecutable.join("sniper-cli"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            for directory in [missing, nonexecutable] {
+                let result = status(&directory, vec![foreign.clone()]);
+                assert!(!result.registered);
+                assert!(result.message.contains("missing or not executable"));
+            }
+        }
+
+        #[test]
+        fn linux_nonunicode_path_is_checked_without_shell_quoting() {
+            let root = TempRoot::new();
+            let directory = root.cli("bundle/bin");
+            let link_directory = root
+                .0
+                .join(std::ffi::OsString::from_vec(b"path-\xff".to_vec()));
+            std::fs::create_dir(&link_directory).unwrap();
+            std::os::unix::fs::symlink(
+                directory.join("sniper-cli"),
+                link_directory.join("sniper-cli"),
+            )
+            .unwrap();
+            assert!(status(&directory, vec![link_directory]).registered);
+        }
+
+        #[test]
+        fn linux_app_lookup_failure_is_actionable_and_never_installable() {
+            let result = linux_cli_path_status(Err("fixture lookup failure".to_string()), vec![]);
+            assert_eq!(result.platform, "linux");
+            assert!(!result.registered);
+            assert!(!result.can_install);
+            assert!(!result.should_prompt);
+            assert_eq!(result.directory, None);
+            assert!(result.message.contains("fixture lookup failure"));
+            assert!(result.message.contains("Debian package"));
+        }
+
+        #[test]
+        fn linux_status_and_install_do_not_create_choice_or_profile_files() {
+            let root = TempRoot::new();
+            let data_dir = root.0.join("unused-data");
+            let result = cli_path_status(&data_dir);
+            assert_eq!(result.platform, "linux");
+            assert!(!result.can_install);
+            assert!(!result.should_prompt);
+            assert!(install_cli_path()
+                .unwrap_err()
+                .contains("does not edit shell profiles"));
+            assert!(!data_dir.exists());
+            assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
         }
     }
 

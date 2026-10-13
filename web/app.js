@@ -20028,6 +20028,9 @@ function cliPathDescription() {
   if (cliPathState.status?.platform === "windows") {
     return "Optionally add this app's bundled sniper-cli to your user PATH. This changes only your account's PATH. Open a new terminal afterwards; you may need to restart your terminal app.";
   }
+  if (cliPathState.status?.platform === "linux") {
+    return "CLI availability is checked against the running app's PATH, which may differ from your terminal's. Use the Debian package or the portable archive's bin/sniper-cli. Sniper does not edit shell profiles on Linux.";
+  }
   return "Make this app's bundled sniper-cli available in a terminal. PATH setup is optional; availability depends on the platform and app package.";
 }
 
@@ -20082,7 +20085,7 @@ function renderCliPathUi() {
 }
 
 function validCliPathStatus(status) {
-  return status && ["macos", "windows", "unsupported"].includes(status.platform)
+  return status && ["macos", "windows", "linux", "unsupported"].includes(status.platform)
     && ["supported", "registered", "can_install", "should_prompt"].every((key) => typeof status[key] === "boolean")
     && (status.directory === null || typeof status.directory === "string")
     && typeof status.message === "string";

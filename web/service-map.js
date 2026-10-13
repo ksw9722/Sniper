@@ -927,6 +927,7 @@
     let peerMatchesAbort = null;
     let htmlGeneratorsAbort = null;
     let detailRender = null;
+    const renderedMarkup = new WeakMap();
     let visible = false;
     let currentLayout = null;
     function viewportSize() {
@@ -980,14 +981,20 @@
       const size = viewportSize();
       return setZoom(Math.min(1, size.width / currentLayout.width, size.height / currentLayout.height), { fit: true });
     }
-    function replace(element, html) {
-      if (!element || element.innerHTML === html) return;
+    function replace(element, html, force = false) {
+      if (!element) return;
+      // Compare our last output, not browser serialization: boolean attributes
+      // and native control/disclosure state can change innerHTML without a new
+      // render. Replacing an unchanged select dismisses its native popup.
+      const previous = renderedMarkup.get(element);
+      if (!force && previous?.sessionId === state.sessionId && previous.html === html) return;
       const focused = doc?.activeElement;
       const key = focused?.dataset?.serviceFocus;
       const owned = key && element.contains(focused);
       const caret = owned && focused.dataset.serviceEndpointFilter === "path"
         ? [focused.selectionStart, focused.selectionEnd, focused.selectionDirection] : null;
       element.innerHTML = html;
+      renderedMarkup.set(element, { sessionId: state.sessionId, html });
       // Only restore the element that this replacement detached. A newly focused
       // dialog or control is never displaced by a background refresh.
       if (owned && visible && (!doc.activeElement || doc.activeElement === doc.body || doc.activeElement === focused && !focused.isConnected)
@@ -2245,7 +2252,7 @@
       const listScroll = previousList?.scrollTop;
       const limitsOpen = previousLimits?.open;
       const generatorLimitsOpen = els.detail.querySelector?.(".service-map-html-generator-limits")?.open;
-      replace(els.detail, html);
+      replace(els.detail, html, !sameSource);
       detailRender = { identity, evidence: state.evidence, html };
       if (sameSource) {
         const body = els.detail.querySelector?.(".service-map-detail-body");
@@ -2334,7 +2341,15 @@
       else if (data.serviceShowBodyReferences) showBodyReferencesOnMap();
       else if (data.serviceClearBodyReferences) clearBodyReferenceOverlay();
       else if (data.servicePage !== undefined) { state.page = Math.max(0, Number(data.servicePage) || 0); state.pageAnchor = null; renderCatalog(); els.catalog.scrollTop = 0; }
-      else if (data.serviceDetailPage !== undefined) { state.detailPage = Math.max(0, Number(data.serviceDetailPage) || 0); state.detailPageAnchor = null; renderDetail(); }
+      else if (data.serviceDetailPage !== undefined) {
+        state.detailPage = Math.max(0, Number(data.serviceDetailPage) || 0);
+        state.detailPageAnchor = null;
+        renderDetail();
+        // Explicit page navigation returns to the endpoint filters/counts. A
+        // short last page must not inherit a long page's relationship scroll.
+        const body = els.detail.querySelector?.(".service-map-detail-body");
+        if (body) body.scrollTop = 0;
+      }
     }
     let onViewChange = null;
     els.panel.addEventListener("click", handleClick);

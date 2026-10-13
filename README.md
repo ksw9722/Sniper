@@ -43,6 +43,14 @@ since releases are not yet code-signed.
 
 Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or extract a Windows ZIP built by `packaging/windows/make-zip.ps1` and open `sniper-desktop.exe`. Building from source requires the MSVC Rust toolchain. See [Windows setup and packaging](packaging/windows/README.md) for WebView2/runtime prerequisites, HTTPS certificates, CLI usage, and isolated testing. Windows x64 is the first port; Linux validation is still pending.
 
+### Linux qualification candidate
+
+Debian 13 x86_64 on X11 is the first Linux qualification target. Native support
+is not yet claimed. See [Linux build and packaging](packaging/linux/README.md)
+for the candidate archive and `.deb`, system WebKitGTK requirements, explicit
+portable PATH setup, and remaining native desktop checks. No compatibility with
+Ubuntu, other distributions, or native Wayland is implied.
+
 ### macOS
 
 **Install with Homebrew**, which also puts `sniper-cli` on your `PATH`:

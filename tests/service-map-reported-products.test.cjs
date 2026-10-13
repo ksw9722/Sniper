@@ -54,6 +54,30 @@ function fixture() {
     async load(value = snapshot()) { const task = controller.refresh(); requests.at(-1).resolve(response(value)); return task; },
     async verify(index = 0, id = A, seq = index + 1) { controller.selectOrigin(id, index); const task = controller.loadEvidence(token(seq)); requests.at(-1).resolve(response(evidence(seq, id, index))); return task; } };
 }
+// A focused native select owns its popup independently of serialized markup.
+// Model browser boolean-attribute normalization and detachment on innerHTML,
+// which the ordinary inert fixture intentionally does not do.
+function nativeControlModel(f, container) {
+  const normalize = markup => markup.replace(/<[^>]+>/g, tag => tag.replace(/\b(selected|disabled)(?=[ >])/g, '$1=""').replace(/ +>/g, '>'));
+  let html = normalize(container.innerHTML), current = [], replacements = 0;
+  const install = markup => [...markup.matchAll(/<(?:select|input|button)\b[^>]*data-service-focus="([^"]+)"[^>]*>/g)].map(match => ({
+    dataset: { serviceFocus: match[1] }, isConnected: true, popupOpen: false,
+    getClientRects: () => [{}], focus() { f.document.activeElement = this; },
+  }));
+  current = install(html);
+  container.contains = control => current.includes(control);
+  container.querySelectorAll = () => current;
+  Object.defineProperty(container, 'innerHTML', {
+    get: () => html,
+    set(markup) {
+      for (const control of current) { control.isConnected = false; control.popupOpen = false; }
+      if (current.includes(f.document.activeElement)) f.document.activeElement = f.document.body;
+      html = normalize(markup);
+      current = install(html); replacements += 1;
+    },
+  });
+  return { controls: () => current, replacements: () => replacements };
+}
 function evidence(seq = 1, id = A, index = 0) { return { schema_version: 1, session_id: SESSION, technology_catalog_version: 2, evidence_id: token(seq), available: true, source: 'captured_http_metadata',
   row: { evidence_id: token(seq), sequence: String(seq), record_id: RECORD, origin: id, method: 'GET', path: `/path-${index}`, started_at: START, status: 200, metadata_complete: true, omitted: [] },
   socket_peer: { status: 'observed', observation: { source: 'http_response_remote_addr', route: 'direct', observed_at: OBSERVED, address: { ip: '192.0.2.10', port: 443 }, reason: null } } }; }
@@ -263,6 +287,64 @@ test('invalid local choices cannot create arbitrary products or oversized versio
   const f = fixture(); await f.load();
   for (const [kind, value] of [['product', '<script>'], ['version', 'reported:<script>'], ['version', 'reported:' + '1'.repeat(33)], ['version', 'semver:>=1']]) f.filter(kind, value);
   assert.equal(f.state.productId, ''); assert.equal(f.state.productVersion, ''); assert.equal(f.requests.length, 1);
+});
+
+for (const [containerName, key] of [['productFilters', 'products:product'], ['productFilters', 'products:version'], ['catalog', 'serviceMapCatalog:method']]) {
+  test(`native-normalized ${key} retains its exact node and open popup through unchanged polling`, async () => {
+    const f = fixture(), container = f.els[containerName], view = nativeControlModel(f, container);
+    const disclosure = element(); disclosure.open = true; disclosure.querySelector = () => null;
+    f.els.productFilters.parentElement = disclosure;
+    await f.load(); f.filter('product', 'nginx'); f.filter('version', 'reported:1.26.2');
+    f.els.panel.dispatch('change', { target: { value: 'GET', dataset: { serviceEndpointFilter: 'method' } } });
+    const control = view.controls().find(control => control.dataset.serviceFocus === key), count = view.replacements();
+    control.popupOpen = true; control.focus(); container.scrollTop = 125;
+    assert.match(container.innerHTML, /selected=""/);
+    for (let index = 0; index < 3; index += 1) await f.load();
+    assert.equal(view.replacements(), count); assert.equal(control.isConnected, true); assert.equal(control.popupOpen, true);
+    assert.equal(f.document.activeElement, control); assert.equal(container.scrollTop, 125); assert.equal(disclosure.open, true);
+    assert.equal(f.state.productId, 'nginx'); assert.equal(f.state.productVersion, 'reported:1.26.2'); assert.equal(f.state.endpointMethod, 'GET');
+  });
+}
+
+test('native markup cache still commits filter changes, refreshes options and fences session reset', async () => {
+  const f = fixture(), view = nativeControlModel(f, f.els.productFilters); await f.load();
+  f.filter('product', 'nginx'); f.filter('version', 'reported:1.26.2');
+  const selected = view.controls()[0], before = view.replacements(); selected.focus();
+  f.filter('product', 'php');
+  assert.ok(view.replacements() > before); assert.equal(selected.isConnected, false);
+  assert.equal(f.document.activeElement, view.controls()[0]); assert.match(f.els.productFilters.innerHTML, /php" selected="">PHP \(unavailable\)/);
+  await f.load(snapshot([origin(A, [observation('php', '8.3')])]));
+  assert.match(f.els.productFilters.innerHTML, /php" selected="">PHP<\/option>/); assert.match(f.els.productFilters.innerHTML, /Reported: 8.3/);
+  const pending = f.controller.refresh(), oldRequest = f.requests.at(-1);
+  f.setSession('new-synthetic-session'); f.controller.reset();
+  assert.equal(oldRequest.options.signal.aborted, true); assert.equal(f.state.productId, ''); assert.equal(f.state.productVersion, '');
+  assert.doesNotMatch(f.els.productFilters.innerHTML, /<option value="php"|Reported: 8.3/);
+  oldRequest.resolve(response(snapshot())); await pending;
+  assert.equal(f.state.snapshot, null); assert.doesNotMatch(f.els.productFilters.innerHTML, /<option value="php"|Reported: 8.3/);
+});
+
+test('session changes detach old native controls even when generated filter markup is identical', async () => {
+  const f = fixture(), view = nativeControlModel(f, f.els.productFilters);
+  await f.load(snapshot([origin(A, [])]));
+  const previous = view.controls()[0], html = f.els.productFilters.innerHTML;
+  previous.popupOpen = true; previous.focus();
+  f.setSession('new-synthetic-session'); f.controller.reset();
+  assert.equal(f.els.productFilters.innerHTML, html);
+  assert.equal(previous.isConnected, false); assert.equal(previous.popupOpen, false);
+  assert.notEqual(view.controls()[0], previous); assert.equal(f.state.snapshot, null);
+});
+
+test('product and API controls use scoped theme colors, sizing, placeholders and keyboard focus', () => {
+  const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  const controls = css.match(/\.service-map-product-filter-controls select, \.service-map-endpoint-filter-controls input, \.service-map-endpoint-filter-controls select \{([^}]+)\}/)?.[1];
+  assert.ok(controls);
+  for (const rule of ['box-sizing: border-box', 'color: var(--text)', 'background-color: var(--panel-code)', 'border: 1px solid var(--line-strong)', 'font: inherit']) assert.ok(controls.includes(rule), rule);
+  // Native appearance is disabled globally; its shared SVG chevron must survive
+  // the themed background rather than being erased by a background shorthand.
+  assert.match(css, /select:not\(\[multiple\]\) \{[^}]*background-image: url\("data:image\/svg\+xml/);
+  assert.doesNotMatch(controls, /(?:^|;)\s*background\s*:|background-image\s*:/);
+  assert.match(css, /service-map-product-filter-controls select:focus-visible[^}]+outline: 2px solid var\(--point\)/);
+  assert.match(css, /service-map-endpoint-filter-controls input::placeholder \{ color: var\(--text-dim\)/);
 });
 
 test('a hidden catalog anchor is replaced only when its exact loaded endpoint disappears', async () => {

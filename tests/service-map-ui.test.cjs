@@ -1079,10 +1079,14 @@ test('explicit force refresh clears a completed inspection without starting a bo
 
 for (const change of ['generation', 'exact token']) test(`background poll changing ${change} clears the source and fences pending body inspection`, async () => {
   const f = await verifiedBodyFixture(); clickBodyInspector(f); const bodyRead = f.requests.at(-1);
+  const view = nativeInspectorModel(f), previous = view();
+  previous.limits.open = true; previous.body.scrollTop = 350; previous.summary.focus();
   const value = change === 'generation' ? snapshot(undefined, 'session-one', { generation: 'generation-two' })
     : snapshot([origin(originA, [endpoint('/users', 'GET', 'new-exact-token')]), origin(originB)]);
   const poll = pollRealTargetMap(f); f.requests.at(-1).resolve(response(value)); await poll;
   assert.equal(f.state.evidence, null); assert.equal(bodyRead.options.signal.aborted, true);
+  assert.notEqual(view(), previous); assert.equal(previous.summary.isConnected, false);
+  assert.equal(view().limits, null); assert.equal(view().body.scrollTop, 0);
   bodyRead.resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.state.bodyReferences, null); assert.doesNotMatch(f.els.detail.innerHTML, /assets\.example\.com/);
 });
@@ -1151,6 +1155,26 @@ test('unchanged polls preserve nested scroll and native-normalized loading marku
   assert.equal(view().limits.open, true); assert.equal(view().body.scrollTop, 240);
   bodyRead.resolve(response(bodyReferences())); await new Promise(resolve => setImmediate(resolve));
   assert.equal(view().limits.open, true); assert.equal(view().body.scrollTop, 240);
+});
+
+test('explicit inspector pagination returns 50-to-5 and Previous to the endpoint header while polls retain scroll', async () => {
+  const f = fixture(), data = snapshot([origin(originA, Array.from({ length: 55 }, (_, index) => endpoint(`/path-${index}`)))]);
+  const view = nativeInspectorModel(f); await f.load(data);
+  view().body.scrollTop = 2800; f.els.viewport.scrollTop = 95; f.els.catalog.scrollTop = 150;
+  const clickPage = page => { const target = { dataset: { serviceDetailPage: String(page) }, closest: () => target }; f.els.panel.dispatch('click', { target }); };
+  clickPage(1);
+  assert.equal(f.state.detailPage, 1); assert.equal(view().body.scrollTop, 0);
+  assert.equal((f.els.detail.innerHTML.match(/data-service-endpoint=/g) || []).length, 5);
+  view().body.scrollTop = 210;
+  const current = view(); await f.load(data);
+  assert.equal(view(), current); assert.equal(view().body.scrollTop, 210);
+  data.origins[0].request_count += 1; await f.load(data);
+  assert.notEqual(view(), current); assert.equal(view().body.scrollTop, 210, 'same-source changed polls retain scroll too');
+  clickPage(0);
+  assert.equal(f.state.detailPage, 0); assert.equal(view().body.scrollTop, 0);
+  assert.equal((f.els.detail.innerHTML.match(/data-service-endpoint=/g) || []).length, 50);
+  assert.equal(f.els.viewport.scrollTop, 95); assert.equal(f.els.catalog.scrollTop, 150);
+  assert.equal(f.requests.length, 3, 'pagination stays local');
 });
 
 test('same-source output changes retain Coverage keyboard focus, disclosure and both scroll positions', async () => {
