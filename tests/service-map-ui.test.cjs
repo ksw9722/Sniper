@@ -358,7 +358,7 @@ test('integration wires session, removal, gap and owned transaction invalidation
   assert.match(appSource, /function resetSessionScopedUiState\(\)[\s\S]*?targetServiceMapController\?\.reset\(\)/);
   assert.match(appSource, /function applyConfirmedHistoryRemoval\([^]*?targetServiceMapController\?\.invalidate\(\)/);
   assert.match(appSource, /function invalidateHistoryAfterEventGap\([^]*?targetServiceMapController\?\.invalidate\(\)/);
-  assert.match(appSource, /addEventListener\("transaction", \(event\) => \{\s*if \(!ownsHistoryEvents\(\)\) \{\s*return;\s*\}\s*if \(typeof targetServiceMapController[^]*?markDirty\(\)/);
+  assert.match(appSource, /addEventListener\("transaction", \(event\) => \{\s*if \(!ownsHistoryEvents\(\)\) \{\s*return;\s*\}\s*if \(typeof targetServiceMapController[^]*?markDirty\(event\)/);
 });
 
 test('reference-card work is cached and capped independently of the 24-card viewport', async () => {
@@ -1314,8 +1314,8 @@ test('same exact source keeps native inspector state when its selected endpoint 
 
 test('metadata map footer distinguishes explicit body inspection from map-wide extraction', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-  assert.match(html, /Inspect one retained response, then choose Show references on map for a temporary Direct relations overlay\./);
-  assert.match(html, /Pause HTTP recording manually for steadier inspection/);
+  assert.match(html, /Explicitly inspect a source, then Show to add its body, Link or recorded-address relationships alongside other inspections\./);
+  assert.match(html, /Pause HTTP recording manually for steadier peer inspection/);
   assert.doesNotMatch(html, /they are not added to this map/);
   assert.doesNotMatch(html, /Response-body reference extraction is deferred/);
 });
@@ -1345,7 +1345,7 @@ test('explicit Show and Clear are local, keep All origins default, and remove on
   f.controller.selectOrigin('https://assets.example.com');
   assert.equal(f.state.bodyReferences, null, 'inspector is independent from the copied overlay');
   assert.match(f.els.detail.innerHTML, /Literal body URL reference/);
-  assert.match(f.els.detail.innerHTML, /Sequence 9007199254740993/);
+  assert.match(f.els.detail.innerHTML, /[Ss]equence 9007199254740993/);
   clickOverlay(f, 'clear');
   assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(f.state.selectedOrigin, null);
   assert.equal(f.state.anchorOrigin, originA);
@@ -1406,7 +1406,7 @@ test('100 body origins retain the source and prioritize 23 reference cards with 
   assert.match(boundsText(f), /100 metadata \/ 100 body URL links/);
   assert.match(boundsText(f), /177 omitted by 24-card cap/);
   assert.equal((f.els.canvas.innerHTML.match(/data-relationship="body_url_reference"/g) || []).length, 23);
-  assert.equal(f.state.graphOriginsCache.length, 101, 'body targets do not consume the 100 metadata reference slots');
+  assert.equal(f.state.graphOriginsCache.length, 201, 'inspected targets coexist with the 100 metadata reference slots');
   f.els.search.value = 'body099'; f.els.search.dispatch('input');
   assert.deepEqual(cardIds(f), [originA, refs[99].target_origin]);
   f.controller.selectOrigin(refs[99].target_origin);
@@ -1458,8 +1458,6 @@ test('Show pins a source beyond the All origins card cap and search without tran
 });
 
 for (const [name, clear] of [
-  ['All origins', f => f.els.allOrigins.dispatch('click')],
-  ['repin', f => { f.controller.selectOrigin(originB); f.els.focusSelection.dispatch('click'); }],
   ['hidden map', f => f.controller.setVisible(false)],
   ['standalone APIs', f => f.controller.setVisible(true, 'apis')],
   ['transaction event', f => f.controller.markDirty()],
@@ -1469,7 +1467,7 @@ for (const [name, clear] of [
   const reads = f.requests.length; clear(f);
   assert.equal(f.state.bodyReferenceOverlay, null);
   assert.doesNotMatch(f.els.canvas.innerHTML, /body_url_reference/);
-  assert.match(f.els.overlayStatus.innerHTML, /Temporary body references cleared/);
+  assert.match(f.els.overlayStatus.innerHTML, /(?:Shown|Affected) inspections (?:cleared|removed)/);
   f.controller.setVisible(true, 'service-map');
   assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(f.requests.length, reads);
 });

@@ -242,15 +242,16 @@ byte offsets, with truncation and limits; literal references do not prove calls
 or ownership. The session must already be active. Default map/evidence reads
 remain metadata-only, with no automatic body reads or target requests.
 
-In the GUI, **Show references on map** can place an already-inspected response's
-non-self references on a temporary **Direct relations** overlay. Dotted arrows
-mean literal body references; they add no captured traffic or API counts. The
-source method/path and retained-preview coverage remain visible. This explicit,
-in-memory action makes no further read and leaves All origins and the API catalog
-metadata-only. **Clear body references**, leaving the map, or a history/source
-invalidation removes it; it is never saved or restored automatically. The CLI
-body-reference output is unchanged. See
-[temporary overlay behavior and limits](docs/integrations/service-map.md#temporary-retained-relationship-overlay-gui-only).
+In the GUI, explicitly inspected body references, Response Link declarations and
+recorded socket-peer groups can coexist in a session-local map collection, with
+up to eight exact-source entries. Typed reference arrows and undirected recorded
+address spokes retain separate provenance and coverage; they do not prove calls
+or common ownership. Show, filters, selection and per-entry removal make no extra
+reads. The collection is never persisted and shares the existing 24-card/40-edge
+limits. Unrelated record events preserve verified body/Link entries; peer groups
+still clear when history changes because unsampled membership cannot be proved
+unchanged. See the
+[collection behavior and lifetime limits](docs/integrations/service-map.md#session-local-retained-relationship-collection-gui-only).
 
 An optional **Upstream socket peer** Capture Settings card records one bounded
 socket observation for eligible future ordinary captured HTTP(S) responses. It

@@ -163,13 +163,15 @@ test('only explicit Link Inspect issues one exact GET without catalog headers; p
   assert.doesNotMatch(f.els.detail.innerHTML, /Header-reported technologies/); assert.equal(f.requests.length, count + 1);
 });
 
-for (const direction of ['body-link', 'link-body']) test(`${direction}: Inspect preserves overlay and explicit Show replaces the single immutable source`, async () => {
+for (const direction of ['body-link', 'link-body']) test(`${direction}: Inspect preserves entries and explicit Show accumulates independent immutable kinds`, async () => {
   const f = direction === 'body-link' ? await displayedBody() : await displayedLink(), original = f.state.bodyReferenceOverlay;
   const targetKind = direction === 'body-link' ? 'link' : 'body', count = f.requests.length;
   f.controller.setRelationshipKind(targetKind); assert.equal(f.requests.length, count); assert.equal(f.state.bodyReferenceOverlay, original);
   if (targetKind === 'link') await inspectLink(f); else await f.inspect();
-  assert.equal(f.state.bodyReferenceOverlay, original); assert.match(f.els.detail.innerHTML, /Replace shown references/);
+  assert.equal(f.state.bodyReferenceOverlay, original); assert.match(f.els.detail.innerHTML, /Show references on map/);
   const reads = f.requests.length; assert.equal(targetKind === 'link' ? f.controller.showLinkDeclarationsOnMap() : f.controller.showBodyReferencesOnMap(), true);
+  assert.equal(f.state.relationLayers.length, 2); assert.equal(f.state.relationLayers[0], original);
+  assert.match(f.els.canvas.innerHTML, /body_url_reference/); assert.match(f.els.canvas.innerHTML, /link_service_doc/);
   const overlay = f.state.bodyReferenceOverlay; assert.equal(overlay.kind, targetKind); assert.notEqual(overlay, original); assert.equal(f.requests.length, reads);
   assert.ok(Object.isFrozen(overlay) && Object.isFrozen(overlay.scan));
   if (targetKind === 'link') { assert.ok(Object.isFrozen(overlay.scan.observations[0].relation_span)); f.state.linkDeclarations.observations[0].target_origin = OTHER; assert.equal(overlay.scan.observations[0].target_origin, TARGET); }

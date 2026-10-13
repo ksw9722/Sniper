@@ -216,11 +216,11 @@ for (const kind of ['body', 'link', 'peer']) test(`shown ${kind} visualization s
   f.requests.at(-1).resolve(response(kind === 'body' ? bodyScan() : kind === 'link' ? linkScan() : peerScan())); assert.equal(await task, true);
   const show = kind === 'body' ? 'showBodyReferencesOnMap' : kind === 'link' ? 'showLinkDeclarationsOnMap' : 'showPeerMatchesOnMap'; assert.equal(f.controller[show](), true);
   const overlay = f.state.bodyReferenceOverlay, count = f.requests.length; f.filter('product', 'php');
-  assert.equal(f.state.bodyReferenceOverlay, overlay); assert.equal(f.state.anchorOrigin, A); assert.equal(f.state.evidence.origin, A); assert.equal(f.requests.length, count);
-  assert.deepEqual(cards(f), kind === 'peer' ? [A, B] : [A]);
+  assert.equal(f.state.bodyReferenceOverlay, overlay); assert.equal(f.state.anchorOrigin, kind === 'peer' ? null : A); assert.equal(f.state.evidence.origin, A); assert.equal(f.requests.length, count);
+  assert.deepEqual(cards(f), kind === 'peer' ? [B] : [A]);
   if (kind === 'peer') {
     assert.match(f.els.canvas.innerHTML, /PHP 8.3/); assert.doesNotMatch(f.els.canvas.innerHTML, /data-service-origin="https:\/\/peer-only/);
-    assert.match(f.els.graphBounds.textContent, /1 origins \/ 1 rows hidden by products\/versions · 1 matching origins \(source excluded\)/);
+    assert.match(f.els.graphBounds.textContent, /2 hidden by products\/versions/);
     f.controller.selectOrigin(PEER); assert.match(f.els.detail.innerHTML, /Default product metadata unavailable/); assert.match(f.els.detail.innerHTML, /outside the product\/version filters/);
     f.click({ serviceProductFilterClear: 'true' }); assert.match(f.els.canvas.innerHTML, /Default product metadata unavailable/);
   } else assert.match(f.els.graphDiagnostics.textContent, /1 loaded neighbors · 0 query-hidden · 1 product\/version-hidden · 0 matching/);
@@ -355,11 +355,11 @@ test('a hidden catalog anchor is replaced only when its exact loaded endpoint di
   f.click({ serviceProductFilterClear: 'true' }); assert.equal(f.state.pageAnchor.origin, B); assert.equal(f.state.page, 2);
 });
 
-test('peer source-origin extra matches remain separate context, excluded from product matching counts', async () => {
+test('peer source-origin extra matches remain separate per-inspection facts, without invented product metadata', async () => {
   const f = fixture(); await f.load(); await f.verify();
   const scan = peerScan(); scan.origins[0].origin = A; scan.origins.sort((a, b) => a.origin.localeCompare(b.origin));
   const task = f.controller.loadPeerMatches(); f.requests.at(-1).resolve(response(scan)); assert.equal(await task, true); assert.equal(f.controller.showPeerMatchesOnMap(), true);
-  f.filter('product', 'php'); assert.deepEqual(cards(f), [A]);
-  assert.match(f.els.graphBounds.textContent, /0 peer-match rows in shown matching origins/); assert.match(f.els.graphBounds.textContent, /1 peer-match rows in pinned context \(separate\)/);
-  assert.match(f.els.graphBounds.textContent, /0 matching origins \(source excluded\)/); assert.match(f.els.graphDiagnostics.textContent, /1 other loaded returned origins → 0 query-hidden → 1 product\/version-hidden → 0 matching/);
+  f.filter('product', 'php'); assert.deepEqual(cards(f), []);
+  assert.match(f.els.detail.innerHTML, /1 other matching rows in this inspection/);
+  assert.equal(f.state.relationLayers.length, 1);
 });

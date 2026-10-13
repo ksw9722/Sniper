@@ -391,7 +391,7 @@ test('scope-excluded peer seed preserves metadata and an unrelated shown overlay
 });
 for (const reason of AUTHORITATIVE) test(`${reason} does not clear overlay from a different session even with equal token text`, async () => {
   const f = await verified(); await show(f); const overlay = f.state.bodyReferenceOverlay;
-  f.state.bodyReferenceOverlay = Object.freeze({ ...overlay, source: Object.freeze({ ...overlay.source, sessionId: ROW }) });
+  f.state.relationLayers = Object.freeze([Object.freeze({ ...overlay, source: Object.freeze({ ...overlay.source, sessionId: ROW }) })]);
   const foreign = f.state.bodyReferenceOverlay;
   await inspect(f, 'html', missing('html', reason)); assert.equal(f.state.evidence, null); assert.equal(f.state.bodyReferenceOverlay, foreign);
 });

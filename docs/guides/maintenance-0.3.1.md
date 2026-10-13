@@ -22,14 +22,16 @@ and retained-preview offsets with separate capture/prefix truncation and cap
 reasons. References do not establish calls or ownership. The default map and
 metadata evidence still read no bodies, and nothing sends target requests.
 
-The GUI can explicitly show one completed or partial body-reference result as a
-temporary Direct relations overlay. Its pinned source and dotted arrows keep
-literal references separate from traffic counts; the source method/path and
-preview coverage remain visible. It adds no API or CLI operation, automatic read,
-or persistence. All origins and the API catalog remain metadata-only. History or
-source invalidation clears the overlay, including new transaction events; it is
-not automatically restored. See the
-[overlay lifecycle and display limits](../integrations/service-map.md#temporary-body-reference-overlay-gui-only).
+The GUI now collects up to eight explicitly shown body, Link and recorded-peer
+inspections in one session-local graph, alongside loaded metadata. Each retains
+its exact source, timing and coverage, with separate remove/clear controls.
+Reference arrows and undirected address observations remain distinct from traffic
+counts and do not prove runtime calls or common ownership. Show, mode changes,
+filters and removal add no reads; the collection is never persisted and adds no
+API paths. Unrelated UUID events preserve verified body/Link entries, while peer
+groups still clear on transaction events because unsampled membership cannot be
+proved unchanged. See the
+[collection lifetime and display limits](../integrations/service-map.md#session-local-retained-relationship-collection-gui-only).
 
 ## Predictable CLI contracts
 

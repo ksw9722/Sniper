@@ -164,15 +164,18 @@ is separate from other matching-row counts. Duplicate UUID rows count separately
 Do not invent omitted distinct-origin totals or treat `no_matches` as covering
 uninspected rows. Scope matching uses the original captured host.
 
-The GUI can explicitly show one temporary group with a distinct observed endpoint
-node and undirected observation links. It performs no additional read. An origin
-outside the default map is captured in this inspection; its matching-row count
-is not full-session traffic. Every sample uses its exact token for source
-verification, without a UUID fallback. Stale history/session/scope invalidates
-the result; no automatic rescan or persistent aggregate follows. Equal retained
-address values, including imported history, do not prove the same physical
-endpoint, origin ownership or a backend relationship. Socket addresses may reveal
-internal infrastructure; consider this before sharing explicit inspection output.
+The GUI can explicitly collect up to eight shown body, Link and peer inspections.
+Peer groups use distinct canonical recorded-address nodes and undirected observation links;
+equal address keys can share a node, but overlapping per-inspection totals are never
+summed. Show performs no additional read. An origin outside the default map is
+captured in this inspection; its matching-row count is not full-session traffic.
+Every sample uses its exact token for verification, without a UUID fallback.
+Every transaction event and retained-projection change removes peer groups because
+unsampled membership cannot be proved unchanged. No automatic rescan or persistent
+aggregate follows. Equal retained address values, including imported history, do
+not prove the same physical endpoint, origin ownership or a backend relationship.
+Socket addresses may reveal internal infrastructure; consider this before sharing
+explicit inspection output.
 
 For explicitly requested retained response-header relationships, use
 `scope service-map link-declarations --session-id <active-session-uuid>
@@ -192,11 +195,18 @@ spans; it omits target paths, queries, credentials, raw headers and unknown rel
 text. Header indices refer to the retained array, not original wire ordering.
 An older server may lack this endpoint; no fallback or automatic retry is safe.
 In the GUI, Retained relationships selects body or Link evidence without reading
-it. Inspect reads only the chosen source; Show explicitly replaces the one
-session-local temporary overlay. Choosing another kind or an unrelated failed
-inspection does not discard a still-valid shown overlay. Source/session changes,
-retention or unavailable freshness clear it. Never count reference-only targets
-as captured traffic, infer a physical infrastructure chain, or fetch declarations.
+it. Inspect reads only the chosen source; Show explicitly adds one exact inspection
+to the session-local collection. Repeating the same kind and full evidence token
+updates only that entry; the eight-entry cap rejects additions without eviction.
+All origins, pinning, selection and filters preserve the collection. Each entry
+has separate provenance, coverage and removal controls, and none is persisted.
+Validated events for another record UUID preserve body/Link entries; matching UUIDs
+remove them conservatively. A later map poll must still verify the exact source
+token under its original origin and generation. Sampling omissions are not proof
+of deletion. Unknown events, gaps, retention, source/session/scope changes,
+disconnect, refresh failure, Reload or leaving the map retire affected entries.
+Never count reference-only targets as captured traffic, infer a physical
+infrastructure chain, or fetch declarations.
 
 For a separately requested HTML generator inspection, use
 `scope service-map html-generators --session-id <active-session-uuid>

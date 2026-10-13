@@ -142,8 +142,8 @@ test('new scans while disconnected cannot show an overlay until the live stream 
 for (const boundary of ['hide', 'reset', 'clear']) test(`${boundary} discards references to the immutable overlay from identity caches`, async () => {
   const f = await displayed(), shown = f.state.bodyReferenceOverlay;
   f.controller.selectOrigin(TARGET); f.controller.selectOrigin(SOURCE);
-  assert.equal(f.state.neighborhoodOverlay, shown);
-  assert.equal(f.state.extraOriginOverlay, shown);
+  assert.equal(f.state.neighborhoodOverlay, f.state.relationLayers);
+  assert.equal(f.state.graphLayers, f.state.relationLayers);
   if (boundary === 'hide') f.controller.setVisible(false);
   if (boundary === 'reset') { f.setSession('new-session'); f.controller.reset(); }
   if (boundary === 'clear') f.controller.clearBodyReferenceOverlay();
@@ -259,11 +259,11 @@ test('unavailable body inspection on an unrelated source preserves original show
   await f.inspect(payload); assert.equal(f.state.bodyReferenceOverlay, shown); assert.equal(shown.source.evidenceId, TOKEN);
 });
 
-test('explicit replacement discards the old immutable overlay from extra-origin caches', async () => {
+test('adding another source preserves both immutable inspections and refreshes identity caches', async () => {
   const f = await displayed(), old = f.state.bodyReferenceOverlay;
-  f.controller.selectOrigin(TARGET); assert.equal(f.state.extraOriginOverlay, old);
+  f.controller.selectOrigin(TARGET); assert.equal(f.state.graphLayers, f.state.relationLayers);
   await f.verify(SECOND_TOKEN, OTHER, '9007199254740993'); await f.inspect(scan(SECOND_TOKEN, OTHER, '9007199254740993', [SOURCE]));
   assert.equal(f.controller.showBodyReferencesOnMap(), true);
-  assert.notEqual(f.state.bodyReferenceOverlay, old); assert.notEqual(f.state.neighborhoodOverlay, old); assert.notEqual(f.state.extraOriginOverlay, old);
+  assert.equal(f.state.relationLayers.length, 2); assert.equal(f.state.relationLayers[0], old); assert.notEqual(f.state.bodyReferenceOverlay, old);
   assert.equal(f.state.bodyReferenceOverlay.source.evidenceId, SECOND_TOKEN); assert.equal(f.state.selectedOrigin, OTHER);
 });

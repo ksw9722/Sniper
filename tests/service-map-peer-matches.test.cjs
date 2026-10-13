@@ -143,17 +143,17 @@ test('one explicit GET with redirect:error; default, polls, selection, search, F
   await f.load(snapshot({ id: ROW, captured_at: TIME })); assert.equal(f.state.bodyReferenceOverlay.kind, 'peer');
   assert.equal(f.requests.filter(item => item.url.includes('/socket-peer-matches?')).length, 1);
 });
-test('peer group renders one distinct endpoint, reserved source and undirected spokes inside inclusive caps', async () => {
+test('peer group renders a distinct endpoint and undirected spokes within shared graph caps', async () => {
   const f = fixture(); await f.show(matches(35)); const canvas = f.els.canvas.innerHTML;
   assert.equal((canvas.match(/class="service-map-card /g) || []).length, 24);
   assert.equal((canvas.match(/service-map-peer-address/g) || []).length, 1);
   assert.equal((canvas.match(/data-relationship="recorded_peer_observation"/g) || []).length, 23);
-  assert.doesNotMatch(canvas, /marker-end|<marker|redirect_instruction|header-declaration/);
-  assert.match(canvas, /source\.example\.com/); assert.match(canvas, /First:.*2026-10-12/); assert.match(canvas, /Last:.*2026-10-12/);
-  assert.match(f.els.graphBounds.textContent, /13 origins \/ 13 rows omitted by 24-node display cap/);
+  assert.doesNotMatch(canvas.match(/<path class="service-map-edge peer-observation[^]*?<\/path>/g).join(''), /marker-end/);
+  assert.match(canvas, /source\.example\.com/); assert.match(f.els.overlayStatus.innerHTML, /2026-10-12/);
+  assert.match(f.els.graphBounds.textContent, /14 nodes omitted by 24-card cap/);
   f.els.search.value = 'match-034'; f.els.search.dispatch('input');
-  assert.equal((f.els.canvas.innerHTML.match(/class="service-map-card /g) || []).length, 3);
-  assert.match(f.els.graphBounds.textContent, /34 origins \/ 34 rows hidden by query/); assert.match(f.els.graphBounds.textContent, /Pinned source remains visible/);
+  assert.equal((f.els.canvas.innerHTML.match(/class="service-map-card /g) || []).length, 2);
+  assert.match(f.els.graphBounds.textContent, /36 hidden by query/); assert.equal(f.state.relationLayers.length, 1);
 });
 test('outside-default-map origin is captured in this inspection, with only matched totals and separately allowlisted evidence', async () => {
   const f = fixture(); await f.show(); f.controller.selectOrigin(MATCH);
@@ -202,7 +202,7 @@ for (const action of ['origin ABA', 'seed reread', 'All origins', 'Clear', 'forc
   else await f.load(snapshot({ retained_rows: 4 }));
   old.resolve(response(matches())); assert.equal(await task, false); assert.equal(f.state.peerMatches, null); assert.equal(f.controller.showPeerMatchesOnMap(), false); assert.equal(old.options.signal.aborted, true);
 });
-for (const action of ['All origins', 'Clear', 'repin', 'force refresh', 'hidden', 'disconnect', 'history', 'scope invalidation', 'session ABA']) test(`shown peer allowlist and late sample cannot survive ${action}`, async () => {
+for (const action of ['Clear', 'force refresh', 'hidden', 'disconnect', 'history', 'scope invalidation', 'session ABA']) test(`shown peer allowlist and late sample cannot survive ${action}`, async () => {
   const f = fixture(); await f.show(); const task = f.controller.loadPeerEvidence(SAMPLE, MATCH), old = f.requests.at(-1);
   if (action === 'All origins') f.els.allOrigins.dispatch('click');
   else if (action === 'Clear') f.controller.clearBodyReferenceOverlay();
@@ -248,16 +248,16 @@ for (const ip of ['2001:0db8::1', '2001:DB8::1', '::ffff:c000:20a']) test(`nonca
   const value = matches(); value.peer.address_family = 'ipv6'; value.peer.address.ip = ip;
   assert.throws(() => normalize(value, evidence().row, map.normalizeSocketPeer(observation(ip))));
 });
-test('body and peer visualizations explicitly replace one another, without additional reads', async () => {
+test('body and peer visualizations coexist and repeat Show updates only its own entry', async () => {
   const f = fixture(); await f.show(); const priorPeer = f.state.bodyReferenceOverlay;
   const task = f.controller.loadBodyReferences();
   f.requests.at(-1).resolve(response({ schema_version: 1, session_id: SESSION, evidence_id: TOKEN, available: true, status: 'scanned', complete: true, reasons: [], source_origin: SOURCE, source_sequence: String(SEQUENCE), source_started_at: START,
     retained_preview_bytes: 200, scanned_bytes: 200, capture_preview_truncated: false, scan_prefix_truncated: false, candidates_scanned: 1, omitted_reference_occurrences: 0, references: [{ target_origin: OTHER, occurrences: 1, preview_byte_offsets: [20], omitted_offsets: 0 }], limits: { ...map.BODY_REFERENCE_LIMITS }, coverage: 'literal_absolute_http_urls', offset_basis: 'retained_utf8_preview' }));
   assert.equal(await task, true); assert.equal(f.state.bodyReferenceOverlay, priorPeer);
   let count = f.requests.length; assert.equal(f.controller.showBodyReferencesOnMap(), true); assert.equal(f.state.bodyReferenceOverlay.kind, 'body'); assert.equal(f.requests.length, count);
-  assert.doesNotMatch(f.els.canvas.innerHTML, /service-map-peer-address/); assert.equal(await f.controller.loadPeerEvidence(SAMPLE, MATCH), false);
-  await f.verify(); await f.inspect(); count = f.requests.length; assert.equal(f.controller.showPeerMatchesOnMap(), true); assert.equal(f.state.bodyReferenceOverlay.kind, 'peer'); assert.equal(f.requests.length, count);
-  assert.doesNotMatch(f.els.canvas.innerHTML, /marker-end|body_url_reference/);
+  assert.match(f.els.canvas.innerHTML, /service-map-peer-address/); assert.equal(f.state.relationLayers.length, 2); assert.equal(f.state.relationLayers[0], priorPeer);
+  await f.verify(); await f.inspect(); count = f.requests.length; assert.equal(f.controller.showPeerMatchesOnMap(), true); assert.equal(f.state.relationLayers[0].kind, 'peer'); assert.equal(f.requests.length, count);
+  assert.equal(f.state.relationLayers.length, 2); assert.match(f.els.canvas.innerHTML, /body_url_reference/); assert.match(f.els.canvas.innerHTML, /recorded_peer_observation/);
 });
 test('unrelated source inspection failure cannot clear the pinned peer group or reuse old matching results', async () => {
   const f = fixture(); await f.show(); const overlay = f.state.bodyReferenceOverlay; await f.verify(token(SEQUENCE + 2n), OTHER);

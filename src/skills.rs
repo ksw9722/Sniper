@@ -329,7 +329,10 @@ mod tests {
             "undirected observation links",
             "Socket addresses may reveal",
             "only response headers, never body files or linked resources",
-            "Show explicitly replaces the one",
+            "Show explicitly adds one exact inspection",
+            "eight-entry cap rejects additions without eviction",
+            "overlapping per-inspection totals are never\nsummed",
+            "Validated events for another record UUID preserve body/Link entries",
             "not original wire ordering",
             "same exact-row and active-session restrictions apply",
             "separate\nbounded retained-preview read",
@@ -347,15 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn service_map_readme_overlay_link_matches_integration_heading() {
+    fn service_map_readme_collection_link_matches_integration_heading() {
         let readme = include_str!("../README.md");
         let contract = include_str!("../docs/integrations/service-map.md");
         assert!(readme.contains(
-            "](docs/integrations/service-map.md#temporary-retained-relationship-overlay-gui-only)"
+            "](docs/integrations/service-map.md#session-local-retained-relationship-collection-gui-only)"
         ));
         assert!(contract
             .lines()
-            .any(|line| line == "## Temporary retained-relationship overlay (GUI only)"));
+            .any(|line| line == "## Session-local retained relationship collection (GUI only)"));
         assert!(!readme.contains("#temporary-body-reference-overlay-gui-only"));
     }
 

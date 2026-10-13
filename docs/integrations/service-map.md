@@ -19,7 +19,7 @@ normal size. Fit is a one-shot action for the displayed cards, bounded by those
 scale limits. Polling and resizing never refit or change the chosen zoom. Plus
 and minus preserve the viewport center where scroll bounds allow. With the map
 viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. Zooming is
-local and preserves selection, exact-source reads, and temporary relationship overlays.
+local and preserves selection, exact-source reads, and session-local shown inspections.
 There is no force layout or drag editing in this version. The renderer is separate from metadata normalization and
 layout calculation so it can be replaced without changing the read contract.
 The navigation strip follows the existing compact Capture-tab sizing. Long
@@ -142,7 +142,7 @@ aggregate and label that metadata unavailable when there is no such aggregate;
 peer inspection counts remain separate from default-map counts.
 
 Product filters issue no reads and cancel no pending exact-source, body, Link,
-HTML-generator or peer inspection. They preserve selection, temporary overlays,
+HTML-generator or peer inspection. They preserve selection, shown inspections,
 graph mode, zoom and exact endpoint page anchors. Clearing a filter can return
 the catalog to its still-loaded anchor. Same-session refresh, invalidation and
 scope changes retain filters; changing the session clears them. Existing source
@@ -172,14 +172,15 @@ clear these local filters and page anchors.
 ## Direct relations view
 
 All origins remains the default graph view. Direct relations is an optional,
-local view of the origins directly connected to a chosen anchor by loaded
-Origin/Referer declarations or redirect instructions. It does not traverse
+local view of origins and recorded-address nodes directly connected to a chosen
+anchor by loaded declarations or explicitly shown inspections. It does not traverse
 multiple hops or infer service calls. Selecting a different card changes the
 inspector; an explicit Focus selection action changes the pinned anchor.
-An explicit temporary body-or-Link overlay can add literal relationships from
-one already-inspected response, as described below. Returning to All origins clears
-that overlay and keeps the inspector selection only if it still belongs to the
-metadata inventory.
+Explicitly shown body, Link and recorded-peer inspections can coexist with
+metadata relations, as described below. All origins, Direct relations and Focus
+selection preserve the collection and inspector. An address neighbor incident
+to a pinned origin remains visible even when that context origin is outside
+search/product filters; the anchor is not counted as a filter match.
 
 The anchor is included before the 24-card display cap. Local origin search
 filters its neighbors while keeping the anchor visible; the view labels an
@@ -882,88 +883,112 @@ source/session or retained history is invalidated and is never saved in workspac
 state. An unchanged valid metadata poll may preserve it; delayed responses cannot
 restore stale evidence. No larger inspection runs automatically after a limit.
 
-## Temporary retained-relationship overlay (GUI only)
+## Session-local retained relationship collection (GUI only)
 
-After **View source** has verified one exact retained row, the **Retained
-relationships** section offers **Body URL references** or **Response Link
-headers**. Use its source-specific **Inspect** action, then separately choose
-**Show references on map** (or **Replace shown references**) for a supported
-result containing another origin. Body eligibility and scan behavior are
-unchanged; Link inspection requires a fresh visible verified GET/HEAD 200 source.
-A zero-reference or self-only result remains inspectable but cannot create an
-overlay. Unsupported, unavailable, or unverified results cannot be mapped.
+After **View source** verifies an exact retained row, explicitly inspect **Body
+URL references**, **Response Link headers**, or **Matching recorded socket
+peers**. Then choose **Show references on map** or **Show recorded address
+group**. Inspection and visualization remain separate: Show uses only the
+already-returned bounded response and never performs another read. There is no
+automatic scanning, crawling, URL fetching, DNS/TLS lookup, capture, or replay.
+Unsupported/unavailable results cannot be shown. Body and Link results with no
+non-self target stay inspectable but do not add an entry.
 
-There is one pending relationship inspection and one selected-kind result.
-Changing the source selector makes no request, cancels the pending inspection,
-and discards that result. A valid already-shown overlay remains until an explicit
-Show/Replace or ordinary lifetime invalidation. A Link 404 or unrelated inspection
-failure does not discard a still-valid body overlay. The separate HTML generator
-inspector is unchanged.
+Up to **eight immutable inspected entries** coexist in memory for the current
+session, including different kinds from the same source and the same kind from
+different exact sources. Entry identity is kind plus the complete opaque evidence
+token (session, store generation, exact decimal sequence, revision and record ID).
+Showing that identity again updates only that entry, in place. A ninth distinct
+entry is rejected with an explicit notice; existing entries are never silently
+evicted. No inspection is written to workspace, session storage or browser storage.
 
-**Show references on map** opens Direct relations, pins the inspected response's
-source origin, and adds its references to the loaded metadata neighbors. It uses
-only the already-returned, bounded result: showing, selecting, searching, and
-clearing the overlay perform no further inspection or target request. Nothing is
-scanned automatically. Only one body-or-Link overlay exists at a time, from one exact source and in
-memory for the current session; it is not written to saved workspace or session data.
+The first body/Link entry opens its source's Direct relations neighborhood. A
+second distinct entry, or a peer entry, opens **All origins** so the collected
+observations can be seen together with loaded metadata. Search, product/version
+filters, zoom, selecting another source, All origins, and Focus selection preserve
+the collection. A collapsed **Shown inspections** disclosure holds per-entry
+provenance, complete/partial coverage, **View inspected source**, **Remove
+inspection**, and **Clear all inspections**. Expanding it uses a bounded scrolling
+area; the compact map controls and inspector remain independent.
 
-The source method and query-free path, exact retained-row provenance, and
-complete or partial source-specific coverage remain visible. A partial scan
-stays labeled partial even when the metadata inventory is complete. Dotted
-**body URL reference** arrows point from that response's origin to referenced
-origins. Repeated literal occurrences are reference counts, never request counts.
-Link arrows likewise point from the retained response origin to the declared
-target, using `link_service_doc`, `link_service_desc`, `link_describedby`, or
-`link_preconnect`. The legend distinguishes metadata declarations, redirect
-instructions, body URL references, Link declarations, and preconnect hints.
-Graph arrows deduplicate by source/target/type while evidence retains every
-declaration and span. Self declarations remain inspectable without an arrow.
-These arrows do not prove a request, runtime call, followed link, service
-ownership, or dependency. Target origins remain text and are never fetched.
+The collection retains only validated, bounded metadata. Body entries retain
+canonical target origins, occurrence counts and preview byte offsets; Link entries
+retain typed declarations and retained-header byte spans. Source method,
+query-free path, capture time and exact sequence remain attached to each entry.
+Repeated graph edges deduplicate by source, target and relationship type, while
+all contributing inspection entries and their evidence remain separate. Removing
+one entry removes only its contributions; a shared edge survives if another entry
+still supports it. Occurrences are not request counts. Body/Link references and
+redirect/header declarations do not establish calls, followed links, ownership,
+service dependencies or runtime topology. Referenced origins are text only.
 
-A target already present as a captured origin keeps its actual metadata and
-sampled traffic count. A target present only in the inspected preview or Link declaration is
-reference-only: no captured traffic, endpoint, or scope membership is invented.
-That label does not establish that the origin has never been captured. The
-overlay does not enrich All origins, the API catalog, header-derived links, or
-the metadata/CLI result. The existing body-reference CLI output is unchanged;
-there is no additional command or API endpoint for this GUI action.
+Peer entries add **undirected recorded observation spokes** through distinct
+recorded-address nodes. Equality uses observation source, direct route, address
+family, canonical IP and port. Different ports or IPv4 versus IPv4-mapped IPv6
+remain different nodes. Equal addresses across inspections share one visual node
+and deduplicated spokes; overlapping per-inspection matching-row totals are never
+summed. Each entry retains its own considered window, source observation time,
+inspection time, coverage, omission counts and exact samples. Shared addresses do
+not establish common ownership, a common backend, continuous occupancy or a
+current infrastructure inventory. Products remain attached only to the exact
+origin's loaded header aggregate, never inherited through address equality.
 
-The body overlay keeps at most 100 referenced origins from its bounded scan;
-Link results contain at most 32 declarations. Self references are excluded from
-the graph. The pinned source counts toward the existing 24-card limit, and all
-relationship arrows share the 40-arrow limit with metadata arrows. Deterministic
-pair lanes separate up to ten distinct metadata and Link arrow types. Search can hide neighbors while retaining the source. Read the reported
-query-hidden, card-cap, and arrow omissions; graph omissions are separate from
-the scanner's omitted reference occurrences and unknown coverage beyond its
-limits. Selecting a referenced target changes the inspector without moving or
-reassigning the pinned source.
+A collected target already present in the default projection keeps its actual
+captured counts and API paths. Body/Link-only targets stay reference-only without
+invented traffic, endpoints or scope membership. Peer-only origins are labeled
+captured in that inspection, with per-inspection matching counts and independently
+verified exact samples, not default-map traffic totals. The API catalog still
+contains only loaded captured endpoints; no body URL path or inferred endpoint is
+added. Default metadata/CLI responses and all inspection APIs are unchanged.
 
-Use **Clear body references** or **Clear Link references** to return to metadata-only Direct relations. The
-overlay also clears on returning to All origins, focusing a different anchor,
-hiding/leaving Service Map, a forced refresh, scope or session changes, source
-loss or revision, snapshot generation changes, refresh failure, or disconnect.
-Every transaction event clears it: insert and update events are not
-distinguishable here, so even newly appended traffic invalidates the overlay.
-Retention, removals, and event gaps likewise invalidate it. An ordinary unchanged
-metadata poll preserves it only while the original session, store generation,
-source origin, and exact evidence token remain present. Another token with the
-same transaction UUID or method/path is not a substitute; a token falling out of
-the bounded evidence sample also clears the overlay. Later polls, delayed scan
-responses, and reopening the map never restore it automatically.
-Showing a new overlay is disabled while the session's event stream is connecting
-or disconnected, or the current metadata snapshot is stale or failed to refresh.
-Metadata polling alone does not restore event readiness; the owned event stream
-must reconnect and the source must be verified again.
+Collection limits compose with each inspection's existing bounds: at most eight
+entries, each with up to 100 body origins, 32 Link declarations, or 100 peer groups
+and three exact samples per group. Peer results remain capped at 256 KiB each.
+A shared controller identity checks the unchanged metadata projection for peer
+entries; no whole-map serialization is copied into each entry. The graph retains
+its shared **24-card / 40-edge** limits, including recorded-address nodes. Source
+and address cards receive deterministic priority before inspected neighbors and
+ordinary metadata cards. Details report query/product-hidden origins, graph-node
+and edge-cap omissions, and inspected links outside displayed cards. These are
+separate from inspection omissions and do not count unknown origins or unseen
+relationships. Per-origin relationship details remain bounded to 30 declarations;
+additional declarations are explicitly reported as omitted.
 
-For steadier inspection during live traffic, manually pause HTTP recording with
-the **Capturing** control in Capture before verifying and inspecting the source.
-Traffic still passes through the proxy. Pausing is not a snapshot freeze:
-already-started recorded streams may finish updating, and explicit replay sends
-and WebSocket upgrades can still add HTTP history rows. Let in-flight operations
-finish before showing the overlay; other history changes can still clear it.
-Resume recording when ready. Showing an overlay never pauses or resumes recording
-for you.
+**Remove inspection** and **Clear all inspections** are local and send no requests.
+They retire removed peer sample allowlists, cached provenance and unavailable
+sample markers. A row may be a sample in one peer entry and the source of another
+entry: failure to verify it removes every entry seeded by that exact token.
+Sample-only verification failure marks that sample unavailable in surviving
+point-in-time peer results; no substitute UUID lookup occurs.
+
+### Source lifetime and live capture
+
+- A validated transaction event for another record UUID preserves body/Link
+  entries. An event for the same UUID removes their entries conservatively,
+  including distinct exact tokens sharing that UUID. No event header/body fields
+  are stored in the collection.
+- The next ordinary metadata poll must still contain each body/Link source's
+  exact token under its original origin and generation. Another revision, sequence
+  or record with the same path is not a substitute. A token omitted by the bounded
+  evidence sample is described as no longer verified in the loaded projection;
+  this does not prove that the record was deleted. Polls never recreate entries.
+- **Peer entries remain conservative during live traffic:** every transaction
+  event and any retained metadata-projection change removes them. Events do not
+  distinguish insert from update or carry the revisions of unsampled group rows,
+  so their aggregate membership cannot safely be proved unchanged. Accumulating
+  stable peer groups during continuously changing capture remains outside this
+  milestone. Manually pausing HTTP recording can make inspection steadier, but
+  in-flight operations and explicit replay or other history changes may still
+  invalidate the result. Show never changes recording settings.
+- Unknown/malformed events, event gaps, retention/deletion, history invalidation,
+  generation/session/scope changes, disconnect, a failed map refresh, manual
+  **Reload**, and leaving/hiding Service Map clear the collection. Refresh failure
+  keeps the existing explicit-retry pause; it never starts automatic source reads.
+  An unchanged successful metadata poll preserves verified entries.
+- Show is disabled while event readiness is lost, the session is inactive, or the
+  metadata snapshot is stale/failed. An owned stream reconnection invalidates old
+  evidence; metadata polling alone does not restore readiness. Delayed responses,
+  reopened views and later polls cannot restore removed entries automatically.
 
 ## Local API
 

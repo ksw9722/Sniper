@@ -1400,7 +1400,7 @@
             <div class="service-map-toolbar">
               <div class="service-map-view-controls" id="serviceMapViewControls" role="group" aria-label="Service map view">
                 <button class="service-map-mode" id="serviceMapAllOrigins" type="button" aria-pressed="true">All origins</button>
-                <button class="service-map-mode" id="serviceMapDirectRelations" type="button" aria-pressed="false" title="Pin the selected origin and show only its direct metadata neighbors">Direct relations</button>
+                <button class="service-map-mode" id="serviceMapDirectRelations" type="button" aria-pressed="false" title="Pin the selected origin and show its direct retained relations">Direct relations</button>
                 <button class="secondary-action hidden" id="serviceMapFocusSelection" type="button">Focus selection</button>
               </div>
               <div class="service-map-zoom-controls" id="serviceMapZoomControls" role="group" aria-label="Map zoom">
@@ -1417,14 +1417,14 @@
             <div class="service-map-status" id="serviceMapStatus" role="status" aria-live="polite"></div>
             <div class="service-map-content" id="serviceMapContent">
               <section class="service-map-graph" aria-label="Captured service origins">
-                <div class="service-map-body-overlay hidden" id="serviceMapBodyOverlay" aria-label="Temporary retained observation or reference" aria-live="polite"></div>
+                <div class="service-map-body-overlay hidden" id="serviceMapBodyOverlay" aria-label="Shown retained inspections" aria-live="polite"></div>
                 <div class="service-map-viewport" id="serviceMapViewport" tabindex="0" aria-label="Service map. Plus or minus to zoom, zero to reset, F to fit."><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
                 <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect instruction <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer header declaration <span class="service-map-line dotted" aria-hidden="true"></span>Body URL reference <span class="service-map-line link-declaration" aria-hidden="true"></span>Link declaration <span class="service-map-line preconnect-hint" aria-hidden="true"></span>Preconnect hint <span class="service-map-line peer-observation" aria-hidden="true"></span>Recorded address observation · no confirmed calls<span id="serviceMapGraphBounds"></span><details class="service-map-bounds-details hidden" id="serviceMapBoundsDetails"><summary>Relation details</summary><p id="serviceMapGraphDiagnostics"></p></details></div>
               </section>
               <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
             </div>
             <section class="service-map-api-catalog hidden" id="serviceMapApiCatalog" aria-label="Observed API paths"></section>
-            <footer class="service-map-notice">Passive retained evidence only. Browser initiators, origin-IP associations and TLS certificate identities are unavailable. Inspect one retained response, then choose Show references on map for a temporary Direct relations overlay. Observed socket peers start in exact source evidence. Find matching recorded peer explicitly, then Show recorded address group for temporary undirected observations. A body, Link or recorded-address view replaces the previous temporary visualization. References and header clues do not establish calls or ownership. Pause HTTP recording manually for steadier inspection; traffic still passes through and other history changes can still clear this view.</footer>
+            <footer class="service-map-notice">Passive retained observations only. Explicitly inspect a source, then Show to add its body, Link or recorded-address relationships alongside other inspections. Shown inspections holds exact provenance and removal controls; up to 8 entries, never saved. References do not prove calls; equal recorded addresses do not prove shared ownership or backend. Unrelated traffic preserves verified body/Link entries, but peer groups clear on history changes. Pause HTTP recording manually for steadier peer inspection; in-flight or other history changes may still clear it.</footer>
           </section>
           <section class="panel-card hidden" id="targetPathsPanel" role="tabpanel" aria-labelledby="targetPathsTab">
             <header class="panel-toolbar"><div><p class="placeholder-kicker">Site map</p><h2>Captured hosts and paths</h2></div></header>

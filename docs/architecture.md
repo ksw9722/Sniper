@@ -92,9 +92,10 @@ flowchart LR
 - `web/service-map.js`
   - renders the metadata inventory and exact-source inspector without loading
     whole-history bodies
-  - can explicitly project one already-inspected response's literal origins into
-    a temporary Direct relations overlay; this GUI-only, session-local state
-    changes no captured counts or API catalog and is never persisted
+  - can collect up to eight explicitly shown body, Link and recorded-peer
+    inspections in one session-local graph with exact provenance and removal
+  - typed references and undirected address observations share display caps;
+    the collection changes no captured counts or API catalog and is never persisted
 - `src/api.rs`
   - exposes record/detail APIs
   - serves the lightweight desktop UI

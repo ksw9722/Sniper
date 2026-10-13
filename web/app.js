@@ -7863,7 +7863,7 @@ function connectEvents() {
     if (!ownsHistoryEvents()) {
       return;
     }
-    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.markDirty();
+    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.markDirty(event);
     _lastHttpHistoryFallbackPoll = Date.now();
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");

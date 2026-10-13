@@ -7555,7 +7555,7 @@ button.utility-button.replay-tab-add {
 .service-map-body-overlay { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--point-soft); font-size: var(--font-xs); line-height: 1.5; min-width: 0; }
 .service-map-body-overlay > div { flex: 1; min-width: 180px; }
 .service-map-body-overlay p { margin: 3px 0 0; overflow-wrap: anywhere; }
-.service-map-body-overlay > .service-map-overlay-actions { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 1 auto; min-width: 0; }
+.service-map-body-overlay .service-map-overlay-actions { display: flex; flex-wrap: wrap; gap: 6px; flex: 0 1 auto; min-width: 0; }
 .service-map-overlay-source { font-family: var(--mono); overflow-wrap: anywhere; }
 .service-map-body-overlay .service-map-overlay-source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -7588,3 +7588,10 @@ button.utility-button.replay-tab-add {
 .service-map-peer-coverage { margin-top: 3px; }
 .service-map-peer-coverage summary { cursor: pointer; color: var(--text-soft); }
 .service-map-peer-coverage[open] { max-height: 160px; overflow: auto; }
+
+/* Retained inspection provenance stays collapsed above the map by default. */
+.service-map-collection { flex: 1 1 100%; min-width: 0; max-height: 220px; overflow: auto; }
+.service-map-collection > summary { cursor: pointer; font-weight: 600; }
+.service-map-collection-entry { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.service-map-collection-entry .service-map-overlay-actions { margin-top: 6px; }
+.service-map-collection > button { margin-top: 8px; }
