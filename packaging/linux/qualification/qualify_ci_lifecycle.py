@@ -72,6 +72,22 @@ def lifecycle_sequence(deb, pinned_hash, current_hash, command, installed, absen
 
 
 
+
+def check_candidate_overrides(command):
+    for tool in ("dpkg-divert", "dpkg-statoverride"):
+        if tool == "dpkg-statoverride":
+            result = command(tool, "--list", allowed=(0, 1))
+            # dpkg-statoverride documents 1 for an empty --list result only.
+            require(result.stderr == "" and (result.returncode == 0 or
+                    (result.returncode == 1 and result.stdout == "")),
+                    "unexpected statoverride listing result")
+        else:
+            result = command(tool, "--list")
+        rows = result.stdout.splitlines()
+        require(not any(any("/" + path in row for path in EXPECTED) for row in rows),
+                "candidate path diversion/override requires review")
+
+
 def verify_loader_closures(inventory, command, home, custom_data):
     """Inspect linked-library resolution with glibc --verify/--list; no app entry."""
     loader = Path("/lib64/ld-linux-x86-64.so.2")
@@ -213,9 +229,7 @@ def main():
     clean_audit()
     tool_baseline = packages_except_sniper()
     (results / "tool-baseline.json").write_text(json.dumps(tool_baseline, indent=2) + "\n")
-    for tool in ("dpkg-divert", "dpkg-statoverride"):
-        rows = command(tool, "--list").stdout.splitlines()
-        require(not any(any("/" + path in row for path in EXPECTED) for row in rows), "candidate path diversion/override requires review")
+    check_candidate_overrides(command)
     deb = Path(inventory["deb"])
     plan = command("apt-get", "--simulate", "install", "--no-install-recommends", "--no-remove", str(deb))
     require(not any(row.startswith("Remv ") for row in plan.stdout.splitlines()), "APT would remove an unrelated package")

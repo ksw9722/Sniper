@@ -1,6 +1,7 @@
 """Pure boundary/sequence/loader mocks. No APT, dpkg lifecycle or app execution."""
 from pathlib import Path
 import subprocess
+import tempfile
 import sys
 import unittest
 from unittest.mock import Mock, patch
@@ -118,6 +119,57 @@ class LifecycleSequenceTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 qa.lifecycle_sequence(**cb)
             self.assertEqual(cb["command"].call_count, count)
+
+
+
+class OverrideListingTests(unittest.TestCase):
+    def exercise(self, stat_result=(1, "", ""), divert_result=(0, "", "")):
+        calls = []
+        def command(*argv, allowed=(0,)):
+            calls.append((argv, allowed))
+            code, output, error = stat_result if argv[0] == "dpkg-statoverride" else divert_result
+            qa.require(code in allowed, "command failed")
+            return subprocess.CompletedProcess(argv, code, output, error)
+        qa.check_candidate_overrides(command)
+        return calls
+
+    def test_exact_ci_empty_result_is_accepted_only_for_statoverride(self):
+        # CI run 38347689220, evidence/006-command.json: 1, "", "".
+        self.assertEqual(self.exercise(), [(("dpkg-divert", "--list"), (0,)),
+                                          (("dpkg-statoverride", "--list"), (0, 1))])
+        with self.assertRaisesRegex(ValueError, "command failed"):
+            self.exercise(divert_result=(1, "", ""))
+
+    def test_nonempty_successful_lists_keep_candidate_path_checks(self):
+        self.exercise(stat_result=(0, "root root 755 /usr/bin/unrelated\n", ""),
+                      divert_result=(0, "diversion of /usr/bin/unrelated to /usr/bin/unrelated.old by example\n", ""))
+        for path in qa.EXPECTED:
+            with self.subTest(path=path, tool="statoverride"), self.assertRaisesRegex(ValueError, "candidate path"):
+                self.exercise(stat_result=(0, "root root 755 /" + path + "\n", ""))
+            with self.subTest(path=path, tool="divert"), self.assertRaisesRegex(ValueError, "candidate path"):
+                self.exercise(divert_result=(0, "diversion of /" + path + " to /old by example\n", ""))
+
+    def test_error_diagnostic_and_contradictory_empty_status_are_rejected(self):
+        for result in ((2, "", ""), (2, "", "fatal\n"), (1, "unexpected\n", ""),
+                       (1, "\n", ""), (1, "", "diagnostic\n"), (1, "", " "),
+                       (0, "root root 755 /usr/bin/unrelated\n", "diagnostic\n")):
+            with self.subTest(result=result), self.assertRaises(ValueError):
+                self.exercise(stat_result=result)
+
+    def test_empty_private_database_real_readonly_contract(self):
+        with tempfile.TemporaryDirectory(prefix="sniper-statoverride-readonly-", dir="/tmp") as directory:
+            database = Path(directory)
+            before = database.stat()
+            env = {key: value for key, value in qa.ENV.items() if not key.startswith("DPKG_")}
+            env.update(LC_ALL="C", DPKG_COLORS="never", DPKG_NLS="0")
+            result = subprocess.run(("dpkg-statoverride", "--admindir", str(database), "--list"),
+                                    text=True, capture_output=True, env=env, check=False)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (1, "", ""))
+            after = database.stat()
+            self.assertEqual(list(database.iterdir()), [])
+            self.assertEqual((before.st_mode, before.st_uid, before.st_gid, before.st_mtime_ns),
+                             (after.st_mode, after.st_uid, after.st_gid, after.st_mtime_ns))
+            self.exercise(stat_result=(result.returncode, result.stdout, result.stderr))
 
 
 class LoaderDiagnosticTests(unittest.TestCase):
