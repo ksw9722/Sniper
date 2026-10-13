@@ -2244,6 +2244,142 @@ mod tests {
                 .unwrap()
         }
 
+        // Identity assertions need a live fixture, not an eight-second lease
+        // that can expire while parallel tests keep the parent off the CPU.
+        struct HeldBrowser {
+            child: Child,
+        }
+
+        impl HeldBrowser {
+            fn id(&self) -> u32 {
+                self.child.id()
+            }
+        }
+
+        impl Drop for HeldBrowser {
+            fn drop(&mut self) {
+                self.child.stdin.take();
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        fn held_browser(flags: &[String]) -> HeldBrowser {
+            let child = Command::new(SHELL)
+                .args([
+                    "-c",
+                    "printf 'ready\\n'; IFS= read -r keep_open; true",
+                    "browser",
+                ])
+                .args(flags)
+                .env_remove("BASH_ENV")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            // Allow a busy CI worker to schedule the handshake; once ready,
+            // fixture lifetime is controlled by this parent rather than time.
+            await_fixture_ready(child, Duration::from_secs(10)).expect("ready browser fixture")
+        }
+
+        fn await_fixture_ready(child: Child, timeout: Duration) -> io::Result<HeldBrowser> {
+            let mut holder = HeldBrowser { child };
+            let mut stdout = holder
+                .child
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("fixture readiness pipe missing"))?;
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let reader = std::thread::Builder::new()
+                .name("browser-fixture-ready".into())
+                .spawn(move || {
+                    let mut marker = [0; 6];
+                    let ready = stdout.read_exact(&mut marker).and_then(|()| {
+                        if marker == *b"ready\n" {
+                            Ok(())
+                        } else {
+                            Err(io::Error::other("unexpected fixture readiness marker"))
+                        }
+                    });
+                    let _ = ready_tx.send(ready);
+                })?;
+            let ready = ready_rx
+                .recv_timeout(timeout)
+                .map_err(|error| {
+                    io::Error::new(
+                        match error {
+                            mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
+                            mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
+                        },
+                        "browser fixture did not signal readiness",
+                    )
+                })
+                .and_then(|ready| ready);
+            if let Err(error) = ready {
+                // Killing/reaping the writer closes stdout before joining a
+                // reader that may still be blocked on the missing marker.
+                drop(holder);
+                let _ = reader.join();
+                return Err(error);
+            }
+            reader
+                .join()
+                .map_err(|_| io::Error::other("fixture readiness reader panicked"))?;
+            if holder.child.try_wait()?.is_some() {
+                return Err(io::Error::other("browser fixture exited after readiness"));
+            }
+            Ok(holder)
+        }
+
+        #[test]
+        fn held_browser_fixtures_are_ready_and_parent_owned_in_parallel() {
+            let workers: Vec<_> = (0..4)
+                .map(|worker| {
+                    std::thread::spawn(move || {
+                        for round in 0..4 {
+                            let flag = format!("--fixture-identity={worker}-{round}");
+                            let holder = held_browser(std::slice::from_ref(&flag));
+                            assert!(process_runs_as(holder.id(), Path::new(SHELL)));
+                            assert!(process_args(holder.id()).unwrap().contains(&flag));
+                            drop(holder);
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn held_browser_readiness_timeout_reaps_the_unready_fixture() {
+            let child = Command::new(SHELL)
+                .args(["-c", "IFS= read -r keep_open; true"])
+                .env_remove("BASH_ENV")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let result = await_fixture_ready(child, Duration::from_millis(20));
+            assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::TimedOut));
+            assert!(!process_runs_as(pid, Path::new(SHELL)));
+        }
+
+        #[test]
+        fn held_browser_guard_reaps_during_unwinding() {
+            let mut pid = 0;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let holder = held_browser(&[]);
+                pid = holder.id();
+                panic!("synthetic assertion failure");
+            }));
+            assert!(result.is_err());
+            assert!(!process_runs_as(pid, Path::new(SHELL)));
+        }
+
         fn flags(profile: &Path, rest: &[&str]) -> Vec<String> {
             std::iter::once(format!("--user-data-dir={}", profile.display()))
                 .chain(rest.iter().map(|flag| flag.to_string()))
@@ -2271,16 +2407,13 @@ mod tests {
         fn a_holder_no_record_names_is_adopted_with_the_wiring_it_was_started_with() {
             let shell = Path::new(SHELL);
             let profile = scratch("adopt");
-            let holder = browser_process(
-                "8",
-                &flags(
-                    &profile,
-                    &[
-                        "--proxy-server=127.0.0.1:18890",
-                        "--remote-debugging-port=0",
-                    ],
-                ),
-            );
+            let holder = held_browser(&flags(
+                &profile,
+                &[
+                    "--proxy-server=127.0.0.1:18890",
+                    "--remote-debugging-port=0",
+                ],
+            ));
             lock(&profile, &format!("some-host-{}", holder.id()));
 
             let owner =
@@ -2309,7 +2442,7 @@ mod tests {
             let unlocked = scratch("adopt-unlocked");
             assert!(current_owner(&unlocked, &HashMap::new(), shell, Driver::Cdp).is_none());
 
-            stop(holder);
+            drop(holder);
             for dir in [profile, other, stale, unlocked] {
                 let _ = fs::remove_dir_all(dir);
             }
@@ -2319,20 +2452,17 @@ mod tests {
         fn a_stale_lock_whose_pid_is_now_the_same_browser_on_another_profile_is_not_adopted() {
             let shell = Path::new(SHELL);
             let ours = scratch("ours");
-            let everyday = browser_process(
-                "8",
-                &flags(
-                    Path::new("/somewhere/else"),
-                    &["--proxy-server=127.0.0.1:18890"],
-                ),
-            );
+            let everyday = held_browser(&flags(
+                Path::new("/somewhere/else"),
+                &["--proxy-server=127.0.0.1:18890"],
+            ));
             lock(&ours, &format!("some-host-{}", everyday.id()));
             assert!(
                 current_owner(&ours, &HashMap::new(), shell, Driver::Cdp).is_none(),
                 "the executable matches but the command line names another profile"
             );
             assert!(read_owner(&ours).is_none(), "nothing recorded for it");
-            stop(everyday);
+            drop(everyday);
             let _ = fs::remove_dir_all(&ours);
         }
 
@@ -2341,8 +2471,8 @@ mod tests {
             let shell = Path::new(SHELL);
             let one = scratch("proxy-one");
             let two = scratch("proxy-two");
-            let elsewhere = browser_process("8", &flags(&one, &["--proxy-server=127.0.0.1:1"]));
-            let unwired = browser_process("8", &flags(&two, &[]));
+            let elsewhere = held_browser(&flags(&one, &["--proxy-server=127.0.0.1:1"]));
+            let unwired = held_browser(&flags(&two, &[]));
             lock(&one, &format!("host-{}", elsewhere.id()));
             lock(&two, &format!("host-{}", unwired.id()));
 
@@ -2358,8 +2488,8 @@ mod tests {
                 "empty, so the refusal says it had no proxy rather than naming one"
             );
 
-            stop(elsewhere);
-            stop(unwired);
+            drop(elsewhere);
+            drop(unwired);
             let _ = fs::remove_dir_all(&one);
             let _ = fs::remove_dir_all(&two);
         }
@@ -2368,7 +2498,7 @@ mod tests {
         fn a_launch_that_ends_at_once_is_a_handoff_only_when_a_browser_holds_the_profile() {
             let shell = Path::new(SHELL);
             let profile = scratch("handoff");
-            let holder = browser_process("8", &flags(&profile, &[]));
+            let holder = held_browser(&flags(&profile, &[]));
             let exit = |success| Exit {
                 status: "exit status".into(),
                 success,
@@ -2386,7 +2516,7 @@ mod tests {
                 None,
                 "a failure is a failure even with a browser running"
             );
-            stop(holder);
+            drop(holder);
             let _ = fs::remove_dir_all(&profile);
         }
 
