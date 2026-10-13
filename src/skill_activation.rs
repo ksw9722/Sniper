@@ -283,7 +283,7 @@ mod supported {
             let mut file = unsafe { File::from_raw_fd(fd) };
             write_bytes(&mut file, bytes)?;
             // Preserve supported access bits; unexpected ACLs/xattrs are refused below.
-            if unsafe { libc::fchmod(file.as_raw_fd(), mode & 0o777) } != 0 {
+            if unsafe { libc::fchmod(file.as_raw_fd(), (mode & 0o777) as libc::mode_t) } != 0 {
                 return Err(io_error(std::io::Error::last_os_error()));
             }
             sync_file(&file, "file_sync")?;
