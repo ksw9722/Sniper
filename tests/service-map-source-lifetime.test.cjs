@@ -201,6 +201,60 @@ const NONIDENTITY = {
   html: ['response_unavailable', 'body_identity_unverifiable', 'body_storage_unavailable', 'body_read_failed', 'serialized_row_limit', 'malformed_retained_row', 'retained_preview_unavailable', 'metadata_unavailable', 'body_scan_failed', 'unsupported_metadata', 'metadata_limit', 'unsupported_content_type', 'unsupported_body_encoding', 'unsupported_content_encoding'],
   peer: ['unsupported_source_context', 'observation_not_recorded', 'observation_unavailable', 'non_direct_observation', 'invalid_observation', 'metadata_unavailable', 'scope_work_limit', 'peer_inspection_failed'],
 };
+const SUPPLEMENT_UNSUPPORTED = {
+  html: ['metadata_limit', 'unsupported_content_type', 'unsupported_body_encoding', 'unsupported_content_encoding', 'unsupported_metadata'],
+  link: ['unsupported_source_context'],
+};
+const SUPPLEMENT_ERRORS = {
+  html: 'Could not verify retained HTML generators. Retry explicitly, or refresh the map and select the source again.',
+  link: 'Could not verify retained Link headers. Retry explicitly, or refresh the map and select the source again.',
+};
+for (const kind of ['html', 'link']) {
+  const normalize = value => map[kind === 'html' ? 'normalizeHtmlGenerators' : 'normalizeLinkDeclarations'](value, SESSION, TOKEN, evidence().row);
+  const invalid = kind === 'html' ? /^Invalid retained HTML-generator response$/ : /^Invalid retained Link-declaration response$/;
+  const acquisition = [...AUTHORITATIVE, 'inactive_session', ...NONIDENTITY[kind]];
+  for (const reason of acquisition) test(`${kind} acquisition reason ${reason} is status-bound while legacy unavailable remains valid`, () => {
+    const value = missing(kind, reason); value.status = 'unavailable';
+    assert.equal(normalize(value).status, 'unavailable');
+    value.status = 'unsupported';
+    if (SUPPLEMENT_UNSUPPORTED[kind].includes(reason)) assert.equal(normalize(value).status, 'unsupported');
+    else assert.throws(() => normalize(value), { message: invalid });
+    const scanned = successful(kind); scanned.complete = false; scanned.reasons = [reason];
+    assert.throws(() => normalize(scanned), { message: invalid });
+  });
+  for (const reason of ['PRIVATE_CONTENT_SENTINEL', ...(kind === 'html' ? SUPPLEMENT_UNSUPPORTED.link : SUPPLEMENT_UNSUPPORTED.html)]) {
+    for (const status of ['unavailable', 'unsupported', 'scanned']) test(`${kind} rejects ${status} with an unknown or cross-family reason ${reason}`, () => {
+      const value = missing(kind, reason); value.status = status;
+      assert.throws(() => normalize(value), { message: invalid });
+    });
+  }
+  for (const status of ['partial', 'UNSUPPORTED', 'unknown']) test(`${kind} rejects an unknown non-scanned status ${status}`, () => {
+    const value = missing(kind, SUPPLEMENT_UNSUPPORTED[kind][0]); value.status = status;
+    assert.throws(() => normalize(value), { message: invalid });
+  });
+  for (const reason of [...AUTHORITATIVE, 'inactive_session', 'PRIVATE_CONTENT_SENTINEL']) for (const overlayKind of ['body', 'link', 'peer']) {
+    test(`${kind} malformed unsupported ${reason} preserves verified source and ${overlayKind} overlay without echo or extra reads`, async () => {
+      const f = await verified(); await show(f, overlayKind);
+      const row = f.state.evidence, peer = f.state.socketPeer, snapshotBefore = f.state.snapshot, overlay = f.state.bodyReferenceOverlay;
+      const count = f.requests.length, value = missing(kind, reason); value.status = 'unsupported';
+      let jsonReads = 0;
+      const { task, request } = begin(f, kind);
+      request.resolve({ ok: true, json: async () => { jsonReads++; return value; } });
+      assert.equal(await task, false);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(f.requests.length, count + 1, 'only the explicit inspection read; no retry or fallback');
+      assert.equal(jsonReads, 1);
+      assert.equal(f.state.evidence, row); assert.equal(f.state.evidenceId, TOKEN); assert.equal(f.state.socketPeer, peer);
+      assert.equal(f.state.snapshot, snapshotBefore); assert.equal(f.state.bodyReferenceOverlay, overlay); assert.equal(f.state.inactiveSessionId, null);
+      assert.equal(f.state[kind === 'html' ? 'htmlGenerators' : 'linkDeclarations'], null);
+      assert.equal(f.state[kind === 'html' ? 'htmlGeneratorsError' : 'linkDeclarationsError'], SUPPLEMENT_ERRORS[kind]);
+      assert.match(f.els.detail.innerHTML, /Verified retained source/);
+      assert.ok(f.els.detail.innerHTML.includes(SUPPLEMENT_ERRORS[kind]));
+      assert.ok(!f.els.detail.innerHTML.includes(reason));
+      assert.doesNotMatch(f.els.detail.innerHTML, /PRIVATE_CONTENT_SENTINEL|PRIVATE_TOKEN|Source unavailable|session must be active/);
+    });
+  }
+}
 for (const kind of KINDS) for (const reason of NONIDENTITY[kind]) test(`${kind} ${reason} preserves ordinary metadata and existing overlay`, async () => {
   const f = await verified(); await show(f); const overlay = f.state.bodyReferenceOverlay, row = f.state.evidence;
   await inspect(f, kind, missing(kind, reason));

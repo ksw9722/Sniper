@@ -9264,6 +9264,16 @@ fn validate_service_map_html_generators_response(
             && !result.complete
             && result.reasons.len() == 1
             && ACQUISITION_REASONS.contains(&result.reasons[0].as_str())
+            // Missing constructors also accept eligibility reasons; only unsupported is narrower.
+            && (result.status != "unsupported"
+                || matches!(
+                    result.reasons[0].as_str(),
+                    "metadata_limit"
+                        | "unsupported_content_type"
+                        | "unsupported_body_encoding"
+                        | "unsupported_content_encoding"
+                        | "unsupported_metadata"
+                ))
             && result.source_origin.is_none()
             && result.source_sequence.is_none()
             && result.source_started_at.is_none()
@@ -9451,6 +9461,8 @@ fn validate_service_map_link_declarations_response(
             && !result.complete
             && result.reasons.len() == 1
             && LINK_ACQUISITION_REASONS.contains(&result.reasons[0].as_str())
+            && (result.status != "unsupported"
+                || result.reasons[0] == "unsupported_source_context")
             && result.source_origin.is_none()
             && result.source_sequence.is_none()
             && result.source_started_at.is_none()
@@ -16297,6 +16309,123 @@ mod tests {
             match &self.previous {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn assert_supplement_invalid_response(
+        error: anyhow::Error,
+        operation: &str,
+        message: &str,
+        reason: &str,
+    ) {
+        let payload = cli_error_payload(operation, &error);
+        assert_eq!(payload.code, "INVALID_RESPONSE");
+        assert_eq!(payload.message, message);
+        assert_eq!(payload.details, json!({"status":null}));
+        assert_eq!(payload.exit_code, 5);
+        assert!(!payload.retryable);
+        assert!(!serde_json::to_string(&payload).unwrap().contains(reason));
+    }
+
+    #[test]
+    fn service_map_html_supplement_status_reason_contract() {
+        use sniper::service_map_html::{ServiceMapHtmlGenerators, ACQUISITION_REASONS};
+        let session_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let args = super::ServiceMapHtmlGeneratorsArgs {
+            session_id,
+            evidence_id: format!("v1.{session_id}.22222222-2222-4222-8222-222222222222.9007199254740993.44444444-4444-4444-8444-444444444444.33333333-3333-4333-8333-333333333333"),
+        };
+        let unsupported = [
+            "metadata_limit",
+            "unsupported_content_type",
+            "unsupported_body_encoding",
+            "unsupported_content_encoding",
+            "unsupported_metadata",
+        ];
+        for reason in ACQUISITION_REASONS.iter().copied().chain([
+            "unsupported_source_context",
+            "malformed_tag",
+            "PRIVATE_CONTENT_SENTINEL",
+        ]) {
+            for status in [
+                "unavailable",
+                "unsupported",
+                "scanned",
+                "partial",
+                "UNSUPPORTED",
+            ] {
+                let mut result =
+                    ServiceMapHtmlGenerators::missing(session_id, args.evidence_id.clone(), reason);
+                // The constructor sanitizes unknown input; simulate the wire value directly.
+                result.reasons = vec![reason.into()];
+                result.status = status.into();
+                let valid = match status {
+                    "unavailable" => ACQUISITION_REASONS.contains(&reason),
+                    "unsupported" => unsupported.contains(&reason),
+                    _ => false,
+                };
+                let outcome = super::validate_service_map_html_generators_response(&result, &args);
+                assert_eq!(outcome.is_ok(), valid, "{status}/{reason}");
+                if !valid {
+                    assert_supplement_invalid_response(
+                        outcome.unwrap_err(),
+                        "target.service_map.html_generators.get",
+                        "HTML generator inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract",
+                        reason,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn service_map_link_supplement_status_reason_contract() {
+        use sniper::service_map_links::{ServiceMapLinkDeclarations, ACQUISITION_REASONS};
+        let session_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let args = super::ServiceMapLinkDeclarationsArgs {
+            session_id,
+            evidence_id: format!("v1.{session_id}.22222222-2222-4222-8222-222222222222.9007199254740993.44444444-4444-4444-8444-444444444444.33333333-3333-4333-8333-333333333333"),
+        };
+        for reason in ACQUISITION_REASONS.iter().copied().chain([
+            "metadata_limit",
+            "unsupported_content_type",
+            "unsupported_body_encoding",
+            "unsupported_content_encoding",
+            "unsupported_metadata",
+            "malformed_field",
+            "PRIVATE_CONTENT_SENTINEL",
+        ]) {
+            for status in [
+                "unavailable",
+                "unsupported",
+                "scanned",
+                "partial",
+                "UNSUPPORTED",
+            ] {
+                let mut result = ServiceMapLinkDeclarations::missing(
+                    session_id,
+                    args.evidence_id.clone(),
+                    reason,
+                );
+                result.reasons = vec![reason.into()];
+                result.status = status.into();
+                let valid = match status {
+                    "unavailable" => ACQUISITION_REASONS.contains(&reason),
+                    "unsupported" => reason == "unsupported_source_context",
+                    _ => false,
+                };
+                let outcome =
+                    super::validate_service_map_link_declarations_response(&result, &args);
+                assert_eq!(outcome.is_ok(), valid, "{status}/{reason}");
+                if !valid {
+                    assert_supplement_invalid_response(
+                        outcome.unwrap_err(),
+                        "target.service_map.link_declarations.get",
+                        "Link declaration inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract",
+                        reason,
+                    );
+                }
             }
         }
     }

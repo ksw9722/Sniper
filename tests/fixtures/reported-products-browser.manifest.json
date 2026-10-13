@@ -35,7 +35,7 @@
     "empty"
   ],
   "sha256": {
-    "web/service-map.js": "b40051e49cf5364ff43af5da954046db2d96deccad8c7643970341d64d4b88a0",
+    "web/service-map.js": "8e24c5ebfd2a10c4e56ee7752eb03982d9a121f4e7598256b228cb7524248d4b",
     "web/styles.css": "d975c30e67d8510251e6331ae7046595656e574681ebdcb364b576c47a447fa2",
     "web/index.html": "25e128c32dab1376dbde6898b81b2c886c4b40439a99de1633cb1b10d609b73f",
     "tests/fixtures/reported-products-browser.html": "89d6a7a6169b5bfb6b9aaad77d465861cc10136050e347a10a9ee1e54af2c24c",

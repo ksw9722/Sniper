@@ -547,6 +547,7 @@
     const c = payload.counts;
     if (!payload.available) {
       if (payload.complete || payload.reasons.length !== 1 || !LINK_ACQUISITION_REASONS.has(payload.reasons[0])
+        || payload.status === "unsupported" && payload.reasons[0] !== "unsupported_source_context"
         || sourceFields.some((key) => payload[key] !== null) || countFields.some((key) => c[key] !== 0) || payload.observations.length) invalid();
     } else {
       if (!canonical(payload.source_origin, 4096) || payload.source_origin !== row.origin || payload.source_sequence !== row.sequence
@@ -605,6 +606,8 @@
     "unsupported_metadata", "serialized_row_limit", "body_storage_unavailable", "body_read_failed", "malformed_retained_row",
     "retained_preview_unavailable", "body_scan_failed", "inactive_session", "session_source_changed", "metadata_unavailable",
   ]);
+  // Missing constructors also accept eligibility reasons; only unsupported is narrower.
+  const HTML_GENERATOR_UNSUPPORTED_REASONS = new Set(["metadata_limit", "unsupported_content_type", "unsupported_body_encoding", "unsupported_content_encoding", "unsupported_metadata"]);
   const HTML_GENERATOR_STOP_REASONS = {
     end_of_preview: "Preview ended before a supported closing head", input_limit: "Input limit reached before a supported closing head",
     tag_candidate_limit: "Tag candidate limit reached", tag_byte_limit: "Tag byte limit reached", attribute_limit: "Attribute limit reached",
@@ -648,6 +651,7 @@
     const scanned = payload.available;
     if (!scanned) {
       if (payload.complete || payload.reasons.length !== 1 || payload.reasons.some((reason) => !HTML_GENERATOR_ACQUISITION_REASONS.has(reason))
+        || payload.status === "unsupported" && !HTML_GENERATOR_UNSUPPORTED_REASONS.has(payload.reasons[0])
         || ["source_origin", "source_sequence", "source_started_at", "retained_preview_bytes", "parser_stop"].some((key) => payload[key] !== null)
         || payload.scan_prefix_bytes || payload.tag_candidates_inspected || payload.unknown_product_declarations || payload.observations.length
         || payload.head_closed || payload.capture_preview_truncated || payload.scan_prefix_truncated
