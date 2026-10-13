@@ -3,7 +3,8 @@
 These commands operate on skill files on the **CLI host**, even with a remote
 `--api`. They do not contact an API or a network service. The bundled templates
 come from the running binary; upgrading the binary alone does not replace
-existing installed skills.
+existing installed skills. Automatic updates are disabled by default; separate
+explicit host-local consent is described below.
 
 ## Inspect before changing anything
 
@@ -29,7 +30,9 @@ Select exactly one agent. Directory overrides identify skills roots, matching
 its matching agent selector: `--codex-dir` requires `--codex`, and
 `--claude-dir` requires `--claude`. `--all` selects both agents for `install`,
 `status`, and `update-preview`; enrollment, staging, activation, result inspection,
-and rollback require exactly one agent. Previously ignored overrides for unselected agents now fail with
+and rollback require exactly one agent. The automatic-update commands also
+require exactly one agent; only `enable-auto-updates` accepts directory overrides.
+Previously ignored overrides for unselected agents now fail with
 `INVALID_INPUT`, including in dry run. JSON `null` overrides remain equivalent
 to omission. Overrides never redirect another agent's selected root.
 
@@ -144,8 +147,11 @@ last operation ID, while keeping automatic updates disabled. Receipts are local
 consistency records, not tamper-proof proof of authorship or trust.
 
 Apply saves durable transaction artifacts before exchanging active objects.
-Linux uses atomic exchange; the macOS swap adapter has been source-reviewed
-only, without macOS compilation or native runtime verification in this milestone.
+Linux uses atomic exchange. The baseline macOS swap adapter at commit `875e3cc`
+passed 80 focused tests in hosted macOS 15.7.9 ARM64 CI with Rust 1.99.0
+([run 38414932831](https://github.com/sm1ee/Sniper/actions/runs/38414932831)).
+This does not cover Intel Macs, the user's device, GUI behavior, or the new
+automatic-update policy layer; native CI for that new layer is still pending.
 Windows activation,
 rollback and transaction-result inspection currently return
 `platform_unsupported`. A filesystem that cannot provide the required exchange
@@ -220,6 +226,108 @@ Do not use this manual receipt procedure while an activation transaction is
 pending or recovery-required. Keep its receipt and transaction artifacts intact
 and inspect its original operation ID first.
 
+## Opt-in host-local automatic updates
+
+Automatic updates are **Off by default**. Enrollment, application startup,
+upgrading Sniper, reading a skill, and `--yes` on another command do not grant
+consent. An agent must not enable this feature on the user's behalf without
+explicit approval of future updates to the selected installation.
+
+```bash
+sniper-cli skills auto-update-status --codex
+sniper-cli skills enable-auto-updates --codex --dry-run
+sniper-cli skills enable-auto-updates --codex --yes
+sniper-cli skills auto-update-once --codex --yes
+sniper-cli skills disable-auto-updates --codex --yes
+```
+
+Use `--claude` for Claude. Select exactly one agent; `--all` is not accepted.
+`auto-update-status` is read-only. Enable, disable and one-shot execution require
+`--yes` outside dry run. The corresponding canonical operations are
+`skills.auto_update_status`, `skills.enable_auto_updates`,
+`skills.disable_auto_updates`, and `skills.auto_update_once`; discover their
+exact inputs and outputs through `manifest`, `schema`, and `examples`.
+
+Enable only records consent for one **existing, unchanged managed baseline**;
+it does not install a skill, enroll an unmanaged file, adopt edits, stage a
+candidate, or update the active file immediately. Optional `--codex-dir` and
+`--claude-dir` overrides are accepted only by enable and require their matching
+selector. The policy binds the selected absolute target and filesystem objects.
+Status, disable and one-shot execution take only the agent selector and always
+use that stored target. They reject directory overrides rather than redirecting
+existing consent to another installation. Changing the agent's default directory
+later does not move the consent.
+
+Policy and attempt records are host-local under
+`<Sniper data directory>/host-skill-updates`, separate from session data,
+workspace exports and UI settings. `SNIPER_DATA_DIR` selects that host-local data
+directory for the CLI. A remote `--api` never changes the policy location and is
+never contacted. There is no network template fetch: the only candidate is the
+executing binary's bundled template, with strictly newer semantic-version
+precedence for different bytes. There is no force overwrite, automatic enrollment,
+legacy-install fallback, artifact pruning, or agent reload.
+
+After the desktop WebView has been built, its first idle event schedules one
+background pass over enabled policies, off the UI thread. It is not a repeating
+timer. Teardown cancels any not-yet-started next-agent pass and waits for the
+active worker; it does not abandon an in-flight guarded transaction. Headless
+server startup, ordinary CLI commands, and environment-triggered installers do
+not run these updates. `auto-update-once` is the explicit host-local alternative.
+
+Inspect `state`, not just exit zero or `enabled`:
+
+- `disabled`: no policy, or consent has been disabled
+- `enabled`: consent exists; this does not prove a later attempt will be eligible
+- `current`: the one-shot check needed no newer bundled update
+- `updated`: the guarded attempt completed; `agent_reloaded` remains false
+- `paused`: changed or uncertain state requires inspection and fresh authorization
+
+`enabled` describes stored consent and can remain true while paused. `path`,
+`policy_id`, `revision`, `generation`, and `operation_id` identify the bound
+policy and retained attempt; absent policies return null identifiers. Read
+`error_code` when present. Durable pauses report `policy_paused`; the optional
+`pause_reason` retains the bounded original cause. A pending attempt can be
+paused without a recorded cause. Status reads never create or repair a policy,
+resume an attempt, or enable updates. Global `--dry-run` is argument-only: zero
+filesystem or API I/O, no eligibility guarantee, and no reservation of consent.
+For these four operations, canonical `call --dry-run` accepts inline JSON only;
+`--input @file` and `--input -` are rejected before opening files or reading stdin.
+Other operations retain their existing explicit input-source behavior.
+
+Edited, replaced, missing, unsupported, conflicting or uncertain objects are
+preserved. Pending attempts consume that authorization; restarting Sniper or
+retrying the one-shot command does not mint a replacement operation ID or silently
+resume an uncertain mutation. Preserve policy history, staging and transaction
+artifacts. Inspect `auto-update-status` and, where an operation ID is present,
+`update-result` with that original ID and the recorded installation root. Do not
+remove a lock, rewrite policy files, use legacy install, or invent an operation ID
+to bypass a refusal.
+
+After resolving a pause safely and reviewing the target, explicitly re-enable
+using the exact current revision from status:
+
+```bash
+sniper-cli skills auto-update-status --codex
+sniper-cli skills enable-auto-updates --codex --policy-revision 3 --dry-run
+sniper-cli skills enable-auto-updates --codex --policy-revision 3 --yes
+```
+
+`3` is illustrative; use the returned revision, and repeat the original directory
+override on enable if the installation uses a nondefault root. An existing policy
+cannot be re-enabled without its current revision. A stale revision fails rather
+than overwriting newer consent. Successful re-enable creates a new authorization
+generation, and still does not update the active file immediately. Disabled and
+paused policies never re-enable themselves. Disabling preserves active bytes and
+all recovery artifacts; it does not undo an already committed update.
+
+The same safe activation platform limits apply. Linux exchange has native fixture
+coverage. The baseline macOS ARM64 adapter has the hosted CI coverage linked
+above; the new automatic-update layer still awaits native macOS CI. Intel,
+user-device and GUI validation remain unverified. Windows host-policy operations
+are currently unsupported. Unsupported filesystems
+fail closed with no overwrite fallback. These checks are bounded observations,
+not a sandbox against malicious concurrent ancestor replacement.
+
 ## Automation result handling
 
 Input errors exit 2. A safely refused or failed managed skill operation
@@ -230,7 +338,9 @@ with the same agent, root and original operation ID first. Preserve every
 transaction artifact and displaced object. A `recovery_required` error means
 the outcome is uncertain; do not blindly retry or change the operation ID. For
 enrollment/staging, rerun `skills status` and `skills update-preview` for the
-selected agent before making a new deliberate attempt. Enrollment can
+selected agent before making a new deliberate attempt. For automatic-update
+commands, inspect `skills auto-update-status` for the same agent and its original
+attempt before deciding on any fresh authorization. Enrollment can
 leave a valid visible receipt that preview recognizes as a baseline even when
 the command reports a write or sync error. Preserve existing receipts and staged
 files; do not overwrite them or reuse a staging path to force a retry.
@@ -242,7 +352,9 @@ closes. An apply or rollback may already have changed active files when its outp
 lost. Inspect `skills update-result` with the original operation ID; that read
 does not repeat the mutation. For enrollment or staging, inspect `skills status`,
 `skills update-preview`, and existing receipt/candidate files instead. Preserve
-all artifacts before deciding on any deliberate retry.
+all artifacts before deciding on any deliberate retry. For enable, disable or
+one-shot automatic updates, inspect `auto-update-status` first: lost output is
+not evidence that consent or active files stayed unchanged.
 
 The receipt and version fields describe the recorded baseline; differing version
 strings alone do not prove provenance. Preview/staging candidate eligibility is

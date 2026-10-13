@@ -1479,7 +1479,7 @@ enum SkillsCommand {
     StageUpdate(SkillsStageArgs),
     /// Experimental: explicitly activate one reviewed staged update with a durable operation ID.
     #[command(
-        after_help = "Requires --yes outside dry run. Select exactly one agent and retain the original operation UUID.\nThe staged candidate, enrollment baseline and executing binary bundle must agree; different bytes need a strictly newer semantic version.\nAfter uncertain output, inspect skills update-result with that same UUID before any deliberate retry.\nNo automatic updates or agent reload. Linux exchange and macOS swap adapters only; Windows is unsupported."
+        after_help = "Requires --yes outside dry run. Select exactly one agent and retain the original operation UUID.\nThe staged candidate, enrollment baseline and executing binary bundle must agree; different bytes need a strictly newer semantic version.\nAfter uncertain output, inspect skills update-result with that same UUID before any deliberate retry.\nDoes not grant automatic-update consent or reload the agent. Linux exchange and macOS swap adapters only; Windows is unsupported."
     )]
     ApplyUpdate(SkillsApplyArgs),
     /// Inspect one local update transaction without changing files or resuming it.
@@ -1492,6 +1492,49 @@ enum SkillsCommand {
         after_help = "Requires --yes outside dry run. Use the original apply-update UUID, not a new rollback ID.\nOnly a bound transaction can be restored; changed or unsupported objects can block rollback.\nAfter uncertain output, inspect skills update-result with the same UUID. Preserve all artifacts and do not blindly retry."
     )]
     RollbackUpdate(SkillsOperationArgs),
+    /// Inspect the selected agent's host-local automatic-update policy without writes.
+    #[command(
+        after_help = "CLI-host local only, even with remote --api. Uses the target already stored in the policy; no directory overrides.
+Read-only inspection never creates, repairs, resumes, or enables a policy. Inspect state and error_code; paused is not permission to retry."
+    )]
+    AutoUpdateStatus(StoredSkillArgs),
+    /// Explicitly authorize future bundled updates of one unchanged managed installation.
+    #[command(
+        after_help = "Requires --yes outside dry run. Records consent only; it does not update SKILL.md now.
+Select exactly one agent and an unchanged managed baseline. Re-enabling an existing policy requires its current --policy-revision and creates a fresh authorization generation.
+Only host-local bundled templates are eligible; no network fetch, arbitrary content, or agent reload."
+    )]
+    EnableAutoUpdates(SkillsEnableAutoUpdatesArgs),
+    /// Revoke future automatic updates for the policy's stored target.
+    #[command(
+        after_help = "Requires --yes outside dry run. Uses the selected agent's stored target; no directory overrides.
+Preserves active files, receipts, attempts and recovery artifacts. Does not roll back an already committed update."
+    )]
+    DisableAutoUpdates(StoredSkillArgs),
+    /// Make one guarded automatic-update attempt for an explicitly enabled local policy.
+    #[command(
+        after_help = "Requires --yes outside dry run. Uses the policy's stored target; no directory overrides or replacement operation IDs.
+No policy means no authorization. Modified, replaced, unsupported or uncertain state is preserved and pauses updates. Inspect auto-update-status before any deliberate re-enable."
+    )]
+    AutoUpdateOnce(StoredSkillArgs),
+}
+
+#[derive(Args, Debug, Default)]
+#[command(group(ArgGroup::new("skill_agent").args(["codex", "claude"]).required(true)))]
+struct StoredSkillArgs {
+    #[arg(long)]
+    codex: bool,
+    #[arg(long)]
+    claude: bool,
+}
+
+#[derive(Args, Debug)]
+struct SkillsEnableAutoUpdatesArgs {
+    #[command(flatten)]
+    target: SingleSkillArgs,
+    /// Current policy revision from auto-update-status; required when re-enabling a policy.
+    #[arg(long)]
+    policy_revision: Option<u64>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -2722,6 +2765,10 @@ impl SkillsCommand {
             SkillsCommand::ApplyUpdate(_) => "skills.apply_update",
             SkillsCommand::UpdateResult(_) => "skills.update_result",
             SkillsCommand::RollbackUpdate(_) => "skills.rollback_update",
+            SkillsCommand::AutoUpdateStatus(_) => "skills.auto_update_status",
+            SkillsCommand::EnableAutoUpdates(_) => "skills.enable_auto_updates",
+            SkillsCommand::DisableAutoUpdates(_) => "skills.disable_auto_updates",
+            SkillsCommand::AutoUpdateOnce(_) => "skills.auto_update_once",
         }
     }
 }
@@ -2827,6 +2874,42 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             true,
             &["operation_id"],
             vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","operation_id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
+            "skills.auto_update_status",
+            "skills auto-update-status <--codex|--claude>",
+            "Read the selected agent's host-local automatic-update policy and stored target without creating, repairing, or resuming anything. Remote --api is never contacted.",
+            Read,
+            false,
+            &[],
+            vec![json!({"codex":true}), json!({"claude":true})],
+        ),
+        op(
+            "skills.enable_auto_updates",
+            "skills enable-auto-updates <--codex|--claude> [--policy-revision <current-revision>]",
+            "Explicitly authorize future updates from this host's bundled templates for one unchanged managed installation. Records consent only; does not update active files. Re-enabling requires the current policy revision and creates a fresh authorization generation.",
+            Write,
+            true,
+            &[],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills"}), json!({"codex":true,"codex_dir":"/tmp/example-skills","policy_revision":2})],
+        ),
+        op(
+            "skills.disable_auto_updates",
+            "skills disable-auto-updates <--codex|--claude>",
+            "Revoke future automatic updates using the selected agent's stored target. Preserve active files and all policy, attempt, transaction and recovery artifacts; do not roll back committed updates.",
+            Write,
+            true,
+            &[],
+            vec![json!({"codex":true})],
+        ),
+        op(
+            "skills.auto_update_once",
+            "skills auto-update-once <--codex|--claude>",
+            "Run one guarded local bundled-update attempt under existing explicit consent. Uses only the stored target; edited, replaced, unsupported or uncertain objects are preserved and pause updates. Never fetch content or reload an agent.",
+            Write,
+            true,
+            &[],
+            vec![json!({"codex":true})],
         ),
         op(
             "session.list",
@@ -4376,6 +4459,7 @@ fn op(
             .or_else(|| session_read_output_schema(operation))
             .or_else(|| skills_status_output_schema(operation))
             .or_else(|| skills_managed_output_schema(operation))
+            .or_else(|| skills_auto_update_output_schema(operation))
             .or_else(|| examples_output_schema(operation))
             .or_else(|| history_list_output_schema(operation))
             .unwrap_or_else(|| {
@@ -4571,6 +4655,39 @@ fn skills_status_output_schema(operation: &str) -> Option<Value> {
     }))
 }
 
+fn is_skill_auto_update_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "skills.auto_update_status"
+            | "skills.enable_auto_updates"
+            | "skills.disable_auto_updates"
+            | "skills.auto_update_once"
+    )
+}
+
+fn skills_auto_update_output_schema(operation: &str) -> Option<Value> {
+    if !is_skill_auto_update_operation(operation) {
+        return None;
+    }
+    Some(json!({
+        "type":"object", "additionalProperties":false,
+        "required":["agent","state","enabled","policy_id","revision","generation","path","operation_id","agent_reloaded"],
+        "properties":{
+            "agent":{"type":"string","enum":["codex","claude"]},
+            "state":{"type":"string","enum":["disabled","enabled","paused","current","updated"],"description":"Disabled includes absent consent. Paused requires inspection and fresh explicit re-authorization; enabled alone does not mean an attempt is eligible."},
+            "enabled":{"type":"boolean","description":"Stored consent; may remain true while state is paused. Inspect state and error_code before acting."},
+            "policy_id":{"type":["string","null"]},
+            "revision":{"type":["integer","null"],"minimum":0,"maximum":u64::MAX},
+            "generation":{"type":["string","null"],"description":"Authorization generation; changes on explicit re-enable."},
+            "path":{"type":["string","null"],"description":"The policy's stored absolute active SKILL.md path; never source text."},
+            "operation_id":{"type":["string","null"],"description":"Retained operation ID for the policy's update attempt; never replace it to bypass recovery."},
+            "agent_reloaded":{"type":"boolean","const":false},
+            "error_code":{"type":"string","description":"Stable bounded local refusal code. A durable pause reports policy_paused; inspect pause_reason for its retained cause."},
+            "pause_reason":{"type":["string","null"],"minLength":1,"maxLength":64,"pattern":"^[a-z_]+$","description":"Optional bounded stored cause of a durable pause; no source text. Pending attempts can be paused without a recorded cause."}
+        }
+    }))
+}
+
 fn skills_managed_output_schema(operation: &str) -> Option<Value> {
     let string = json!({"type":"string"});
     let hash = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
@@ -4720,6 +4837,27 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
         return schema;
     }
     if let Some(schema) = history_retention_input_schema(operation) {
+        return schema;
+    }
+    if is_skill_auto_update_operation(operation) {
+        let mut schema = json!({
+            "type":"object", "additionalProperties":false, "required":[],
+            "properties":{
+                "codex":{"type":["boolean","null"],"default":false},
+                "claude":{"type":["boolean","null"],"default":false}
+            },
+            "oneOf":[
+                {"required":["codex"],"properties":{"codex":{"const":true},"claude":{"enum":[false,null]}}},
+                {"required":["claude"],"properties":{"claude":{"const":true},"codex":{"enum":[false,null]}}}
+            ]
+        });
+        if operation == "skills.enable_auto_updates" {
+            for (agent, root) in [("codex", "codex_dir"), ("claude", "claude_dir")] {
+                schema["properties"][root] = json!({"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":format!("Host-local {agent} skills root; requires its matching selector. Omission or null uses that agent's install default. Only enable may select a target; later commands use the recorded target.")});
+            }
+            schema["allOf"] = skill_root_selection_schema(false);
+            schema["properties"]["policy_revision"] = json!({"type":["integer","null"],"minimum":0,"maximum":u64::MAX,"description":"Expected current revision from auto-update-status. Required to re-enable an existing policy; omission or null does not authorize replacing existing consent."});
+        }
         return schema;
     }
     if matches!(
@@ -5003,6 +5141,16 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             &["codex", "claude", "all", "codex_dir", "claude_dir"]
         }
         "skills.enroll" => &["codex", "claude", "codex_dir", "claude_dir"],
+        "skills.auto_update_status" | "skills.disable_auto_updates" | "skills.auto_update_once" => {
+            &["codex", "claude"]
+        }
+        "skills.enable_auto_updates" => &[
+            "codex",
+            "claude",
+            "codex_dir",
+            "claude_dir",
+            "policy_revision",
+        ],
         "skills.stage_update" => &["codex", "claude", "codex_dir", "claude_dir", "staging_dir"],
         "skills.apply_update" => &[
             "codex",
@@ -5340,6 +5488,16 @@ fn command_input_preview(command: &Command) -> Value {
                 "claude_dir": args.claude_dir,
             }),
             SkillsCommand::Enroll(args) => single_skill_input_preview(args),
+            SkillsCommand::AutoUpdateStatus(args)
+            | SkillsCommand::DisableAutoUpdates(args)
+            | SkillsCommand::AutoUpdateOnce(args) => {
+                json!({"codex":args.codex,"claude":args.claude})
+            }
+            SkillsCommand::EnableAutoUpdates(args) => {
+                let mut input = single_skill_input_preview(&args.target);
+                input["policy_revision"] = json!(args.policy_revision);
+                input
+            }
             SkillsCommand::StageUpdate(args) => {
                 let mut input = single_skill_input_preview(&args.target);
                 input["staging_dir"] = json!(args.staging_dir);
@@ -6262,12 +6420,18 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
         notes.push("Enrollment records explicit local opt-in only and does not enable startup or automatic updates. Preview never implies ownership of unmanaged files.");
         notes.push("Staging requires an unchanged enrolled skill with different bundled bytes and a new output directory. It writes a candidate and receipt only; the active SKILL.md remains unchanged and nothing is activated.");
     }
+    if is_skill_auto_update_operation(command.operation_name()) {
+        notes.push("CLI-host local only; remote --api is never contacted. Dry-run validates arguments only, with no filesystem reads/writes, policy inspection, eligibility checks, or API discovery.");
+        notes.push("Canonical call dry runs require inline JSON in --input; @file and stdin are rejected before opening or reading them. Other commands retain their ordinary input-source behavior.");
+        notes.push("Enable records consent for one unchanged managed baseline without updating active files. Existing consent can be re-enabled only with its current policy revision, creating a new authorization generation.");
+        notes.push("Status, disable and one-shot execution use only the stored target. No automatic enrollment, adoption of edits, network templates, overwrite fallback, artifact pruning, or agent reload. Paused or uncertain state needs inspection and fresh explicit re-authorization.");
+    }
     if matches!(
         command.operation_name(),
         "skills.apply_update" | "skills.update_result" | "skills.rollback_update"
     ) {
         notes.push("CLI-host local only; dry-run validates arguments without filesystem reads, host/API discovery, or checking eligibility. It does not reserve the operation UUID.");
-        notes.push("Explicit partial-milestone maintenance only: no startup hooks, automatic updates, or agent reload. Apply requires a reviewed candidate bound to the unchanged enrollment baseline and this binary's newer bundle.");
+        notes.push("This explicit operation does not grant automatic-update consent or reload an agent. Apply requires a reviewed candidate bound to the unchanged enrollment baseline and this binary's newer bundle.");
         notes.push("Keep the original operation UUID and all transaction artifacts. After uncertain output, use skills update-result with that same UUID; do not blindly retry or replace the ID. Rollback uses that original UUID and preserves displaced objects.");
     }
     if matches!(
@@ -6397,6 +6561,30 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 },
             }
         }
+        "skills.auto_update_status" | "skills.disable_auto_updates" | "skills.auto_update_once" => {
+            let target = StoredSkillArgs {
+                codex: call_bool(operation, input, "codex")?,
+                claude: call_bool(operation, input, "claude")?,
+            };
+            Command::Skills {
+                command: match operation {
+                    "skills.auto_update_status" => SkillsCommand::AutoUpdateStatus(target),
+                    "skills.disable_auto_updates" => SkillsCommand::DisableAutoUpdates(target),
+                    _ => SkillsCommand::AutoUpdateOnce(target),
+                },
+            }
+        }
+        "skills.enable_auto_updates" => Command::Skills {
+            command: SkillsCommand::EnableAutoUpdates(SkillsEnableAutoUpdatesArgs {
+                target: SingleSkillArgs {
+                    codex: call_bool(operation, input, "codex")?,
+                    claude: call_bool(operation, input, "claude")?,
+                    codex_dir: call_optional_path(operation, input, "codex_dir")?,
+                    claude_dir: call_optional_path(operation, input, "claude_dir")?,
+                },
+                policy_revision: call_optional(operation, input, "policy_revision")?,
+            }),
+        },
         "skills.enroll"
         | "skills.stage_update"
         | "skills.apply_update"
@@ -7828,7 +8016,22 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Call(args) if args.operation.starts_with("saved.v1.") => {
             return run_saved_call(api_override, args, dry_run, yes).await;
         }
-        Command::Call(args) => command_from_call_args(args)?,
+        Command::Call(args) => {
+            // These previews promise argument-only execution, including input
+            // acquisition. Never open an input file or block on a stdin stream.
+            if dry_run
+                && is_skill_auto_update_operation(&args.operation)
+                && args
+                    .input
+                    .as_deref()
+                    .is_some_and(|source| source == "-" || source.starts_with('@'))
+            {
+                return Err(CallInputError::Source(
+                    "Automatic-update dry runs require inline JSON in --input; @file and stdin are not opened.".into(),
+                ).into());
+            }
+            command_from_call_args(args)?
+        }
         command => command,
     };
 
@@ -7896,6 +8099,42 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Skills {
             command: SkillsCommand::UpdatePreview(args),
         } => print_json(&skills_update_preview(args)?),
+        Command::Skills {
+            command: SkillsCommand::AutoUpdateStatus(args),
+        } => {
+            let (agent, _) = stored_skill_agent(args);
+            print_json(&sniper::skill_auto_update::status(&cli_data_dir(), agent)?)
+        }
+        Command::Skills {
+            command: SkillsCommand::EnableAutoUpdates(args),
+        } => {
+            let (agent, root, bundled) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_auto_update::enable(
+                &cli_data_dir(),
+                agent,
+                &root,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+                args.policy_revision,
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::DisableAutoUpdates(args),
+        } => {
+            let (agent, _) = stored_skill_agent(args);
+            print_json(&sniper::skill_auto_update::disable(&cli_data_dir(), agent)?)
+        }
+        Command::Skills {
+            command: SkillsCommand::AutoUpdateOnce(args),
+        } => {
+            let (agent, bundled) = stored_skill_agent(args);
+            print_json(&sniper::skill_auto_update::run_once(
+                &cli_data_dir(),
+                agent,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+            )?)
+        }
         Command::Skills {
             command: SkillsCommand::Enroll(args),
         } => {
@@ -8081,6 +8320,7 @@ fn validate_command_preflight(command: &Command) -> Result<()> {
     if let Command::Skills {
         command:
             SkillsCommand::Enroll(args)
+            | SkillsCommand::EnableAutoUpdates(SkillsEnableAutoUpdatesArgs { target: args, .. })
             | SkillsCommand::StageUpdate(SkillsStageArgs { target: args, .. })
             | SkillsCommand::ApplyUpdate(SkillsApplyArgs { target: args, .. })
             | SkillsCommand::UpdateResult(SkillsOperationArgs { target: args, .. })
@@ -8099,6 +8339,17 @@ fn validate_command_preflight(command: &Command) -> Result<()> {
         )?;
         for path in [&args.codex_dir, &args.claude_dir].into_iter().flatten() {
             validate_skill_cli_path(path)?;
+        }
+    }
+    if let Command::Skills {
+        command:
+            SkillsCommand::AutoUpdateStatus(args)
+            | SkillsCommand::DisableAutoUpdates(args)
+            | SkillsCommand::AutoUpdateOnce(args),
+    } = command
+    {
+        if args.codex == args.claude {
+            bail!("must select exactly one destination with --codex or --claude");
         }
     }
     if let Command::Skills {
@@ -15705,6 +15956,14 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
     }
     if let Some(managed) = error.downcast_ref::<sniper::skill_managed::ManagedSkillError>() {
         let (message, hint) = match (operation, managed.code) {
+            (operation, "policy_revision_conflict" | "policy_revision_required") if is_skill_auto_update_operation(operation) => (
+                "The automatic-update policy needs fresh explicit authorization at its current revision.",
+                "Inspect skills auto-update-status for the same agent. Preserve all files and recovery artifacts; only deliberately re-enable with the returned --policy-revision after reviewing the stored target and pause reason.",
+            ),
+            (operation, _) if is_skill_auto_update_operation(operation) => (
+                "The host-local automatic-update action could not complete safely.",
+                "Inspect skills auto-update-status for the same agent and preserve active files, policy, attempt and transaction artifacts. Paused or uncertain state is not permission to retry, replace operation IDs, adopt edits or use legacy install. Re-enable only after review with the current --policy-revision.",
+            ),
             ("skills.apply_update" | "skills.rollback_update", "recovery_required") => (
                 "The local skill mutation requires recovery inspection; its outcome must not be assumed.",
                 "Use skills update-result with the same selected agent, root and original --operation-id. Preserve all transaction and staging artifacts and displaced files; do not blindly retry or use a new operation ID.",
@@ -16170,6 +16429,14 @@ fn validate_skill_cli_path(path: &Path) -> Result<()> {
         bail!("skill directory must be nonempty and contain no NUL characters");
     }
     Ok(())
+}
+
+fn stored_skill_agent(args: StoredSkillArgs) -> (&'static str, &'static str) {
+    if args.codex {
+        ("codex", skills::CODEX_SKILL_TEMPLATE)
+    } else {
+        ("claude", skills::CLAUDE_SKILL_TEMPLATE)
+    }
 }
 
 fn single_skill_target(args: SingleSkillArgs) -> Result<(&'static str, PathBuf, &'static str)> {

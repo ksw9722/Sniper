@@ -575,7 +575,7 @@ Completed inspections exit zero, including missing/error rows: automation must
 check each row's `status` and `error_code`. Invalid arguments or failure to
 resolve a selected path exit nonzero. Existing install behavior is unchanged.
 
-### Explicit skill maintenance
+### Local skill maintenance
 
 `skills update-preview` compares active installed bytes with this binary's bundle
 without writing. Experimental enrollment and staging preserve a known baseline.
@@ -586,11 +586,23 @@ rollback, especially after interrupted or lost output. Different bytes must come
 from a strictly newer bundled semantic version; edited or mismatched files are
 refused, and recovery artifacts are preserved.
 
-This does not enable startup updates, unattended activation, or agent reload.
-Linux exchange is covered by native fixtures; the macOS swap adapter is source
-reviewed but has not been compiled or runtime-tested on macOS here. Windows
-activation, rollback and transaction-result
-inspection are currently unsupported. See [safe skill maintenance](docs/integrations/skill-maintenance.md)
+These explicit operations do not themselves grant automatic-update consent.
+Automatic updates are Off by default. `skills enable-auto-updates --codex --yes`
+records host-local consent for one unchanged managed installation without
+updating it immediately. `skills auto-update-status --codex` reads the policy;
+`skills auto-update-once --codex --yes` attempts an eligible bundled update, and
+`skills disable-auto-updates --codex --yes` revokes future updates. Use `--claude`
+for Claude. Status, disable and one-shot execution use the stored target and
+reject directory overrides. Re-enabling an existing policy requires its current
+`--policy-revision` and creates fresh authorization. The desktop schedules one
+background pass after its first idle event; no agent reload or network template
+fetch occurs. Uncertain attempts pause rather than silently retrying.
+
+Linux exchange is covered by native fixtures. The baseline macOS ARM64 swap
+adapter passed [hosted CI](https://github.com/sm1ee/Sniper/actions/runs/38414932831);
+new automatic-update-layer native CI, Intel, user-device and GUI validation are
+still pending. Windows activation, rollback, transaction-result inspection and
+host-policy operations are currently unsupported. See [safe skill maintenance](docs/integrations/skill-maintenance.md)
 for the review workflow, confirmation requirements, recovery and platform limits.
 
 AI agents can drive the full workflow through CLI — capture, scope, replay, fuzz — no UI scraping needed.

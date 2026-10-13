@@ -66,12 +66,15 @@ $ echo $?
 ```
 
 The installed file is a **copy of the template embedded in the binary**, not a
-link to the repository. Upgrading Sniper does not refresh it. Inspect it first
+link to the repository. Upgrading Sniper alone does not refresh it. Inspect it first
 with `sniper-cli skills status --codex` or `sniper-cli skills update-preview --codex`.
 `skills install --codex --yes` **overwrites** an existing `SKILL.md`; preserve any
 edits before deliberately choosing replacement. See
 [safe skill maintenance](skill-maintenance.md) for read-only checks and the
-experimental non-activating staging workflow.
+experimental staging and activation workflows. Automatic updates are Off by
+default and need separate explicit `enable-auto-updates --codex --yes` consent;
+that command only records authorization. Inspect the host-local policy with
+`auto-update-status --codex`.
 
 Installing both agents into one directory is rejected, because both would write
 the same `SKILL.md`:

@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use crate::skill_managed::{error, ManagedSkillError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, ManagedSkillError>;
 
@@ -28,6 +28,139 @@ pub struct SkillUpdateResult {
     pub agent_reloaded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) struct Record {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) size: u64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) struct DirectoryBinding {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+/// Exact local observations, not publisher authentication or update permission.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) struct BaselineBinding {
+    pub(crate) agent: String,
+    pub(crate) path: String,
+    pub(crate) directory: DirectoryBinding,
+    pub(crate) skill: Record,
+    pub(crate) receipt: Record,
+    pub(crate) installed_sha256: String,
+    pub(crate) enrolled_version: String,
+    pub(crate) history_sha256: String,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) struct AutomaticUpdateResult {
+    pub(crate) result: SkillUpdateResult,
+    pub(crate) committed_baseline: BaselineBinding,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy)]
+pub(crate) enum AutomaticTestCheckpoint {
+    BeforeSkillSwap,
+    AfterSkillSwap,
+    BeforeReceiptSwap,
+    AfterReceiptSwap,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn set_automatic_test_failure(checkpoint: Option<AutomaticTestCheckpoint>) {
+    supported::set_automatic_test_failure(checkpoint);
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn inspect_automatic_baseline(agent: &str, root: &Path) -> Result<BaselineBinding> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return supported::inspect_baseline(agent, root);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (agent, root);
+        Err(error("platform_unsupported"))
+    }
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn inspect_automatic_completion(
+    agent: &str,
+    root: &Path,
+    expected: &BaselineBinding,
+    operation_id: &str,
+    version: &str,
+    hash: &str,
+) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return supported::inspect_completion(agent, root, expected, operation_id, version, hash);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (agent, root, expected, operation_id, version, hash);
+        Err(error("platform_unsupported"))
+    }
+}
+
+/// The caller separately authorizes policy. This fresh-only entry cannot resume
+/// a prior operation and returns a checked committed baseline under the same lock.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn apply_automatic_skill_update(
+    agent: &str,
+    root: &Path,
+    bundled: &str,
+    version: &str,
+    staging_dir: &Path,
+    operation_id: &str,
+    expected: &BaselineBinding,
+) -> Result<AutomaticUpdateResult> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return supported::apply_automatic(
+        agent,
+        root,
+        bundled,
+        version,
+        staging_dir,
+        operation_id,
+        expected,
+        |_step| {
+            #[cfg(test)]
+            supported::automatic_test_checkpoint(_step)?;
+            Ok(())
+        },
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (
+            agent,
+            root,
+            bundled,
+            version,
+            staging_dir,
+            operation_id,
+            expected,
+        );
+        Err(error("platform_unsupported"))
+    }
 }
 
 pub fn apply_skill_update(
@@ -80,7 +213,7 @@ pub fn rollback_skill_update(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-mod supported {
+pub(crate) mod supported {
     use super::*;
     use crate::{
         skill_managed::{
@@ -96,6 +229,7 @@ mod supported {
         io::{Read, Write},
         os::{
             fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
             unix::fs::{MetadataExt, OpenOptionsExt},
         },
         path::PathBuf,
@@ -111,19 +245,6 @@ mod supported {
     const LIMIT: u64 = 16 * 1024;
     const MAX_TRANSACTIONS: usize = 128;
 
-    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-    #[serde(deny_unknown_fields)]
-    struct Record {
-        dev: u64,
-        ino: u64,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        size: u64,
-        mtime: i64,
-        mtime_nsec: i64,
-        sha256: String,
-    }
     impl Record {
         fn new(meta: &Metadata, bytes: &[u8]) -> Self {
             Self {
@@ -140,12 +261,12 @@ mod supported {
         }
     }
 
-    struct Observed {
-        file: File,
-        bytes: Vec<u8>,
-        record: Record,
+    pub(crate) struct Observed {
+        pub(crate) file: File,
+        pub(crate) bytes: Vec<u8>,
+        pub(crate) record: Record,
     }
-    struct Directory {
+    pub(crate) struct Directory {
         path: PathBuf,
         file: File,
         locked: std::cell::Cell<bool>,
@@ -159,7 +280,21 @@ mod supported {
         }
     }
     impl Directory {
-        fn open(path: &Path) -> Result<Self> {
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+        pub(crate) fn binding(&self) -> Result<DirectoryBinding> {
+            self.check()?;
+            let meta = self.file.metadata().map_err(io_error)?;
+            Ok(DirectoryBinding {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mode: meta.mode(),
+                uid: meta.uid(),
+                gid: meta.gid(),
+            })
+        }
+        pub(crate) fn open(path: &Path) -> Result<Self> {
             let before = fs::symlink_metadata(path).map_err(io_error)?;
             validate_dir(&before)?;
             let file = OpenOptions::new()
@@ -180,7 +315,7 @@ mod supported {
             }
             Ok(result)
         }
-        fn check(&self) -> Result<()> {
+        pub(crate) fn check(&self) -> Result<()> {
             let now = fs::symlink_metadata(&self.path).map_err(io_error)?;
             validate_dir(&now)?;
             let held = self.file.metadata().map_err(io_error)?;
@@ -190,7 +325,7 @@ mod supported {
             }
             Ok(())
         }
-        fn lock(&self) -> Result<()> {
+        pub(crate) fn lock(&self) -> Result<()> {
             // SAFETY: the held directory fd remains live; flock never removes a lock inode.
             if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(error("transaction_busy"));
@@ -198,10 +333,10 @@ mod supported {
             self.locked.set(true);
             self.check()
         }
-        fn sync(&self) -> Result<()> {
+        pub(crate) fn sync(&self) -> Result<()> {
             sync_file(&self.file, "directory_sync")
         }
-        fn read(&self, name: &str, limit: u64) -> Result<Observed> {
+        pub(crate) fn read(&self, name: &str, limit: u64) -> Result<Observed> {
             self.check()?;
             let name_c = name_c(name)?;
             // SAFETY: both fd and single-component C string are live. NONBLOCK prevents FIFO hangs.
@@ -246,21 +381,21 @@ mod supported {
                 record,
             })
         }
-        fn stat(&self, name: &str) -> Result<Metadata> {
+        pub(crate) fn stat(&self, name: &str) -> Result<Metadata> {
             // This pathname observation is checked against the open directory on either side.
             self.check()?;
             let meta = fs::symlink_metadata(self.path.join(name)).map_err(io_error)?;
             self.check()?;
             Ok(meta)
         }
-        fn exists(&self, name: &str) -> Result<bool> {
+        pub(crate) fn exists(&self, name: &str) -> Result<bool> {
             match self.stat(name) {
                 Ok(_) => Ok(true),
                 Err(e) if e.code == "missing" => Ok(false),
                 Err(e) => Err(e),
             }
         }
-        fn write_new(&self, name: &str, bytes: &[u8], mode: u32) -> Result<Observed> {
+        pub(crate) fn write_new(&self, name: &str, bytes: &[u8], mode: u32) -> Result<Observed> {
             self.check()?;
             let name_c = name_c(name)?;
             // SAFETY: O_EXCL prevents replacing any existing entry or following its link.
@@ -289,7 +424,7 @@ mod supported {
             sync_file(&file, "file_sync")?;
             self.read(name, MAX_SKILL_BYTES)
         }
-        fn child_new(&self, name: &str) -> Result<Self> {
+        pub(crate) fn child_new(&self, name: &str) -> Result<Self> {
             self.check()?;
             let c = name_c(name)?;
             // SAFETY: mkdirat creates only this single child in the held directory.
@@ -303,6 +438,10 @@ mod supported {
     }
     #[cfg(test)]
     thread_local! { static IO_FAILURE: std::cell::RefCell<Option<(&'static str, usize, usize)>> = const { std::cell::RefCell::new(None) }; }
+    #[cfg(test)]
+    pub(crate) fn set_policy_io_test_failure(failure: Option<(&'static str, usize)>) {
+        IO_FAILURE.with(|slot| *slot.borrow_mut() = failure.map(|(kind, nth)| (kind, nth, 0)));
+    }
     fn io_boundary(kind: &'static str) -> Result<()> {
         #[cfg(test)]
         if IO_FAILURE.with(|cell| {
@@ -442,6 +581,7 @@ mod supported {
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Step {
+        BaselineValidated,
         DirectoryCreated,
         SkillPrepared,
         ReceiptPrepared,
@@ -460,6 +600,39 @@ mod supported {
         BeforeSkillRestore,
         SkillRestored,
         RolledBackRecorded,
+    }
+    #[cfg(test)]
+    thread_local! {
+        static AUTOMATIC_TEST_FAILURE: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
+    }
+    #[cfg(test)]
+    thread_local! { static AUTOMATIC_TEST_EXIT: std::cell::Cell<bool> = const {std::cell::Cell::new(false)}; }
+    #[cfg(test)]
+    pub(crate) fn set_automatic_test_exit(checkpoint: Option<AutomaticTestCheckpoint>) {
+        set_automatic_test_failure(checkpoint);
+        AUTOMATIC_TEST_EXIT.with(|value| value.set(checkpoint.is_some()));
+    }
+    #[cfg(test)]
+    pub(super) fn set_automatic_test_failure(checkpoint: Option<AutomaticTestCheckpoint>) {
+        AUTOMATIC_TEST_FAILURE.with(|value| {
+            value.set(checkpoint.map(|point| match point {
+                AutomaticTestCheckpoint::BeforeSkillSwap => Step::BeforeSkillSwap,
+                AutomaticTestCheckpoint::AfterSkillSwap => Step::SkillSwapped,
+                AutomaticTestCheckpoint::BeforeReceiptSwap => Step::BeforeReceiptSwap,
+                AutomaticTestCheckpoint::AfterReceiptSwap => Step::ReceiptSwapped,
+            }))
+        });
+    }
+    #[cfg(test)]
+    pub(super) fn automatic_test_checkpoint(step: Step) -> Result<()> {
+        if AUTOMATIC_TEST_FAILURE.with(|value| value.get() == Some(step)) {
+            if AUTOMATIC_TEST_EXIT.with(|value| value.get()) {
+                std::process::exit(93);
+            }
+            Err(error("injected"))
+        } else {
+            Ok(())
+        }
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Placement {
@@ -676,16 +849,27 @@ mod supported {
         agent: &str,
         excluding: Option<&str>,
     ) -> Result<()> {
+        inspect_history(active, target, agent, excluding, true).map(|_| ())
+    }
+    fn inspect_history(
+        active: &Directory,
+        target: &Target,
+        agent: &str,
+        excluding: Option<&str>,
+        establish_terminal_durability: bool,
+    ) -> Result<String> {
         active.check()?;
         let mut count = 0;
         let mut found = false;
+        let mut history = Vec::new();
         for entry in fs::read_dir(&active.path).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
             let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(id) = name.strip_prefix(PREFIX) else {
+            if !name.as_bytes().starts_with(PREFIX.as_bytes()) {
                 continue;
-            };
+            }
+            let name = name.to_str().ok_or_else(|| error("pending_transaction"))?;
+            let id = &name[PREFIX.len()..];
             count += 1;
             if count > MAX_TRANSACTIONS {
                 return Err(error("transaction_limit"));
@@ -697,6 +881,7 @@ mod supported {
             let completed = (|| {
                 validate_id(id)?;
                 let tx = Directory::open(&entry.path())?;
+                let recorded = tx.read(MANIFEST, LIMIT)?;
                 load_intent(&tx, target, agent, id)?;
                 let back = marker(&tx, id, ROLLED_BACK)?;
                 let rolling = marker(&tx, id, ROLLBACK)?;
@@ -708,12 +893,22 @@ mod supported {
                 } else {
                     None
                 };
-                if let Some(name) = terminal {
+                if let Some(name) = terminal.filter(|_| establish_terminal_durability) {
                     // Complete visible marker bytes can survive a failed file
                     // fsync. Establish their durability before a later operation
                     // moves the inode needed to reconcile this older transaction.
                     publish_marker(&tx, id, name)?;
                 }
+                if tx.read(MANIFEST, LIMIT)?.record != recorded.record {
+                    return Err(error("transaction_changed"));
+                }
+                history.push((
+                    id.to_owned(),
+                    recorded.record.sha256,
+                    applied,
+                    rolling,
+                    back,
+                ));
                 Ok::<_, ManagedSkillError>(terminal.is_some())
             })();
             if completed != Ok(true) {
@@ -723,12 +918,93 @@ mod supported {
         if count == MAX_TRANSACTIONS && excluding.is_some() && !found {
             return Err(error("transaction_limit"));
         }
-        active.check()
+        active.check()?;
+        history.sort();
+        // The entry count and every intent are bounded above. Exact journal
+        // history catches an explicit apply/rollback that restored old inodes.
+        let bytes = serde_json::to_vec(&history).map_err(|_| error("invalid_journal"))?;
+        Ok(sha256(&bytes))
     }
     pub(super) fn check_pending(agent: &str, root: &Path) -> Result<()> {
         let target = target(agent, root, "", "0.0.0")?;
         let active = Directory::open(target.path.parent().unwrap())?;
         pending(&active, &target, agent, None)
+    }
+
+    fn baseline_from_observed(
+        active: &Directory,
+        target: &Target,
+        agent: &str,
+        skill: &Observed,
+        receipt: &Observed,
+    ) -> Result<BaselineBinding> {
+        let enrolled = parse_receipt(&receipt.bytes, agent, &target.path_text)?;
+        if enrolled.enrolled_sha256 != skill.record.sha256 {
+            return Err(error("installed_modified"));
+        }
+        let history_sha256 = inspect_history(active, target, agent, None, false)?;
+        let directory = active.binding()?;
+        if active.read("SKILL.md", MAX_SKILL_BYTES)?.record != skill.record
+            || active.read(ENROLLMENT_FILE, LIMIT)?.record != receipt.record
+        {
+            return Err(error("baseline_changed"));
+        }
+        Ok(BaselineBinding {
+            agent: agent.into(),
+            path: target.path_text.clone(),
+            directory,
+            skill: skill.record.clone(),
+            receipt: receipt.record.clone(),
+            installed_sha256: skill.record.sha256.clone(),
+            enrolled_version: enrolled.enrolled_version,
+            history_sha256,
+        })
+    }
+    fn baseline_locked(
+        active: &Directory,
+        target: &Target,
+        agent: &str,
+    ) -> Result<BaselineBinding> {
+        let skill = active.read("SKILL.md", MAX_SKILL_BYTES)?;
+        let receipt = active.read(ENROLLMENT_FILE, LIMIT)?;
+        baseline_from_observed(active, target, agent, &skill, &receipt)
+    }
+    pub(super) fn inspect_baseline(agent: &str, root: &Path) -> Result<BaselineBinding> {
+        let target = target(agent, root, "", "0.0.0")?;
+        let active = Directory::open(target.path.parent().unwrap())?;
+        active.lock()?;
+        baseline_locked(&active, &target, agent)
+    }
+    pub(super) fn inspect_completion(
+        agent: &str,
+        root: &Path,
+        expected: &BaselineBinding,
+        id: &str,
+        version: &str,
+        hash: &str,
+    ) -> Result<()> {
+        let (target, active, name) = locate(agent, root, id)?;
+        active.lock()?;
+        if &baseline_locked(&active, &target, agent)? != expected {
+            return Err(error("baseline_changed"));
+        }
+        let tx = Directory::open(&active.path.join(name))?;
+        let intent = load_intent(&tx, &target, agent, id)?;
+        if !marker(&tx, id, APPLIED)?
+            || marker(&tx, id, ROLLBACK)?
+            || marker(&tx, id, ROLLED_BACK)?
+            || intent.bundle_version != version
+            || intent.new_skill.sha256 != hash
+            || expected.enrolled_version != version
+            || expected.installed_sha256 != hash
+        {
+            return Err(error("completion_mismatch"));
+        }
+        let placement = placements(&active, &tx, &intent)?;
+        if placement.skill != Placement::After || placement.receipt != Placement::After {
+            return Err(error("completion_mismatch"));
+        }
+        Ok(())
     }
 
     fn observation(
@@ -827,6 +1103,7 @@ mod supported {
         staging: &Path,
         id: &str,
         name: &str,
+        expected: Option<&BaselineBinding>,
         checkpoint: &mut impl FnMut(Step) -> Result<()>,
     ) -> Result<Directory> {
         if bundle.len() as u64 > MAX_SKILL_BYTES {
@@ -866,6 +1143,11 @@ mod supported {
         }
         if candidate.bytes != bundle.as_bytes() {
             return Err(error("candidate_changed"));
+        }
+        if let Some(expected) = expected {
+            if &baseline_from_observed(active, target, agent, &skill, &receipt)? != expected {
+                return Err(error("baseline_changed"));
+            }
         }
         let updated = EnrollmentReceipt {
             schema_version: 2,
@@ -920,14 +1202,66 @@ mod supported {
         version: &str,
         staging: &Path,
         id: &str,
-        mut checkpoint: impl FnMut(Step) -> Result<()>,
+        checkpoint: impl FnMut(Step) -> Result<()>,
     ) -> Result<SkillUpdateResult> {
+        apply_checked(agent, root, bundle, version, staging, id, None, checkpoint)
+            .map(|(result, _)| result)
+    }
+    pub(super) fn apply_automatic(
+        agent: &str,
+        root: &Path,
+        bundle: &str,
+        version: &str,
+        staging: &Path,
+        id: &str,
+        expected: &BaselineBinding,
+        checkpoint: impl FnMut(Step) -> Result<()>,
+    ) -> Result<AutomaticUpdateResult> {
+        let (result, committed_baseline) = apply_checked(
+            agent,
+            root,
+            bundle,
+            version,
+            staging,
+            id,
+            Some(expected),
+            checkpoint,
+        )?;
+        Ok(AutomaticUpdateResult {
+            result,
+            committed_baseline: committed_baseline.ok_or_else(|| error("recovery_required"))?,
+        })
+    }
+    fn apply_checked(
+        agent: &str,
+        root: &Path,
+        bundle: &str,
+        version: &str,
+        staging: &Path,
+        id: &str,
+        expected: Option<&BaselineBinding>,
+        mut checkpoint: impl FnMut(Step) -> Result<()>,
+    ) -> Result<(SkillUpdateResult, Option<BaselineBinding>)> {
         // Validate the public library API as strictly as the CLI's embedded inputs.
         target(agent, root, bundle, version)?;
         let (target, active, name) = locate(agent, root, id)?;
         active.lock()?;
+        if let Some(expected) = expected {
+            // Refuse stale authority or any prior operation before pending()
+            // is allowed to fsync historical markers. Never resume automatically.
+            if active.exists(&name)? {
+                return Err(error("operation_exists"));
+            }
+            if &baseline_locked(&active, &target, agent)? != expected {
+                return Err(error("baseline_changed"));
+            }
+            checkpoint(Step::BaselineValidated)?;
+        }
         pending(&active, &target, agent, Some(id))?;
         let exists = active.exists(&name)?;
+        if expected.is_some() && exists {
+            return Err(error("operation_exists"));
+        }
         let staging = if exists {
             std::path::absolute(staging).map_err(io_error)?
         } else {
@@ -945,6 +1279,7 @@ mod supported {
                 &staging,
                 id,
                 &name,
+                expected,
                 &mut checkpoint,
             )?
         };
@@ -1005,7 +1340,7 @@ mod supported {
             checkpoint(Step::AppliedRecorded)?;
             Ok(observation(&target, &active, &tx, agent, id))
         };
-        match resume() {
+        let result = match resume() {
             Ok(v) => Ok(v),
             Err(e)
                 if matches!(
@@ -1019,7 +1354,31 @@ mod supported {
                 Err(e)
             }
             Err(_) => Err(error("recovery_required")),
-        }
+        }?;
+        let committed_baseline = if expected.is_some() {
+            let checked = || -> Result<BaselineBinding> {
+                let intent = load_intent(&tx, &target, agent, id)?;
+                let committed = baseline_locked(&active, &target, agent)?;
+                let placement = placements(&active, &tx, &intent)?;
+                if result.state != "applied"
+                    || result.current_state != "updated"
+                    || result.error_code.is_some()
+                    || placement.skill != Placement::After
+                    || placement.receipt != Placement::After
+                    || committed.skill != intent.new_skill
+                    || committed.receipt != intent.new_receipt
+                    || committed.enrolled_version != intent.bundle_version
+                    || committed.directory != expected.unwrap().directory
+                {
+                    return Err(error("transaction_changed"));
+                }
+                Ok(committed)
+            };
+            Some(checked().map_err(|_| error("recovery_required"))?)
+        } else {
+            None
+        };
+        Ok((result, committed_baseline))
     }
     pub(super) fn rollback(
         agent: &str,
@@ -1190,6 +1549,356 @@ mod supported {
         impl Drop for Fixture {
             fn drop(&mut self) {
                 let _ = fs::remove_dir_all(&self.home);
+            }
+        }
+
+        fn automatic(f: &Fixture, expected: &BaselineBinding) -> Result<AutomaticUpdateResult> {
+            apply_automatic_skill_update(
+                "codex",
+                &f.root(),
+                NEW,
+                NEW_VERSION,
+                &f.staged(),
+                &f.id,
+                expected,
+            )
+        }
+        #[test]
+        fn automatic_baseline_inspection_is_strict_and_never_syncs() {
+            let f = Fixture::new();
+            for kind in ["file_sync", "directory_sync", "write", "swap"] {
+                fault(kind, 1);
+                let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+                assert_eq!(baseline.installed_sha256, sha256(OLD.as_bytes()));
+                assert_eq!(baseline.enrolled_version, OLD_VERSION);
+                assert_eq!(clear_fault(), 0);
+            }
+            f.apply().unwrap();
+            // Even a terminal marker is only observed, not fsynced by inspection.
+            fault("file_sync", 1);
+            inspect_automatic_baseline("codex", &f.root()).unwrap();
+            assert_eq!(clear_fault(), 0);
+            fs::write(f.skill(), "synthetic edit").unwrap();
+            assert_eq!(
+                inspect_automatic_baseline("codex", &f.root())
+                    .unwrap_err()
+                    .code,
+                "installed_modified"
+            );
+        }
+        #[test]
+        fn automatic_apply_returns_checked_baseline_and_never_replays_an_id() {
+            let f = Fixture::new();
+            let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            let outcome = automatic(&f, &baseline).unwrap();
+            assert_eq!(outcome.result.state, "applied");
+            assert_eq!(outcome.result.current_state, "updated");
+            assert_eq!(
+                outcome.committed_baseline,
+                inspect_automatic_baseline("codex", &f.root()).unwrap()
+            );
+            assert_ne!(
+                outcome.committed_baseline.history_sha256,
+                baseline.history_sha256
+            );
+            assert_eq!(outcome.committed_baseline.directory, baseline.directory);
+            fault("file_sync", 1);
+            assert_eq!(
+                automatic(&f, &outcome.committed_baseline).unwrap_err().code,
+                "operation_exists"
+            );
+            assert_eq!(clear_fault(), 0);
+            // The explicit interface still supports historical idempotent replay.
+            assert_eq!(f.apply().unwrap().state, "applied");
+        }
+        #[test]
+        fn automatic_completion_requires_exact_current_terminal_transaction_without_sync() {
+            let f = Fixture::new();
+            let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            let committed = automatic(&f, &baseline).unwrap().committed_baseline;
+            let hash = sha256(NEW.as_bytes());
+            for kind in ["file_sync", "directory_sync", "write", "swap"] {
+                fault(kind, 1);
+                inspect_automatic_completion(
+                    "codex",
+                    &f.root(),
+                    &committed,
+                    &f.id,
+                    NEW_VERSION,
+                    &hash,
+                )
+                .unwrap();
+                assert!(inspect_automatic_completion(
+                    "codex",
+                    &f.root(),
+                    &committed,
+                    &f.id,
+                    OLD_VERSION,
+                    &hash
+                )
+                .is_err());
+                assert!(inspect_automatic_completion(
+                    "codex",
+                    &f.root(),
+                    &committed,
+                    &f.id,
+                    NEW_VERSION,
+                    &sha256(OLD.as_bytes())
+                )
+                .is_err());
+                assert!(inspect_automatic_completion(
+                    "codex",
+                    &f.root(),
+                    &committed,
+                    &uuid::Uuid::new_v4().to_string(),
+                    NEW_VERSION,
+                    &hash
+                )
+                .is_err());
+                assert_eq!(clear_fault(), 0);
+            }
+            f.back().unwrap();
+            let rolled_back = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            assert!(inspect_automatic_completion(
+                "codex",
+                &f.root(),
+                &rolled_back,
+                &f.id,
+                NEW_VERSION,
+                &hash
+            )
+            .is_err());
+        }
+        #[test]
+        fn automatic_completion_validates_retained_placement_not_only_terminal_marker() {
+            let f = Fixture::new();
+            let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            let committed = automatic(&f, &baseline).unwrap().committed_baseline;
+            fs::write(f.tx().join(SKILL_SLOT), "synthetic changed retained object").unwrap();
+            assert_eq!(
+                inspect_automatic_baseline("codex", &f.root()).unwrap(),
+                committed
+            );
+            fault("file_sync", 1);
+            assert!(inspect_automatic_completion(
+                "codex",
+                &f.root(),
+                &committed,
+                &f.id,
+                NEW_VERSION,
+                &sha256(NEW.as_bytes())
+            )
+            .is_err());
+            assert_eq!(clear_fault(), 0);
+            assert_eq!(fs::read(f.skill()).unwrap(), NEW.as_bytes());
+        }
+        #[test]
+        fn automatic_baseline_rejects_same_bytes_on_replaced_objects_before_io() {
+            for target in 0..3 {
+                let f = Fixture::new();
+                let expected = inspect_automatic_baseline("codex", &f.root()).unwrap();
+                if target == 2 {
+                    fs::rename(f.dir(), f.home.join("retained-directory")).unwrap();
+                    fs::create_dir(f.dir()).unwrap();
+                    fs::copy(f.home.join("retained-directory/SKILL.md"), f.skill()).unwrap();
+                    fs::copy(
+                        f.home.join("retained-directory").join(ENROLLMENT_FILE),
+                        f.receipt(),
+                    )
+                    .unwrap();
+                } else {
+                    let path = if target == 0 { f.skill() } else { f.receipt() };
+                    let replacement = f.home.join("replacement");
+                    fs::copy(&path, &replacement).unwrap();
+                    fs::rename(&replacement, &path).unwrap();
+                }
+                fault("file_sync", 1);
+                assert_eq!(
+                    automatic(&f, &expected).unwrap_err().code,
+                    "baseline_changed"
+                );
+                assert_eq!(clear_fault(), 0);
+                assert!(!f.tx().exists());
+                f.baseline();
+            }
+        }
+        #[test]
+        fn automatic_history_detects_explicit_apply_then_rollback() {
+            let f = Fixture::new();
+            let expected = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            f.apply().unwrap();
+            f.back().unwrap();
+            let after = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            assert_eq!(after.skill, expected.skill);
+            assert_eq!(after.receipt, expected.receipt);
+            assert_ne!(after.history_sha256, expected.history_sha256);
+            let new_id = uuid::Uuid::new_v4().to_string();
+            fault("file_sync", 1);
+            assert_eq!(
+                apply_automatic_skill_update(
+                    "codex",
+                    &f.root(),
+                    NEW,
+                    NEW_VERSION,
+                    &f.staged(),
+                    &new_id,
+                    &expected
+                )
+                .unwrap_err()
+                .code,
+                "baseline_changed"
+            );
+            assert_eq!(clear_fault(), 0);
+            assert!(!f.dir().join(format!("{PREFIX}{new_id}")).exists());
+        }
+        #[test]
+        fn automatic_capture_rejects_partial_and_malformed_journals_without_sync() {
+            for malformed in [false, true] {
+                let f = Fixture::new();
+                if malformed {
+                    f.apply().unwrap();
+                    fs::write(f.tx().join(APPLIED), b"{").unwrap();
+                } else {
+                    f.at(Step::Prepared).unwrap_err();
+                }
+                fault("file_sync", 1);
+                assert_eq!(
+                    inspect_automatic_baseline("codex", &f.root())
+                        .unwrap_err()
+                        .code,
+                    "pending_transaction"
+                );
+                assert_eq!(clear_fault(), 0);
+            }
+        }
+        #[test]
+        fn non_utf8_transaction_suffix_is_retained_and_blocks_without_sync() {
+            use std::os::unix::ffi::OsStringExt;
+            let f = Fixture::new();
+            fs::write(
+                f.dir()
+                    .join(std::ffi::OsString::from_vec(b"unrelated-\xff".to_vec())),
+                b"synthetic",
+            )
+            .unwrap();
+            let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            let malformed = f.dir().join(std::ffi::OsString::from_vec(
+                b".sniper-update-\xff".to_vec(),
+            ));
+            fs::create_dir(&malformed).unwrap();
+            fault("file_sync", 1);
+            assert_eq!(
+                inspect_automatic_baseline("codex", &f.root())
+                    .unwrap_err()
+                    .code,
+                "pending_transaction"
+            );
+            assert_eq!(
+                automatic(&f, &baseline).unwrap_err().code,
+                "pending_transaction"
+            );
+            assert_eq!(clear_fault(), 0);
+            assert!(malformed.is_dir());
+            assert!(!f.tx().exists());
+            f.baseline();
+        }
+        #[test]
+        fn automatic_prepare_rechecks_the_authorized_snapshot_before_first_write() {
+            let f = Fixture::new();
+            let expected = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            fault("file_sync", 1);
+            let result = apply_automatic(
+                "codex",
+                &f.root(),
+                NEW,
+                NEW_VERSION,
+                &f.staged(),
+                &f.id,
+                &expected,
+                |step| {
+                    if step == Step::BaselineValidated {
+                        let replacement = f.home.join("same-byte-replacement");
+                        fs::copy(f.skill(), &replacement).unwrap();
+                        fs::rename(replacement, f.skill()).unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(result.unwrap_err().code, "baseline_changed");
+            assert_eq!(clear_fault(), 0);
+            assert!(!f.tx().exists());
+            f.baseline();
+        }
+        #[test]
+        fn automatic_apply_refuses_a_transaction_created_after_its_first_check() {
+            let f = Fixture::new();
+            let expected = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            fault("file_sync", 1);
+            let result = apply_automatic(
+                "codex",
+                &f.root(),
+                NEW,
+                NEW_VERSION,
+                &f.staged(),
+                &f.id,
+                &expected,
+                |step| {
+                    if step == Step::BaselineValidated {
+                        fs::create_dir(f.tx()).unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(result.unwrap_err().code, "operation_exists");
+            assert_eq!(clear_fault(), 0);
+            assert_eq!(fs::read_dir(f.tx()).unwrap().count(), 0);
+            f.baseline();
+        }
+        #[test]
+        fn automatic_committed_result_refuses_an_editor_change_after_publication() {
+            let f = Fixture::new();
+            let expected = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            let result = apply_automatic(
+                "codex",
+                &f.root(),
+                NEW,
+                NEW_VERSION,
+                &f.staged(),
+                &f.id,
+                &expected,
+                |step| {
+                    if step == Step::AppliedRecorded {
+                        fs::write(f.skill(), "synthetic later editor save").unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(result.unwrap_err().code, "recovery_required");
+            assert_eq!(fs::read(f.skill()).unwrap(), b"synthetic later editor save");
+            assert_eq!(fs::read(f.tx().join(SKILL_SLOT)).unwrap(), OLD.as_bytes());
+            assert_eq!(f.result().state, "applied");
+            assert_eq!(f.result().current_state, "changed");
+        }
+        #[test]
+        fn automatic_test_hook_interrupts_each_swap_boundary_without_enabling_resume() {
+            for point in [
+                AutomaticTestCheckpoint::BeforeSkillSwap,
+                AutomaticTestCheckpoint::AfterSkillSwap,
+                AutomaticTestCheckpoint::BeforeReceiptSwap,
+                AutomaticTestCheckpoint::AfterReceiptSwap,
+            ] {
+                let f = Fixture::new();
+                let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+                set_automatic_test_failure(Some(point));
+                let interrupted = automatic(&f, &baseline);
+                set_automatic_test_failure(None);
+                assert_eq!(interrupted.unwrap_err().code, "recovery_required");
+                assert_eq!(
+                    automatic(&f, &baseline).unwrap_err().code,
+                    "operation_exists"
+                );
+                assert_eq!(f.back().unwrap().state, "rolled_back");
+                f.baseline();
             }
         }
 

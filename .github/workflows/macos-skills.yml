@@ -71,10 +71,14 @@ jobs:
           done
           cargo test --locked --release --lib skill_activation:: \
             2>&1 | tee "$evidence/activation-tests.log"
+          cargo check --locked --release --bin sniper-desktop \
+            2>&1 | tee "$evidence/desktop-compile.log"
+          cargo test --locked --release --lib skill_auto_update:: \
+            2>&1 | tee "$evidence/auto-update-tests.log"
           cargo test --locked --release --lib skill_managed:: \
             2>&1 | tee "$evidence/managed-tests.log"
           cargo test --locked --release \
-            --test skills_activation_cli --test skills_managed_cli \
+            --test skills_activation_cli --test skills_managed_cli --test skills_auto_update_cli \
             2>&1 | tee "$evidence/cli-tests.log"
       - name: Preserve focused native test evidence
         if: always()

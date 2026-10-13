@@ -79,7 +79,7 @@ See the [CLI integration guide](../integrations/codex.md),
 [saved-data contract](../integrations/saved-data-v1.md), and
 [saved-tab metadata operations](../integrations/saved-replay-tabs.md).
 
-## Explicit local skill maintenance (partial milestone)
+## Local skill maintenance and explicit automatic-update consent
 
 `skills status` compares installed files with the embedded bundle without
 returning their text. A differing hash means `modified_or_outdated`; it does not
@@ -105,12 +105,27 @@ invent a replacement ID, or remove artifacts to bypass a blocked transaction.
 Incomplete or corrupted preparation or markers need manual reconciliation.
 There is a 128-retained-operation cap and no automatic pruning.
 
-No startup hook, unattended activation, network access or agent reload is enabled.
-Only global dry run is argument-only and performs no filesystem inspection.
+Automatic updates remain Off by default. Separate `skills enable-auto-updates
+--yes` consent binds one unchanged managed installation and only records
+permission; it does not immediately change the active file. Read-only
+`auto-update-status`, explicit `auto-update-once --yes`, and
+`disable-auto-updates --yes` use that policy's stored target and reject directory
+overrides. Existing policies require their exact current `--policy-revision` to
+re-enable, creating a fresh authorization generation. Modified, conflicting or
+uncertain state pauses and preserves artifacts instead of resuming silently.
+
+The desktop schedules one background pass at its first idle event after the
+WebView exists; it is not a repeating timer. Headless startup and ordinary CLI
+commands do not trigger it. Candidates come only from the local binary's bundle;
+there is no network fetch or agent reload. Only global dry run is argument-only
+and performs no filesystem inspection.
 Existing legacy installation can overwrite an installed skill and is never a
-recovery fallback. Linux exchange has native fixture coverage; the macOS swap
-adapter has only been source-reviewed, without macOS compilation or runtime
-testing here. Windows activation, rollback and result inspection are unsupported.
+recovery fallback. Linux exchange has native fixture coverage. The baseline
+macOS ARM64 swap adapter passed 80 focused tests in
+[hosted CI](https://github.com/sm1ee/Sniper/actions/runs/38414932831) at `875e3cc`;
+new automatic-update-layer native CI, Intel, user-device and GUI validation remain
+pending. Windows activation, rollback, result inspection and host-policy
+operations are unsupported.
 
 See [safe skill maintenance](../integrations/skill-maintenance.md) for exact
 commands, confirmation requirements, refusal states and recovery limitations.

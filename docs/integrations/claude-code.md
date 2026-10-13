@@ -52,7 +52,10 @@ Before replacing an existing copy, use `skills status --claude` or
 `skills update-preview --claude` to inspect it without writing. See
 [safe skill maintenance](skill-maintenance.md) for explicit enrollment,
 experimental candidate staging, and preservation limits. Staging does not
-activate an update or enable unattended startup replacement.
+activate an update or enable unattended startup replacement. Automatic updates
+are Off by default and require separate explicit `enable-auto-updates --claude
+--yes` consent; it only records authorization. Inspect the host-local policy with
+`auto-update-status --claude`.
 
 Two things `skills install` does not do. It never touches `PATH` — put `sniper-cli`
 there yourself, as the [CLI section of the README](../../README.md#cli) describes. And

@@ -431,13 +431,47 @@ refused. Explicit `skills rollback-update --yes` uses that original apply ID to
 restore the bound baseline and preserves displaced objects. Unexpected changes
 can block rollback; there is no force-overwrite fallback.
 
-Linux exchange has native fixture coverage. The macOS swap adapter is source
-reviewed only, without macOS compilation or runtime validation here. Windows
-activation, rollback and result inspection are unsupported. There is a cap of
+Linux exchange has native fixture coverage. The baseline macOS ARM64 swap
+adapter at `875e3cc` passed 80 focused hosted CI tests; native CI for the new
+automatic-update layer, Intel Macs, user-device and GUI validation remain pending.
+Windows activation, rollback and result inspection are unsupported. There is a cap of
 128 retained operations and no automatic pruning. Partial or corrupted preparation
 or markers require manual reconciliation while preserving all artifacts.
 The legacy `skills install --yes` can overwrite installations; never use it as
 an automatic update or recovery fallback.
+
+Automatic updates are Off by default and require separate explicit user approval
+of future bundled updates for one unchanged managed installation. Never infer
+that approval from enrollment, an app upgrade, startup, or reading this skill.
+Discover `skills.auto_update_status`, `skills.enable_auto_updates`,
+`skills.disable_auto_updates`, and `skills.auto_update_once` before use.
+`auto-update-status` is read-only; enable, disable and one-shot execution require
+`--yes`. Enable records consent only and does not immediately update the skill.
+Only enable accepts a selected agent's directory override; status, disable and
+once always use the recorded target and reject redirection. Select exactly one
+agent; `--all` is unsupported for these commands.
+
+Host policy lives under the local Sniper data directory's `host-skill-updates`,
+not session data or exports. Remote `--api` is never contacted. The desktop runs
+one background pass after its first idle event; headless startup and ordinary
+CLI commands do not run it. Candidates come only from the executing binary's
+bundle and different bytes need a strictly newer semantic version. No network
+fetch, automatic enrollment, adoption of edits, overwrite fallback, pruning or
+agent reload is permitted.
+
+Inspect policy `state`, `error_code` and optional retained `pause_reason`;
+`enabled:true` can coexist with `paused`.
+A pending or uncertain attempt consumes its authorization and is not permission
+to retry, invent another ID or resume at startup. Preserve all policy, attempt,
+staging and transaction artifacts. After lost output, inspect
+`skills auto-update-status` and the original transaction when present. A pause or
+disabled policy never re-enables itself. Re-enable only after explicit user
+approval and review, supplying the exact current `--policy-revision` from status
+and the original target; this creates a new authorization generation. Disable
+revokes future work without undoing committed updates. Windows host-policy
+operations are unsupported. Dry run remains argument-only with zero filesystem
+or API I/O and cannot establish eligibility. For these four operations, canonical
+`call --dry-run` requires inline JSON; `@file` and stdin are rejected before reads.
 
 ## Guardrails
 
