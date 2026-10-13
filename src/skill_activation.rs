@@ -2040,6 +2040,288 @@ mod supported {
             }
         }
 
+        // These fixtures compile only on macOS. Linux test success does not
+        // validate Darwin FFI, actual ACL inheritance, or native swap durability.
+        #[cfg(target_os = "macos")]
+        mod macos_acl_fixtures {
+            use super::*;
+            use std::ffi::c_void;
+
+            const EXTENDED: i32 = 0x100;
+            const ALLOW: i32 = 1;
+            const DENY: i32 = 2;
+            const READ_ATTRIBUTES: u64 = 1 << 7;
+            const WRITE_ATTRIBUTES: u64 = 1 << 8;
+            const INHERITED: u32 = 1 << 4;
+            const FILE_INHERIT: u32 = 1 << 5;
+            const DIRECTORY_INHERIT: u32 = 1 << 6;
+            const ONLY_INHERIT: u32 = 1 << 8;
+
+            // Types/constants follow Apple's sys/acl.h and membership.h. The
+            // setter order is fd, acl, type; the getter order is fd, type.
+            unsafe extern "C" {
+                fn acl_init(count: i32) -> *mut c_void;
+                fn acl_free(object: *mut c_void) -> i32;
+                fn acl_create_entry(acl: *mut *mut c_void, entry: *mut *mut c_void) -> i32;
+                fn acl_valid(acl: *mut c_void) -> i32;
+                fn acl_set_tag_type(entry: *mut c_void, tag: i32) -> i32;
+                fn acl_get_tag_type(entry: *mut c_void, tag: *mut i32) -> i32;
+                fn acl_set_qualifier(entry: *mut c_void, qualifier: *const c_void) -> i32;
+                fn acl_get_qualifier(entry: *mut c_void) -> *mut c_void;
+                fn acl_set_permset_mask_np(entry: *mut c_void, mask: u64) -> i32;
+                fn acl_get_permset_mask_np(entry: *mut c_void, mask: *mut u64) -> i32;
+                fn acl_get_flagset_np(entry: *mut c_void, flags: *mut *mut c_void) -> i32;
+                fn acl_add_flag_np(flags: *mut c_void, flag: u32) -> i32;
+                fn acl_get_flag_np(flags: *mut c_void, flag: u32) -> i32;
+                fn acl_get_entry(acl: *mut c_void, which: i32, entry: *mut *mut c_void) -> i32;
+                fn acl_get_fd_np(fd: i32, kind: i32) -> *mut c_void;
+                fn acl_set_fd_np(fd: i32, acl: *mut c_void, kind: i32) -> i32;
+                fn mbr_uid_to_uuid(uid: libc::uid_t, uuid: *mut u8) -> i32;
+            }
+
+            struct Allocation(*mut c_void);
+            impl Drop for Allocation {
+                fn drop(&mut self) {
+                    // SAFETY: this owns one allocation returned by a Darwin ACL API.
+                    unsafe { acl_free(self.0) };
+                }
+            }
+            fn empty_acl() -> Allocation {
+                // SAFETY: zero entries is the supported empty ACL constructor.
+                let pointer = unsafe { acl_init(0) };
+                assert!(!pointer.is_null(), "allocate synthetic empty ACL");
+                Allocation(pointer)
+            }
+            fn read_acl(file: &File) -> Option<Allocation> {
+                // SAFETY: the descriptor belongs to an owned synthetic fixture.
+                let pointer = unsafe { acl_get_fd_np(file.as_raw_fd(), EXTENDED) };
+                if pointer.is_null() {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ENOENT),
+                        "native ACL inspection must work; do not skip unsupported/error results"
+                    );
+                    None
+                } else {
+                    let acl = Allocation(pointer);
+                    assert_eq!(unsafe { acl_valid(acl.0) }, 0, "valid fixture ACL");
+                    Some(acl)
+                }
+            }
+            fn owner_uuid() -> [u8; 16] {
+                let mut uuid = [0; 16];
+                // SAFETY: uid is this process's owner and the output is 16 bytes.
+                assert_eq!(
+                    unsafe { mbr_uid_to_uuid(libc::geteuid(), uuid.as_mut_ptr()) },
+                    0,
+                    "resolve only the fixture owner"
+                );
+                uuid
+            }
+            fn owner_acl(tag: i32, mask: u64, inheritable: bool) -> Allocation {
+                assert!(matches!(
+                    (tag, mask),
+                    (ALLOW, READ_ATTRIBUTES) | (DENY, WRITE_ATTRIBUTES)
+                ));
+                let mut acl = empty_acl();
+                let mut entry = std::ptr::null_mut();
+                let owner = owner_uuid();
+                // SAFETY: all pointers refer to live owned ACL/output storage;
+                // create_entry may replace the owned ACL allocation in place.
+                unsafe {
+                    assert_eq!(acl_create_entry(&mut acl.0, &mut entry), 0);
+                    assert_eq!(acl_set_tag_type(entry, tag), 0);
+                    assert_eq!(acl_set_qualifier(entry, owner.as_ptr().cast()), 0);
+                    assert_eq!(acl_set_permset_mask_np(entry, mask), 0);
+                    if inheritable {
+                        assert_eq!(tag, ALLOW);
+                        let mut flags = std::ptr::null_mut();
+                        assert_eq!(acl_get_flagset_np(entry, &mut flags), 0);
+                        for flag in [FILE_INHERIT, DIRECTORY_INHERIT, ONLY_INHERIT] {
+                            assert_eq!(acl_add_flag_np(flags, flag), 0);
+                        }
+                    }
+                    assert_eq!(acl_valid(acl.0), 0);
+                }
+                acl
+            }
+            fn open_fixture(f: &Fixture, path: &Path, directory: bool) -> File {
+                assert!(
+                    path.starts_with(&f.home),
+                    "ACL fixture must stay inside its UUID temporary root"
+                );
+                let before = fs::symlink_metadata(path).unwrap();
+                assert!(!before.file_type().is_symlink());
+                assert_eq!(before.uid(), unsafe { libc::geteuid() });
+                assert_eq!(before.is_dir(), directory);
+                assert_eq!(before.is_file(), !directory);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        libc::O_NOFOLLOW
+                            | libc::O_NONBLOCK
+                            | libc::O_CLOEXEC
+                            | if directory { libc::O_DIRECTORY } else { 0 },
+                    )
+                    .open(path)
+                    .unwrap();
+                assert!(identity(&before, &file.metadata().unwrap()));
+                file
+            }
+            struct RestoreAcl<'a> {
+                file: &'a File,
+                original: Allocation,
+            }
+            impl Drop for RestoreAcl<'_> {
+                fn drop(&mut self) {
+                    // The fixture ACEs never deny WRITE_SECURITY, traversal or
+                    // deletion. Restore through the same fd before temp cleanup.
+                    let rc =
+                        unsafe { acl_set_fd_np(self.file.as_raw_fd(), self.original.0, EXTENDED) };
+                    if rc != 0 {
+                        if std::thread::panicking() {
+                            eprintln!("synthetic ACL restoration failed; temporary fixture cleanup remains enabled");
+                        } else {
+                            panic!("restore synthetic fixture ACL");
+                        }
+                    }
+                }
+            }
+            fn install<'a>(file: &'a File, acl: &Allocation) -> RestoreAcl<'a> {
+                let restore = RestoreAcl {
+                    file,
+                    original: read_acl(file).unwrap_or_else(empty_acl),
+                };
+                // SAFETY: owned fixture descriptor and a validated live ACL.
+                assert_eq!(
+                    unsafe { acl_set_fd_np(file.as_raw_fd(), acl.0, EXTENDED) },
+                    0,
+                    "install only the synthetic current-owner ACE"
+                );
+                restore
+            }
+            fn assert_entry(file: &File, expected_tag: i32, expected_mask: u64, inherited: bool) {
+                let acl = read_acl(file).expect("real ACE must be present");
+                let mut entry = std::ptr::null_mut();
+                let mut tag = 0;
+                let mut mask = 0;
+                let mut flags = std::ptr::null_mut();
+                // Entry and flagset pointers are borrowed from acl, never freed.
+                unsafe {
+                    assert_eq!(acl_get_entry(acl.0, 0, &mut entry), 0);
+                    assert_eq!(acl_get_tag_type(entry, &mut tag), 0);
+                    assert_eq!(acl_get_permset_mask_np(entry, &mut mask), 0);
+                    assert_eq!(acl_get_flagset_np(entry, &mut flags), 0);
+                    assert_eq!(acl_get_flag_np(flags, INHERITED), i32::from(inherited));
+                    let pointer = acl_get_qualifier(entry);
+                    assert!(!pointer.is_null());
+                    let qualifier = Allocation(pointer);
+                    let expected_owner = owner_uuid();
+                    assert_eq!(
+                        std::slice::from_raw_parts(qualifier.0.cast::<u8>(), 16),
+                        expected_owner.as_slice()
+                    );
+                }
+                assert_eq!(tag, expected_tag);
+                assert_eq!(mask, expected_mask);
+                let mut next = std::ptr::null_mut();
+                assert_eq!(
+                    unsafe { acl_get_entry(acl.0, -1, &mut next) },
+                    -1,
+                    "exactly one fixture ACE"
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINVAL)
+                );
+            }
+
+            #[test]
+            fn absent_and_explicitly_empty_acls_allow_private_fixture_files_and_directories() {
+                let f = Fixture::new();
+                for (path, directory) in [(f.skill(), false), (f.dir(), true)] {
+                    let file = open_fixture(&f, &path, directory);
+                    check_macos_acl(&file).unwrap();
+                    let empty = empty_acl();
+                    let _restore = install(&file, &empty);
+                    // The filesystem may canonicalize an empty ACL to absent.
+                    check_macos_acl(&file).unwrap();
+                    validate_access_metadata(&file).unwrap();
+                }
+                f.apply().unwrap();
+                f.back().unwrap();
+                f.baseline();
+                fs::remove_dir_all(&f.home).unwrap();
+            }
+            #[test]
+            fn current_owner_allow_and_deny_aces_refuse_before_activation() {
+                for (tag, mask) in [(ALLOW, READ_ATTRIBUTES), (DENY, WRITE_ATTRIBUTES)] {
+                    for target in 0..3 {
+                        let f = Fixture::new();
+                        let before_skill = fs::read(f.skill()).unwrap();
+                        let before_receipt = fs::read(f.receipt()).unwrap();
+                        let path = [f.skill(), f.receipt(), f.dir()][target].clone();
+                        let file = open_fixture(&f, &path, target == 2);
+                        {
+                            let acl = owner_acl(tag, mask, false);
+                            let _restore = install(&file, &acl);
+                            assert_entry(&file, tag, mask, false);
+                            assert_eq!(
+                                check_macos_acl(&file).unwrap_err().code,
+                                "metadata_unsupported"
+                            );
+                            assert_eq!(f.apply().unwrap_err().code, "metadata_unsupported");
+                            assert_eq!(fs::read(f.skill()).unwrap(), before_skill);
+                            assert_eq!(fs::read(f.receipt()).unwrap(), before_receipt);
+                            assert!(!f.tx().exists());
+                        }
+                        check_macos_acl(&file).unwrap();
+                        fs::remove_dir_all(&f.home).unwrap();
+                    }
+                }
+            }
+            #[test]
+            fn real_parent_inheritance_is_rejected_on_new_child_files_and_directories() {
+                let f = Fixture::new();
+                let parent = f.home.join("acl-inheritance");
+                fs::create_dir(&parent).unwrap();
+                let parent_file = open_fixture(&f, &parent, true);
+                {
+                    let acl = owner_acl(ALLOW, READ_ATTRIBUTES, true);
+                    let _restore = install(&parent_file, &acl);
+                    assert_entry(&parent_file, ALLOW, READ_ATTRIBUTES, false);
+                    let child_file = parent.join("child-file");
+                    let child_dir = parent.join("child-dir");
+                    // These objects are created after setting the parent ACL,
+                    // so inherited bits must come from the filesystem itself.
+                    fs::write(&child_file, b"synthetic inherited ACL").unwrap();
+                    fs::create_dir(&child_dir).unwrap();
+                    for (path, directory) in [(&child_file, false), (&child_dir, true)] {
+                        let file = open_fixture(&f, path, directory);
+                        assert_entry(&file, ALLOW, READ_ATTRIBUTES, true);
+                        assert_eq!(
+                            check_macos_acl(&file).unwrap_err().code,
+                            "metadata_unsupported"
+                        );
+                        if directory {
+                            assert_eq!(
+                                Directory::open(path).err().unwrap().code,
+                                "metadata_unsupported"
+                            );
+                        } else {
+                            assert_eq!(
+                                validate_file(&file, &file.metadata().unwrap(), MAX_SKILL_BYTES)
+                                    .unwrap_err()
+                                    .code,
+                                "metadata_unsupported"
+                            );
+                        }
+                    }
+                }
+                fs::remove_dir_all(&f.home).unwrap();
+            }
+        }
+
         #[test]
         fn process_exit_after_swap_is_reconciled_by_a_new_process() {
             let f = Fixture::new();
