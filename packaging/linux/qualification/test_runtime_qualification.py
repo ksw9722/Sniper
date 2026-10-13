@@ -1,5 +1,8 @@
-"""Pure boundary/sequence/loader mocks. No APT, dpkg lifecycle or app execution."""
+"""Pure QA mocks plus an inert private-root dpkg filter test; no app execution."""
 from pathlib import Path
+import io
+import json
+import tarfile
 import subprocess
 import tempfile
 import sys
@@ -60,7 +63,13 @@ class LifecycleSequenceTests(unittest.TestCase):
     def test_exact_sequence_accepts_post_apt_dependency_baseline(self):
         cb = self.callbacks()
         qa.lifecycle_sequence(**cb)
-        self.assertEqual([call.args[:2] for call in cb["command"].call_args_list], [("apt-get", "install"), ("dpkg", "--remove"), ("dpkg", "--install"), ("dpkg", "--purge")])
+        commands = [call.args for call in cb["command"].call_args_list]
+        self.assertEqual(commands, [
+            ("apt-get", "install", "--no-install-recommends", "--no-remove", "-y", *qa.APT_DOC_OPTIONS, str(cb["deb"])),
+            ("dpkg", "--remove", "sniper"),
+            ("dpkg", *qa.DPKG_DOC_OPTIONS, "--install", str(cb["deb"])),
+            ("dpkg", "--purge", "sniper"),
+        ])
         self.assertEqual([call.args[0] for call in cb["record_stage"].call_args_list], ["apt-installed", "removed", "reinstalled", "purged"])
         self.assertEqual(cb["installed"].call_count, 2)
         self.assertEqual(cb["absent"].call_count, 3)
@@ -120,6 +129,166 @@ class LifecycleSequenceTests(unittest.TestCase):
                 qa.lifecycle_sequence(**cb)
             self.assertEqual(cb["command"].call_count, count)
 
+
+
+
+# Verbatim stdout of CI 38349602193 evidence/011-command.json.
+CAPTURED_LISTFILES = '/.\n/usr\n/usr/bin\n/usr/bin/sniper\n/usr/bin/sniper-cli\n/usr/bin/sniper-desktop\n/usr/share\n/usr/share/applications\n/usr/share/applications/sniper.desktop\n/usr/share/doc\n/usr/share/doc/sniper\n/usr/share/doc/sniper/LICENSE\n/usr/share/doc/sniper/README.md\n/usr/share/doc/sniper/SHA256SUMS\n/usr/share/doc/sniper/build-manifest.json\n/usr/share/icons\n/usr/share/icons/hicolor\n/usr/share/icons/hicolor/256x256\n/usr/share/icons/hicolor/256x256/apps\n/usr/share/icons/hicolor/256x256/apps/sniper.png\n'
+
+
+class InstalledInventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="sniper-installed-paths-", dir="/tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.listed = CAPTURED_LISTFILES.splitlines()
+        for row in self.listed:
+            path = self.root / row.lstrip("/")
+            if row.lstrip("/") in qa.EXPECTED:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("inert owned payload fixture\n")
+            else:
+                path.mkdir(parents=True, exist_ok=True)
+
+    def inspect(self, listed=None):
+        return qa.installed_inventory_evidence(self.listed if listed is None else listed,
+            lambda path: qa.installed_path_type(self.root / str(path).lstrip("/")))
+
+    def test_exact_ci_list_with_all_nine_regular_files_passes(self):
+        observed = self.inspect()
+        self.assertEqual(set(observed["actual_files"]), qa.EXPECTED)
+        self.assertEqual((observed["missing"], observed["unexpected"]), ([], []))
+        self.assertEqual(observed["path_types"]["/."], "directory")
+        self.assertEqual(len(qa.EXPECTED), 9)
+
+    def test_full_metadata_list_with_slim_missing_docs_still_fails(self):
+        for name in qa.DOC_PATHS:
+            (self.root / name.lstrip("/")).unlink()
+        observed = self.inspect()
+        self.assertEqual(observed["listed"], self.listed)
+        self.assertEqual(observed["missing"], sorted(path.lstrip("/") for path in qa.DOC_PATHS))
+        self.assertEqual(observed["unexpected"], [])
+        self.assertNotEqual(set(observed["actual_files"]), qa.EXPECTED)
+
+    def test_missing_binary_or_directory_in_place_of_file_remains_fatal(self):
+        path = self.root / "usr/bin/sniper"
+        path.unlink()
+        for replacement in ("missing", "directory"):
+            if replacement == "directory":
+                path.mkdir()
+            observed = self.inspect()
+            self.assertIn("usr/bin/sniper", observed["missing"])
+            self.assertEqual(observed["path_types"]["/usr/bin/sniper"], replacement)
+
+    def test_extra_file_and_special_paths_are_not_ignored(self):
+        extra = self.root / "usr/bin/unexpected"
+        extra.write_text("inert extra\n")
+        observed = self.inspect(self.listed + ["/usr/bin/unexpected"])
+        self.assertEqual(observed["unexpected"], ["usr/bin/unexpected"])
+        special = qa.installed_inventory_evidence(["/usr/bin/unexpected"], lambda path: "special")
+        self.assertEqual(special["unexpected"], ["usr/bin/unexpected"])
+
+    def test_payload_symlink_remains_rejected_by_existing_plain_path_guard(self):
+        path = self.root / "usr/bin/sniper"
+        path.unlink()
+        path.symlink_to(self.root / "usr/bin/sniper-cli")
+        self.assertEqual(self.inspect()["path_types"]["/usr/bin/sniper"], "symlink")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            qa.plain_path(path)
+
+    def test_real_dpkg_doc_filter_order_and_parent_directories_in_private_roots(self):
+        # Text-only package, no scripts/triggers/conffiles or executable payload.
+        # Keep the current UID/GID; root-owned installation is the real CI gate.
+        # This never uses the host package database or installation directory.
+        stage = self.root / "fixture-stage"
+        (stage / "DEBIAN").mkdir(parents=True)
+        (stage / "DEBIAN/control").write_text(
+            "Package: sniper-docfilter-fixture\nVersion: 1\nArchitecture: amd64\n"
+            "Maintainer: Test <test@example.com>\nDescription: inert doc filter fixture\n")
+        for relative in (*sorted(qa.EXPECTED), "usr/share/doc/unrelated/README"):
+            path = stage / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("INERT TEXT ONLY; never execute\n")
+            path.chmod(0o644)
+        deb = self.root / "inert.deb"
+        env = {key: value for key, value in qa.ENV.items() if not key.startswith("DPKG_")}
+        home = self.root / "synthetic-home"
+        home.mkdir()
+        env.update(HOME=str(home), LC_ALL="C", DPKG_COLORS="never", DPKG_NLS="0",
+                   PATH="/usr/sbin:/usr/bin:/sbin:/bin")
+        # Refuse an unexpected ambient command hook rather than execute it.
+        configs = [Path("/etc/dpkg/dpkg.cfg"), *Path("/etc/dpkg/dpkg.cfg.d").glob("*")]
+        for config in configs:
+            if config.is_file():
+                self.assertFalse(any(line.lstrip().startswith(("pre-invoke", "post-invoke"))
+                                     for line in config.read_text().splitlines()))
+        subprocess.run(("dpkg-deb", "--build", str(stage), str(deb)),
+                       env=env, capture_output=True, text=True, check=True)
+        controls = subprocess.check_output(("dpkg-deb", "--ctrl-tarfile", str(deb)), env=env)
+        with tarfile.open(fileobj=io.BytesIO(controls)) as archive:
+            self.assertEqual({item.name.removeprefix("./") for item in archive if item.isfile()}, {"control"})
+        # Exact relevant filter pair from the pinned official slim image.
+        slim = ("--path-exclude=/usr/share/doc/*", "--path-include=/usr/share/doc/*/copyright")
+        evidence = []
+        for phase, options, missing in (
+            ("slim", slim, sorted(path.lstrip("/") for path in qa.DOC_PATHS)),
+            ("included", (*slim, *qa.DPKG_DOC_OPTIONS), []),
+            ("wrong-order", (*qa.DPKG_DOC_OPTIONS, *slim), sorted(path.lstrip("/") for path in qa.DOC_PATHS)),
+        ):
+            owned = self.root / phase
+            install, database, log = owned / "root", owned / "db", owned / "dpkg.log"
+            install.mkdir(parents=True)
+            for name in ("info", "updates", "triggers"):
+                (database / name).mkdir(parents=True, exist_ok=True)
+            (database / "status").write_text("")
+            argv = ("dpkg", "--force-not-root", "--instdir=" + str(install),
+                    "--admindir=" + str(database), "--log=" + str(log), *options, "--unpack", str(deb))
+            self.assertTrue(all(path.is_relative_to(self.root) for path in (install, database, log, deb)))
+            self.assertIn("--instdir=" + str(install), argv)
+            self.assertIn("--admindir=" + str(database), argv)
+            result = subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            listed = subprocess.run(("dpkg-query", "--admindir=" + str(database), "--listfiles", "sniper-docfilter-fixture"),
+                                    env=env, capture_output=True, text=True, check=True).stdout.splitlines()
+            observed = qa.installed_inventory_evidence(listed,
+                lambda path: qa.installed_path_type(install / str(path).lstrip("/")))
+            self.assertEqual(observed["missing"], missing)
+            self.assertEqual(observed["unexpected"], [])
+            self.assertTrue(all("/" + name in listed for name in qa.EXPECTED))
+            self.assertFalse((install / "usr/share/doc/unrelated/README").exists())
+            if phase == "included":
+                self.assertTrue((install / "usr/share/doc/sniper").is_dir())
+                self.assertEqual(set(observed["actual_files"]), qa.EXPECTED)
+            evidence.append({"phase": phase, "argv": argv, "exit_code": result.returncode,
+                             "missing": observed["missing"], "unexpected": observed["unexpected"]})
+        print("Private inert dpkg filter evidence: " + json.dumps(evidence, sort_keys=True))
+
+    def test_per_operation_options_are_four_exact_doc_files_only(self):
+        self.assertEqual(set(qa.DOC_PATHS), {"/usr/share/doc/sniper/" + name for name in
+                        ("LICENSE", "README.md", "SHA256SUMS", "build-manifest.json")})
+        self.assertEqual(qa.DPKG_DOC_OPTIONS, tuple("--path-include=" + path for path in qa.DOC_PATHS))
+        self.assertEqual(qa.APT_DOC_OPTIONS, tuple(part for option in qa.DPKG_DOC_OPTIONS
+                         for part in ("-o", "DPkg::Options::=" + option)))
+        self.assertFalse(any("*" in option or "force" in option for option in qa.DPKG_DOC_OPTIONS))
+
+    def test_apt_config_preserves_all_four_forwarded_dpkg_options(self):
+        # apt-config only parses/prints options; no package action is invoked.
+        result = subprocess.run(("apt-config", *qa.APT_DOC_OPTIONS, "dump"),
+                                env=qa.ENV, capture_output=True, text=True, check=True)
+        for option in qa.DPKG_DOC_OPTIONS:
+            self.assertEqual(result.stdout.count('DPkg::Options:: "' + option + '";'), 1)
+
+    def test_filter_evidence_preserves_config_and_records_narrow_overrides(self):
+        config = self.root / "etc/dpkg"
+        (config / "dpkg.cfg.d").mkdir(parents=True)
+        path = config / "dpkg.cfg.d/docker"
+        original = "# Debian slim\npath-exclude /usr/share/doc/*\npath-include /usr/share/doc/*/copyright\n"
+        path.write_text(original)
+        observed = qa.path_filter_evidence(config)
+        self.assertEqual(observed["per_install_options"], list(qa.DPKG_DOC_OPTIONS))
+        self.assertEqual(observed["observed_configs"][str(path)]["path_filters"], original.splitlines()[1:])
+        self.assertEqual(path.read_text(), original)
+        self.assertEqual(list((config / "dpkg.cfg.d").iterdir()), [path])
 
 
 class OverrideListingTests(unittest.TestCase):

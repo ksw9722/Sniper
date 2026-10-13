@@ -21,6 +21,13 @@ sys.dont_write_bytecode = True
 from inspect_candidate import EXPECTED, ENV, inspect, plain_path, require, sha
 
 ACK = "I approve exact-candidate APT runtime installation and package lifecycle in this explicit disposable Debian 13 container"
+# Debian slim excludes /usr/share/doc/*. Re-include only our four hashed
+# payload files, for these install commands, without editing dpkg config.
+DOC_PATHS = tuple("/usr/share/doc/sniper/" + name for name in
+                  ("LICENSE", "README.md", "SHA256SUMS", "build-manifest.json"))
+DPKG_DOC_OPTIONS = tuple("--path-include=" + path for path in DOC_PATHS)
+APT_DOC_OPTIONS = tuple(part for option in DPKG_DOC_OPTIONS for part in ("-o", "DPkg::Options::=" + option))
+
 
 
 
@@ -58,19 +65,47 @@ def lifecycle_sequence(deb, pinned_hash, current_hash, command, installed, absen
     """Callbacks permit pure mocked sequence/failure tests, with no installer run."""
     absent()
     require(current_hash() == pinned_hash, "candidate changed before initial APT install")
-    command("apt-get", "install", "--no-install-recommends", "--no-remove", "-y", str(deb))
+    command("apt-get", "install", "--no-install-recommends", "--no-remove", "-y", *APT_DOC_OPTIONS, str(deb))
     installed()
     baseline = package_snapshot()
     record_stage("apt-installed")
     for stage, action in (("removed", "--remove"), ("reinstalled", "--install"), ("purged", "--purge")):
         require(current_hash() == pinned_hash, "candidate changed during qualification")
-        command("dpkg", action, str(deb) if action == "--install" else "sniper")
+        command("dpkg", *(DPKG_DOC_OPTIONS if action == "--install" else ()),
+                action, str(deb) if action == "--install" else "sniper")
         installed() if action == "--install" else absent()
         clean_audit()
         require(package_snapshot() == baseline, "unrelated package states changed")
         record_stage(stage)
 
 
+
+
+
+def path_filter_evidence(config=Path("/etc/dpkg")):
+    files = {}
+    for path in [config / "dpkg.cfg", *sorted((config / "dpkg.cfg.d").glob("*"))]:
+        if path.is_file():
+            files[str(path)] = {"sha256": sha(path), "path_filters": [line for line in path.read_text().splitlines()
+                                if re.match(r"^\s*path-(?:include|exclude)(?:\s|=)", line)]}
+    return {"observed_configs": files, "per_install_options": list(DPKG_DOC_OPTIONS),
+            "scope": "include only four Sniper documentation payload files; inherited configuration is unchanged"}
+
+
+def installed_path_type(path):
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return "missing"
+    return ("regular" if stat.S_ISREG(mode) else "directory" if stat.S_ISDIR(mode) else
+            "symlink" if stat.S_ISLNK(mode) else "special")
+
+
+def installed_inventory_evidence(listed, path_type=installed_path_type):
+    types = {path: path_type(Path(path)) for path in listed}
+    actual = {path.lstrip("/") for path, kind in types.items() if kind not in {"directory", "missing"}}
+    return {"listed": listed, "path_types": types, "actual_files": sorted(actual),
+            "missing": sorted(EXPECTED - actual), "unexpected": sorted(actual - EXPECTED)}
 
 
 def check_candidate_overrides(command):
@@ -202,12 +237,18 @@ def main():
         require(not docdir.exists(), "package documentation directory remains")
         require(synthetic_snapshot() == sentinels, "synthetic user data or profile changed")
 
+    installed_checks = 0
+
     def installed():
+        nonlocal installed_checks
+        installed_checks += 1
         status = command("dpkg-query", "--show", "--showformat=${Status}\t${Version}\t${Architecture}\t${Conffiles}", "sniper").stdout
         require(status == "install ok installed\t" + inventory["version"] + "\tamd64\t", "incorrect installed state, identity or conffiles")
         listed = command("dpkg-query", "--listfiles", "sniper").stdout.splitlines()
-        actual_files = {path.lstrip("/") for path in listed if Path(path).is_file() or Path(path).is_symlink()}
-        require(actual_files == EXPECTED, "dpkg file inventory differs")
+        observed = installed_inventory_evidence(listed)
+        (results / f"installed-files-{installed_checks}.json").write_text(json.dumps(observed, indent=2, sort_keys=True) + "\n")
+        require(set(observed["actual_files"]) == EXPECTED,
+                "dpkg file inventory differs: missing=" + repr(observed["missing"]) + "; unexpected=" + repr(observed["unexpected"]))
         for name, expected in inventory["files"].items():
             path = plain_path(Path("/") / name)
             info = path.lstat()
@@ -230,8 +271,9 @@ def main():
     tool_baseline = packages_except_sniper()
     (results / "tool-baseline.json").write_text(json.dumps(tool_baseline, indent=2) + "\n")
     check_candidate_overrides(command)
+    (results / "dpkg-path-filters.json").write_text(json.dumps(path_filter_evidence(), indent=2, sort_keys=True) + "\n")
     deb = Path(inventory["deb"])
-    plan = command("apt-get", "--simulate", "install", "--no-install-recommends", "--no-remove", str(deb))
+    plan = command("apt-get", "--simulate", "install", "--no-install-recommends", "--no-remove", *APT_DOC_OPTIONS, str(deb))
     require(not any(row.startswith("Remv ") for row in plan.stdout.splitlines()), "APT would remove an unrelated package")
     planned = []
     for row in plan.stdout.splitlines():
