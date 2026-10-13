@@ -1477,6 +1477,21 @@ enum SkillsCommand {
     UpdatePreview(SkillsInstallArgs),
     /// Experimental: stage a bundled candidate in a new directory without activating it.
     StageUpdate(SkillsStageArgs),
+    /// Experimental: explicitly activate one reviewed staged update with a durable operation ID.
+    #[command(
+        after_help = "Requires --yes outside dry run. Select exactly one agent and retain the original operation UUID.\nThe staged candidate, enrollment baseline and executing binary bundle must agree; different bytes need a strictly newer semantic version.\nAfter uncertain output, inspect skills update-result with that same UUID before any deliberate retry.\nNo automatic updates or agent reload. Linux exchange and macOS swap adapters only; Windows is unsupported."
+    )]
+    ApplyUpdate(SkillsApplyArgs),
+    /// Inspect one local update transaction without changing files or resuming it.
+    #[command(
+        after_help = "Read-only and CLI-host local; no --yes, API contact, resume, repair, or agent reload.\nInspect both state and current_state: a historical applied receipt does not prove the active file remains unchanged.\nKeep the original operation UUID and all transaction artifacts. Windows inspection is currently unsupported."
+    )]
+    UpdateResult(SkillsOperationArgs),
+    /// Explicitly restore the baseline of one update transaction, preserving displaced files.
+    #[command(
+        after_help = "Requires --yes outside dry run. Use the original apply-update UUID, not a new rollback ID.\nOnly a bound transaction can be restored; changed or unsupported objects can block rollback.\nAfter uncertain output, inspect skills update-result with the same UUID. Preserve all artifacts and do not blindly retry."
+    )]
+    RollbackUpdate(SkillsOperationArgs),
 }
 
 #[derive(Args, Debug, Default)]
@@ -1499,6 +1514,27 @@ struct SkillsStageArgs {
     /// New local directory for candidate and staging receipt; it must not exist.
     #[arg(long)]
     staging_dir: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct SkillsApplyArgs {
+    #[command(flatten)]
+    target: SingleSkillArgs,
+    /// Existing reviewed staging directory made by this CLI's bundled version.
+    #[arg(long)]
+    staging_dir: PathBuf,
+    /// Canonical lowercase hyphenated UUID; retain it for result inspection and rollback.
+    #[arg(long)]
+    operation_id: String,
+}
+
+#[derive(Args, Debug)]
+struct SkillsOperationArgs {
+    #[command(flatten)]
+    target: SingleSkillArgs,
+    /// The original apply-update UUID, in canonical lowercase hyphenated form.
+    #[arg(long)]
+    operation_id: String,
 }
 
 #[derive(Args, Debug, Default)]
@@ -2683,6 +2719,9 @@ impl SkillsCommand {
             SkillsCommand::Enroll(_) => "skills.enroll",
             SkillsCommand::UpdatePreview(_) => "skills.update_preview",
             SkillsCommand::StageUpdate(_) => "skills.stage_update",
+            SkillsCommand::ApplyUpdate(_) => "skills.apply_update",
+            SkillsCommand::UpdateResult(_) => "skills.update_result",
+            SkillsCommand::RollbackUpdate(_) => "skills.rollback_update",
         }
     }
 }
@@ -2761,6 +2800,33 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             true,
             &["staging_dir"],
             vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","staging_dir":"/tmp/example-skill-candidate"})],
+        ),
+        op(
+            "skills.apply_update",
+            "skills apply-update <--codex|--claude> --staging-dir <reviewed-directory> --operation-id <uuid>",
+            "Experimental: explicitly activate one strictly bound, newer staged bundle. Retain the operation UUID for read-only result inspection and rollback; no startup updates or agent reload.",
+            Write,
+            true,
+            &["staging_dir", "operation_id"],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","staging_dir":"/tmp/example-skill-candidate","operation_id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
+            "skills.update_result",
+            "skills update-result <--codex|--claude> --operation-id <original-uuid>",
+            "Read one local skill update transaction and current state without resuming or changing files. Use the original operation UUID after lost output or any recovery-required result.",
+            Read,
+            false,
+            &["operation_id"],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","operation_id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
+            "skills.rollback_update",
+            "skills rollback-update <--codex|--claude> --operation-id <original-uuid>",
+            "Explicitly restore a partial or completed skill update's baseline using its original operation UUID. Preserve transaction artifacts and displaced files; never blindly retry an uncertain mutation.",
+            Write,
+            true,
+            &["operation_id"],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","operation_id":"22222222-2222-2222-2222-222222222222"})],
         ),
         op(
             "session.list",
@@ -4569,6 +4635,27 @@ fn skills_managed_output_schema(operation: &str) -> Option<Value> {
                 "activated":{"type":"boolean","const":false}
             }),
         ),
+        "skills.apply_update" | "skills.update_result" | "skills.rollback_update" => (
+            json!([
+                "transaction_dir",
+                "operation_id",
+                "state",
+                "current_state",
+                "installed_sha256",
+                "allows_automatic_updates",
+                "agent_reloaded"
+            ]),
+            json!({
+                "transaction_dir":string,
+                "operation_id":skill_operation_id_schema(),
+                "state":{"type":"string","enum":["prepared","applied","rolled_back","recovery_required"],"description":"Recorded transaction state; inspect current_state separately. A recovered result does not itself resume a write."},
+                "current_state":{"type":"string","enum":["baseline","updated","changed","unavailable"],"description":"Current observation relative to the bound baseline and update; changed or unavailable requires inspection."},
+                "installed_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
+                "allows_automatic_updates":{"type":"boolean","const":false},
+                "agent_reloaded":{"type":"boolean","const":false},
+                "error_code":{"type":"string","description":"Stable bounded inspection or recovery code; never source text."}
+            }),
+        ),
         _ => return None,
     };
     entry["required"]
@@ -4613,6 +4700,10 @@ fn skill_root_selection_schema(allow_all: bool) -> Value {
     json!(constraints)
 }
 
+fn skill_operation_id_schema() -> Value {
+    json!({"type":"string","minLength":36,"maxLength":36,"pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$","description":"Exact canonical lowercase hyphenated UUID. Save the original apply-update ID for result inspection and rollback; alternate spellings are rejected."})
+}
+
 // Legacy Uuid arguments accept spellings that strict JSON Schema uuid formats reject.
 fn legacy_uuid_input_schema(nullable: bool, context: &str) -> Value {
     json!({
@@ -4652,7 +4743,14 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
             ]
         });
     }
-    if matches!(operation, "skills.enroll" | "skills.stage_update") {
+    if matches!(
+        operation,
+        "skills.enroll"
+            | "skills.stage_update"
+            | "skills.apply_update"
+            | "skills.update_result"
+            | "skills.rollback_update"
+    ) {
         let mut schema = json!({
             "type":"object", "additionalProperties":false, "required":[],
             "properties":{
@@ -4670,6 +4768,20 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
         if operation == "skills.stage_update" {
             schema["required"] = json!(["staging_dir"]);
             schema["properties"]["staging_dir"] = json!({"type":"string","minLength":1,"pattern":"^[^\\u0000]*$","description":"Explicit new local staging directory, which must not exist. The active SKILL.md is never replaced."});
+        }
+        if operation == "skills.apply_update" {
+            schema["required"] = json!(["staging_dir"]);
+            schema["properties"]["staging_dir"] = json!({"type":"string","minLength":1,"pattern":"^[^\\u0000]*$","description":"Existing reviewed staging directory; candidate, staging receipt, enrollment baseline and running binary bundle must agree."});
+        }
+        if matches!(
+            operation,
+            "skills.apply_update" | "skills.update_result" | "skills.rollback_update"
+        ) {
+            schema["required"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("operation_id"));
+            schema["properties"]["operation_id"] = skill_operation_id_schema();
         }
         return schema;
     }
@@ -4892,6 +5004,17 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         }
         "skills.enroll" => &["codex", "claude", "codex_dir", "claude_dir"],
         "skills.stage_update" => &["codex", "claude", "codex_dir", "claude_dir", "staging_dir"],
+        "skills.apply_update" => &[
+            "codex",
+            "claude",
+            "codex_dir",
+            "claude_dir",
+            "staging_dir",
+            "operation_id",
+        ],
+        "skills.update_result" | "skills.rollback_update" => {
+            &["codex", "claude", "codex_dir", "claude_dir", "operation_id"]
+        }
         "session.create" => &["name"],
         "session.rename" => &["id", "name"],
         "findings.list" | "event_log.list" => &["session_id", "limit"],
@@ -5220,6 +5343,17 @@ fn command_input_preview(command: &Command) -> Value {
             SkillsCommand::StageUpdate(args) => {
                 let mut input = single_skill_input_preview(&args.target);
                 input["staging_dir"] = json!(args.staging_dir);
+                input
+            }
+            SkillsCommand::ApplyUpdate(args) => {
+                let mut input = single_skill_input_preview(&args.target);
+                input["staging_dir"] = json!(args.staging_dir);
+                input["operation_id"] = json!(args.operation_id);
+                input
+            }
+            SkillsCommand::UpdateResult(args) | SkillsCommand::RollbackUpdate(args) => {
+                let mut input = single_skill_input_preview(&args.target);
+                input["operation_id"] = json!(args.operation_id);
                 input
             }
         },
@@ -6130,6 +6264,14 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
     }
     if matches!(
         command.operation_name(),
+        "skills.apply_update" | "skills.update_result" | "skills.rollback_update"
+    ) {
+        notes.push("CLI-host local only; dry-run validates arguments without filesystem reads, host/API discovery, or checking eligibility. It does not reserve the operation UUID.");
+        notes.push("Explicit partial-milestone maintenance only: no startup hooks, automatic updates, or agent reload. Apply requires a reviewed candidate bound to the unchanged enrollment baseline and this binary's newer bundle.");
+        notes.push("Keep the original operation UUID and all transaction artifacts. After uncertain output, use skills update-result with that same UUID; do not blindly retry or replace the ID. Rollback uses that original UUID and preserves displaced objects.");
+    }
+    if matches!(
+        command.operation_name(),
         "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
     ) {
         notes.push("Dry-run is fully offline. The explicit session must already be active; execution never switches or activates it. Discovery and settings reads do not inspect traffic or contact upstream services.");
@@ -6255,7 +6397,11 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 },
             }
         }
-        "skills.enroll" | "skills.stage_update" => {
+        "skills.enroll"
+        | "skills.stage_update"
+        | "skills.apply_update"
+        | "skills.update_result"
+        | "skills.rollback_update" => {
             let target = SingleSkillArgs {
                 codex: call_bool(operation, input, "codex")?,
                 claude: call_bool(operation, input, "claude")?,
@@ -6263,17 +6409,36 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 claude_dir: call_optional_path(operation, input, "claude_dir")?,
             };
             Command::Skills {
-                command: if operation == "skills.enroll" {
-                    SkillsCommand::Enroll(target)
-                } else {
-                    SkillsCommand::StageUpdate(SkillsStageArgs {
+                command: match operation {
+                    "skills.enroll" => SkillsCommand::Enroll(target),
+                    "skills.stage_update" => SkillsCommand::StageUpdate(SkillsStageArgs {
                         target,
                         staging_dir: PathBuf::from(call_required::<String>(
                             operation,
                             input,
                             "staging_dir",
                         )?),
-                    })
+                    }),
+                    "skills.apply_update" => SkillsCommand::ApplyUpdate(SkillsApplyArgs {
+                        target,
+                        staging_dir: PathBuf::from(call_required::<String>(
+                            operation,
+                            input,
+                            "staging_dir",
+                        )?),
+                        operation_id: call_required(operation, input, "operation_id")?,
+                    }),
+                    _ => {
+                        let args = SkillsOperationArgs {
+                            target,
+                            operation_id: call_required(operation, input, "operation_id")?,
+                        };
+                        if operation == "skills.update_result" {
+                            SkillsCommand::UpdateResult(args)
+                        } else {
+                            SkillsCommand::RollbackUpdate(args)
+                        }
+                    }
                 },
             }
         }
@@ -7754,6 +7919,39 @@ async fn run(cli: Cli) -> Result<()> {
                 &args.staging_dir,
             )?)
         }
+        Command::Skills {
+            command: SkillsCommand::ApplyUpdate(args),
+        } => {
+            let (agent, root, bundled) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_activation::apply_skill_update(
+                agent,
+                &root,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+                &args.staging_dir,
+                &args.operation_id,
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::UpdateResult(args),
+        } => {
+            let (agent, root, _) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_activation::update_result(
+                agent,
+                &root,
+                &args.operation_id,
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::RollbackUpdate(args),
+        } => {
+            let (agent, root, _) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_activation::rollback_skill_update(
+                agent,
+                &root,
+                &args.operation_id,
+            )?)
+        }
         command => {
             let api = if matches!(
                 command.operation_name(),
@@ -7883,7 +8081,10 @@ fn validate_command_preflight(command: &Command) -> Result<()> {
     if let Command::Skills {
         command:
             SkillsCommand::Enroll(args)
-            | SkillsCommand::StageUpdate(SkillsStageArgs { target: args, .. }),
+            | SkillsCommand::StageUpdate(SkillsStageArgs { target: args, .. })
+            | SkillsCommand::ApplyUpdate(SkillsApplyArgs { target: args, .. })
+            | SkillsCommand::UpdateResult(SkillsOperationArgs { target: args, .. })
+            | SkillsCommand::RollbackUpdate(SkillsOperationArgs { target: args, .. }),
     } = command
     {
         if args.codex == args.claude {
@@ -7901,10 +8102,23 @@ fn validate_command_preflight(command: &Command) -> Result<()> {
         }
     }
     if let Command::Skills {
-        command: SkillsCommand::StageUpdate(args),
+        command:
+            SkillsCommand::StageUpdate(SkillsStageArgs { staging_dir, .. })
+            | SkillsCommand::ApplyUpdate(SkillsApplyArgs { staging_dir, .. }),
     } = command
     {
-        validate_skill_cli_path(&args.staging_dir)?;
+        validate_skill_cli_path(staging_dir)?;
+    }
+    if let Command::Skills {
+        command:
+            SkillsCommand::ApplyUpdate(SkillsApplyArgs { operation_id, .. })
+            | SkillsCommand::UpdateResult(SkillsOperationArgs { operation_id, .. })
+            | SkillsCommand::RollbackUpdate(SkillsOperationArgs { operation_id, .. }),
+    } = command
+    {
+        if !sniper::skill_activation::valid_operation_id(operation_id) {
+            bail!("operation_id must be a canonical lowercase hyphenated UUID");
+        }
     }
 
     if let Command::Replay {
@@ -15491,6 +15705,34 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
     }
     if let Some(managed) = error.downcast_ref::<sniper::skill_managed::ManagedSkillError>() {
         let (message, hint) = match (operation, managed.code) {
+            ("skills.apply_update" | "skills.rollback_update", "recovery_required") => (
+                "The local skill mutation requires recovery inspection; its outcome must not be assumed.",
+                "Use skills update-result with the same selected agent, root and original --operation-id. Preserve all transaction and staging artifacts and displaced files; do not blindly retry or use a new operation ID.",
+            ),
+            ("skills.apply_update" | "skills.rollback_update", "platform_unsupported" | "swap_unsupported" | "metadata_unsupported") => (
+                "Safe skill activation or rollback is unavailable on this platform or filesystem.",
+                "Preserve the active skill and all artifacts. Use skills update-result with the original --operation-id if a transaction exists; never fall back to overwrite or legacy install.",
+            ),
+            ("skills.apply_update", "version_conflict") => (
+                "Different skill bytes do not have a strictly newer semantic version.",
+                "Preserve the active file, enrollment and stage. Inspect their versions and hashes; equal semantic-version precedence with different bytes is refused, including build-metadata-only changes.",
+            ),
+            ("skills.apply_update", "downgrade") => (
+                "The candidate's semantic version is older than the enrolled baseline.",
+                "Preserve the active file, enrollment and staged candidate. This activation path only accepts strictly newer bundled versions; use transaction-bound rollback with the original operation ID to restore that transaction's baseline.",
+            ),
+            ("skills.apply_update", "request_conflict") => (
+                "The operation ID is already bound to a different skill update request.",
+                "Inspect skills update-result using the original --operation-id, agent and root. Preserve its artifacts; do not reuse the ID for another bundle or staging directory or replace the ID to bypass an unresolved transaction.",
+            ),
+            ("skills.apply_update" | "skills.rollback_update", "transaction_busy" | "pending_transaction") => (
+                "Another local skill transaction blocks this action.",
+                "Stop concurrent writers and inspect the existing transaction with skills update-result and its original --operation-id. Preserve its lock and recovery artifacts; do not remove them or invent another ID to bypass the transaction.",
+            ),
+            ("skills.apply_update" | "skills.update_result" | "skills.rollback_update", _) => (
+                "The local skill transaction could not be completed or inspected safely.",
+                "Use skills update-result with the same selected agent, root and original --operation-id. Preserve transaction and staging artifacts and displaced files; inspect the reason before any deliberate action, and do not blindly retry or replace the operation ID.",
+            ),
             ("skills.stage_update", "already_current") => (
                 "The active skill already matches this binary's bundled template.",
                 "Use skills status to check the active bytes; no update candidate is needed.",
@@ -19192,6 +19434,44 @@ mod tests {
             for fragment in hint_fragments {
                 assert!(payload.hint.unwrap().contains(fragment), "{operation}/{reason}: {fragment}");
             }
+        }
+    }
+
+    #[test]
+    fn activation_recovery_errors_preserve_original_operation_guidance() {
+        for operation in ["skills.apply_update", "skills.rollback_update"] {
+            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError {
+                code: "recovery_required",
+            });
+            let payload = cli_error_payload(operation, &error);
+            assert_eq!(payload.code, "MANAGED_SKILL_ERROR");
+            assert_eq!(payload.exit_code, 5);
+            assert!(!payload.retryable);
+            assert_eq!(payload.details, json!({"reason":"recovery_required"}));
+            let hint = payload.hint.unwrap();
+            for fragment in [
+                "skills update-result",
+                "original --operation-id",
+                "Preserve",
+                "do not blindly retry",
+                "new operation ID",
+            ] {
+                assert!(hint.contains(fragment), "{operation}: {fragment}");
+            }
+            assert!(!hint.contains("No activation is performed"));
+        }
+        for operation in [
+            "skills.apply_update",
+            "skills.update_result",
+            "skills.rollback_update",
+        ] {
+            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError {
+                code: "unrecognized_reason",
+            });
+            let hint = cli_error_payload(operation, &error).hint.unwrap();
+            assert!(hint.contains("skills update-result"));
+            assert!(hint.contains("original --operation-id"));
+            assert!(!hint.contains("No activation is performed"));
         }
     }
 

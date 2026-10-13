@@ -79,7 +79,7 @@ See the [CLI integration guide](../integrations/codex.md),
 [saved-data contract](../integrations/saved-data-v1.md), and
 [saved-tab metadata operations](../integrations/saved-replay-tabs.md).
 
-## Inspect and stage local skills
+## Explicit local skill maintenance (partial milestone)
 
 `skills status` compares installed files with the embedded bundle without
 returning their text. A differing hash means `modified_or_outdated`; it does not
@@ -87,16 +87,33 @@ identify whether a person edited the file. `update-preview` compares an enrolled
 baseline, so a manually updated file can be `current` in status and `modified`
 in preview. Inspect the row states; exit zero does not mean every file is current.
 
-`skills update-preview` is read-only. Explicit enrollment records a baseline;
-experimental staging writes a separate candidate while preserving the active
-file. Neither operation activates an update or enables unattended startup
-replacement. Existing manual installation can overwrite an installed skill, so
-preserve edits before choosing it. Enrollment receipts record a byte baseline,
-selected path, agent, and bundle version; they do not grant account or network
-access.
+Explicit enrollment records a baseline; staging writes a separate candidate
+while preserving the active file. `skills apply-update --yes` explicitly
+activates a reviewed stage bound to that unchanged baseline and the running
+binary's bundle. Different bytes require strictly newer semantic-version
+precedence. Equal precedence with different bytes is a conflict, even when only
+build metadata differs. The source package remains `0.3.0`; changed embedded
+bytes at that same version are intentionally refused as an upgrade.
+
+Apply uses a retained canonical lowercase operation UUID. After uncertain or
+lost output, inspect read-only `skills update-result` with the same original ID,
+agent and root; it reads files but never resumes a write. Inspect recorded
+`state` separately from `current_state`. A same-ID continuation requires proven
+object placements. Explicit `skills rollback-update --yes` restores that bound
+transaction's baseline while preserving displaced objects. Do not blindly retry,
+invent a replacement ID, or remove artifacts to bypass a blocked transaction.
+Incomplete or corrupted preparation or markers need manual reconciliation.
+There is a 128-retained-operation cap and no automatic pruning.
+
+No startup hook, unattended activation, network access or agent reload is enabled.
+Only global dry run is argument-only and performs no filesystem inspection.
+Existing legacy installation can overwrite an installed skill and is never a
+recovery fallback. Linux exchange has native fixture coverage; the macOS swap
+adapter has only been source-reviewed, without macOS compilation or runtime
+testing here. Windows activation, rollback and result inspection are unsupported.
 
 See [safe skill maintenance](../integrations/skill-maintenance.md) for exact
-commands, refusal states, and activation and backup limitations.
+commands, confirmation requirements, refusal states and recovery limitations.
 
 ## CLI PATH setup
 

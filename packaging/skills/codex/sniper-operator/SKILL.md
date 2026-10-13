@@ -397,13 +397,47 @@ bundle, or `sniper-cli skills update-preview --all` to inspect enrollment and
 update eligibility. These are local, read-only operations; inspect each row's
 state/error rather than treating exit zero as proof every file is current.
 The experimental `skills.enroll` and `skills.stage_update` operations must be
-discovered through `manifest`, `schema`,
-and `examples` before using them. Enrollment records an explicit local baseline;
-it does not enable automatic updates. Staging requires confirmation and a new
-output directory, writes only a candidate and receipt, and returns
-`activated:false`. Never claim staging updated the active skill or the agent's
-loaded context. Preserve modified or unmanaged installations; do not invoke
-`skills install --yes` as an automatic fallback because it can overwrite them.
+discovered through `manifest`, `schema`, and `examples` before using them.
+Enrollment records an explicit local baseline; it does not enable automatic updates.
+Staging requires confirmation and a new output directory, writes only a candidate
+and receipt, and returns `activated:false`. Never claim staging updated the active
+skill or the agent's loaded context.
+
+Explicit activation is a partial milestone. Discover `skills.apply_update`,
+`skills.update_result`, and `skills.rollback_update` before using them. Select
+exactly one agent and preserve its skills root. Apply requires the reviewed stage
+to match the unchanged enrollment baseline and the executing binary's bundle;
+different bytes require a strictly newer semantic version. Equal precedence with
+different bytes, including build-metadata-only differences, is a version conflict.
+Unmanaged, edited or mismatched files must be preserved rather than overwritten.
+
+Generate and retain one canonical lowercase hyphenated UUID `operation_id` before
+an approved apply. `skills apply-update` requires `--staging-dir`, that
+`--operation-id`, and `--yes`; preview with global `--dry-run` first. Dry run is
+argument-only and performs no filesystem inspection or API discovery. It cannot
+prove the stage is eligible. Successful application records an updated managed
+baseline but never enables startup updates or unattended activation, and reports
+`allows_automatic_updates:false` and `agent_reloaded:false`. Changing a file does
+not prove a running agent reloaded its instructions.
+
+After lost output, interruption or `recovery_required`, use the read-only
+`skills update-result` with the same original operation ID, agent and root.
+This reads local files but never resumes a mutation. Inspect both `state` and
+`current_state`: a historical applied result is separate from today's active
+bytes. Preserve all transaction and staging artifacts and displaced objects;
+never blindly retry or silently mint a replacement ID. The same bound ID can
+resume only proven object placements; a different request under that ID is
+refused. Explicit `skills rollback-update --yes` uses that original apply ID to
+restore the bound baseline and preserves displaced objects. Unexpected changes
+can block rollback; there is no force-overwrite fallback.
+
+Linux exchange has native fixture coverage. The macOS swap adapter is source
+reviewed only, without macOS compilation or runtime validation here. Windows
+activation, rollback and result inspection are unsupported. There is a cap of
+128 retained operations and no automatic pruning. Partial or corrupted preparation
+or markers require manual reconciliation while preserving all artifacts.
+The legacy `skills install --yes` can overwrite installations; never use it as
+an automatic update or recovery fallback.
 
 ## Guardrails
 

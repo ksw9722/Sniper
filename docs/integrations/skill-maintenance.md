@@ -28,8 +28,8 @@ Select exactly one agent. Directory overrides identify skills roots, matching
 `skills status` and the existing installer. A non-null directory override requires
 its matching agent selector: `--codex-dir` requires `--codex`, and
 `--claude-dir` requires `--claude`. `--all` selects both agents for `install`,
-`status`, and `update-preview`; enrollment and staging still require exactly
-one agent. Previously ignored overrides for unselected agents now fail with
+`status`, and `update-preview`; enrollment, staging, activation, result inspection,
+and rollback require exactly one agent. Previously ignored overrides for unselected agents now fail with
 `INVALID_INPUT`, including in dry run. JSON `null` overrides remain equivalent
 to omission. Overrides never redirect another agent's selected root.
 
@@ -106,30 +106,104 @@ succeed. Use `update-preview` for a read-only observation, then inspect the
 actual execution result. Files can change between those steps. Path checks are bounded observations, not
 a sandbox against another process maliciously replacing ancestor directories.
 
-## Experimental workflow limitations
+## Explicit activation and rollback (partial milestone)
 
-For everyday use, start with `status` and `update-preview`. Enrollment and
-staging are experimental, not a complete update installer. This release has no
-managed activate/apply command. Review the
-candidate and compare it with the active file first. Preserve a backup of the
-current active file, stop editors or other writers, and use your normal manual
-file-management process only after deciding which changes to keep. A backup
-made before a concurrent editor saves can miss that editor's last changes;
-atomic replacement alone does not solve that race. Staging avoids the race by
-not replacing the active file at all.
+Activation is an explicit, experimental step. It is not an unattended updater:
+there is no startup hook, scheduled activation, automatic fallback, or agent
+reload. A newer binary alone still does not alter an installed skill.
+
+Review the staged candidate and choose a new operation UUID before applying.
+Use exactly the canonical lowercase hyphenated spelling; uppercase, compact,
+braced and URN spellings are refused even in dry run. Keep this ID with the
+selected agent, skills root and staging directory. The example ID below is for
+illustration; choose a fresh UUID for your own transaction.
+
+```bash
+sniper-cli skills apply-update --codex --staging-dir /tmp/sniper-skill-candidate --operation-id 22222222-2222-2222-2222-222222222222 --dry-run
+sniper-cli skills apply-update --codex --staging-dir /tmp/sniper-skill-candidate --operation-id 22222222-2222-2222-2222-222222222222 --yes
+sniper-cli skills update-result --codex --operation-id 22222222-2222-2222-2222-222222222222
+```
+
+Use the same `--codex-dir` or `--claude-dir` on every command when the
+installation has an explicit root. Apply requires the exact staged candidate
+and staging receipt to agree with the selected agent, absolute installation,
+unchanged enrolled baseline and running binary's bundle. A changed candidate,
+changed active file, invalid or mismatched receipt, unsupported object or
+conflicting transaction is refused. Preserve those objects and inspect the
+reason instead of bypassing the checks with legacy install.
+
+Different bundle bytes must have a strictly newer semantic-version precedence
+than the enrolled baseline. An older version is a downgrade; equal precedence
+with different bytes is a version conflict, including build-metadata-only
+changes. Existing previews/staging describe byte eligibility; they are not a
+promise that these stricter activation checks will pass.
+
+Successful activation changes both active bytes and the managed baseline. Its
+v2 enrollment receipt records the bundled-binary source, contract revision and
+last operation ID, while keeping automatic updates disabled. Receipts are local
+consistency records, not tamper-proof proof of authorship or trust.
+
+Apply saves durable transaction artifacts before exchanging active objects.
+Linux uses atomic exchange; the macOS swap adapter has been source-reviewed
+only, without macOS compilation or native runtime verification in this milestone.
+Windows activation,
+rollback and transaction-result inspection currently return
+`platform_unsupported`. A filesystem that cannot provide the required exchange
+or metadata guarantees is refused; there is no overwrite fallback. Path checks
+are bounded observations, not a sandbox against malicious ancestor replacement.
+Avoid concurrent editors and retain every transaction and displaced object.
+
+A repeated successful apply with the same ID and exact bound request reports
+that transaction instead of installing again. Reusing the ID with a different
+stage or bundle is refused. Eligible partial apply transactions can resume under
+the same ID only when the recorded object placements can be proven, and only
+after inspecting the recorded and current state. Do not
+blindly retry after interruption or invent a replacement ID to bypass recovery.
+
+There is a cap of 128 retained operation directories per installation. Nothing
+is automatically deleted or pruned to make room. Incomplete or corrupted
+preparation artifacts and markers cannot be automatically repaired. Preserve
+them and seek manual reconciliation; do not remove a directory or marker to
+force an otherwise blocked operation.
+
+Result inspection reads the filesystem but is read-only: it never resumes or
+repairs a transaction. Only global `--dry-run` is argument-only with no file I/O.
+`state` describes `prepared`, `applied`, `rolled_back`, or `recovery_required`;
+`current_state` separately reports `baseline`, `updated`, `changed`, or
+`unavailable`. A historical `applied` receipt does not prove that today's active
+file remains unchanged. Inspect `error_code` when present. Every successful
+result includes `allows_automatic_updates:false` and `agent_reloaded:false`.
+
+To deliberately restore the original baseline of a partial or completed update,
+use the original apply ID, not a new rollback ID:
+
+```bash
+sniper-cli skills rollback-update --codex --operation-id 22222222-2222-2222-2222-222222222222 --dry-run
+sniper-cli skills rollback-update --codex --operation-id 22222222-2222-2222-2222-222222222222 --yes
+sniper-cli skills update-result --codex --operation-id 22222222-2222-2222-2222-222222222222
+```
+
+Rollback restores the exact original skill and enrollment receipt by exchange,
+preserving displaced objects rather than discarding them. This is a
+transaction-bound recovery action, not a generic file restore. Inspect the result
+and retained artifacts before deciding what to keep. Unexpected edited or
+replaced objects can block rollback; there is no force-overwrite option. If rollback is interrupted,
+inspect the same transaction before continuing; never delete recovery artifacts
+to force a new attempt.
 
 A staged candidate is not an installed update, and changing a file is not proof
 that an already running agent has reloaded its instructions. Follow that host's
 reload/restart behavior and verify the active skill separately.
 
-Enrollment receipts are never rewritten by these commands. They are ordinary
-local files, not tamper-proof evidence of provenance. After a manual
-activation, the old receipt can make preview report `modified`; that means the
-active hash differs from the enrolled baseline, not that Sniper knows who changed
-it. In particular, `status` can report `current` while `update-preview` reports
-`modified` after manual activation of the current bundle. These observations
-are consistent: one compares the bundle, and the other compares the old baseline.
-This does not mean the active skill failed to update.
+### Manual activation remains separate
+
+After a manual activation, an old enrollment receipt can make preview report
+`modified`; that means the active hash differs from the enrolled baseline, not
+that Sniper knows who changed it. In particular, `status` can report `current`
+while `update-preview` reports `modified` after manually installing the current
+bundle. These observations are consistent. Explicit managed activation updates
+the receipt as part of its transaction; it does not silently adopt prior manual
+changes or customized files.
 
 ### Optional advanced receipt recovery
 
@@ -142,13 +216,21 @@ you. Enrollment still requires exact current bundle bytes. Preserve customized
 active files and leave them unmanaged or modified rather than erasing edits
 merely to obtain an enrolled status.
 
+Do not use this manual receipt procedure while an activation transaction is
+pending or recovery-required. Keep its receipt and transaction artifacts intact
+and inspect its original operation ID first.
+
 ## Automation result handling
 
-Input errors exit 2. A safely refused or failed enrollment/staging operation
+Input errors exit 2. A safely refused or failed managed skill operation
 returns a structured `MANAGED_SKILL_ERROR`, exits 5, and includes a stable reason
 under `error.details.reason`. It is not automatically retryable. Inspect the
-command result and any output, and rerun `skills status` and `skills update-preview`
-for the selected agent before making a new deliberate attempt. Enrollment can
+command result and any output. For apply or rollback, use `skills update-result`
+with the same agent, root and original operation ID first. Preserve every
+transaction artifact and displaced object. A `recovery_required` error means
+the outcome is uncertain; do not blindly retry or change the operation ID. For
+enrollment/staging, rerun `skills status` and `skills update-preview` for the
+selected agent before making a new deliberate attempt. Enrollment can
 leave a valid visible receipt that preview recognizes as a baseline even when
 the command reports a write or sync error. Preserve existing receipts and staged
 files; do not overwrite them or reuse a staging path to force a retry.
@@ -156,13 +238,16 @@ files; do not overwrite them or reuse a staging path to force a retry.
 Local writes happen before the JSON result is printed. An output-delivery failure
 does not prove that no files were written: stdout errors can exit 1 after the local
 write completed, while this CLI exits 0 on `BrokenPipe` when an output consumer
-closes. Neither behavior automatically replaces the active skill. If the result
-is lost, inspect `skills status`, `skills update-preview`, and the existing
-receipt/candidate files before deciding whether to retry; preserve those files.
+closes. An apply or rollback may already have changed active files when its output is
+lost. Inspect `skills update-result` with the original operation ID; that read
+does not repeat the mutation. For enrollment or staging, inspect `skills status`,
+`skills update-preview`, and existing receipt/candidate files instead. Preserve
+all artifacts before deciding on any deliberate retry.
 
 The receipt and version fields describe the recorded baseline; differing version
-strings alone do not prove an upgrade or downgrade. Candidate eligibility is based
-on byte hashes.
+strings alone do not prove provenance. Preview/staging candidate eligibility is
+based on byte hashes; activation additionally enforces strictly newer semantic
+version precedence for different bytes.
 
 Common refusals provide operation-specific guidance:
 
@@ -180,3 +265,13 @@ Common refusals provide operation-specific guidance:
   recorded baseline, including after manual activation with an old receipt.
   Check both `skills status` and `skills update-preview` before deciding whether
   optional receipt recovery is useful.
+- `skills.apply_update` / `version_conflict` or `downgrade`: different bytes need
+  strictly newer semantic-version precedence. Preserve the baseline and candidate.
+- `skills.apply_update` / `request_conflict`: the operation ID is already bound
+  to a different request. Inspect the original transaction; do not overwrite it.
+- `recovery_required`: a mutation may have partially completed. Use
+  `skills update-result` with the original operation ID and preserve all artifacts.
+- `transaction_busy` or `pending_transaction`: another local transaction blocks
+  this action. Inspect it and stop concurrent writers; do not bypass its lock.
+- `platform_unsupported`, `swap_unsupported`, or `metadata_unsupported`: the
+  required safe operation is unavailable. There is no legacy overwrite fallback.

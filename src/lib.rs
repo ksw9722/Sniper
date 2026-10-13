@@ -34,6 +34,7 @@ pub mod service_map_links;
 pub mod service_map_peer_matches;
 pub mod service_map_technology;
 pub mod session;
+pub mod skill_activation;
 pub mod skill_managed;
 pub mod skill_status;
 pub mod skills;

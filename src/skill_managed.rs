@@ -1,7 +1,8 @@
 //! Explicit local enrollment and non-activating skill update candidates.
 //!
 //! Enrollment records one observed byte hash, not provenance or permission to
-//! update a file. No operation in this module opens an active skill for writing.
+//! update a file. Explicit transaction-bound activation lives in skill_activation.
+//! No operation in this module opens an active skill for writing.
 //! Observations cannot lock out an editor; the active file may change afterward.
 use std::{
     fmt,
@@ -34,11 +35,11 @@ impl std::error::Error for ManagedSkillError {}
 
 type Result<T> = std::result::Result<T, ManagedSkillError>;
 
-fn error(code: &'static str) -> ManagedSkillError {
+pub(crate) fn error(code: &'static str) -> ManagedSkillError {
     ManagedSkillError { code }
 }
 
-fn io_error(err: io::Error) -> ManagedSkillError {
+pub(crate) fn io_error(err: io::Error) -> ManagedSkillError {
     error(match err.kind() {
         io::ErrorKind::AlreadyExists => "already_exists",
         io::ErrorKind::NotFound => "missing",
@@ -100,14 +101,20 @@ pub struct StagedSkillUpdate {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct EnrollmentReceipt {
-    schema_version: u32,
-    kind: String,
-    agent: String,
-    path: String,
-    enrolled_sha256: String,
-    enrolled_version: String,
-    allows_automatic_updates: bool,
+pub(crate) struct EnrollmentReceipt {
+    pub(crate) schema_version: u32,
+    pub(crate) kind: String,
+    pub(crate) agent: String,
+    pub(crate) path: String,
+    pub(crate) enrolled_sha256: String,
+    pub(crate) enrolled_version: String,
+    pub(crate) allows_automatic_updates: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) contract_revision: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_operation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,14 +132,14 @@ struct StagingReceipt<'a> {
     allows_automatic_updates: bool,
 }
 
-struct Target {
-    path: PathBuf,
-    receipt_path: PathBuf,
-    path_text: String,
-    receipt_text: String,
+pub(crate) struct Target {
+    pub(crate) path: PathBuf,
+    pub(crate) receipt_path: PathBuf,
+    pub(crate) path_text: String,
+    pub(crate) receipt_text: String,
 }
 
-fn path_text(path: &Path) -> Result<String> {
+pub(crate) fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| error("non_utf8_path"))
@@ -142,7 +149,7 @@ fn validate_version(version: &str) -> bool {
     version.len() <= 128 && semver::Version::parse(version).is_ok()
 }
 
-fn target(agent: &str, root: &Path, bundled: &str, version: &str) -> Result<Target> {
+pub(crate) fn target(agent: &str, root: &Path, bundled: &str, version: &str) -> Result<Target> {
     if !matches!(agent, "codex" | "claude") {
         return Err(error("invalid_agent"));
     }
@@ -173,14 +180,35 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     })
 }
 
-fn read_receipt(target: &Target, agent: &str) -> Result<(EnrollmentReceipt, Vec<u8>)> {
+pub(crate) fn read_receipt(target: &Target, agent: &str) -> Result<(EnrollmentReceipt, Vec<u8>)> {
     let bytes = read_receipt_bytes(&target.receipt_path)?;
+    let receipt = parse_receipt(&bytes, agent, &target.path_text)?;
+    Ok((receipt, bytes))
+}
+
+pub(crate) fn parse_receipt(bytes: &[u8], agent: &str, path: &str) -> Result<EnrollmentReceipt> {
     let receipt: EnrollmentReceipt =
-        serde_json::from_slice(&bytes).map_err(|_| error("invalid_receipt"))?;
-    if receipt.schema_version != 1
+        serde_json::from_slice(bytes).map_err(|_| error("invalid_receipt"))?;
+    let schema_valid = match receipt.schema_version {
+        1 => {
+            receipt.source.is_none()
+                && receipt.contract_revision.is_none()
+                && receipt.last_operation_id.is_none()
+        }
+        2 => {
+            receipt.source.as_deref() == Some("bundled_binary")
+                && receipt.contract_revision == Some(1)
+                && receipt
+                    .last_operation_id
+                    .as_deref()
+                    .is_some_and(crate::skill_activation::valid_operation_id)
+        }
+        _ => false,
+    };
+    if !schema_valid
         || receipt.kind != "sniper_skill_enrollment"
         || receipt.agent != agent
-        || receipt.path != target.path_text
+        || receipt.path != path
         || receipt.allows_automatic_updates
         || !validate_version(&receipt.enrolled_version)
         || receipt.enrolled_sha256.len() != 64
@@ -191,7 +219,7 @@ fn read_receipt(target: &Target, agent: &str) -> Result<(EnrollmentReceipt, Vec<
     {
         return Err(error("invalid_receipt"));
     }
-    Ok((receipt, bytes))
+    Ok(receipt)
 }
 
 fn read_receipt_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -296,9 +324,14 @@ fn enroll_impl(
         enrolled_sha256: sha256(bundled.as_bytes()),
         enrolled_version: bundled_version.to_owned(),
         allows_automatic_updates: false,
+        source: None,
+        contract_revision: None,
+        last_operation_id: None,
     };
     let bytes = encode_receipt(&receipt)?;
     let directory = CheckedDirectory::open(target.path.parent().unwrap())?;
+    directory.lock()?;
+    crate::skill_activation::check_pending(agent, root)?;
     before_write();
     directory.check_path()?;
     // Catch an editor change before publishing the snapshot. Future changes are
@@ -319,7 +352,7 @@ fn enroll_impl(
     })
 }
 
-fn encode_receipt(value: &impl Serialize) -> Result<Vec<u8>> {
+pub(crate) fn encode_receipt(value: &impl Serialize) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| error("serialization_failed"))?;
     bytes.push(b'\n');
     if bytes.len() > MAX_RECEIPT_BYTES {
@@ -365,6 +398,9 @@ fn stage_impl(
     mut checkpoint: impl FnMut(StageStep, &Path) -> Result<()>,
 ) -> Result<StagedSkillUpdate> {
     let target = target(agent, root, bundled, bundled_version)?;
+    let active_directory = CheckedDirectory::open(target.path.parent().unwrap())?;
+    active_directory.lock()?;
+    crate::skill_activation::check_pending(agent, root)?;
     let (receipt, receipt_bytes) = read_receipt(&target, agent)?;
     let installed = read_bytes(&target.path)?;
     let installed_hash = sha256(&installed);
@@ -454,6 +490,16 @@ struct CheckedDirectory {
     file: File,
 }
 
+#[cfg(unix)]
+impl Drop for CheckedDirectory {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Closing alone can leave a fork-inherited lock alive until child exec.
+        // Unlocking an independently opened, unlocked directory is harmless.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl CheckedDirectory {
     fn create(path: &Path) -> Result<Self> {
         let mut builder = fs::DirBuilder::new();
@@ -499,6 +545,18 @@ impl CheckedDirectory {
             }
         }
         Ok(())
+    }
+
+    fn lock(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the directory fd is held throughout the managed write.
+            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(error("transaction_busy"));
+            }
+        }
+        self.check_path()
     }
 
     fn write_new(&self, name: &str, bytes: &[u8]) -> Result<()> {
