@@ -1772,19 +1772,41 @@ pub(crate) mod supported {
             }
         }
         #[test]
-        fn non_utf8_transaction_suffix_is_retained_and_blocks_without_sync() {
+        fn non_utf8_transaction_suffix_is_retained_or_refused_by_filesystem() {
             use std::os::unix::ffi::OsStringExt;
             let f = Fixture::new();
-            fs::write(
-                f.dir()
-                    .join(std::ffi::OsString::from_vec(b"unrelated-\xff".to_vec())),
-                b"synthetic",
-            )
-            .unwrap();
-            let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            let before = inspect_automatic_baseline("codex", &f.root()).unwrap();
             let malformed = f.dir().join(std::ffi::OsString::from_vec(
                 b".sniper-update-\xff".to_vec(),
             ));
+            let unrelated = f
+                .dir()
+                .join(std::ffi::OsString::from_vec(b"unrelated-\xff".to_vec()));
+            if let Err(error) = fs::write(&unrelated, b"synthetic") {
+                #[cfg(target_os = "macos")]
+                if error.raw_os_error() == Some(libc::EILSEQ) {
+                    // APFS can reject these names before the scanner sees them.
+                    // Prove the dangerous prefix is equally unrepresentable;
+                    // every other error and every supporting filesystem still
+                    // exercises the retained-artifact refusal below.
+                    assert_eq!(
+                        fs::create_dir(&malformed).unwrap_err().raw_os_error(),
+                        Some(libc::EILSEQ)
+                    );
+                    assert!(!unrelated.exists());
+                    assert!(!malformed.exists());
+                    assert_eq!(
+                        inspect_automatic_baseline("codex", &f.root()).unwrap(),
+                        before
+                    );
+                    f.baseline();
+                    assert!(!f.tx().exists());
+                    return;
+                }
+                panic!("could not create raw-filename fixture: {error}");
+            }
+            let baseline = inspect_automatic_baseline("codex", &f.root()).unwrap();
+            assert_eq!(baseline, before);
             fs::create_dir(&malformed).unwrap();
             fault("file_sync", 1);
             assert_eq!(
