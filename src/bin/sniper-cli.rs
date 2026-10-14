@@ -14887,6 +14887,20 @@ fn parse_editable_raw_request_parts(
     let mut absolute_form = false;
 
     if is_absolute_http_url(target) {
+        if target.bytes().any(|byte| byte.is_ascii_control()) {
+            bail!("absolute request target must not include control characters");
+        }
+        let authority_and_path = target.split_once("://").unwrap().1;
+        let authority_end = authority_and_path
+            .find(['/', '?', '#'])
+            .unwrap_or(authority_and_path.len());
+        let raw_authority = &authority_and_path[..authority_end];
+        if raw_authority.is_empty() || raw_authority.contains('\\') {
+            bail!("absolute request target has an invalid authority");
+        }
+        if raw_authority.contains('@') {
+            bail!("absolute request target must not include credentials");
+        }
         let parsed = Url::parse(target)
             .with_context(|| format!("request target is not a valid URL: {target}"))?;
         if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -14904,14 +14918,14 @@ fn parse_editable_raw_request_parts(
         let parsed_port = parsed.port();
         host = format_request_authority(&parsed_host, parsed_port);
         absolute_target_authority = Some(host.clone());
-        path = format!(
-            "{}{}",
-            parsed.path(),
-            parsed
-                .query()
-                .map(|value| format!("?{value}"))
-                .unwrap_or_default()
-        );
+        // URL parsing validates the destination but normalizes dot segments.
+        // Keep the original request-target bytes, including an empty query.
+        let raw_path_and_query = &authority_and_path[authority_end..];
+        path = if raw_path_and_query.starts_with('/') {
+            raw_path_and_query.to_string()
+        } else {
+            format!("/{raw_path_and_query}")
+        };
     } else {
         path = target.to_string();
     }
@@ -17713,6 +17727,72 @@ mod tests {
         assert_eq!(request.scheme, "http");
         assert_eq!(request.host, "target.example:8080");
         assert_eq!(request.path, "/admin");
+    }
+
+    #[test]
+    fn raw_request_parser_preserves_absolute_target_bytes() {
+        for suffix in [
+            "/a/../b",
+            "/a/./b",
+            "/a/%2e%2E/b",
+            "/a/.%2e/b",
+            "/a/%2E./b",
+            "//a//b",
+            "/a//b/",
+            "/a?",
+            "/a?x=%2f%2F",
+            "/a@b?x=@example.com",
+            "/a/%2f%2F?x=/../%2e&x=",
+            "",
+            "?",
+            "?x=%2f%2F",
+        ] {
+            let raw = format!(
+                "GET HtTp://example.com:8080{suffix} HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+            );
+            let parsed = parse_editable_raw_request_with_version(&raw, None).unwrap();
+            let expected = if suffix.starts_with('/') {
+                suffix.to_string()
+            } else {
+                format!("/{suffix}")
+            };
+            assert_eq!(parsed.request.path, expected, "target suffix: {suffix:?}");
+            assert_eq!(parsed.request.scheme, "http");
+            assert_eq!(parsed.request.host, "example.com:8080");
+            assert_eq!(parsed.http_version.as_deref(), Some("HTTP/1.1"));
+        }
+    }
+
+    #[test]
+    fn raw_request_parser_preserves_origin_target_bytes() {
+        for target in ["/a/../b", "/a/.%2e/b", "//a//b?", "/a/%2f%2F?x=%2e"] {
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let request = parse_editable_raw_request(&raw, None).unwrap();
+            assert_eq!(request.path, target);
+            assert_eq!(request.scheme, "https");
+        }
+    }
+
+    #[test]
+    fn raw_request_parser_rejects_malformed_absolute_target() {
+        for target in [
+            "http:///example.com/a",
+            "http://?q",
+            "http://example.com:bad/a",
+            "http://[::1/a",
+            "http://example.com\\other/a",
+            "http://example.com/a\0b",
+            "http://@example.com/a",
+            "http://user:pass@example.com/a",
+            "http://example.com/a#",
+            "http://example.com/a#fragment",
+        ] {
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            assert!(
+                parse_editable_raw_request(&raw, None).is_err(),
+                "accepted {target:?}"
+            );
+        }
     }
 
     #[test]

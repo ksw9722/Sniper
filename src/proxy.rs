@@ -3797,6 +3797,12 @@ async fn execute_streaming_http_exchange(
     let build_outbound = |client: &ProxyClient| {
         let mut request_builder = client
             .request(method.clone(), absolute_uri.to_string())
+            .raw_path_and_query(
+                absolute_uri
+                    .path_and_query()
+                    .cloned()
+                    .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/")),
+            )
             .headers(outbound_headers.clone())
             .body(request_body.clone());
         if let Some(version) = requested_http_version {
@@ -4347,6 +4353,12 @@ async fn execute_http_exchange(
     let build_outbound = |client: &ProxyClient| {
         let mut request_builder = client
             .request(method.clone(), absolute_uri.to_string())
+            .raw_path_and_query(
+                absolute_uri
+                    .path_and_query()
+                    .cloned()
+                    .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/")),
+            )
             .headers(outbound_headers.clone())
             .body(request_body.clone());
         if let Some(version) = requested_http_version {

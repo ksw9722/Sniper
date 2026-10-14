@@ -21772,16 +21772,23 @@ function parseEditableRawRequest(text, fallback) {
 
   if (/^https?:\/\//i.test(target)) {
     const absolute = new URL(target);
-    if (absolute.username || absolute.password) {
+    if (absolute.username || absolute.password || /^https?:\/\/[^/?#]*@/i.test(target)) {
       throw new Error("Absolute request target must not include credentials");
     }
-    if (absolute.hash) {
+    if (target.includes("#")) {
       throw new Error("Absolute request target must not include a fragment");
+    }
+    // URL validates the authority, but its path serialization removes dot
+    // segments and an empty query delimiter. Replay must retain the raw target.
+    const rawTarget = target.match(/^https?:\/\/[^/?#\\]+([/?][^#]*)?$/i);
+    if (!rawTarget || /[\u0000-\u0020\u007f]/.test(target)) {
+      throw new Error("Invalid absolute request target");
     }
     scheme = absolute.protocol.replace(":", "");
     host = absolute.host;
     absoluteAuthority = absolute.host;
-    path = `${absolute.pathname || "/"}${absolute.search || ""}`;
+    path = rawTarget[1] || "/";
+    if (path.startsWith("?")) path = `/${path}`;
   }
 
   const hostHeader = headerValue(headers, "host");

@@ -26,6 +26,8 @@ jobs:
       - run: cargo test --locked --release
       - run: python tests/runtime_smoke.py
       - run: python tests/proxy_chain_smoke.py
+      - name: Verify raw HTTP targets against isolated local origins
+        run: python tests/raw_request_target_smoke.py target/release
       # The release script, not make-zip.ps1 directly: running the real release
       # path on every push is what stops it rotting between releases, which is
       # the only time anyone would otherwise notice it broke.
