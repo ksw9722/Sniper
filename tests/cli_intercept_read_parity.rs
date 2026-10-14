@@ -38,20 +38,24 @@ impl Fixture {
         }
     }
     async fn cli(&self, args: &[&str], expected: i32) -> Value {
-        let output = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"))
-                .env_clear()
-                .env("SNIPER_DATA_DIR", &self.dir)
-                .env("HOME", &self.dir)
-                .args(["--api", &self.api, "--output", "compact"])
-                .args(args)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .expect("CLI exceeded bounded wait")
-        .unwrap();
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sniper-cli"));
+        command
+            .env_clear()
+            .env("SNIPER_DATA_DIR", &self.dir)
+            .env("HOME", &self.dir)
+            .args(["--api", &self.api, "--output", "compact"])
+            .args(args)
+            .kill_on_drop(true);
+        // Winsock needs SystemRoot to locate socket-provider DLLs even when
+        // all traffic stays on loopback. Keep user/API settings isolated.
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .expect("CLI exceeded bounded wait")
+            .unwrap();
         assert_eq!(output.status.code(), Some(expected), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
         serde_json::from_slice(&output.stdout).unwrap()
