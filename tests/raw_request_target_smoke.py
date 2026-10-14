@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import ssl
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,9 +46,24 @@ class Origin(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def run_curl(command, env):
+    response = subprocess.run(command, env=env, capture_output=True)
+    if response.returncode:
+        # This fixture only talks to its synthetic origins. Keep TLS diagnostics
+        # without printing the command's headers/body or unbounded tool output.
+        stderr = response.stderr.decode("utf-8", errors="replace")
+        bounded = stderr[:4096] + (" [truncated]" if len(stderr) > 4096 else "")
+        raise AssertionError(f"curl failed ({response.returncode}) for synthetic traffic: {bounded}")
+    return response
+
+
 def main():
     binaries = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release").resolve()
     suffix = ".exe" if os.name == "nt" else ""
+    curl = shutil.which("curl")
+    assert curl is not None, "curl is required for the raw request-target regression"
+    curl_version = subprocess.run([curl, "--version"], check=True, capture_output=True, text=True)
+    print(f"curl executable: {curl}\n{curl_version.stdout.splitlines()[0]}", flush=True)
     servers = []
     child = None
     with tempfile.TemporaryDirectory(prefix="sniper-raw-target-") as temporary:
@@ -116,7 +132,7 @@ def main():
 
             def exercise(scheme, target, name="127.0.0.1"):
                 host = f"{name}:{origins[scheme]}"
-                command = ["curl", "--silent", "--show-error", "--path-as-is", "--max-time", "15",
+                command = [curl, "--silent", "--show-error", "--path-as-is", "--max-time", "15",
                            "--noproxy", "", "--proxy", "http://" + runtime["proxy_addr"],
                            "--cacert", ca, "--data-binary", body]
                 for header in headers:
@@ -125,8 +141,7 @@ def main():
                 # explicitly set the wire target to exercise that valid case.
                 if target.endswith("?"):
                     command += ["--request-target", f"http://{host}{target}" if scheme == "http" else target]
-                response = subprocess.run(command + [f"{scheme}://{host}{target}"], env=env,
-                                          check=True, capture_output=True)
+                response = run_curl(command + [f"{scheme}://{host}{target}"], env)
                 check(json.loads(response.stdout), target, host)
                 record = eventually(lambda: next((r for r in api("/api/transactions")
                     if r["path"] == target and r["host"] == host and r["scheme"] == scheme), None))
