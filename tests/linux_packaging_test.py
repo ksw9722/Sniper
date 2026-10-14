@@ -238,11 +238,13 @@ class PackagingTests(unittest.TestCase):
 
     def test_source_binary_target_version_and_epoch_mismatches_are_rejected(self):
         original = self.record_path.read_text()
+        major, minor, patch_version = map(int, json.loads(original)["version"].split("."))
+        mismatched_version = f"{major}.{minor}.{patch_version + 1}"
         changes = [
             (lambda r: r.update(source={}), "source changed"),
             (lambda r: r["binaries"]["sniper"].update(sha256="0" * 64), "binary changed"),
             (lambda r: r.update(target="ubuntu-x86_64"), "wrong build record target"),
-            (lambda r: r.update(version="0.3.1"), "invalid package version"),
+            (lambda r: r.update(version=mismatched_version), "invalid package version"),
             (lambda r: r.update(source_date_epoch=-1), "invalid source date epoch"),
         ]
         for change, error in changes:
