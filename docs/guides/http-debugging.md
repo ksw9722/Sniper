@@ -540,6 +540,11 @@ invalid replay target: Replay target override is not supported when the request 
 
 An override therefore needs a capture whose `Host:` header is a name.
 
+A request read with `--request-file` or `--stdin` names no scheme of its own, so
+`--scheme` (or the scheme of a URL given to `--host`) becomes its scheme rather
+than an override. Sending such a request to `127.0.0.1` over plain HTTP works as
+long as `--host` and `--port` match its `Host:` header.
+
 `--label` on `replay open` and `replay update` names the tab, the same as
 renaming it in the tab strip. An agent firing several requests can mark what
 each tab tests, and an empty `--label ""` clears the name:

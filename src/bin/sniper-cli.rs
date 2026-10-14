@@ -10498,6 +10498,11 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 }
                 tab.response_record = None;
             }
+            adopt_target_scheme_for_uncaptured_request(
+                tab.base_request.as_mut(),
+                tab.source_transaction_id,
+                &tab.target_scheme,
+            );
             let snapshot = post_workspace_state(&api, &mut workspace, args.session_id).await?;
             let tab = find_replay_tab(&snapshot.replay, &args.tab_id)?;
             print_json_with_session(tab, workspace.session_id)
@@ -13313,6 +13318,25 @@ struct ReplayOpenInput {
     label: Option<String>,
 }
 
+/// A request read from a file or stdin, or the placeholder `replay open` starts
+/// from, names no scheme of its own, so the scheme it is sent with is its scheme.
+/// Left at the parser's default, a different target scheme reads as an override,
+/// which the server refuses when the request's host is an IP address: plain HTTP to
+/// `127.0.0.1` could not be set up from the CLI at all. A captured request keeps the
+/// scheme it was captured with, and a scheme change on it stays an override.
+fn adopt_target_scheme_for_uncaptured_request(
+    request: Option<&mut EditableRequest>,
+    source_transaction_id: Option<Uuid>,
+    target_scheme: &str,
+) {
+    if source_transaction_id.is_some() || target_scheme.is_empty() {
+        return;
+    }
+    if let Some(request) = request {
+        request.scheme = target_scheme.to_string();
+    }
+}
+
 async fn open_replay_tab(
     api: &ApiClient,
     input: ReplayOpenInput,
@@ -13328,7 +13352,7 @@ async fn open_replay_tab(
         label,
     } = input;
     let mut workspace = load_workspace_state(api, session_id).await?;
-    let (base_request, source_transaction_id, request_text) = resolve_request_source(
+    let (mut base_request, source_transaction_id, request_text) = resolve_request_source(
         api,
         workspace.session_id,
         transaction_id,
@@ -13337,6 +13361,11 @@ async fn open_replay_tab(
     )
     .await?;
     let normalized = normalize_target_inputs(scheme, host, port, base_request.as_ref())?;
+    adopt_target_scheme_for_uncaptured_request(
+        base_request.as_mut(),
+        source_transaction_id,
+        &normalized.scheme,
+    );
     let sequence = next_replay_tab_sequence(&workspace.replay)?;
     let tab = ReplayTabState {
         id: Uuid::new_v4().to_string(),
@@ -16726,9 +16755,10 @@ fn parse_response_status_line(status_line: &str) -> Result<u16> {
 mod tests {
     use super::validate_saved_response_binding;
     use super::{
-        active_session_id_from_summaries, api_failure_detail, api_url, attach_session_id,
-        attach_workspace_save_error, auto_replace_write_session_id, browser_choices,
-        browser_open_body, build_annotations_payload, build_editable_raw_request,
+        active_session_id_from_summaries, adopt_target_scheme_for_uncaptured_request,
+        api_failure_detail, api_url, attach_session_id, attach_workspace_save_error,
+        auto_replace_write_session_id, browser_choices, browser_open_body,
+        build_annotations_payload, build_editable_raw_request,
         build_editable_raw_request_with_version, build_oast_configure_update, clap_error_payload,
         cli_data_dir, cli_error_payload, cli_output_format_from_raw_args,
         cli_parse_error_long_option, cli_parse_error_operation, cli_partial_apply_error,
@@ -18253,6 +18283,30 @@ mod tests {
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "mixed.example");
         assert_eq!(target.port, "9443");
+    }
+
+    #[test]
+    fn only_an_uncaptured_request_adopts_the_target_scheme() {
+        let mut typed = default_editable_request();
+        adopt_target_scheme_for_uncaptured_request(Some(&mut typed), None, "http");
+        assert_eq!(typed.scheme, "http");
+        adopt_target_scheme_for_uncaptured_request(Some(&mut typed), None, "");
+        assert_eq!(
+            typed.scheme, "http",
+            "an unset target scheme changes nothing"
+        );
+
+        let mut captured = default_editable_request();
+        let scheme = captured.scheme.clone();
+        adopt_target_scheme_for_uncaptured_request(
+            Some(&mut captured),
+            Some(Uuid::new_v4()),
+            "http",
+        );
+        assert_eq!(
+            captured.scheme, scheme,
+            "a captured request keeps its scheme; a change stays an override"
+        );
     }
 
     #[test]

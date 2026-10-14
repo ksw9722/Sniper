@@ -74,6 +74,12 @@ proved unchanged. See the
 - Inspect `saved.v1` mutation receipts after uncertain outcomes. Legacy session
   and saved-tab metadata operations do not provide these receipts. Do not
   automatically repeat a mutation just because its response was lost or invalid.
+- `replay open` and `replay update` give a request read from `--request-file` or
+  `--stdin`, or the placeholder `replay open` starts from, the target scheme as
+  its own. It used to keep the parser's `https`, so `--scheme http` read as a
+  target override, which the server refuses for an IP-address host: plain-HTTP
+  replay to `127.0.0.1` could not be set up from the CLI. A request opened from a
+  captured transaction keeps its scheme, and changing it is still an override.
 
 See the [CLI integration guide](../integrations/codex.md),
 [saved-data contract](../integrations/saved-data-v1.md), and
