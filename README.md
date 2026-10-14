@@ -48,8 +48,8 @@ Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or
 **Debian 13 (trixie), x86_64, X11 is supported on the unreleased
 `release/0.3.1` development branch.** Build from that branch or use its exact-run
 CI candidate archive or `.deb`; there are **no published Linux release assets
-yet**. Candidate filenames currently use the crate version `0.3.0`, not the
-branch name.
+yet**. Candidate filenames use the crate version `0.3.1`, the version this branch
+will release.
 
 See [Linux source, CI artifacts and installation](packaging/linux/README.md)
 for the qualification boundary, system GTK 3/WebKitGTK 4.1 requirements,

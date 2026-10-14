@@ -1,7 +1,7 @@
 # CLI and saved-workspace maintenance (unreleased)
 
 This is an overview of maintenance work on `release/0.3.1`, not a release
-announcement. The package version remains `0.3.0` until release preparation.
+announcement. The package version is `0.3.1`, the version this branch releases.
 
 ## Passive Service Map
 
@@ -98,8 +98,9 @@ while preserving the active file. `skills apply-update --yes` explicitly
 activates a reviewed stage bound to that unchanged baseline and the running
 binary's bundle. Different bytes require strictly newer semantic-version
 precedence. Equal precedence with different bytes is a conflict, even when only
-build metadata differs. The source package remains `0.3.0`; changed embedded
-bytes at that same version are intentionally refused as an upgrade.
+build metadata differs. Changed embedded bytes at the same package version are
+intentionally refused as an upgrade; bytes staged by a `0.3.0` build are older
+than this `0.3.1` bundle.
 
 Apply uses a retained canonical lowercase operation UUID. After uncertain or
 lost output, inspect read-only `skills update-result` with the same original ID,

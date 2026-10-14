@@ -3,7 +3,7 @@
 **Debian 13 (trixie), x86_64, X11 is a supported development-branch target.**
 Use the unreleased `release/0.3.1` branch for source builds and CI candidates.
 There are **no published Linux release assets yet**. The crate and candidate
-filenames still use version `0.3.0`; the branch name is not a released version.
+filenames use version `0.3.1`, which is not released yet.
 Ubuntu, other Debian versions, other distributions, ARM, musl, native Wayland
 and XWayland are outside this qualification. These Linux checks make no new
 macOS qualification claim.
@@ -61,10 +61,10 @@ not replace native desktop qualification or extend support to another target.
 
 ## Candidate artifacts and ownership
 
-- `Sniper-0.3.0-debian13-x86_64.tar.gz`: one versioned directory with `bin/sniper`,
+- `Sniper-0.3.1-debian13-x86_64.tar.gz`: one versioned directory with `bin/sniper`,
   `bin/sniper-cli`, `bin/sniper-desktop`, `LICENSE`, this README, icon,
   `share/applications/sniper.desktop`, `build-manifest.json`, and `SHA256SUMS`.
-- `Sniper-0.3.0-debian13-x86_64.deb`: package-owned `/usr/bin/sniper`,
+- `Sniper-0.3.1-debian13-x86_64.deb`: package-owned `/usr/bin/sniper`,
   `/usr/bin/sniper-cli`, `/usr/bin/sniper-desktop`, desktop entry under
   `/usr/share/applications`, PNG under the standard hicolor 256x256 apps directory,
   and documentation, license, build manifest and checksums under
@@ -86,11 +86,11 @@ standard icon/desktop-cache triggers may run; Sniper adds no custom triggers.
 For a qualified candidate, inspect and verify the files before installation:
 
 ```sh
-sha256sum -c Sniper-0.3.0-debian13-x86_64.deb.sha256
-dpkg-deb --info Sniper-0.3.0-debian13-x86_64.deb
-dpkg-deb --contents Sniper-0.3.0-debian13-x86_64.deb
+sha256sum -c Sniper-0.3.1-debian13-x86_64.deb.sha256
+dpkg-deb --info Sniper-0.3.1-debian13-x86_64.deb
+dpkg-deb --contents Sniper-0.3.1-debian13-x86_64.deb
 # Changes system package state; use only on the intended Debian 13 machine:
-sudo apt install ./Sniper-0.3.0-debian13-x86_64.deb
+sudo apt install ./Sniper-0.3.1-debian13-x86_64.deb
 # After closing Sniper, to remove its package-owned files:
 sudo apt remove sniper
 ```
@@ -107,9 +107,9 @@ Verify the archive, then extract it into a new user-owned directory. Do not
 extract over an existing installation or into a system directory:
 
 ```sh
-sha256sum -c Sniper-0.3.0-debian13-x86_64.tar.gz.sha256
-tar -xzf Sniper-0.3.0-debian13-x86_64.tar.gz
-cd Sniper-0.3.0-debian13-x86_64
+sha256sum -c Sniper-0.3.1-debian13-x86_64.tar.gz.sha256
+tar -xzf Sniper-0.3.1-debian13-x86_64.tar.gz
+cd Sniper-0.3.1-debian13-x86_64
 sha256sum -c SHA256SUMS
 # Optional for this shell only; no shell profile is changed:
 export PATH="$PWD/bin:$PATH"
