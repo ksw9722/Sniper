@@ -423,3 +423,62 @@ for (const kind of KINDS) for (const reason of [...AUTHORITATIVE, 'inactive_sess
   }
   assert.equal(f.requests.length, readCount, 'response and tab navigation add no reads');
 });
+
+for (const endpoint of [false, true]) for (const shown of [false, true]) for (const mismatch of ['sequence', 'record_id']) {
+  test(`exact evidence rejects mismatched ${mismatch}, endpoint=${endpoint}, shown=${shown}`, async () => {
+    const f = fixture(); await f.load(); await f.verify();
+    if (shown) await show(f);
+    f.controller.selectOrigin(SOURCE, endpoint ? 0 : null);
+    const payload = evidence();
+    payload.row[mismatch] = mismatch === 'sequence' ? '9007199254740994' : NEW_GENERATION;
+    const task = f.controller.loadEvidence(TOKEN);
+    f.requests.at(-1).resolve(result(payload));
+    assert.equal(await task, false);
+    assert.equal(f.state.evidence, null);
+    assert.equal(f.state.socketPeer, null);
+    assert.equal(f.state.bodyReferenceOverlay, null);
+    assert.doesNotMatch(f.els.detail.innerHTML, /Exact retained source verified|Verified retained source/);
+    assert.match(f.els.detail.innerHTML, /Source unavailable/);
+    const count = f.requests.length;
+    assert.equal(await f.controller.loadBodyReferences(), false);
+    assert.equal(f.requests.length, count, 'unverified source cannot initiate a body read');
+  });
+}
+
+for (const [label, mutate] of [
+  ['another session', fields => { fields[1] = NEW_GENERATION; }],
+  ['another generation', fields => { fields[2] = NEW_GENERATION; }],
+  ['noncanonical sequence', fields => { fields[3] = '0' + fields[3]; }],
+  ['invalid revision', fields => { fields[4] = 'invalid'; }],
+]) test(`exact source rejects versioned evidence with ${label}`, async () => {
+  const fields = TOKEN.split('.'); mutate(fields); const id = fields.join('.');
+  const f = fixture(); await f.load(snapshot([origin(SOURCE, id)]));
+  assert.equal(await f.verify(id), false);
+  assert.equal(f.state.evidence, null);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Exact retained source verified/);
+});
+
+test('identity mismatch clears only the affected shown source', async () => {
+  const f = fixture(); await f.load(); await f.verify(); await show(f);
+  const original = f.state.bodyReferenceOverlay;
+  await f.verify(SECOND_TOKEN, OTHER); await show(f, 'body', SECOND_TOKEN, OTHER);
+  f.controller.selectOrigin(OTHER);
+  const payload = evidence(SECOND_TOKEN, OTHER); payload.row.record_id = NEW_GENERATION;
+  const task = f.controller.loadEvidence(SECOND_TOKEN); f.requests.at(-1).resolve(result(payload));
+  assert.equal(await task, false);
+  assert.equal(f.state.relationLayers.length, 1);
+  assert.equal(f.state.relationLayers[0], original);
+  const count = f.requests.length;
+  for (const load of ['loadBodyReferences', 'loadLinkDeclarations', 'loadHtmlGenerators', 'loadPeerMatches']) {
+    assert.equal(await f.controller[load](), false);
+  }
+  assert.equal(f.requests.length, count);
+});
+
+test('exact source preserves uint64 precision through maximum sequence', async () => {
+  const sequence = '18446744073709551615', id = TOKEN.replace(SEQUENCE, sequence);
+  const f = fixture(); await f.load(snapshot([origin(SOURCE, id)]));
+  assert.equal(await f.verify(id), true);
+  assert.equal(f.state.evidence.sequence, sequence);
+  assert.match(f.els.detail.innerHTML, /Exact retained source verified/);
+});
