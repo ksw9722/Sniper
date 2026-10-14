@@ -133,6 +133,14 @@ were verified at `e7cbe95`. Actual GUI behavior, Intel Macs and user-installed
 skills remain unverified. Windows activation, rollback, result inspection and
 host-policy operations are unsupported.
 
+Activation refused every skill file and directory that carried an extended
+attribute, and macOS gives each file a process creates `com.apple.provenance`,
+naming the app it came from. Every file a downloaded Sniper, or a terminal it
+started, writes therefore failed with `metadata_unsupported`; on such a Mac all
+97 enrollment, activation and automatic-update tests failed that way. That label
+alone is now tolerated on macOS. Any other attribute and every ACL are still
+refused, and Linux still refuses all attributes, since it keeps ACLs there.
+
 See [safe skill maintenance](../integrations/skill-maintenance.md) for exact
 commands, confirmation requirements, refusal states and recovery limitations.
 

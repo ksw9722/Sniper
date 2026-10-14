@@ -530,18 +530,55 @@ pub(crate) mod supported {
         }
         validate_access_metadata(file)
     }
-    fn validate_access_metadata(file: &File) -> Result<()> {
+    /// Attributes the system attaches by itself, which grant no access. macOS tags
+    /// every file a process creates with the app it came from, so each file a
+    /// downloaded Sniper or a terminal it started writes carries
+    /// `com.apple.provenance`, and refusing it refused every activation there.
+    // ponytail: only this label. An SELinux host gives every file `security.selinux`
+    // and is refused the same way; add it if such hosts are supported. Linux keeps
+    // ACLs in attributes (`system.posix_acl_*`), so anything else stays refused.
+    #[cfg(target_os = "macos")]
+    const SYSTEM_ATTRIBUTES: &[&[u8]] = &[b"com.apple.provenance"];
+    #[cfg(target_os = "linux")]
+    const SYSTEM_ATTRIBUTES: &[&[u8]] = &[];
+
+    /// Whether a NUL-separated attribute name list holds only system labels.
+    fn only_system_attributes(names: &[u8]) -> bool {
+        names
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .all(|name| SYSTEM_ATTRIBUTES.contains(&name))
+    }
+
+    fn list_attribute_names(file: &File, names: &mut [u8]) -> isize {
+        let list = if names.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            names.as_mut_ptr().cast()
+        };
         #[cfg(target_os = "linux")]
-        // SAFETY: a null list with zero size queries the attribute list length.
-        let attributes = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
+        // SAFETY: a null list with zero size queries the length; otherwise the
+        // buffer is live and its exact length is passed.
+        let listed = unsafe { libc::flistxattr(file.as_raw_fd(), list, names.len()) };
         #[cfg(target_os = "macos")]
-        // SAFETY: a null list with zero size queries the attribute list length.
-        let attributes = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
-        if attributes < 0 {
+        // SAFETY: as above, with no options.
+        let listed = unsafe { libc::flistxattr(file.as_raw_fd(), list, names.len(), 0) };
+        listed
+    }
+
+    fn validate_access_metadata(file: &File) -> Result<()> {
+        let length = list_attribute_names(file, &mut []);
+        if length < 0 {
             return Err(error("metadata_unsupported"));
         }
-        if attributes != 0 {
-            return Err(error("metadata_unsupported"));
+        if length > 0 {
+            let mut names = vec![0_u8; length as usize];
+            // A list that grew since the length query fails with ERANGE, so it is
+            // refused rather than read short.
+            let listed = list_attribute_names(file, &mut names);
+            if listed < 0 || !only_system_attributes(&names[..listed as usize]) {
+                return Err(error("metadata_unsupported"));
+            }
         }
         #[cfg(target_os = "macos")]
         check_macos_acl(file)?;
@@ -2742,7 +2779,8 @@ pub(crate) mod supported {
             assert_eq!(f.apply().unwrap().state, "applied");
             assert_eq!(f.back().unwrap().state, "rolled_back");
         }
-        #[cfg(target_os = "linux")]
+        // On macOS the fixture files already carry the system's provenance label,
+        // so this also shows that label does not let any other attribute through.
         #[test]
         fn extended_file_and_directory_metadata_fails_closed() {
             for directory in [false, true] {
@@ -2751,6 +2789,7 @@ pub(crate) mod supported {
                 let p = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
                 let name = std::ffi::CString::new("user.sniper_test").unwrap();
                 let value = b"synthetic";
+                #[cfg(target_os = "linux")]
                 // SAFETY: all buffers and explicit lengths are live in this temporary fixture.
                 let rc = unsafe {
                     libc::setxattr(
@@ -2758,6 +2797,18 @@ pub(crate) mod supported {
                         name.as_ptr(),
                         value.as_ptr().cast(),
                         value.len(),
+                        0,
+                    )
+                };
+                #[cfg(target_os = "macos")]
+                // SAFETY: as above, at position 0 with no options.
+                let rc = unsafe {
+                    libc::setxattr(
+                        p.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
                         0,
                     )
                 };
@@ -2769,6 +2820,24 @@ pub(crate) mod supported {
                 f.baseline();
                 assert!(!f.tx().exists());
             }
+        }
+
+        #[test]
+        fn only_the_system_provenance_label_is_tolerated() {
+            assert!(only_system_attributes(b""));
+            for refused in [
+                &b"user.sniper_test\0"[..],
+                b"system.posix_acl_access\0",
+                b"com.apple.provenance\0user.sniper_test\0",
+                b"com.apple.provenance.extra\0",
+            ] {
+                assert!(!only_system_attributes(refused), "{refused:?}");
+            }
+            assert_eq!(
+                only_system_attributes(b"com.apple.provenance\0"),
+                cfg!(target_os = "macos"),
+                "the label macOS attaches by itself, and only on macOS"
+            );
         }
 
         // These fixtures compile only on macOS. Linux test success does not
