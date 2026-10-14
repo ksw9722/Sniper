@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -64,6 +65,11 @@ def main():
     assert curl is not None, "curl is required for the raw request-target regression"
     curl_version = subprocess.run([curl, "--version"], check=True, capture_output=True, text=True)
     print(f"curl executable: {curl}\n{curl_version.stdout.splitlines()[0]}", flush=True)
+    # This throwaway CA has no CRL distribution point. Schannel otherwise rejects
+    # its valid chain with CERT_TRUST_REVOCATION_STATUS_UNKNOWN. Tolerate only
+    # missing/offline revocation data in this fixture; CA/hostname checks remain
+    # enabled, and known revoked certificates are still rejected.
+    tls_options = ["--ssl-revoke-best-effort"] if "Schannel" in curl_version.stdout else []
     servers = []
     child = None
     with tempfile.TemporaryDirectory(prefix="sniper-raw-target-") as temporary:
@@ -74,6 +80,8 @@ def main():
                    SNIPER_DATA_DIR=str(data), SNIPER_UI_ADDR="127.0.0.1:0",
                    SNIPER_PROXY_ADDR="127.0.0.1:0", RUST_LOG="off")
         env.pop("SNIPER_API_ADDR", None)
+        for name in ("CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+            env.pop(name, None)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
         def api(path, payload=None):
@@ -135,6 +143,8 @@ def main():
                 command = [curl, "--silent", "--show-error", "--path-as-is", "--max-time", "15",
                            "--noproxy", "", "--proxy", "http://" + runtime["proxy_addr"],
                            "--cacert", ca, "--data-binary", body]
+                if scheme == "https":
+                    command += tls_options
                 for header in headers:
                     command += ["-H", header["name"] + ": " + header["value"]]
                 # curl drops an empty query delimiter while parsing its URL;
@@ -193,6 +203,58 @@ def main():
             for scheme in origins:
                 for target in targets:
                     exercise(scheme, target)
+            # Export an unrelated, currently valid platform root into the
+            # temporary fixture. Reading it does not modify platform trust.
+            # Reusing another Sniper root with the same subject can instead
+            # trigger an ambiguous signature error in OpenSSL's chain builder.
+            own_trust = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            own_trust.load_verify_locations(cafile=ca)
+            own_subject = own_trust.get_ca_certs()[0]["subject"]
+            own_der = ssl.PEM_cert_to_DER_cert(Path(ca).read_text())
+            platform_trust = ssl.create_default_context()
+            details = platform_trust.get_ca_certs()
+            certificates = platform_trust.get_ca_certs(binary_form=True)
+            assert len(details) == len(certificates)
+            wrong_ca = root / "unrelated-ca.pem"
+            now = time.time()
+            for detail, certificate in zip(details, certificates):
+                if (detail["subject"] != own_subject and detail["subject"] == detail["issuer"]
+                        and certificate != own_der
+                        and ssl.cert_time_to_seconds(detail["notBefore"]) <= now
+                        <= ssl.cert_time_to_seconds(detail["notAfter"])):
+                    wrong_ca.write_text(ssl.DER_cert_to_PEM_cert(certificate), encoding="ascii")
+                    break
+            else:
+                raise AssertionError("A valid unrelated platform root is required for the negative TLS check")
+
+            # The fixture-only CRL option must not become a TLS verification
+            # bypass. Use the wrong valid CA; then trust the correct CA but
+            # CONNECT to an IP leaf while verifying the URL's DNS hostname.
+            # Both use the same reachable MITM endpoint as the positive cases.
+            port = origins["https"]
+            tls_command = [curl, "--silent", "--show-error", "--max-time", "15",
+                           "--noproxy", "", "--proxy", "http://" + runtime["proxy_addr"],
+                           *tls_options]
+            negatives = [
+                ("untrusted CA", ["--cacert", str(wrong_ca), f"https://127.0.0.1:{port}/tls-negative"],
+                    ["self-signed certificate", "unable to get local issuer",
+                     "untrusted_root", "untrusted root", "unknown ca"]),
+                ("hostname mismatch", ["--cacert", ca, "--connect-to",
+                    f"example.com:{port}:127.0.0.1:{port}", f"https://example.com:{port}/tls-negative"],
+                    ["hostname", "host name", "wrong_principal", "principal name is incorrect"]),
+            ]
+            for label, arguments, reasons in negatives:
+                rejected = subprocess.run(tls_command + arguments, env=env, capture_output=True)
+                diagnostic = rejected.stderr.decode("utf-8", errors="replace")[:4096]
+                assert rejected.returncode == 60, (
+                    f"Expected curl certificate rejection for {label}, got {rejected.returncode}: {diagnostic}"
+                )
+                assert any(reason in diagnostic.lower() for reason in reasons), (
+                    f"Unexpected certificate rejection for {label}: {diagnostic}"
+                )
+                print(f"Expected {label} rejection: {diagnostic.splitlines()[0]}", flush=True)
+            print("PASS: client still rejects an untrusted CA and a hostname mismatch", flush=True)
+
             # Exercise the real CLI raw-file entry point, not just its parser.
             cli_target = "/cli/a/../%2e%2E/b?raw=%2f"
             cli_host = f"127.0.0.1:{origins['http']}"
