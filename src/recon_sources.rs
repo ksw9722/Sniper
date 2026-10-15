@@ -911,14 +911,14 @@ mod tests {
 
     #[test]
     fn html_resolves_base_attributes_and_entities_without_running_content() {
-        let found = extract_document(&base(), "text/html; charset=utf-8", r#"
+        let found = extract_document(&base(), "text/html; charset=utf-8", r##"
           <base href="/assets/"><a href='view?x=1&amp;x=2'>view</a>
           <img src=image.png><script src="/bundle.js"></script>
           <!-- <a href="/comment-decoy"> -->
           <script>const template = '<a href="/fake-link">'; fetch('/api/data');</script>
           <style>.foo{content:'<a href="/style-decoy">'}</style>
           <a href="javascript:alert(1)">invalid</a><a href="#only-fragment">fragment</a>
-        "#);
+        "##);
         let link = found.iter().find(|d| d.url == "https://example.com/assets/view?x=1&x=2").unwrap();
         assert!(is_followable(link));
         assert!(found.iter().any(|d| d.url == "https://example.com/assets/image.png"));
