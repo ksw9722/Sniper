@@ -361,6 +361,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/decoder/", get(decoder_index))
         .route("/decoder/*path", get(decoder_asset))
         .route("/app.js", get(app_js))
+        .route("/recon.js", get(recon_js))
+        .route("/api/recon", get(crate::recon::list))
+        .route("/api/recon/jobs", post(crate::recon::start))
+        .route("/api/recon/jobs/:id/stop", post(crate::recon::stop))
         .route("/service-map.js", get(service_map_js))
         .route("/codemirror.js", get(codemirror_js))
         .route("/styles.css", get(styles_css))
@@ -8485,6 +8489,13 @@ async fn app_js() -> Response {
     asset_response(
         "application/javascript; charset=utf-8",
         include_str!("../web/app.js"),
+    )
+}
+
+async fn recon_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/recon.js"),
     )
 }
 
@@ -25037,3 +25048,4 @@ mod web_assets {
         );
     }
 }
+

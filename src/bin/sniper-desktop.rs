@@ -761,6 +761,7 @@ fn persist_desktop_session_state(
     runtime: &tokio::runtime::Runtime,
     state: &AppState,
 ) -> Result<()> {
+    runtime.block_on(state.stop_recon_jobs())?;
     let relay_result = runtime
         .block_on(proxy::close_live_websocket_relays(
             state,
@@ -1575,3 +1576,4 @@ mod tests {
         ));
     }
 }
+
