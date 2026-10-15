@@ -287,8 +287,11 @@ All origins picked its 24 cards by name, and an arrow is drawn only between two
 shown cards, so related origins usually fell on either side of the cap: a real
 session with 67 relationships among 86 origins showed none. Cards now open, and
 reorder on an explicit Reload, by relationship: the best-connected origin, its
-neighbours, then each further connected group. Linked cards also lead each
-column, so a hub no longer sits below a column of unrelated names with its arrows
-off screen. Polling still keeps cards in place. A Referer or Origin naming the requested origin itself is no longer
+neighbours, then each further connected group. The graph also dropped its two
+fixed columns for a layout by link depth: the same session went from one hub
+beside a column of 23 cards, with 17 arrows looping inside that column, to three
+columns of 1, 13 and 10 cards with no same-column arrow, about 40% shorter.
+Direct relations now reads sources, the pinned origin, then targets. Polling
+still keeps cards in place. A Referer or Origin naming the requested origin itself is no longer
 listed as a relationship. A trackpad pinch, or Ctrl with the mouse wheel, zooms
 the graph around the pointer.

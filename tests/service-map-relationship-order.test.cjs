@@ -1,7 +1,7 @@
 // The map draws at most MAX_CARDS cards and an arrow only between two shown
 // cards. Picked by name, related origins fell on either side of the cap, and a
 // real session with 67 relationships among 86 origins drew no arrow at all.
-// Linked cards also lead their column, so the arrows start on screen.
+// Cards are laid out by link depth, so links run between columns, not inside one.
 // Trackpad pinch zooms the graph around the fingers.
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -70,7 +70,44 @@ test('related origins lead the order, best connected first, so their arrows fit 
   assert.deepEqual([...order.slice(4)], unrelated, 'unrelated origins follow by name');
   const layout = map.graphLayout(origins, order);
   assert.equal(layout.edges.length, 3);
-  assert.deepEqual([api, app, cdn].map(id => layout.slots.get(id).row), [0, 1, 2], 'linked targets lead their column, ahead of unrelated names');
+  const at = id => [layout.slots.get(id).column, layout.slots.get(id).row];
+  assert.deepEqual([login, app, api, cdn].map(at), [[0, 0], [1, 0], [2, 0], [2, 1]], 'each link moves one column right');
+  assert.ok(unrelated.slice(0, 20).every(id => layout.slots.get(id).row >= 2), 'unlinked cards sit below the linked ones');
+});
+
+const columnOf = (layout, id) => layout.slots.get(id).column;
+const sameColumnArrows = layout => layout.edges.filter(edge => columnOf(layout, edge.source) === columnOf(layout, edge.target)).length;
+
+test('a hub whose targets also link to each other spreads over columns without same-column loops', () => {
+  // The real session's shape: one page, its targets, and two of those targets
+  // calling further origins and one shared target.
+  const id = name => `https://${name}.example.com`;
+  const hub = origin(id('hub')), targets = Array.from({ length: 6 }, (_, i) => origin(id(`t${i}`), { header_links: [referer(hub.origin)] }));
+  const shared = origin(id('shared'), { header_links: [referer(hub.origin), referer(targets[0].origin), referer(targets[1].origin)] });
+  const deep = origin(id('deep'), { header_links: [referer(targets[0].origin)] });
+  const origins = [hub, ...targets, shared, deep];
+  const layout = map.graphLayout(origins, map.relationshipOrder(origins));
+  assert.equal(columnOf(layout, hub.origin), 0);
+  assert.ok(targets.every(item => columnOf(layout, item.origin) === 1));
+  assert.deepEqual([shared, deep].map(item => columnOf(layout, item.origin)), [2, 2], 'a target of the hub and of its targets sits past both');
+  assert.equal(sameColumnArrows(layout), 0);
+  assert.equal(layout.slots.get(hub.origin).row, 2, 'a short column is centered on the tallest');
+});
+
+test('a cycle turns one link around, and a long chain stops at five columns', () => {
+  const a = origin('https://a.example.com', { redirects: [redirect('https://b.example.com')] });
+  const b = origin('https://b.example.com', { redirects: [redirect(a.origin)] });
+  const loop = map.graphLayout([a, b], [a.origin, b.origin]);
+  assert.deepEqual([a, b].map(item => columnOf(loop, item.origin)), [0, 1]);
+  assert.equal(loop.edges.length, 2, 'both directions keep their arrow');
+  assert.equal(sameColumnArrows(loop), 0);
+
+  const chain = Array.from({ length: 8 }, (_, i) => origin(`https://c${i}.example.com`));
+  chain.forEach((item, i) => { if (chain[i + 1]) item.redirects = [redirect(chain[i + 1].origin)]; });
+  const long = map.graphLayout(chain, chain.map(item => item.origin));
+  assert.deepEqual(chain.map(item => columnOf(long, item.origin)), [0, 1, 2, 3, 4, 4, 4, 4]);
+  assert.deepEqual(chain.slice(4).map(item => long.slots.get(item.origin).row), [0, 1, 2, 3], 'the shared last column keeps chain order');
+  assert.equal(long.width, 2 * map.GRAPH_GEOMETRY.padding + 4 * map.GRAPH_GEOMETRY.columnPitch + map.GRAPH_GEOMETRY.cardWidth);
 });
 
 test('a self declaration links nothing and reference-only origins stay after captured ones', () => {

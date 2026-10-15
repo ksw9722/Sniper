@@ -1517,8 +1517,10 @@ test('overlay direct star keeps the pinned source opposite every incoming and ou
   await f.load(snapshot([a, b])); assert.equal(JSON.stringify([...f.state.layoutSlots]), slots);
 });
 
-function assertFixedCanvasContainsGeometry(layout) {
-  assert.equal(layout.width, 568, 'loop routing must not enlarge the compact horizontal scroll surface');
+function assertCanvasContainsGeometry(layout) {
+  const { padding, columnPitch, cardWidth } = map.GRAPH_GEOMETRY;
+  const columns = Math.max(1, ...[...layout.slots.values()].map(slot => slot.column));
+  assert.equal(layout.width, padding * 2 + columns * columnPitch + cardWidth, 'the canvas is as wide as its columns; loop routing never widens it');
   for (const node of layout.nodes) {
     assert.ok(node.x >= 0 && node.x + map.GRAPH_GEOMETRY.cardWidth <= layout.width);
     assert.ok(node.y >= 0 && node.y + map.GRAPH_GEOMETRY.cardHeight <= layout.height);
@@ -1537,20 +1539,20 @@ function assertFixedCanvasContainsGeometry(layout) {
   }
 }
 
-test('metadata chain keeps three typed right-column curves within the unchanged fixed canvas', () => {
+test('metadata chain reads left to right, one column per link, inside its canvas', () => {
   const a = origin('https://a.example.com'), b = origin('https://b.example.com'), c = origin('https://c.example.com');
   a.redirects = [redirect(b.origin)]; b.redirects = [redirect(c.origin)];
   c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
   const data = map.normalizeSnapshot(snapshot([a, b, c]), 'session-one');
   const order = [a.origin, b.origin, c.origin];
   const layout = map.graphLayout(data.origins, order);
-  assert.equal(layout.slots.get(b.origin).column, 1); assert.equal(layout.slots.get(c.origin).column, 1);
+  assert.deepEqual([a, b, c].map(item => layout.slots.get(item.origin).column), [0, 1, 2]);
   assert.equal(layout.edges.length, 4); assert.equal(new Set(layout.edges.map(edge => edge.path)).size, 4);
   assert.deepEqual([...new Set(layout.edges.map(edge => edge.relationship))].sort(), ['origin_header', 'redirect_instruction', 'referer_header']);
-  assertFixedCanvasContainsGeometry(layout);
+  assertCanvasContainsGeometry(layout);
   const refreshed = map.graphLayout(data.origins, order, layout.slots);
   assert.deepEqual([...refreshed.slots], [...layout.slots]);
-  assertFixedCanvasContainsGeometry(refreshed);
+  assertCanvasContainsGeometry(refreshed);
 });
 
 test('reciprocal metadata curves and direct relations remain unclipped without body overlays or self arrows', () => {
@@ -1564,7 +1566,7 @@ test('reciprocal metadata curves and direct relations remain unclipped without b
     assert.equal(layout.edges.length, 7); assert.equal(layout.edgeCount, 7);
     assert.equal(layout.edges.filter(edge => edge.source !== a.origin).length, 6);
     assert.equal(new Set(layout.edges.map(edge => edge.path)).size, 7);
-    assertFixedCanvasContainsGeometry(layout);
+    assertCanvasContainsGeometry(layout);
   }
 });
 
@@ -1946,7 +1948,7 @@ test('compact cards and arrow attachments share geometry at every scale', async 
   assert.equal(geometry.cardWidth, 220); assert.equal(geometry.cardHeight, 104);
   assert.equal(geometry.rowPitch, 124); assert.equal(geometry.columnPitch, 300);
   const layout = map.graphLayout(f.state.snapshot.origins, f.state.order);
-  assertFixedCanvasContainsGeometry(layout);
+  assertCanvasContainsGeometry(layout);
   const points = layout.edges[0].path.match(/-?\d+(?:\.\d+)?/g).map(Number);
   const from = layout.nodes.find(node => node.origin === originA), to = layout.nodes.find(node => node.origin === originB);
   assert.equal(points[0], from.x + geometry.cardWidth); assert.equal(points[1], from.y + geometry.cardHeight / 2);
@@ -2063,7 +2065,7 @@ test('display text geometry keeps compact defaults and grows card, pitch, and ar
     const a = origin(originA), b = origin(originB), c = origin('https://assets.example.com');
     a.redirects = [redirect(b.origin)]; b.redirects = [redirect(c.origin)]; c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
     const layout = map.graphLayout([a, b, c], [a.origin, b.origin, c.origin], new Map(), null, [], geometry);
-    assert.equal(layout.width, 568);
+    assert.equal(layout.width, geometry.padding * 2 + 2 * geometry.columnPitch + geometry.cardWidth, 'text size never widens the three-column chain');
     for (const node of layout.nodes) assert.ok(node.y + geometry.cardHeight + geometry.padding <= layout.height);
     for (const edge of layout.edges) {
       const points = edge.path.match(/-?\d+(?:\.\d+)?/g).map(Number);

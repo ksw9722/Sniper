@@ -4,6 +4,10 @@
   "use strict";
   const MAX_CARDS = 24;
   const MAX_EDGES = 40;
+  // A dense cyclic graph layers into one long chain; five columns hold a typical
+  // sign-in redirect chain. ponytail: deeper cards share the last column; wrap
+  // them into extra rows if long chains turn out to matter.
+  const MAX_COLUMNS = 5;
   const MAX_RELATION_LAYERS = 8;
   const MAX_REFERENCE_CARDS = 100;
   const MAX_REFERENCE_SOURCES = 30;
@@ -830,8 +834,69 @@
     const cardHeight = Math.max(GRAPH_GEOMETRY.cardHeight, Math.ceil((Math.max(10, size - 1) + 3 * Math.max(9, size - 2)) * GRAPH_GEOMETRY.lineHeight + 36));
     return { ...GRAPH_GEOMETRY, cardHeight, rowPitch: cardHeight + GRAPH_GEOMETRY.rowPitch - GRAPH_GEOMETRY.cardHeight };
   }
+  // Each linked card sits one column right of its furthest linked source
+  // (longest-path layering), so a chain reads left to right and no arrow joins
+  // two cards of one column. Two fixed columns put a real session's hub alone on
+  // the left and its 23 targets in one column, drawing their 17 links to each
+  // other as loops piled on the column edge. Only a link that closes a cycle is
+  // turned around, found by a depth-first walk from the sources. Columns are
+  // centered on the tallest and sorted by their sources' rows to limit
+  // crossings; unlinked cards fill a grid below.
+  function layeredSlots(visibleOrigins, connections) {
+    const ids = visibleOrigins.map((origin) => origin.origin);
+    const rank = new Map(ids.map((id, index) => [id, index]));
+    const inspected = new Set(visibleOrigins.filter((origin) => origin.inspectedSource).map((origin) => origin.origin));
+    const next = new Map(ids.map((id) => [id, new Set()]));
+    for (const [source, target] of connections) next.get(source).add(target);
+    const linked = new Set(connections.flat());
+    const targets = new Set(connections.map(([, target]) => target));
+    const visiting = new Set(), done = new Set(), forward = [];
+    const visit = (id) => {
+      visiting.add(id);
+      for (const target of next.get(id)) {
+        if (visiting.has(target)) {
+          forward.push([target, id]);
+        } else {
+          forward.push([id, target]);
+          if (!done.has(target)) visit(target);
+        }
+      }
+      visiting.delete(id);
+      done.add(id);
+    };
+    for (const id of [...ids.filter((id) => !targets.has(id)), ...ids]) {
+      if (linked.has(id) && !done.has(id)) visit(id);
+    }
+    const layer = new Map([...linked].map((id) => [id, 0]));
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const [source, target] of forward) {
+        if (layer.get(target) <= layer.get(source)) {
+          layer.set(target, layer.get(source) + 1);
+          changed = true;
+        }
+      }
+    }
+    const columns = Array.from({ length: linked.size ? Math.min(MAX_COLUMNS, Math.max(...layer.values()) + 1) : 0 }, () => []);
+    for (const id of ids) if (linked.has(id)) columns[Math.min(MAX_COLUMNS - 1, layer.get(id))].push(id);
+    const tallest = Math.max(0, ...columns.map((column) => column.length));
+    const slots = new Map();
+    columns.forEach((column, index) => {
+      const center = new Map(column.map((id) => {
+        const rows = forward.filter(([source, target]) => target === id && slots.has(source)).map(([source]) => slots.get(source).row);
+        return [id, rows.length ? rows.reduce((sum, row) => sum + row, 0) / rows.length : Infinity];
+      }));
+      column.sort((a, b) => Number(inspected.has(b)) - Number(inspected.has(a)) || center.get(a) - center.get(b) || rank.get(a) - rank.get(b));
+      const offset = Math.floor((tallest - column.length) / 2);
+      column.forEach((id, row) => slots.set(id, { column: index, row: offset + row }));
+    });
+    const gridColumns = Math.max(2, columns.length);
+    ids.filter((id) => !linked.has(id)).forEach((id, index) => {
+      slots.set(id, { column: index % gridColumns, row: tallest + Math.floor(index / gridColumns) });
+    });
+    return slots;
+  }
   function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = [], geometry = GRAPH_GEOMETRY) {
-    const width = geometry.padding * 2 + geometry.columnPitch + geometry.cardWidth;
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
@@ -839,36 +904,16 @@
       ...origin.redirects.map((redirect) => [origin.origin, redirect.target_origin]),
       ...origin.header_links.map((link) => [link.source_origin, origin.origin]),
     ])].filter(([source, target]) => source !== target && visibleIds.has(source) && visibleIds.has(target) && (!anchor || source === anchor || target === anchor));
-    const incoming = new Set(connections.map(([, target]) => target));
-    const outgoing = new Set(connections.map(([source]) => source));
-    let left = visibleOrigins.filter((origin) => outgoing.has(origin.origin) && !incoming.has(origin.origin));
-    let right = visibleOrigins.filter((origin) => !left.includes(origin));
-    if (!left.length) {
-      left = visibleOrigins.filter((_, index) => index % 2 === 0);
-      right = visibleOrigins.filter((_, index) => index % 2 !== 0);
-    } else {
-      // Linked targets lead the column. Sorted only by name, a hub fell below a
-      // column of unrelated cards and its arrows ran off screen.
-      right.sort((a, b) => Number(incoming.has(b.origin)) - Number(incoming.has(a.origin)) || a.origin.localeCompare(b.origin));
-      const targetRank = new Map(right.map((origin, index) => [origin.origin, index]));
-      const averageTarget = (origin) => {
-        const ranks = connections.filter(([source, target]) => source === origin.origin && targetRank.has(target)).map(([, target]) => targetRank.get(target));
-        return ranks.length ? ranks.reduce((sum, rank) => sum + rank, 0) / ranks.length : 0;
-      };
-      left.sort((a, b) => Number(!!b.inspectedSource) - Number(!!a.inspectedSource) || averageTarget(a) - averageTarget(b) || a.origin.localeCompare(b.origin));
-    }
+    let preferred;
     if (anchor && bodyEdges.length) {
       // A pinned direct neighborhood is a star. Keep every neighbor
       // opposite the source so mixed incoming/outgoing declarations cannot
-      // become clipped same-column loops at the fixed canvas edge.
-      left = visibleOrigins.filter((origin) => origin.origin === anchor);
-      right = visibleOrigins.filter((origin) => origin.origin !== anchor);
+      // become same-column loops.
+      const neighbors = visibleOrigins.filter((origin) => origin.origin !== anchor);
+      preferred = new Map([[anchor, { column: 0, row: 0 }], ...neighbors.map((origin, row) => [origin.origin, { column: 1, row }])]);
+    } else {
+      preferred = layeredSlots(visibleOrigins, connections);
     }
-    if (anchor) {
-      const pin = (items) => [...items.filter((origin) => origin.origin === anchor), ...items.filter((origin) => origin.origin !== anchor)];
-      left = pin(left); right = pin(right);
-    }
-    const preferred = new Map([...left.map((origin, row) => [origin.origin, { column: 0, row }]), ...right.map((origin, row) => [origin.origin, { column: 1, row }])]);
     const slots = new Map(visibleOrigins.filter((origin) => previousSlots.has(origin.origin)).map((origin) => [origin.origin, previousSlots.get(origin.origin)]));
     for (const origin of visibleOrigins) {
       if (slots.has(origin.origin)) continue;
@@ -877,6 +922,7 @@
       while ([...slots.values()].some((slot) => slot.column === column && slot.row === row)) row += 1;
       slots.set(origin.origin, { column, row });
     }
+    const width = geometry.padding * 2 + Math.max(1, ...[...slots.values()].map((slot) => slot.column)) * geometry.columnPitch + geometry.cardWidth;
     const visible = visibleOrigins.map((origin) => ({ ...origin, x: geometry.padding + slots.get(origin.origin).column * geometry.columnPitch, y: geometry.padding + slots.get(origin.origin).row * geometry.rowPitch }));
     const positions = new Map(visible.map((origin) => [origin.origin, origin]));
     const edges = [];
