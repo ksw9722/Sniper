@@ -2848,7 +2848,7 @@ async function _applySettings(response) {
   state.runtime = state.settings.runtime;
   syncHttpCapturePill();
   state.activeSession = state.settings.active_session;
-  reconController?.syncSession();
+  if (typeof reconController !== "undefined") reconController?.syncSession();
   state.oastTokenClearPending = false;
   // Sync intercept scope pill with server state
   const interceptScopePill = document.getElementById("interceptInScopeToggle");
@@ -3099,7 +3099,7 @@ async function loadSessions({ reloadOnActiveChange = false, preserveWorkspaceOwn
   }
   state.sessions = sessions;
   state.activeSession = nextActiveSession;
-  reconController?.syncSession();
+  if (typeof reconController !== "undefined") reconController?.syncSession();
   renderDashboard();
 }
 
@@ -4999,7 +4999,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
 
 function resetSessionScopedUiState() {
   workspaceStateGeneration += 1;
-  reconController?.reset();
+  if (typeof reconController !== "undefined") reconController?.reset();
   state.historyRetentionSettings = null;
   state.upstreamPeerSettings = null;
   state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
@@ -8772,8 +8772,8 @@ function renderToolPanels() {
   els.sequenceShell.classList.toggle("hidden", !sequenceVisible);
   els.targetShell.classList.toggle("hidden", !targetVisible);
   els.loggerShell.classList.toggle("hidden", !loggerVisible);
-  els.reconShell.classList.toggle("hidden", !reconVisible);
-  reconController?.setVisible(reconVisible);
+  els.reconShell?.classList.toggle("hidden", !reconVisible);
+  if (typeof reconController !== "undefined") reconController?.setVisible(reconVisible);
 
   if (dashboardVisible) {
     renderDashboard();

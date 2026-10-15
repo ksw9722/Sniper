@@ -300,3 +300,102 @@ test("late stop responses cannot change a newer session's job controls", async (
   assert.equal(descendants(f.node("Jobs")).some(item => item.dataset.stopJob), false);
   f.controller.dispose();
 });
+
+// Exercise the actual app integration too: controller-only fixtures cannot catch
+// an optional feature breaking legacy functions loaded into isolated contexts.
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+const appSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").replace(/\r\n/g, "\n");
+function loadAppFunctions(names, globals) {
+  const context = vm.createContext({ console, ...globals });
+  for (const name of names) {
+    const match = appSource.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}`, "m"));
+    assert.ok(match, `Missing frontend function: ${name}`);
+    vm.runInContext(match[0], context, { filename: `web/app.js:${name}` });
+  }
+  return context;
+}
+
+function panelsFixture(extra = {}) {
+  const names = ["dashboard", "proxy", "replay", "tools", "fuzzer", "sequence", "target", "logger"];
+  const state = { activeTool: "dashboard" };
+  const els = Object.fromEntries(names.map(name => [`${name}Shell`, new NodeFixture()]));
+  els.footerMode = new NodeFixture();
+  return loadAppFunctions(["renderToolPanels"], { state, els, mainTabs: [], sanitizeActiveTool: tool => tool,
+    renderDashboard() {}, renderProxyPanels() {}, renderReplay() {}, renderFuzzer() {}, renderSequencePanel() {}, renderTarget() {}, renderEventLog() {},
+    ensureDecoderWorkbench: async () => {}, ...extra });
+}
+
+for (const optionalController of ["absent", "null"]) {
+  test(`legacy tool panels work with a missing or ${optionalController} Recon controller and no Recon shell`, () => {
+    const context = panelsFixture(optionalController === "null" ? { reconController: null } : {});
+    assert.equal(Object.hasOwn(context, "reconController"), optionalController !== "absent");
+    for (const tool of ["dashboard", "proxy", "replay", "tools", "fuzzer", "sequence", "target", "logger"]) {
+      context.state.activeTool = tool;
+      assert.doesNotThrow(() => context.renderToolPanels());
+      assert.equal(context.els[`${tool}Shell`].classList.contains("hidden"), false);
+    }
+  });
+}
+
+test("Recon navigation still toggles its mounted shell and initialized controller", () => {
+  const calls = [];
+  const context = panelsFixture({ reconController: { setVisible: value => calls.push(value) } });
+  context.els.reconShell = new NodeFixture();
+  context.state.activeTool = "recon";
+  context.renderToolPanels();
+  assert.equal(context.els.reconShell.classList.contains("hidden"), false);
+  assert.equal(context.els.dashboardShell.classList.contains("hidden"), true);
+  assert.equal(context.els.footerMode.textContent, "Recon active");
+  context.state.activeTool = "dashboard";
+  context.renderToolPanels();
+  assert.equal(context.els.reconShell.classList.contains("hidden"), true);
+  assert.deepEqual(calls, [true, false]);
+});
+
+for (const hasController of [false, true]) {
+  test(`session listing adopts the new session ${hasController ? "before syncing Recon" : "without requiring Recon"}`, async () => {
+    const state = { activeSession: { id: "old" } };
+    const sessions = [{ id: "new", name: "Fixture session", active: true }];
+    const calls = [];
+    const context = loadAppFunctions(["loadSessions"], { state, sessionsLoadGeneration: 0, sessionsAppliedLoadGeneration: 0,
+      currentSessionId: () => state.activeSession?.id, fetch: async () => ({ json: async () => sessions }), requireOkResponse: async () => {},
+      renderDashboard: () => calls.push(`dashboard:${state.activeSession.id}`),
+      ...(hasController ? { reconController: { syncSession: () => calls.push(`recon:${state.activeSession.id}`) } } : {}),
+    });
+    await context.loadSessions();
+    assert.equal(state.activeSession.id, "new");
+    assert.deepEqual(calls, hasController ? ["recon:new", "dashboard:new"] : ["dashboard:new"]);
+  });
+
+  test(`settings hydration ${hasController ? "syncs the new Recon session" : "works without a Recon binding"}`, async () => {
+    const state = { activeSession: { id: "old" } };
+    const calls = [];
+    const els = Object.fromEntries(["proxyAddr", "uiAddr", "captureMode", "settingsSpecialHostHttp", "certificateName", "certificateExpiry", "certificatePemPath", "certificateDerPath", "specialHostHttps", "dataDir", "certificateNote"].map(id => [id, new NodeFixture()]));
+    const context = loadAppFunctions(["_applySettings"], { state, els, document: { getElementById: () => null },
+      syncHttpCapturePill() {}, formatSize: value => String(value), formatTimestamp: value => value, escapeHtml: value => value,
+      updateProxyStatusIndicator() {}, updateRemoteUiIndicator() {}, renderInterceptStatus() {}, renderProxySettings() {}, renderDashboard() {},
+      ...(hasController ? { reconController: { syncSession: () => calls.push(state.activeSession.id) } } : {}),
+    });
+    await context._applySettings({ json: async () => ({ active_session: { id: "new" }, runtime: {}, body_preview_bytes: 1024, certificate: {} }) });
+    assert.equal(state.activeSession.id, "new");
+    assert.deepEqual(calls, hasController ? ["new"] : []);
+    assert.match(els.captureMode.textContent, /1024 body preview cap/);
+  });
+
+  test(`session reset ${hasController ? "invalidates Recon after advancing generation" : "does not require a Recon binding"}`, () => {
+    const reachedLegacyReset = new Error("Legacy replay cleanup reached");
+    const generations = [];
+    // Stop at the first legacy cleanup call; the existing replay fixtures cover
+    // the remaining reset work, while this fixture isolates the new entry hook.
+    const context = loadAppFunctions(["resetSessionScopedUiState"], { state: {}, workspaceStateGeneration: 7, workspaceLoaded: true,
+      clearReplaySendInFlight() { throw reachedLegacyReset; },
+      ...(hasController ? { reconController: { reset: () => generations.push(context.workspaceStateGeneration) } } : {}),
+    });
+    assert.throws(() => context.resetSessionScopedUiState(), error => error === reachedLegacyReset);
+    assert.equal(context.workspaceStateGeneration, 8);
+    assert.equal(context.workspaceLoaded, false);
+    assert.deepEqual(generations, hasController ? [8] : []);
+  });
+}
