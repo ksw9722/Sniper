@@ -3260,6 +3260,17 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             vec![json!({})],
         ),
         op(
+            "capture.intercept.get", "capture intercept get --id <uuid>",
+            "Get one held request, including its potentially sensitive headers and body.",
+            Read, false, &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.intercept.wait", "capture intercept wait",
+            "Poll for a held request, then return its full detail without forwarding it. Timeout zero performs one queue check; the polling budget excludes API discovery and detail retrieval.",
+            Read, false, &[], vec![json!({"timeout":30,"poll_interval":200})],
+        ),
+        op(
             "capture.intercept.forward",
             "capture intercept forward --id <uuid>",
             "Forward one held request.",
@@ -3330,6 +3341,11 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &[],
             vec![json!({})],
+        ),
+        op(
+            "capture.response_intercept.wait", "capture response-intercept wait",
+            "Poll for a held response, then return its full detail without forwarding it. Timeout zero performs one queue check; the polling budget excludes API discovery and detail retrieval.",
+            Read, false, &[], vec![json!({"timeout":30,"poll_interval":200})],
         ),
         op(
             "capture.response_intercept.get",
@@ -4830,6 +4846,20 @@ fn legacy_uuid_input_schema(nullable: bool, context: &str) -> Value {
 }
 
 fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
+    if matches!(
+        operation,
+        "capture.intercept.get" | "capture.intercept.wait" | "capture.response_intercept.wait"
+    ) {
+        let mut schema = json!({"type":"object","additionalProperties":false,"required":required_fields,
+            "properties":{"session_id":legacy_uuid_input_schema(true, "Read this session without switching it; omitted or null selects the active session.")}});
+        if operation.ends_with(".get") {
+            schema["properties"]["id"] = legacy_uuid_input_schema(false, "Held request UUID.");
+        } else {
+            schema["properties"]["timeout"] = json!({"type":["integer","null"],"minimum":0,"maximum":u64::MAX,"default":30,"description":"Polling timeout in seconds; must fit the host's monotonic clock. Zero checks once. Omission or null uses 30."});
+            schema["properties"]["poll_interval"] = json!({"type":["integer","null"],"minimum":0,"maximum":u64::MAX,"default":200,"description":"Polling interval in milliseconds, clamped to at least 25 and the remaining polling budget. Omission or null uses 200."});
+        }
+        return schema;
+    }
     if let Some(schema) = service_map_input_schema(operation) {
         return schema;
     }
@@ -5316,6 +5346,10 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         | "capture.oast.status"
         | "capture.oast.generate"
         | "capture.oast.clear" => &["session_id"],
+        "capture.intercept.get" => &["id", "session_id"],
+        "capture.intercept.wait" | "capture.response_intercept.wait" => {
+            &["session_id", "timeout", "poll_interval"]
+        }
         "capture.intercept.forward" => &["id", "session_id", "request_file", "stdin"],
         "capture.intercept.drop"
         | "capture.response_intercept.get"
@@ -5690,7 +5724,7 @@ fn intercept_input_preview(command: &InterceptCommand) -> Value {
         InterceptCommand::Drop(args) => json!({ "id": args.id, "session_id": args.session_id }),
         InterceptCommand::Get(args) => json!({ "id": args.id, "session_id": args.session_id }),
         InterceptCommand::Wait(args) => {
-            json!({ "session_id": args.session_id, "timeout": args.timeout })
+            json!({ "session_id": args.session_id, "timeout": args.timeout, "poll_interval": args.poll_interval })
         }
     }
 }
@@ -5734,7 +5768,7 @@ fn response_intercept_input_preview(command: &ResponseInterceptCommand) -> Value
             json!({ "session_id": args.session_id })
         }
         ResponseInterceptCommand::Wait(args) => {
-            json!({ "session_id": args.session_id, "timeout": args.timeout })
+            json!({ "session_id": args.session_id, "timeout": args.timeout, "poll_interval": args.poll_interval })
         }
         ResponseInterceptCommand::Get(args) => {
             json!({ "id": args.id, "session_id": args.session_id })
@@ -7256,6 +7290,32 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 }),
             },
         },
+        "capture.intercept.get" => Command::Capture {
+            command: CaptureCommand::Intercept {
+                command: InterceptCommand::Get(InterceptGetArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept.wait" | "capture.response_intercept.wait" => {
+            let args = InterceptWaitArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                timeout: call_optional(operation, input, "timeout")?.unwrap_or(30),
+                poll_interval: call_optional(operation, input, "poll_interval")?.unwrap_or(200),
+            };
+            Command::Capture {
+                command: if operation == "capture.intercept.wait" {
+                    CaptureCommand::Intercept {
+                        command: InterceptCommand::Wait(args),
+                    }
+                } else {
+                    CaptureCommand::ResponseIntercept {
+                        command: ResponseInterceptCommand::Wait(args),
+                    }
+                },
+            }
+        }
         "capture.intercept.forward" => {
             let request_file = call_optional_path(operation, input, "request_file")?;
             let stdin = call_bool(operation, input, "stdin")?;
@@ -8271,6 +8331,26 @@ fn validate_skill_root_selection(
 }
 
 fn validate_command_preflight(command: &Command) -> Result<()> {
+    match command {
+        Command::Capture {
+            command:
+                CaptureCommand::Intercept {
+                    command: InterceptCommand::Wait(args),
+                },
+        }
+        | Command::Intercept {
+            command: InterceptCommand::Wait(args),
+        }
+        | Command::Capture {
+            command:
+                CaptureCommand::ResponseIntercept {
+                    command: ResponseInterceptCommand::Wait(args),
+                },
+        } => {
+            intercept_wait_deadline(args.timeout)?;
+        }
+        _ => {}
+    }
     if let Command::Capture {
         command:
             CaptureCommand::InterceptRule {
@@ -11161,6 +11241,12 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
     }
 }
 
+fn intercept_wait_deadline(timeout_secs: u64) -> Result<std::time::Instant> {
+    std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(timeout_secs))
+        .ok_or_else(|| anyhow!("invalid timeout: exceeds the host monotonic clock range"))
+}
+
 /// Block until the queue at `list_path` holds something, and return the first
 /// entry.
 ///
@@ -11175,17 +11261,32 @@ async fn wait_for_first_intercept<T: DeserializeOwned>(
     poll_interval_ms: u64,
     _id_of: impl Fn(&T) -> Uuid,
 ) -> Result<Option<T>> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = intercept_wait_deadline(timeout_secs)?;
     let interval = std::time::Duration::from_millis(poll_interval_ms.max(25));
     loop {
-        let mut queued: Vec<T> = api.get_json(list_path).await?;
+        // Zero retains the one-shot queue check. Positive timeouts also bound
+        // an unresponsive queue read, not only the delay between polls.
+        let mut queued: Vec<T> = if timeout_secs == 0 {
+            api.get_json(list_path).await?
+        } else {
+            match tokio::time::timeout_at(deadline.into(), api.get_json(list_path)).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(None),
+            }
+        };
         if !queued.is_empty() {
             return Ok(Some(queued.remove(0)));
         }
         if std::time::Instant::now() >= deadline {
             return Ok(None);
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(
+            interval.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        )
+        .await;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
     }
 }
 

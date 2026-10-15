@@ -377,6 +377,9 @@ sniper-cli fuzzer run --yes
 sniper-cli capture intercept on --dry-run
 sniper-cli capture intercept on --yes
 sniper-cli capture intercept list
+sniper-cli --output compact call capture.intercept.get --input '{"id":"<uuid>"}'
+sniper-cli --output compact call capture.intercept.wait --input '{"timeout":30,"poll_interval":200}'
+sniper-cli --output compact call capture.response_intercept.wait --input '{"timeout":30,"poll_interval":200}'
 sniper-cli capture intercept forward --id <uuid> --dry-run
 sniper-cli capture intercept forward --id <uuid> --yes
 sniper-cli capture web-socket list --limit 20

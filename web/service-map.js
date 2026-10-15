@@ -1742,6 +1742,11 @@
           || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.record_id || "") || typeof row.sequence !== "string" || !/^[0-9]+$/.test(row.sequence)
           || typeof row.method !== "string" || typeof row.path !== "string"
           || endpoint && (row.method !== endpoint.method || safePath(row.path) !== endpoint.path))) throw new Error("Evidence row changed");
+        // Legacy metadata treats evidence IDs as opaque. For versioned IDs,
+        // bind every verified read to the exact retained identity, not just peer
+        // reads: a well-formed UUID/sequence can still describe another row.
+        if (result.available && id.startsWith("v1.") && (!validTechnologyEvidence(id, sessionId, state.snapshot?.snapshot.generation)
+          || row.sequence !== id.split(".")[3] || row.record_id.toLowerCase() !== id.split(".")[5].toLowerCase())) throw new Error("Evidence identity changed");
         const normalizedPeer = result.available ? normalizeSocketPeer(result.socket_peer) : null;
         if (peerBinding && (!peerBindingIsCurrent(peerBinding) || result.available && (row.origin !== peerBinding.origin
           || row.sequence !== peerBinding.sample.sequence || row.sequence !== id.split(".")[3] || row.record_id !== id.split(".")[5]
