@@ -973,7 +973,13 @@ impl AppState {
     /// Stop every cached session's discovery before shutdown. A switched-away
     /// session may still own a job, so persisting only the active one loses it.
     pub async fn stop_recon_jobs(&self) -> Result<()> {
-        let mut contexts: Vec<_> = self.session_contexts.lock().await.values().cloned().collect();
+        let mut contexts: Vec<_> = self
+            .session_contexts
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
         let active = self.session().await;
         if !contexts.iter().any(|session| session.id() == active.id()) {
             contexts.push(active);
