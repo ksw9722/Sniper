@@ -203,7 +203,7 @@ const FUZZER_RESULT_BUFFER_ROWS = 30;
 const FINDINGS_ROW_HEIGHT = 27;
 let measuredFindingsRowHeight = FINDINGS_ROW_HEIGHT;
 const FINDINGS_BUFFER_ROWS = 20;
-const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "fuzzer", "sequence", "replay", "tools", "logger"]);
+const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "fuzzer", "sequence", "replay", "recon", "tools", "logger"]);
 const IMPLEMENTED_PROXY_TABS = new Set(["intercept", "http-history", "websockets-history", "replace", "findings", "oast", "proxy-settings"]);
 const DECODER_SCRIPT_SOURCES = [
   "/decoder/lib/jquery-1.7.2.min.js",
@@ -587,6 +587,7 @@ let _interceptToggleRequestSeq = 0;
 let _interceptToggleInFlight = false;
 
 const els = {
+  reconShell: document.getElementById("reconShell"),
   dashboardShell: document.getElementById("dashboardShell"),
   dashboardCurrentSessionName: document.getElementById("dashboardCurrentSessionName"),
   dashboardCurrentSessionStatus: document.getElementById("dashboardCurrentSessionStatus"),
@@ -957,6 +958,7 @@ const sectionToggles = Array.from(document.querySelectorAll(".section-toggle"));
 let sortHeaders = Array.from(document.querySelectorAll(".sort-header"));
 let historyColumnHandles = Array.from(document.querySelectorAll(".column-resize-handle"));
 
+let reconController = null;
 let targetServiceMapController = null;
 let targetServiceMapEventStreamReady = () => false;
 let refreshTimer = null;
@@ -1171,6 +1173,13 @@ function setActiveProxyTab(tab, options = {}) {
 
 function bindEvents() {
   initializeTargetWorkspace();
+  if (window.SniperRecon && els.reconShell) {
+    reconController = window.SniperRecon.createController({
+      root: els.reconShell,
+      getSessionId: currentSessionId,
+      getSessionGeneration: () => workspaceStateGeneration,
+    });
+  }
   window.addEventListener("resize", resetLayoutTextareas);
   document.addEventListener("visibilitychange", flushWorkspaceStateBeforeHidden);
   window.addEventListener("pagehide", flushWorkspaceStateOnUnload);
@@ -2839,6 +2848,7 @@ async function _applySettings(response) {
   state.runtime = state.settings.runtime;
   syncHttpCapturePill();
   state.activeSession = state.settings.active_session;
+  reconController?.syncSession();
   state.oastTokenClearPending = false;
   // Sync intercept scope pill with server state
   const interceptScopePill = document.getElementById("interceptInScopeToggle");
@@ -3089,6 +3099,7 @@ async function loadSessions({ reloadOnActiveChange = false, preserveWorkspaceOwn
   }
   state.sessions = sessions;
   state.activeSession = nextActiveSession;
+  reconController?.syncSession();
   renderDashboard();
 }
 
@@ -4988,6 +4999,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
 
 function resetSessionScopedUiState() {
   workspaceStateGeneration += 1;
+  reconController?.reset();
   state.historyRetentionSettings = null;
   state.upstreamPeerSettings = null;
   state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
@@ -8751,6 +8763,7 @@ function renderToolPanels() {
   const sequenceVisible = state.activeTool === "sequence";
   const targetVisible = state.activeTool === "target";
   const loggerVisible = state.activeTool === "logger";
+  const reconVisible = state.activeTool === "recon";
   els.dashboardShell.classList.toggle("hidden", !dashboardVisible);
   els.proxyShell.classList.toggle("hidden", !proxyVisible);
   els.replayShell.classList.toggle("hidden", !replayVisible);
@@ -8759,6 +8772,8 @@ function renderToolPanels() {
   els.sequenceShell.classList.toggle("hidden", !sequenceVisible);
   els.targetShell.classList.toggle("hidden", !targetVisible);
   els.loggerShell.classList.toggle("hidden", !loggerVisible);
+  els.reconShell.classList.toggle("hidden", !reconVisible);
+  reconController?.setVisible(reconVisible);
 
   if (dashboardVisible) {
     renderDashboard();
@@ -8804,6 +8819,11 @@ function renderToolPanels() {
   if (targetVisible) {
     renderTarget();
     els.footerMode.textContent = "Scope active";
+    return;
+  }
+
+  if (reconVisible) {
+    els.footerMode.textContent = "Recon active";
     return;
   }
 
@@ -29060,3 +29080,4 @@ init().catch((error) => {
   els.liveStatus.textContent = "Error";
   els.liveStatus.classList.remove("online");
 });
+

@@ -7595,3 +7595,96 @@ button.utility-button.replay-tab-add {
 .service-map-collection-entry { padding: 9px 0; border-bottom: 1px solid var(--line); }
 .service-map-collection-entry .service-map-overlay-actions { margin-top: 6px; }
 .service-map-collection > button { margin-top: 8px; }
+
+
+/* Recon keeps untrusted endpoint strings selectable but never navigates to them. */
+.recon-shell {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(290px, 340px) minmax(0, 1fr);
+  grid-template-rows: minmax(125px, 28%) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+  overflow: hidden;
+  background: var(--shell);
+}
+.recon-shell .panel-card { min-width: 0; min-height: 0; }
+.recon-setup { grid-row: 1 / 3; overflow: auto; }
+.recon-form { display: grid; gap: 12px; padding: 14px; }
+.recon-target-row { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.recon-target-field { flex: 1 1 230px; }
+.recon-field { display: grid; gap: 5px; color: var(--text-soft); }
+.recon-shell input:not([type="checkbox"]), .recon-shell select {
+  min-width: 0; width: 100%; min-height: var(--control-h);
+  border: 1px solid var(--line-strong); border-radius: 5px;
+  background: var(--panel-code); color: var(--text); padding: 5px 8px;
+}
+.recon-shell input:focus-visible, .recon-shell select:focus-visible, .recon-shell button:focus-visible, .recon-shell summary:focus-visible {
+  outline: 2px solid var(--info); outline-offset: 2px;
+}
+.recon-target-field input { font-family: var(--mono); }
+.recon-check { display: flex; gap: 7px; align-items: flex-start; color: var(--text-soft); }
+.recon-check input { flex: 0 0 auto; margin: 3px 0 0; }
+.recon-help { color: var(--text-dim); margin: 0; font-size: var(--font-sm); }
+.recon-sources { display: grid; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 5px; margin: 0; }
+.recon-sources legend { padding: 0 5px; color: var(--text-soft); }
+.recon-history-consent { padding: 10px; background: var(--point-soft); border: 1px solid var(--point-border); border-radius: 5px; }
+.recon-limits summary { cursor: pointer; color: var(--text-soft); }
+.recon-limit-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+.recon-notice { margin: 0; padding: 10px; color: var(--info); overflow-wrap: anywhere; }
+.recon-notice.recon-error, .recon-warning { color: var(--warning); }
+.recon-jobs-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.recon-jobs { overflow: auto; }
+.recon-job { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.recon-job:last-child { border-bottom: 0; }
+.recon-job-header { display: flex; align-items: center; gap: 10px; margin-bottom: 5px; }
+.recon-job-target { flex: 1; min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-weight: 500; user-select: text; -webkit-user-select: text; }
+.recon-badge { padding: 2px 6px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--info); white-space: nowrap; }
+.recon-badge-warning { color: var(--warning); }
+.recon-job-sources { display: grid; gap: 4px; margin-top: 6px; }
+.recon-source-status { font-size: var(--font-sm); color: var(--text-soft); }
+.recon-warning { margin: 3px 0; overflow-wrap: anywhere; }
+.recon-inventory { display: flex; flex-direction: column; overflow: hidden; }
+.recon-inventory-toolbar { flex-wrap: wrap; gap: 10px; }
+.recon-search-controls { display: flex; gap: 8px; flex: 1 1 320px; }
+.recon-search-controls input { flex: 1 1 160px; }
+.recon-search-controls select { flex: 0 0 130px; }
+.recon-results { display: grid; grid-template-columns: minmax(0, 1fr) minmax(230px, 34%); flex: 1; min-height: 0; overflow: hidden; }
+.recon-table-scroll { min-width: 0; overflow: auto; }
+.recon-table { width: 100%; table-layout: fixed; }
+.recon-table th:first-child { width: 76px; }
+.recon-table th:nth-child(3) { width: 110px; }
+.recon-table th:nth-child(4) { width: 125px; }
+.recon-table td { vertical-align: top; white-space: normal; overflow-wrap: anywhere; }
+.recon-table thead th { position: sticky; top: 0; z-index: 1; background: var(--panel-elevated); }
+.recon-table .recon-selected { background: var(--selection); }
+.recon-method { font-family: var(--mono); }
+.recon-endpoint-button { width: 100%; padding: 0; border: 0; background: none; color: var(--text); text-align: left; cursor: pointer; font-family: var(--mono); overflow-wrap: anywhere; white-space: normal; }
+.recon-endpoint-button:hover { color: var(--info); }
+.recon-empty { padding: 14px; margin: 0; color: var(--text-dim); }
+.recon-detail { overflow: auto; border-left: 1px solid var(--line); padding: 12px; background: var(--panel-code-alt); user-select: text; -webkit-user-select: text; }
+.recon-detail h3 { margin: 0 0 12px; font-size: var(--font-md); }
+.recon-detail h4 { margin: 16px 0 8px; font-size: var(--font-sm); color: var(--text-soft); }
+.recon-detail-fields { margin: 0; display: grid; gap: 3px; }
+.recon-detail-fields dt { color: var(--text-dim); font-size: var(--font-xs); }
+.recon-detail-fields dd { margin: 0 0 8px; overflow-wrap: anywhere; font-family: var(--mono); }
+.recon-raw-urls { margin: 0; padding-left: 16px; font-family: var(--mono); overflow-wrap: anywhere; }
+.recon-raw-urls li { margin-bottom: 6px; }
+.recon-evidence-item + .recon-evidence-item { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 8px; }
+.recon-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border-top: 1px solid var(--line); color: var(--text-dim); }
+@media (max-width: 1200px) {
+  .recon-shell { grid-template-columns: minmax(255px, 290px) minmax(0, 1fr); }
+  .recon-results { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(150px, 1fr) minmax(120px, 35%); }
+  .recon-detail { border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (max-width: 760px) {
+  .recon-shell { display: flex; flex-direction: column; overflow: auto; }
+  .recon-setup { flex: 0 0 auto; overflow: visible; }
+  .recon-jobs-panel { flex: 0 0 200px; }
+  .recon-inventory { flex: 0 0 650px; }
+  .recon-pagination { flex-wrap: wrap; }
+}
+.recon-scan-options { display: grid; gap: 10px; padding: 10px; border: 1px solid var(--point-border); background: var(--point-soft); border-radius: 5px; }
+.recon-scan-options .recon-check { overflow-wrap: anywhere; }
+.recon-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }

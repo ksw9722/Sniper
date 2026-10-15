@@ -15,6 +15,8 @@ pub mod model;
 pub mod oast;
 pub mod platform;
 pub mod proxy;
+pub mod recon;
+pub mod recon_sources;
 pub mod runtime;
 pub mod runtime_state;
 pub mod saved_contract;
@@ -209,6 +211,7 @@ async fn shutdown_headless_runtime(
     state: &AppState,
     oast_task: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
+    state.stop_recon_jobs().await?;
     oast_task.abort();
     if let Err(error) = oast_task.await {
         if !error.is_cancelled() {
@@ -278,3 +281,4 @@ pub fn init_tracing() {
             .init();
     });
 }
+

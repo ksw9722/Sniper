@@ -15,6 +15,7 @@
           <button class="main-tab" data-tool="dashboard">Session</button>
           <button class="main-tab" data-tool="target">Scope</button>
           <button class="main-tab active" data-tool="proxy">Capture</button>
+          <button class="main-tab" data-tool="recon">Recon</button>
           <button class="main-tab" data-tool="replay">Replay</button>
           <button class="main-tab" data-tool="fuzzer">Fuzzer</button>
           <button class="main-tab" data-tool="sequence">Sequence</button>
@@ -1432,6 +1433,78 @@
           </section>
         </section>
 
+        <section class="recon-shell hidden" id="reconShell" aria-labelledby="reconTitle">
+          <section class="panel-card recon-setup">
+            <header class="panel-toolbar">
+              <div><p class="placeholder-kicker">Endpoint discovery</p><h2 id="reconTitle">Recon</h2></div>
+              <button class="secondary-action" id="reconRefresh" type="button">Refresh</button>
+            </header>
+            <form id="reconForm" class="recon-form">
+              <div class="recon-target-row">
+                <label class="recon-field recon-target-field" for="reconTarget">Target URL
+                  <input id="reconTarget" type="url" placeholder="https://example.com/" required autocomplete="off" spellcheck="false" />
+                </label>
+                <button class="primary-action" id="reconStart" type="submit" disabled>Start discovery</button>
+              </div>
+              <label class="recon-check"><input id="reconSubdomains" type="checkbox" /> Include subdomains (same effective port)</label>
+              <p class="recon-help" id="reconScope">Enter an explicit HTTP or HTTPS URL. Discovery is limited to that hostname and effective port.</p>
+              <fieldset class="recon-sources">
+                <legend>Sources</legend>
+                <label class="recon-check"><input id="reconCrawler" type="checkbox" checked /> Static HTML / JavaScript crawler</label>
+                <label class="recon-check"><input id="reconUrlscan" type="checkbox" /> urlscan.io historical search</label>
+                <label class="recon-check"><input id="reconWayback" type="checkbox" /> Wayback Machine history</label>
+                <label class="recon-check"><input id="reconUrlscanSubmit" type="checkbox" /> Submit a new urlscan.io browser scan</label>
+              </fieldset>
+              <p class="recon-help">The crawler sends bounded GET requests and reads static HTML and JavaScript. It does not run a browser or submit forms. Historical results and extracted candidates do not prove an endpoint is live. Only test targets you are authorized to access.</p>
+              <label class="recon-check recon-history-consent hidden" id="reconHistoryConsentRow"><input id="reconHistoryConsent" type="checkbox" /><span id="reconHistoryConsentText">Allow sending the target domain to the selected history services.</span></label>
+              <div id="reconScanOptions" class="recon-scan-options hidden">
+                <label class="recon-field" for="reconScanVisibility">New scan visibility<select id="reconScanVisibility"><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select></label>
+                <p class="recon-help">A new scan sends the full target URL to urlscan.io; remove query strings and fragments first. Its remote browser may contact third-party resources outside Sniper's scope. Public results are visible to everyone; unlisted results are not private. urlscan.io plan and retention limits apply. The API key is configured only on the backend.</p>
+                <label class="recon-check"><input id="reconScanConsent" type="checkbox" /><span id="reconScanConsentText">Allow a new urlscan.io scan of this URL with the selected visibility.</span></label>
+              </div>
+              <details class="recon-limits">
+                <summary>Discovery limits</summary>
+                <div class="recon-limit-fields">
+                  <label class="recon-field" for="reconMaxRequests">Crawler requests<input id="reconMaxRequests" type="number" min="1" max="1000" value="100" required /></label>
+                  <label class="recon-field" for="reconMaxDepth">Crawl depth<input id="reconMaxDepth" type="number" min="0" max="10" value="3" required /></label>
+                  <label class="recon-field" for="reconMaxEndpoints">Endpoints<input id="reconMaxEndpoints" type="number" min="1" max="5000" value="5000" required /></label>
+                  <label class="recon-field" for="reconMaxPages">History pages per source<input id="reconMaxPages" type="number" min="1" max="20" value="5" required /></label>
+                </div>
+              </details>
+              <p class="recon-notice hidden" id="reconActionStatus" role="status" aria-live="polite"></p>
+            </form>
+          </section>
+          <section class="panel-card recon-jobs-panel" aria-labelledby="reconJobsTitle">
+            <header class="panel-toolbar"><h2 id="reconJobsTitle">Jobs</h2><span id="reconJobsMeta" class="recon-help"></span></header>
+            <div id="reconJobs" class="recon-jobs"><p class="recon-empty">No discovery jobs in this session.</p></div>
+          </section>
+          <section class="panel-card recon-inventory" aria-labelledby="reconInventoryTitle">
+            <header class="panel-toolbar recon-inventory-toolbar">
+              <div><h2 id="reconInventoryTitle">Endpoint inventory</h2><p id="reconInventoryMeta" class="recon-help" role="status" aria-live="polite">Open Recon to load this session.</p></div>
+              <div class="recon-search-controls">
+                <label class="recon-sr-only" for="reconSearch">Search endpoints and evidence</label>
+                <input id="reconSearch" type="search" placeholder="Search URL, method, source or evidence" autocomplete="off" />
+                <label class="recon-sr-only" for="reconKind">Evidence type</label>
+                <select id="reconKind"><option value="">All evidence</option><option value="live">Live</option><option value="observed">Observed</option><option value="history">Historical</option><option value="candidate">Candidate</option></select>
+              </div>
+            </header>
+            <p id="reconLoadStatus" class="recon-notice hidden" role="status" aria-live="polite"></p>
+            <div class="recon-results">
+              <div class="recon-table-scroll">
+                <table class="mini-table recon-table">
+                  <thead><tr><th>Method</th><th>URL</th><th>Evidence</th><th>Sources</th></tr></thead>
+                  <tbody id="reconEndpoints"></tbody>
+                </table>
+              </div>
+              <aside class="recon-detail" id="reconDetail" aria-labelledby="reconDetailTitle"><h3 id="reconDetailTitle">Endpoint details</h3><p class="recon-help">Select an endpoint to inspect its raw URLs and provenance.</p></aside>
+            </div>
+            <footer class="recon-pagination">
+              <span id="reconPageMeta">0 endpoints</span>
+              <div class="toolbar-actions"><button class="secondary-action" id="reconPrevious" type="button" disabled>Previous</button><button class="secondary-action" id="reconNext" type="button" disabled>Next</button></div>
+            </footer>
+          </section>
+        </section>
+
         <section class="logger-shell hidden" id="loggerShell">
           <section class="panel-card">
             <header class="panel-toolbar">
@@ -1858,6 +1931,8 @@
 
     <script src="/codemirror.js" defer></script>
     <script src="/service-map.js" defer></script>
+    <script src="/recon.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>
+

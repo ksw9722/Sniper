@@ -915,6 +915,9 @@ impl AppState {
             Some(session) => Some(session.owned_mutation_guard().await),
             None => None,
         };
+        if let Some(session) = cached_session.as_ref() {
+            session.recon.stop(None).await;
+        }
         // A canceled full-save waiter may have released its mutation guard while
         // its blocking writer still owns persistence. Drain it before quarantine.
         let persist_guard = match cached_session.as_ref() {
@@ -965,6 +968,25 @@ impl AppState {
 
     pub fn session_storage_path(&self, id: uuid::Uuid) -> Result<std::path::PathBuf> {
         self.sessions.session_storage_path(id)
+    }
+
+    /// Stop every cached session's discovery before shutdown. A switched-away
+    /// session may still own a job, so persisting only the active one loses it.
+    pub async fn stop_recon_jobs(&self) -> Result<()> {
+        let mut contexts: Vec<_> = self.session_contexts.lock().await.values().cloned().collect();
+        let active = self.session().await;
+        if !contexts.iter().any(|session| session.id() == active.id()) {
+            contexts.push(active);
+        }
+        for session in contexts {
+            let operation_lock = self.session_operation_lock(session.id()).await;
+            let _operation_guard = operation_lock.lock_owned().await;
+            let _guard = session.owned_mutation_guard().await;
+            if session.recon.stop(None).await && self.sessions.contains_session(session.id()) {
+                session.persist_state_only().await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn persist_active_session(&self) -> Result<SessionSummary> {
@@ -1569,6 +1591,7 @@ impl AppState {
     }
 
     async fn prepare_for_self_update_shutdown(&self) -> Result<()> {
+        self.stop_recon_jobs().await?;
         self.ws_replay.disconnect_all().await;
         let relay_result = crate::proxy::close_live_websocket_relays(
             self,
@@ -5947,3 +5970,4 @@ mod tests {
         });
     }
 }
+

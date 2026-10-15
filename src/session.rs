@@ -168,6 +168,8 @@ struct StoredSessionSnapshot {
     #[serde(default)]
     sequence_runs: Vec<SequenceRunRecord>,
     #[serde(default)]
+    recon: crate::recon::ReconSnapshot,
+    #[serde(default)]
     oast_callbacks: Option<Vec<crate::oast::OastCallback>>,
     #[serde(default)]
     oast_cleared_callback_keys: Vec<crate::oast::OastCallbackDedupKey>,
@@ -329,6 +331,7 @@ pub struct SessionContext {
     pub fuzzer: Arc<FuzzerStore>,
     pub scanner: Arc<ScannerStore>,
     pub sequence: Arc<SequenceStore>,
+    pub recon: Arc<crate::recon::ReconStore>,
     pub oast: Arc<crate::oast::OastStore>,
     pub workspace: Arc<WorkspaceStateStore>,
     websocket_journal_tx: Option<mpsc::Sender<WebSocketJournalCommand>>,
@@ -481,6 +484,7 @@ impl SessionContext {
                 sequence_definitions,
                 snapshot.sequence_runs,
             )),
+            recon: Arc::new(crate::recon::ReconStore::from_snapshot(snapshot.recon)),
             oast: {
                 let store = Arc::new(crate::oast::OastStore::new_with_config(
                     max_entries,
@@ -1060,6 +1064,7 @@ impl SessionContext {
             intercept_rules: self.intercept_rules.snapshot().await,
             sequence_definitions: self.sequence.snapshot_definitions().await,
             sequence_runs: self.sequence.snapshot_runs(Some(self.max_entries)).await,
+            recon: self.recon.snapshot(),
             oast_callbacks: Some(self.oast.snapshot().await),
             oast_cleared_callback_keys: self.oast.snapshot_cleared_keys().await,
             oast_registration: self.oast.snapshot_registration().await,
@@ -1079,12 +1084,20 @@ impl SessionContext {
     /// small component — an intercept enqueue, a scanner finding, a websocket
     /// open — can pay a few MB instead of the whole session document.
     pub async fn persist_state_only(&self) -> Result<()> {
-        let _persist_guard = self.persist_lock.lock().await;
+        let persist_guard = self.persist_lock.clone().lock_owned().await;
         let state = self
             .build_state_snapshot(self.workspace.snapshot().await)
             .await;
-        ensure_existing_private_session_dir(&self.storage_dir)?;
-        write_json(&state_path(&self.storage_dir), &state)
+        let storage_dir = self.storage_dir.clone();
+        // Recon inventories can be several MiB; keep fsync and serialization off
+        // the async runtime, while retaining the permit through publication.
+        tokio::task::spawn_blocking(move || {
+            let _persist_guard = persist_guard;
+            ensure_existing_private_session_dir(&storage_dir)?;
+            write_json(&state_path(&storage_dir), &state)
+        })
+        .await
+        .context("session state writer failed")?
     }
 
     async fn persist_with_workspace_snapshot_locked(
@@ -12175,3 +12188,4 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+

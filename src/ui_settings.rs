@@ -38,6 +38,7 @@ const ACTIVE_TOOL_OPTIONS: &[&str] = &[
     "proxy",
     "fuzzer",
     "sequence",
+    "recon",
     "replay",
     "tools",
     "logger",
@@ -2105,3 +2106,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
+
