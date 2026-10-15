@@ -282,3 +282,13 @@ origin normalization and path-bearing Referer declarations remain supported.
 Socket-peer eligibility now copies only its three scalar runtime inputs, avoiding
 unrelated settings clones while preserving the existing capture and durability
 gates.
+
+All origins picked its 24 cards by name, and an arrow is drawn only between two
+shown cards, so related origins usually fell on either side of the cap: a real
+session with 67 relationships among 86 origins showed none. Cards now open, and
+reorder on an explicit Reload, by relationship: the best-connected origin, its
+neighbours, then each further connected group. Linked cards also lead each
+column, so a hub no longer sits below a column of unrelated names with its arrows
+off screen. Polling still keeps cards in place. A Referer or Origin naming the requested origin itself is no longer
+listed as a relationship. A trackpad pinch, or Ctrl with the mouse wheel, zooms
+the graph around the pointer.

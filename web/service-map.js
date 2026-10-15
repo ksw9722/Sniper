@@ -784,6 +784,44 @@
     const previousIds = new Set(previous);
     return [...previous.filter((id) => ids.has(id)), ...[...ids].filter((id) => !previousIds.has(id)).sort()];
   }
+  // Only the first MAX_CARDS cards are drawn, and an arrow needs both ends on
+  // screen. Picked by name, related origins land on either side of the cap: a
+  // session with 67 relationships among 86 origins drew none. Lead with the
+  // best-connected captured origin, follow it with its neighbours breadth first,
+  // and repeat for each connected group; unrelated and reference-only origins
+  // follow by name.
+  function relationshipOrder(origins) {
+    const captured = new Set(origins.filter((origin) => origin.captured !== false).map((origin) => origin.origin));
+    const neighbors = new Map();
+    const link = (a, b) => {
+      if (a === b || !captured.has(a) || !captured.has(b)) return;
+      for (const [from, to] of [[a, b], [b, a]]) {
+        if (!neighbors.has(from)) neighbors.set(from, new Set());
+        neighbors.get(from).add(to);
+      }
+    };
+    for (const origin of origins) {
+      for (const redirect of origin.redirects || []) link(origin.origin, redirect.target_origin);
+      for (const header of origin.header_links || []) link(header.source_origin, origin.origin);
+    }
+    const degree = (id) => neighbors.get(id)?.size || 0;
+    const rank = (a, b) => degree(b) - degree(a) || a.localeCompare(b);
+    const order = [];
+    const placed = new Set();
+    for (const seed of [...neighbors.keys()].sort(rank)) {
+      if (placed.has(seed)) continue;
+      placed.add(seed);
+      for (const queue = [seed]; queue.length;) {
+        const id = queue.shift();
+        order.push(id);
+        for (const next of [...neighbors.get(id)].sort(rank)) {
+          if (!placed.has(next)) { placed.add(next); queue.push(next); }
+        }
+      }
+    }
+    const rest = (wanted) => origins.filter((origin) => !placed.has(origin.origin) && captured.has(origin.origin) === wanted).map((origin) => origin.origin).sort();
+    return [...order, ...rest(true), ...rest(false)];
+  }
   function graphGeometry(textSize = 12) {
     const size = Math.max(8, Math.min(20, Number.isFinite(textSize) ? textSize : 12));
     // Four text rows, three gaps, two card paddings/borders, and clue borders.
@@ -809,7 +847,9 @@
       left = visibleOrigins.filter((_, index) => index % 2 === 0);
       right = visibleOrigins.filter((_, index) => index % 2 !== 0);
     } else {
-      right.sort((a, b) => a.origin.localeCompare(b.origin));
+      // Linked targets lead the column. Sorted only by name, a hub fell below a
+      // column of unrelated cards and its arrows ran off screen.
+      right.sort((a, b) => Number(incoming.has(b.origin)) - Number(incoming.has(a.origin)) || a.origin.localeCompare(b.origin));
       const targetRank = new Map(right.map((origin, index) => [origin.origin, index]));
       const averageTarget = (origin) => {
         const ranks = connections.filter(([source, target]) => source === origin.origin && targetRank.has(target)).map(([, target]) => targetRank.get(target));
@@ -961,21 +1001,25 @@
       }
       updateZoomControls();
     }
-    function setZoom(value, { fit = false } = {}) {
+    // `anchor` is a point in the viewport, such as the fingers of a pinch, that
+    // stays over the same part of the graph; without one it is the center.
+    function setZoom(value, { fit = false, anchor = null } = {}) {
       if (!zoomAvailable() || !Number.isFinite(value)) return false;
       const viewport = els.viewport, size = viewportSize();
       const previous = state.zoomScale;
       const next = Math.max(ZOOM_LIMITS.min, Math.min(ZOOM_LIMITS.max, (fit ? Math.floor(value * 10000) : Math.round(value * 10000)) / 10000));
+      const anchorX = Number.isFinite(anchor?.x) ? Math.max(0, Math.min(size.width, anchor.x)) : size.width / 2;
+      const anchorY = Number.isFinite(anchor?.y) ? Math.max(0, Math.min(size.height, anchor.y)) : size.height / 2;
       // The canvas centers a small graph. Include that inset when preserving
-      // the point under the viewport center across either scrollbar boundary.
-      const centerX = (viewport.scrollLeft + size.width / 2 - Math.max(0, (size.width - currentLayout.width * previous) / 2)) / previous;
-      const centerY = (viewport.scrollTop + size.height / 2 - Math.max(0, (size.height - currentLayout.height * previous) / 2)) / previous;
+      // the point under the anchor across either scrollbar boundary.
+      const pointX = (viewport.scrollLeft + anchorX - Math.max(0, (size.width - currentLayout.width * previous) / 2)) / previous;
+      const pointY = (viewport.scrollTop + anchorY - Math.max(0, (size.height - currentLayout.height * previous) / 2)) / previous;
       state.zoomScale = next;
       applyGraphScale();
       const scaledWidth = currentLayout.width * next, scaledHeight = currentLayout.height * next;
       const nextSize = viewportSize();
-      viewport.scrollLeft = fit ? 0 : Math.max(0, Math.min(scaledWidth - nextSize.width, centerX * next + Math.max(0, (nextSize.width - scaledWidth) / 2) - nextSize.width / 2));
-      viewport.scrollTop = fit ? 0 : Math.max(0, Math.min(scaledHeight - nextSize.height, centerY * next + Math.max(0, (nextSize.height - scaledHeight) / 2) - nextSize.height / 2));
+      viewport.scrollLeft = fit ? 0 : Math.max(0, Math.min(scaledWidth - nextSize.width, pointX * next + Math.max(0, (nextSize.width - scaledWidth) / 2) - anchorX));
+      viewport.scrollTop = fit ? 0 : Math.max(0, Math.min(scaledHeight - nextSize.height, pointY * next + Math.max(0, (nextSize.height - scaledHeight) / 2) - anchorY));
       return true;
     }
     function fitGraph() {
@@ -1038,6 +1082,10 @@
       };
       captured.forEach((origin) => {
         origin.header_links.forEach((link) => {
+          // A page calling its own origin names it in Origin/Referer. That is
+          // not a relationship to another service, and listing it showed
+          // "a → a" rows in the inspector; arrows already skip it.
+          if (link.source_origin === origin.origin) return;
           reference(link.source_origin, origin, `${link.relationship === "origin_header" ? "Origin" : "Referer"} header on`);
           relation({ sourceOrigin: link.source_origin, targetOrigin: origin.origin, capturedOrigin: origin.origin, label: `${link.relationship === "origin_header" ? "Origin" : "Referer"} header declaration`, evidence: link.evidence[0] || "" });
         });
@@ -1639,10 +1687,7 @@
         state.refreshPaused = false;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
-        state.order = state.order.length ? stableOrder(state.order, allOrigins) : [
-          ...snapshot.origins.map((origin) => origin.origin).sort(),
-          ...allOrigins.filter((origin) => !origin.captured).map((origin) => origin.origin).sort(),
-        ];
+        state.order = state.order.length ? stableOrder(state.order, allOrigins) : relationshipOrder(allOrigins);
         if (state.anchorOrigin && !findOrigin(state.anchorOrigin)) {
           state.anchorOrigin = null;
           state.modeNotice = "Direct relations cleared: the pinned origin is absent from this snapshot.";
@@ -2457,10 +2502,53 @@
         : event.key === "0" ? setZoom(1) : event.key.toLowerCase() === "f" ? fitGraph() : false;
       if (handled) event.preventDefault();
     });
+    // A trackpad pinch arrives as a ctrl+wheel event in Chromium and as WebKit
+    // gesture events (the macOS desktop app, Safari) with a scale relative to the
+    // start. Either zooms the graph around the fingers instead of zooming the
+    // whole page; a plain wheel still scrolls the map. Ctrl+wheel on a mouse
+    // zooms the same way.
+    let pinchStartScale = null;
+    const pinchAnchor = (event) => {
+      const rect = els.viewport?.getBoundingClientRect?.();
+      return rect && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
+        ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : null;
+    };
+    els.viewport?.addEventListener("wheel", (event) => {
+      if (!event.ctrlKey || pinchStartScale !== null || !zoomAvailable()) return;
+      event.preventDefault();
+      // A mouse notch is about 100px against a few px per trackpad frame; the cap
+      // keeps one notch near a button step.
+      const lines = event.deltaMode === 1 ? 16 : 1;
+      const delta = Math.max(-20, Math.min(20, (Number(event.deltaY) || 0) * lines));
+      setZoom(state.zoomScale * Math.exp(-delta / 100), { anchor: pinchAnchor(event) });
+    }, { passive: false });
+    els.viewport?.addEventListener("gesturestart", (event) => {
+      if (!zoomAvailable()) return;
+      event.preventDefault();
+      pinchStartScale = state.zoomScale;
+    });
+    els.viewport?.addEventListener("gesturechange", (event) => {
+      if (pinchStartScale === null) return;
+      event.preventDefault();
+      if (Number.isFinite(event.scale)) setZoom(pinchStartScale * event.scale, { anchor: pinchAnchor(event) });
+    });
+    els.viewport?.addEventListener("gestureend", (event) => {
+      if (pinchStartScale === null) return;
+      event.preventDefault();
+      pinchStartScale = null;
+    });
     // Resize only refreshes control availability; Fit is an explicit one-shot
     // action, so resizing or polling cannot silently change the user's zoom.
     if (els.viewport && typeof root.ResizeObserver === "function") new root.ResizeObserver(updateZoomControls).observe(els.viewport);
-    els.refresh.addEventListener("click", () => refresh({ force: true, retry: true }));
+    els.refresh.addEventListener("click", () => {
+      // Polling keeps cards where they are; an explicit Reload may move them so
+      // relationships captured since the map opened come within the card cap.
+      if (state.snapshot) {
+        state.order = relationshipOrder(graphOrigins());
+        state.layoutSlots = new Map();
+      }
+      return refresh({ force: true, retry: true });
+    });
     els.allOrigins?.addEventListener("click", () => setMapMode(false));
     els.directRelations?.addEventListener("click", () => setMapMode(true));
     els.focusSelection?.addEventListener("click", focusSelection);
@@ -2539,5 +2627,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, relationshipOrder, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

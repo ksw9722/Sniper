@@ -18,7 +18,9 @@ only the graph from 10% to 200%; the inspector and Scope navigation retain their
 normal size. Fit is a one-shot action for the displayed cards, bounded by those
 scale limits. Polling and resizing never refit or change the chosen zoom. Plus
 and minus preserve the viewport center where scroll bounds allow. With the map
-viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. Zooming is
+viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. A trackpad
+pinch, or Ctrl with the mouse wheel, zooms around the pointer instead of zooming
+the whole page; a plain wheel still scrolls the map. Zooming is
 local and preserves selection, exact-source reads, and session-local shown inspections.
 There is no force layout or drag editing in this version. The renderer is separate from metadata normalization and
 layout calculation so it can be replaced without changing the read contract.
@@ -27,7 +29,12 @@ origin, method, and path previews stay bounded; their full text remains availabl
 in accessible text and hover titles, and selected endpoint evidence shows the
 complete query-free path.
 
-The graph displays at most 24 cards and 40 arrows. All origins keeps at most 100
+The graph displays at most 24 cards and 40 arrows, and an arrow needs both of its
+cards on screen. When the map opens, and on an explicit Reload, All origins
+therefore orders cards by relationship: the best-connected captured origin, then
+its neighbours, then each further connected group; unrelated and reference-only
+origins follow by name, and in each column linked cards sit above unlinked ones.
+Background polling keeps that order so cards do not move under the pointer. All origins keeps at most 100
 additional reference-only candidate cards; those cards mean no captured rows are
 shown in this snapshot, not that the origin has never been captured. Relationship and
 source lists show at most 30 rows per pane, and API lists page through 50 exact
@@ -258,7 +265,8 @@ active-discovery option, or automatic retry with a larger limit.
   target was contacted, or that the two origins call each other.
 - Origin and Referer links are request-header declarations. They do not prove
   which page, browser process, or service initiated a request. Header-only origins
-  do not create observed-service cards.
+  do not create observed-service cards. A declaration naming the requested origin
+  itself is kept in the data but not drawn or listed as a relationship.
 - Technology clues are limited observations of response headers. They are not
   verified product/version detection and do not imply an application, proxy, CDN,
   or database chain. Raw header values, including cookie and authorization values,
