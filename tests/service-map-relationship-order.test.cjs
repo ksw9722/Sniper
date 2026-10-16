@@ -581,6 +581,33 @@ test("a card shows its origin's captured icon once the image has loaded, and kee
   assert.equal(images.length, 2, 'a redraw loads nothing again');
 });
 
+test('every exposure the server can report has a short card label', () => {
+  const rust = fs.readFileSync(path.join(__dirname, '../src/service_map_servers.rs'), 'utf8');
+  const ids = [...rust.matchAll(/\(\s*"([a-z0-9_]+)",\s*"[^"]+",\s*EXPOSURE,?\s*\)/g)].map(match => match[1]);
+  assert.ok(ids.length >= 30, `${ids.length} exposures found`);
+  assert.deepEqual(ids.filter(id => !map.EXPOSURE_LABELS[id]), []);
+  assert.ok(Object.values(map.EXPOSURE_LABELS).every(label => label.length <= 13), 'short enough to leave a product beside it');
+});
+
+test('a product chip carries its logo, and the card mark is the logo on its brand colour', async () => {
+  const iconContext = vm.createContext({ URL, URLSearchParams, AbortController, console, getComputedStyle: element => ({ getPropertyValue: name => element.style.values[name] || '' }), ResizeObserver: class { observe() {} } });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/product-icons.js'), 'utf8'), iconContext);
+  vm.runInContext(source, iconContext);
+  const f = fixture({}, iconContext.SniperServiceMap);
+  await f.load(snapshot([origin(app, {
+    front_technologies: [{ product_id: 'next_js', name: 'Next.js', category: 'meta_framework', version: '14.2.3', source_origin: app, row_count: 1, evidence: ['evidence-next'] }],
+    server_technologies: [{ product_id: 'apache_tomcat', name: 'Apache Tomcat', category: 'app_server', signals: ['header'], row_count: 1, evidence: ['evidence-tomcat'] }],
+  }), origin(api, {
+    server_technologies: [{ product_id: 'werkzeug', name: 'Werkzeug', category: 'app_server', signals: ['header'], row_count: 1, evidence: ['evidence-werkzeug'] }],
+  })]));
+  const card = (id) => f.els.canvas.innerHTML.split(`data-service-origin="${id}"`)[1].split('</button>')[0];
+  assert.match(card(app), /<span class="service-map-mark" style="background:#000000" title="Next\.js"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#fff" d="M[^"]+"\/><\/svg><\/span>/, 'white on Next.js black');
+  assert.match(card(app), /<svg class="service-map-product-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M[^"]+"\/><\/svg>Next\.js 14\.2\.3</, 'black would vanish on the dark theme');
+  assert.match(card(app), /<path fill="#F8DC75" d="[^"]+"\/><\/svg>Apache Tomcat</, "Tomcat's own yellow");
+  assert.match(card(api), /<span title="[^"]*">Werkzeug<\/span>/, 'a product with no allowed logo keeps its bare name');
+  assert.doesNotMatch(card(api), /service-map-mark/, 'and its card keeps the role icon');
+});
+
 test('server technologies show on the card after the backend, exposures first, and in the inspector', async () => {
   const server = (product_id, name, category, extra = {}) => ({ product_id, name, category, signals: ['body'], row_count: 1, evidence: [`evidence-${product_id}`], ...extra });
   const f = fixture();
@@ -597,8 +624,8 @@ test('server technologies show on the card after the backend, exposures first, a
   const normalized = f.state.snapshot.origins[0].server_technologies;
   assert.deepEqual(normalized.map(item => item.product_id), ['java_stack_trace', 'cloudflare', 'spring_boot', 'apache_tomcat'], 'unsafe entries are dropped');
   const card = f.els.canvas.innerHTML;
-  assert.match(card, /class="service-map-exposure" title="Java stack trace">⚠ 1<\/span><span[^>]*>Spring Boot<\/span><span[^>]*>Apache Tomcat 9\.0\.83</,
-    'the exposure leads, then the backend and its app server; the edge waits behind +N');
+  assert.match(card, /class="service-map-exposure" aria-label="Exposures: Java stack trace" data-more="Java stack trace" title="">⚠ Stack trace<\/span><span[^>]*>Spring Boot<\/span><span class="service-map-products-more"[^>]*data-more="Apache Tomcat 9\.0\.83\nCloudflare"[^>]*>\+2</,
+    'the exposure leads with a short name and takes a product place; the app server and the edge wait behind +N');
   assert.match(card, /service-map-mark[^>]*>S</, "the backend's mark replaces the role icon");
   f.controller.selectOrigin(api);
   const detail = f.els.detail.innerHTML;

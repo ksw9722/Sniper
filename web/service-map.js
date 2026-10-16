@@ -352,19 +352,34 @@
   // servers in front of it, then the kits, libraries and trackers it loads.
   const RANKS = { meta_framework: 0, cms: 1, framework: 2, backend: 3, app_server: 4, web_server: 5, gateway: 6, edge: 7, platform: 8,
     language: 9, database: 10, os: 11, ui: 12, library: 13, analytics: 14 };
+  // What a card's ⚠ chip calls each exposure: short enough to leave a product
+  // beside it. The inspector keeps the full name.
+  const EXPOSURE_LABELS = { django_debug: "Debug page", werkzeug_debugger: "Debugger", laravel_debug: "Debug page",
+    symfony_debug: "Debug page", symfony_profiler: "Profiler", rails_debug: "Debug page", aspnet_error: "Error detail",
+    iis_error: "Error detail", php_error: "PHP error", phpinfo: "phpinfo()", java_stack_trace: "Stack trace",
+    dotnet_stack_trace: "Stack trace", python_traceback: "Traceback", node_stack_trace: "Stack trace", go_panic: "Go panic",
+    sql_error: "SQL error", directory_listing: "Dir listing", spring_actuator: "Actuator", api_docs: "API docs",
+    elasticsearch_root: "Elasticsearch", backend_address: "Backend IP", backend_host_header: "Backend host",
+    source_map: "Source map", aws_access_key: "AWS key", google_api_key: "Google key", slack_token: "Slack token",
+    slack_webhook: "Slack hook", github_token: "GitHub token", stripe_secret_key: "Stripe key", sendgrid_key: "SendGrid key",
+    private_key: "Private key", jwt: "JWT", private_ip: "Private IP" };
   const productRank = (product) => RANKS[product.category] ?? (product.observations.length ? 5 : 15);
   function productSummaryMarkup(origin) {
     const products = reportedProducts(origin).sort((a, b) => productRank(a) - productRank(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const exposures = (origin?.server_technologies || []).filter((item) => item.category === "exposure");
     if (!products.length && !exposures.length) return "";
     // Exposures lead: a debug page or a stack trace is the first thing to see.
-    const warning = exposures.length ? `<span class="service-map-exposure" title="${escape(exposures.map((item) => item.name).join("\n"))}">⚠ ${exposures.length}</span>` : "";
+    // An exposure says what it is: a bare count read as nothing. Hovering it
+    // lists them all, as +N does.
+    const warning = exposures.length ? `<span class="service-map-exposure" aria-label="Exposures: ${escape(exposures.map((item) => item.name).join(", "))}" data-more="${escape(exposures.map((item) => item.name).join("\n"))}" title="">⚠ ${escape(EXPOSURE_LABELS[exposures[0].product_id] || exposures[0].name)}${exposures.length > 1 ? ` +${exposures.length - 1}` : ""}</span>` : "";
+    // An exposure takes one of the two product places.
+    const shown = warning ? 1 : 2;
     const full = (product) => [product.observations.length ? "Header-reported declarations; versions unverified." : "",
       ...product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`),
       ...product.declared.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) from ${item.source_origin}`),
       ...product.seen.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) · ${item.signals.join(", ")}`)].filter(Boolean).join("\n");
     const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : ""}`;
-    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${warning}${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" data-more="${escape(products.slice(2).map(label).join("\n"))}" title="">+${products.length - 2}</span>` : ""}</span>`;
+    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${warning}${products.slice(0, shown).map((product) => `<span title="${escape(full(product))}">${productIcon(product.id)}${escape(label(product))}</span>`).join("")}${products.length > shown ? `<span class="service-map-products-more" aria-label="${products.length - shown} additional products" data-more="${escape(products.slice(shown).map(label).join("\n"))}" title="">+${products.length - shown}</span>` : ""}</span>`;
   }
   // What an origin serves, read from the response types of its loaded
   // endpoints: pages (Front), API data, or static files. A front-end framework
@@ -425,12 +440,27 @@
     jquery: ["$", "#0769ad", "#fff"], express: ["ex", "#353535", "#fff"], asp_net: [".N", "#512bd4", "#fff"], php: ["php", "#777bb4", "#fff"],
     spring_boot: ["S", "#6db33f", "#fff"], django: ["dj", "#0c4b33", "#fff"], laravel: ["L", "#ff2d20", "#fff"], ruby_on_rails: ["R", "#cc0000", "#fff"],
     fastapi: ["F", "#009688", "#fff"], symfony: ["sf", "#000", "#fff"], asp_net_core: [".N", "#512bd4", "#fff"] };
+  // A product's logo from product-icons.js: its brand colour and how light it is.
+  const productLogo = (id) => {
+    const entry = root.SniperProductIcons?.[id];
+    if (!entry) return null;
+    const value = parseInt(entry[0], 16);
+    return { hex: `#${entry[0]}`, path: entry[1], light: (0.2126 * (value >> 16) + 0.7152 * ((value >> 8) & 255) + 0.0722 * (value & 255)) / 255 };
+  };
+  // Beside a product's name, in its brand colour unless that colour would
+  // vanish on a dark or a light theme.
+  const productIcon = (id) => {
+    const logo = productLogo(id);
+    return logo ? `<svg class="service-map-product-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="${logo.light < 0.2 || logo.light > 0.92 ? "currentColor" : logo.hex}" d="${logo.path}"/></svg>` : "";
+  };
   function roleMarkup(origin, pinned = false, favicon = null) {
     const role = originRole(origin);
     const products = reportedProducts(origin);
-    const product = products.filter((item) => PRODUCT_MARKS[item.id]).sort((a, b) => productRank(a) - productRank(b))[0];
-    const [text, background, color] = product ? PRODUCT_MARKS[product.id] : [];
+    const product = products.filter((item) => productLogo(item.id) || PRODUCT_MARKS[item.id]).sort((a, b) => productRank(a) - productRank(b))[0];
+    const logo = product && productLogo(product.id);
+    const [text, background, color] = product && !logo ? PRODUCT_MARKS[product.id] : [];
     const icon = favicon ? `<img class="service-map-favicon" src="${escape(favicon)}" alt="">`
+      : logo ? `<span class="service-map-mark" style="background:${logo.hex}" title="${escape(product.name)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="${logo.light > 0.6 ? "#000" : "#fff"}" d="${logo.path}"/></svg></span>`
       : product ? `<span class="service-map-mark" style="background:${background};color:${color}" title="${escape(product.name)}">${escape(text)}</span>` : ROLE_ICONS[role];
     return `<span class="service-map-card-role role-${role}" title="${pinned ? "Pinned anchor · " : ""}${ROLE_TITLES[role]}"><span class="service-map-card-symbol" aria-hidden="true">${icon}</span><span class="service-map-card-role-label">${ROLE_LABELS[role]}</span></span>`;
   }
@@ -3295,5 +3325,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, relationshipOrder, siteKey, groupSites, originRole, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, EXPOSURE_LABELS, relationshipOrder, siteKey, groupSites, originRole, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

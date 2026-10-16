@@ -168,7 +168,13 @@ read and its `max_records` unless `--all-rows` asks for every row.
 Origin cards summarize at most two products from the loaded, validated response-
 header observations, with `+N` for further products; hovering `+N`, or focusing
 the card, lists them. A product found without a version shows its name alone.
-Full hover titles and the
+A product's chip carries its logo, and a card with no captured favicon shows
+the leading product's logo on its brand colour. The logos come from Simple
+Icons 16.35.0, bundled in `web/product-icons.js`: 110 products share 97 icons
+released under CC0, MIT, Apache-2.0, BSD or CC-BY, each licence noted in the
+file. Icons under a copyleft, non-commercial or custom licence (Vue.js, PHP,
+Ruby, Jenkins, Debian, Keycloak, Quasar) are left out, and those products keep
+a letter or no mark. Nothing is fetched at run time. Full hover titles and the
 inspector retain each literal version, unknown reason, header source, timestamp
 and exact evidence link separately. Missing product/version metadata is labeled
 unavailable; a present empty observation list says no declarations are loaded.
@@ -445,16 +451,19 @@ Boot Actuator, Swagger UI or an OpenAPI document, an Elasticsearch root
 endpoint, a backend address in a BIG-IP cookie, or an `X-Backend-Server`-style
 header. Scripts and pages are read for what they give away too: a
 `sourceMappingURL` comment (`source_map`), an AWS, Google, Slack, GitHub,
-Stripe or SendGrid key, a Slack webhook, a private key block, a JWT, and a
+Stripe or SendGrid key, a Slack webhook, a private key block with key material
+after its header (a PEM parser's bare header constant does not count), a JWT
+in a script or an error (a page's is usually the visitor's own token), and a
 private (RFC 1918) address in a URL a script calls or anywhere in an error
 (`private_ip`). Only the finding is reported, never the matched value; View
 source opens the row. These are what the responses say, not verified
 identification.
 
 They always belong to the origin that responded, never to the page that
-loaded the row. A card shows `⚠` and the number of exposures before its
-products, and leads its products with the backend and the servers in front of
-it; the inspector lists **Exposures** and **Server** with View source. The API
+loaded the row. A card's first chip names an exposure in a word or two (`⚠ JWT`,
+`⚠ AWS key +1`; hovering it lists them all) and takes one of the two product
+places. The products follow, the backend and the servers in front of it first;
+the inspector lists **Exposures** and **Server** with View source. The API
 and the CLI carry them on the origin as `server_technologies` (`product_id`,
 `name`, `category`, `version` when named, `signals`: `header`, `cookie` or
 `body`, `row_count`, `evidence`), at most 32 per origin, omitted when none.

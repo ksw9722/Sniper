@@ -366,6 +366,7 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/recon/jobs", post(crate::recon::start))
         .route("/api/recon/jobs/:id/stop", post(crate::recon::stop))
         .route("/service-map.js", get(service_map_js))
+        .route("/product-icons.js", get(product_icons_js))
         .route("/codemirror.js", get(codemirror_js))
         .route("/styles.css", get(styles_css))
         .route("/favicon.svg", get(favicon_svg))
@@ -8690,6 +8691,13 @@ async fn service_map_js() -> Response {
     asset_response(
         "application/javascript; charset=utf-8",
         include_str!("../web/service-map.js"),
+    )
+}
+
+async fn product_icons_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/product-icons.js"),
     )
 }
 

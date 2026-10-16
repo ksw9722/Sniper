@@ -628,9 +628,11 @@ const EXPOSURE_RULES: &[(&str, &str)] = &[
         "sendgrid_key",
         r"\bSG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}\b",
     ),
+    // Only with key material after the header: a PEM parser in a script
+    // carries the bare header as a constant.
     (
         "private_key",
-        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----",
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----(?:\\[rn]|\s)*[A-Za-z0-9+/]{40}",
     ),
     (
         "jwt",
@@ -886,11 +888,15 @@ pub(crate) enum Exposed {
 /// What a body gives away by mistake. The matched values never leave here.
 pub(crate) fn detect_exposures(body: &str, kind: Exposed) -> Vec<Detection> {
     let mut found = Vec::new();
+    let page = matches!(kind, Exposed::Page);
     let ids = EXPOSURES
         .set
         .matches(body)
         .into_iter()
-        .map(|index| EXPOSURE_RULES[index].0);
+        .map(|index| EXPOSURE_RULES[index].0)
+        // A page's token is usually the visitor's own session; a script's or
+        // an error's was written into it.
+        .filter(|id| !(page && *id == "jwt"));
     let private = match kind {
         Exposed::Script => PRIVATE.0.is_match(body),
         Exposed::Error => PRIVATE.1.is_match(body),
@@ -1453,10 +1459,19 @@ mod tests {
                 "sendgrid_key",
             ),
             (
-                concat!("-----BEGIN RSA PRIVATE", " KEY-----\nMIIE"),
+                concat!(
+                    "-----BEGIN RSA PRIVATE",
+                    " KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun"
+                ),
                 "private_key",
             ),
-            (concat!("-----BEGIN PRIVATE", " KEY-----"), "private_key"),
+            (
+                concat!(
+                    "var k=\"-----BEGIN PRIVATE",
+                    " KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\";"
+                ),
+                "private_key",
+            ),
             (
                 concat!(
                     "Bearer eyJhbGciOiJIUzI1NiJ9.",
@@ -1467,8 +1482,10 @@ mod tests {
         ];
         for (body, id) in samples {
             for kind in [Exposed::Script, Exposed::Page, Exposed::Error] {
-                assert!(
+                let expected = !(*id == "jwt" && matches!(kind, Exposed::Page));
+                assert_eq!(
                     found(detect_exposures(body, kind)).contains(&one(id, None)),
+                    expected,
                     "{id} in {body}"
                 );
             }
@@ -1501,6 +1518,8 @@ mod tests {
             "AIzaSy-too-short",
             concat!("sk", "_test_0123456789abcdefghijklmn"),
             "-----BEGIN PUBLIC KEY-----",
+            // A PEM parser's own constant, with no key after it.
+            concat!("var h=\"-----BEGIN PRIVATE", " KEY-----\";"),
             "//# sourceURL=app.js",
         ] {
             assert!(detect_exposures(body, Exposed::Script).is_empty(), "{body}");

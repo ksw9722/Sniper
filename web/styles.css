@@ -7387,11 +7387,14 @@ button.utility-button.replay-tab-add {
 .service-map-product-filter-panel p { margin: 8px 0 0; overflow-wrap: anywhere; }
 .service-map-products > span { min-width: 0; flex: 0 1 auto; }
 .service-map-products > .service-map-products-more { flex: 0 0 auto; }
-/* The products +N stands for show on hover or keyboard focus: the desktop
-   app's web view shows no title tooltip. Placed against the card, below it,
-   so the clipped chip row does not cut the list off. */
-.service-map-products-more:hover::after, .service-map-card:focus-visible .service-map-products-more::after { content: attr(data-more); position: absolute; z-index: 3; left: 52px; top: calc(100% - 6px); min-width: 120px; max-width: 220px; padding: 6px 9px; white-space: pre-line; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--panel-elevated); color: var(--text); font-size: var(--font-xs); line-height: 1.6; text-align: left; box-shadow: 0 4px 18px rgba(0,0,0,.25); pointer-events: none; }
+/* The products +N stands for, and the exposures ⚠ names, show on hover (+N on
+   keyboard focus too): the desktop app's web view shows no title tooltip.
+   Placed against the card, below it, so the clipped chip row does not cut the
+   list off. */
+.service-map-products-more:hover::after, .service-map-exposure:hover::after, .service-map-card:focus-visible .service-map-products-more::after { content: attr(data-more); position: absolute; z-index: 3; left: 52px; top: calc(100% - 6px); min-width: 120px; max-width: 220px; padding: 6px 9px; white-space: pre-line; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--panel-elevated); color: var(--text); font-size: var(--font-xs); line-height: 1.6; text-align: left; box-shadow: 0 4px 18px rgba(0,0,0,.25); pointer-events: none; }
 .service-map-products > .service-map-exposure { flex: 0 0 auto; color: var(--danger); border-color: var(--danger); }
+.service-map-product-icon { width: 1em; height: 1em; margin-right: 2px; vertical-align: -0.12em; }
+.service-map-mark svg { width: 15px; height: 15px; }
 .service-map-exposures h4 { color: var(--danger); }
 @media (max-width: 560px) { .service-map-product-filter-controls { grid-template-columns: minmax(0, 1fr); } .service-map-product-filter-controls > button { justify-self: start; } }
 .service-map-zoom-controls { display: inline-flex; align-items: center; gap: 3px; }
@@ -7452,7 +7455,7 @@ button.utility-button.replay-tab-add {
 .service-map-card-scheme, .service-map-card-meta { color: var(--text-soft); font-size: var(--font-xs); line-height: var(--service-map-line-height); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .service-map-card-meta { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .service-map-clues { display: flex; gap: 4px; height: calc(var(--font-xs) * var(--service-map-line-height) + 2px); overflow: hidden; }
-.service-map-clues > span { font-size: var(--font-xs); color: var(--text-soft); background: var(--bg-glow); border: 1px solid var(--line-strong); border-radius: 14px; padding: 0 5px; line-height: var(--service-map-line-height); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.service-map-clues > span { font-size: var(--font-xs); color: var(--text-soft); background: var(--bg-glow); border: 1px solid var(--line-strong); border-radius: 14px; padding: 0 4px; line-height: var(--service-map-line-height); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .service-map-scope-dot { position: absolute; right: 9px; top: 10px; width: 5px; height: 5px; border-radius: 50%; background: var(--text-dim); }
 .service-map-scope-dot.in-scope { background: var(--point); }
 .service-map-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 16px; color: var(--text-dim); font-size: var(--font-xs); border-top: 1px solid var(--line); }
