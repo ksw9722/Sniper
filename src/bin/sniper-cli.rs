@@ -4260,6 +4260,27 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "row_count",
         "evidence"
     ]);
+    let mut server = service_map_object(json!({
+        "product_id":{"type":"string","pattern":"^[a-z0-9_]{1,40}$"},
+        "name":{"type":"string","pattern":"^[A-Za-z.][A-Za-z0-9 .()!+_-]{0,39}$"},
+        "category":{"type":"string","enum":sniper::service_map_servers::CATEGORIES},
+        "version":{"type":"string","pattern":"^[0-9][0-9A-Za-z.+-]{0,39}$"},
+        "signals":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string","enum":sniper::service_map_servers::SIGNALS}},
+        "row_count":count,"evidence":strings
+    }));
+    server["required"] = json!([
+        "product_id",
+        "name",
+        "category",
+        "signals",
+        "row_count",
+        "evidence"
+    ]);
+    origin["properties"]["server_technologies"] = json!({
+        "type":"array","maxItems":32,
+        "description":"What the origin's own responses say about the servers behind it, outermost layer first (edge, gateway, platform, web_server, app_server, backend, language, database, os), and what they expose (category exposure: debug pages, stack traces, SQL errors, directory listings, API documents, a backend address in a BIG-IP cookie). Read from vendor header names, header values the technology catalog does not name, the names of cookies it sets, and error, default and debug page bodies. Never from another origin's rows.",
+        "items":server
+    });
     origin["properties"]["front_technologies"] = json!({
         "type":"array","maxItems":32,
         "description":"Front-end frameworks, CMSs, UI kits, libraries and analytics retained scripts, pages and asset URLs name: license banners, runtime values such as Next.js's window.next, page markup such as ng-version or data-v- attributes, <meta name=generator>, CDN package@version paths, versioned file names and build directories such as /_next/static/. An asset's goes to the page that loaded it when that page is in the map.",
@@ -9716,6 +9737,25 @@ fn validate_service_map_response(
                         && link.request_kinds.values().sum::<usize>() == link.request_count
                         && link.cors_credentials_count <= link.cors_allowed_count
                         && link.cors_allowed_count <= link.request_count
+                })
+                && origin.server_technologies.iter().all(|item| {
+                    !item.product_id.is_empty()
+                        && item.product_id.len() <= 40
+                        && item
+                            .product_id
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                        && !item.name.is_empty()
+                        && item.name.len() <= 40
+                        && sniper::service_map_servers::CATEGORIES.contains(&item.category.as_str())
+                        && !item.signals.is_empty()
+                        && item.signals.iter().all(|signal| {
+                            sniper::service_map_servers::SIGNALS.contains(&signal.as_str())
+                        })
+                        && item.version.as_deref().is_none_or(|version| {
+                            version.len() <= 40 && version.starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        && item.row_count > 0
                 })
                 && origin.front_technologies.iter().all(|item| {
                     !item.product_id.is_empty()

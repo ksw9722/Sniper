@@ -147,6 +147,30 @@ impl BodySource {
         )
     }
 
+    /// Pages and scripts, and the error, root and API-document responses whose
+    /// text can name the servers behind them.
+    pub(crate) fn from_text_record(record: &TransactionRecord) -> Result<Self, &'static str> {
+        Self::from_record_for_types(
+            record,
+            &[
+                "text/html",
+                "application/xhtml+xml",
+                "application/javascript",
+                "text/javascript",
+                "application/ecmascript",
+                "text/ecmascript",
+                "application/x-javascript",
+                "application/json",
+                "application/problem+json",
+                "application/hal+json",
+                "application/vnd.api+json",
+                "text/plain",
+                "application/xml",
+                "text/xml",
+            ],
+        )
+    }
+
     pub(crate) fn from_html_record(record: &TransactionRecord) -> Result<Self, &'static str> {
         Self::from_record_for_types(record, &["text/html"])
     }

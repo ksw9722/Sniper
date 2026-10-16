@@ -688,7 +688,7 @@ fn library_lookup(
         caches.rows.insert(row_key, found.clone());
         return Some(Ok(found));
     }
-    if BodySource::from_record(record).is_err() {
+    if BodySource::from_text_record(record).is_err() {
         caches.rows.insert(row_key, Vec::new());
         return Some(Ok(Vec::new()));
     }

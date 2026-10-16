@@ -44,13 +44,18 @@ pub struct Detection {
     pub category: &'static str,
     /// None when the signal names the product but not its version.
     pub version: Option<String>,
+    /// Empty for a front-end signal; `service_map_servers::SIGNALS` for one the
+    /// responding origin's own headers, cookies or body gave.
+    pub signal: &'static str,
 }
 
-/// What a row's body can declare: a script's technologies, or a page's.
+/// What a row's body can declare: a script's technologies, a page's, or what
+/// an error, a root or an API document response says about its servers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Script,
     Page,
+    Data,
 }
 
 pub(crate) fn kind(row: &ServiceMapRow) -> Option<Kind> {
@@ -59,6 +64,16 @@ pub(crate) fn kind(row: &ServiceMapRow) -> Option<Kind> {
         Some(Kind::Script)
     } else if mime.contains("html") {
         Some(Kind::Page)
+    } else if (mime.contains("json") || mime.contains("xml") || mime.starts_with("text/"))
+        && (row.status.is_some_and(|status| status >= 400)
+            || row.path == "/"
+            || row.path.starts_with("/actuator")
+            || ["/api-docs", "openapi.json", "swagger.json"]
+                .iter()
+                .any(|end| row.path.ends_with(end)))
+    {
+        // Only these are read: an API's every success would spend the budget.
+        Some(Kind::Data)
     } else {
         None
     }
@@ -467,13 +482,14 @@ fn package_product(name: &str) -> Option<&'static str> {
 }
 
 /// A product in the table, with the version found for it.
-fn known(id: &str, version: Option<&str>) -> Option<Detection> {
+pub(crate) fn known(id: &str, version: Option<&str>) -> Option<Detection> {
     let (id, name, category) = PRODUCTS.iter().find(|(known, _, _)| *known == id)?;
     Some(Detection {
         product_id: (*id).into(),
         name: (*name).into(),
         category,
         version: version.filter(|v| valid_version(v)).map(str::to_string),
+        signal: "",
     })
 }
 
@@ -526,6 +542,14 @@ pub(crate) fn detect(body: &str, kind: Kind) -> Vec<Detection> {
                 for detection in detect_url(&url[1]) {
                     merge(&mut found, detection);
                 }
+            }
+            for detection in crate::service_map_servers::detect_body(body) {
+                merge(&mut found, detection);
+            }
+        }
+        Kind::Data => {
+            for detection in crate::service_map_servers::detect_body(body) {
+                merge(&mut found, detection);
             }
         }
     }
@@ -629,10 +653,11 @@ fn generator(content: &str) -> Option<Detection> {
         name,
         category: CMS,
         version: version.filter(|v| valid_version(v)),
+        signal: "",
     })
 }
 
-fn valid_version(version: &str) -> bool {
+pub(crate) fn valid_version(version: &str) -> bool {
     !version.is_empty()
         && version.len() <= 40
         && version.starts_with(|c: char| c.is_ascii_digit())

@@ -220,7 +220,30 @@ pub struct ServiceOrigin {
     /// `service_map_libraries`. Absent when none, as on older servers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub front_technologies: Vec<FrontTechnology>,
+    /// What the origin's own headers, cookies and bodies say about the servers
+    /// behind it, and what they expose. See `service_map_servers`. Absent when
+    /// none, as on older servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_technologies: Vec<ServerTechnology>,
 }
+
+/// A server-side technology, or an exposure, an origin's own responses name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServerTechnology {
+    pub product_id: String,
+    pub name: String,
+    /// One of `service_map_servers::CATEGORIES`.
+    pub category: String,
+    /// Absent when no row named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Where it was seen: `header`, `cookie` or `body`.
+    pub signals: Vec<String>,
+    pub row_count: usize,
+    pub evidence: Vec<String>,
+}
+
+const MAX_SERVER_TECHNOLOGIES_PER_ORIGIN: usize = 32;
 
 /// A front-end technology a retained script, page or asset URL names. An asset's
 /// goes to the page that loaded it (its Referer) when that page is in the map,
@@ -927,6 +950,18 @@ pub(crate) fn project_record_for_catalog(
             }
         }
     }
+    // What the responding servers say about themselves: vendor headers, values
+    // the catalog does not name, and the cookies they set.
+    for detection in crate::service_map_servers::detect_headers(
+        response
+            .headers
+            .iter()
+            .take(MAX_HEADERS)
+            .filter(|header| header.value.len() <= MAX_HEADER_VALUE_BYTES)
+            .map(|header| (header.name.as_str(), header.value.as_str())),
+    ) {
+        crate::service_map_libraries::merge(&mut row.libraries, detection);
+    }
     row.omitted.sort();
     row.omitted.dedup();
     row.metadata_complete = row.omitted.is_empty();
@@ -1140,6 +1175,8 @@ struct ClientTally {
 struct FrontHit {
     name: String,
     category: &'static str,
+    /// The server signals among them; front-end ones are not kept.
+    signals: BTreeSet<&'static str>,
     rows: usize,
     evidence: Vec<String>,
 }
@@ -1151,6 +1188,12 @@ fn hit(
     detection: crate::service_map_libraries::Detection,
     evidence: &str,
 ) {
+    // A server's own header, cookie or body is about it, never about the page
+    // that loaded the row.
+    let page = (!crate::service_map_servers::server_signal(&detection))
+        .then_some(page)
+        .flatten();
+    let signal = detection.signal;
     let hit = hits
         .entry((
             page,
@@ -1161,9 +1204,13 @@ fn hit(
         .or_insert_with(|| FrontHit {
             name: detection.name,
             category: detection.category,
+            signals: BTreeSet::new(),
             rows: 0,
             evidence: Vec::new(),
         });
+    if !signal.is_empty() {
+        hit.signals.insert(signal);
+    }
     hit.rows += 1;
     sample(&mut hit.evidence, evidence);
 }
@@ -1244,6 +1291,7 @@ impl MapBuilder {
                 redirects: vec![],
                 header_links: vec![],
                 front_technologies: vec![],
+                server_technologies: vec![],
             });
         origin.in_scope |= in_scope;
         origin.request_count += 1;
@@ -1475,6 +1523,35 @@ impl MapBuilder {
             let Some(origin) = self.origins.get_mut(&owner) else {
                 continue;
             };
+            if crate::service_map_servers::CATEGORIES.contains(&hit.category) {
+                let signals = hit.signals.iter().map(|signal| signal.to_string());
+                if let Some(existing) = origin
+                    .server_technologies
+                    .iter_mut()
+                    .find(|item| item.product_id == product_id && item.version == version)
+                {
+                    existing.row_count += hit.rows;
+                    for signal in signals {
+                        if !existing.signals.contains(&signal) {
+                            existing.signals.push(signal);
+                        }
+                    }
+                    for evidence in &hit.evidence {
+                        sample(&mut existing.evidence, evidence);
+                    }
+                } else {
+                    origin.server_technologies.push(ServerTechnology {
+                        product_id,
+                        name: hit.name,
+                        category: hit.category.into(),
+                        version,
+                        signals: signals.collect(),
+                        row_count: hit.rows,
+                        evidence: hit.evidence,
+                    });
+                }
+                continue;
+            }
             if let Some(existing) = origin
                 .front_technologies
                 .iter_mut()
@@ -1520,6 +1597,32 @@ impl MapBuilder {
             if found.len() > MAX_FRONT_TECHNOLOGIES_PER_ORIGIN {
                 found.truncate(MAX_FRONT_TECHNOLOGIES_PER_ORIGIN);
                 self.stopped_by.insert("front_technologies_limit".into());
+            }
+            let servers = &mut origin.server_technologies;
+            let versioned: BTreeSet<String> = servers
+                .iter()
+                .filter(|item| item.version.is_some())
+                .map(|item| item.product_id.clone())
+                .collect();
+            servers.retain(|item| item.version.is_some() || !versioned.contains(&item.product_id));
+            let layer = |category: &str| {
+                crate::service_map_servers::CATEGORIES
+                    .iter()
+                    .position(|known| *known == category)
+            };
+            servers.sort_by(|a, b| {
+                (layer(&a.category), &a.name, &a.version).cmp(&(
+                    layer(&b.category),
+                    &b.name,
+                    &b.version,
+                ))
+            });
+            for item in servers.iter_mut() {
+                item.signals.sort();
+            }
+            if servers.len() > MAX_SERVER_TECHNOLOGIES_PER_ORIGIN {
+                servers.truncate(MAX_SERVER_TECHNOLOGIES_PER_ORIGIN);
+                self.stopped_by.insert("server_technologies_limit".into());
             }
         }
         let mut clients: Vec<ServiceClient> = std::mem::take(&mut self.clients)

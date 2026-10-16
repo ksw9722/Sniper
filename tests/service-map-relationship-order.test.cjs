@@ -546,3 +546,29 @@ test('clients lead the map with an arrow to each card they sent rows to themselv
   f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceOrigin: api } }) } });
   assert.equal(f.state.selectedClient, null, 'inspecting an origin leaves the client');
 });
+
+test('server technologies show on the card after the backend, exposures first, and in the inspector', async () => {
+  const server = (product_id, name, category, extra = {}) => ({ product_id, name, category, signals: ['body'], row_count: 1, evidence: [`evidence-${product_id}`], ...extra });
+  const f = fixture();
+  await f.load(snapshot([origin(api, { endpoints: [{ method: 'GET', path: '/v1', request_count: 1, statuses: [404], content_types: ['application/json'], evidence: ['evidence-api'] }],
+    server_technologies: [
+      server('java_stack_trace', 'Java stack trace', 'exposure'),
+      server('cloudflare', 'Cloudflare', 'edge', { signals: ['header'] }),
+      server('spring_boot', 'Spring Boot', 'backend'),
+      server('apache_tomcat', 'Apache Tomcat', 'app_server', { version: '9.0.83' }),
+      server('bad', '<b>', 'backend'),
+      server('worse', 'Worse', 'kernel'),
+      server('quiet', 'Quiet', 'backend', { signals: [] }),
+    ] })]));
+  const normalized = f.state.snapshot.origins[0].server_technologies;
+  assert.deepEqual(normalized.map(item => item.product_id), ['java_stack_trace', 'cloudflare', 'spring_boot', 'apache_tomcat'], 'unsafe entries are dropped');
+  const card = f.els.canvas.innerHTML;
+  assert.match(card, /class="service-map-exposure" title="Java stack trace">⚠ 1<\/span><span[^>]*>Spring Boot<\/span><span[^>]*>Apache Tomcat 9\.0\.83</,
+    'the exposure leads, then the backend and its app server; the edge waits behind +N');
+  assert.match(card, /service-map-mark[^>]*>S</, "the backend's mark replaces the role icon");
+  f.controller.selectOrigin(api);
+  const detail = f.els.detail.innerHTML;
+  assert.match(detail, /<h4>Exposures<\/h4>[^]*?Java stack trace[^]*?<h4>Server<\/h4>[^]*?Cloudflare<\/strong> <span class="service-map-muted">Edge<\/span><p class="service-map-muted">1 row · header/);
+  assert.match(detail, /data-service-relation-origin="https:\/\/x-api\.example\.com" data-service-relation-evidence="evidence-spring_boot"/);
+  assert.ok(map.reportedProducts(f.state.snapshot.origins[0]).every(product => product.id !== 'java_stack_trace'), 'an exposure is not a product');
+});

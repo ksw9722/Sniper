@@ -389,6 +389,58 @@ HTTP history. `GET /api/target/service-map/parameters` with `session_id`,
 `origin`, `method` and `path` returns the same result; the CLI does not read it
 yet.
 
+## Server technologies and exposures
+
+The header catalog below reads three headers for a fixed list of product
+literals. An origin's own responses say more about the servers behind it, and
+the map now reads four places for that, without sending anything:
+
+- **Vendor header names:** `CF-RAY` (Cloudflare), `X-Amz-Cf-Id` (CloudFront),
+  `X-Served-By: cache-…` (Fastly), `x-envoy-*` (Envoy), `x-kong-*` (Kong),
+  `X-Varnish`, `x-amz-id-2` (S3), `X-Vercel-Id`, `X-Jenkins: 2.426.1`,
+  `kbn-version` (Kibana), and about sixty more.
+- **Header values the catalog does not name:** `Server: AmazonS3`,
+  `awselb/2.0`, `Kestrel`, `Werkzeug/3.0.1 Python/3.12.0`, an operating system
+  in parentheses (`Apache/2.4.52 (Ubuntu)`), `Via: 1.1 … (CloudFront)`,
+  `X-Powered-By: Servlet/4.0`, `X-AspNet-Version: 4.0.30319`.
+- **Names of the cookies a response sets:** `JSESSIONID` (Java servlet),
+  `PHPSESSID`, `ASP.NET_SessionId`, `laravel_session`, `connect.sid`
+  (Express), `AWSALB`, `BIGipServer…` (F5), `TS…` (F5 WAF), `__cf_bm`,
+  `incap_ses_…`, `ak_bmsc`, `KEYCLOAK_SESSION`. A value is never read, except a
+  BIG-IP cookie's, to tell whether it encodes the pool member's address; the
+  address itself is not reported.
+- **Bodies:** default error pages (`<center>nginx/1.25.3</center>`,
+  `<address>Apache/… Server at …</address>`, `Apache Tomcat/9.0.83`, Spring
+  Boot's Whitelabel page and JSON error, Express's `Cannot GET`, Werkzeug's
+  404 text, FastAPI's and DRF's `detail`), gateway and WAF pages (HAProxy,
+  Envoy, Varnish, Cloudflare, Akamai, Imperva, ModSecurity, Kong, API Gateway),
+  debug pages, stack traces, SQL errors, and banners such as Elasticsearch's.
+  Pages are read as for the front end; JSON, XML and plain-text responses are
+  read only when they are errors (status 400 or above), an origin's root, an
+  `/actuator` path or an API document, so an API's successes do not spend the
+  read budget.
+
+Each finding gets a layer, outermost first: `edge` (CDN and WAF), `gateway`
+(load balancer, API gateway, proxy cache), `platform` (hosting and storage),
+`web_server`, `app_server`, `backend` (framework or application), `language`,
+`database`, `os`. What a response gives away by mistake is an `exposure`: a
+Django, Laravel, Symfony or Rails debug page, the Werkzeug debugger, a
+detailed ASP.NET or IIS error, a PHP error or `phpinfo()` page, a Java, .NET,
+Python, Node.js or Go stack trace, an SQL error, a directory listing, Spring
+Boot Actuator, Swagger UI or an OpenAPI document, an Elasticsearch root
+endpoint, a backend address in a BIG-IP cookie, or an `X-Backend-Server`-style
+header. These are what the responses say, not verified identification.
+
+They always belong to the origin that responded, never to the page that
+loaded the row. A card shows `⚠` and the number of exposures before its
+products, and leads its products with the backend and the servers in front of
+it; the inspector lists **Exposures** and **Server** with View source. The API
+and the CLI carry them on the origin as `server_technologies` (`product_id`,
+`name`, `category`, `version` when named, `signals`: `header`, `cookie` or
+`body`, `row_count`, `evidence`), at most 32 per origin, omitted when none.
+ZAP's passive rules, wafw00f's WAF checks and nuclei's technology templates
+were the checklist; the rules are Sniper's own.
+
 ## Clients
 
 Each row's `User-Agent` names the client that sent it, and for a Chromium
@@ -526,7 +578,8 @@ active-discovery option, or automatic retry with a larger limit.
 The result lists initiator, remote IP, and TLS certificate in `unavailable`.
 The default map continues to list response-body references as `deferred`. The
 only bodies it reads are JavaScript and HTML responses, for
-[Front-end technologies](#front-end-technologies);
+[Front-end technologies](#front-end-technologies), and error, root and API-document
+responses, for [Server technologies](#server-technologies-and-exposures);
 its metadata evidence reads none. A separate,
 explicit one-row retained-preview read is described below. It does not enrich the
 default inventory automatically. Do not fill unavailable gaps using hostname

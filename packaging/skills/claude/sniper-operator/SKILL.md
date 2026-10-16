@@ -97,7 +97,12 @@ coverage and triggers a warning; it does not establish catalog 2 support. A
 present marker must match the requested supported catalog. Catalog selection
 adds no target traffic, body reads, fallback reads, or automatic retries. Default
 map and evidence reads remain metadata-only apart from scripts and pages read for
-front-end technologies. The GUI map covers every retained row, so its counts can exceed
+front-end technologies, and error and debug responses read for
+`server_technologies`: the edge, gateway, platform, servers, backend, language,
+database and OS an origin's own headers, cookie names and bodies name, and
+`exposure` entries (debug pages, stack traces, SQL errors, directory listings,
+API documents, a backend address in a BIG-IP cookie). They are what responses
+say, not verified identification. The GUI map covers every retained row, so its counts can exceed
 a CLI read limited to `max_records`.
 
 Ordinary-map failures use fixed CLI codes `SERVICE_MAP_BUSY`,

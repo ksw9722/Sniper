@@ -7387,6 +7387,8 @@ button.utility-button.replay-tab-add {
 .service-map-product-filter-panel p { margin: 8px 0 0; overflow-wrap: anywhere; }
 .service-map-products > span { min-width: 0; flex: 0 1 auto; }
 .service-map-products > .service-map-products-more { flex: 0 0 auto; }
+.service-map-products > .service-map-exposure { flex: 0 0 auto; color: var(--danger); border-color: var(--danger); }
+.service-map-exposures h4 { color: var(--danger); }
 @media (max-width: 560px) { .service-map-product-filter-controls { grid-template-columns: minmax(0, 1fr); } .service-map-product-filter-controls > button { justify-self: start; } }
 .service-map-zoom-controls { display: inline-flex; align-items: center; gap: 3px; }
 .service-map-zoom-controls > button { padding: 5px 8px; min-width: 29px; }

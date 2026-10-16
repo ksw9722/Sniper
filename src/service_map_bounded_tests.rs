@@ -1275,3 +1275,106 @@ fn clients_count_their_rows_and_their_own_visits() {
     );
     assert!(map.snapshot.complete);
 }
+
+// What a response's own headers, cookies and error body say about its servers
+// stays with the origin that responded, even when a page's Referer loaded it.
+#[test]
+fn server_technologies_stay_with_the_origin_that_responded() {
+    let session = Uuid::from_u128(104);
+    let response =
+        |host: &str, status, kind: &str, headers: &[(&str, &str)], body: &str, sequence| {
+            let mut record = filter_fixture(
+                host,
+                "/v1/items",
+                status,
+                kind,
+                Some("https://www.example.com/"),
+                sequence,
+            );
+            let mut map = http::HeaderMap::new();
+            map.insert(http::header::CONTENT_TYPE, kind.parse().unwrap());
+            for (name, value) in headers {
+                map.append(
+                    http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &map,
+                body.as_bytes(),
+                1024,
+            ));
+            record
+        };
+    let store = TransactionStore::from_records(vec![
+        filter_fixture("www.example.com", "/", 200, "text/html", None, 1),
+        response(
+            "api.example.com",
+            404,
+            "application/json",
+            &[("CF-RAY", "8d2c1e9a7b3f1a2b-ICN"), ("Set-Cookie", "JSESSIONID=abc; Path=/"), ("Set-Cookie", "BIGipServerpool=1677787402.20480.0000; path=/")],
+            r#"{"timestamp":"2026-10-16T09:00:00.000+00:00","status":404,"error":"Not Found","path":"/v1/items"}"#,
+            2,
+        ),
+        response(
+            "api.example.com",
+            500,
+            "text/html",
+            &[],
+            "<pre>\tat org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)</pre>",
+            3,
+        ),
+    ]);
+    let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        DEFAULT_MAX_RECORDS,
+        technology::CatalogVersion::V2,
+        &crate::store::ListFilters::default(),
+    );
+    let map = build_bounded(
+        session,
+        snapshot,
+        DEFAULT_MAX_RECORDS,
+        false,
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    let origin = |host: &str| {
+        map.origins
+            .iter()
+            .find(|origin| origin.origin == format!("https://{host}"))
+            .unwrap()
+    };
+    let servers: Vec<_> = origin("api.example.com")
+        .server_technologies
+        .iter()
+        .map(|item| {
+            (
+                item.product_id.as_str(),
+                item.category.as_str(),
+                item.signals.join("+"),
+                item.row_count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        servers,
+        [
+            ("backend_address", "exposure", "cookie".to_string(), 1),
+            ("java_stack_trace", "exposure", "body".to_string(), 1),
+            ("cloudflare", "edge", "header".to_string(), 1),
+            ("f5_big_ip", "gateway", "cookie".to_string(), 1),
+            ("java_servlet", "app_server", "cookie".to_string(), 1),
+            ("spring_boot", "backend", "body".to_string(), 1),
+            ("java", "language", "body".to_string(), 1),
+        ],
+        "exposures first, then outermost layer to innermost"
+    );
+    let www = origin("www.example.com");
+    assert!(
+        www.server_technologies.is_empty() && www.front_technologies.is_empty(),
+        "the page only loaded them"
+    );
+}

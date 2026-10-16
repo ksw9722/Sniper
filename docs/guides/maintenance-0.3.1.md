@@ -370,6 +370,14 @@ offers Show parameters, which reads its newest 200 rows on request and lists
 each query, form, JSON or multipart parameter with its row count and up to
 three values (`GET /api/target/service-map/parameters`).
 
+The map also reads what an origin's own responses say about its servers:
+vendor header names (`CF-RAY`, `x-envoy-*`), header values the catalog does not
+name (`Server: AmazonS3`, an operating system in parentheses), the names of the
+cookies it sets (`JSESSIONID`, `AWSALB`, `BIGipServer…`), and error, default and
+debug pages, stack traces and SQL errors. Each finding gets a layer from edge to
+database, and what a response gives away by mistake is an exposure, shown first
+on the card. The API and the CLI carry them as `server_technologies`.
+
 Each row's User-Agent, with Client Hints for Chromium browsers, now names the
 client that sent it: a browser, an app's WebView, an app's HTTP stack, a tool, a
 library or a crawler, from a fixed list of rules. The map counts each client's

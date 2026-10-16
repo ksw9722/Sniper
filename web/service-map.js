@@ -283,7 +283,7 @@
     // exact-source inspections must never turn into an origin-level claim.
     const products = new Map();
     const product = (id, name) => {
-      if (!products.has(id)) products.set(id, { id, name, category: HEADER_CATEGORIES[id] || null, versions: new Set(), statuses: new Set(), observations: [], declared: [] });
+      if (!products.has(id)) products.set(id, { id, name, category: HEADER_CATEGORIES[id] || null, versions: new Set(), statuses: new Set(), observations: [], declared: [], seen: [] });
       return products.get(id);
     };
     for (const item of origin?.technology_observations_present ? origin.technology_observations : []) {
@@ -302,6 +302,18 @@
         entry.statuses.delete("not_reported");
       }
       entry.declared.push(item);
+    }
+    // What the origin's own responses say about its servers. An exposure is
+    // a finding, not a product.
+    for (const item of origin?.server_technologies || []) {
+      if (item.category === "exposure") continue;
+      const entry = product(item.product_id, item.name);
+      entry.category ??= item.category;
+      if (item.version) {
+        entry.versions.add(item.version);
+        entry.statuses.delete("not_reported");
+      }
+      entry.seen.push(item);
     }
     return [...products.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   }
@@ -325,19 +337,32 @@
   // front-end products take the category their bodies would give them.
   const FRONT_CATEGORIES = ["meta_framework", "cms", "framework", "ui", "library", "analytics"];
   const HEADER_CATEGORIES = { next_js: "meta_framework", nuxt: "meta_framework", gatsby: "meta_framework", astro: "meta_framework",
-    wordpress: "cms", drupal: "cms", react: "framework", vue: "framework", angular: "framework", angularjs: "framework" };
-  // What the site is built with leads a card, then what its headers declare,
-  // then the kits, libraries and trackers it loads.
-  const RANKS = { meta_framework: 0, cms: 1, framework: 2, ui: 4, library: 5, analytics: 6 };
-  const productRank = (product) => RANKS[product.category] ?? (product.observations.length ? 3 : 7);
+    wordpress: "cms", drupal: "cms", react: "framework", vue: "framework", angular: "framework", angularjs: "framework",
+    express: "backend", asp_net: "backend", apache_tomcat: "app_server", jetty: "app_server", apache_coyote: "app_server", gunicorn: "app_server",
+    uvicorn: "app_server", waitress: "app_server", nginx: "web_server", apache_http_server: "web_server", microsoft_iis: "web_server",
+    caddy: "web_server", openresty: "web_server", litespeed: "web_server", envoy: "gateway", cloudflare: "edge", php: "language" };
+  // Server layers, outermost first, as the origin's own responses name them.
+  const SERVER_CATEGORIES = ["exposure", "edge", "gateway", "platform", "web_server", "app_server", "backend", "language", "database", "os"];
+  const SERVER_SIGNALS = ["header", "cookie", "body"];
+  const SERVER_LABELS = { edge: "Edge", gateway: "Gateway", platform: "Platform", web_server: "Web server", app_server: "App server",
+    backend: "Backend", language: "Language", database: "Database", os: "OS" };
+  // What the site is built with leads a card, then the backend and the
+  // servers in front of it, then the kits, libraries and trackers it loads.
+  const RANKS = { meta_framework: 0, cms: 1, framework: 2, backend: 3, app_server: 4, web_server: 5, gateway: 6, edge: 7, platform: 8,
+    language: 9, database: 10, os: 11, ui: 12, library: 13, analytics: 14 };
+  const productRank = (product) => RANKS[product.category] ?? (product.observations.length ? 5 : 15);
   function productSummaryMarkup(origin) {
     const products = reportedProducts(origin).sort((a, b) => productRank(a) - productRank(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    if (!products.length) return "";
+    const exposures = (origin?.server_technologies || []).filter((item) => item.category === "exposure");
+    if (!products.length && !exposures.length) return "";
+    // Exposures lead: a debug page or a stack trace is the first thing to see.
+    const warning = exposures.length ? `<span class="service-map-exposure" title="${escape(exposures.map((item) => item.name).join("\n"))}">⚠ ${exposures.length}</span>` : "";
     const full = (product) => [product.observations.length ? "Header-reported declarations; versions unverified." : "",
       ...product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`),
-      ...product.declared.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) from ${item.source_origin}`)].filter(Boolean).join("\n");
+      ...product.declared.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) from ${item.source_origin}`),
+      ...product.seen.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) · ${item.signals.join(", ")}`)].filter(Boolean).join("\n");
     const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : product.statuses.size ? " · version unknown" : ""}${product.versions.size && product.statuses.size ? " + unknown" : ""}`;
-    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" title="${escape(products.slice(2).map(full).join("\n"))}">+${products.length - 2}</span>` : ""}</span>`;
+    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${warning}${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" title="${escape(products.slice(2).map(full).join("\n"))}">+${products.length - 2}</span>` : ""}</span>`;
   }
   // What an origin serves, read from the response types of its loaded
   // endpoints: pages (Front), API data, or static files. A front-end framework
@@ -392,7 +417,9 @@
     wix: ["W", "#000", "#fff"], squarespace: ["S", "#000", "#fff"], angular: ["A", "#dd0031", "#fff"], angularjs: ["A", "#b52e31", "#fff"],
     react: ["R", "#20232a", "#61dafb"], vue: ["V", "#42b883", "#fff"], svelte: ["S", "#ff3e00", "#fff"], ember: ["E", "#e04e39", "#fff"],
     preact: ["P", "#673ab8", "#fff"], lit: ["L", "#324fff", "#fff"], qwik: ["Q", "#ac7ef4", "#fff"], alpine_js: ["A", "#2d3441", "#77c1d2"],
-    jquery: ["$", "#0769ad", "#fff"], express: ["ex", "#353535", "#fff"], asp_net: [".N", "#512bd4", "#fff"], php: ["php", "#777bb4", "#fff"] };
+    jquery: ["$", "#0769ad", "#fff"], express: ["ex", "#353535", "#fff"], asp_net: [".N", "#512bd4", "#fff"], php: ["php", "#777bb4", "#fff"],
+    spring_boot: ["S", "#6db33f", "#fff"], django: ["dj", "#0c4b33", "#fff"], laravel: ["L", "#ff2d20", "#fff"], ruby_on_rails: ["R", "#cc0000", "#fff"],
+    fastapi: ["F", "#009688", "#fff"], symfony: ["sf", "#000", "#fff"], asp_net_core: [".N", "#512bd4", "#fff"] };
   function roleMarkup(origin, pinned = false) {
     const role = originRole(origin);
     const products = reportedProducts(origin);
@@ -936,6 +963,14 @@
           target_origin: safeOrigin(redirect.target_origin), target_path: safePath(redirect.target_path),
           evidence: array(redirect.evidence).filter((id) => typeof id === "string" && id.length > 0),
           request_count: count(redirect.request_count),
+        })),
+        // What the origin's own responses say about its servers, and expose.
+        server_technologies: array(item.server_technologies).filter((entry) => /^[a-z0-9_]{1,40}$/.test(entry?.product_id)
+          && /^[A-Za-z.][A-Za-z0-9 .()!+_-]{0,39}$/.test(entry.name) && SERVER_CATEGORIES.includes(entry.category)
+          && (entry.version == null || /^[0-9][0-9A-Za-z.+-]{0,39}$/.test(entry.version))
+          && array(entry.signals).length > 0 && array(entry.signals).every((signal) => SERVER_SIGNALS.includes(signal))).map((entry) => ({
+          product_id: entry.product_id, name: entry.name, category: entry.category, ...(entry.version == null ? {} : { version: entry.version }),
+          signals: array(entry.signals), row_count: count(entry.row_count), evidence: array(entry.evidence).filter((id) => typeof id === "string" && id.length > 0),
         })),
         // Front-end technologies retained scripts, pages and asset URLs name.
         front_technologies: array(item.front_technologies).filter((entry) => /^[a-z0-9_]{1,40}$/.test(entry?.product_id)
@@ -2826,6 +2861,14 @@
     }
     // Front-end technologies retained scripts, pages and asset URLs name, each
     // with the rows to open.
+    // What the origin's own responses say about its servers, exposures first,
+    // each with the rows to open.
+    function serverTechnologiesMarkup(origin) {
+      const items = origin.server_technologies || [];
+      const list = (entries) => `<ul class="service-map-references">${entries.map((item) => `<li><strong>${escape(item.name)}</strong>${item.version ? ` · ${escape(item.version)}` : ""}${SERVER_LABELS[item.category] ? ` <span class="service-map-muted">${SERVER_LABELS[item.category]}</span>` : ""}<p class="service-map-muted">${rowCount(item.row_count)} · ${item.signals.join(", ")}</p><div class="service-map-evidence-list">${item.evidence.map((id, index) => `<button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(origin.origin)}" data-service-relation-evidence="${escape(id)}" data-service-focus="server:${escape(JSON.stringify([item.product_id, item.version, id]))}"><span>${escape(item.name)}</span><span>View source${item.evidence.length > 1 ? ` ${index + 1}` : ""} ›</span></button>`).join("")}</div></li>`).join("")}</ul>`;
+      const exposures = items.filter((item) => item.category === "exposure"), servers = items.filter((item) => item.category !== "exposure");
+      return `${exposures.length ? `<section class="service-map-technologies service-map-exposures" aria-label="Exposures"><h4>Exposures</h4>${list(exposures)}</section>` : ""}${servers.length ? `<section class="service-map-technologies" aria-label="Server"><h4>Server</h4>${list(servers)}</section>` : ""}`;
+    }
     function frontTechnologiesMarkup(origin) {
       if (!origin.front_technologies?.length) return "";
       return `<section class="service-map-technologies" aria-label="Front-end"><h4>Front-end</h4><ul class="service-map-references">${origin.front_technologies.map((item) => `<li><strong>${escape(item.name)}</strong>${item.version ? ` · ${escape(item.version)}` : ""}<p class="service-map-muted">${item.row_count} retained row${item.row_count === 1 ? "" : "s"} from ${escape(item.source_origin)}</p><div class="service-map-evidence-list">${item.evidence.map((id, index) => `<button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(item.source_origin)}" data-service-relation-evidence="${escape(id)}" data-service-focus="library:${escape(JSON.stringify([item.product_id, item.version, id]))}"><span>${escape(item.name)}${item.version ? ` ${escape(item.version)}` : ""}</span><span>View source${item.evidence.length > 1 ? ` ${index + 1}` : ""} ›</span></button>`).join("")}</div></li>`).join("")}</ul></section>`;
@@ -2913,7 +2956,7 @@
       if (!state.detailPageAnchor && entries[start]) state.detailPageAnchor = endpointIdentity(entries[start]);
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>${originActionsMarkup(origin)}
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${frontTechnologiesMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${serverTechnologiesMarkup(origin)}${frontTechnologiesMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
     function renderCatalog() {
       const loaded = loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false);

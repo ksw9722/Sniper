@@ -37,6 +37,7 @@ mod service_map_link_parser;
 pub mod service_map_links;
 pub mod service_map_parameters;
 pub mod service_map_peer_matches;
+pub mod service_map_servers;
 pub mod service_map_technology;
 pub mod session;
 pub mod skill_activation;
