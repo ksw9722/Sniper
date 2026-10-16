@@ -264,9 +264,10 @@ pub struct TransactionStore {
     /// Session directory, so a record whose bodies were dropped can be read back
     /// out of transactions.ndjson. Derived from the journal path.
     storage_dir: Option<PathBuf>,
-    /// Next.js versions read from retained scripts, by record and revision;
-    /// None when a row was read and named none. See `service_map_scripts`.
-    script_versions: Mutex<HashMap<(Uuid, Uuid), Option<String>>>,
+    /// Libraries read from retained scripts and pages; see `LibraryCaches`.
+    library_versions: Mutex<LibraryCaches>,
+    /// The last whole-history map, serialized; see `cached_service_map`.
+    service_map_result: Mutex<Option<CachedServiceMap>>,
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
     next_event_sequence: AtomicU64,
@@ -502,6 +503,9 @@ struct StoreInner {
     // Changes under the metadata mutation lock, before event publication. Pure
     // append, annotations and body-file changes preserve the projected rows.
     service_map_metadata_epoch: Uuid,
+    /// Changes only when rows are removed or replaced, which moves the rows a
+    /// whole-history map reads by index; updates and appends keep it.
+    service_map_structure_epoch: Uuid,
     by_id: HashMap<Uuid, usize>,
     /// Where a record's line sits in transactions.ndjson, for records whose bodies
     /// were dropped after loading. Bodies are read back through this rather than
@@ -628,12 +632,142 @@ fn validate_service_map_body_locator(
 #[cfg(test)]
 type ServiceMapBodyReadHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// A retained script row to read after the store lock is released.
-struct PendingScript {
-    row: usize,
+/// Libraries already read, by row revision and by asset (origin, path and
+/// size), so each row, and each distinct file, is read once.
+#[derive(Default)]
+struct LibraryCaches {
+    rows: HashMap<(Uuid, Uuid), Vec<crate::service_map_libraries::Detection>>,
+    assets: HashMap<(String, usize), Vec<crate::service_map_libraries::Detection>>,
+}
+
+impl LibraryCaches {
+    // ponytail: forget everything at a cap rather than track recency.
+    fn trim(&mut self) {
+        if self.rows.len() > 100_000 || self.assets.len() > 100_000 {
+            *self = Self::default();
+        }
+    }
+}
+
+/// Body reads one map may make; a row past it waits for a later map.
+#[derive(Default)]
+struct LibraryBudget {
+    reads: usize,
+    bytes: usize,
+    exhausted: bool,
+}
+
+/// The libraries a script or page row declares when read before (`Ok`); or,
+/// within the budget, how to read them (`Err`); None when the row declares
+/// nothing to read, or must wait for a later map.
+fn library_lookup(
+    inner: &StoreInner,
+    caches: &mut LibraryCaches,
+    row: &crate::service_map::ServiceMapRow,
+    budget: &mut LibraryBudget,
+) -> Option<Result<Vec<crate::service_map_libraries::Detection>, PendingLibrary>> {
+    use crate::{
+        service_map::EvidenceKey,
+        service_map_body::BodySource,
+        service_map_libraries::{kind, MAX_BYTES_PER_MAP, MAX_READS, MAX_ROW_BYTES},
+    };
+    let body_kind = kind(row)?;
+    let key = EvidenceKey::parse(&row.evidence_id)?;
+    let row_key = (key.record_id, key.revision);
+    if let Some(found) = caches.rows.get(&row_key) {
+        return Some(Ok(found.clone()));
+    }
+    let index = service_map_body_row_index(inner, &key).ok()?;
+    let record = &inner.entries[index];
+    let response = record.response.as_ref()?;
+    // ponytail: an asset with the same origin, path and size is taken to be the
+    // same file; a hashed bundle fetched a thousand times is read once. Content
+    // hashing would make it exact.
+    let asset = (format!("{}{}", row.origin, record.path), response.body_size);
+    if let Some(found) = caches.assets.get(&asset).cloned() {
+        caches.rows.insert(row_key, found.clone());
+        return Some(Ok(found));
+    }
+    if BodySource::from_record(record).is_err() {
+        caches.rows.insert(row_key, Vec::new());
+        return Some(Ok(Vec::new()));
+    }
+    let locator = (inner.by_id.get(&record.id) == Some(&index))
+        .then(|| inner.locators.get(&record.id).copied())
+        .flatten();
+    let size = locator.map_or(response.body_preview.len().min(MAX_ROW_BYTES), |l| {
+        l.len as usize
+    });
+    if budget.reads >= MAX_READS || budget.bytes + size > MAX_BYTES_PER_MAP {
+        budget.exhausted = true;
+        return None;
+    }
+    budget.reads += 1;
+    budget.bytes += size;
+    let source = match locator {
+        Some(locator) => LibrarySource::Retained(locator, inner.file_generation),
+        None => {
+            let mut end = response.body_preview.len().min(MAX_ROW_BYTES);
+            while !response.body_preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            LibrarySource::Resident(response.body_preview[..end].to_string())
+        }
+    };
+    Some(Err(PendingLibrary {
+        key,
+        kind: body_kind,
+        asset,
+        source,
+    }))
+}
+
+#[derive(Debug)]
+pub(crate) enum ServiceMapStreamError {
+    HistoryChanged,
+    ScopeWorkLimit,
+}
+
+/// Where the rows a whole-history read has yet to fold end, after rows were
+/// removed: at the oldest row of its last chunk that is still retained, found
+/// by ID and body generation. Nothing read yet starts again from the newest.
+fn resume_below(inner: &StoreInner, read: &[(Uuid, Uuid)]) -> Option<usize> {
+    if read.is_empty() {
+        return Some(inner.entries.len());
+    }
+    read.iter().find_map(|&(id, generation)| {
+        inner
+            .by_id
+            .get(&id)
+            .copied()
+            .filter(|&index| inner.body_generations.get(index) == Some(&generation))
+    })
+}
+
+/// The last whole-history map, serialized, and the history it was built from.
+struct CachedServiceMap {
+    key: String,
+    token: (Uuid, usize),
+    built: std::time::Instant,
+    cost: std::time::Duration,
+    /// Every script and page body was read; otherwise rebuild for the rest.
+    complete: bool,
+    bytes: bytes::Bytes,
+}
+
+/// A script or page row to scan after the store lock is released.
+struct PendingLibrary {
     key: crate::service_map::EvidenceKey,
-    locator: crate::session::BodyLocator,
-    file_generation: Uuid,
+    kind: crate::service_map_libraries::Kind,
+    asset: (String, usize),
+    source: LibrarySource,
+}
+
+enum LibrarySource {
+    /// A copy of a body still in memory.
+    Resident(String),
+    /// Where a retained body sits in transactions.ndjson, and in which file.
+    Retained(crate::session::BodyLocator, Uuid),
 }
 
 #[derive(Clone, Debug)]
@@ -750,6 +884,7 @@ impl StoreInner {
             unresolved_body_generations: HashSet::new(),
             file_generation: Uuid::new_v4(),
             service_map_metadata_epoch: Uuid::new_v4(),
+            service_map_structure_epoch: Uuid::new_v4(),
             by_id,
             locators: HashMap::new(),
         }
@@ -788,6 +923,7 @@ impl StoreInner {
             self.locators.clear();
             if trimmed {
                 self.service_map_metadata_epoch = Uuid::new_v4();
+                self.service_map_structure_epoch = Uuid::new_v4();
             }
             return trimmed;
         }
@@ -810,6 +946,7 @@ impl StoreInner {
             .collect();
         self.locators.retain(|id, _| self.by_id.contains_key(id));
         self.service_map_metadata_epoch = Uuid::new_v4();
+        self.service_map_structure_epoch = Uuid::new_v4();
         true
     }
 }
@@ -859,7 +996,8 @@ impl TransactionStore {
             journal_tx: None,
             journal_start_failed: false,
             storage_dir: None,
-            script_versions: Mutex::new(HashMap::new()),
+            library_versions: Mutex::new(LibraryCaches::default()),
+            service_map_result: Mutex::new(None),
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
             next_event_sequence: AtomicU64::new(max_seq.max(latest_event_sequence) + 1),
@@ -1153,6 +1291,7 @@ impl TransactionStore {
             .map(|(index, record)| (record.id, index))
             .collect();
         inner.service_map_metadata_epoch = Uuid::new_v4();
+        inner.service_map_structure_epoch = Uuid::new_v4();
         drop(inner);
         let event_sequence = self.next_event_sequence.fetch_add(1, Ordering::Relaxed);
         let event = if automatic_retention {
@@ -1419,113 +1558,292 @@ impl TransactionStore {
         let epoch = ServiceMapMetadataEpoch(inner.service_map_metadata_epoch);
         let mut snapshot =
             self.service_map_snapshot_locked(&inner, session_id, max_records, catalog, filters);
-        let pending = self.cached_script_versions(&inner, &mut snapshot);
+        let pending = self.cached_library_versions(&inner, &mut snapshot);
         drop(inner);
-        self.read_script_versions(&mut snapshot, pending);
+        self.read_library_versions(&mut snapshot, pending);
         (snapshot, epoch)
     }
 
-    /// Fills in the Next.js version of each script row read before, reads the
-    /// ones still in memory, and returns the retained ones to read after the
-    /// lock is released. A row is read once per revision.
-    fn cached_script_versions(
+    /// Fills in the libraries each script and page row declares: from the cache
+    /// when read before, otherwise copied or located within this map's budget,
+    /// to read after the lock is released. Later maps read the rest.
+    fn cached_library_versions(
         &self,
         inner: &StoreInner,
         snapshot: &mut crate::service_map::MetadataSnapshot,
-    ) -> Vec<PendingScript> {
-        use crate::{
-            service_map::EvidenceKey,
-            service_map_body::BodySource,
-            service_map_scripts::{is_candidate, next_version, MAX_SCRIPT_READS},
-        };
-        let mut cache = self
-            .script_versions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // ponytail: forget everything at a cap rather than track recency.
-        if cache.len() > 50_000 {
-            cache.clear();
-        }
+    ) -> Vec<(usize, PendingLibrary)> {
+        let mut caches = self.library_caches();
+        caches.trim();
+        let mut budget = LibraryBudget::default();
         let mut pending = Vec::new();
         for (row_index, row) in snapshot.rows.iter_mut().enumerate() {
-            if !is_candidate(row) {
-                continue;
-            }
-            let Some(key) = EvidenceKey::parse(&row.evidence_id) else {
-                continue;
-            };
-            if let Some(version) = cache.get(&(key.record_id, key.revision)) {
-                row.script_version = version.clone();
-                continue;
-            }
-            let Ok(index) = service_map_body_row_index(inner, &key) else {
-                continue;
-            };
-            let record = &inner.entries[index];
-            if BodySource::from_record(record).is_err() {
-                cache.insert((key.record_id, key.revision), None);
-                continue;
-            }
-            let locator = (inner.by_id.get(&record.id) == Some(&index))
-                .then(|| inner.locators.get(&record.id).copied())
-                .flatten();
-            match locator {
-                Some(locator) => {
-                    if pending.len() < MAX_SCRIPT_READS {
-                        pending.push(PendingScript {
-                            row: row_index,
-                            key,
-                            locator,
-                            file_generation: inner.file_generation,
-                        });
-                    }
-                }
-                None => {
-                    let body = record.response.as_ref().map(|r| r.body_preview.as_str());
-                    let version = body.and_then(next_version);
-                    cache.insert((key.record_id, key.revision), version.clone());
-                    row.script_version = version;
-                }
+            match library_lookup(inner, &mut caches, row, &mut budget) {
+                Some(Ok(found)) => row.libraries = found,
+                Some(Err(item)) => pending.push((row_index, item)),
+                None => {}
             }
         }
         pending
     }
 
-    /// Reads retained script rows without the store lock, each checked to still
-    /// own its locator in this file, as an explicit body inspection is.
-    fn read_script_versions(
+    fn read_library_versions(
         &self,
         snapshot: &mut crate::service_map::MetadataSnapshot,
-        pending: Vec<PendingScript>,
+        pending: Vec<(usize, PendingLibrary)>,
     ) {
-        use crate::service_map_scripts::{next_version, read_script};
-        let Some(storage_dir) = self.storage_dir.as_ref().filter(|_| !pending.is_empty()) else {
+        if pending.is_empty() {
             return;
-        };
-        let Ok(mut file) = fs::File::open(storage_dir.join("transactions.ndjson")) else {
-            return;
-        };
-        for item in pending {
-            if validate_service_map_body_locator(
-                &self.inner.blocking_read(),
-                &item.key,
-                item.file_generation,
-                item.locator,
-            )
-            .is_err()
-            {
-                continue;
-            }
-            let Some(script) = read_script(&mut file, item.locator, item.key.record_id) else {
-                continue;
-            };
-            let version = next_version(&script);
-            self.script_versions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert((item.key.record_id, item.key.revision), version.clone());
-            snapshot.rows[item.row].script_version = version;
         }
+        let mut file = self.transactions_file();
+        for (row_index, item) in pending {
+            if let Some(found) = self.read_library(&mut file, item) {
+                snapshot.rows[row_index].libraries = found;
+            }
+        }
+    }
+
+    /// Scans a copied or retained body without the store lock. A retained row
+    /// must still own its locator in this file, as for a body inspection.
+    fn read_library(
+        &self,
+        file: &mut Option<fs::File>,
+        item: PendingLibrary,
+    ) -> Option<Vec<crate::service_map_libraries::Detection>> {
+        use crate::service_map_libraries::{detect, read_body};
+        let body = match item.source {
+            LibrarySource::Resident(body) => body,
+            LibrarySource::Retained(locator, file_generation) => {
+                let file = file.as_mut()?;
+                validate_service_map_body_locator(
+                    &self.inner.blocking_read(),
+                    &item.key,
+                    file_generation,
+                    locator,
+                )
+                .ok()?;
+                read_body(file, locator, item.key.record_id)?
+            }
+        };
+        let found = detect(&body, item.kind);
+        let mut caches = self.library_caches();
+        caches
+            .rows
+            .insert((item.key.record_id, item.key.revision), found.clone());
+        caches.assets.insert(item.asset, found.clone());
+        Some(found)
+    }
+
+    fn library_caches(&self) -> std::sync::MutexGuard<'_, LibraryCaches> {
+        self.library_versions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn transactions_file(&self) -> Option<fs::File> {
+        self.storage_dir
+            .as_ref()
+            .and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok())
+    }
+
+    /// The map over every retained row, newest first. Rows are folded as they
+    /// are projected, so none are kept, and the store lock is held a chunk at a
+    /// time, so captures continue while a large session is read. Appends and
+    /// updates during the read wait for the next map. Retention at its limit
+    /// removes a row with every capture, which moves the rows not yet read, so
+    /// the read continues below the oldest row it read that is still retained;
+    /// only losing all of its last chunk ends it as HistoryChanged. The flag says
+    /// whether every script and page body was read, or some wait for a later map.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn service_map_all_rows_blocking(
+        &self,
+        session_id: Uuid,
+        catalog: crate::service_map_technology::CatalogVersion,
+        filters: &ListFilters,
+        in_scope_only: bool,
+        origin_filter: Option<String>,
+        include: &[String],
+        exclude: &[String],
+    ) -> Result<(crate::service_map::ServiceMap, bool), ServiceMapStreamError> {
+        use crate::service_map::{
+            evidence_id, library_page, project_record, project_record_for_catalog, BoundedScope,
+            MapBuilder, MetadataSnapshot,
+        };
+        const CHUNK: usize = 8_192;
+        let mut scope = BoundedScope::new(include, exclude)
+            .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
+        let advanced_matcher = AdvancedSearchMatcher::new(filters);
+        let mut builder = MapBuilder::new(in_scope_only, origin_filter);
+        let (mut structure, retained, first, last) = {
+            let inner = self.inner.blocking_read();
+            (
+                inner.service_map_structure_epoch,
+                inner.entries.len(),
+                inner.entries.first().map(|r| r.started_at),
+                inner.entries.last().map(|r| r.started_at),
+            )
+        };
+        let mut meta = MetadataSnapshot {
+            generation: self.saved_cursor_generation,
+            captured_at: chrono::Utc::now(),
+            first_retained_started_at: first,
+            last_retained_started_at: last,
+            oldest_considered_at: None,
+            latest_considered_at: None,
+            retained_rows: retained,
+            considered_rows: 0,
+            non_http_rows: 0,
+            filtered_rows: 0,
+            omitted_rows: 0,
+            stopped_by: Default::default(),
+            rows: Vec::new(),
+        };
+        let mut budget = LibraryBudget::default();
+        let mut pending = Vec::new();
+        let mut next = retained;
+        // The last chunk's rows, oldest first, by ID and body generation.
+        let mut read = Vec::new();
+        while next > 0 {
+            let inner = self.inner.blocking_read();
+            if inner.service_map_structure_epoch != structure {
+                next = resume_below(&inner, &read).ok_or(ServiceMapStreamError::HistoryChanged)?;
+                structure = inner.service_map_structure_epoch;
+            }
+            let mut caches = self.library_caches();
+            caches.trim();
+            let from = next.saturating_sub(CHUNK);
+            for index in (from..next).rev() {
+                let record = &inner.entries[index];
+                meta.considered_rows += 1;
+                meta.oldest_considered_at = Some(
+                    meta.oldest_considered_at
+                        .map_or(record.started_at, |time| time.min(record.started_at)),
+                );
+                meta.latest_considered_at = Some(
+                    meta.latest_considered_at
+                        .map_or(record.started_at, |time| time.max(record.started_at)),
+                );
+                if record.method == "CONNECT" {
+                    meta.non_http_rows += 1;
+                    continue;
+                }
+                if !matches_filters(
+                    &inner.summaries[index],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    filters,
+                    advanced_matcher.as_ref(),
+                    false,
+                ) {
+                    meta.filtered_rows += 1;
+                    continue;
+                }
+                let id = evidence_id(
+                    session_id,
+                    self.saved_cursor_generation,
+                    inner.body_generations[index],
+                    record,
+                );
+                let row = match catalog {
+                    crate::service_map_technology::CatalogVersion::V1 => project_record(record, id),
+                    crate::service_map_technology::CatalogVersion::V2 => {
+                        project_record_for_catalog(record, id, catalog)
+                    }
+                };
+                let Some(mut row) = row else {
+                    meta.omitted_rows += 1;
+                    meta.stopped_by
+                        .insert("unsupported_or_oversized_metadata".into());
+                    continue;
+                };
+                let waiting = match library_lookup(&inner, &mut caches, &row, &mut budget) {
+                    Some(Ok(found)) => {
+                        row.libraries = found;
+                        None
+                    }
+                    Some(Err(item)) => Some((
+                        item,
+                        library_page(&row),
+                        row.origin.clone(),
+                        row.evidence_id.clone(),
+                    )),
+                    None => None,
+                };
+                let in_scope = scope
+                    .contains(&row.scope_host)
+                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
+                if builder.add(row, in_scope) {
+                    pending.extend(waiting);
+                }
+            }
+            read.clear();
+            read.extend(
+                (from..next).map(|index| (inner.entries[index].id, inner.body_generations[index])),
+            );
+            next = from;
+        }
+        let mut file = self.transactions_file();
+        for (item, page, origin, evidence) in pending {
+            if let Some(found) = self.read_library(&mut file, item) {
+                builder.add_libraries(page, origin, found, evidence);
+            }
+        }
+        Ok((
+            builder.finish(session_id, meta, retained.max(1)),
+            !budget.exhausted,
+        ))
+    }
+
+    /// A whole-history map from the last read with the same key, when history
+    /// is unchanged since, or when that read is recent: a large session is
+    /// rebuilt no more often than four times its build time, at least every
+    /// 1.2 seconds' poll, unless the caller asks for a fresh map. Retention at
+    /// its limit removes a row with every capture, so a recent map is served
+    /// whatever changed, and shows rows removed since until the next.
+    pub(crate) fn cached_service_map(&self, key: &str, fresh: bool) -> Option<bytes::Bytes> {
+        let token = self.service_map_history_token();
+        let cache = self
+            .service_map_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = cache.as_ref().filter(|cached| cached.key == key)?;
+        let unchanged = cached.complete && cached.token == token;
+        let recent = !fresh
+            && cached.built.elapsed()
+                < (cached.cost * 4).max(std::time::Duration::from_millis(1_200));
+        (unchanged || recent).then(|| cached.bytes.clone())
+    }
+
+    pub(crate) fn store_service_map(
+        &self,
+        key: String,
+        token: (Uuid, usize),
+        cost: std::time::Duration,
+        complete: bool,
+        bytes: bytes::Bytes,
+    ) {
+        *self
+            .service_map_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedServiceMap {
+            key,
+            token,
+            built: std::time::Instant::now(),
+            cost,
+            complete,
+            bytes,
+        });
+    }
+
+    /// What a whole-history map was built from: an update or removal changes
+    /// the epoch, and an append the row count.
+    pub(crate) fn service_map_history_token(&self) -> (Uuid, usize) {
+        let inner = self.inner.blocking_read();
+        (inner.service_map_metadata_epoch, inner.entries.len())
     }
 
     pub(crate) async fn service_map_metadata_epoch_matches(

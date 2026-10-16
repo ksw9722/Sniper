@@ -14,10 +14,11 @@ an APIs/Evidence inspector. Each card leads with what its origin serves, read
 from the response types of its loaded endpoints: **Front** (HTML pages), **API**
 (JSON, XML, protobuf, gRPC or GraphQL), **Static** (images, fonts, styles,
 scripts), or **Unknown** when no typed response is loaded; **Ref** marks an
-origin only referenced, and **Site** a card of grouped origins. A declared
-front-end product or CMS (Next.js, WordPress, Drupal) makes it Front whatever its
-endpoints return, and a declared application product shows its mark in place
-of the icon. Only an error or the first load shows above the map; the snapshot
+origin only referenced, and **Site** a card of grouped origins. A front-end
+product or CMS (Next.js, React, Vue, WordPress and the like) makes it Front
+whatever its endpoints return when a header names it, the origin serves pages, or
+one of its pages loaded the script naming it; a CDN that only serves that script
+stays Static. A declared application product shows its mark in place of the icon. Only an error or the first load shows above the map; the snapshot
 counts, coverage and window sit under **Details** below it, whose summary names
 how many origins the card cap leaves out. Compact 220×104px cards at the default 12px Display
 text size share their geometry with all arrow attachments. Larger Display text
@@ -135,6 +136,25 @@ The CLI reports a fixed failure once without retrying. Its codes are
 `SERVICE_MAP_HISTORY_CHANGED` and `SERVICE_MAP_BUILD_FAILED`; existing status-
 based exit codes and `retryable:false` remain unchanged.
 
+## Every retained row in the GUI
+
+The GUI map reads every retained row, not a newest-rows window: it asks for
+`all_rows=true`. The server folds each row into the map as it projects it, newest
+first, and keeps none, so the 8 MiB projection limit does not apply. It holds the
+store lock 8,192 rows at a time, so capture continues while a large session is
+read. Appends and updates during the read wait for the next map. Retention at its
+limit removes a row with every capture; the read continues below the oldest row
+it has read that is still retained, and fails with `history_changed` only if none
+of its last 8,192 rows remains. No history check follows the read: the map shows
+the history as it read it.
+
+A measured 240,000-row session took about 0.7 seconds to read, so the server
+keeps the last whole-history map. A poll is answered from it while history is
+unchanged, or while it is younger than four times its build time (at least
+1.2 seconds), and may then show rows removed since. `fresh=true` rebuilds it; the
+GUI sends that on its first read and on Reload. `sniper-cli` keeps the windowed
+read and its `max_records`.
+
 ## Reported products and local origin filters
 
 Origin cards summarize at most two products from the loaded, validated response-
@@ -243,8 +263,9 @@ so a page's image and style CDN drops out of the map with its rows. Each conditi
 hides exactly the rows it hides in HTTP history: the server applies History's own
 row matcher while it takes the snapshot. Origins, endpoints, redirect
 instructions and Origin/Referer declarations seen only in hidden rows disappear
-with them. Filtering happens inside the newest-row window (10,000 by default); it
-does not widen the window. `snapshot.filtered_rows` counts the hidden rows, and
+with them. The GUI filters every retained row. A windowed read (the CLI's)
+filters inside the newest-row window and does not widen it.
+`snapshot.filtered_rows` counts the hidden rows, and
 Details reports them. Changing the filter re-reads the map and ranks the cards
 again for the rows that remain; a filter restored from settings does the same on
 the next read.
@@ -304,22 +325,38 @@ selects the origin that recorded it (the target of an Origin or Referer link,
 the source of a redirect) and marks the relationship in the inspector, where
 View source opens an example row.
 
-## Script versions
+## Library versions
 
-A response header can say a page is built with Next.js but never which version:
-`X-Powered-By: Next.js` carries none. Next.js's client runtime does, as
-`window.next={version:"…"}` in its bundles. When the map is built, Sniper reads
-retained JavaScript responses under `/_next/` for that value, once per row
-revision, at most 64 retained rows per map and none larger than 2 MiB. Only that
-anchor counts: another library's `version:"…"` in the same bundles is not
-Next.js's. The version goes to the page that loaded the script (its Referer)
-when that page is in the map, else to the script's own origin, so a bundle
-served from a CDN names the page's framework.
+Response headers name few products and rarely a version: `X-Powered-By: Next.js`
+carries none. Scripts and pages name theirs in fixed places, and the map reads
+those, as Retire.js reads files for their banners:
 
-The card's product chip then reads `Next.js 14.2.3`, and the inspector lists the
-script rows under **Script versions**, each with View source. The API and the CLI
-carry it on the origin as `script_versions` (`product_id`, `name`, `version`,
-`script_origin`, `row_count`, `evidence`), omitted when no script names one.
+- a license banner, such as `/*! jQuery v3.7.1` or `@license React v18.2.0`
+- a runtime literal, such as Next.js's `window.next={version:"…"}`, Nuxt's
+  `get nuxt(){return"…"}` or React DOM's renderer registration
+- Angular's `ng-version="…"` attribute in a page
+- a page's `<meta name="generator">` that names a version, such as
+  `WordPress 6.5.2`
+
+Scripts are read for React, Vue, Nuxt, Next.js, Angular, AngularJS, jQuery,
+jQuery UI, Bootstrap, core-js, Moment.js, Underscore.js, DOMPurify, Axios,
+Socket.IO, Chart.js, Swiper, GSAP, Video.js, Backbone.js, Knockout, Select2,
+Sentry and PDF.js. Only these anchors count: a bundle holds other libraries'
+`version:"…"` literals too, and a file name is not a declaration.
+
+When the map is built, Sniper reads retained JavaScript and HTML responses for
+them, once per row revision; a script served again at the same path with the same
+size is not read again. One map reads at most 256 rows from disk and 32 MiB in
+all, and skips any row larger than 2 MiB; later maps read the rest. A script's
+versions go to the page that loaded it (its Referer) when that page is in the
+map, else to the script's own origin, so a bundle served from a CDN names the
+page's framework. A page's own versions stay with the page.
+
+The card's product chip then reads, for example, `Next.js 14.2.3`, and the
+inspector lists the rows under **Library versions**, each with View source. The
+API and the CLI carry them on the origin as `library_versions` (`product_id`,
+`name`, `version`, `source_origin` where the declaring row was served,
+`row_count`, `evidence`), at most 24 per origin, omitted when nothing names one.
 
 ## Endpoint parameters
 
@@ -433,7 +470,8 @@ active-discovery option, or automatic retry with a larger limit.
 
 The result lists initiator, remote IP, and TLS certificate in `unavailable`.
 The default map continues to list response-body references as `deferred`. The
-only bodies it reads are Next.js bundles, for [Script versions](#script-versions);
+only bodies it reads are JavaScript and HTML responses, for
+[Library versions](#library-versions);
 its metadata evidence reads none. A separate,
 explicit one-row retained-preview read is described below. It does not enrich the
 default inventory automatically. Do not fill unavailable gaps using hostname
@@ -1160,6 +1198,8 @@ point-in-time peer results; no substitute UUID lookup occurs.
 ## Local API
 
 - `GET /api/target/service-map?session_id=<uuid>&in_scope_only=false&max_records=10000`
+- `GET /api/target/service-map?session_id=<uuid>&in_scope_only=false&all_rows=true&fresh=true`
+- `GET /api/target/service-map/parameters?session_id=<active-uuid>&origin=<origin>&method=<method>&path=<path>`
 - `GET /api/target/service-map/evidence?session_id=<uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/socket-peer-matches?session_id=<active-uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/body-references?session_id=<active-uuid>&evidence_id=<opaque-token>`

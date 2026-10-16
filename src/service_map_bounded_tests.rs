@@ -921,7 +921,7 @@ fn links_count_rows_whose_response_allowed_the_source_origin() {
 // A Next.js bundle names its framework version; the map gives it to the page
 // that loaded the bundle, and to the bundle's own origin when no page did.
 #[test]
-fn script_versions_go_to_the_page_that_loaded_the_bundle() {
+fn library_versions_go_to_the_page_that_loaded_the_bundle() {
     let session = Uuid::from_u128(100);
     let script = |host: &str, referer: Option<&str>, body: &str, sequence| {
         let mut record = filter_fixture(
@@ -956,6 +956,20 @@ fn script_versions_go_to_the_page_that_loaded_the_bundle() {
             4,
         ),
         script("img.example.com", None, "console.log(1)", 5),
+        {
+            // A page's generator stays with the page, whatever its Referer.
+            let mut record = filter_fixture(
+                "blog.example.com",
+                "/",
+                200,
+                "text/html",
+                Some("https://www.example.com/"),
+                6,
+            );
+            record.response.as_mut().unwrap().body_preview =
+                r#"<meta name="generator" content="WordPress 6.5.2">"#.into();
+            record
+        },
     ]);
     let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
         session,
@@ -978,12 +992,12 @@ fn script_versions_go_to_the_page_that_loaded_the_bundle() {
             .iter()
             .find(|origin| origin.origin == format!("https://{host}"))
             .unwrap()
-            .script_versions
+            .library_versions
             .iter()
             .map(|item| {
                 (
                     item.version.clone(),
-                    item.script_origin.clone(),
+                    item.source_origin.clone(),
                     item.row_count,
                 )
             })
@@ -1010,4 +1024,119 @@ fn script_versions_go_to_the_page_that_loaded_the_bundle() {
         )]
     );
     assert!(versions("img.example.com").is_empty());
+    assert_eq!(
+        versions("blog.example.com"),
+        [(
+            "6.5.2".to_string(),
+            "https://blog.example.com".to_string(),
+            1
+        )]
+    );
+}
+
+// The UI's whole-history map folds every retained row, newest first, keeping
+// none: where the windowed map holds every row it is the same map, and past
+// the window's row and byte caps every row still counts. The window held only
+// 6,202 of these rows before its 8 MiB projection cap stopped it.
+#[test]
+fn whole_history_map_matches_the_window_and_reads_past_it() {
+    let session = Uuid::from_u128(101);
+    let store = |rows: u64| {
+        TransactionStore::from_records(
+            (1..=rows)
+                .rev()
+                .map(|i| fixture_record(&format!("h{}.example.com", i % 7), i))
+                .collect(),
+        )
+    };
+    let filters = crate::store::ListFilters::default();
+    let all_rows = |store: &TransactionStore| {
+        store
+            .service_map_all_rows_blocking(
+                session,
+                technology::CatalogVersion::V2,
+                &filters,
+                false,
+                None,
+                &[],
+                &[],
+            )
+            .unwrap()
+    };
+    let small = store(3_000);
+    let (snapshot, _) = small.service_map_snapshot_blocking_for_catalog(
+        session,
+        3_000,
+        technology::CatalogVersion::V2,
+        &filters,
+    );
+    assert!(snapshot.stopped_by.is_empty());
+    let windowed = build_bounded(session, snapshot, 3_000, false, None, &[], &[]).unwrap();
+    let (mut all, complete) = all_rows(&small);
+    assert!(complete, "no script or page body was left to read");
+    all.snapshot.captured_at = windowed.snapshot.captured_at;
+    same_output(windowed, all);
+
+    let large = store(12_000);
+    let (snapshot, _) = large.service_map_snapshot_blocking_for_catalog(
+        session,
+        DEFAULT_MAX_RECORDS,
+        technology::CatalogVersion::V2,
+        &filters,
+    );
+    assert!(snapshot.stopped_by.contains("metadata_bytes"));
+    let (all, _) = all_rows(&large);
+    assert_eq!(
+        (all.snapshot.considered_rows, all.snapshot.included_rows),
+        (12_000, 12_000)
+    );
+    assert!(all.snapshot.complete, "{:?}", all.snapshot.stopped_by);
+}
+
+// The whole-history cache serves an unchanged history, or a recent map unless
+// a fresh one is asked for, whatever changed since.
+#[test]
+fn whole_history_cache_serves_an_unchanged_or_recent_map() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let store = TransactionStore::from_records(vec![
+        fixture_record("a.example.com", 2),
+        fixture_record("b.example.com", 1),
+    ]);
+    let cache = |cost: u64, complete: bool| {
+        store.store_service_map(
+            "key".into(),
+            store.service_map_history_token(),
+            std::time::Duration::from_secs(cost),
+            complete,
+            bytes::Bytes::from_static(b"{}"),
+        )
+    };
+    cache(0, true);
+    let unchanged = store.service_map_history_token();
+    assert!(store.cached_service_map("key", true).is_some(), "unchanged");
+    assert!(store.cached_service_map("other", false).is_none());
+    cache(0, false);
+    assert!(
+        store.cached_service_map("key", true).is_none(),
+        "bodies left to read"
+    );
+
+    cache(60, true);
+    runtime.block_on(store.insert(fixture_record("c.example.com", 3)));
+    let appended = store.service_map_history_token();
+    assert_ne!(appended, unchanged, "an append changes the history");
+    runtime.block_on(store.update_record(Uuid::from_u128(2), |record| record.status = Some(204)));
+    assert_ne!(
+        store.service_map_history_token(),
+        appended,
+        "so does an update"
+    );
+    assert!(
+        store.cached_service_map("key", false).is_some(),
+        "a recent map serves a poll"
+    );
+    assert!(
+        store.cached_service_map("key", true).is_none(),
+        "a fresh read rebuilds"
+    );
 }

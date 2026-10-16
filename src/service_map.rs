@@ -181,27 +181,27 @@ pub struct ServiceOrigin {
     pub technology_observations: Option<Vec<TechnologyAggregate>>,
     pub redirects: Vec<RedirectInstruction>,
     pub header_links: Vec<HeaderLink>,
-    /// Versions retained scripts declare about their framework; see
-    /// `service_map_scripts`. Absent when none, as on older servers.
+    /// Library and framework versions retained scripts and pages declare; see
+    /// `service_map_libraries`. Absent when none, as on older servers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub script_versions: Vec<ScriptVersion>,
+    pub library_versions: Vec<LibraryVersion>,
 }
 
-/// A framework version read from a retained script, attributed to the page that
-/// loaded it (its Referer) when that page is in the map, else to the script's
-/// own origin.
+/// A version a retained body declared. A script's goes to the page that loaded
+/// it (its Referer) when that page is in the map, else to the script's own
+/// origin; a page's stays with the page.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScriptVersion {
+pub struct LibraryVersion {
     pub product_id: String,
     pub name: String,
     pub version: String,
-    /// Where the first script naming this version was served from.
-    pub script_origin: String,
+    /// Where the first body naming this version was served from.
+    pub source_origin: String,
     pub row_count: usize,
     pub evidence: Vec<String>,
 }
 
-const MAX_SCRIPT_VERSIONS_PER_ORIGIN: usize = 8;
+const MAX_LIBRARY_VERSIONS_PER_ORIGIN: usize = 24;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceEndpoint {
@@ -282,7 +282,7 @@ pub struct ServiceMapRow {
     // the shared history matcher. Retain the bounded captured authority only
     // for internal scope decisions; never serialize potential userinfo.
     #[serde(skip)]
-    scope_host: String,
+    pub(crate) scope_host: String,
     pub evidence_id: String,
     pub record_id: Uuid,
     /// String preserves row identity in JavaScript beyond 2^53.
@@ -315,10 +315,10 @@ pub struct ServiceMapRow {
     /// credentials were allowed with it; aggregated onto links only.
     #[serde(skip)]
     pub cors: Option<(String, bool)>,
-    /// The Next.js version this row's script declares; filled in by the store,
-    /// which reads the body once per row revision.
+    /// The libraries this row's script or page declares; filled in by the
+    /// store, which reads the body once per row revision.
     #[serde(skip)]
-    pub script_version: Option<String>,
+    pub libraries: Vec<crate::service_map_libraries::Detection>,
 }
 
 /// Every value `request_kind` returns, in the order clients present them.
@@ -660,7 +660,7 @@ pub(crate) fn project_record_for_catalog(
         omitted: vec![],
         request_kind: request_kind(record),
         cors: None,
-        script_version: None,
+        libraries: Vec::new(),
     };
     if record
         .response
@@ -955,7 +955,7 @@ const MAX_SCOPE_WORK: usize = 8 * 1024 * 1024;
 const MAX_SCOPE_CACHE_ENTRIES: usize = 512;
 const MAX_SCOPE_CACHE_KEY_BYTES: usize = 128 * 1024;
 
-struct BoundedScope {
+pub(crate) struct BoundedScope {
     prepared: scope::PreparedScope,
     empty: bool,
     remaining: usize,
@@ -964,7 +964,10 @@ struct BoundedScope {
 }
 
 impl BoundedScope {
-    fn new(include: &[String], exclude: &[String]) -> Result<Self, scope::ScopeWorkLimit> {
+    pub(crate) fn new(
+        include: &[String],
+        exclude: &[String],
+    ) -> Result<Self, scope::ScopeWorkLimit> {
         let prepared = scope::PreparedScope::try_new(
             include,
             exclude,
@@ -981,7 +984,7 @@ impl BoundedScope {
         })
     }
 
-    fn contains(&mut self, raw_host: &str) -> Result<bool, scope::ScopeWorkLimit> {
+    pub(crate) fn contains(&mut self, raw_host: &str) -> Result<bool, scope::ScopeWorkLimit> {
         // The common unscoped path needs neither normalization nor cache keys.
         if self.empty {
             return Ok(true);
@@ -1045,42 +1048,80 @@ pub(crate) fn build(
     .expect("legacy scope matching is unbounded")
 }
 
-fn build_with_scope(
-    session_id: Uuid,
-    snapshot: MetadataSnapshot,
-    max_records: usize,
+/// The page a script row's libraries belong to: its Referer's origin. A page
+/// row's own libraries stay with it.
+pub(crate) fn library_page(row: &ServiceMapRow) -> Option<String> {
+    (crate::service_map_libraries::kind(row) == Some(crate::service_map_libraries::Kind::Script))
+        .then(|| {
+            row.header_links
+                .iter()
+                .find(|link| link.relationship == "referer_header")
+                .map(|link| link.source_origin.clone())
+        })
+        .flatten()
+}
+
+/// Folds projected rows, newest first, into a map. `build_with_scope` feeds it a
+/// materialized snapshot; the store feeds it rows as it reads them, so a map
+/// over a whole retained history holds no copy of its rows.
+pub(crate) struct MapBuilder {
     in_scope_only: bool,
     origin_filter: Option<String>,
-    mut is_in_scope: impl FnMut(&str) -> Result<bool, scope::ScopeWorkLimit>,
-) -> Result<ServiceMap, scope::ScopeWorkLimit> {
-    let projected_rows = snapshot.rows.len();
-    let mut stopped_by = snapshot.stopped_by;
-    let mut origins = BTreeMap::<String, ServiceOrigin>::new();
-    let mut endpoint_indexes = BTreeMap::<(String, String, String), usize>::new();
-    let mut technology_observation_count = 0usize;
-    let mut script_hits = Vec::new();
-    let mut included_rows = 0;
-    let mut excluded_rows = 0;
-    let mut omitted_rows = snapshot.omitted_rows;
-    for row in snapshot.rows {
-        let in_scope = is_in_scope(&row.scope_host)?;
-        if (in_scope_only && !in_scope)
-            || origin_filter
+    stopped_by: BTreeSet<String>,
+    origins: BTreeMap<String, ServiceOrigin>,
+    endpoint_indexes: BTreeMap<(String, String, String), usize>,
+    technology_observation_count: usize,
+    library_hits: Vec<(
+        Option<String>,
+        String,
+        crate::service_map_libraries::Detection,
+        String,
+    )>,
+    projected_rows: usize,
+    included_rows: usize,
+    excluded_rows: usize,
+    omitted_rows: usize,
+}
+
+impl MapBuilder {
+    pub(crate) fn new(in_scope_only: bool, origin_filter: Option<String>) -> Self {
+        Self {
+            in_scope_only,
+            origin_filter,
+            stopped_by: BTreeSet::new(),
+            origins: BTreeMap::new(),
+            endpoint_indexes: BTreeMap::new(),
+            technology_observation_count: 0,
+            library_hits: Vec::new(),
+            projected_rows: 0,
+            included_rows: 0,
+            excluded_rows: 0,
+            omitted_rows: 0,
+        }
+    }
+
+    /// Folds one row. False when the row was excluded or left out by a cap.
+    pub(crate) fn add(&mut self, row: ServiceMapRow, in_scope: bool) -> bool {
+        self.projected_rows += 1;
+        if (self.in_scope_only && !in_scope)
+            || self
+                .origin_filter
                 .as_ref()
                 .is_some_and(|origin| origin != &row.origin)
         {
-            excluded_rows += 1;
-            continue;
+            self.excluded_rows += 1;
+            return false;
         }
         for reason in &row.omitted {
-            stopped_by.insert(reason.clone());
+            self.stopped_by.insert(reason.clone());
         }
-        if !origins.contains_key(&row.origin) && origins.len() == MAX_ORIGINS {
-            stopped_by.insert("origins_limit".into());
-            omitted_rows += 1;
-            continue;
+        if !self.origins.contains_key(&row.origin) && self.origins.len() == MAX_ORIGINS {
+            self.stopped_by.insert("origins_limit".into());
+            self.omitted_rows += 1;
+            return false;
         }
-        let origin = origins
+        let origin = self
+            .origins
             .entry(row.origin.clone())
             .or_insert_with(|| ServiceOrigin {
                 origin: row.origin.clone(),
@@ -1096,32 +1137,35 @@ fn build_with_scope(
                 technology_observations: Some(vec![]),
                 redirects: vec![],
                 header_links: vec![],
-                script_versions: vec![],
+                library_versions: vec![],
             });
         origin.in_scope |= in_scope;
         origin.request_count += 1;
         origin.first_seen = origin.first_seen.min(row.started_at);
         origin.last_seen = origin.last_seen.max(row.started_at);
-        included_rows += 1;
-        if let Some(version) = row.script_version.clone() {
-            let page = row
-                .header_links
-                .iter()
-                .find(|link| link.relationship == "referer_header")
-                .map(|link| link.source_origin.clone());
-            script_hits.push((page, row.origin.clone(), version, row.evidence_id.clone()));
+        self.included_rows += 1;
+        if !row.libraries.is_empty() {
+            let page = library_page(&row);
+            for detection in &row.libraries {
+                self.library_hits.push((
+                    page.clone(),
+                    row.origin.clone(),
+                    detection.clone(),
+                    row.evidence_id.clone(),
+                ));
+            }
         }
         let key = (row.origin.clone(), row.method.clone(), row.path.clone());
-        let endpoint_index = if let Some(index) = endpoint_indexes.get(&key) {
+        let endpoint_index = if let Some(index) = self.endpoint_indexes.get(&key) {
             Some(*index)
-        } else if endpoint_indexes.len() >= MAX_ENDPOINTS
+        } else if self.endpoint_indexes.len() >= MAX_ENDPOINTS
             || origin.endpoints.len() >= MAX_ENDPOINTS_PER_ORIGIN
         {
-            stopped_by.insert("endpoints_limit".into());
+            self.stopped_by.insert("endpoints_limit".into());
             None
         } else {
             let index = origin.endpoints.len();
-            endpoint_indexes.insert(key, index);
+            self.endpoint_indexes.insert(key, index);
             origin.endpoints.push(ServiceEndpoint {
                 method: row.method.clone(),
                 path: row.path.clone(),
@@ -1141,7 +1185,7 @@ fn build_with_scope(
                     if endpoint.statuses.len() < 32 {
                         endpoint.statuses.push(status);
                     } else {
-                        stopped_by.insert("statuses_limit".into());
+                        self.stopped_by.insert("statuses_limit".into());
                     }
                 }
             }
@@ -1150,7 +1194,7 @@ fn build_with_scope(
                     if endpoint.content_types.len() < 16 {
                         endpoint.content_types.push(mime.clone());
                     } else {
-                        stopped_by.insert("content_types_limit".into());
+                        self.stopped_by.insert("content_types_limit".into());
                     }
                 }
             }
@@ -1197,9 +1241,11 @@ fn build_with_scope(
                 existing.last_seen = existing.last_seen.max(row.started_at);
                 sample(&mut existing.evidence, &row.evidence_id);
             } else if observations.len() >= technology::MAX_OBSERVATIONS_PER_ORIGIN {
-                stopped_by.insert("technology_observations_per_origin_limit".into());
-            } else if technology_observation_count >= technology::MAX_OBSERVATIONS {
-                stopped_by.insert("technology_observations_map_limit".into());
+                self.stopped_by
+                    .insert("technology_observations_per_origin_limit".into());
+            } else if self.technology_observation_count >= technology::MAX_OBSERVATIONS {
+                self.stopped_by
+                    .insert("technology_observations_map_limit".into());
             } else {
                 observations.push(TechnologyAggregate {
                     product_id: observation.product_id,
@@ -1215,7 +1261,7 @@ fn build_with_scope(
                     last_seen: row.started_at,
                     evidence: vec![row.evidence_id.clone()],
                 });
-                technology_observation_count += 1;
+                self.technology_observation_count += 1;
             }
         }
         for link in row.header_links {
@@ -1250,7 +1296,7 @@ fn build_with_scope(
                     cors_credentials_count: cors_credentials,
                 });
             } else {
-                stopped_by.insert("header_links_limit".into());
+                self.stopped_by.insert("header_links_limit".into());
             }
         }
         if let Some(target) = row.redirect {
@@ -1269,95 +1315,143 @@ fn build_with_scope(
                     request_count: 1,
                 });
             } else {
-                stopped_by.insert("redirects_limit".into());
+                self.stopped_by.insert("redirects_limit".into());
             }
         }
+        true
     }
-    // A script's version belongs to the page that loaded it when that page is
-    // in the map; a CDN serving the bundle is only where it was read.
-    for (page, script_origin, version, evidence) in script_hits {
-        let owner = page
-            .filter(|page| origins.contains_key(page))
-            .unwrap_or_else(|| script_origin.clone());
-        let Some(origin) = origins.get_mut(&owner) else {
-            continue;
-        };
-        if let Some(existing) = origin
-            .script_versions
-            .iter_mut()
-            .find(|item| item.version == version)
-        {
-            existing.row_count += 1;
-            sample(&mut existing.evidence, &evidence);
-        } else if origin.script_versions.len() < MAX_SCRIPT_VERSIONS_PER_ORIGIN {
-            origin.script_versions.push(ScriptVersion {
-                product_id: "next_js".into(),
-                name: "Next.js".into(),
-                version,
-                script_origin,
-                row_count: 1,
-                evidence: vec![evidence],
+
+    /// Libraries read from an included row's body after it was folded.
+    pub(crate) fn add_libraries(
+        &mut self,
+        page: Option<String>,
+        source_origin: String,
+        found: Vec<crate::service_map_libraries::Detection>,
+        evidence: String,
+    ) {
+        for detection in found {
+            self.library_hits.push((
+                page.clone(),
+                source_origin.clone(),
+                detection,
+                evidence.clone(),
+            ));
+        }
+    }
+
+    /// The map, with the snapshot's own counts and stop reasons merged in.
+    pub(crate) fn finish(
+        mut self,
+        session_id: Uuid,
+        snapshot: MetadataSnapshot,
+        max_records: usize,
+    ) -> ServiceMap {
+        // A script's version belongs to the page that loaded it when that page is
+        // in the map; a CDN serving the bundle is only where it was read.
+        for (page, source_origin, detection, evidence) in self.library_hits {
+            let owner = page
+                .filter(|page| self.origins.contains_key(page))
+                .unwrap_or_else(|| source_origin.clone());
+            let Some(origin) = self.origins.get_mut(&owner) else {
+                continue;
+            };
+            if let Some(existing) = origin.library_versions.iter_mut().find(|item| {
+                item.product_id == detection.product_id && item.version == detection.version
+            }) {
+                existing.row_count += 1;
+                sample(&mut existing.evidence, &evidence);
+            } else if origin.library_versions.len() < MAX_LIBRARY_VERSIONS_PER_ORIGIN {
+                origin.library_versions.push(LibraryVersion {
+                    product_id: detection.product_id,
+                    name: detection.name,
+                    version: detection.version,
+                    source_origin,
+                    row_count: 1,
+                    evidence: vec![evidence],
+                });
+            } else {
+                self.stopped_by.insert("library_versions_limit".into());
+            }
+        }
+        let stopped_by: BTreeSet<String> = self
+            .stopped_by
+            .union(&snapshot.stopped_by)
+            .cloned()
+            .collect();
+        let mut origins: Vec<_> = self.origins.into_values().collect();
+        for origin in &mut origins {
+            origin
+                .library_versions
+                .sort_by(|a, b| (&a.product_id, &a.version).cmp(&(&b.product_id, &b.version)));
+            origin
+                .endpoints
+                .sort_by(|a, b| (&a.path, &a.method).cmp(&(&b.path, &b.method)));
+            for endpoint in &mut origin.endpoints {
+                endpoint.statuses.sort_unstable();
+                endpoint.content_types.sort();
+            }
+            origin
+                .technology_clues
+                .sort_by(|a, b| (&a.name, &a.header_name).cmp(&(&b.name, &b.header_name)));
+            if let Some(observations) = &mut origin.technology_observations {
+                observations.sort_by(|a, b| {
+                    (
+                        &a.product_id,
+                        &a.header_name,
+                        &a.reported_version,
+                        a.version_status,
+                    )
+                        .cmp(&(
+                            &b.product_id,
+                            &b.header_name,
+                            &b.reported_version,
+                            b.version_status,
+                        ))
+                });
+            }
+            origin.header_links.sort_by(|a, b| {
+                (&a.source_origin, &a.relationship).cmp(&(&b.source_origin, &b.relationship))
             });
-        } else {
-            stopped_by.insert("script_versions_limit".into());
-        }
-    }
-    let mut origins: Vec<_> = origins.into_values().collect();
-    for origin in &mut origins {
-        origin
-            .script_versions
-            .sort_by(|a, b| a.version.cmp(&b.version));
-        origin
-            .endpoints
-            .sort_by(|a, b| (&a.path, &a.method).cmp(&(&b.path, &b.method)));
-        for endpoint in &mut origin.endpoints {
-            endpoint.statuses.sort_unstable();
-            endpoint.content_types.sort();
-        }
-        origin
-            .technology_clues
-            .sort_by(|a, b| (&a.name, &a.header_name).cmp(&(&b.name, &b.header_name)));
-        if let Some(observations) = &mut origin.technology_observations {
-            observations.sort_by(|a, b| {
-                (
-                    &a.product_id,
-                    &a.header_name,
-                    &a.reported_version,
-                    a.version_status,
-                )
-                    .cmp(&(
-                        &b.product_id,
-                        &b.header_name,
-                        &b.reported_version,
-                        b.version_status,
-                    ))
+            origin.redirects.sort_by(|a, b| {
+                (&a.target_origin, &a.target_path).cmp(&(&b.target_origin, &b.target_path))
             });
         }
-        origin.header_links.sort_by(|a, b| {
-            (&a.source_origin, &a.relationship).cmp(&(&b.source_origin, &b.relationship))
-        });
-        origin.redirects.sort_by(|a, b| {
-            (&a.target_origin, &a.target_path).cmp(&(&b.target_origin, &b.target_path))
-        });
+        ServiceMap { schema_version: 1, technology_catalog_version: None, session_id,
+            snapshot: ServiceMapSnapshot {
+                window_order: "newest_capture_sequence".into(), id: Uuid::new_v4(), generation: snapshot.generation,
+                captured_at: snapshot.captured_at,
+                first_retained_started_at: snapshot.first_retained_started_at, last_retained_started_at: snapshot.last_retained_started_at,
+                oldest_considered_at: snapshot.oldest_considered_at, latest_considered_at: snapshot.latest_considered_at,
+                retained_rows: snapshot.retained_rows,
+                considered_rows: snapshot.considered_rows,
+                non_http_rows: snapshot.non_http_rows, filtered_rows: snapshot.filtered_rows, projected_rows: self.projected_rows,
+                included_rows: self.included_rows, excluded_rows: self.excluded_rows, omitted_rows: self.omitted_rows + snapshot.omitted_rows,
+                origin_count: origins.len(), endpoint_count: self.endpoint_indexes.len(), complete: stopped_by.is_empty(),
+                stopped_by: stopped_by.into_iter().collect(), limits: ServiceMapLimits::new(max_records) },
+            in_scope_only: self.in_scope_only, origin_filter: self.origin_filter, origins,
+            unavailable: vec!["initiator".into(), "remote_ip".into(), "tls_certificate".into()],
+            deferred: vec!["response_body_references".into()],
+            warnings: vec!["Counts describe analyzed rows in a newest-capture-sequence window, not all-time traffic. Removed or uncaptured traffic is unavailable; retained first/last timestamps are capture-order boundaries.".into(),
+                "Header clues do not prove software identity or a backend chain. Redirect instructions and Origin/Referer declarations do not prove a follow-up or initiating call.".into(),
+                "Evidence samples are bounded. Queries, fragments, userinfo, raw headers, and bodies are omitted. Origin in_scope means at least one analyzed row matches scope using its captured host.".into()],
+        }
     }
-    Ok(ServiceMap { schema_version: 1, technology_catalog_version: None, session_id,
-        snapshot: ServiceMapSnapshot {
-            window_order: "newest_capture_sequence".into(), id: Uuid::new_v4(), generation: snapshot.generation,
-            captured_at: snapshot.captured_at,
-            first_retained_started_at: snapshot.first_retained_started_at, last_retained_started_at: snapshot.last_retained_started_at,
-            oldest_considered_at: snapshot.oldest_considered_at, latest_considered_at: snapshot.latest_considered_at,
-            retained_rows: snapshot.retained_rows,
-            considered_rows: snapshot.considered_rows,
-            non_http_rows: snapshot.non_http_rows, filtered_rows: snapshot.filtered_rows, projected_rows, included_rows, excluded_rows, omitted_rows,
-            origin_count: origins.len(), endpoint_count: endpoint_indexes.len(), complete: stopped_by.is_empty(),
-            stopped_by: stopped_by.into_iter().collect(), limits: ServiceMapLimits::new(max_records) },
-        in_scope_only, origin_filter, origins,
-        unavailable: vec!["initiator".into(), "remote_ip".into(), "tls_certificate".into()],
-        deferred: vec!["response_body_references".into()],
-        warnings: vec!["Counts describe analyzed rows in a newest-capture-sequence window, not all-time traffic. Removed or uncaptured traffic is unavailable; retained first/last timestamps are capture-order boundaries.".into(),
-            "Header clues do not prove software identity or a backend chain. Redirect instructions and Origin/Referer declarations do not prove a follow-up or initiating call.".into(),
-            "Evidence samples are bounded. Queries, fragments, userinfo, raw headers, and bodies are omitted. Origin in_scope means at least one analyzed row matches scope using its captured host.".into()],
-    })
+}
+
+fn build_with_scope(
+    session_id: Uuid,
+    mut snapshot: MetadataSnapshot,
+    max_records: usize,
+    in_scope_only: bool,
+    origin_filter: Option<String>,
+    mut is_in_scope: impl FnMut(&str) -> Result<bool, scope::ScopeWorkLimit>,
+) -> Result<ServiceMap, scope::ScopeWorkLimit> {
+    let mut builder = MapBuilder::new(in_scope_only, origin_filter);
+    for row in std::mem::take(&mut snapshot.rows) {
+        let in_scope = is_in_scope(&row.scope_host)?;
+        builder.add(row, in_scope);
+    }
+    Ok(builder.finish(session_id, snapshot, max_records))
 }
 
 #[cfg(test)]

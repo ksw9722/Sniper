@@ -283,7 +283,7 @@
     // exact-source inspections must never turn into an origin-level claim.
     const products = new Map();
     const product = (id, name) => {
-      if (!products.has(id)) products.set(id, { id, name, versions: new Set(), statuses: new Set(), observations: [], scripts: [] });
+      if (!products.has(id)) products.set(id, { id, name, versions: new Set(), statuses: new Set(), observations: [], declared: [] });
       return products.get(id);
     };
     for (const item of origin?.technology_observations_present ? origin.technology_observations : []) {
@@ -292,12 +292,13 @@
       else entry.statuses.add(item.version_status);
       entry.observations.push(item);
     }
-    // A version a retained script names supersedes a header that named none.
-    for (const item of origin?.script_versions || []) {
+    // A version a retained script or page declares supersedes a header that
+    // named none.
+    for (const item of origin?.library_versions || []) {
       const entry = product(item.product_id, item.name);
       entry.versions.add(item.version);
       entry.statuses.delete("not_reported");
-      entry.scripts.push(item);
+      entry.declared.push(item);
     }
     return [...products.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   }
@@ -308,23 +309,25 @@
         || version.startsWith("reported:") && product.versions.has(version.slice(9))
         || version.startsWith("status:") && product.statuses.has(version.slice(7))));
   }
+  // Frameworks lead a card, then products a header declared, then libraries.
+  const MARK_ORDER = ["next_js", "nuxt", "angular", "angularjs", "react", "vue", "wordpress", "drupal", "jquery", "express", "asp_net", "php"];
+  const productRank = (product) => MARK_ORDER.includes(product.id) ? MARK_ORDER.indexOf(product.id) : product.observations.length ? 50 : 100;
   function productSummaryMarkup(origin) {
-    const products = reportedProducts(origin);
+    const products = reportedProducts(origin).sort((a, b) => productRank(a) - productRank(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     if (!products.length) return "";
     const full = (product) => [product.observations.length ? "Header-reported declarations; versions unverified." : "",
       ...product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`),
-      ...product.scripts.map((item) => `${item.name} ${item.version} · named by window.next in ${item.row_count} retained script row(s) from ${item.script_origin}`)].filter(Boolean).join("\n");
+      ...product.declared.map((item) => `${item.name} ${item.version} · declared in ${item.row_count} retained row(s) from ${item.source_origin}`)].filter(Boolean).join("\n");
     const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : " · version unknown"}${product.versions.size && product.statuses.size ? " + unknown" : ""}`;
     return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" title="${escape(products.slice(2).map(full).join("\n"))}">+${products.length - 2}</span>` : ""}</span>`;
   }
   // What an origin serves, read from the response types of its loaded
   // endpoints: pages (Front), API data, or static files. A declared front-end
   // product or CMS names the front end however its endpoints respond.
-  const FRONT_PRODUCTS = new Set(["next_js", "wordpress", "drupal"]);
+  const FRONT_PRODUCTS = new Set(["next_js", "nuxt", "react", "vue", "angular", "angularjs", "wordpress", "drupal", "gatsby", "astro"]);
   function originRole(origin) {
     if (origin.site) return "site";
     if (origin.captured === false || origin.peerInspectionOnly) return "ref";
-    if (reportedProducts(origin).some((product) => FRONT_PRODUCTS.has(product.id))) return "front";
     const tally = { front: 0, api: 0, static: 0 };
     for (const endpoint of origin.endpoints || []) {
       for (const type of endpoint.content_types || []) {
@@ -333,6 +336,11 @@
         if (role) tally[role] += 1;
       }
     }
+    // A front-end product makes the origin Front when a header names it, the
+    // origin serves pages, or one of its pages loaded the script naming it. A
+    // CDN that only serves that script stays Static.
+    if (reportedProducts(origin).some((product) => FRONT_PRODUCTS.has(product.id) && (tally.front || product.observations.length
+      || product.declared.some((item) => item.source_origin !== origin.origin)))) return "front";
     const [role, endpoints] = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
     return endpoints ? role : "unknown";
   }
@@ -348,11 +356,14 @@
     site: svg('<rect x="4.5" y="1.5" width="10" height="8" rx="1"/><rect x="1.5" y="6.5" width="10" height="8" rx="1"/>'),
   };
   // A declared application product shows its own mark in place of the role icon.
-  const PRODUCT_MARKS = { next_js: ["N", "#000", "#fff"], express: ["ex", "#353535", "#fff"], asp_net: [".N", "#512bd4", "#fff"],
-    php: ["php", "#777bb4", "#fff"], wordpress: ["W", "#21759b", "#fff"], drupal: ["D", "#0678be", "#fff"] };
+  const PRODUCT_MARKS = { next_js: ["N", "#000", "#fff"], nuxt: ["N", "#00dc82", "#020420"], angular: ["A", "#dd0031", "#fff"],
+    angularjs: ["A", "#b52e31", "#fff"], react: ["R", "#20232a", "#61dafb"], vue: ["V", "#42b883", "#fff"], wordpress: ["W", "#21759b", "#fff"],
+    drupal: ["D", "#0678be", "#fff"], jquery: ["$", "#0769ad", "#fff"], express: ["ex", "#353535", "#fff"], asp_net: [".N", "#512bd4", "#fff"],
+    php: ["php", "#777bb4", "#fff"] };
   function roleMarkup(origin, pinned = false) {
     const role = originRole(origin);
-    const product = reportedProducts(origin).find((item) => PRODUCT_MARKS[item.id]);
+    const products = reportedProducts(origin);
+    const product = MARK_ORDER.map((id) => products.find((item) => item.id === id)).find(Boolean);
     const [text, background, color] = product ? PRODUCT_MARKS[product.id] : [];
     const icon = product ? `<span class="service-map-mark" style="background:${background};color:${color}" title="${escape(product.name)}">${escape(text)}</span>` : ROLE_ICONS[role];
     return `<span class="service-map-card-role role-${role}" title="${pinned ? "Pinned anchor · " : ""}${ROLE_TITLES[role]}"><span class="service-map-card-symbol" aria-hidden="true">${icon}</span><span class="service-map-card-role-label">${ROLE_LABELS[role]}</span></span>`;
@@ -893,10 +904,11 @@
           evidence: array(redirect.evidence).filter((id) => typeof id === "string" && id.length > 0),
           request_count: count(redirect.request_count),
         })),
-        // Framework versions read from retained scripts: Next.js for now.
-        script_versions: array(item.script_versions).filter((entry) => entry?.product_id === "next_js" && typeof entry.version === "string"
-          && /^[0-9][0-9A-Za-z.+-]{0,39}$/.test(entry.version) && safeOrigin(entry.script_origin)).map((entry) => ({
-          product_id: "next_js", name: "Next.js", version: entry.version, script_origin: safeOrigin(entry.script_origin),
+        // Library and framework versions retained scripts and pages declare.
+        library_versions: array(item.library_versions).filter((entry) => /^[a-z0-9_]{1,40}$/.test(entry?.product_id)
+          && /^[A-Za-z][A-Za-z0-9 .!+_-]{0,39}$/.test(entry.name) && /^[0-9][0-9A-Za-z.+-]{0,39}$/.test(entry.version)
+          && safeOrigin(entry.source_origin)).map((entry) => ({
+          product_id: entry.product_id, name: entry.name, version: entry.version, source_origin: safeOrigin(entry.source_origin),
           row_count: count(entry.row_count), evidence: array(entry.evidence).filter((id) => typeof id === "string" && id.length > 0),
         })),
       }];
@@ -1954,7 +1966,10 @@
       let failure = null;
       try {
         // The Service Map filter's conditions use HTTP history's parameter names.
-        const params = new URLSearchParams({ ...filterQuery, session_id: sessionId, in_scope_only: String(scopeOnly), max_records: "10000" });
+        // Every retained row, not a newest-rows window. The server serves an
+        // unchanged or recent whole-history map from its cache; Reload and the
+        // first read ask for a fresh one.
+        const params = new URLSearchParams({ ...filterQuery, session_id: sessionId, in_scope_only: String(scopeOnly), all_rows: "true", ...(force || !state.snapshot ? { fresh: "true" } : {}) });
         const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal, headers: { [TECHNOLOGY_CATALOG_HEADER]: String(TECHNOLOGY_CATALOG_VERSION) } });
         if (!response.ok) {
           failure = mapFailure(response);
@@ -2731,10 +2746,10 @@
         : `<table class="service-map-parameters"><thead><tr><th>Name</th><th>In</th><th>Rows</th><th>Values</th></tr></thead><tbody>${result.items.map((item) => `<tr><td class="service-map-parameter-name">${escape(item.name)}</td><td>${item.location}</td><td>${item.rows}</td><td>${item.examples.map((value) => `<code>${escape(value)}</code>`).join("")}</td></tr>`).join("")}</tbody></table><p class="service-map-muted">From the newest ${rows(result.rows)}${result.moreRows ? "; older rows not read" : ""}${result.unreadBodies ? ` · ${result.unreadBodies} bodies not read (size limit)` : ""}${result.omitted ? ` · ${result.omitted} more parameters` : ""}.</p>`;
       return `<section class="service-map-parameters-section" aria-label="Parameters"><h4>Parameters</h4>${body}</section>`;
     }
-    // Versions retained scripts name, each with the script rows to open.
-    function scriptVersionsMarkup(origin) {
-      if (!origin.script_versions?.length) return "";
-      return `<section class="service-map-technologies" aria-label="Script versions"><h4>Script versions</h4><ul class="service-map-references">${origin.script_versions.map((item) => `<li><strong>${escape(item.name)}</strong> · ${escape(item.version)}<p class="service-map-muted">window.next in ${item.row_count} script row${item.row_count === 1 ? "" : "s"} from ${escape(item.script_origin)}</p><div class="service-map-evidence-list">${item.evidence.map((id, index) => `<button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(item.script_origin)}" data-service-relation-evidence="${escape(id)}" data-service-focus="script:${escape(JSON.stringify([item.version, id]))}"><span>${escape(item.name)} ${escape(item.version)}</span><span>View source${item.evidence.length > 1 ? ` ${index + 1}` : ""} ›</span></button>`).join("")}</div></li>`).join("")}</ul></section>`;
+    // Versions retained scripts and pages declare, each with the rows to open.
+    function libraryVersionsMarkup(origin) {
+      if (!origin.library_versions?.length) return "";
+      return `<section class="service-map-technologies" aria-label="Library versions"><h4>Library versions</h4><ul class="service-map-references">${origin.library_versions.map((item) => `<li><strong>${escape(item.name)}</strong> · ${escape(item.version)}<p class="service-map-muted">Declared in ${item.row_count} retained row${item.row_count === 1 ? "" : "s"} from ${escape(item.source_origin)}</p><div class="service-map-evidence-list">${item.evidence.map((id, index) => `<button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(item.source_origin)}" data-service-relation-evidence="${escape(id)}" data-service-focus="library:${escape(JSON.stringify([item.product_id, item.version, id]))}"><span>${escape(item.name)} ${escape(item.version)}</span><span>View source${item.evidence.length > 1 ? ` ${index + 1}` : ""} ›</span></button>`).join("")}</div></li>`).join("")}</ul></section>`;
     }
     function evidenceMarkup(origin) {
       const items = evidenceItems(origin);
@@ -2813,7 +2828,7 @@
       if (!state.detailPageAnchor && entries[start]) state.detailPageAnchor = endpointIdentity(entries[start]);
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>${originActionsMarkup(origin)}
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${scriptVersionsMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${libraryVersionsMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
     function renderCatalog() {
       const loaded = loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false);

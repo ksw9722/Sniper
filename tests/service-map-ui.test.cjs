@@ -2656,14 +2656,14 @@ const passiveReads = [
     payload: () => htmlGenerators(), result: 'htmlGenerators', loading: 'htmlGeneratorsLoading', error: 'htmlGeneratorsError' },
 ];
 
-function assertPassiveReadRequest(request, read) {
+function assertPassiveReadRequest(request, read, { fresh = false } = {}) {
   const url = new URL(request.url, originA);
   assert.equal(url.pathname, read.path); assert.equal(request.options.redirect, 'error');
   assert.equal(request.options.method || 'GET', 'GET'); assert.equal(request.options.body, undefined);
   assert.ok(request.options.signal instanceof AbortSignal); assert.equal(request.options.signal.aborted, false);
   const metadata = read.name === 'metadata', evidenceRead = read.name === 'exact evidence';
   assert.deepEqual(Object.fromEntries(url.searchParams), metadata
-    ? { session_id: technologySession, in_scope_only: 'false', max_records: '10000' }
+    ? { session_id: technologySession, in_scope_only: 'false', all_rows: 'true', ...(fresh ? { fresh: 'true' } : {}) }
     : { session_id: technologySession, evidence_id: technologyToken(), ...(evidenceRead ? { include_socket_peer: 'true' } : {}) });
   assert.deepEqual(request.options.headers && { ...request.options.headers }, metadata || evidenceRead
     ? { 'X-Sniper-Technology-Catalog-Version': '2' } : undefined);
@@ -2733,7 +2733,8 @@ for (const read of passiveReads) {
     assert.equal(countForPath(), failedReads);
     const next = read.name === 'metadata' ? f.controller.refresh({ force: true, retry: true }) : read.start(f);
     const expected = before + (read.name === 'metadata' ? 2 : 3);
-    assert.equal(f.requests.length, expected); assertPassiveReadRequest(f.requests.at(-1), read);
+    // The explicit metadata retry is a Reload, which asks for a fresh map.
+    assert.equal(f.requests.length, expected); assertPassiveReadRequest(f.requests.at(-1), read, { fresh: read.name === 'metadata' });
     f.requests.at(-1).resolve(response(read.payload())); assert.equal(await next, true);
     assert.equal(f.requests.length, expected);
   });

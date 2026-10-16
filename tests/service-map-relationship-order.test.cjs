@@ -440,6 +440,10 @@ test('a card leads with what its origin serves, or with a declared front-end pro
     ['front', 'api', 'static', 'unknown', 'unknown', 'ref']);
   const next = typed(['application/json'], { technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }] });
   assert.equal(map.originRole(next), 'front', 'Next.js names the front end however its endpoints respond');
+  const react = (origin, types) => typed(types, { library_versions: [{ product_id: 'react', name: 'React', version: '18.2.0', source_origin: origin, row_count: 1, evidence: 'e' }] });
+  assert.equal(map.originRole(react('https://a.example.com', ['application/javascript'])), 'static', 'a CDN serving React is not the page');
+  assert.equal(map.originRole(react('https://cdn.example.com', ['application/json'])), 'front', 'a page that loaded React is');
+  assert.equal(map.originRole(react('https://a.example.com', ['text/html', 'application/javascript', 'application/javascript'])), 'front');
 });
 
 test('only an error or the first load shows above the map; counts sit under Details', async () => {
@@ -457,20 +461,22 @@ test('only an error or the first load shows above the map; counts sit under Deta
   assert.equal(f.els.alert.classList.contains('service-map-error'), true);
 });
 
-test('a Next.js version a retained script names shows on the card and in the inspector', async () => {
-  const named = { product_id: 'next_js', name: 'Next.js', version: '14.2.3', script_origin: cdn, row_count: 2, evidence: ['evidence-script'] };
-  const header = { technology_observations_present: true, technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }], script_versions: [named] };
+test('library versions retained bodies declare show on the card and in the inspector', async () => {
+  const named = { product_id: 'next_js', name: 'Next.js', version: '14.2.3', source_origin: cdn, row_count: 2, evidence: ['evidence-script'] };
+  const react = { product_id: 'react', name: 'React', version: '18.2.0', source_origin: cdn, row_count: 2, evidence: ['evidence-react'] };
+  const core = { product_id: 'core_js', name: 'core-js', version: '3.38.1', source_origin: cdn, row_count: 1, evidence: [] };
+  const header = { technology_observations_present: true, technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }], library_versions: [named] };
   const [product] = map.reportedProducts(header);
-  assert.deepEqual([[...product.versions], [...product.statuses]], [['14.2.3'], []], 'the script version supersedes a header that named none');
+  assert.deepEqual([[...product.versions], [...product.statuses]], [['14.2.3'], []], 'a declared version supersedes a header that named none');
   assert.match(map.productSummaryMarkup(header), />Next\.js 14\.2\.3</);
 
   const f = fixture();
-  await f.load(snapshot([origin(app, { script_versions: [named, { ...named, version: '<b>' }] }), origin(api, { header_links: [referer(app)] })]));
-  assert.equal(f.state.snapshot.origins.find(item => item.origin === app).script_versions.length, 1, 'an unsafe version is dropped');
-  assert.match(f.els.canvas.innerHTML, /role-front"[^]*?service-map-mark[^>]*>N<[^]*?>Next\.js 14\.2\.3</, 'the card names the version and shows the mark');
+  await f.load(snapshot([origin(app, { library_versions: [core, react, named, { ...named, version: '<b>' }, { ...react, product_id: 'Bad-Id' }] }), origin(api, { header_links: [referer(app)] })]));
+  assert.equal(f.state.snapshot.origins.find(item => item.origin === app).library_versions.length, 3, 'unsafe entries are dropped');
+  assert.match(f.els.canvas.innerHTML, /role-front"[^]*?service-map-mark[^>]*>N<[^]*?>Next\.js 14\.2\.3<[^]*?>React 18\.2\.0</, 'the framework leads: its mark, then its chip, then the libraries');
   f.controller.selectOrigin(app);
-  assert.match(f.els.detail.innerHTML, /<h4>Script versions<\/h4>[^]*?Next\.js<\/strong> · 14\.2\.3[^]*?window\.next in 2 script rows from https:\/\/x-cdn\.example\.com/);
-  assert.match(f.els.detail.innerHTML, /data-service-relation-origin="https:\/\/x-cdn\.example\.com" data-service-relation-evidence="evidence-script"/);
+  assert.match(f.els.detail.innerHTML, /<h4>Library versions<\/h4>[^]*?Next\.js<\/strong> · 14\.2\.3[^]*?Declared in 2 retained rows from https:\/\/x-cdn\.example\.com/);
+  assert.match(f.els.detail.innerHTML, /data-service-relation-origin="https:\/\/x-cdn\.example\.com" data-service-relation-evidence="evidence-react"/);
 });
 
 test('an endpoint shows its parameters when asked: name, where sent, rows and values', async () => {
@@ -489,4 +495,17 @@ test('an endpoint shows its parameters when asked: name, where sent, rows and va
   assert.match(f.els.detail.innerHTML, /<td class="service-map-parameter-name">q<\/td><td>query<\/td><td>2<\/td><td><code>shoes<\/code><code>&lt;b&gt;<\/code><\/td>/);
   assert.doesNotMatch(f.els.detail.innerHTML, /service-map-parameter-name">x</, 'an unknown location is dropped');
   assert.match(f.els.detail.innerHTML, /From the newest 2 rows\./);
+});
+
+test('the map reads every retained row, and asks for a fresh map only on the first read and Reload', async () => {
+  const f = fixture();
+  await f.load(snapshot(relatedOrigins()));
+  assert.match(f.requests.at(-1).path, /[?&]all_rows=true(&|$)/);
+  assert.doesNotMatch(f.requests.at(-1).path, /max_records=/);
+  assert.match(f.requests.at(-1).path, /[?&]fresh=true(&|$)/, 'the first read');
+  await f.load(snapshot(relatedOrigins()));
+  assert.doesNotMatch(f.requests.at(-1).path, /fresh=/, 'a poll may be served from the cache');
+  const reload = f.controller.refresh({ force: true });
+  assert.match(f.requests.at(-1).path, /[?&]fresh=true(&|$)/, 'Reload');
+  f.requests.at(-1).resolve(response(snapshot(relatedOrigins()))); await reload;
 });

@@ -323,3 +323,23 @@ async fn service_map_epoch_invalidates_after_unlock_before_event_sequence_advanc
     assert!(updating.await.unwrap().is_some());
     assert!(store.latest_event_sequence() > event_sequence);
 }
+
+// Retention removes rows between a whole-history read's chunks. The read
+// continues below the oldest row it read that is still retained, so each
+// remaining unread row is read once; a replaced history keeps none of them.
+#[test]
+fn whole_history_read_resumes_below_the_oldest_retained_row_it_read() {
+    let mut inner = StoreInner::from_newest_first((0..10).rev().map(row).collect());
+    // The last chunk read the newest six rows, oldest first.
+    let read: Vec<_> = (4..10)
+        .map(|index| (inner.entries[index].id, inner.body_generations[index]))
+        .collect();
+    assert_eq!(resume_below(&inner, &[]), Some(10), "nothing read yet");
+    inner.trim_to_max_entries(8);
+    assert_eq!(resume_below(&inner, &read), Some(2));
+    assert_eq!(inner.entries[1].path, "/items/3", "the unread rows left");
+    inner.trim_to_max_entries(5);
+    assert_eq!(resume_below(&inner, &read), Some(0), "and none left");
+    let replaced = StoreInner::from_newest_first((0..10).rev().map(row).collect());
+    assert_eq!(resume_below(&replaced, &read), None);
+}

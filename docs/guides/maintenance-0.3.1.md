@@ -20,7 +20,8 @@ remain unavailable without being loaded or activated. Only bounded retained
 UTF-8 HTML/JavaScript previews are inspected; results expose canonical origins
 and retained-preview offsets with separate capture/prefix truncation and cap
 reasons. References do not establish calls or ownership. The default map reads
-no bodies apart from Next.js bundles (see below), metadata evidence reads none,
+no bodies apart from scripts and pages read for library versions (see below),
+metadata evidence reads none,
 and nothing sends target requests.
 
 The GUI now collects up to eight explicitly shown body, Link and recorded-peer
@@ -354,11 +355,21 @@ card instead leads with what its origin serves (Front, API, Static, Unknown, Ref
 or Site), read from its endpoints' response types, with a declared application
 product's mark, such as Next.js, in place of the icon.
 
-Two reads were added. Next.js names its version only in its client runtime, as
-`window.next={version:"…"}`, never in `X-Powered-By`. The map now reads retained
-JavaScript under `/_next/` for that value, once per row revision and bounded
-per map, and gives it to the page that loaded the bundle; cards show
-`Next.js 14.2.3` and the inspector lists the script rows. Opening an endpoint
+Two reads were added. Headers rarely name a version (`X-Powered-By: Next.js`
+carries none), but scripts and pages do: license banners, runtime literals such
+as `window.next={version:"…"}`, Angular's `ng-version` and a page's generator
+meta. The map now reads retained JavaScript and HTML for these, for two dozen
+libraries and any generator, once per row revision and bounded per map. A
+script's versions go to the page that loaded it; cards show `Next.js 14.2.3` and
+the inspector lists the rows under Library versions (`library_versions` in the
+API and the CLI). Opening an endpoint
 offers Show parameters, which reads its newest 200 rows on request and lists
 each query, form, JSON or multipart parameter with its row count and up to
 three values (`GET /api/target/service-map/parameters`).
+
+The GUI map also stopped reading only the newest 10,000 rows, where its 8 MiB
+projection limit often stopped it near 6,000. It now asks for `all_rows=true`:
+the server folds every retained row into the map a chunk at a time without
+keeping them, continues past rows that retention removes during the read, and
+keeps the last result to answer polls while history is unchanged or the map is
+recent. Reload asks for a fresh map. The CLI keeps the windowed read.

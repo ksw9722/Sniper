@@ -5364,10 +5364,17 @@ async fn update_match_replace_rules(
     Json(rules).into_response()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceMapQuery {
     session_id: Option<Uuid>,
+    /// Read every retained row, as the UI does, instead of the newest
+    /// `max_records`; such a read is cached per filter, scope and catalog.
+    #[serde(default)]
+    all_rows: bool,
+    /// Rebuild a whole-history map now rather than serve a recent one.
+    #[serde(default)]
+    fresh: bool,
     #[serde(default)]
     in_scope_only: bool,
     max_records: Option<usize>,
@@ -5523,6 +5530,12 @@ async fn get_target_service_map_impl(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let row_filters = service_map_row_filters(&query);
+    let (all_rows, fresh) = (query.all_rows, query.fresh);
+    let cache_query = ServiceMapQuery {
+        fresh: false,
+        session_id: None,
+        ..query.clone()
+    };
     let max_records = query
         .max_records
         .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
@@ -5551,6 +5564,7 @@ async fn get_target_service_map_impl(
         Err(response) => return response,
     };
     let (include, exclude) = session.runtime.scope_lists().await;
+    let cache_key = format!("{catalog:?}|{cache_query:?}|{include:?}|{exclude:?}");
     let worker_include = include.clone();
     let worker_exclude = exclude.clone();
     let worker_session = session.clone();
@@ -5561,6 +5575,38 @@ async fn get_target_service_map_impl(
             resume
                 .recv_timeout(Duration::from_secs(10))
                 .expect("map worker test hook resumed");
+        }
+        if all_rows {
+            let store = &worker_session.store;
+            if let Some(bytes) = store.cached_service_map(&cache_key, fresh) {
+                return Ok((bytes, None, permit));
+            }
+            let started = std::time::Instant::now();
+            let token = store.service_map_history_token();
+            let (mut map, complete) = store
+                .service_map_all_rows_blocking(
+                    worker_session.id(),
+                    catalog,
+                    &row_filters,
+                    query.in_scope_only,
+                    origin,
+                    &worker_include,
+                    &worker_exclude,
+                )
+                .map_err(|error| match error {
+                    crate::store::ServiceMapStreamError::HistoryChanged => {
+                        ServiceMapReadError::HistoryChanged
+                    }
+                    crate::store::ServiceMapStreamError::ScopeWorkLimit => {
+                        ServiceMapReadError::ScopeWorkLimit
+                    }
+                })?;
+            map.technology_catalog_version = catalog_marker;
+            let bytes = bytes::Bytes::from(
+                serde_json::to_vec(&map).map_err(|_| ServiceMapReadError::BuildFailed)?,
+            );
+            store.store_service_map(cache_key, token, started.elapsed(), complete, bytes.clone());
+            return Ok((bytes, None, permit));
         }
         let (snapshot, epoch) = worker_session
             .store
@@ -5582,7 +5628,7 @@ async fn get_target_service_map_impl(
         .map_err(|_| ServiceMapReadError::ScopeWorkLimit)?;
         map.technology_catalog_version = catalog_marker;
         let bytes = serde_json::to_vec(&map).map_err(|_| ServiceMapReadError::BuildFailed)?;
-        Ok::<_, ServiceMapReadError>((bytes, epoch, permit))
+        Ok::<_, ServiceMapReadError>((bytes::Bytes::from(bytes), Some(epoch), permit))
     })
     .await;
     let (bytes, epoch, _permit) = match result {
@@ -5607,12 +5653,16 @@ async fn get_target_service_map_impl(
     if session.runtime.scope_lists().await != (include, exclude) {
         return ServiceMapReadError::ScopeChanged.into_response();
     }
-    if !session
-        .store
-        .service_map_metadata_epoch_matches(epoch)
-        .await
-    {
-        return ServiceMapReadError::HistoryChanged.into_response();
+    // A whole-history read has no window to invalidate: it already continued
+    // past removals, and shows the history as it read it until the next map.
+    if let Some(epoch) = epoch {
+        if !session
+            .store
+            .service_map_metadata_epoch_matches(epoch)
+            .await
+        {
+            return ServiceMapReadError::HistoryChanged.into_response();
+        }
     }
     ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
