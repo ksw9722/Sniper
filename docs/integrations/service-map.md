@@ -422,7 +422,8 @@ the map now reads four places for that, without sending anything:
 - **Header values the catalog does not name:** `Server: AmazonS3`,
   `awselb/2.0`, `Kestrel`, `Werkzeug/3.0.1 Python/3.12.0`, an operating system
   in parentheses (`Apache/2.4.52 (Ubuntu)`), `Via: 1.1 … (CloudFront)`,
-  `X-Powered-By: Servlet/4.0`, `X-AspNet-Version: 4.0.30319`.
+  `X-Powered-By: Servlet/4.0`, `X-AspNet-Version: 4.0.30319`,
+  `Payara Server 6.2024.6`, `GlassFish Server Open Source Edition 4.1.2`.
 - **Names of the cookies a response sets:** `JSESSIONID` (Java servlet),
   `PHPSESSID`, `ASP.NET_SessionId`, `laravel_session`, `connect.sid`
   (Express), `AWSALB`, `BIGipServer…` (F5), `TS…` (F5 WAF), `__cf_bm`,
@@ -432,13 +433,24 @@ the map now reads four places for that, without sending anything:
 - **Bodies:** default error pages (`<center>nginx/1.25.3</center>`,
   `<address>Apache/… Server at …</address>`, `Apache Tomcat/9.0.83`, Spring
   Boot's Whitelabel page and JSON error, Express's `Cannot GET`, Werkzeug's
-  404 text, FastAPI's and DRF's `detail`), gateway and WAF pages (HAProxy,
+  404 text (named Flask, which serves it whatever server runs the app),
+  FastAPI's and DRF's `detail`, WildFly's welcome page and Undertow's error
+  page, Open Liberty's pages and WebSphere's `SRVE…E` servlet codes, Payara's
+  and GlassFish's error reports, Grafana's boot data), gateway and WAF pages (HAProxy,
   Envoy, Varnish, Cloudflare, Akamai, Imperva, ModSecurity, Kong, API Gateway),
   debug pages, stack traces, SQL errors, and banners such as Elasticsearch's.
   Pages are read as for the front end; JSON, XML and plain-text responses are
   read only when they are errors (status 400 or above), an origin's root, an
   `/actuator` path or an API document, so an API's successes do not spend the
   read budget.
+
+The server rules were checked against real servers run in a lab: nginx,
+Apache httpd, Tomcat 9 and 10, Jetty, WildFly, Open Liberty, Payara,
+OpenResty, Caddy, Traefik, HAProxy, Varnish, Envoy, PHP on Apache,
+OpenLiteSpeed, Kestrel, Express, gunicorn, uvicorn, Django's and Flask's
+development servers, Kong, Jenkins, Grafana and Elasticsearch, each answering
+its root and a missing path. Traefik's not-found page is Go's own, so it reads
+as Go.
 
 Each finding gets a layer, outermost first: `edge` (CDN and WAF), `gateway`
 (load balancer, API gateway, proxy cache), `platform` (hosting and storage),
