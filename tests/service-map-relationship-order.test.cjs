@@ -492,9 +492,10 @@ test('an endpoint shows its parameters when asked: name, where sent, rows and va
   f.requests.at(-1).resolve(response({ schema_version: 1, session_id: 'session-one', available: true, origin: app, method: 'GET', path: '/search', rows: 2, more_rows: false, omitted_parameters: 0,
     parameters: [{ name: 'q', location: 'query', rows: 2, examples: ['shoes', '<b>'] }, { name: 'x', location: 'cookie', rows: 1, examples: [] }] }));
   await new Promise(resolve => setImmediate(resolve));
-  assert.match(f.els.detail.innerHTML, /<td class="service-map-parameter-name">q<\/td><td>query<\/td><td>2<\/td><td><code>shoes<\/code><code>&lt;b&gt;<\/code><\/td>/);
+  assert.match(f.els.detail.innerHTML, /<li><div><span class="service-map-parameter-name">q<\/span><span class="service-map-muted">query · 2 rows<\/span><\/div><div class="service-map-parameter-values"><code>shoes<\/code><code>&lt;b&gt;<\/code><\/div><\/li>/);
   assert.doesNotMatch(f.els.detail.innerHTML, /service-map-parameter-name">x</, 'an unknown location is dropped');
-  assert.match(f.els.detail.innerHTML, /From the newest 2 rows\./);
+  assert.doesNotMatch(f.els.detail.innerHTML, /From the newest/, 'every row was read: nothing to note');
+  assert.doesNotMatch(f.els.detail.innerHTML, /<table/, 'no table to squeeze a name beside long values');
 });
 
 test('the map reads every retained row, and asks for a fresh map only on the first read and Reload', async () => {
