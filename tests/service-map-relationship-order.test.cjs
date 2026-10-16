@@ -516,3 +516,33 @@ test('the map reads every retained row, and asks for a fresh map only on the fir
   assert.match(f.requests.at(-1).path, /[?&]fresh=true(&|$)/, 'Reload');
   f.requests.at(-1).resolve(response(snapshot(relatedOrigins()))); await reload;
 });
+
+test('clients lead the map with an arrow to each card they sent rows to themselves', async () => {
+  const chrome = { kind: 'browser', name: 'Chrome', version: 141, os: 'macOS', request_count: 5, evidence: [],
+    origins: [{ origin: api, request_count: 3 }, { origin: app, request_count: 2, entry_kinds: { navigation: 1 } }] };
+  const okhttp = { kind: 'app', name: 'OkHttp', version: 4, request_count: 2, evidence: [], origins: [{ origin: api, request_count: 2, entry_kinds: { api: 2 } }] };
+  const curl = { kind: 'tool', name: 'curl', version: 8, request_count: 1, evidence: [], origins: [{ origin: cdn, request_count: 1, entry_kinds: { static: 1 } }] };
+  let hidden = ['static'];
+  const f = fixture({ getHiddenLinkKinds: () => hidden, setHiddenLinkKinds: kinds => { hidden = kinds; } });
+  await f.load({ ...snapshot([origin(app), origin(api, { header_links: [referer(app)] }), origin(cdn)]),
+    clients: [chrome, okhttp, curl, { ...curl, kind: 'server' }, { ...okhttp, name: '<b>' }] });
+  assert.equal(f.state.snapshot.clients.length, 3, 'unsafe clients are dropped');
+  const html = f.els.canvas.innerHTML;
+  assert.match(html, /data-service-client="client:browser:Chrome:141:macOS"[^]*?>Chrome 141<[^]*?macOS · 5 rows/);
+  assert.match(html, /data-service-client="client:app:OkHttp:4:"[^]*?>App</);
+  assert.doesNotMatch(html, /data-service-client="client:tool:curl/, 'a client whose own requests are all of a hidden kind draws no card');
+  assert.equal((html.match(/data-relationship="client_request"/g) || []).length, 2, 'Chrome went to the app page itself; OkHttp called the API');
+  assert.match(html, /class="service-map-edge client-request kind-navigation[^"]*"[^>]*>[^]*?Chrome 141 → https:\/\/x-app\.example\.com · Direct request/);
+  // The client column sits left of the cards it points at.
+  const left = (attribute, id) => Number(html.split(`${attribute}="${id}"`)[1]?.match(/left:(\d+)px/)?.[1]);
+  assert.ok(left('data-service-client', 'client:browser:Chrome:141:macOS') < left('data-service-origin', app));
+  assert.ok(left('data-service-origin', app) < left('data-service-origin', api));
+  assert.equal(f.els.detailsSummary.textContent, 'Details', 'clients are not counted as origins');
+
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceClient: 'client:browser:Chrome:141:macOS' } }) } });
+  assert.equal(f.state.selectedClient, 'client:browser:Chrome:141:macOS');
+  assert.match(f.els.detail.innerHTML, /<h3>Chrome 141<\/h3><p>Browser · macOS<\/p>[^]*?https:\/\/x-api\.example\.com<br>3 rows[^]*?https:\/\/x-app\.example\.com<br>2 rows · 1 direct/);
+  assert.match(f.els.canvas.innerHTML, /OkHttp 4<[^]*?2 rows</);
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceOrigin: api } }) } });
+  assert.equal(f.state.selectedClient, null, 'inspecting an origin leaves the client');
+});

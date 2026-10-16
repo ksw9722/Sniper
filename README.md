@@ -242,6 +242,10 @@ page's static CDN and its arrows drop out. `sniper-cli scope service-map` takes
 the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`,
 `--hide-without-responses` and `--only-parameterized`.
 
+Each row's User-Agent names the client that sent it (a browser, an app's
+WebView, an app, a tool, a library or a crawler), and the map's first column
+shows the clients with an arrow to each origin they went to themselves.
+
 Origin and Referer links are sorted by request kind (API call, page navigation,
 frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each
 kind; frames, scripts and static files draw no arrows by default, and an arrow

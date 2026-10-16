@@ -1158,3 +1158,120 @@ fn whole_history_cache_serves_an_unchanged_or_recent_map() {
         "a fresh read rebuilds"
     );
 }
+
+// Each row's User-Agent names its client; the map counts its rows per origin,
+// and apart those it sent itself, with no Origin or Referer.
+#[test]
+fn clients_count_their_rows_and_their_own_visits() {
+    let session = Uuid::from_u128(103);
+    let chrome = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+    let row =
+        |host: &str, kind: &str, user_agent: Option<&str>, referer: Option<&str>, sequence| {
+            let mut record = filter_fixture(host, "/", 200, kind, None, sequence);
+            let mut request = http::HeaderMap::new();
+            if let Some(value) = user_agent {
+                request.insert(http::header::USER_AGENT, value.parse().unwrap());
+            }
+            if let Some(value) = referer {
+                request.insert(http::header::REFERER, value.parse().unwrap());
+            }
+            record.request = MessageRecord::from_headers_and_body(&request, b"", 0);
+            record
+        };
+    let store = TransactionStore::from_records(vec![
+        row("www.example.com", "text/html", Some(chrome), None, 1),
+        row(
+            "api.example.com",
+            "application/json",
+            Some(chrome),
+            Some("https://www.example.com/"),
+            2,
+        ),
+        row(
+            "api.example.com",
+            "application/json",
+            Some(chrome),
+            Some("https://www.example.com/"),
+            3,
+        ),
+        row(
+            "api.example.com",
+            "application/json",
+            Some("okhttp/4.12.0"),
+            None,
+            4,
+        ),
+        row("api.example.com", "application/json", None, None, 5),
+    ]);
+    let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        DEFAULT_MAX_RECORDS,
+        technology::CatalogVersion::V2,
+        &crate::store::ListFilters::default(),
+    );
+    let map = build_bounded(
+        session,
+        snapshot,
+        DEFAULT_MAX_RECORDS,
+        false,
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    let clients: Vec<_> = map
+        .clients
+        .iter()
+        .map(|client| {
+            (
+                client.name.as_str(),
+                client.version,
+                client.os.as_deref(),
+                client.request_count,
+                client
+                    .origins
+                    .iter()
+                    .map(|origin| {
+                        (
+                            origin.origin.trim_start_matches("https://"),
+                            origin.request_count,
+                            origin.entry_kinds.clone().into_iter().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let kinds = |kind: &str, rows| vec![(kind.to_string(), rows)];
+    assert_eq!(
+        clients,
+        [
+            (
+                "Chrome",
+                Some(141),
+                Some("macOS"),
+                3,
+                vec![
+                    ("api.example.com", 2, vec![]),
+                    ("www.example.com", 1, kinds("navigation", 1)),
+                ]
+            ),
+            (
+                "OkHttp",
+                Some(4),
+                None,
+                1,
+                vec![("api.example.com", 1, kinds("api", 1))]
+            ),
+            (
+                "No User-Agent",
+                None,
+                None,
+                1,
+                vec![("api.example.com", 1, kinds("api", 1))]
+            ),
+        ],
+        "a page's calls are not the browser's own visits; an app's are"
+    );
+    assert!(map.snapshot.complete);
+}

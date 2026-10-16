@@ -7611,6 +7611,10 @@ button.utility-button.replay-tab-add {
 .service-map-retained-relationships > div > button { width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .service-map-edge.link-declaration, .service-map-line.link-declaration { stroke-dasharray: 10 3 2 3; }
 .service-map-edge.preconnect-hint, .service-map-line.preconnect-hint { stroke-dasharray: 3 3; }
+/* A client's own request: long dashes, unlike a page's Origin/Referer link. */
+.service-map-edge.client-request { stroke-dasharray: 16 4; }
+.service-map-line.client-request { height: 2px; border-top: 0; background: linear-gradient(to right, var(--text-dim) 75%, transparent 0) 0 0 / 12px 2px repeat-x; }
+.role-client .service-map-card-symbol { color: var(--text-soft); }
 .service-map-line.link-declaration { border-top-style: double; }
 .service-map-line.preconnect-hint { border-top-style: dashed; opacity: 0.65; }
 

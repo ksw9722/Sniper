@@ -4311,14 +4311,39 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         .as_array_mut()
         .unwrap()
         .retain(|name| name != "filtered_rows");
-    Some(service_map_catalog_output_schema(
-        service_map_object(json!({
-            "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
-            "in_scope_only":boolean,"origin_filter":{"type":["string","null"]},
-            "origins":{"type":"array","items":origin},"unavailable":strings,"deferred":strings,"warnings":strings
-        })),
-        false,
-    ))
+    let entry_kinds = sniper::service_map::REQUEST_KINDS
+        .iter()
+        .map(|kind| (kind.to_string(), json!({"type":"integer","minimum":1})))
+        .collect::<serde_json::Map<_, _>>();
+    let mut client_origin = service_map_object(json!({
+        "origin":string,"request_count":count,
+        "entry_kinds":{"type":"object","additionalProperties":false,"properties":entry_kinds,
+            "description":"Rows the client sent to this origin itself, with no Origin or Referer (a typed address, a bookmark, an app's call), by request kind. Absent when a page started every row."}
+    }));
+    client_origin["required"] = json!(["origin", "request_count"]);
+    let mut client = service_map_object(json!({
+        "kind":{"type":"string","enum":sniper::service_map_clients::KINDS},
+        "name":{"type":"string","enum":sniper::service_map_clients::names()},
+        "version":{"type":"integer","minimum":0,"description":"Major version, when the client names one."},
+        "os":{"type":"string","enum":sniper::service_map_clients::SYSTEMS},
+        "request_count":count,
+        "origins":{"type":"array","maxItems":64,"items":client_origin},
+        "evidence":strings
+    }));
+    client["required"] = json!(["kind", "name", "request_count", "origins", "evidence"]);
+    let mut map = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
+        "in_scope_only":boolean,"origin_filter":{"type":["string","null"]},
+        "origins":{"type":"array","items":origin},
+        "clients":{"type":"array","maxItems":16,"items":client,
+            "description":"Clients named by each row's User-Agent and, for Chromium browsers, Client Hints: browsers, app WebViews, app HTTP stacks, tools, libraries and crawlers, busiest first. Only these fixed names are reported, never the header. Absent when there are none, and on older servers."},
+        "unavailable":strings,"deferred":strings,"warnings":strings
+    }));
+    map["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|name| name != "clients");
+    Some(service_map_catalog_output_schema(map, false))
 }
 
 fn service_map_input_schema(operation: &str) -> Option<Value> {
@@ -9622,6 +9647,30 @@ fn validate_service_map_response(
         && snapshot.projected_rows <= snapshot.considered_rows
         && snapshot.complete == snapshot.stopped_by.is_empty()
         && snapshot.origin_count == result.origins.len()
+        && result.clients.len() <= 16
+        && result.clients.iter().all(|client| {
+            let names = sniper::service_map_clients::names();
+            sniper::service_map_clients::KINDS.contains(&client.kind.as_str())
+                && names.contains(&client.name.as_str())
+                && client.os.as_deref().is_none_or(|os| {
+                    sniper::service_map_clients::SYSTEMS.contains(&os)
+                })
+                && client.request_count > 0
+                && client.origins.len() <= 64
+                // Each origin's rows are some of the client's, and its own
+                // visits some of those.
+                && client.origins.iter().map(|origin| origin.request_count).sum::<usize>()
+                    <= client.request_count
+                && client.origins.iter().all(|origin| {
+                    service_map_safe_origin(&origin.origin)
+                        && origin.request_count > 0
+                        && origin
+                            .entry_kinds
+                            .keys()
+                            .all(|kind| sniper::service_map::REQUEST_KINDS.contains(&kind.as_str()))
+                        && origin.entry_kinds.values().sum::<usize>() <= origin.request_count
+                })
+        })
         && snapshot.endpoint_count
             == result
                 .origins

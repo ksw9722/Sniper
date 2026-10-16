@@ -312,6 +312,15 @@
         || version.startsWith("reported:") && product.versions.has(version.slice(9))
         || version.startsWith("status:") && product.statuses.has(version.slice(7))));
   }
+  // Clients the map names from each row's User-Agent; never the header itself.
+  const CLIENT_KINDS = ["browser", "webview", "app", "tool", "library", "bot", "unknown"];
+  const CLIENT_SYSTEMS = ["Windows", "macOS", "iOS", "Android", "ChromeOS", "Linux"];
+  const CLIENT_LABELS = { browser: "Browser", webview: "WebView", app: "App", tool: "Tool", library: "Library", bot: "Crawler", unknown: "Client" };
+  const MAX_CLIENT_CARDS = 6;
+  const clientId = (client) => `client:${client.kind}:${client.name}:${client.version ?? ""}:${client.os ?? ""}`;
+  const clientName = (client) => client ? `${client.name}${client.version === undefined ? "" : ` ${client.version}`}` : "";
+  const directRows = (item) => Object.values(item.entry_kinds).reduce((sum, rows) => sum + rows, 0);
+  const rowCount = (rows) => `${rows.toLocaleString()} row${rows === 1 ? "" : "s"}`;
   // Front-end categories in the order a card presents them. Header-declared
   // front-end products take the category their bodies would give them.
   const FRONT_CATEGORIES = ["meta_framework", "cms", "framework", "ui", "library", "analytics"];
@@ -364,6 +373,18 @@
     ref: svg('<path d="M7 3H3v10h10V9M9.5 3H13v3.5M13 3 7.5 8.5"/>'),
     site: svg('<rect x="4.5" y="1.5" width="10" height="8" rx="1"/><rect x="1.5" y="6.5" width="10" height="8" rx="1"/>'),
   };
+  const CLIENT_ICONS = {
+    browser: svg('<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2.2 2 2.2 10 0 12M8 2c-2.2 2-2.2 10 0 12"/>'),
+    webview: svg('<rect x="4" y="1.5" width="8" height="13" rx="1.5"/><path d="M4 4.5h8M4 11.5h8"/>'),
+    app: svg('<rect x="4" y="1.5" width="8" height="13" rx="1.5"/><path d="M7 12.5h2"/>'),
+    tool: svg('<path d="M2.5 4.5l3 3-3 3M7.5 11.5h6"/>'),
+    library: svg('<path d="M5 3.5l-3 4.5 3 4.5M11 3.5l3 4.5-3 4.5"/>'),
+    bot: svg('<rect x="3" y="5" width="10" height="8" rx="2"/><path d="M8 2.5v2.5M6 9h.01M10 9h.01"/>'),
+    unknown: ROLE_ICONS.unknown,
+  };
+  function clientRoleMarkup(client) {
+    return `<span class="service-map-card-role role-client" title="${CLIENT_LABELS[client.kind]}"><span class="service-map-card-symbol" aria-hidden="true">${CLIENT_ICONS[client.kind]}</span><span class="service-map-card-role-label">${CLIENT_LABELS[client.kind]}</span></span>`;
+  }
   // A declared application product shows its own mark in place of the role icon.
   const PRODUCT_MARKS = { next_js: ["N", "#000", "#fff"], nuxt: ["N", "#00dc82", "#020420"], sveltekit: ["S", "#ff3e00", "#fff"],
     remix: ["R", "#121212", "#fff"], gatsby: ["G", "#663399", "#fff"], astro: ["A", "#ff5d01", "#fff"], wordpress: ["W", "#21759b", "#fff"],
@@ -926,7 +947,14 @@
         })),
       }];
     });
-    return { snapshot: payload.snapshot, origins, warningCount: array(payload.warnings).length, technologyCatalogVersion: catalogVersion, legacyCatalog: catalogVersion !== requestedVersion };
+    // Clients each row's User-Agent named, and the rows they sent each origin.
+    const clients = array(payload.clients).filter((client) => CLIENT_KINDS.includes(client?.kind) && /^[A-Za-z][A-Za-z0-9 ./-]{0,39}$/.test(client.name)
+      && (client.version == null || Number.isSafeInteger(client.version) && client.version >= 0) && (client.os == null || CLIENT_SYSTEMS.includes(client.os)))
+      .slice(0, 16).map((client) => ({ kind: client.kind, name: client.name, ...(client.version == null ? {} : { version: client.version }), ...(client.os == null ? {} : { os: client.os }),
+        request_count: count(client.request_count),
+        origins: array(client.origins).filter((item) => safeOrigin(item?.origin)).slice(0, 64).map((item) => ({ origin: safeOrigin(item.origin), request_count: count(item.request_count),
+          entry_kinds: Object.fromEntries(REQUEST_KINDS.filter((kind) => count(item.entry_kinds?.[kind]) > 0).map((kind) => [kind, count(item.entry_kinds[kind])])) })) }));
+    return { snapshot: payload.snapshot, origins, clients, warningCount: array(payload.warnings).length, technologyCatalogVersion: catalogVersion, legacyCatalog: catalogVersion !== requestedVersion };
   }
   function stableOrder(previous, origins) {
     const ids = new Set(origins.map((origin) => origin.origin));
@@ -1045,9 +1073,10 @@
     });
     return slots;
   }
-  function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = [], geometry = GRAPH_GEOMETRY, hiddenKinds = []) {
+  const LINK_LABELS = { origin_header: "Origin header", referer_header: "Referer header", client_request: "Direct request" };
+  function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = [], geometry = GRAPH_GEOMETRY, hiddenKinds = [], clientCards = 0) {
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
-    const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
+    const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS + clientCards).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
     const hidden = new Set(hiddenKinds);
     // An Origin/Referer link is drawn for the kinds of request it stood for
@@ -1057,7 +1086,7 @@
     const headerEdge = (origin, link) => {
       const kinds = linkKindCounts(link).filter(([kind]) => !hidden.has(kind));
       if (!kinds.length) return [];
-      return [{ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: link.relationship === "origin_header" ? "Origin header" : "Referer header",
+      return [{ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: LINK_LABELS[link.relationship] || "Referer header",
         kind: kinds[0][0], kinds: Object.fromEntries(kinds), count: kinds.reduce((sum, [, rows]) => sum + rows, 0), cors: linkCors(link) }];
     };
     // The explicit overlay gets the first arrow slots. Metadata remains distinct
@@ -1226,7 +1255,7 @@
     const request = (path, options) => sendRequest(path, { ...options, redirect: "error" });
     const productFilterContainer = els.productFilters || els.panel.querySelector?.("#serviceMapProductFilters");
     const state = {
-      sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectionInitialized: false,
+      sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectedClient: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null,
       loading: false, backgroundLoading: false, error: "", refreshPaused: false, requestId: 0, evidenceRequestId: 0, evidence: null,
@@ -1896,7 +1925,7 @@
       cancelEvidence();
       state.parametersRequestId += 1;
       Object.assign(state, { parameters: null, parametersKey: null, parametersLoading: false, parametersError: "" });
-      Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
+      Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null,
         inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
@@ -1906,6 +1935,7 @@
       const changedOrigin = state.selectedOrigin !== origin;
       state.highlightedRelation = null;
       state.selectedSite = null;
+      state.selectedClient = null;
       if (changedOrigin || state.endpointIndex !== endpointIndex) cancelEvidence();
       if (changedOrigin) { state.detailPage = 0; state.detailPageAnchor = null; }
       state.selectedOrigin = origin;
@@ -2388,6 +2418,28 @@
       const display = siteDisplay();
       replace(els.siteControls, `<button class="service-map-kind" type="button" data-service-group-sites="toggle" data-service-focus="sites:group" aria-pressed="${display.groupSites}" title="${display.groupSites ? "Show every origin on its own card" : "Gather the origins of one site onto one card"}">Group by site</button>${display.hidden.length ? `<details class="service-map-hidden-list"><summary data-service-focus="sites:hidden">Hidden ${display.hidden.length}</summary>${display.hidden.map((entry) => `<button class="service-map-kind" type="button" data-service-unhide="${escape(entry)}" data-service-focus="unhide:${escape(entry)}" title="Show ${escape(entry)} on the map again">${escape(entry.includes("://") ? entry : `*.${entry}`)} ✕</button>`).join("")}<button class="service-map-kind" type="button" data-service-unhide-all="all" data-service-focus="sites:unhide-all">Show all</button></details>` : ""}`);
     }
+    const clientById = (id) => state.snapshot?.clients?.find((client) => clientId(client) === id) || null;
+    // Clients lead the map: an arrow from each to the cards it sent rows to
+    // itself, with no Origin or Referer (a typed address, a bookmark, an app's
+    // call). A page's own requests already have the page's arrow.
+    function clientCards(grouped, cardOrder, hidden) {
+      const known = new Set(grouped.cards.map((card) => card.origin));
+      const shown = new Set(cardOrder.filter((id) => known.has(id)).slice(0, MAX_CARDS));
+      const cards = [], links = new Map();
+      for (const client of state.snapshot?.clients || []) {
+        if (cards.length >= MAX_CLIENT_CARDS) break;
+        const id = clientId(client);
+        const visits = client.origins.filter((item) => shown.has(grouped.card(item.origin)) && Object.keys(item.entry_kinds).some((kind) => !hidden.has(kind)));
+        if (!visits.length) continue;
+        cards.push({ ...referenceOrigin(id), client, captured: true, in_scope: true, request_count: client.request_count });
+        for (const item of visits) {
+          const target = grouped.card(item.origin);
+          if (!links.has(target)) links.set(target, []);
+          links.get(target).push({ source_origin: id, relationship: "client_request", request_kinds: item.entry_kinds, request_count: directRows(item) });
+        }
+      }
+      return { cards, links };
+    }
     function renderGraph() {
       const selected = selectedOrigin();
       const direct = directNeighborhood();
@@ -2416,10 +2468,13 @@
       const grouped = groupSites(origins, (site) => !display.groupSites || site === leadingSite || display.expandedSites.includes(site)
         || [state.anchorOrigin, ...collectionIds].some((id) => id && siteKey(id) === site));
       state.siteCards = new Map(grouped.cards.filter((card) => card.site).map((card) => [card.site, card]));
-      const selectedCard = state.selectedSite ? `site:${state.selectedSite}` : grouped.card(state.selectedOrigin);
-      const layout = graphLayout(grouped.cards, [...new Set(order.map(grouped.card))], state.layoutSlots, state.anchorOrigin, overlayEdges(), graphGeometry(textSize), hiddenLinkKinds());
+      const selectedCard = state.selectedClient || (state.selectedSite ? `site:${state.selectedSite}` : grouped.card(state.selectedOrigin));
+      const cardOrder = [...new Set(order.map(grouped.card))];
+      const clients = direct ? { cards: [], links: new Map() } : clientCards(grouped, cardOrder, new Set(hiddenLinkKinds()));
+      const linkedCards = grouped.cards.map((card) => clients.links.has(card.origin) ? { ...card, header_links: [...card.header_links, ...clients.links.get(card.origin)] } : card);
+      const layout = graphLayout([...clients.cards, ...linkedCards], [...clients.cards.map((card) => card.origin), ...cardOrder], state.layoutSlots, state.anchorOrigin, overlayEdges(), graphGeometry(textSize), hiddenLinkKinds(), clients.cards.length);
       // Status counts origins, not cards: a site card shows all of its own.
-      const shownOrigins = layout.nodes.reduce((sum, node) => sum + (node.members?.length || 1), 0);
+      const shownOrigins = layout.nodes.reduce((sum, node) => sum + (node.client ? 0 : node.members?.length || 1), 0);
       // The one count worth seeing without opening Details: cards left out.
       if (els.detailsSummary) els.detailsSummary.textContent = origins.length > shownOrigins ? `Details · ${shownOrigins} / ${origins.length} origins shown` : "Details";
       renderLinkKinds();
@@ -2458,14 +2513,20 @@
       const weight = (rows) => rows > 1 ? Math.round(Math.min(2.5, 1.5 + Math.log2(rows) / 6) * 100) / 100 : 0;
       const requests = (edge) => edge.count > 1 || edge.kinds
         ? ` · ${edge.count} request${edge.count === 1 ? "" : "s"}${edge.kinds ? ` (${REQUEST_KINDS.filter((kind) => edge.kinds[kind]).map((kind) => `${REQUEST_KIND_LABELS[kind]} ${edge.kinds[kind]}`).join(", ")})` : ""}${edge.cors?.[0] ? ` · ${corsText(edge.cors)}` : ""}` : "";
-      const cardName = (id) => String(id).startsWith("site:") ? `*.${id.slice(5)}` : id;
+      const cardName = (id) => String(id).startsWith("site:") ? `*.${id.slice(5)}` : String(id).startsWith("client:") ? clientName(clientById(id)) : id;
       const title = (edge) => `${escape(cardName(edge.source))} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : cardName(edge.target))} · ${escape(edge.label)} · ${edge.relationship}${requests(edge)}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}`;
-      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(selectedCard) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : `marker-end="url(#service-map-arrow${[edge.source, edge.target].includes(selectedCard) ? "-selected" : edge.kind === "api" ? "-api" : ""})"`}><title>${title(edge)}</title></path>`).join("")
+      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship === "client_request" ? "client-request" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(selectedCard) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : `marker-end="url(#service-map-arrow${[edge.source, edge.target].includes(selectedCard) ? "-selected" : edge.kind === "api" ? "-api" : ""})"`}><title>${title(edge)}</title></path>`).join("")
         // Arrows are thin, so a wide transparent stroke over each recorded one
         // takes the pointer: its tooltip, and a click that opens its entry.
         + layout.edges.map((edge, index) => edge.kind ? `<path class="service-map-hit" data-service-edge="${index}" d="${edge.path}"><title>${title(edge)} · Select to list its rows and open a source</title></path>` : "").join("");
       const cards = layout.nodes.map((origin) => {
         if (origin.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(origin.address)}" style="left:${origin.x}px;top:${origin.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(origin.address)}">${escape(origin.address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${origin.family.toUpperCase()}</span><span class="service-map-card-meta">Undirected observations only</span><span class="service-map-card-meta">No shared ownership inferred</span></span></div>`;
+        if (origin.client) {
+          const selected = selectedCard === origin.origin;
+          return `<button class="service-map-card service-map-client ${selected ? "selected" : ""}" type="button" data-service-client="${escape(origin.origin)}" data-service-focus="client:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
+          ${clientRoleMarkup(origin.client)}<span class="service-map-card-copy"><strong title="${escape(clientName(origin.client))}">${escape(clientName(origin.client))}</strong><span class="service-map-card-meta">${origin.client.os ? `${escape(origin.client.os)} · ` : ""}${rowCount(origin.client.request_count)}</span></span>
+        </button>`;
+        }
         if (origin.site) {
           const selected = selectedCard === origin.origin;
           return `<button class="service-map-card service-map-site ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""}" type="button" data-service-site="${escape(origin.site)}" data-service-focus="site:${escape(origin.site)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
@@ -2812,6 +2873,9 @@
         if (list && listScroll !== undefined) list.scrollTop = listScroll;
       }
     }
+    function clientDetailMarkup(client) {
+      return `<header class="service-map-detail-header"><div><h3>${escape(clientName(client))}</h3><p>${[CLIENT_LABELS[client.kind], client.os].filter(Boolean).map(escape).join(" · ")}</p></div></header><div class="service-map-detail-body"><p class="service-map-muted">${rowCount(client.request_count)} named by the User-Agent</p><h4>Origins</h4><div class="service-map-evidence-list">${client.origins.map((item) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="client-origin:${escape(item.origin)}"><span>${escape(item.origin)}<br>${rowCount(item.request_count)}${directRows(item) ? ` · ${directRows(item).toLocaleString()} direct` : ""}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
+    }
     function siteDetailMarkup(site) {
       const inScope = site.members.filter((member) => member.in_scope).length;
       return `<header class="service-map-detail-header"><div><h3 title="${escape(site.site)}">*.${escape(site.site)}</h3><p>${site.members.length} origins grouped by site</p></div><span class="detail-chip ${inScope ? "ok" : "none"}">${inScope === site.members.length ? "In scope" : inScope ? "Partly in scope" : "Out of scope"}</span></header><div class="service-map-detail-body"><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-site-expand="${escape(site.site)}" data-service-focus="site:expand">Show origins separately</button><button class="secondary-action" type="button" data-service-hide="${escape(site.site)}" data-service-focus="site:hide">Hide site from map</button></div><h4>Origins</h4><div class="service-map-evidence-list">${site.members.map((member) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(member.origin)}" data-service-focus="site-member:${escape(member.origin)}"><span>${escape(member.origin)}<br>${member.captured === false ? "Referenced only in this snapshot" : `${member.endpoints.length} API paths · ${count(member.request_count).toLocaleString()} sampled rows`}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
@@ -2825,6 +2889,9 @@
       return `<div class="service-map-overlay-actions service-map-origin-actions">${hiddenAs ? `<button class="secondary-action" type="button" data-service-unhide="${escape(hiddenAs)}" data-service-focus="origin:unhide">${hiddenAs === origin.origin ? "Show on map" : `Show *.${escape(site)} on map`}</button>` : `<button class="secondary-action" type="button" data-service-hide="${escape(origin.origin)}" data-service-focus="origin:hide">Hide from map</button>`}${regroup ? `<button class="secondary-action" type="button" data-service-site-collapse="${escape(site)}" data-service-focus="origin:regroup">Group *.${escape(site)} again</button>` : ""}</div>`;
     }
     function renderDetail() {
+      const client = state.selectedClient ? clientById(state.selectedClient) : null;
+      if (client) { replaceDetail(clientDetailMarkup(client)); return; }
+      state.selectedClient = null;
       const site = state.selectedSite ? state.siteCards?.get(state.selectedSite) : null;
       if (site) { replaceDetail(siteDetailMarkup(site)); return; }
       state.selectedSite = null;
@@ -2877,6 +2944,7 @@
     // is marked and focused in the inspector.
     function selectEdge(edge) {
       if (!edge?.kind) return;
+      if (edge.relationship === "client_request") return selectClient(edge.source);
       const recordedBy = edge.relationship === "redirect_instruction" ? edge.source : edge.target;
       // A site card's arrow stands for links of several origins: open the site.
       if (recordedBy.startsWith("site:")) return selectSite(recordedBy.slice(5));
@@ -2891,7 +2959,14 @@
     function selectSite(site) {
       if (!state.siteCards?.has(site)) return;
       cancelEvidence();
-      Object.assign(state, { selectedSite: site, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
+      Object.assign(state, { selectedSite: site, selectedClient: null, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
+      render();
+    }
+    // A client card selects the client; its inspector lists where it sent rows.
+    function selectClient(id) {
+      if (!clientById(id)) return;
+      cancelEvidence();
+      Object.assign(state, { selectedClient: id, selectedSite: null, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
       render();
     }
     // Showing a site's origins separately selects the first of them, so the
@@ -2924,6 +2999,7 @@
         if (state.view === "apis") { state.view = "service-map"; onViewChange?.("service-map"); render(); }
       } else if (data.serviceOrigin) selectOrigin(data.serviceOrigin);
       else if (data.serviceSite) selectSite(data.serviceSite);
+      else if (data.serviceClient) selectClient(data.serviceClient);
       else if (data.serviceSiteExpand) expandSite(data.serviceSiteExpand);
       else if (data.serviceSiteCollapse) saveSiteDisplay({ expandedSites: siteDisplay().expandedSites.filter((site) => site !== data.serviceSiteCollapse) });
       else if (data.serviceHide) {

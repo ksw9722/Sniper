@@ -389,6 +389,42 @@ HTTP history. `GET /api/target/service-map/parameters` with `session_id`,
 `origin`, `method` and `path` returns the same result; the CLI does not read it
 yet.
 
+## Clients
+
+Each row's `User-Agent` names the client that sent it, and for a Chromium
+browser the `Sec-CH-UA` and `Sec-CH-UA-Platform` Client Hints name its brand and
+platform. A fixed list of rules gives each client a kind, a name, a major
+version and an operating system:
+
+| Kind | Names |
+| --- | --- |
+| `browser` | Chrome, Edge, Safari, Firefox, Samsung Internet, Whale, Opera, Brave, Vivaldi, Yandex Browser, Internet Explorer |
+| `webview` | Android WebView, iOS WebView, and the in-app browsers of Instagram, Facebook, LINE, NAVER and WeChat |
+| `app` | OkHttp, Android app (Dalvik), Alamofire, Apple app (CFNetwork) |
+| `tool` | curl, Wget, HTTPie, Postman, Insomnia, Headless Chrome, sqlmap, Nmap, Nikto, WPScan |
+| `library` | python-requests, HTTPX, aiohttp, Python urllib, Go net/http, Apache HttpClient, Java, axios, Node.js |
+| `bot` | Googlebot, Bingbot, Yeti, Applebot, DuckDuckBot, Baiduspider, YandexBot, link previews of Facebook, Twitter, Slack, Discord and LinkedIn, GPTBot, ClaudeBot, and any other crawler |
+| `unknown` | Other, and No User-Agent |
+
+An app's WebView sends a browser's User-Agent without the browser's own token,
+so an in-app browser no rule names is an Android or iOS WebView. Only these
+names reach the map; the header itself never does.
+
+The map counts each client's rows per origin, and apart from them the rows it
+sent itself, with no Origin or Referer: a typed address or bookmark, a
+browser's own background request, an app's or a tool's call. A page's own
+requests carry the page in Referer and already have its arrow. In the GUI the
+clients lead the map, up to six cards beside the origin cap, with a long-dashed
+**Direct request** arrow to each shown card they went to themselves; a request
+kind hidden in the legend hides those arrows too, and a client left with none
+draws no card. Selecting a client lists the origins it sent rows to.
+
+The API and the CLI carry `clients`, busiest first and at most 16 (`kind`,
+`name`, `version` when named, `os` when known, `request_count`, `origins` with
+each origin's `request_count` and `entry_kinds`, the client's own rows there by
+request kind, at most 64 origins, and `evidence`), omitted when no row was
+analyzed.
+
 ## Sites and hidden origins
 
 **Group by site** (on by default) gathers two or more origins of one site onto a

@@ -370,6 +370,14 @@ offers Show parameters, which reads its newest 200 rows on request and lists
 each query, form, JSON or multipart parameter with its row count and up to
 three values (`GET /api/target/service-map/parameters`).
 
+Each row's User-Agent, with Client Hints for Chromium browsers, now names the
+client that sent it: a browser, an app's WebView, an app's HTTP stack, a tool, a
+library or a crawler, from a fixed list of rules. The map counts each client's
+rows per origin and the requests it made itself, with no Origin or Referer. In
+the GUI the clients lead the map with a Direct request arrow to each card they
+went to themselves; the API and the CLI carry them as `clients`. Only the fixed
+names leave the parser, never the header.
+
 The GUI map also stopped reading only the newest 10,000 rows, where its 8 MiB
 projection limit often stopped it near 6,000. It now asks for `all_rows=true`:
 the server folds every retained row into the map a chunk at a time without

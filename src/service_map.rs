@@ -155,10 +155,45 @@ pub struct ServiceMap {
     pub in_scope_only: bool,
     pub origin_filter: Option<String>,
     pub origins: Vec<ServiceOrigin>,
+    /// The clients that sent the analyzed rows, busiest first. Absent when
+    /// none, as on older servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clients: Vec<ServiceClient>,
     pub unavailable: Vec<String>,
     pub deferred: Vec<String>,
     pub warnings: Vec<String>,
 }
+
+/// A client its User-Agent names, and the origins it sent rows to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceClient {
+    /// One of `service_map_clients::KINDS`.
+    pub kind: String,
+    pub name: String,
+    /// The major version, when the client names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    pub request_count: usize,
+    /// Busiest first.
+    pub origins: Vec<ClientOrigin>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClientOrigin {
+    pub origin: String,
+    pub request_count: usize,
+    /// Rows the client sent here itself, with no Origin or Referer (a typed
+    /// address, a bookmark, an app's call), by request kind. Absent when a
+    /// page started every row.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entry_kinds: BTreeMap<String, usize>,
+}
+
+const MAX_CLIENTS: usize = 16;
+const MAX_CLIENT_ORIGINS: usize = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceOrigin {
@@ -323,6 +358,12 @@ pub struct ServiceMapRow {
     /// body declares, which the store reads once per row revision.
     #[serde(skip)]
     pub libraries: Vec<crate::service_map_libraries::Detection>,
+    /// The client its User-Agent and Client Hints name; aggregated only.
+    #[serde(skip)]
+    pub client: Option<crate::service_map_clients::Client>,
+    /// It sent an Origin or Referer: a page started it, not the client itself.
+    #[serde(skip)]
+    pub initiated: bool,
 }
 
 /// Every value `request_kind` returns, in the order clients present them.
@@ -665,6 +706,8 @@ pub(crate) fn project_record_for_catalog(
         request_kind: request_kind(record),
         cors: None,
         libraries: Vec::new(),
+        client: None,
+        initiated: false,
     };
     // A script, stylesheet or image URL can name its product without a body.
     if matches!(row.request_kind, "script" | "static") {
@@ -686,6 +729,7 @@ pub(crate) fn project_record_for_catalog(
     let mut connection_upgrade = false;
     let mut origin_values = Vec::new();
     let mut referer_values = Vec::new();
+    let (mut user_agent, mut brands, mut platform) = (None, None, None);
     for (index, header) in record.request.headers.iter().enumerate() {
         request_header_bytes = request_header_bytes
             .saturating_add(header.name.len())
@@ -717,8 +761,21 @@ pub(crate) fn project_record_for_catalog(
         if header.name.eq_ignore_ascii_case("referer") {
             referer_values.push(header.value.as_str());
         }
+        for (name, value) in [
+            ("user-agent", &mut user_agent),
+            ("sec-ch-ua", &mut brands),
+            ("sec-ch-ua-platform", &mut platform),
+        ] {
+            if header.name.eq_ignore_ascii_case(name) {
+                value.get_or_insert(header.value.as_str());
+            }
+        }
     }
     row.is_websocket = record.status == Some(101) && websocket_upgrade && connection_upgrade;
+    row.client = Some(crate::service_map_clients::classify(
+        user_agent, brands, platform,
+    ));
+    row.initiated = !origin_values.is_empty() || !referer_values.is_empty();
     if !row
         .omitted
         .iter()
@@ -1072,6 +1129,14 @@ pub(crate) fn library_page(row: &ServiceMapRow) -> Option<String> {
 
 type FrontKey = (Option<String>, String, String, Option<String>);
 
+#[derive(Default)]
+struct ClientTally {
+    rows: usize,
+    /// Rows per origin, and its own visits there by request kind.
+    origins: BTreeMap<String, (usize, BTreeMap<&'static str, usize>)>,
+    evidence: Vec<String>,
+}
+
 struct FrontHit {
     name: String,
     category: &'static str,
@@ -1116,6 +1181,7 @@ pub(crate) struct MapBuilder {
     /// Rows naming each technology, by the page they may belong to and the
     /// origin they were served from, attributed once every page is known.
     front_hits: BTreeMap<FrontKey, FrontHit>,
+    clients: BTreeMap<crate::service_map_clients::Client, ClientTally>,
     projected_rows: usize,
     included_rows: usize,
     excluded_rows: usize,
@@ -1132,6 +1198,7 @@ impl MapBuilder {
             endpoint_indexes: BTreeMap::new(),
             technology_observation_count: 0,
             front_hits: BTreeMap::new(),
+            clients: BTreeMap::new(),
             projected_rows: 0,
             included_rows: 0,
             excluded_rows: 0,
@@ -1183,6 +1250,16 @@ impl MapBuilder {
         origin.first_seen = origin.first_seen.min(row.started_at);
         origin.last_seen = origin.last_seen.max(row.started_at);
         self.included_rows += 1;
+        if let Some(client) = row.client {
+            let tally = self.clients.entry(client).or_default();
+            tally.rows += 1;
+            sample(&mut tally.evidence, &row.evidence_id);
+            let (rows, entries) = tally.origins.entry(row.origin.clone()).or_default();
+            *rows += 1;
+            if !row.initiated {
+                *entries.entry(row.request_kind).or_default() += 1;
+            }
+        }
         if !row.libraries.is_empty() {
             let page = library_page(&row);
             for detection in std::mem::take(&mut row.libraries) {
@@ -1445,6 +1522,56 @@ impl MapBuilder {
                 self.stopped_by.insert("front_technologies_limit".into());
             }
         }
+        let mut clients: Vec<ServiceClient> = std::mem::take(&mut self.clients)
+            .into_iter()
+            .map(|(client, tally)| {
+                let mut origins: Vec<ClientOrigin> = tally
+                    .origins
+                    .into_iter()
+                    .map(|(origin, (request_count, entries))| ClientOrigin {
+                        origin,
+                        request_count,
+                        entry_kinds: entries
+                            .into_iter()
+                            .map(|(kind, rows)| (kind.to_string(), rows))
+                            .collect(),
+                    })
+                    .collect();
+                origins.sort_by(|a, b| {
+                    (b.request_count, &a.origin).cmp(&(a.request_count, &b.origin))
+                });
+                if origins.len() > MAX_CLIENT_ORIGINS {
+                    origins.truncate(MAX_CLIENT_ORIGINS);
+                    self.stopped_by.insert("client_origins_limit".into());
+                }
+                ServiceClient {
+                    kind: client.kind.into(),
+                    name: client.name.into(),
+                    version: client.version,
+                    os: client.os.map(Into::into),
+                    request_count: tally.rows,
+                    origins,
+                    evidence: tally.evidence,
+                }
+            })
+            .collect();
+        let kind_rank = |kind: &str| {
+            crate::service_map_clients::KINDS
+                .iter()
+                .position(|known| *known == kind)
+        };
+        clients.sort_by(|a, b| {
+            (b.request_count, kind_rank(&a.kind), &a.name, a.version).cmp(&(
+                a.request_count,
+                kind_rank(&b.kind),
+                &b.name,
+                b.version,
+            ))
+        });
+        if clients.len() > MAX_CLIENTS {
+            clients.truncate(MAX_CLIENTS);
+            self.stopped_by.insert("clients_limit".into());
+        }
         let stopped_by: BTreeSet<String> = self
             .stopped_by
             .union(&snapshot.stopped_by)
@@ -1497,7 +1624,7 @@ impl MapBuilder {
                 included_rows: self.included_rows, excluded_rows: self.excluded_rows, omitted_rows: self.omitted_rows + snapshot.omitted_rows,
                 origin_count: origins.len(), endpoint_count: self.endpoint_indexes.len(), complete: stopped_by.is_empty(),
                 stopped_by: stopped_by.into_iter().collect(), limits: ServiceMapLimits::new(max_records) },
-            in_scope_only: self.in_scope_only, origin_filter: self.origin_filter, origins,
+            in_scope_only: self.in_scope_only, origin_filter: self.origin_filter, origins, clients,
             unavailable: vec!["initiator".into(), "remote_ip".into(), "tls_certificate".into()],
             deferred: vec!["response_body_references".into()],
             warnings: vec!["Counts describe analyzed rows in a newest-capture-sequence window, not all-time traffic. Removed or uncaptured traffic is unavailable; retained first/last timestamps are capture-order boundaries.".into(),

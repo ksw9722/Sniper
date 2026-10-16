@@ -60,7 +60,10 @@ Both describe responses, not a confirmed cross-origin read.
 kits, libraries and analytics that retained scripts, pages and asset URLs name
 (banners, runtime values such as `window.next`, markup such as `ng-version`,
 generator meta, CDN `package@version` paths), with `category` and a `version`
-only when one was named; an asset's goes to the page that loaded it. Check `snapshot.complete`, `stopped_by`, counts, limits,
+only when one was named; an asset's goes to the page that loaded it. `clients`
+lists the clients each row's User-Agent names (fixed names by `kind`: browser,
+webview, app, tool, library, bot, unknown), with rows per origin and
+`entry_kinds`, the rows a client sent itself with no Origin or Referer. Check `snapshot.complete`, `stopped_by`, counts, limits,
 `unavailable`, `deferred`, and warnings before claiming coverage. Counts include duplicate-ID
 rows, and even a complete result covers retained captures only.
 
