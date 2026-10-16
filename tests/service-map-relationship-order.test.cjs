@@ -41,7 +41,7 @@ function node() {
 }
 function fixture(options = {}) {
   const requests = [];
-  const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn', 'linkKinds', 'siteControls'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn', 'linkKinds', 'siteControls', 'alert', 'detailsSummary'].map(name => [name, node()]));
   els.viewport.clientWidth = 300; els.viewport.clientHeight = 300;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty('--ui-root-size', '12px');
@@ -432,4 +432,27 @@ test("a site's origins share one card and one arrow, and the leading origin's si
   assert.equal(display.groupSites, false);
   assert.match(f.els.siteControls.innerHTML, /data-service-group-sites="toggle"[^>]*aria-pressed="false"/);
   assert.equal(saves.length, 4, 'expand, hide, show all and the toggle each save once');
+});
+
+test('a card leads with what its origin serves, or with a declared front-end product', () => {
+  const typed = (types, extra = {}) => ({ origin: 'https://a.example.com', captured: true, endpoints: types.map(type => ({ content_types: [type] })), technology_observations_present: true, technology_observations: [], ...extra });
+  assert.deepEqual([typed(['text/html', 'application/json']), typed(['application/json']), typed(['image/svg+xml', 'text/css']), typed([]), typed(['text/plain']), typed([], { captured: false })].map(map.originRole),
+    ['front', 'api', 'static', 'unknown', 'unknown', 'ref']);
+  const next = typed(['application/json'], { technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }] });
+  assert.equal(map.originRole(next), 'front', 'Next.js names the front end however its endpoints respond');
+});
+
+test('only an error or the first load shows above the map; counts sit under Details', async () => {
+  const f = fixture();
+  const reading = f.controller.refresh();
+  assert.equal(f.els.alert.textContent, 'Loading retained HTTP metadata…');
+  f.requests.at(-1).resolve(response(snapshot(relatedOrigins()))); await reading;
+  assert.equal(f.els.alert.textContent, '');
+  assert.match(f.els.status.textContent, /rows considered/, 'the full status stays under Details');
+  assert.match(f.els.canvas.innerHTML, /service-map-card-role role-front"[^]*?>Front</, 'each card names its role');
+  assert.equal(f.els.detailsSummary.textContent, 'Details · 24 / 28 origins shown');
+  const failing = f.controller.refresh({ force: true });
+  f.requests.at(-1).resolve({ ok: false, status: 500, json: async () => ({}) }); await failing;
+  assert.notEqual(f.els.alert.textContent, '');
+  assert.equal(f.els.alert.classList.contains('service-map-error'), true);
 });

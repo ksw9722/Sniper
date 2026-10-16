@@ -115,7 +115,7 @@ test('missing, present-empty and reference-only are distinct from an unknown ver
   missing.technology_clues = [{ name: 'nginx/9.9', source: 'response_header', confidence: 'observed_header', evidence: [] }];
   const a = map.normalizeSnapshot(snapshot([missing]), SESSION).origins[0], b = normalized([]), c = normalized([observation('nginx', null)]);
   assert.equal(a.technology_observations_present, false); assert.equal(b.technology_observations_present, true);
-  assert.match(map.productSummaryMarkup(a), /Product\/version metadata unavailable/); assert.match(map.productSummaryMarkup(b), /No loaded product declarations/);
+  assert.equal(map.productSummaryMarkup(a), '', 'a card shows products only when declared'); assert.equal(map.productSummaryMarkup(b), '');
   for (const item of [a, b, { captured: false, technology_observations: [] }]) {
     assert.equal(map.productMatches(item), true); assert.equal(map.productMatches(item, 'nginx'), false); assert.equal(map.productMatches(item, '', 'status:not_reported'), false);
   }
@@ -189,8 +189,8 @@ test('catalog membership is origin-level; selected endpoint inspector keeps inde
   const pageAnchor = plain(f.state.pageAnchor), evidenceBefore = f.state.evidence;
   f.filter('product', 'nginx'); assert.deepEqual(plain(f.state.pageAnchor), pageAnchor); assert.equal(f.state.page, 2); assert.equal(f.state.detailPage, 2);
   f.filter('product', 'php'); assert.equal(f.state.detailPage, 2); assert.equal(f.state.endpointSelection.path, '/path-110'); assert.equal(f.state.evidence, evidenceBefore);
-  assert.equal(rows(f.els.detail).length, 30); assert.equal(rows(f.els.catalog).length, 2); assert.match(f.els.catalog.innerHTML, /combinations belonging to matching origins/);
-  assert.match(f.els.catalog.innerHTML, /do not prove that each endpoint reported them/); assert.match(f.els.catalog.innerHTML, /2 matching · 132 loaded · 0 hidden by endpoint filters · 130 hidden by origin products\/versions/);
+  assert.equal(rows(f.els.detail).length, 30); assert.equal(rows(f.els.catalog).length, 2);
+  assert.match(f.els.catalog.innerHTML, /2 matching · 132 loaded · 0 hidden by endpoint filters · 130 hidden by origin products\/versions/);
   f.search('app'); assert.equal(rows(f.els.catalog).length, 0); assert.match(f.els.catalog.innerHTML, /0 matching · 132 loaded · 0 hidden by endpoint filters · 130 hidden by origin products\/versions · 2 hidden by origin search/);
   f.els.panel.dispatch('input', { target: { value: '/path-11', dataset: { serviceEndpointFilter: 'path' } } }); assert.equal(rows(f.els.detail).length, 11);
   assert.equal(f.state.productId, 'php'); assert.equal(f.requests.length, 2);
@@ -221,8 +221,8 @@ for (const kind of ['body', 'link', 'peer']) test(`shown ${kind} visualization s
   if (kind === 'peer') {
     assert.match(f.els.canvas.innerHTML, /PHP 8.3/); assert.doesNotMatch(f.els.canvas.innerHTML, /data-service-origin="https:\/\/peer-only/);
     assert.match(f.els.graphBounds.textContent, /2 hidden by products\/versions/);
-    f.controller.selectOrigin(PEER); assert.match(f.els.detail.innerHTML, /Default product metadata unavailable/); assert.match(f.els.detail.innerHTML, /outside the product\/version filters/);
-    f.click({ serviceProductFilterClear: 'true' }); assert.match(f.els.canvas.innerHTML, /Default product metadata unavailable/);
+    f.controller.selectOrigin(PEER); assert.match(f.els.detail.innerHTML, /outside the product\/version filters/);
+    f.click({ serviceProductFilterClear: 'true' }); assert.match(f.els.canvas.innerHTML, /peer-only\.example\.com/);
   } else assert.match(f.els.graphDiagnostics.textContent, /1 loaded neighbors · 0 query-hidden · 1 product\/version-hidden · 0 matching/);
 });
 

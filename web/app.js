@@ -14755,6 +14755,8 @@ function initializeTargetWorkspace() {
       graphBounds: document.getElementById("serviceMapGraphBounds"),
       linkKinds: document.getElementById("serviceMapLinkKinds"),
       siteControls: document.getElementById("serviceMapSiteControls"),
+      alert: document.getElementById("serviceMapAlert"),
+      detailsSummary: document.getElementById("serviceMapDetailsSummary"),
       boundsDetails: document.getElementById("serviceMapBoundsDetails"),
       graphDiagnostics: document.getElementById("serviceMapGraphDiagnostics"),
       overlayStatus: document.getElementById("serviceMapBodyOverlay"),

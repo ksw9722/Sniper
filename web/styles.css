@@ -7400,7 +7400,7 @@ button.utility-button.replay-tab-add {
 .service-map-scope input { accent-color: var(--point); }
 .service-map-filter-summary { color: var(--text-dim); font-size: var(--font-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 280px; }
 .service-map-search { margin-left: auto; max-width: 260px; min-width: 150px; flex: 1; }
-.service-map-status { color: var(--text-dim); font-size: var(--font-xs); min-height: 16px; padding: 0 4px; overflow-wrap: anywhere; }
+.service-map-alert { color: var(--text-soft); font-size: var(--font-xs); padding: 0 4px; overflow-wrap: anywhere; }
 .service-map-content { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(280px, 34%); gap: 12px; min-width: 0; min-height: 0; }
 .service-map-graph, .service-map-detail, .service-map-api-catalog { border: 1px solid var(--line-strong); border-radius: var(--radius-lg); min-width: 0; min-height: 0; background: linear-gradient(135deg, var(--bg-glow), transparent 65%), var(--panel); }
 .service-map-graph { display: flex; flex-direction: column; overflow: hidden; }
@@ -7426,9 +7426,16 @@ button.utility-button.replay-tab-add {
 .service-map-card.selected { border: 2px solid var(--point); padding: 9px; background: linear-gradient(var(--point-soft), var(--point-soft)), var(--panel); }
 .service-map-card-symbol { border: 1px solid var(--line-strong); border-radius: 50%; width: 26px; height: 26px; display: grid; place-items: center; font-size: 20px; flex: 0 0 26px; color: var(--text-soft); }
 .service-map-card.selected .service-map-card-symbol { border-color: var(--point-border); color: var(--point); }
-/* A site card holds several origins: a double ring sets it apart. */
-.service-map-card.service-map-site .service-map-card-symbol { border-style: double; border-width: 3px; }
+/* A card leads with what the origin serves: an icon, or a declared product's
+   mark, over a short role label. */
+.service-map-card-role { display: grid; justify-items: center; align-content: start; gap: 4px; flex: 0 0 34px; }
+.service-map-card-role-label { font-size: 10px; line-height: 1; color: var(--text-dim); white-space: nowrap; }
+.service-map-card-symbol svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.service-map-card-role.role-api .service-map-card-symbol { color: var(--token-url-color); }
+.service-map-card.pinned .service-map-card-symbol { box-shadow: 0 0 0 2px var(--point-soft); color: var(--point); }
+.service-map-mark { display: grid; place-items: center; width: 100%; height: 100%; border-radius: 50%; font: 700 11px/1 var(--sans); letter-spacing: -.02em; }
 .service-map-origin-actions { padding: 0 18px; }
+.service-map-origin-actions .secondary-action { min-height: 0; padding: 3px 10px; font-size: var(--font-xs); }
 .service-map-card-copy { display: grid; gap: 4px; min-width: 0; width: 100%; }
 .service-map-card-copy strong { font-size: var(--font-sm); line-height: var(--service-map-line-height); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 3px; }
 .service-map-card-scheme, .service-map-card-meta { color: var(--text-soft); font-size: var(--font-xs); line-height: var(--service-map-line-height); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -7499,7 +7506,6 @@ button.utility-button.replay-tab-add {
 .service-map-detail h4 { font-size: var(--font-md); margin: 16px 0 8px; }
 .service-map-evidence-summary p { line-height: 1.5; }
 .service-map-evidence-summary > button { width: 100%; color: var(--point); border-color: var(--point-border); }
-.service-map-notice { color: var(--text-dim); font-size: var(--font-xs); line-height: 1.5; padding: 0 4px; }
 .service-map-empty { display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; min-height: 250px; padding: 30px; gap: 8px; color: var(--text-dim); }
 .service-map-empty h3 { margin: 0; color: var(--text-soft); font-size: var(--font-lg); }
 .service-map-empty p { max-width: 300px; line-height: 1.6; margin: 0; }

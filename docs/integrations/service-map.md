@@ -10,7 +10,16 @@ create a persistent graph or change the active session.
 
 Scope keeps four views: Rules, Service Map, APIs, and Paths. Service Map uses a
 stable card layout with origin search, scope filtering, viewport scrolling, and
-an APIs/Evidence inspector. Compact 220×104px cards at the default 12px Display
+an APIs/Evidence inspector. Each card leads with what its origin serves, read
+from the response types of its loaded endpoints: **Front** (HTML pages), **API**
+(JSON, XML, protobuf, gRPC or GraphQL), **Static** (images, fonts, styles,
+scripts), or **Unknown** when no typed response is loaded; **Ref** marks an
+origin only referenced, and **Site** a card of grouped origins. A declared
+front-end product or CMS (Next.js, WordPress, Drupal) makes it Front whatever its
+endpoints return, and a declared application product shows its mark in place
+of the icon. Only an error or the first load shows above the map; the snapshot
+counts, coverage and window sit under **Details** below it, whose summary names
+how many origins the card cap leaves out. Compact 220×104px cards at the default 12px Display
 text size share their geometry with all arrow attachments. Larger Display text
 grows card height and row spacing together (146px cards at 20px), retaining
 legible line boxes, aligned arrows, selection, and the chosen zoom. Fit, minus, the percentage/reset button, and plus scale
@@ -205,8 +214,8 @@ anchor outside the search. Counts distinguish all unique loaded neighbors,
 query-hidden neighbors, card-cap omissions, and typed arrows among displayed
 cards. Multiple captured redirect paths can share one typed origin-to-origin
 arrow; their exact paths remain separate in the inspector. The compact summary
-keeps nonzero omissions visible; Relation details exposes complete typed-link
-counts, direction definitions, and display limits.
+keeps nonzero omissions visible; Details exposes complete typed-link counts,
+direction definitions, and display limits.
 
 Neighborhood discovery uses the full bounded metadata response, independently
 of the All origins view's reference-card cap. It cannot recover metadata omitted
@@ -235,8 +244,8 @@ hides exactly the rows it hides in HTTP history: the server applies History's ow
 row matcher while it takes the snapshot. Origins, endpoints, redirect
 instructions and Origin/Referer declarations seen only in hidden rows disappear
 with them. Filtering happens inside the newest-row window (10,000 by default); it
-does not widen the window. `snapshot.filtered_rows` counts the hidden rows, and the
-status line reports them. Changing the filter re-reads the map and ranks the cards
+does not widen the window. `snapshot.filtered_rows` counts the hidden rows, and
+Details reports them. Changing the filter re-reads the map and ranks the cards
 again for the rows that remain; a filter restored from settings does the same on
 the next read.
 

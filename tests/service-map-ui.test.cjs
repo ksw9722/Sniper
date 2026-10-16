@@ -571,7 +571,7 @@ test('direct mode pins beyond-card-cap anchors and never expands transitively', 
   rows[0].redirects = [redirect(rows[1].origin)];
   await f.load(snapshot(rows)); pin(f, rows[29].origin);
   assert.deepEqual(new Set(cardIds(f)), new Set([rows[29].origin, rows[0].origin]));
-  assert.match(f.els.canvas.innerHTML, /pinned anchor/);
+  assert.match(f.els.canvas.innerHTML, /title="Pinned anchor · /);
   assert.match(boundsText(f), /1 known direct neighbors/);
   assert.equal(f.requests.length, 1);
 });
@@ -887,7 +887,7 @@ test('direct primary summary stays compact while native disclosure retains all c
   assert.equal(f.els.boundsDetails.classList.contains('hidden'), false);
   assert.match(f.els.graphDiagnostics.textContent, /2 loaded origins · 0 query-hidden · 0 product\/version-hidden · 2 matching/);
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-  assert.match(html, /<details[^>]*id="serviceMapBoundsDetails"><summary>Relation details<\/summary><p id="serviceMapGraphDiagnostics"><\/p><\/details>/);
+  assert.match(html, /<details[^>]*id="serviceMapBoundsDetails"><summary id="serviceMapDetailsSummary">Details<\/summary><p class="service-map-status" id="serviceMapStatus"><\/p><p id="serviceMapGraphBounds"><\/p><p id="serviceMapGraphDiagnostics"><\/p><\/details>/, 'counts and coverage sit under Details');
 });
 
 test('primary direct summary keeps meaningful omissions visible without opening details', async () => {
@@ -1312,10 +1312,10 @@ test('same exact source keeps native inspector state when its selected endpoint 
 });
 
 
-test('metadata map footer distinguishes explicit body inspection from map-wide extraction', () => {
+test('the map carries no explanatory footer; only errors and the first load show above it', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-  assert.match(html, /Explicitly inspect a source, then Show to add its body, Link or recorded-address relationships alongside other inspections\./);
-  assert.match(html, /Pause HTTP recording manually for steadier peer inspection/);
+  assert.doesNotMatch(html, /service-map-notice|Explicitly inspect a source/);
+  assert.match(html, /<div class="service-map-alert hidden" id="serviceMapAlert" role="status" aria-live="polite"><\/div>/);
   assert.doesNotMatch(html, /they are not added to this map/);
   assert.doesNotMatch(html, /Response-body reference extraction is deferred/);
 });

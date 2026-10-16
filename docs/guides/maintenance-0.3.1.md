@@ -343,3 +343,12 @@ leading origin's site, and sites shown separately, keep a card per origin. An
 origin or a whole site can be hidden from the map in every session, and the
 legend's Hidden list brings each back. Both are saved in UI settings and change
 the map only; the API and the CLI still return every origin.
+
+The map also says less. The snapshot status above it and the explanatory footer
+below it are gone: only an error or the first load shows above the map, and the
+counts, coverage and window sit under Details, whose summary names the origins
+the card cap leaves out. Legend labels are shorter, cards drop the scheme line and
+the empty product chip, and the inspector drops its explanatory paragraphs. Each
+card instead leads with what its origin serves (Front, API, Static, Unknown, Ref
+or Site), read from its endpoints' response types, with a declared application
+product's mark, such as Next.js, in place of the icon.

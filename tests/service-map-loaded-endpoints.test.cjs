@@ -112,7 +112,7 @@ test('exact method filter distinguishes GET, get, unknown methods and literal as
   await f.load(snapshot([origin(A, methods.map(method => endpoint('/same', method)))]));
   for (const [index, method] of methods.entries()) {
     f.filter('method', method); assert.deepEqual(rows(f.els.detail), [index]); assert.deepEqual(rows(f.els.catalog), [index]);
-    assert.equal(f.state.endpointMethod, method); assert.match(f.els.detail.innerHTML, /Method \(exact\)/); assert.match(f.els.detail.innerHTML, /Both case-sensitive/);
+    assert.equal(f.state.endpointMethod, method); assert.match(f.els.detail.innerHTML, /Method \(exact\)/);
   }
   f.filter('method', 'G'); assert.deepEqual(rows(f.els.detail), []); assert.equal(f.requests.length, 1);
 });
@@ -171,8 +171,6 @@ test('loaded-filter zero results never imply server omissions or exhaustive inve
   const f = fixture(); await f.load(snapshot([origin(A)], { complete: false, stopped_by: ['max_records', 'endpoint_limit'], retained_rows: 20000, considered_rows: 10000, omitted_rows: 900 }));
   const status = f.els.status.textContent; f.filter('path', '/absent');
   assert.match(f.els.detail.innerHTML, /0–0 \/ 0 matching · 130 loaded · 130 hidden by endpoint filters/);
-  assert.match(f.els.catalog.innerHTML, /Server scope and projection omissions are separate/);
-  assert.match(f.els.catalog.innerHTML, /not an exhaustive endpoint inventory/);
   assert.equal(f.els.status.textContent, status); assert.match(status, /900 omitted/); assert.equal(f.requests.length, 1);
 });
 
