@@ -416,7 +416,7 @@ async fn bounded_scope_cost_measurement() {
                     // The uncontended wrapper timing includes read-lock acquisition,
                     // the coherent projection, and guard drop, but no queue delay.
                     let started = Instant::now();
-                    let (snapshot, epoch) = worker_store.service_map_snapshot_blocking_for_catalog(session, max_records, technology::CatalogVersion::V1);
+                    let (snapshot, epoch) = worker_store.service_map_snapshot_blocking_for_catalog(session, max_records, technology::CatalogVersion::V1, &crate::store::ListFilters::default());
                     let projection = started.elapsed();
                     let projected_rows = snapshot.rows.len();
                     let legacy_snapshot = matches!(scenario, "empty" | "common").then(|| snapshot.clone());
@@ -519,4 +519,122 @@ async fn bounded_scope_full_caches_never_omit_rows() {
         assert_eq!(bounded.origins[0].request_count, count);
         same_output(legacy, bounded);
     }
+}
+
+fn filter_fixture(
+    host: &str,
+    path: &str,
+    status: u16,
+    content_type: &str,
+    referer: Option<&str>,
+    sequence: u64,
+) -> TransactionRecord {
+    // MessageRecord derives its content type when built, so build it from headers.
+    let mut response = http::HeaderMap::new();
+    response.insert(http::header::CONTENT_TYPE, content_type.parse().unwrap());
+    let mut request = http::HeaderMap::new();
+    if let Some(value) = referer {
+        request.insert(http::header::REFERER, value.parse().unwrap());
+    }
+    let mut record = fixture_record(host, sequence);
+    record.path = path.into();
+    record.status = Some(status);
+    record.request = MessageRecord::from_headers_and_body(&request, b"", 0);
+    record.response = Some(MessageRecord::from_headers_and_body(&response, b"", 0));
+    record
+}
+
+// The Service Map display filter reuses HTTP history's row matcher, so a page's
+// image CDN disappears with its rows and its Referer arrow, while the newest-row
+// window that bounds the work stays the same size.
+#[test]
+fn display_filter_drops_rows_as_history_does_and_counts_them() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(97);
+    let page = "https://www.example.com/";
+    let store = TransactionStore::from_records(vec![
+        filter_fixture("www.example.com", "/", 200, "text/html", None, 1),
+        filter_fixture(
+            "cdn.example.com",
+            "/logo.png",
+            200,
+            "image/png",
+            Some(page),
+            2,
+        ),
+        filter_fixture(
+            "api.example.com",
+            "/v1/items",
+            200,
+            "application/json",
+            Some(page),
+            3,
+        ),
+        filter_fixture(
+            "api.example.com",
+            "/v1/missing",
+            404,
+            "application/json",
+            Some(page),
+            4,
+        ),
+    ]);
+    let read = |filters: ListFilters| {
+        let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+            session,
+            DEFAULT_MAX_RECORDS,
+            technology::CatalogVersion::V1,
+            &filters,
+        );
+        build_bounded(
+            session,
+            snapshot,
+            DEFAULT_MAX_RECORDS,
+            false,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap()
+    };
+    let origins = |map: &ServiceMap| -> Vec<String> {
+        let mut ids: Vec<String> = map.origins.iter().map(|o| o.origin.clone()).collect();
+        ids.sort();
+        ids
+    };
+    let cdn = "https://cdn.example.com".to_string();
+
+    let all = read(ListFilters::default());
+    assert!(origins(&all).contains(&cdn));
+    assert_eq!(all.snapshot.filtered_rows, 0);
+
+    let static_hidden = read(ListFilters {
+        hidden_extensions: vec!["png".into()],
+        ..ListFilters::default()
+    });
+    assert!(!origins(&static_hidden).contains(&cdn));
+    assert_eq!(static_hidden.snapshot.filtered_rows, 1);
+    assert_eq!(static_hidden.snapshot.considered_rows, 4);
+    assert_eq!(static_hidden.snapshot.included_rows, 3);
+
+    let images_off = read(ListFilters {
+        mime_types: Some(vec!["html".into(), "json".into()]),
+        ..ListFilters::default()
+    });
+    assert_eq!(origins(&images_off), origins(&static_hidden));
+
+    let success_only = read(ListFilters {
+        status_classes: Some(vec!["success".into()]),
+        ..ListFilters::default()
+    });
+    let api = success_only
+        .origins
+        .iter()
+        .find(|origin| origin.origin == "https://api.example.com")
+        .unwrap();
+    assert!(api
+        .endpoints
+        .iter()
+        .all(|endpoint| endpoint.path != "/v1/missing"));
+    assert_eq!(success_only.snapshot.filtered_rows, 1);
 }

@@ -7398,6 +7398,7 @@ button.utility-button.replay-tab-add {
 .service-map-mode:focus-visible { outline: 2px solid var(--point); outline-offset: 2px; }
 .service-map-scope { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .service-map-scope input { accent-color: var(--point); }
+.service-map-filter-summary { color: var(--text-dim); font-size: var(--font-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 280px; }
 .service-map-search { margin-left: auto; max-width: 260px; min-width: 150px; flex: 1; }
 .service-map-status { color: var(--text-dim); font-size: var(--font-xs); min-height: 16px; padding: 0 4px; overflow-wrap: anywhere; }
 .service-map-content { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(280px, 34%); gap: 12px; min-width: 0; min-height: 0; }
@@ -7412,6 +7413,11 @@ button.utility-button.replay-tab-add {
 .service-map-edges { position: absolute; inset: 0; color: var(--point); pointer-events: none; }
 .service-map-edge { fill: none; stroke: var(--text-dim); stroke-width: 1.5; opacity: .6; }
 .service-map-edge.selected { stroke: var(--point); opacity: 1; stroke-width: 2; }
+/* Dots ride the selected card's arrows toward their targets; the base line keeps
+   its legend style underneath. Reduced motion drops them, the highlight stays. */
+.service-map-flow { fill: none; stroke: var(--text); stroke-width: 2.5; stroke-linecap: round; stroke-dasharray: 0.1 11.9; opacity: .85; animation: service-map-flow 0.8s linear infinite; }
+@keyframes service-map-flow { to { stroke-dashoffset: -12; } }
+@media (prefers-reduced-motion: reduce) { .service-map-flow { display: none; } }
 .service-map-card { display: flex; gap: 8px; position: absolute; width: var(--service-map-card-width); height: var(--service-map-card-height); box-sizing: border-box; align-items: flex-start; padding: 10px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel-elevated); color: var(--text); text-align: left; cursor: pointer; box-shadow: 0 4px 18px rgba(0,0,0,.12); }
 .service-map-card:hover { border-color: var(--point-border); }
 .service-map-card.pinned { box-shadow: 0 0 0 2px var(--point-soft), 0 4px 18px rgba(0,0,0,.12); }

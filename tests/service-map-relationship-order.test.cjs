@@ -38,13 +38,13 @@ function node() {
     get innerHTML() { return html; }, set innerHTML(value) { html = value; },
   };
 }
-function fixture() {
+function fixture(options = {}) {
   const requests = [];
-  const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
   els.viewport.clientWidth = 300; els.viewport.clientHeight = 300;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty('--ui-root-size', '12px');
-  const controller = map.createController({ elements: els, getSessionId: () => 'session-one', document, request() { const pending = deferred(); requests.push(pending); return pending.promise; } });
+  const controller = map.createController({ ...options, elements: els, getSessionId: () => 'session-one', document, request(path) { const pending = deferred(); pending.path = path; requests.push(pending); return pending.promise; } });
   controller.setVisible(true);
   return { controller, els, requests, state: controller.getState(), async load(payload) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
 }
@@ -216,6 +216,44 @@ test('a pinned star centers its source on its neighbors', () => {
   const layout = map.graphLayout([source, ...neighbors], [source.origin, ...neighbors.map(item => item.origin)], new Map(), source.origin, bodyEdges);
   assert.deepEqual([layout.slots.get(source.origin).column, layout.slots.get(source.origin).row], [0, 2]);
   for (const edge of layout.edges) assert.deepEqual(cardsCrossed(layout, edge), [], edge.path);
+});
+
+test('the Service Map filter rides on every read; changing it re-reads, re-ranks and reports hidden rows', async () => {
+  let filter = { hidden_extensions: 'png,css' };
+  const f = fixture({ getFilterQuery: () => filter, getFilterSummary: () => ({ text: 'hiding png, css', detail: 'Service Map filter: hiding png, css' }) });
+  await f.load(snapshot(relatedOrigins()));
+  assert.match(f.requests.at(-1).path, /hidden_extensions=png%2Ccss/);
+  assert.match(f.requests.at(-1).path, /session_id=session-one/);
+  assert.equal(f.els.filterSummary.textContent, 'hiding png, css');
+
+  // A filter restored from settings, with no dialog: the next poll re-ranks.
+  filter = { hidden_extensions: 'png' };
+  f.state.order = ['https://stale.example.com'];
+  await f.load(snapshot(relatedOrigins()));
+  assert.equal(f.state.order[0], app);
+
+  filter = { mime_types: 'html,json' };
+  f.state.order = ['https://stale.example.com'];
+  const reading = f.controller.filterChanged();
+  assert.match(f.requests.at(-1).path, /mime_types=html%2Cjson/);
+  assert.doesNotMatch(f.requests.at(-1).path, /hidden_extensions/);
+  const payload = snapshot(relatedOrigins());
+  payload.snapshot.filtered_rows = 7;
+  f.requests.at(-1).resolve(response(payload)); await reading;
+  assert.deepEqual([...f.state.order.slice(0, 4)], [app, api, cdn, login], 'cards are ranked again for the rows that remain');
+  assert.match(f.els.status.textContent, /7 hidden by the Service Map filter/);
+});
+
+test("the selected card's arrows carry moving dots toward their targets, and reduced motion drops them", async () => {
+  const f = fixture();
+  await f.load(snapshot(relatedOrigins()));
+  const flows = () => (f.els.canvas.innerHTML.match(/class="service-map-flow"/g) || []).length;
+  f.controller.selectOrigin(app);
+  assert.equal(flows(), 3, 'the hub: two Referer targets and the redirect into it');
+  f.controller.selectOrigin(api);
+  assert.equal(flows(), 1);
+  const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  assert.match(css, /prefers-reduced-motion: reduce\) \{ \.service-map-flow \{ display: none; \}/);
 });
 
 test('ctrl+wheel and WebKit pinch gestures zoom around the fingers; a plain wheel only scrolls', async () => {

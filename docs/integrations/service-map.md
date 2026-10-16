@@ -20,7 +20,9 @@ scale limits. Polling and resizing never refit or change the chosen zoom. Plus
 and minus preserve the viewport center where scroll bounds allow. With the map
 viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. A trackpad
 pinch, or Ctrl with the mouse wheel, zooms around the pointer instead of zooming
-the whole page; a plain wheel still scrolls the map. Zooming is
+the whole page; a plain wheel still scrolls the map. The selected card's arrows
+carry dots moving from source to target, so its links and their direction stand
+out; with reduced motion requested the dots are not drawn and the highlight stays. Zooming is
 local and preserves selection, exact-source reads, and session-local shown inspections.
 There is no force layout or drag editing in this version. The renderer is separate from metadata normalization and
 layout calculation so it can be replaced without changing the read contract.
@@ -216,6 +218,27 @@ still reads fresh retained metadata. Temporary invalidation clears displayed
 data, and a fresh result that no longer contains the anchor returns to All
 origins. A session change resets the mode and evidence immediately.
 
+## Service Map filter
+
+The map has its own display filter, as Burp keeps one for its site map. **Filter**
+on the map toolbar opens the same dialog as HTTP history's filter, editing the
+map's settings: MIME type, status class, hidden extensions, rows with responses
+only, parameterized rows only, rows with notes only, port and advanced search.
+Scope stays on the map's own **In scope only** toggle, and colour tags stay with
+History. The two filters are saved apart in UI settings; changing one never
+changes the other.
+
+The default hides `png,ico,css,woff,woff2,ttf,svg,jpg,jpeg,gif`, as History's does,
+so a page's image and style CDN drops out of the map with its rows. Each condition
+hides exactly the rows it hides in HTTP history: the server applies History's own
+row matcher while it takes the snapshot. Origins, endpoints, redirect
+instructions and Origin/Referer declarations seen only in hidden rows disappear
+with them. Filtering happens inside the newest-row window (10,000 by default); it
+does not widen the window. `snapshot.filtered_rows` counts the hidden rows, and the
+status line reports them. Changing the filter re-reads the map and ranks the cards
+again for the rows that remain; a filter restored from settings does the same on
+the next read.
+
 ## Read through the CLI
 
 Discover the contract offline before reading a running local instance:
@@ -226,6 +249,7 @@ sniper-cli schema output target.service_map.get
 sniper-cli examples target.service_map.get
 sniper-cli scope service-map --session-id <session-uuid>
 sniper-cli scope service-map --session-id <session-uuid> --in-scope-only --max-records 10000
+sniper-cli scope service-map --session-id <session-uuid> --hidden-extensions png,css,woff2 --mime-types html,script,json,other
 sniper-cli call target.service_map.get --input '{"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":false,"max_records":10000}'
 ```
 
@@ -245,8 +269,12 @@ retained metadata rows considered. Optional `--origin https://example.com` (or
 `origin` in `call`) selects one exact canonical HTTP(S) origin. Supply no path,
 query, fragment, credentials, or explicit default port; copy the canonical origin
 from a map card. `in_scope_only` defaults to false and uses the
-same session scope matcher as other Sniper views. These are read filters, not
-capture or scope-setting controls. There is no pagination cursor, URL input,
+same session scope matcher as other Sniper views. `--mime-types`,
+`--status-classes`, `--hidden-extensions`, `--hide-without-responses` and
+`--only-parameterized` (or the same fields in `call`) are the
+[Service Map filter](#service-map-filter)'s conditions. Omitted, they hide
+nothing: the CLI keeps every row unless asked, while the GUI applies its saved
+filter. These are read filters, not capture or scope-setting controls. There is no pagination cursor, URL input,
 active-discovery option, or automatic retry with a larger limit.
 
 ## What the map means

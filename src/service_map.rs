@@ -124,6 +124,11 @@ pub struct ServiceMapSnapshot {
     pub retained_rows: usize,
     pub considered_rows: usize,
     pub non_http_rows: usize,
+    /// Considered rows hidden by the request's display filter, as HTTP history
+    /// would hide them. Absent when nothing was hidden, as from older servers,
+    /// so an unfiltered map keeps its earlier shape.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub filtered_rows: usize,
     pub projected_rows: usize,
     pub included_rows: usize,
     pub excluded_rows: usize,
@@ -278,6 +283,10 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceMapEvidence {
     pub schema_version: u32,
@@ -377,6 +386,7 @@ pub(crate) struct MetadataSnapshot {
     pub retained_rows: usize,
     pub considered_rows: usize,
     pub non_http_rows: usize,
+    pub filtered_rows: usize,
     pub omitted_rows: usize,
     pub stopped_by: BTreeSet<String>,
     pub rows: Vec<ServiceMapRow>,
@@ -1141,7 +1151,7 @@ fn build_with_scope(
             oldest_considered_at: snapshot.oldest_considered_at, latest_considered_at: snapshot.latest_considered_at,
             retained_rows: snapshot.retained_rows,
             considered_rows: snapshot.considered_rows,
-            non_http_rows: snapshot.non_http_rows, projected_rows, included_rows, excluded_rows, omitted_rows,
+            non_http_rows: snapshot.non_http_rows, filtered_rows: snapshot.filtered_rows, projected_rows, included_rows, excluded_rows, omitted_rows,
             origin_count: origins.len(), endpoint_count: endpoint_indexes.len(), complete: stopped_by.is_empty(),
             stopped_by: stopped_by.into_iter().collect(), limits: ServiceMapLimits::new(max_records) },
         in_scope_only, origin_filter, origins,

@@ -235,6 +235,13 @@ is performed. Always inspect the reported completeness and unavailable fields;
 this is an observed inventory, not a verified infrastructure topology. See the
 [Service Map contract and examples](docs/integrations/service-map.md).
 
+The map has its own display filter, as Burp's site map does: the HTTP history
+filter's conditions (MIME type, status class, hidden extensions and the rest),
+kept apart from History's. By default it hides images, styles and fonts, so a
+page's static CDN and its arrows drop out. `sniper-cli scope service-map` takes
+the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`,
+`--hide-without-responses` and `--only-parameterized`.
+
 A separate, explicit `sniper-cli target service-map body-references --session-id
 <active-session-uuid> --evidence-id <returned-token>` read can inspect one retained
 UTF-8 HTML/JavaScript response preview. It returns canonical origins and preview

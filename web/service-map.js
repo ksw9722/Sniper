@@ -1028,7 +1028,7 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, request: sendRequest, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, request: sendRequest, document: doc = root.document }) {
     // A local retained-data read must not turn an API redirect into another
     // request. Enforce this for every map/inspector read, preserving its signal.
     const request = (path, options) => sendRequest(path, { ...options, redirect: "error" });
@@ -1743,6 +1743,7 @@
       abort = new AbortController();
       const requestId = ++state.requestId;
       const scopeOnly = state.scopeOnly;
+      const filterQuery = getFilterQuery();
       const historyVersion = state.historyVersion;
       state.backgroundLoading = !!state.snapshot && !force;
       state.loading = true;
@@ -1751,7 +1752,8 @@
       if (!state.snapshot || force) render();
       let failure = null;
       try {
-        const params = new URLSearchParams({ session_id: sessionId, in_scope_only: String(scopeOnly), max_records: "10000" });
+        // The Service Map filter's conditions use HTTP history's parameter names.
+        const params = new URLSearchParams({ ...filterQuery, session_id: sessionId, in_scope_only: String(scopeOnly), max_records: "10000" });
         const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal, headers: { [TECHNOLOGY_CATALOG_HEADER]: String(TECHNOLOGY_CATALOG_VERSION) } });
         if (!response.ok) {
           failure = mapFailure(response);
@@ -1771,6 +1773,14 @@
         state.refreshPaused = false;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
+        // Another filter counts other rows, wherever it changed (the dialog, a
+        // loaded setting, another window): rank the cards again for them.
+        const filterSignature = JSON.stringify(filterQuery);
+        if (state.filterSignature !== undefined && state.filterSignature !== filterSignature) {
+          state.order = [];
+          state.layoutSlots = new Map();
+        }
+        state.filterSignature = filterSignature;
         state.order = state.order.length ? stableOrder(state.order, allOrigins) : relationshipOrder(allOrigins);
         if (state.anchorOrigin && !findOrigin(state.anchorOrigin)) {
           state.anchorOrigin = null;
@@ -2078,6 +2088,12 @@
       }
     }
     function renderStatus() {
+      // Re-rendered with the status so a filter restored from settings shows.
+      if (els.filterSummary) {
+        const summary = getFilterSummary();
+        els.filterSummary.textContent = summary?.text || "";
+        els.filterSummary.title = summary?.detail || "";
+      }
       if (!els.status) return;
       const snapshot = state.snapshot?.snapshot;
       let status = "Open a session to view its retained history.";
@@ -2086,6 +2102,7 @@
         status = `${count(snapshot.considered_rows).toLocaleString()} rows considered / ${count(snapshot.retained_rows).toLocaleString()} retained · ${state.snapshot.origins.length.toLocaleString()} origins`;
         status += snapshot.complete === true ? " · Complete retained snapshot" : ` · Incomplete: ${array(snapshot.stopped_by).join(", ") || "projection bounds reached"}`;
         status += ` · ${count(snapshot.included_rows)} included / ${count(snapshot.excluded_rows)} excluded / ${count(snapshot.omitted_rows)} omitted among analyzed`;
+        if (count(snapshot.filtered_rows)) status += ` · ${count(snapshot.filtered_rows).toLocaleString()} hidden by the Service Map filter`;
         status += ` · Newest capture-sequence window: ${snapshot.oldest_considered_at || "unknown"} to ${snapshot.latest_considered_at || "unknown"}`;
         if (array(snapshot.stopped_by).includes("technology_token_scan_limit")) status += " · Header technology scan partial: token candidate limit reached";
         if (state.snapshot.legacyCatalog) status += ` · ${LEGACY_CATALOG_NOTICE}`;
@@ -2154,6 +2171,10 @@
         return;
       }
       const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}" d="${edge.path}" ${edge.undirected ? "" : 'marker-end="url(#service-map-arrow)"'}><title>${escape(edge.source)} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : edge.target)} · ${escape(edge.label)} · ${edge.relationship}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}</title></path>`).join("");
+      // The selected card's arrows carry dots moving from source to target, so
+      // its links and their direction stand out in a dense map.
+      const flows = layout.edges.filter((edge) => !edge.undirected && state.selectedOrigin && [edge.source, edge.target].includes(state.selectedOrigin))
+        .map((edge) => `<path class="service-map-flow" d="${edge.path}"></path>`).join("");
       const cards = layout.nodes.map((origin) => {
         if (origin.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(origin.address)}" style="left:${origin.x}px;top:${origin.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(origin.address)}">${escape(origin.address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${origin.family.toUpperCase()}</span><span class="service-map-card-meta">Undirected observations only</span><span class="service-map-card-meta">No shared ownership inferred</span></span></div>`;
         const selected = origin.origin === state.selectedOrigin;
@@ -2164,7 +2185,7 @@
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
       }).join("");
-      replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout" style="--service-map-card-width:${layout.geometry.cardWidth}px;--service-map-card-height:${layout.geometry.cardHeight}px;--service-map-line-height:${layout.geometry.lineHeight};width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}</svg>${cards}</div></div>`);
+      replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout" style="--service-map-card-width:${layout.geometry.cardWidth}px;--service-map-card-height:${layout.geometry.cardHeight}px;--service-map-line-height:${layout.geometry.lineHeight};width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}${flows}</svg>${cards}</div></div>`);
       if (state.relationLayers.some((layer) => layer.kind === "peer")
         || new Set(state.relationLayers.map((layer) => layer.kind)).size > 1) {
         const addressCount = layout.nodes.filter((item) => item.endpointNode).length;
@@ -2652,6 +2673,17 @@
     return {
       refresh, reset, selectOrigin, setProductFilter, setZoom, fitGraph, loadEvidence, loadPeerEvidence, loadPeerMatches, showPeerMatchesOnMap, loadBodyReferences, loadLinkDeclarations, loadHtmlGenerators, setRelationshipKind, showBodyReferencesOnMap, showLinkDeclarationsOnMap, clearBodyReferenceOverlay,
       displayChanged() { renderGraph(); },
+      // The Service Map filter changes which rows count, as the scope filter
+      // does, so it drops inspections the same way; the read re-ranks the cards.
+      filterChanged() {
+        state.refreshPaused = false;
+        clearOverlay("Temporary body references cleared because the Service Map filter changed.");
+        state.page = 0;
+        state.snapshot = null;
+        state.endpointIndex = null;
+        cancelEvidence();
+        return refresh({ force: true });
+      },
       scopeChanged(previous, next) {
         const signature = (runtime) => JSON.stringify([array(runtime?.scope_patterns), array(runtime?.excluded_scope_patterns)]);
         if (signature(previous) === signature(next)) return false;

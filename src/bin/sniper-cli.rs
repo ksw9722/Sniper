@@ -898,6 +898,60 @@ struct ServiceMapArgs {
     /// Select the literal response-header technology catalog (default: 2).
     #[arg(long, default_value_t = 2, value_parser = parse_service_map_catalog_version)]
     technology_catalog_version: u32,
+    #[command(flatten)]
+    filter: ServiceMapFilterArgs,
+}
+
+const SERVICE_MAP_MIME_TYPES: [&str; 7] = [
+    "html",
+    "script",
+    "json",
+    "css",
+    "image",
+    "websocket",
+    "other",
+];
+const SERVICE_MAP_STATUS_CLASSES: [&str; 5] = [
+    "success",
+    "redirect",
+    "client_error",
+    "server_error",
+    "other",
+];
+
+/// The Service Map display filter. Each condition hides rows exactly as the
+/// HTTP history filter does; omitted conditions hide nothing.
+#[derive(Args, Debug, Default)]
+struct ServiceMapFilterArgs {
+    /// Keep only rows in these MIME groups. Repeat or comma-separate.
+    #[arg(long, value_delimiter = ',', value_parser = SERVICE_MAP_MIME_TYPES)]
+    mime_types: Vec<String>,
+    /// Keep only rows in these status classes. Repeat or comma-separate.
+    #[arg(long, value_delimiter = ',', value_parser = SERVICE_MAP_STATUS_CLASSES)]
+    status_classes: Vec<String>,
+    /// Hide rows whose path ends in these extensions, e.g. png,css,woff2.
+    #[arg(long, value_delimiter = ',', value_parser = parse_service_map_extension)]
+    hidden_extensions: Vec<String>,
+    /// Hide rows that have no response.
+    #[arg(long)]
+    hide_without_responses: bool,
+    /// Keep only rows whose URL has a query string.
+    #[arg(long)]
+    only_parameterized: bool,
+}
+
+fn parse_service_map_extension(value: &str) -> Result<String, String> {
+    let extension = value.trim().trim_start_matches('.').to_ascii_lowercase();
+    if !extension.is_empty()
+        && extension.len() <= 16
+        && extension.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        Ok(extension)
+    } else {
+        Err(format!(
+            "extension must be 1-16 letters or digits, such as png or woff2: {value}"
+        ))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -4202,15 +4256,20 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     ] {
         limits["properties"][name] = json!({"type":"integer","enum":[cap]});
     }
-    let snapshot = service_map_object(json!({
+    let mut snapshot = service_map_object(json!({
         "id":uuid,"generation":uuid,"captured_at":timestamp,
         "first_retained_started_at":nullable_timestamp,"last_retained_started_at":nullable_timestamp,
         "window_order":{"type":"string","enum":["newest_capture_sequence"]},
         "oldest_considered_at":nullable_timestamp,"latest_considered_at":nullable_timestamp,
-        "retained_rows":count,"considered_rows":count,"non_http_rows":count,"projected_rows":count,"included_rows":count,
+        "retained_rows":count,"considered_rows":count,"non_http_rows":count,"filtered_rows":count,"projected_rows":count,"included_rows":count,
         "excluded_rows":count,"omitted_rows":count,"origin_count":count,"endpoint_count":count,
         "complete":boolean,"stopped_by":strings,"limits":limits
     }));
+    // Present only when a display filter hid rows; older servers never send it.
+    snapshot["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|name| name != "filtered_rows");
     Some(service_map_catalog_output_schema(
         service_map_object(json!({
             "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
@@ -4234,7 +4293,12 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "session_id":legacy_uuid_input_schema(true, "Read this retained session without switching it. Omitted or null pins the active session once."),
                 "origin":{"type":["string","null"],"description":"Exact canonical HTTP(S) origin (for example https://example.com), without path, credentials, query, fragment, or explicit default port. Omitted or null selects all observed origins."},
                 "in_scope_only":{"type":["boolean","null"],"default":false,"description":"Filter retained rows using the session's current shared scope matcher. Null uses false."},
-                "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."}
+                "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."},
+                "mime_types":{"type":["array","null"],"items":{"type":"string","enum":SERVICE_MAP_MIME_TYPES},"description":"Display filter: keep only rows in these MIME groups, as HTTP history does. Omitted, null or empty keeps every group; snapshot.filtered_rows counts hidden rows."},
+                "status_classes":{"type":["array","null"],"items":{"type":"string","enum":SERVICE_MAP_STATUS_CLASSES},"description":"Display filter: keep only rows in these status classes. Omitted, null or empty keeps every class."},
+                "hidden_extensions":{"type":["array","null"],"items":{"type":"string","pattern":"^\\.?[A-Za-z0-9]{1,16}$"},"description":"Display filter: hide rows whose path ends in these extensions, such as png or woff2. Omitted, null or empty hides none."},
+                "hide_without_responses":{"type":["boolean","null"],"default":false,"description":"Display filter: hide rows that have no response. Null uses false."},
+                "only_parameterized":{"type":["boolean","null"],"default":false,"description":"Display filter: keep only rows whose URL has a query string. Null uses false."}
             }
         })),
         "target.service_map.socket_peer_matches.get" => Some(json!({
@@ -4275,6 +4339,24 @@ fn service_map_path(args: &ServiceMapArgs, session_id: Option<Uuid>) -> String {
     ];
     if let Some(origin) = &args.origin {
         params.push(("origin".into(), origin.clone()));
+    }
+    let filter = &args.filter;
+    for (name, values) in [
+        ("mime_types", &filter.mime_types),
+        ("status_classes", &filter.status_classes),
+        ("hidden_extensions", &filter.hidden_extensions),
+    ] {
+        if !values.is_empty() {
+            params.push((name.into(), values.join(",")));
+        }
+    }
+    for (name, enabled) in [
+        ("hide_without_responses", filter.hide_without_responses),
+        ("only_parameterized", filter.only_parameterized),
+    ] {
+        if enabled {
+            params.push((name.into(), "true".into()));
+        }
     }
     let query = encode_query(params);
     session_query_path(&format!("/api/target/service-map?{query}"), session_id)
@@ -5275,6 +5357,11 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "in_scope_only",
             "max_records",
             "technology_catalog_version",
+            "mime_types",
+            "status_classes",
+            "hidden_extensions",
+            "hide_without_responses",
+            "only_parameterized",
         ],
         "target.service_map.evidence.get" => &[
             "session_id",
@@ -6954,6 +7041,37 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                         .transpose()?,
                     max_records,
                     technology_catalog_version: call_service_map_catalog_version(input)?,
+                    filter: ServiceMapFilterArgs {
+                        mime_types: call_service_map_tokens(
+                            operation,
+                            input,
+                            "mime_types",
+                            &SERVICE_MAP_MIME_TYPES,
+                        )?,
+                        status_classes: call_service_map_tokens(
+                            operation,
+                            input,
+                            "status_classes",
+                            &SERVICE_MAP_STATUS_CLASSES,
+                        )?,
+                        hidden_extensions: call_optional::<Vec<String>>(
+                            operation,
+                            input,
+                            "hidden_extensions",
+                        )?
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|value| {
+                            parse_service_map_extension(value).map_err(|message| anyhow!(message))
+                        })
+                        .collect::<Result<_>>()?,
+                        hide_without_responses: call_bool(
+                            operation,
+                            input,
+                            "hide_without_responses",
+                        )?,
+                        only_parameterized: call_bool(operation, input, "only_parameterized")?,
+                    },
                 }),
             }
         }
@@ -6974,6 +7092,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     in_scope_only: false,
                     max_records: 10_000,
                     technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
                 }),
             }
         }
@@ -6994,6 +7113,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     in_scope_only: false,
                     max_records: 10_000,
                     technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
                 }),
             }
         }
@@ -7031,6 +7151,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     in_scope_only: false,
                     max_records: 10_000,
                     technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
                 }),
             }
         }
@@ -7051,6 +7172,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     in_scope_only: false,
                     max_records: 10_000,
                     technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
                 }),
             }
         }
@@ -7741,6 +7863,22 @@ fn call_optional_path(operation: &str, input: &Value, field: &str) -> Result<Opt
 
 fn call_bool(operation: &str, input: &Value, field: &str) -> Result<bool> {
     Ok(call_optional::<bool>(operation, input, field)?.unwrap_or(false))
+}
+
+fn call_service_map_tokens(
+    operation: &str,
+    input: &Value,
+    field: &str,
+    allowed: &[&str],
+) -> Result<Vec<String>> {
+    let values = call_optional::<Vec<String>>(operation, input, field)?.unwrap_or_default();
+    if let Some(value) = values
+        .iter()
+        .find(|value| !allowed.contains(&value.as_str()))
+    {
+        bail!("{field} accepts {}; got {value}", allowed.join(", "));
+    }
+    Ok(values)
 }
 
 fn call_optional_nonzero_usize(

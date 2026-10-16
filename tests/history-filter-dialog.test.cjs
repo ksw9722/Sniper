@@ -61,11 +61,16 @@ function fixture() {
   document.activeElement = els.openFilterSettingsButton;
   document.querySelector = () => els.openFilterSettingsButton;
   const state = { displaySettings: {}, historyColumnWidths: {}, historyColumnOrder: [], wsColumnWidths: {} };
+  const mapFilterChanges = [];
   const context = loadFunctions([
     "createDefaultFilterSettings", "openFilterModal", "closeFilterModal", "isModalVisible", "restoreModalFocus", "trapModalFocus", "getActiveModalAction",
     "hydrateFilterForm", "applyFilterSettings", "syncColorTagFilterUI", "truncateUiSettingsText", "sanitizeHttpFilterSettings", "sanitizeHttpBooleanMap", "sanitizeHttpColorTags", "serializeHttpFilterSettings",
     "isUiSettingsLoadSnapshot", "loadUiSettings", "applyUiSettingsSnapshot", "updateUiSettingsServerRevision", "snapshotUiSettings", "nextUiSettingsSnapshot", "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "persistUiSettings",
+    "serviceMapFilterApplied", "serviceMapFilterQuery", "serviceMapFilterSummary", "selectedMimeTypes", "selectedStatusClasses",
   ], {
+    targetServiceMapController: { filterChanged: () => mapFilterChanges.push(true) },
+    SERVICE_MAP_FILTER_MIME_LABELS: { html: "HTML", script: "script", json: "JSON", css: "CSS", image: "images", websocket: "WebSocket", other: "other types" },
+    SERVICE_MAP_FILTER_STATUS_LABELS: { success: "2xx", redirect: "3xx", clientError: "4xx", serverError: "5xx", other: "other status" },
     state, els, document, activeConfirmDialog: null, filterSettingsReturnFocus: null, filterSettingsEditedControls: new Set(),
     uiSettingsLoadState: "loading", uiSettingsLoadPromise: null, displaySettingsReady: true, pendingDisplaySettingsApply: null,
     uiSettingsInitialPostGeneration: 0, uiSettingsInitialPostRevision: 0,
@@ -89,6 +94,7 @@ function fixture() {
     serializeWorkbenchPaneWidths: () => ({}), applyDisplaySettingsState() {}, renderHistoryHeader() {}, applyHistoryColumnWidths() {}, applyWsColumnWidths() {},
     updateWebsocketSortIndicators() {}, applySavedWorkbenchPaneWidths() {}, applySavedWebsocketPaneWidth() {}, applySavedWebsocketStackHeight() {}, applySavedWsReplayLayout() {},
   });
+  state.serviceMapFilterSettings = context.createDefaultFilterSettings();
   state.filterSettings = context.createDefaultFilterSettings();
   state.filterSettings.searchTerm = "saved";
   state.filterSettings.onlyNotes = true;
@@ -102,7 +108,7 @@ function fixture() {
   const keyEnd = appSource.indexOf('    if (\n      !event.defaultPrevented', keyStart);
   vm.runInContext(appSource.slice(keyStart, keyEnd) + "  });", context);
   return {
-    context, state, els, document, timers, writes, refreshes, notices,
+    context, state, els, document, timers, writes, refreshes, notices, mapFilterChanges,
     get selectionClears() { return selectionClears; },
     async save() { context.uiSettingsDirty = true; await context.persistUiSettings(); },
     key(key, target = document.activeElement, options = {}) {
@@ -485,4 +491,35 @@ test("composing Escape retains the unapplied Filter draft and normal Escape stil
   assert.equal(f.document.activeElement, f.els.openFilterSettingsButton);
   f.context.openFilterModal(); assert.equal(f.els.filterSearchTerm.value, "saved");
   assert.equal(f.writes.length, 0); assert.equal(f.refreshes.length, 0);
+});
+
+test("the Service Map Filter edits only the map's own settings and saves both filters apart", async () => {
+  const f = fixture();
+  assert.deepEqual({ ...f.context.serviceMapFilterQuery() }, { hidden_extensions: "png,ico,css,woff,woff2,ttf,svg,jpg,jpeg,gif" },
+    "by default only static files are hidden; groups with every option selected are not sent");
+  f.context.openFilterModal("serviceMap");
+  assert.equal(f.els.filterSearchTerm.value, "", "the map opens with its own settings, not History's");
+  f.els.filterMimeImage.checked = false; f.els.filterMimeImage.dispatch("change");
+  f.els.filterHiddenExtensions.value = "png,js"; f.els.filterHiddenExtensions.dispatch("input");
+  f.els.applyFilterSettingsButton.dispatch("click");
+  assert.equal(f.state.serviceMapFilterSettings.mime.image, false);
+  assert.equal(f.state.filterSettings.searchTerm, "saved", "History keeps its filter");
+  assert.equal(f.mapFilterChanges.length, 1, "the map re-reads once");
+  assert.equal(f.refreshes.length, 0, "History does not reload");
+  assert.deepEqual({ ...f.context.serviceMapFilterQuery() }, { mime_types: "html,script,json,css,websocket,other", hidden_extensions: "png,js" });
+  assert.equal(f.context.serviceMapFilterSummary().text, "hiding png, js · no images");
+  await f.save();
+  const saved = f.writes.at(-1);
+  assert.equal(saved.service_map_filter_settings.mime.image, false);
+  assert.equal(saved.service_map_filter_settings.hidden_extensions, "png,js");
+  assert.equal(saved.http_filter_settings.search_term, "saved");
+
+  f.context.openFilterModal();
+  assert.equal(f.els.filterSearchTerm.value, "saved", "History's dialog still shows History's filter");
+  f.context.closeFilterModal();
+  f.context.openFilterModal("serviceMap");
+  f.els.resetFilterSettingsButton.dispatch("click");
+  assert.equal(f.state.serviceMapFilterSettings.mime.image, true, "Reset restores the map defaults");
+  assert.equal(f.mapFilterChanges.length, 2);
+  assert.equal(f.state.filterSettings.searchTerm, "saved");
 });

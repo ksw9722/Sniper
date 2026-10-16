@@ -1517,3 +1517,143 @@ async fn recorded_peer_matches_api_and_cli_preserve_exact_sources_and_private_de
     drop(state);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn filter_row(
+    host: &str,
+    path: &str,
+    content_type: &str,
+    referer: Option<&str>,
+) -> TransactionRecord {
+    let mut request_headers = HeaderMap::new();
+    if let Some(referer) = referer {
+        request_headers.insert("referer", referer.parse().unwrap());
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("content-type", content_type.parse().unwrap());
+    TransactionRecord::http(
+        chrono::Utc::now(),
+        "GET".into(),
+        "https".into(),
+        host.into(),
+        path.into(),
+        Some(200),
+        1,
+        MessageRecord::from_headers_and_body(&request_headers, b"", 1024),
+        Some(MessageRecord::from_headers_and_body(
+            &response_headers,
+            b"",
+            1024,
+        )),
+        Vec::new(),
+        None,
+        None,
+    )
+}
+
+// A page's image CDN is the noise the Service Map filter removes: its row, its
+// card and the page's Referer arrow to it go, through the API and the CLI alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_map_display_filter_hides_rows_through_api_and_cli_as_history_does() {
+    let dir = std::env::temp_dir().join(format!("sniper-map-filter-{}", Uuid::new_v4()));
+    let state = Arc::new(
+        AppState::new(AppConfig {
+            data_dir: dir.clone(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 1024,
+        })
+        .unwrap(),
+    );
+    let session = state.session().await;
+    let session_id = session.id();
+    let page = "https://www.example.com/";
+    for record in [
+        filter_row("www.example.com", "/", "text/html", None),
+        filter_row("cdn.example.com", "/logo.png", "image/png", Some(page)),
+        filter_row(
+            "api.example.com",
+            "/v1/items",
+            "application/json",
+            Some(page),
+        ),
+    ] {
+        session.store.insert(record).await;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let app = sniper::api::router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let get = |query: &str| {
+        let url = format!("{api}/api/target/service-map?session_id={session_id}{query}");
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let origins = |map: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = map["origins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|origin| origin["origin"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let cdn = "https://cdn.example.com".to_string();
+
+    let all = get("").await;
+    assert!(origins(&all).contains(&cdn));
+    assert!(
+        all["snapshot"].get("filtered_rows").is_none(),
+        "an unfiltered map keeps its earlier shape"
+    );
+
+    let filtered = get("&hidden_extensions=PNG,%20css").await;
+    assert!(!origins(&filtered).contains(&cdn));
+    assert_eq!(filtered["snapshot"]["filtered_rows"], 1);
+    assert_eq!(filtered["snapshot"]["considered_rows"], 3);
+    let api_origin = filtered["origins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|origin| origin["origin"] == "https://api.example.com")
+        .unwrap();
+    assert_eq!(
+        api_origin["header_links"][0]["source_origin"],
+        "https://www.example.com"
+    );
+
+    let cli = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id": session_id, "hidden_extensions": ["png"]}),
+    )
+    .await;
+    assert_eq!(origins(&cli), origins(&filtered));
+    let cli_mime = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id": session_id, "mime_types": ["html", "json"]}),
+    )
+    .await;
+    assert_eq!(origins(&cli_mime), origins(&filtered));
+    assert_eq!(cli_mime["snapshot"]["filtered_rows"], 1);
+
+    server.abort();
+    drop(session);
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}

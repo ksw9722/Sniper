@@ -5360,7 +5360,7 @@ async fn update_match_replace_rules(
     Json(rules).into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceMapQuery {
     session_id: Option<Uuid>,
@@ -5368,6 +5368,46 @@ struct ServiceMapQuery {
     in_scope_only: bool,
     max_records: Option<usize>,
     origin: Option<String>,
+    // The Service Map display filter: the HTTP history filter's row conditions,
+    // under the same names as `/api/transactions`.
+    #[serde(default)]
+    hide_without_responses: bool,
+    #[serde(default)]
+    only_parameterized: bool,
+    #[serde(default)]
+    only_notes: bool,
+    status_classes: Option<String>,
+    mime_types: Option<String>,
+    hidden_extensions: Option<String>,
+    port: Option<String>,
+    color_tags: Option<String>,
+    advanced_search: Option<String>,
+    #[serde(default)]
+    advanced_regex: bool,
+    #[serde(default)]
+    advanced_case_sensitive: bool,
+    #[serde(default)]
+    advanced_negative: bool,
+}
+
+/// Builds the map's display filter as `transaction_list_filters` would, so a
+/// condition hides exactly the rows it hides in HTTP history.
+fn service_map_row_filters(query: &ServiceMapQuery) -> ListFilters {
+    ListFilters {
+        hide_without_responses: query.hide_without_responses,
+        only_parameterized: query.only_parameterized,
+        only_notes: query.only_notes,
+        status_classes: optional_csv_param(query.status_classes.clone()),
+        mime_types: optional_csv_param(query.mime_types.clone()),
+        hidden_extensions: csv_param(query.hidden_extensions.clone()),
+        port: query.port.clone().filter(|port| !port.trim().is_empty()),
+        color_tags: csv_param(query.color_tags.clone()),
+        advanced_search: query.advanced_search.clone(),
+        advanced_regex: query.advanced_regex,
+        advanced_case_sensitive: query.advanced_case_sensitive,
+        advanced_negative: query.advanced_negative,
+        ..ListFilters::default()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5478,6 +5518,7 @@ async fn get_target_service_map_impl(
         Ok(selection) => selection,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    let row_filters = service_map_row_filters(&query);
     let max_records = query
         .max_records
         .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
@@ -5519,7 +5560,12 @@ async fn get_target_service_map_impl(
         }
         let (snapshot, epoch) = worker_session
             .store
-            .service_map_snapshot_blocking_for_catalog(worker_session.id(), max_records, catalog);
+            .service_map_snapshot_blocking_for_catalog(
+                worker_session.id(),
+                max_records,
+                catalog,
+                &row_filters,
+            );
         let mut map = crate::service_map::build_bounded(
             worker_session.id(),
             snapshot,
@@ -15277,6 +15323,7 @@ mod tests {
             in_scope_only: false,
             max_records: Some(100),
             origin: None,
+            ..Default::default()
         }
     }
 
@@ -15879,6 +15926,7 @@ mod tests {
                     in_scope_only: false,
                     max_records: None,
                     origin: None,
+                    ..Default::default()
                 }),
             )
             .await,
@@ -15944,6 +15992,7 @@ mod tests {
                     in_scope_only: false,
                     max_records: None,
                     origin: Some(origin.into()),
+                    ..Default::default()
                 }),
             )
             .await;
@@ -15958,6 +16007,7 @@ mod tests {
                     in_scope_only: false,
                     max_records: Some(limit),
                     origin: None,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -15977,6 +16027,7 @@ mod tests {
                     in_scope_only: false,
                     max_records: None,
                     origin: None,
+                    ..Default::default()
                 }),
             )
             .await,
@@ -16929,6 +16980,7 @@ mod tests {
                 in_scope_only: false,
                 max_records: None,
                 origin: None,
+                ..Default::default()
             }),
         )
         .await;
@@ -16942,6 +16994,7 @@ mod tests {
                 in_scope_only: false,
                 max_records: None,
                 origin: None,
+                ..Default::default()
             }),
         )
         .await;

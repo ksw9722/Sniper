@@ -31,6 +31,7 @@ async fn capture(store: &Arc<TransactionStore>) -> (MetadataSnapshot, ServiceMap
             Uuid::from_u128(99),
             DEFAULT_MAX_RECORDS,
             CatalogVersion::V1,
+            &crate::store::ListFilters::default(),
         )
     })
     .await
@@ -67,6 +68,7 @@ async fn service_map_epoch_blocking_projection_matches_async_and_never_reads_bod
                 Uuid::from_u128(99),
                 DEFAULT_MAX_RECORDS,
                 catalog,
+                &crate::store::ListFilters::default(),
             )
         })
         .await

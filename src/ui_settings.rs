@@ -351,6 +351,9 @@ pub struct AppUiSettingsSnapshot {
     pub http_sort_key: String,
     pub http_sort_direction: String,
     pub http_filter_settings: HttpFilterSettingsSnapshot,
+    /// Service Map's own display filter, as Burp keeps one for its site map: the
+    /// HTTP history conditions, set apart so each view hides what suits it.
+    pub service_map_filter_settings: HttpFilterSettingsSnapshot,
     pub workbench_height: Option<u16>,
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
@@ -384,6 +387,7 @@ impl Default for AppUiSettingsSnapshot {
             http_sort_key: "index".to_string(),
             http_sort_direction: "desc".to_string(),
             http_filter_settings: HttpFilterSettingsSnapshot::default(),
+            service_map_filter_settings: HttpFilterSettingsSnapshot::default(),
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
@@ -426,6 +430,7 @@ impl AppUiSettingsSnapshot {
         sanitized.http_sort_direction =
             sanitize_option(self.http_sort_direction, "desc", &["asc", "desc"]);
         sanitized.http_filter_settings = self.http_filter_settings.sanitized();
+        sanitized.service_map_filter_settings = self.service_map_filter_settings.sanitized();
         sanitized.workbench_height = self
             .workbench_height
             .filter(|height| *height > 0)
@@ -2104,5 +2109,39 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // The map keeps its own filter: a file saved before it existed opens with
+    // static files hidden, and one view's filter never rewrites the other's.
+    #[test]
+    fn service_map_filter_defaults_and_stays_apart_from_history() {
+        let static_files = "png,ico,css,woff,woff2,ttf,svg,jpg,jpeg,gif";
+        let older: super::AppUiSettingsSnapshot = serde_json::from_value(
+            serde_json::json!({"http_filter_settings": {"hidden_extensions": ""}}),
+        )
+        .unwrap();
+        let older = older.sanitized();
+        assert_eq!(older.http_filter_settings.hidden_extensions, "");
+        assert_eq!(
+            older.service_map_filter_settings.hidden_extensions,
+            static_files
+        );
+
+        let saved: super::AppUiSettingsSnapshot = serde_json::from_value(serde_json::json!({
+            "service_map_filter_settings": {"hidden_extensions": "png,js", "only_parameterized": true}
+        }))
+        .unwrap();
+        let reopened: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::to_value(saved.sanitized()).unwrap()).unwrap();
+        let reopened = reopened.sanitized();
+        assert_eq!(
+            reopened.service_map_filter_settings.hidden_extensions,
+            "png,js"
+        );
+        assert!(reopened.service_map_filter_settings.only_parameterized);
+        assert_eq!(
+            reopened.http_filter_settings.hidden_extensions,
+            static_files
+        );
     }
 }

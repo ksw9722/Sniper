@@ -1382,7 +1382,13 @@ impl TransactionStore {
         catalog: crate::service_map_technology::CatalogVersion,
     ) -> crate::service_map::MetadataSnapshot {
         let inner = self.inner.read().await;
-        self.service_map_snapshot_locked(&inner, session_id, max_records, catalog)
+        self.service_map_snapshot_locked(
+            &inner,
+            session_id,
+            max_records,
+            catalog,
+            &ListFilters::default(),
+        )
     }
 
     /// Call only in a blocking worker. The fence and projection share one read
@@ -1392,13 +1398,15 @@ impl TransactionStore {
         session_id: Uuid,
         max_records: usize,
         catalog: crate::service_map_technology::CatalogVersion,
+        filters: &ListFilters,
     ) -> (
         crate::service_map::MetadataSnapshot,
         ServiceMapMetadataEpoch,
     ) {
         let inner = self.inner.blocking_read();
         let epoch = ServiceMapMetadataEpoch(inner.service_map_metadata_epoch);
-        let snapshot = self.service_map_snapshot_locked(&inner, session_id, max_records, catalog);
+        let snapshot =
+            self.service_map_snapshot_locked(&inner, session_id, max_records, catalog, filters);
         (snapshot, epoch)
     }
 
@@ -1415,11 +1423,15 @@ impl TransactionStore {
         session_id: Uuid,
         max_records: usize,
         catalog: crate::service_map_technology::CatalogVersion,
+        filters: &ListFilters,
     ) -> crate::service_map::MetadataSnapshot {
         use crate::service_map::{
             evidence_id, project_record, project_record_for_catalog, MetadataSnapshot,
             MAX_METADATA_BYTES,
         };
+        // The display filter is HTTP history's own row matcher, so the map hides
+        // exactly the rows History would hide; scope stays with `in_scope_only`.
+        let advanced_matcher = AdvancedSearchMatcher::new(filters);
         let mut snapshot = MetadataSnapshot {
             generation: self.saved_cursor_generation,
             captured_at: chrono::Utc::now(),
@@ -1430,12 +1442,19 @@ impl TransactionStore {
             retained_rows: inner.entries.len(),
             considered_rows: 0,
             non_http_rows: 0,
+            filtered_rows: 0,
             omitted_rows: 0,
             stopped_by: Default::default(),
             rows: Vec::new(),
         };
         let mut bytes = 0usize;
-        for (record, revision) in inner.entries.iter().zip(&inner.body_generations).rev() {
+        for ((record, revision), cached) in inner
+            .entries
+            .iter()
+            .zip(&inner.body_generations)
+            .zip(&inner.summaries)
+            .rev()
+        {
             if snapshot.considered_rows >= max_records {
                 snapshot.stopped_by.insert("max_records".into());
                 break;
@@ -1453,6 +1472,22 @@ impl TransactionStore {
             );
             if record.method == "CONNECT" {
                 snapshot.non_http_rows += 1;
+                continue;
+            }
+            if !matches_filters(
+                cached,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                filters,
+                advanced_matcher.as_ref(),
+                false,
+            ) {
+                snapshot.filtered_rows += 1;
                 continue;
             }
             let id = evidence_id(session_id, self.saved_cursor_generation, *revision, record);

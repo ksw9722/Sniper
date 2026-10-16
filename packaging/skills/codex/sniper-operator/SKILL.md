@@ -43,7 +43,12 @@ traffic. Discover its input/output schemas and examples first. Pin `session_id`
 explicitly, including for inactive sessions; no switch is needed. Optional
 `in_scope_only` uses current shared scope rules. `max_records` defaults to 10000
 and is capped at 50000. Optional `origin` is an exact canonical HTTP(S) origin,
-without a path, query, credentials, or fragment. Check `snapshot.complete`, `stopped_by`, counts, limits,
+without a path, query, credentials, or fragment. Optional `mime_types`,
+`status_classes`, `hidden_extensions`, `hide_without_responses` and
+`only_parameterized` hide rows exactly as the HTTP history filter does, for
+example `hidden_extensions: ["png","css","woff2"]` to drop static CDNs;
+`snapshot.filtered_rows` counts them. Omitted, they hide nothing; the GUI's saved
+map filter never applies to these reads. Check `snapshot.complete`, `stopped_by`, counts, limits,
 `unavailable`, `deferred`, and warnings before claiming coverage. Counts include duplicate-ID
 rows, and even a complete result covers retained captures only.
 

@@ -305,6 +305,16 @@ columns all bent at the middle of the gap and fused into one band; each now
 turns at its own point, the longest nearest its source. Cards whose links all
 fell past the 40-arrow cap were still laid out among linked cards with no
 arrow; they now join the unlinked grid. A pinned body/Link star also centers its
-source on its neighbours. A Referer or Origin naming the requested origin itself is no longer
+source on its neighbours.
+
+The map also gained its own display filter, as Burp has for its site map. It
+opens HTTP history's filter dialog on the map's own settings, saved apart in UI
+settings, and the server applies History's row matcher while it takes the map
+snapshot, so a condition hides exactly the rows it hides in History. The default
+hides images, styles and fonts, which removes a page's static CDN and its arrows.
+`snapshot.filtered_rows` and the status line count the hidden rows, and
+`sniper-cli scope service-map` takes the same conditions as options. The selected
+card's arrows now carry dots moving toward their targets; reduced motion drops
+them. A Referer or Origin naming the requested origin itself is no longer
 listed as a relationship. A trackpad pinch, or Ctrl with the mouse wheel, zooms
 the graph around the pointer.

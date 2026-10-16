@@ -466,6 +466,8 @@ const state = {
   historyColumnOrder: [...DEFAULT_HISTORY_COLUMN_ORDER],
   wsColumnWidths: createDefaultWsColumnWidths(),
   filterSettings: createDefaultFilterSettings(),
+  // Service Map's own display filter, as Burp keeps one for its site map.
+  serviceMapFilterSettings: createDefaultFilterSettings(),
   targetScopeDraft: "",
   targetScopeExcludeDraft: "",
   targetScopeDirty: false,
@@ -1655,6 +1657,14 @@ function bindEvents() {
   });
   els.applyFilterSettingsButton.addEventListener("click", applyFilterSettings);
   els.resetFilterSettingsButton.addEventListener("click", () => {
+    if (state.filterModalTarget === "serviceMap") {
+      state.serviceMapFilterSettings = createDefaultFilterSettings();
+      hydrateFilterForm();
+      filterSettingsEditedControls.clear();
+      els.filterModal.querySelectorAll("input").forEach((control) => filterSettingsEditedControls.add(control));
+      serviceMapFilterApplied();
+      return;
+    }
     state.filterSettings = createDefaultFilterSettings();
     hydrateFilterForm();
     filterSettingsEditedControls.clear();
@@ -14723,6 +14733,7 @@ function initializeTargetWorkspace() {
     elements: {
       panel,
       status: document.getElementById("serviceMapStatus"),
+      filterSummary: document.getElementById("serviceMapFilterSummary"),
       refresh: document.getElementById("serviceMapRefresh"),
       search: document.getElementById("serviceMapSearch"),
       scope: document.getElementById("serviceMapScopeOnly"),
@@ -14747,8 +14758,11 @@ function initializeTargetWorkspace() {
     },
     getSessionId: currentSessionId,
     getEventStreamReady: () => targetServiceMapEventStreamReady(),
+    getFilterQuery: () => serviceMapFilterQuery(),
+    getFilterSummary: () => serviceMapFilterSummary(),
     request: (path, options) => fetch(path, options),
   });
+  document.getElementById("serviceMapFilterButton")?.addEventListener("click", () => openFilterModal("serviceMap"));
   // Inspector-to-map navigation already owns a verified snapshot. Keep the
   // explicit temporary-reference action local instead of issuing another read.
   targetServiceMapController.setViewChange((view) => setActiveTargetView(view, { refresh: false }));
@@ -20301,8 +20315,18 @@ function closeDisplaySettingsModal() {
   }
 }
 
-function openFilterModal() {
+// One dialog edits either HTTP history's filter or the Service Map's own one;
+// state.filterModalTarget says which.
+function openFilterModal(target) {
   if (isModalVisible(els.filterModal)) return;
+  state.filterModalTarget = target === "serviceMap" ? "serviceMap" : "history";
+  const forMap = state.filterModalTarget === "serviceMap";
+  const title = document.getElementById?.("filterModalTitle");
+  if (title) title.textContent = forMap ? "Service Map filter" : "Filter settings";
+  const kicker = els.filterModal.querySelector?.(".modal-header .placeholder-kicker");
+  if (kicker) kicker.textContent = forMap ? "Scope" : "HTTP";
+  // The map keeps scope on its own In scope only toggle.
+  els.filterInScopeOnly?.closest?.("label")?.classList.toggle("hidden", forMap);
   filterSettingsReturnFocus = document.activeElement;
   filterSettingsEditedControls.clear();
   hydrateFilterForm();
@@ -20476,8 +20500,8 @@ function sanitizeHttpFilterSettings(candidate) {
   };
 }
 
-function serializeHttpFilterSettings() {
-  const filters = sanitizeHttpFilterSettings(state.filterSettings);
+function serializeHttpFilterSettings(source = state.filterSettings) {
+  const filters = sanitizeHttpFilterSettings(source);
   return {
     in_scope_only: filters.inScopeOnly,
     hide_without_responses: filters.hideWithoutResponses,
@@ -20912,6 +20936,8 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   state.sortKey = sanitizeHttpSortKey(snapshot?.http_sort_key);
   state.sortDirection = sanitizeHttpSortDirection(snapshot?.http_sort_direction);
   state.filterSettings = sanitizeHttpFilterSettings(snapshot?.http_filter_settings);
+  // The map reads its filter on every refresh and re-ranks when it changed.
+  state.serviceMapFilterSettings = sanitizeHttpFilterSettings(snapshot?.service_map_filter_settings);
   if (snapshot?.ws_column_widths && typeof snapshot.ws_column_widths === "object") {
     Object.entries(snapshot.ws_column_widths).forEach(([k, v]) => {
       if (WS_COLUMN_RULES[k] && WS_COLUMN_RULES[k].max > 0 && typeof v === "number") {
@@ -20997,6 +21023,7 @@ function snapshotUiSettings() {
     http_sort_key: sanitizeHttpSortKey(state.sortKey),
     http_sort_direction: sanitizeHttpSortDirection(state.sortDirection),
     http_filter_settings: serializeHttpFilterSettings(),
+    service_map_filter_settings: serializeHttpFilterSettings(state.serviceMapFilterSettings),
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,
@@ -21205,7 +21232,7 @@ function syncHttpCapturePill() {
 }
 
 function hydrateFilterForm({ preserveDraft = false } = {}) {
-  const filters = state.filterSettings;
+  const filters = state.filterModalTarget === "serviceMap" ? state.serviceMapFilterSettings : state.filterSettings;
   const update = (control, value) => {
     if (!preserveDraft || !filterSettingsEditedControls.has(control)) {
       control[control.type === "checkbox" ? "checked" : "value"] = value;
@@ -21267,12 +21294,12 @@ function applyFilterSettings() {
       new RegExp(searchTerm, els.filterCaseSensitive.checked ? "" : "i");
     } catch (error) {
       const message = `Invalid regex: ${error.message}`;
-      if (els.historyMeta) els.historyMeta.textContent = message;
+      if (els.historyMeta && state.filterModalTarget !== "serviceMap") els.historyMeta.textContent = message;
       showToast(message, "error");
       return;
     }
   }
-  state.filterSettings = {
+  const next = {
     inScopeOnly: els.filterInScopeOnly.checked,
     hideWithoutResponses: els.filterHideWithoutResponses.checked,
     onlyParameterized: els.filterOnlyParameterized.checked,
@@ -21285,14 +21312,70 @@ function applyFilterSettings() {
     status: nextStatus,
     hiddenExtensions: els.filterHiddenExtensions.value.trim(),
     port: els.filterPort.value.trim(),
-    colorTags: state.filterSettings.colorTags,
   };
+  if (state.filterModalTarget === "serviceMap") {
+    // Scope and colour tags stay with the map toggle and History's colour dots.
+    state.serviceMapFilterSettings = { ...next, inScopeOnly: false, colorTags: new Set() };
+    closeFilterModal();
+    serviceMapFilterApplied();
+    return;
+  }
+  state.filterSettings = { ...next, colorTags: state.filterSettings.colorTags };
   closeFilterModal();
   syncHttpInScopePill();
   syncHttpCapturePill();
   scheduleUiSettingsSave();
   clearHttpHistorySelectionPreview();
   scheduleRefresh({ resetScroll: true });
+}
+
+const SERVICE_MAP_FILTER_MIME_LABELS = { html: "HTML", script: "script", json: "JSON", css: "CSS", image: "images", websocket: "WebSocket", other: "other types" };
+const SERVICE_MAP_FILTER_STATUS_LABELS = { success: "2xx", redirect: "3xx", clientError: "4xx", serverError: "5xx", other: "other status" };
+
+function serviceMapFilterApplied() {
+  scheduleUiSettingsSave();
+  targetServiceMapController?.filterChanged?.();
+}
+
+// Conditions for the Service Map read, under HTTP history's parameter names.
+// A group with every option selected hides nothing, so it is not sent.
+function serviceMapFilterQuery(filters = sanitizeHttpFilterSettings(state.serviceMapFilterSettings)) {
+  const query = {};
+  const mime = selectedMimeTypes(filters);
+  const status = selectedStatusClasses(filters);
+  if (mime.length < Object.keys(SERVICE_MAP_FILTER_MIME_LABELS).length) query.mime_types = mime.join(",");
+  if (status.length < Object.keys(SERVICE_MAP_FILTER_STATUS_LABELS).length) query.status_classes = status.join(",");
+  if (filters.hiddenExtensions) query.hidden_extensions = filters.hiddenExtensions;
+  if (filters.port) query.port = filters.port;
+  if (filters.hideWithoutResponses) query.hide_without_responses = "true";
+  if (filters.onlyParameterized) query.only_parameterized = "true";
+  if (filters.onlyNotes) query.only_notes = "true";
+  if (filters.searchTerm) {
+    query.advanced_search = filters.searchTerm;
+    if (filters.regex) query.advanced_regex = "true";
+    if (filters.caseSensitive) query.advanced_case_sensitive = "true";
+    if (filters.negativeSearch) query.advanced_negative = "true";
+  }
+  return query;
+}
+
+// What the Service Map filter hides, for the map toolbar.
+function serviceMapFilterSummary() {
+  const filters = sanitizeHttpFilterSettings(state.serviceMapFilterSettings);
+  const parts = [];
+  const extensions = filters.hiddenExtensions.split(",").map((value) => value.trim()).filter(Boolean);
+  if (extensions.length) parts.push(`hiding ${extensions.slice(0, 3).join(", ")}${extensions.length > 3 ? ` +${extensions.length - 3}` : ""}`);
+  const mimeOff = Object.entries(SERVICE_MAP_FILTER_MIME_LABELS).filter(([key]) => (key === "websocket" ? filters.mime.websocket === false : !filters.mime[key])).map(([, label]) => label);
+  if (mimeOff.length) parts.push(`no ${mimeOff.join(", ")}`);
+  const statusOff = Object.entries(SERVICE_MAP_FILTER_STATUS_LABELS).filter(([key]) => !filters.status[key]).map(([, label]) => label);
+  if (statusOff.length) parts.push(`no ${statusOff.join(", ")}`);
+  if (filters.hideWithoutResponses) parts.push("responses only");
+  if (filters.onlyParameterized) parts.push("parameterized only");
+  if (filters.onlyNotes) parts.push("notes only");
+  if (filters.port) parts.push(`port ${filters.port}`);
+  if (filters.searchTerm) parts.push(`${filters.negativeSearch ? "without" : "with"} "${filters.searchTerm}"`);
+  const text = parts.length ? parts.join(" · ") : "showing every row";
+  return { text, detail: `Service Map filter: ${text}${extensions.length > 3 ? ` (extensions ${extensions.join(", ")})` : ""}` };
 }
 
 async function openCertificateFolder() {
