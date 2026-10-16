@@ -2928,15 +2928,14 @@ const UPDATE_STEPS = new Set([
   "Restarting...",
 ]);
 
-// A filled disc with a ring in it: the ring's arc grows with the download, and
-// spins for the steps with nothing to measure. No text; the percentage is the
-// tooltip. The button keeps the size it had.
+// A bare ring: its arc grows with the download, and spins for the steps with
+// nothing to measure. A filled disc behind it was the loudest thing in the top
+// bar. No text; the percentage is the tooltip. The button keeps the size it had.
 const UPDATE_RING_MARKUP = `
   <span class="update-ring">
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <circle class="update-ring-disc" cx="12" cy="12" r="12"></circle>
-      <circle class="update-ring-track" cx="12" cy="12" r="6.5"></circle>
-      <circle class="update-ring-arc" cx="12" cy="12" r="6.5" pathLength="100"></circle>
+      <circle class="update-ring-track" cx="12" cy="12" r="8"></circle>
+      <circle class="update-ring-arc" cx="12" cy="12" r="8" pathLength="100"></circle>
     </svg>
   </span>`;
 
