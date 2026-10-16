@@ -2188,7 +2188,7 @@
           for (const [kind] of linkKindCounts(link)) links.set(kind, links.get(kind) + 1);
         }
       }
-      const toggles = REQUEST_KINDS.filter((kind) => links.get(kind) > 0).map((kind) => `<button class="service-map-kind kind-${kind}" type="button" data-link-kind="${kind}" data-service-focus="link-kind:${kind}" aria-pressed="${!hidden.has(kind)}" title="${REQUEST_KIND_LABELS[kind]} in ${links.get(kind)} Origin/Referer link(s). ${hidden.has(kind) ? "Draw" : "Hide"} them.">${REQUEST_KIND_LABELS[kind]} ${links.get(kind)}</button>`).join("");
+      const toggles = REQUEST_KINDS.filter((kind) => links.get(kind) > 0).map((kind) => `<button class="service-map-kind kind-${kind}" type="button" data-link-kind="${kind}" data-service-focus="link-kind:${kind}" aria-pressed="${!hidden.has(kind)}" title="${REQUEST_KIND_LABELS[kind]} in ${links.get(kind)} Origin/Referer link(s). ${hidden.has(kind) ? "Draw" : "Hide"} them."><span class="service-map-kind-swatch" aria-hidden="true"></span>${REQUEST_KIND_LABELS[kind]} ${links.get(kind)}</button>`).join("");
       replace(els.linkKinds, toggles ? `<span class="service-map-kinds-label">Links by request:</span>${toggles}` : "");
     }
     function renderGraph() {
@@ -2237,12 +2237,14 @@
         els.graphBounds.textContent = ["0 matching origins", stages.queryHidden ? `${stages.queryHidden} hidden by query` : "", stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "", state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
       }
-      // More rows draw a heavier line, up to about twice the base width.
-      const weight = (rows) => rows > 1 ? Math.round(Math.min(3.25, 1.25 + 0.6 * Math.log2(rows)) * 100) / 100 : 0;
+      // More rows draw a slightly heavier line: 1.5px for one row, 2.5px from 64
+      // rows. A real session has hundreds of rows per link, so a steeper scale
+      // drew nearly every line at its heaviest.
+      const weight = (rows) => rows > 1 ? Math.round(Math.min(2.5, 1.5 + Math.log2(rows) / 6) * 100) / 100 : 0;
       const requests = (edge) => edge.count > 1 || edge.kinds
         ? ` · ${edge.count} request${edge.count === 1 ? "" : "s"}${edge.kinds ? ` (${Object.entries(edge.kinds).map(([kind, rows]) => `${REQUEST_KIND_LABELS[kind]} ${rows}`).join(", ")})` : ""}${edge.cors ? ` · ${corsText(edge.cors)}` : ""}` : "";
       const title = (edge) => `${escape(edge.source)} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : edge.target)} · ${escape(edge.label)} · ${edge.relationship}${requests(edge)}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}`;
-      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : 'marker-end="url(#service-map-arrow)"'}><title>${title(edge)}</title></path>`).join("")
+      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : `marker-end="url(#service-map-arrow${[edge.source, edge.target].includes(state.selectedOrigin) ? "-selected" : edge.kind === "api" ? "-api" : ""})"`}><title>${title(edge)}</title></path>`).join("")
         // Arrows are thin, so a wide transparent stroke over each recorded one
         // takes the pointer: its tooltip, and a click that opens its entry.
         + layout.edges.map((edge, index) => edge.kind ? `<path class="service-map-hit" data-service-edge="${index}" d="${edge.path}"><title>${title(edge)} · Select to list its rows and open a source</title></path>` : "").join("");
@@ -2256,7 +2258,11 @@
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
       }).join("");
-      replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout" style="--service-map-card-width:${layout.geometry.cardWidth}px;--service-map-card-height:${layout.geometry.cardHeight}px;--service-map-line-height:${layout.geometry.lineHeight};width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs><marker id="service-map-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker></defs>${edges}</svg>${cards}</div></div>`);
+      // An arrowhead takes its line's colour and keeps one size: sized by the
+      // stroke, a heavy line grew a large head, and every head was gold.
+      const arrowheads = [["service-map-arrow", "--text-dim"], ["service-map-arrow-api", "--token-url-color"], ["service-map-arrow-selected", "--point"]]
+        .map(([id, color]) => `<marker id="${id}" viewBox="0 0 8 8" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="7" refY="4" orient="auto" style="color:var(${color})"><path d="M1,1 L7,4 L1,7" fill="none" stroke="currentColor" stroke-width="1.5" /></marker>`).join("");
+      replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout" style="--service-map-card-width:${layout.geometry.cardWidth}px;--service-map-card-height:${layout.geometry.cardHeight}px;--service-map-line-height:${layout.geometry.lineHeight};width:${layout.width}px;height:${layout.height}px"><svg class="service-map-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true"><defs>${arrowheads}</defs>${edges}</svg>${cards}</div></div>`);
       if (state.relationLayers.some((layer) => layer.kind === "peer")
         || new Set(state.relationLayers.map((layer) => layer.kind)).size > 1) {
         const addressCount = layout.nodes.filter((item) => item.endpointNode).length;

@@ -7441,6 +7441,11 @@ button.utility-button.replay-tab-add {
 .service-map-kind { font: inherit; color: var(--text-soft); background: none; border: 1px solid var(--line-strong); border-radius: 12px; padding: 1px 8px; cursor: pointer; }
 .service-map-kind:hover { border-color: var(--point-border); }
 .service-map-kind.kind-api { color: var(--token-url-color); }
+/* Each toggle shows its line: blue API calls, grey page loads and frames, faint
+   resource loads. */
+.service-map-kind-swatch { display: inline-block; width: 14px; margin-right: 5px; border-top: 2px dashed var(--text-dim); vertical-align: middle; }
+.service-map-kind.kind-api .service-map-kind-swatch { border-top-color: var(--token-url-color); }
+.service-map-kind:is(.kind-script, .kind-static) .service-map-kind-swatch { opacity: .4; }
 .service-map-kind[aria-pressed="false"] { color: var(--text-dim); border-style: dashed; text-decoration: line-through; }
 #serviceMapGraphBounds { margin-left: auto; }
 .service-map-bounds-details { margin-left: auto; }

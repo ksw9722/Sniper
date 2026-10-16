@@ -326,8 +326,9 @@ navigation, frame, script, static file, other), read from `Sec-Fetch-Dest` and,
 without it, from the response type, the `Origin` header and the method. The
 legend toggles each kind; frames, scripts and static files are hidden by
 default, so a page's CDN loads draw no arrows and rank nothing. An arrow takes
-the colour of its leading kind, so one API call among image loads still reads as
-an API link, and grows heavier with its rows. Each link also counts the rows
+the colour of its leading kind (API calls blue, shown on each legend toggle), so
+one API call among image loads still reads as an API link, and grows slightly
+heavier with its rows; its head keeps one size in the line's colour. Each link also counts the rows
 whose response let its source read it through CORS, and those that allowed
 credentials too. Selecting an arrow marks its relationship in the inspector,
 with View source for an example row. The links carry `request_count`,

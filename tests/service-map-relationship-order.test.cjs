@@ -337,10 +337,10 @@ test('the legend toggles links by request kind: the map redraws, ranks again and
   const saves = [];
   const f = fixture({ getHiddenLinkKinds: () => hidden, setHiddenLinkKinds: kinds => { hidden = kinds; saves.push([...kinds]); } });
   await f.load(snapshot(kindedOrigins()));
-  const toggles = () => Object.fromEntries([...f.els.linkKinds.innerHTML.matchAll(/data-link-kind="(\w+)"[^>]*aria-pressed="(\w+)"[^>]*>([^<]*)</g)].map(([, kind, pressed, label]) => [kind, `${pressed} ${label}`]));
+  const toggles = () => Object.fromEntries([...f.els.linkKinds.innerHTML.matchAll(/data-link-kind="(\w+)"[^>]*aria-pressed="(\w+)"[^>]*><span class="service-map-kind-swatch"[^>]*><\/span>([^<]*)</g)].map(([, kind, pressed, label]) => [kind, `${pressed} ${label}`]));
   assert.deepEqual(toggles(), { api: 'true API calls 1', navigation: 'true Page navigations 1', frame: 'true Frames 1', script: 'false Scripts 1', static: 'false Static files 1' });
   assert.equal(arrows(f.els.canvas.innerHTML), 2);
-  assert.match(f.els.canvas.innerHTML, /class="service-map-edge header-declaration kind-api [^"]*" data-relationship="referer_header" style="--edge-weight:2.2px"/, 'three rows draw a heavier line');
+  assert.match(f.els.canvas.innerHTML, /class="service-map-edge header-declaration kind-api [^"]*" data-relationship="referer_header" style="--edge-weight:1.76px"/, 'three rows draw a slightly heavier line');
   assert.match(f.els.canvas.innerHTML, /3 requests \(API calls 3\)<\/title>/);
 
   const click = kind => f.els.linkKinds.dispatch('click', { target: { closest: () => ({ dataset: { linkKind: kind } }) } });
@@ -348,7 +348,7 @@ test('the legend toggles links by request kind: the map redraws, ranks again and
   assert.deepEqual(saves, [['script']]);
   assert.equal(toggles().static, 'true Static files 1');
   assert.equal(arrows(f.els.canvas.innerHTML), 3, 'the CDN link returns for its images');
-  assert.match(f.els.canvas.innerHTML, /kind-static [^"]*" data-relationship="referer_header" style="--edge-weight:2.45px"/);
+  assert.match(f.els.canvas.innerHTML, /kind-static [^"]*" data-relationship="referer_header" style="--edge-weight:1.83px"/);
   assert.match(f.els.canvas.innerHTML, /4 requests \(Static files 4\)<\/title>/, 'the hidden script row is not counted');
   click('bogus');
   assert.equal(saves.length, 1, 'only a known kind toggles');
@@ -371,8 +371,11 @@ test('an arrow names its CORS rows, and selecting it marks its entry in the insp
   assert.equal(hits.length, 1, 'one pointer target per recorded arrow');
 
   f.controller.selectOrigin(login);
+  assert.match(f.els.canvas.innerHTML, /markerUnits="userSpaceOnUse"/, 'an arrowhead keeps its size on a heavy line');
+  assert.match(f.els.canvas.innerHTML, /kind-api "[^>]*marker-end="url\(#service-map-arrow-api\)"/, 'an API arrow ends in a blue head');
   f.els.panel.dispatch('click', { target: { closest: selector => selector === '[data-service-edge]' ? { dataset: { serviceEdge: hits[0][1] } } : null } });
   assert.equal(f.state.selectedOrigin, api, 'the Referer link is recorded on the origin it was sent to');
+  assert.match(f.els.canvas.innerHTML, /kind-api selected"[^>]*marker-end="url\(#service-map-arrow-selected\)"/, "the selected card's arrows end in gold heads");
   assert.match(f.els.detail.innerHTML, /service-map-relation highlighted"[^]*?API calls 3 · CORS allowed 2 of 3 rows, 1 with credentials/);
   assert.equal((f.els.detail.innerHTML.match(/highlighted/g) || []).length, 1);
   f.controller.selectOrigin(app);

@@ -270,10 +270,13 @@ by default, so API calls, page navigations, unclassified requests and redirects
 draw arrows, and a page's CDN loads draw none. The rows of a hidden kind do not
 draw, rank or weigh a link: a link made only of hidden kinds is not drawn, and a
 link with other rows is drawn for those rows only. The arrow takes the colour of
-its first shown kind in the order of the table above, so one API call among a
-CDN's image loads still reads as an API link: API calls stand out, and scripts
-and static files recede. More rows draw a heavier line, and the tooltip lists the
-rows by kind.
+its first shown kind in the order of the table above: API calls are blue; page
+navigations, frames and other requests grey; scripts and static files faint
+grey; the selected card's arrows gold. So one API call among a CDN's image loads
+still reads as an API link. Each legend toggle shows its colour. More rows draw
+a slightly heavier line, from 1.5px for one row to 2.5px from 64 rows, and an
+arrowhead takes its line's colour at one size. The tooltip lists the rows by
+kind.
 The choice is saved in UI settings (`service_map_hidden_link_kinds`). It hides
 arrows, not cards: to drop a CDN's cards too, use the
 [Service Map filter](#service-map-filter). Redirects are always drawn and count
