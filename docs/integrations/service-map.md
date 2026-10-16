@@ -36,9 +36,12 @@ its neighbours, then each further connected group; unrelated and reference-only
 origins follow by name. Linked cards are laid out left to right by link depth:
 each card sits one column right of its furthest linked source, so no arrow joins
 two cards of one column. A link that closes a cycle points back to the left, and
-cards deeper than five columns share the last one. Unlinked cards fill a grid
-below. Background polling keeps cards where they are so they do not move under
-the pointer. All origins keeps at most 100
+cards deeper than five columns share the last one. An arrow that skips a column
+runs along the gap between two rows rather than behind the cards it passes, and
+arrows between neighbouring columns each turn at their own point in the gap.
+Cards are placed by the arrows actually drawn, so a card whose links all fall past
+the arrow cap joins the unlinked cards, which fill a grid below. Background
+polling keeps cards where they are so they do not move under the pointer. All origins keeps at most 100
 additional reference-only candidate cards; those cards mean no captured rows are
 shown in this snapshot, not that the origin has never been captured. Relationship and
 source lists show at most 30 rows per pane, and API lists page through 50 exact

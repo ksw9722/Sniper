@@ -139,6 +139,85 @@ test('an origin naming itself in Referer is not listed as a relationship of that
   assert.deepEqual([...labels], [`${api} -> ${app}`]);
 });
 
+// Points along an SVG path of M, L and C commands, in layout pixels.
+function pathPoints(d, steps = 40) {
+  const tokens = d.match(/[MLC]|-?\d+(?:\.\d+)?/g), points = [];
+  let i = 0, x = 0, y = 0, command = 'M';
+  const num = () => Number(tokens[i++]);
+  while (i < tokens.length) {
+    if (/[MLC]/.test(tokens[i])) command = tokens[i++];
+    if (command === 'M') { x = num(); y = num(); points.push([x, y]); command = 'L'; continue; }
+    const [ax, ay, bx, by, nx, ny] = command === 'L' ? [x, y, x, y, num(), num()] : [num(), num(), num(), num(), num(), num()];
+    const lerp = command === 'L';
+    for (let s = 1; s <= steps; s++) {
+      const t = s / steps, u = 1 - t;
+      points.push(lerp ? [x + (nx - x) * t, y + (ny - y) * t]
+        : [u ** 3 * x + 3 * u * u * t * ax + 3 * u * t * t * bx + t ** 3 * nx, u ** 3 * y + 3 * u * u * t * ay + 3 * u * t * t * by + t ** 3 * ny]);
+    }
+    x = nx; y = ny;
+  }
+  return points;
+}
+function cardsCrossed(layout, edge) {
+  const { cardWidth, cardHeight } = layout.geometry, points = pathPoints(edge.path);
+  return Array.from(layout.nodes).filter(node => node.origin !== edge.source && node.origin !== edge.target
+    && points.some(([x, y]) => x > node.x + 1 && x < node.x + cardWidth - 1 && y > node.y + 1 && y < node.y + cardHeight - 1)).map(node => node.origin);
+}
+
+test('an arrow that skips a column runs between rows instead of behind the cards it passes', () => {
+  // A sign-in chain that returns to its start: every card is on one row, so a
+  // straight return arrow would run through both middle cards and under the
+  // forward arrows.
+  const chain = Array.from({ length: 4 }, (_, i) => origin(`https://s${i}.example.com`));
+  chain.forEach((item, i) => { item.redirects = [redirect(chain[(i + 1) % 4].origin)]; });
+  const layout = map.graphLayout(chain, chain.map(item => item.origin));
+  assert.deepEqual(chain.map(item => columnOf(layout, item.origin)), [0, 1, 2, 3]);
+  const back = layout.edges.find(edge => edge.source === chain[3].origin);
+  assert.ok(back.path.includes(' L '), 'the return arrow follows a lane');
+  const { padding, cardHeight, rowPitch } = layout.geometry;
+  const laneY = Number(back.path.split(' L ')[1].split(' ')[1]);
+  assert.ok(laneY > padding + cardHeight && laneY < padding + rowPitch, 'the lane is the gap below the row');
+  for (const edge of layout.edges) assert.deepEqual(cardsCrossed(layout, edge), [], edge.path);
+
+  // The real session's shape: the hub also declares the targets of its targets.
+  const id = name => `https://${name}.example.com`;
+  const hub = origin(id('hub')), mid = Array.from({ length: 5 }, (_, i) => origin(id(`m${i}`), { header_links: [referer(hub.origin)] }));
+  const far = Array.from({ length: 4 }, (_, i) => origin(id(`f${i}`), { header_links: [referer(hub.origin), referer(mid[i].origin)] }));
+  const shaped = map.graphLayout([hub, ...mid, ...far], map.relationshipOrder([hub, ...mid, ...far]));
+  assert.equal(shaped.edges.filter(edge => Math.abs(columnOf(shaped, edge.target) - columnOf(shaped, edge.source)) > 1).length, 4);
+  for (const edge of shaped.edges) assert.deepEqual(cardsCrossed(shaped, edge), [], edge.path);
+});
+
+test('arrows between neighbouring columns turn at their own points, the longest nearest the source', () => {
+  const hub = origin('https://hub.example.com');
+  const targets = Array.from({ length: 5 }, (_, i) => origin(`https://t${i}.example.com`, { header_links: [referer(hub.origin)] }));
+  const layout = map.graphLayout([hub, ...targets], [hub.origin, ...targets.map(item => item.origin)]);
+  const bend = edge => Number(edge.path.match(/C (-?[\d.]+)/)[1]);
+  const span = edge => Math.abs(layout.slots.get(edge.target).row - layout.slots.get(edge.source).row);
+  const bent = layout.edges.filter(edge => span(edge) > 0);
+  assert.equal(new Set(bent.map(bend)).size, bent.length, 'no two vertical runs share a track');
+  const [longest] = [...bent].sort((a, b) => span(b) - span(a));
+  assert.equal(bend(longest), Math.min(...bent.map(bend)));
+});
+
+test('cards whose arrows all fall past the arrow cap sit with the unlinked cards', () => {
+  const hub = origin('https://hub.example.com');
+  const targets = Array.from({ length: 20 }, (_, i) => origin(`https://t${String(i).padStart(2, '0')}.example.com`, { header_links: [referer(hub.origin), { ...referer(hub.origin), relationship: 'origin_header' }] }));
+  const p = origin('https://p.example.com'), q = origin('https://q.example.com', { header_links: [referer('https://p.example.com')] });
+  const origins = [hub, ...targets, p, q];
+  const layout = map.graphLayout(origins, map.relationshipOrder(origins));
+  assert.equal(layout.edgeCount, 41); assert.equal(layout.edges.length, 40);
+  assert.ok([p, q].every(item => layout.slots.get(item.origin).row >= 20), 'below the 20 linked targets, not beside them');
+});
+
+test('a pinned star centers its source on its neighbors', () => {
+  const source = origin('https://source.example.com'), neighbors = Array.from({ length: 5 }, (_, i) => origin(`https://n${i}.example.com`));
+  const bodyEdges = neighbors.map(item => ({ source: source.origin, target: item.origin, relationship: 'body_url_reference', label: 'Literal body URL reference' }));
+  const layout = map.graphLayout([source, ...neighbors], [source.origin, ...neighbors.map(item => item.origin)], new Map(), source.origin, bodyEdges);
+  assert.deepEqual([layout.slots.get(source.origin).column, layout.slots.get(source.origin).row], [0, 2]);
+  for (const edge of layout.edges) assert.deepEqual(cardsCrossed(layout, edge), [], edge.path);
+});
+
 test('ctrl+wheel and WebKit pinch gestures zoom around the fingers; a plain wheel only scrolls', async () => {
   const f = fixture();
   await f.load(snapshot(unrelated.map(id => origin(id))));

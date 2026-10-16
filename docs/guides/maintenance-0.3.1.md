@@ -292,6 +292,19 @@ fixed columns for a layout by link depth: the same session went from one hub
 beside a column of 23 cards, with 17 arrows looping inside that column, to three
 columns of 1, 13 and 10 cards with no same-column arrow, about 40% shorter.
 Direct relations now reads sources, the pinned origin, then targets. Polling
-still keeps cards in place. A Referer or Origin naming the requested origin itself is no longer
+still keeps cards in place.
+
+Twelve registered cases (sign-in redirect chain, hub fan-out, hub with
+sub-hubs, cycles, separate sites, card and arrow caps, reference-only origins,
+self links, a dense mutual cluster, body and Link inspections, an eight-hop
+redirect chain, recorded address groups) then exposed three drawing faults. An arrow that skipped a column was
+drawn straight, behind the cards it passed: a sign-in chain's return redirect
+hid under the forward arrows and seemed to start at the card beside its target.
+Such arrows now follow the gap between two rows. Arrows between neighbouring
+columns all bent at the middle of the gap and fused into one band; each now
+turns at its own point, the longest nearest its source. Cards whose links all
+fell past the 40-arrow cap were still laid out among linked cards with no
+arrow; they now join the unlinked grid. A pinned body/Link star also centers its
+source on its neighbours. A Referer or Origin naming the requested origin itself is no longer
 listed as a relationship. A trackpad pinch, or Ctrl with the mouse wheel, zooms
 the graph around the pointer.

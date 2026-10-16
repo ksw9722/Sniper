@@ -900,17 +900,34 @@
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
-    const connections = [...bodyEdges.map((edge) => [edge.source, edge.target]), ...visibleOrigins.flatMap((origin) => [
-      ...origin.redirects.map((redirect) => [origin.origin, redirect.target_origin]),
-      ...origin.header_links.map((link) => [link.source_origin, origin.origin]),
-    ])].filter(([source, target]) => source !== target && visibleIds.has(source) && visibleIds.has(target) && (!anchor || source === anchor || target === anchor));
+    // The explicit overlay gets the first arrow slots. Metadata remains distinct
+    // even when the same pair also occurs in a retained response body.
+    const declaredEdges = [...bodyEdges, ...visibleOrigins.flatMap((origin) => [
+      ...origin.redirects.map((redirect) => ({ source: origin.origin, target: redirect.target_origin, relationship: "redirect_instruction", label: "Redirect instruction" })),
+      ...origin.header_links.map((link) => ({ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: link.relationship === "origin_header" ? "Origin header" : "Referer header" })),
+    ])];
+    const seen = new Set();
+    const shown = [];
+    let edgeCount = 0;
+    for (const edge of declaredEdges) {
+      const key = JSON.stringify([edge.source, edge.target, edge.relationship]);
+      if (edge.source === edge.target || !visibleIds.has(edge.source) || !visibleIds.has(edge.target) || seen.has(key)
+        || anchor && edge.source !== anchor && edge.target !== anchor) continue;
+      seen.add(key);
+      edgeCount += 1;
+      if (shown.length < MAX_EDGES) shown.push(edge);
+    }
+    // Cards are placed by the arrows actually drawn, so a card whose links all
+    // fall past the arrow cap is not laid out among linked cards with no arrow.
+    const connections = shown.map((edge) => [edge.source, edge.target]);
     let preferred;
     if (anchor && bodyEdges.length) {
       // A pinned direct neighborhood is a star. Keep every neighbor
       // opposite the source so mixed incoming/outgoing declarations cannot
-      // become same-column loops.
+      // become same-column loops. The source sits level with the middle of its
+      // neighbors, as a layered hub does, so the star opens both ways.
       const neighbors = visibleOrigins.filter((origin) => origin.origin !== anchor);
-      preferred = new Map([[anchor, { column: 0, row: 0 }], ...neighbors.map((origin, row) => [origin.origin, { column: 1, row }])]);
+      preferred = new Map([[anchor, { column: 0, row: Math.floor(Math.max(0, neighbors.length - 1) / 2) }], ...neighbors.map((origin, row) => [origin.origin, { column: 1, row }])]);
     } else {
       preferred = layeredSlots(visibleOrigins, connections);
     }
@@ -925,24 +942,32 @@
     const width = geometry.padding * 2 + Math.max(1, ...[...slots.values()].map((slot) => slot.column)) * geometry.columnPitch + geometry.cardWidth;
     const visible = visibleOrigins.map((origin) => ({ ...origin, x: geometry.padding + slots.get(origin.origin).column * geometry.columnPitch, y: geometry.padding + slots.get(origin.origin).row * geometry.rowPitch }));
     const positions = new Map(visible.map((origin) => [origin.origin, origin]));
-    const edges = [];
-    const seen = new Set();
-    let edgeCount = 0;
-    // The explicit overlay gets the first arrow slots. Metadata remains distinct
-    // even when the same pair also occurs in a retained response body.
-    const declaredEdges = [...bodyEdges, ...visible.flatMap((origin) => [
-      ...origin.redirects.map((redirect) => ({ source: origin.origin, target: redirect.target_origin, relationship: "redirect_instruction", label: "Redirect instruction" })),
-      ...origin.header_links.map((link) => ({ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: link.relationship === "origin_header" ? "Origin header" : "Referer header" })),
-    ])];
+    const gap = geometry.columnPitch - geometry.cardWidth;
+    const rowGap = geometry.rowPitch - geometry.cardHeight;
+    const lastRow = Math.max(0, ...[...slots.values()].map((slot) => slot.row));
+    // Arrows between neighbouring columns cross one gap. Bent at its middle, their
+    // vertical runs fused into a single band that no arrow could be followed
+    // through. Each gets its own track instead, the longest nearest its source, so
+    // a fan opens out without crossing itself.
+    const turns = new Map();
+    const tracks = new Map();
+    for (const edge of shown) {
+      const source = positions.get(edge.source), target = positions.get(edge.target);
+      if (Math.abs(target.x - source.x) !== geometry.columnPitch || source.y === target.y) continue;
+      const key = Math.min(source.x, target.x);
+      if (!tracks.has(key)) tracks.set(key, []);
+      tracks.get(key).push(edge);
+    }
+    for (const group of tracks.values()) {
+      const span = (edge) => Math.abs(positions.get(edge.target).y - positions.get(edge.source).y);
+      group.sort((a, b) => span(b) - span(a));
+      group.forEach((edge, index) => turns.set(edge, group.length > 1 ? 0.25 + 0.5 * index / (group.length - 1) : 0.5));
+    }
     const pairCounts = new Map();
-    for (const edge of declaredEdges) {
+    const laneCounts = new Map();
+    const edges = shown.map((edge) => {
       const source = positions.get(edge.source);
       const target = positions.get(edge.target);
-      const key = JSON.stringify([edge.source, edge.target, edge.relationship]);
-      if (!source || !target || target === source || seen.has(key) || anchor && edge.source !== anchor && edge.target !== anchor) continue;
-      seen.add(key);
-      edgeCount += 1;
-      if (edges.length >= MAX_EDGES) continue;
       const pair = JSON.stringify([edge.source, edge.target].sort());
       const pairIndex = pairCounts.get(pair) || 0;
       pairCounts.set(pair, pairIndex + 1);
@@ -956,11 +981,24 @@
       const x2 = target.x + (sameColumn ? geometry.cardWidth : toRight ? 0 : geometry.cardWidth);
       const y1 = source.y + geometry.cardHeight / 2 + offset;
       const y2 = target.y + geometry.cardHeight / 2 + offset;
+      if (Math.abs(target.x - source.x) > geometry.columnPitch) {
+        // An arrow that skips a column runs along the gap between two rows, so it
+        // never passes behind a card it does not join. Drawn straight, a sign-in
+        // chain's return redirect ran through both middle cards, under the
+        // forward arrows, and seemed to start at the card next to its target.
+        const step = toRight ? gap : -gap;
+        const row = Math.min(lastRow + 1, Math.max(1, Math.round(((y1 + y2) / 2 - geometry.padding + rowGap / 2) / geometry.rowPitch)));
+        const used = laneCounts.get(row) || 0;
+        laneCounts.set(row, used + 1);
+        const laneY = geometry.padding + row * geometry.rowPitch - rowGap / 2 + [0, -4, 4, -8, 8][used % 5];
+        const xa = x1 + step, xb = x2 - step;
+        return { ...edge, path: `M ${x1} ${y1} C ${(x1 + xa) / 2} ${y1}, ${(x1 + xa) / 2} ${laneY}, ${xa} ${laneY} L ${xb} ${laneY} C ${(xb + x2) / 2} ${laneY}, ${(xb + x2) / 2} ${y2}, ${x2} ${y2}` };
+      }
       // Keep right-column loops inside the SVG, with room for stroke and markers.
       // Attachment offsets still distinguish typed links without widening cards.
-      const bend = sameColumn ? Math.min(x1 + geometry.padding + Math.abs(offset), width - geometry.loopInset) : (x1 + x2) / 2;
-      edges.push({ ...edge, path: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}` });
-    }
+      const bend = sameColumn ? Math.min(x1 + geometry.padding + Math.abs(offset), width - geometry.loopInset) : x1 + (x2 - x1) * (turns.get(edge) ?? 0.5);
+      return { ...edge, path: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}` };
+    });
     return { nodes: visible, edges, edgeCount, slots, geometry, width, height: Math.max(geometry.padding * 2 + geometry.cardHeight, ...visible.map((origin) => origin.y + geometry.cardHeight + geometry.padding)) };
   }
 
