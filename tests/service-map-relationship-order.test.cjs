@@ -244,16 +244,21 @@ test('the Service Map filter rides on every read; changing it re-reads, re-ranks
   assert.match(f.els.status.textContent, /7 hidden by the Service Map filter/);
 });
 
-test("the selected card's arrows carry moving dots toward their targets, and reduced motion drops them", async () => {
+test("the selected card's own gold arrows flow toward their targets, and only when motion is allowed", async () => {
   const f = fixture();
   await f.load(snapshot(relatedOrigins()));
-  const flows = () => (f.els.canvas.innerHTML.match(/class="service-map-flow"/g) || []).length;
+  const selected = () => (f.els.canvas.innerHTML.match(/class="service-map-edge [^"]*\bselected\b/g) || []).length;
   f.controller.selectOrigin(app);
-  assert.equal(flows(), 3, 'the hub: two Referer targets and the redirect into it');
+  assert.equal(selected(), 3, 'the hub: two Referer targets and the redirect into it');
   f.controller.selectOrigin(api);
-  assert.equal(flows(), 1);
+  assert.equal(selected(), 1);
+  assert.doesNotMatch(f.els.canvas.innerHTML, /service-map-flow/, 'no second line is drawn over the arrow');
   const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
-  assert.match(css, /prefers-reduced-motion: reduce\) \{ \.service-map-flow \{ display: none; \}/);
+  const motion = css.match(/@media \(prefers-reduced-motion: no-preference\) \{([^]*?)\n\}/)?.[1] || '';
+  assert.match(motion, /\.service-map-edge\.selected:not\(\.peer-observation\) \{ animation: service-map-flow-18/);
+  assert.match(motion, /data-relationship="redirect_instruction"\] \{ stroke-dasharray: 14 4; \}/, 'a solid redirect takes dashes so it can flow');
+  assert.match(css, /@keyframes service-map-flow-11 \{ to \{ stroke-dashoffset: -11; \} \}/, 'one Referer dash period per cycle');
+  assert.doesNotMatch(css.replace(motion, ''), /\.service-map-edge\.selected[^{]*\{[^}]*animation/, 'no animation outside the motion-allowed block');
 });
 
 test('ctrl+wheel and WebKit pinch gestures zoom around the fingers; a plain wheel only scrolls', async () => {

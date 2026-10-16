@@ -20,9 +20,10 @@ scale limits. Polling and resizing never refit or change the chosen zoom. Plus
 and minus preserve the viewport center where scroll bounds allow. With the map
 viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. A trackpad
 pinch, or Ctrl with the mouse wheel, zooms around the pointer instead of zooming
-the whole page; a plain wheel still scrolls the map. The selected card's arrows
-carry dots moving from source to target, so its links and their direction stand
-out; with reduced motion requested the dots are not drawn and the highlight stays. Zooming is
+the whole page; a plain wheel still scrolls the map. The selected card's gold
+arrows flow from source to target: their own dashes move along the line, and a
+solid redirect takes long dashes while selected so it can flow. With reduced
+motion requested the lines stay still and only the highlight remains. Zooming is
 local and preserves selection, exact-source reads, and session-local shown inspections.
 There is no force layout or drag editing in this version. The renderer is separate from metadata normalization and
 layout calculation so it can be replaced without changing the read contract.

@@ -7413,11 +7413,6 @@ button.utility-button.replay-tab-add {
 .service-map-edges { position: absolute; inset: 0; color: var(--point); pointer-events: none; }
 .service-map-edge { fill: none; stroke: var(--text-dim); stroke-width: 1.5; opacity: .6; }
 .service-map-edge.selected { stroke: var(--point); opacity: 1; stroke-width: 2; }
-/* Dots ride the selected card's arrows toward their targets; the base line keeps
-   its legend style underneath. Reduced motion drops them, the highlight stays. */
-.service-map-flow { fill: none; stroke: var(--text); stroke-width: 2.5; stroke-linecap: round; stroke-dasharray: 0.1 11.9; opacity: .85; animation: service-map-flow 0.8s linear infinite; }
-@keyframes service-map-flow { to { stroke-dashoffset: -12; } }
-@media (prefers-reduced-motion: reduce) { .service-map-flow { display: none; } }
 .service-map-card { display: flex; gap: 8px; position: absolute; width: var(--service-map-card-width); height: var(--service-map-card-height); box-sizing: border-box; align-items: flex-start; padding: 10px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel-elevated); color: var(--text); text-align: left; cursor: pointer; box-shadow: 0 4px 18px rgba(0,0,0,.12); }
 .service-map-card:hover { border-color: var(--point-border); }
 .service-map-card.pinned { box-shadow: 0 0 0 2px var(--point-soft), 0 4px 18px rgba(0,0,0,.12); }
@@ -7585,6 +7580,21 @@ button.utility-button.replay-tab-add {
 
 /* Explicit, temporary recorded address observations; never service-call arrows. */
 .service-map-edge.peer-observation { stroke-dasharray: 2 5; stroke-linecap: round; }
+/* The selected card's gold arrows flow from source to target: each dash pattern
+   moves one period per cycle, all at 20px/s. A redirect is solid, so it takes
+   long dashes only while selected; undirected peer lines stay still, and reduced
+   motion keeps every line as drawn. */
+@media (prefers-reduced-motion: no-preference) {
+  .service-map-edge.selected:not(.peer-observation) { animation: service-map-flow-18 0.9s linear infinite; }
+  .service-map-edge.selected[data-relationship="redirect_instruction"] { stroke-dasharray: 14 4; }
+  .service-map-edge.selected.header-declaration { animation: service-map-flow-11 0.55s linear infinite; }
+  .service-map-edge.selected.body-reference { animation: service-map-flow-7 0.35s linear infinite; }
+  .service-map-edge.selected.preconnect-hint { animation: service-map-flow-6 0.3s linear infinite; }
+}
+@keyframes service-map-flow-6 { to { stroke-dashoffset: -6; } }
+@keyframes service-map-flow-7 { to { stroke-dashoffset: -7; } }
+@keyframes service-map-flow-11 { to { stroke-dashoffset: -11; } }
+@keyframes service-map-flow-18 { to { stroke-dashoffset: -18; } }
 .service-map-line.peer-observation { border-top-style: dotted; border-top-color: var(--text-soft); }
 .service-map-card.service-map-peer-address { border: 2px solid var(--text-soft); border-radius: 4px; padding: 9px; background: var(--panel-code); cursor: default; }
 .service-map-peer-address .service-map-card-symbol { border-radius: 4px; }

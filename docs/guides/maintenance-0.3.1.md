@@ -314,7 +314,8 @@ snapshot, so a condition hides exactly the rows it hides in History. The default
 hides images, styles and fonts, which removes a page's static CDN and its arrows.
 `snapshot.filtered_rows` and the status line count the hidden rows, and
 `sniper-cli scope service-map` takes the same conditions as options. The selected
-card's arrows now carry dots moving toward their targets; reduced motion drops
-them. A Referer or Origin naming the requested origin itself is no longer
+card's gold arrows now flow toward their targets, their own dashes moving; a
+selected redirect takes long dashes so it can flow, and reduced motion keeps
+them still. A Referer or Origin naming the requested origin itself is no longer
 listed as a relationship. A trackpad pinch, or Ctrl with the mouse wheel, zooms
 the graph around the pointer.
