@@ -19,8 +19,9 @@ It requires the current active session and an exact-row token. Inactive sessions
 remain unavailable without being loaded or activated. Only bounded retained
 UTF-8 HTML/JavaScript previews are inspected; results expose canonical origins
 and retained-preview offsets with separate capture/prefix truncation and cap
-reasons. References do not establish calls or ownership. The default map and
-metadata evidence still read no bodies, and nothing sends target requests.
+reasons. References do not establish calls or ownership. The default map reads
+no bodies apart from Next.js bundles (see below), metadata evidence reads none,
+and nothing sends target requests.
 
 The GUI now collects up to eight explicitly shown body, Link and recorded-peer
 inspections in one session-local graph, alongside loaded metadata. Each retains
@@ -352,3 +353,12 @@ the empty product chip, and the inspector drops its explanatory paragraphs. Each
 card instead leads with what its origin serves (Front, API, Static, Unknown, Ref
 or Site), read from its endpoints' response types, with a declared application
 product's mark, such as Next.js, in place of the icon.
+
+Two reads were added. Next.js names its version only in its client runtime, as
+`window.next={version:"…"}`, never in `X-Powered-By`. The map now reads retained
+JavaScript under `/_next/` for that value, once per row revision and bounded
+per map, and gives it to the page that loaded the bundle; cards show
+`Next.js 14.2.3` and the inspector lists the script rows. Opening an endpoint
+offers Show parameters, which reads its newest 200 rows on request and lists
+each query, form, JSON or multipart parameter with its row count and up to
+three values (`GET /api/target/service-map/parameters`).

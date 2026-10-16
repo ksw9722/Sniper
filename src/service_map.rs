@@ -181,7 +181,27 @@ pub struct ServiceOrigin {
     pub technology_observations: Option<Vec<TechnologyAggregate>>,
     pub redirects: Vec<RedirectInstruction>,
     pub header_links: Vec<HeaderLink>,
+    /// Versions retained scripts declare about their framework; see
+    /// `service_map_scripts`. Absent when none, as on older servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub script_versions: Vec<ScriptVersion>,
 }
+
+/// A framework version read from a retained script, attributed to the page that
+/// loaded it (its Referer) when that page is in the map, else to the script's
+/// own origin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScriptVersion {
+    pub product_id: String,
+    pub name: String,
+    pub version: String,
+    /// Where the first script naming this version was served from.
+    pub script_origin: String,
+    pub row_count: usize,
+    pub evidence: Vec<String>,
+}
+
+const MAX_SCRIPT_VERSIONS_PER_ORIGIN: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceEndpoint {
@@ -295,6 +315,10 @@ pub struct ServiceMapRow {
     /// credentials were allowed with it; aggregated onto links only.
     #[serde(skip)]
     pub cors: Option<(String, bool)>,
+    /// The Next.js version this row's script declares; filled in by the store,
+    /// which reads the body once per row revision.
+    #[serde(skip)]
+    pub script_version: Option<String>,
 }
 
 /// Every value `request_kind` returns, in the order clients present them.
@@ -636,6 +660,7 @@ pub(crate) fn project_record_for_catalog(
         omitted: vec![],
         request_kind: request_kind(record),
         cors: None,
+        script_version: None,
     };
     if record
         .response
@@ -1033,6 +1058,7 @@ fn build_with_scope(
     let mut origins = BTreeMap::<String, ServiceOrigin>::new();
     let mut endpoint_indexes = BTreeMap::<(String, String, String), usize>::new();
     let mut technology_observation_count = 0usize;
+    let mut script_hits = Vec::new();
     let mut included_rows = 0;
     let mut excluded_rows = 0;
     let mut omitted_rows = snapshot.omitted_rows;
@@ -1070,12 +1096,21 @@ fn build_with_scope(
                 technology_observations: Some(vec![]),
                 redirects: vec![],
                 header_links: vec![],
+                script_versions: vec![],
             });
         origin.in_scope |= in_scope;
         origin.request_count += 1;
         origin.first_seen = origin.first_seen.min(row.started_at);
         origin.last_seen = origin.last_seen.max(row.started_at);
         included_rows += 1;
+        if let Some(version) = row.script_version.clone() {
+            let page = row
+                .header_links
+                .iter()
+                .find(|link| link.relationship == "referer_header")
+                .map(|link| link.source_origin.clone());
+            script_hits.push((page, row.origin.clone(), version, row.evidence_id.clone()));
+        }
         let key = (row.origin.clone(), row.method.clone(), row.path.clone());
         let endpoint_index = if let Some(index) = endpoint_indexes.get(&key) {
             Some(*index)
@@ -1238,8 +1273,40 @@ fn build_with_scope(
             }
         }
     }
+    // A script's version belongs to the page that loaded it when that page is
+    // in the map; a CDN serving the bundle is only where it was read.
+    for (page, script_origin, version, evidence) in script_hits {
+        let owner = page
+            .filter(|page| origins.contains_key(page))
+            .unwrap_or_else(|| script_origin.clone());
+        let Some(origin) = origins.get_mut(&owner) else {
+            continue;
+        };
+        if let Some(existing) = origin
+            .script_versions
+            .iter_mut()
+            .find(|item| item.version == version)
+        {
+            existing.row_count += 1;
+            sample(&mut existing.evidence, &evidence);
+        } else if origin.script_versions.len() < MAX_SCRIPT_VERSIONS_PER_ORIGIN {
+            origin.script_versions.push(ScriptVersion {
+                product_id: "next_js".into(),
+                name: "Next.js".into(),
+                version,
+                script_origin,
+                row_count: 1,
+                evidence: vec![evidence],
+            });
+        } else {
+            stopped_by.insert("script_versions_limit".into());
+        }
+    }
     let mut origins: Vec<_> = origins.into_values().collect();
     for origin in &mut origins {
+        origin
+            .script_versions
+            .sort_by(|a, b| a.version.cmp(&b.version));
         origin
             .endpoints
             .sort_by(|a, b| (&a.path, &a.method).cmp(&(&b.path, &b.method)));

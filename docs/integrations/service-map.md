@@ -304,6 +304,35 @@ selects the origin that recorded it (the target of an Origin or Referer link,
 the source of a redirect) and marks the relationship in the inspector, where
 View source opens an example row.
 
+## Script versions
+
+A response header can say a page is built with Next.js but never which version:
+`X-Powered-By: Next.js` carries none. Next.js's client runtime does, as
+`window.next={version:"…"}` in its bundles. When the map is built, Sniper reads
+retained JavaScript responses under `/_next/` for that value, once per row
+revision, at most 64 retained rows per map and none larger than 2 MiB. Only that
+anchor counts: another library's `version:"…"` in the same bundles is not
+Next.js's. The version goes to the page that loaded the script (its Referer)
+when that page is in the map, else to the script's own origin, so a bundle
+served from a CDN names the page's framework.
+
+The card's product chip then reads `Next.js 14.2.3`, and the inspector lists the
+script rows under **Script versions**, each with View source. The API and the CLI
+carry it on the origin as `script_versions` (`product_id`, `name`, `version`,
+`script_origin`, `row_count`, `evidence`), omitted when no script names one.
+
+## Endpoint parameters
+
+Opening an endpoint shows **Show parameters**. It reads the endpoint's newest
+200 retained rows and lists each parameter by name, where it was sent (`query`,
+`form`, a top-level `json` field, or a `multipart` field name), how many rows
+carried it, and up to three of its values, each cut to 80 characters. Request
+bodies are read for this only, when asked, and only in the active session; a
+body is parsed from its first 64 KiB. The values are shown as captured, as in
+HTTP history. `GET /api/target/service-map/parameters` with `session_id`,
+`origin`, `method` and `path` returns the same result; the CLI does not read it
+yet.
+
 ## Sites and hidden origins
 
 **Group by site** (on by default) gathers two or more origins of one site onto a
@@ -403,8 +432,9 @@ active-discovery option, or automatic retry with a larger limit.
   view.
 
 The result lists initiator, remote IP, and TLS certificate in `unavailable`.
-The default map continues to list response-body references as `deferred`: bodies
-are never read to build or refresh the map or its metadata evidence. A separate,
+The default map continues to list response-body references as `deferred`. The
+only bodies it reads are Next.js bundles, for [Script versions](#script-versions);
+its metadata evidence reads none. A separate,
 explicit one-row retained-preview read is described below. It does not enrich the
 default inventory automatically. Do not fill unavailable gaps using hostname
 guesses or present them as collected evidence.

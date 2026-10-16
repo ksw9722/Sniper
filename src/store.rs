@@ -264,6 +264,9 @@ pub struct TransactionStore {
     /// Session directory, so a record whose bodies were dropped can be read back
     /// out of transactions.ndjson. Derived from the journal path.
     storage_dir: Option<PathBuf>,
+    /// Next.js versions read from retained scripts, by record and revision;
+    /// None when a row was read and named none. See `service_map_scripts`.
+    script_versions: Mutex<HashMap<(Uuid, Uuid), Option<String>>>,
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
     next_event_sequence: AtomicU64,
@@ -625,6 +628,14 @@ fn validate_service_map_body_locator(
 #[cfg(test)]
 type ServiceMapBodyReadHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// A retained script row to read after the store lock is released.
+struct PendingScript {
+    row: usize,
+    key: crate::service_map::EvidenceKey,
+    locator: crate::session::BodyLocator,
+    file_generation: Uuid,
+}
+
 #[derive(Clone, Debug)]
 struct CachedSummary {
     summary: TransactionSummary,
@@ -848,6 +859,7 @@ impl TransactionStore {
             journal_tx: None,
             journal_start_failed: false,
             storage_dir: None,
+            script_versions: Mutex::new(HashMap::new()),
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
             next_event_sequence: AtomicU64::new(max_seq.max(latest_event_sequence) + 1),
@@ -1405,9 +1417,115 @@ impl TransactionStore {
     ) {
         let inner = self.inner.blocking_read();
         let epoch = ServiceMapMetadataEpoch(inner.service_map_metadata_epoch);
-        let snapshot =
+        let mut snapshot =
             self.service_map_snapshot_locked(&inner, session_id, max_records, catalog, filters);
+        let pending = self.cached_script_versions(&inner, &mut snapshot);
+        drop(inner);
+        self.read_script_versions(&mut snapshot, pending);
         (snapshot, epoch)
+    }
+
+    /// Fills in the Next.js version of each script row read before, reads the
+    /// ones still in memory, and returns the retained ones to read after the
+    /// lock is released. A row is read once per revision.
+    fn cached_script_versions(
+        &self,
+        inner: &StoreInner,
+        snapshot: &mut crate::service_map::MetadataSnapshot,
+    ) -> Vec<PendingScript> {
+        use crate::{
+            service_map::EvidenceKey,
+            service_map_body::BodySource,
+            service_map_scripts::{is_candidate, next_version, MAX_SCRIPT_READS},
+        };
+        let mut cache = self
+            .script_versions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // ponytail: forget everything at a cap rather than track recency.
+        if cache.len() > 50_000 {
+            cache.clear();
+        }
+        let mut pending = Vec::new();
+        for (row_index, row) in snapshot.rows.iter_mut().enumerate() {
+            if !is_candidate(row) {
+                continue;
+            }
+            let Some(key) = EvidenceKey::parse(&row.evidence_id) else {
+                continue;
+            };
+            if let Some(version) = cache.get(&(key.record_id, key.revision)) {
+                row.script_version = version.clone();
+                continue;
+            }
+            let Ok(index) = service_map_body_row_index(inner, &key) else {
+                continue;
+            };
+            let record = &inner.entries[index];
+            if BodySource::from_record(record).is_err() {
+                cache.insert((key.record_id, key.revision), None);
+                continue;
+            }
+            let locator = (inner.by_id.get(&record.id) == Some(&index))
+                .then(|| inner.locators.get(&record.id).copied())
+                .flatten();
+            match locator {
+                Some(locator) => {
+                    if pending.len() < MAX_SCRIPT_READS {
+                        pending.push(PendingScript {
+                            row: row_index,
+                            key,
+                            locator,
+                            file_generation: inner.file_generation,
+                        });
+                    }
+                }
+                None => {
+                    let body = record.response.as_ref().map(|r| r.body_preview.as_str());
+                    let version = body.and_then(next_version);
+                    cache.insert((key.record_id, key.revision), version.clone());
+                    row.script_version = version;
+                }
+            }
+        }
+        pending
+    }
+
+    /// Reads retained script rows without the store lock, each checked to still
+    /// own its locator in this file, as an explicit body inspection is.
+    fn read_script_versions(
+        &self,
+        snapshot: &mut crate::service_map::MetadataSnapshot,
+        pending: Vec<PendingScript>,
+    ) {
+        use crate::service_map_scripts::{next_version, read_script};
+        let Some(storage_dir) = self.storage_dir.as_ref().filter(|_| !pending.is_empty()) else {
+            return;
+        };
+        let Ok(mut file) = fs::File::open(storage_dir.join("transactions.ndjson")) else {
+            return;
+        };
+        for item in pending {
+            if validate_service_map_body_locator(
+                &self.inner.blocking_read(),
+                &item.key,
+                item.file_generation,
+                item.locator,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let Some(script) = read_script(&mut file, item.locator, item.key.record_id) else {
+                continue;
+            };
+            let version = next_version(&script);
+            self.script_versions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((item.key.record_id, item.key.revision), version.clone());
+            snapshot.rows[item.row].script_version = version;
+        }
     }
 
     pub(crate) async fn service_map_metadata_epoch_matches(
@@ -2020,6 +2138,120 @@ impl TransactionStore {
             }
         });
         task.await.unwrap_or_else(|_| missing("body_scan_failed"))
+    }
+
+    /// The parameters one endpoint was called with, from its newest retained
+    /// rows. Queries come from row metadata; bodies are read here, on request,
+    /// never to build the map.
+    pub async fn service_map_parameters(
+        &self,
+        session_id: Uuid,
+        origin: &str,
+        method: &str,
+        path: &str,
+    ) -> crate::service_map_parameters::EndpointParameters {
+        use crate::service_map_parameters::{
+            read_request_body, EndpointParameters, ParameterRow, ParameterTally, MAX_ROWS,
+            MAX_TOTAL_BODY_BYTES,
+        };
+        let mut result =
+            EndpointParameters::new(session_id, origin.into(), method.into(), path.into());
+        let mut rows = Vec::new();
+        let file_generation = {
+            let inner = self.inner.read().await;
+            for (index, record) in inner.entries.iter().enumerate().rev() {
+                let (record_path, query) =
+                    match record.path.split('#').next().unwrap_or("").split_once('?') {
+                        Some((record_path, query)) => (record_path, Some(query)),
+                        None => (record.path.split('#').next().unwrap_or(""), None),
+                    };
+                if record.method != method
+                    || record_path != path
+                    || crate::service_map::canonical_origin(&format!(
+                        "{}://{}",
+                        record.scheme, record.host
+                    ))
+                    .as_deref()
+                        != Some(origin)
+                {
+                    continue;
+                }
+                if rows.len() == MAX_ROWS {
+                    result.more_rows = true;
+                    break;
+                }
+                let locator = (inner.by_id.get(&record.id) == Some(&index))
+                    .then(|| inner.locators.get(&record.id).copied())
+                    .flatten();
+                rows.push(ParameterRow {
+                    key: crate::service_map::EvidenceKey {
+                        session_id,
+                        generation: self.saved_cursor_generation,
+                        sequence: record.sequence,
+                        revision: inner.body_generations[index],
+                        record_id: record.id,
+                    },
+                    query: query.map(str::to_string),
+                    content_type: record.request.content_type.clone(),
+                    body: (locator.is_none() && record.request.body_encoding == BodyEncoding::Utf8)
+                        .then(|| record.request.body_preview.clone()),
+                    locator,
+                });
+            }
+            inner.file_generation
+        };
+        let inner = Arc::clone(&self.inner);
+        let storage_dir = self.storage_dir.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            // All file I/O and parsing happen without a store lock; each row
+            // must still own its locator in this file, as for a body inspection.
+            let mut file =
+                storage_dir.and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok());
+            let mut tally = ParameterTally::default();
+            let (mut read, mut budget, mut unread) = (0, MAX_TOTAL_BODY_BYTES, 0);
+            for row in rows {
+                let body = match (row.body, row.locator, file.as_mut()) {
+                    (Some(body), _, _) => body,
+                    (None, Some(locator), Some(_)) if locator.len as usize > budget => {
+                        unread += 1;
+                        String::new()
+                    }
+                    (None, Some(locator), Some(file)) => {
+                        budget -= locator.len as usize;
+                        let current = validate_service_map_body_locator(
+                            &inner.blocking_read(),
+                            &row.key,
+                            file_generation,
+                            locator,
+                        );
+                        match current
+                            .ok()
+                            .and_then(|_| read_request_body(file, locator, row.key.record_id))
+                        {
+                            Some(body) => body,
+                            None => String::new(),
+                        }
+                    }
+                    _ => String::new(),
+                };
+                tally.add_row(row.query.as_deref(), row.content_type.as_deref(), &body);
+                read += 1;
+            }
+            (tally.finish(), read, unread)
+        });
+        match task.await {
+            Ok(((parameters, omitted), read, unread)) => {
+                result.parameters = parameters;
+                result.omitted_parameters = omitted;
+                result.rows = read;
+                result.unread_bodies = unread;
+            }
+            Err(_) => {
+                result.available = false;
+                result.reasons = vec!["parameter_read_failed".into()];
+            }
+        }
+        result
     }
 
     pub async fn site_map_records(&self) -> Vec<SiteMapRecord> {

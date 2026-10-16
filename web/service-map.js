@@ -281,14 +281,23 @@
   function reportedProducts(origin) {
     // Only validated default-map aggregates participate. Missing metadata and
     // exact-source inspections must never turn into an origin-level claim.
-    if (!origin?.technology_observations_present) return [];
     const products = new Map();
-    for (const item of origin.technology_observations) {
-      if (!products.has(item.product_id)) products.set(item.product_id, { id: item.product_id, name: item.name, versions: new Set(), statuses: new Set(), observations: [] });
-      const product = products.get(item.product_id);
-      if (item.version_status === "reported") product.versions.add(item.reported_version);
-      else product.statuses.add(item.version_status);
-      product.observations.push(item);
+    const product = (id, name) => {
+      if (!products.has(id)) products.set(id, { id, name, versions: new Set(), statuses: new Set(), observations: [], scripts: [] });
+      return products.get(id);
+    };
+    for (const item of origin?.technology_observations_present ? origin.technology_observations : []) {
+      const entry = product(item.product_id, item.name);
+      if (item.version_status === "reported") entry.versions.add(item.reported_version);
+      else entry.statuses.add(item.version_status);
+      entry.observations.push(item);
+    }
+    // A version a retained script names supersedes a header that named none.
+    for (const item of origin?.script_versions || []) {
+      const entry = product(item.product_id, item.name);
+      entry.versions.add(item.version);
+      entry.statuses.delete("not_reported");
+      entry.scripts.push(item);
     }
     return [...products.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   }
@@ -302,7 +311,9 @@
   function productSummaryMarkup(origin) {
     const products = reportedProducts(origin);
     if (!products.length) return "";
-    const full = (product) => "Header-reported declarations; versions unverified.\n" + product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`).join("\n");
+    const full = (product) => [product.observations.length ? "Header-reported declarations; versions unverified." : "",
+      ...product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`),
+      ...product.scripts.map((item) => `${item.name} ${item.version} · named by window.next in ${item.row_count} retained script row(s) from ${item.script_origin}`)].filter(Boolean).join("\n");
     const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : " · version unknown"}${product.versions.size && product.statuses.size ? " + unknown" : ""}`;
     return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" title="${escape(products.slice(2).map(full).join("\n"))}">+${products.length - 2}</span>` : ""}</span>`;
   }
@@ -882,6 +893,12 @@
           evidence: array(redirect.evidence).filter((id) => typeof id === "string" && id.length > 0),
           request_count: count(redirect.request_count),
         })),
+        // Framework versions read from retained scripts: Next.js for now.
+        script_versions: array(item.script_versions).filter((entry) => entry?.product_id === "next_js" && typeof entry.version === "string"
+          && /^[0-9][0-9A-Za-z.+-]{0,39}$/.test(entry.version) && safeOrigin(entry.script_origin)).map((entry) => ({
+          product_id: "next_js", name: "Next.js", version: entry.version, script_origin: safeOrigin(entry.script_origin),
+          row_count: count(entry.row_count), evidence: array(entry.evidence).filter((id) => typeof id === "string" && id.length > 0),
+        })),
       }];
     });
     return { snapshot: payload.snapshot, origins, warningCount: array(payload.warnings).length, technologyCatalogVersion: catalogVersion, legacyCatalog: catalogVersion !== requestedVersion };
@@ -1193,6 +1210,7 @@
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       bodyReferencesSource: null, relationLayers: Object.freeze([]), bodyOverlayNotice: "",
       relationshipKind: "body", linkDeclarations: null, linkDeclarationsSource: null, linkDeclarationsError: "",
+      parameters: null, parametersKey: null, parametersLoading: false, parametersError: "", parametersRequestId: 0,
       htmlGenerators: null, htmlGeneratorsLoading: false, htmlGeneratorsError: "", htmlGeneratorsRequestId: 0, htmlGeneratorsSource: null,
       inactiveSessionId: null, historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
     };
@@ -1851,6 +1869,8 @@
       abort?.abort();
       abort = null;
       cancelEvidence();
+      state.parametersRequestId += 1;
+      Object.assign(state, { parameters: null, parametersKey: null, parametersLoading: false, parametersError: "" });
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null,
         inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
@@ -1877,6 +1897,35 @@
       }
       state.detailTab = endpointIndex === null ? "apis" : "evidence";
       render();
+    }
+    // An endpoint's parameters are read when asked, as every retained body is:
+    // each name, where it was sent and a few values, from its newest rows.
+    async function loadParameters(originId, endpoint) {
+      const key = JSON.stringify([originId, endpoint.method, endpoint.path]);
+      if (state.parametersKey === key && (state.parameters || state.parametersLoading)) return;
+      const requestId = ++state.parametersRequestId;
+      const sessionId = getSessionId();
+      Object.assign(state, { parametersKey: key, parameters: null, parametersLoading: true, parametersError: "" });
+      renderDetail();
+      try {
+        const params = new URLSearchParams({ session_id: sessionId, origin: originId, method: endpoint.method, path: endpoint.path });
+        const response = await request(`/api/target/service-map/parameters?${params}`);
+        if (!response.ok) throw new Error("Parameters unavailable");
+        const result = await response.json();
+        if (requestId !== state.parametersRequestId || sessionId !== getSessionId()) return;
+        if (result.schema_version !== 1 || result.origin !== originId || result.method !== endpoint.method || result.path !== endpoint.path) throw new Error("Parameters changed");
+        state.parameters = result.available === true ? {
+          rows: count(result.rows), moreRows: result.more_rows === true, omitted: count(result.omitted_parameters), unreadBodies: count(result.unread_bodies),
+          items: array(result.parameters).filter((item) => typeof item?.name === "string" && ["query", "form", "json", "multipart"].includes(item.location))
+            .map((item) => ({ name: item.name, location: item.location, rows: count(item.rows), examples: array(item.examples).filter((value) => typeof value === "string") })),
+        } : null;
+        state.parametersError = result.available === true ? "" : array(result.reasons).includes("inactive_session") ? "Parameters are read from the active session only." : "Parameters unavailable.";
+      } catch {
+        if (requestId !== state.parametersRequestId) return;
+        state.parametersError = "Parameters unavailable.";
+      }
+      state.parametersLoading = false;
+      renderDetail();
     }
     async function refresh({ force = false, retry = false } = {}) {
       if (!visible) return false;
@@ -2670,6 +2719,23 @@
       }).join("");
       return `<section class="service-map-technologies" aria-label="Header-reported technologies"><h4>Header-reported technologies</h4><ul class="service-map-references">${rows}</ul></section>`;
     }
+    function parametersMarkup(origin, endpoint) {
+      if (state.parametersKey !== JSON.stringify([origin.origin, endpoint.method, endpoint.path])) {
+        return '<section class="service-map-parameters-section" aria-label="Parameters"><h4>Parameters</h4><button class="secondary-action" type="button" data-service-parameters="read" data-service-focus="parameters:read">Show parameters</button></section>';
+      }
+      const result = state.parameters;
+      const rows = (n) => `${n} row${n === 1 ? "" : "s"}`;
+      const body = state.parametersLoading ? '<p class="service-map-muted">Reading parameters…</p>'
+        : state.parametersError ? `<p class="service-map-muted">${escape(state.parametersError)}</p>`
+        : !result?.items.length ? `<p class="service-map-muted">No parameters in the newest ${rows(result?.rows || 0)}.</p>`
+        : `<table class="service-map-parameters"><thead><tr><th>Name</th><th>In</th><th>Rows</th><th>Values</th></tr></thead><tbody>${result.items.map((item) => `<tr><td class="service-map-parameter-name">${escape(item.name)}</td><td>${item.location}</td><td>${item.rows}</td><td>${item.examples.map((value) => `<code>${escape(value)}</code>`).join("")}</td></tr>`).join("")}</tbody></table><p class="service-map-muted">From the newest ${rows(result.rows)}${result.moreRows ? "; older rows not read" : ""}${result.unreadBodies ? ` · ${result.unreadBodies} bodies not read (size limit)` : ""}${result.omitted ? ` · ${result.omitted} more parameters` : ""}.</p>`;
+      return `<section class="service-map-parameters-section" aria-label="Parameters"><h4>Parameters</h4>${body}</section>`;
+    }
+    // Versions retained scripts name, each with the script rows to open.
+    function scriptVersionsMarkup(origin) {
+      if (!origin.script_versions?.length) return "";
+      return `<section class="service-map-technologies" aria-label="Script versions"><h4>Script versions</h4><ul class="service-map-references">${origin.script_versions.map((item) => `<li><strong>${escape(item.name)}</strong> · ${escape(item.version)}<p class="service-map-muted">window.next in ${item.row_count} script row${item.row_count === 1 ? "" : "s"} from ${escape(item.script_origin)}</p><div class="service-map-evidence-list">${item.evidence.map((id, index) => `<button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(item.script_origin)}" data-service-relation-evidence="${escape(id)}" data-service-focus="script:${escape(JSON.stringify([item.version, id]))}"><span>${escape(item.name)} ${escape(item.version)}</span><span>View source${item.evidence.length > 1 ? ` ${index + 1}` : ""} ›</span></button>`).join("")}</div></li>`).join("")}</ul></section>`;
+    }
     function evidenceMarkup(origin) {
       const items = evidenceItems(origin);
       const endpoint = state.endpointIndex === null ? null : origin.endpoints[state.endpointIndex];
@@ -2679,7 +2745,7 @@
         ? '<p class="service-map-muted">Body URL, response Link and retained HTML generator inspections are unavailable for this source outside the default metadata projection. Its exact source metadata, recorded header observations and socket peer remain available here.</p>'
         : htmlGeneratorsMarkup() + relationshipsMarkup();
       const meta = row ? `<div class="service-map-verified"><h4>Verified retained source</h4><dl><dt>Method</dt><dd>${escape(row.method)}</dd><dt>Origin</dt><dd>${escape(safeOrigin(row.origin))}</dd><dt>Path</dt><dd>${escape(safePath(row.path))}</dd><dt>Status</dt><dd>${escape(row.status ?? "No response")}</dd><dt>Sequence</dt><dd>${escape(row.sequence ?? "Unavailable")}</dd><dt>Captured</dt><dd>${escape(row.started_at || "Unavailable")}</dd><dt>Record ID</dt><dd>${escape(row.record_id || "Unavailable")}</dd></dl>${row.metadata_complete === false ? `<p class="service-map-error">Source metadata is incomplete: ${escape(array(row.omitted).join(", ") || "bounded metadata")}</p>` : ""}${array(row.omitted).includes("technology_token_scan_limit") ? '<p class="service-map-error">Header technology scan is partial: token candidate limit reached. Additional declarations may be omitted.</p>' : ""}<h4>Source observations</h4><ul class="service-map-references">${array(row.header_links).filter((link) => ["origin_header", "referer_header"].includes(link.relationship)).map((link) => `<li>${link.relationship === "origin_header" ? "Origin" : "Referer"} header: ${escape(safeOrigin(link.source_origin))} (declaration)</li>`).join("")}${row.redirect ? `<li>Redirect instruction: ${escape(safeOrigin(row.redirect.target_origin))}${escape(safePath(row.redirect.target_path))}</li>` : ""}${array(row.technology_clues).map((clue) => `<li>${escape(clue.name)} · ${escape(clue.header_name)} header clue</li>`).join("")}</ul>${state.evidenceLegacyCatalog ? `<p class="service-map-muted">${LEGACY_CATALOG_NOTICE}</p>` : ""}${technologyMarkup(row.technology_observations, null, row)}<p>Exact retained source verified for this read.</p></div>` : "";
-      return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>` : ""}
+      return `${endpoint ? `<div class="service-map-endpoint-summary"><span class="service-map-method" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><strong>${escape(endpoint.path)}</strong><p>${endpoint.request_count} sampled rows · Statuses: ${escape(endpoint.statuses.join(", ") || "No response")}</p></div>${parametersMarkup(origin, endpoint)}` : ""}
         <h4>Source evidence</h4><p class="service-map-muted">Read the exact retained source metadata. Bodies, query strings and private headers are not included.</p>
         ${activeInspectionsBlocked() ? `<p class="service-map-error" role="status">${INACTIVE_SESSION_NOTICE}</p>` : ""}${state.evidenceLoading ? '<p class="service-map-muted" role="status">Verifying source…</p>' : ""}${state.evidenceError ? `<p class="service-map-error" role="status">${escape(state.evidenceError)}</p>` : ""}${meta}${peerOriginMarkup(origin)}${row ? socketPeerMarkup() + supplementaryMarkup : ""}
         <div class="service-map-evidence-list">${items.slice(0, 30).map((item) => `<button class="service-map-evidence-button ${state.evidenceId === item.id ? "selected" : ""}" type="button" data-service-evidence="${escape(item.id)}" data-service-focus="evidence:${escape(item.id)}"><span>${escape(item.label)}</span><span>View source ›</span></button>`).join("") || `<p class="service-map-muted">${origin.peerInspectionOnly ? "No default-map samples are loaded for this origin; use the exact peer-inspection samples above." : "No source samples are available in this bounded snapshot."}</p>`}</div>${items.length > 30 ? `<p class="service-map-muted">Showing 30 of ${items.length} source samples. Select an API path to narrow the evidence.</p>` : ""}
@@ -2747,7 +2813,7 @@
       if (!state.detailPageAnchor && entries[start]) state.detailPageAnchor = endpointIdentity(entries[start]);
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>${originActionsMarkup(origin)}
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${scriptVersionsMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
     function renderCatalog() {
       const loaded = loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false);
@@ -2834,6 +2900,10 @@
       else if (data.serviceUnhideAll) saveSiteDisplay({ hidden: [] });
       else if (data.serviceGroupSites) saveSiteDisplay({ groupSites: !siteDisplay().groupSites });
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; renderDetail(); }
+      else if (data.serviceParameters) {
+        const endpoint = state.endpointIndex === null ? null : selectedOrigin()?.endpoints[state.endpointIndex];
+        if (endpoint) loadParameters(state.selectedOrigin, endpoint);
+      }
       else if (data.serviceEndpointFilterClear) setEndpointFilter("clear");
       else if (data.serviceProductFilterClear) setProductFilter("clear");
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);

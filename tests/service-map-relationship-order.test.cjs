@@ -456,3 +456,37 @@ test('only an error or the first load shows above the map; counts sit under Deta
   assert.notEqual(f.els.alert.textContent, '');
   assert.equal(f.els.alert.classList.contains('service-map-error'), true);
 });
+
+test('a Next.js version a retained script names shows on the card and in the inspector', async () => {
+  const named = { product_id: 'next_js', name: 'Next.js', version: '14.2.3', script_origin: cdn, row_count: 2, evidence: ['evidence-script'] };
+  const header = { technology_observations_present: true, technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }], script_versions: [named] };
+  const [product] = map.reportedProducts(header);
+  assert.deepEqual([[...product.versions], [...product.statuses]], [['14.2.3'], []], 'the script version supersedes a header that named none');
+  assert.match(map.productSummaryMarkup(header), />Next\.js 14\.2\.3</);
+
+  const f = fixture();
+  await f.load(snapshot([origin(app, { script_versions: [named, { ...named, version: '<b>' }] }), origin(api, { header_links: [referer(app)] })]));
+  assert.equal(f.state.snapshot.origins.find(item => item.origin === app).script_versions.length, 1, 'an unsafe version is dropped');
+  assert.match(f.els.canvas.innerHTML, /role-front"[^]*?service-map-mark[^>]*>N<[^]*?>Next\.js 14\.2\.3</, 'the card names the version and shows the mark');
+  f.controller.selectOrigin(app);
+  assert.match(f.els.detail.innerHTML, /<h4>Script versions<\/h4>[^]*?Next\.js<\/strong> · 14\.2\.3[^]*?window\.next in 2 script rows from https:\/\/x-cdn\.example\.com/);
+  assert.match(f.els.detail.innerHTML, /data-service-relation-origin="https:\/\/x-cdn\.example\.com" data-service-relation-evidence="evidence-script"/);
+});
+
+test('an endpoint shows its parameters when asked: name, where sent, rows and values', async () => {
+  const f = fixture();
+  await f.load(snapshot([origin(app, { endpoints: [{ method: 'GET', path: '/search', request_count: 2, statuses: [200], content_types: ['application/json'], evidence: ['evidence-search'] }] })]));
+  f.controller.selectOrigin(app, 0);
+  assert.match(f.els.detail.innerHTML, /data-service-parameters="read"/, 'opening an endpoint reads nothing');
+  const before = f.requests.length;
+  press(f, { serviceParameters: 'read' });
+  assert.equal(f.requests.length, before + 1);
+  assert.equal(f.requests.at(-1).path, '/api/target/service-map/parameters?session_id=session-one&origin=https%3A%2F%2Fx-app.example.com&method=GET&path=%2Fsearch');
+  assert.match(f.els.detail.innerHTML, /Reading parameters…/);
+  f.requests.at(-1).resolve(response({ schema_version: 1, session_id: 'session-one', available: true, origin: app, method: 'GET', path: '/search', rows: 2, more_rows: false, omitted_parameters: 0,
+    parameters: [{ name: 'q', location: 'query', rows: 2, examples: ['shoes', '<b>'] }, { name: 'x', location: 'cookie', rows: 1, examples: [] }] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(f.els.detail.innerHTML, /<td class="service-map-parameter-name">q<\/td><td>query<\/td><td>2<\/td><td><code>shoes<\/code><code>&lt;b&gt;<\/code><\/td>/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /service-map-parameter-name">x</, 'an unknown location is dropped');
+  assert.match(f.els.detail.innerHTML, /From the newest 2 rows\./);
+});

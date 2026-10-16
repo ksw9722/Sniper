@@ -55,7 +55,9 @@ type). A page's image loads declare Referer too, so read the `api` and
 `navigation` counts before calling a link a service relationship.
 `cors_allowed_count` counts rows whose response allowed the source origin (or
 `*`) to read it; `cors_credentials_count`, those that also allowed credentials.
-Both describe responses, not a confirmed cross-origin read. Check `snapshot.complete`, `stopped_by`, counts, limits,
+Both describe responses, not a confirmed cross-origin read. `script_versions`
+on an origin is a Next.js version read from a retained bundle's `window.next`,
+given to the page that loaded it. Check `snapshot.complete`, `stopped_by`, counts, limits,
 `unavailable`, `deferred`, and warnings before claiming coverage. Counts include duplicate-ID
 rows, and even a complete result covers retained captures only.
 
@@ -88,7 +90,7 @@ header. A missing response `technology_catalog_version` marker means legacy v1
 coverage and triggers a warning; it does not establish catalog 2 support. A
 present marker must match the requested supported catalog. Catalog selection
 adds no target traffic, body reads, fallback reads, or automatic retries. Default
-map and evidence reads remain metadata-only.
+map and evidence reads remain metadata-only apart from Next.js bundles.
 
 Ordinary-map failures use fixed CLI codes `SERVICE_MAP_BUSY`,
 `SERVICE_MAP_SCOPE_WORK_LIMIT`, `SERVICE_MAP_SESSION_CHANGED`,

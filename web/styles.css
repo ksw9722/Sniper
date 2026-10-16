@@ -7435,6 +7435,11 @@ button.utility-button.replay-tab-add {
 .service-map-card.pinned .service-map-card-symbol { box-shadow: 0 0 0 2px var(--point-soft); color: var(--point); }
 .service-map-mark { display: grid; place-items: center; width: 100%; height: 100%; border-radius: 50%; font: 700 11px/1 var(--sans); letter-spacing: -.02em; }
 .service-map-origin-actions { padding: 0 18px; }
+.service-map-parameters { width: 100%; border-collapse: collapse; font-size: var(--font-xs); margin: 6px 0; }
+.service-map-parameters th { text-align: left; color: var(--text-dim); font-weight: 500; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+.service-map-parameters td { padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+.service-map-parameter-name { font-family: var(--mono); color: var(--text); }
+.service-map-parameters code { display: inline-block; margin: 0 4px 2px 0; padding: 0 4px; border-radius: 4px; background: var(--panel-code); font-family: var(--mono); }
 .service-map-origin-actions .secondary-action { min-height: 0; padding: 3px 10px; font-size: var(--font-xs); }
 .service-map-card-copy { display: grid; gap: 4px; min-width: 0; width: 100%; }
 .service-map-card-copy strong { font-size: var(--font-sm); line-height: var(--service-map-line-height); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 3px; }

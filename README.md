@@ -254,7 +254,9 @@ A separate, explicit `sniper-cli target service-map body-references --session-id
 UTF-8 HTML/JavaScript response preview. It returns canonical origins and preview
 byte offsets, with truncation and limits; literal references do not prove calls
 or ownership. The session must already be active. Default map/evidence reads
-remain metadata-only, with no automatic body reads or target requests.
+remain metadata-only apart from Next.js bundles, read for their framework
+version, and send no target requests. An endpoint's parameters (query, form and
+JSON fields, with a few values) are read when asked.
 
 In the GUI, explicitly inspected body references, Response Link declarations and
 recorded socket-peer groups can coexist in a session-local map collection, with

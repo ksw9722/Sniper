@@ -475,6 +475,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_socket_peer_matches),
         )
         .route(
+            "/api/target/service-map/parameters",
+            get(get_target_service_map_parameters),
+        )
+        .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
         )
@@ -5687,6 +5691,53 @@ async fn get_target_service_map_body_references(
         .into_response();
     }
     Json(result).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceMapParametersQuery {
+    session_id: Uuid,
+    origin: String,
+    method: String,
+    path: String,
+}
+
+// One endpoint's parameters, read on request. It reads retained request
+// bodies, so like a body inspection it serves the active session only.
+async fn get_target_service_map_parameters(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapParametersQuery>,
+) -> Response {
+    use crate::service_map_parameters::EndpointParameters;
+    if crate::service_map::canonical_origin(&query.origin).as_deref() != Some(query.origin.as_str())
+        || query.method.is_empty()
+        || query.method.len() > 64
+        || !query.path.starts_with('/')
+        || query.path.len() > 4096
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "origin, method and path must name one endpoint",
+        )
+            .into_response();
+    }
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(EndpointParameters::unavailable(
+            query.session_id,
+            query.origin,
+            query.method,
+            query.path,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    Json(
+        session
+            .store
+            .service_map_parameters(session.id(), &query.origin, &query.method, &query.path)
+            .await,
+    )
+    .into_response()
 }
 
 async fn get_target_service_map_html_generators(

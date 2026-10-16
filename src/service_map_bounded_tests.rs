@@ -917,3 +917,97 @@ fn links_count_rows_whose_response_allowed_the_source_origin() {
         );
     }
 }
+
+// A Next.js bundle names its framework version; the map gives it to the page
+// that loaded the bundle, and to the bundle's own origin when no page did.
+#[test]
+fn script_versions_go_to_the_page_that_loaded_the_bundle() {
+    let session = Uuid::from_u128(100);
+    let script = |host: &str, referer: Option<&str>, body: &str, sequence| {
+        let mut record = filter_fixture(
+            host,
+            "/_next/static/chunks/main-app.js",
+            200,
+            "application/javascript",
+            referer,
+            sequence,
+        );
+        record.response.as_mut().unwrap().body_preview = body.into();
+        record
+    };
+    let store = TransactionStore::from_records(vec![
+        filter_fixture("www.example.com", "/", 200, "text/html", None, 1),
+        script(
+            "cdn.example.com",
+            Some("https://www.example.com/"),
+            r#"n()}window.next={version:"14.2.3",appDir:!0}"#,
+            2,
+        ),
+        script(
+            "cdn.example.com",
+            Some("https://www.example.com/shop"),
+            r#"window.next={version:"14.2.3",appDir:!0}"#,
+            3,
+        ),
+        script(
+            "api.example.com",
+            None,
+            r#"let s="13.4.7";window.next={version:s,router:r}"#,
+            4,
+        ),
+        script("img.example.com", None, "console.log(1)", 5),
+    ]);
+    let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        DEFAULT_MAX_RECORDS,
+        technology::CatalogVersion::V1,
+        &crate::store::ListFilters::default(),
+    );
+    let map = build_bounded(
+        session,
+        snapshot,
+        DEFAULT_MAX_RECORDS,
+        false,
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    let versions = |host: &str| {
+        map.origins
+            .iter()
+            .find(|origin| origin.origin == format!("https://{host}"))
+            .unwrap()
+            .script_versions
+            .iter()
+            .map(|item| {
+                (
+                    item.version.clone(),
+                    item.script_origin.clone(),
+                    item.row_count,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        versions("www.example.com"),
+        [(
+            "14.2.3".to_string(),
+            "https://cdn.example.com".to_string(),
+            2
+        )]
+    );
+    assert!(
+        versions("cdn.example.com").is_empty(),
+        "the CDN only served it"
+    );
+    assert_eq!(
+        versions("api.example.com"),
+        [(
+            "13.4.7".to_string(),
+            "https://api.example.com".to_string(),
+            1
+        )]
+    );
+    assert!(versions("img.example.com").is_empty());
+}

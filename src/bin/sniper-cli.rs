@@ -4243,6 +4243,16 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     origin["properties"]["technology_observations"] = json!({
         "type":"array","maxItems":32,"items":service_map_technology_schema(false, CatalogVersion::V2)
     });
+    // Optional: older servers, and origins whose scripts name nothing, omit it.
+    origin["properties"]["script_versions"] = json!({
+        "type":"array","maxItems":8,
+        "description":"Framework versions retained scripts declare (Next.js's window.next), given to the page that loaded the script when it is in the map.",
+        "items":service_map_object(json!({
+            "product_id":{"type":"string","enum":["next_js"]},"name":{"type":"string","enum":["Next.js"]},
+            "version":{"type":"string","pattern":"^[0-9][0-9A-Za-z.+-]{0,39}$"},
+            "script_origin":string,"row_count":count,"evidence":strings
+        }))
+    });
     let mut limits = serde_json::Map::new();
     for field in [
         "max_records",
@@ -9645,6 +9655,18 @@ fn validate_service_map_response(
                         && link.request_kinds.values().sum::<usize>() == link.request_count
                         && link.cors_credentials_count <= link.cors_allowed_count
                         && link.cors_allowed_count <= link.request_count
+                })
+                && origin.script_versions.iter().all(|item| {
+                    item.product_id == "next_js"
+                        && item.name == "Next.js"
+                        && item.version.len() <= 40
+                        && item.version.starts_with(|c: char| c.is_ascii_digit())
+                        && item
+                            .version
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+                        && service_map_safe_origin(&item.script_origin)
+                        && item.row_count > 0
                 })
         });
     if !valid {

@@ -1725,3 +1725,133 @@ async fn service_map_display_filter_hides_rows_through_api_and_cli_as_history_do
     drop(state);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// An endpoint's parameters: query pairs and JSON fields counted per row with a
+// few values, newest first, read for the active session only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
+    let dir = std::env::temp_dir().join(format!("sniper-map-parameters-{}", Uuid::new_v4()));
+    let state = Arc::new(
+        AppState::new(AppConfig {
+            data_dir: dir.clone(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 1024,
+        })
+        .unwrap(),
+    );
+    let session = state.session().await;
+    let session_id = session.id();
+    let request = |method: &str, path: &str, content_type: Option<&str>, body: &[u8]| {
+        let mut headers = HeaderMap::new();
+        if let Some(content_type) = content_type {
+            headers.insert("content-type", content_type.parse().unwrap());
+        }
+        TransactionRecord::http(
+            chrono::Utc::now(),
+            method.into(),
+            "https".into(),
+            "www.example.com".into(),
+            path.into(),
+            Some(200),
+            1,
+            MessageRecord::from_headers_and_body(&headers, body, 4096),
+            Some(MessageRecord::from_headers_and_body(
+                &HeaderMap::new(),
+                b"",
+                1024,
+            )),
+            Vec::new(),
+            None,
+            None,
+        )
+    };
+    for record in [
+        request("GET", "/search?q=shoes&page=2", None, b""),
+        request("GET", "/search?q=hats", None, b""),
+        request(
+            "POST",
+            "/search",
+            Some("application/json"),
+            br#"{"q":"bags","limit":5}"#,
+        ),
+        request("GET", "/other?x=1", None, b""),
+    ] {
+        session.store.insert(record).await;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let app = sniper::api::router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let read = |session: Uuid, origin: &str, method: &str, path: &str| {
+        let request = client
+            .get(format!("{api}/api/target/service-map/parameters"))
+            .query(&[
+                ("session_id", session.to_string()),
+                ("origin", origin.to_string()),
+                ("method", method.to_string()),
+                ("path", path.to_string()),
+            ]);
+        async move { request.send().await.unwrap() }
+    };
+    let names = |result: &Value| -> Vec<(String, String, u64, Value)> {
+        result["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["location"].as_str().unwrap().to_string(),
+                    item["name"].as_str().unwrap().to_string(),
+                    item["rows"].as_u64().unwrap(),
+                    item["examples"].clone(),
+                )
+            })
+            .collect()
+    };
+    let origin = "https://www.example.com";
+
+    let get: Value = read(session_id, origin, "GET", "/search")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(get["available"], true);
+    assert_eq!(get["rows"], 2);
+    assert_eq!(
+        names(&get),
+        [
+            ("query".into(), "q".into(), 2, json!(["hats", "shoes"])),
+            ("query".into(), "page".into(), 1, json!(["2"])),
+        ]
+    );
+    let post: Value = read(session_id, origin, "POST", "/search")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&post),
+        [
+            ("json".into(), "limit".into(), 1, json!(["5"])),
+            ("json".into(), "q".into(), 1, json!(["bags"])),
+        ]
+    );
+    let other: Value = read(Uuid::new_v4(), origin, "GET", "/search")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(other["available"], false);
+    assert_eq!(other["reasons"], json!(["inactive_session"]));
+    let bad = read(session_id, "https://www.example.com/", "GET", "/search").await;
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+    drop(session);
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}
