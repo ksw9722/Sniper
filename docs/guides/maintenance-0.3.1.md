@@ -20,7 +20,7 @@ remain unavailable without being loaded or activated. Only bounded retained
 UTF-8 HTML/JavaScript previews are inspected; results expose canonical origins
 and retained-preview offsets with separate capture/prefix truncation and cap
 reasons. References do not establish calls or ownership. The default map reads
-no bodies apart from scripts and pages read for library versions (see below),
+no bodies apart from scripts and pages read for front-end technologies (see below),
 metadata evidence reads none,
 and nothing sends target requests.
 
@@ -356,13 +356,16 @@ or Site), read from its endpoints' response types, with a declared application
 product's mark, such as Next.js, in place of the icon.
 
 Two reads were added. Headers rarely name a version (`X-Powered-By: Next.js`
-carries none), but scripts and pages do: license banners, runtime literals such
-as `window.next={version:"…"}`, Angular's `ng-version` and a page's generator
-meta. The map now reads retained JavaScript and HTML for these, for two dozen
-libraries and any generator, once per row revision and bounded per map. A
-script's versions go to the page that loaded it; cards show `Next.js 14.2.3` and
-the inspector lists the rows under Library versions (`library_versions` in the
-API and the CLI). Opening an endpoint
+carries none), but responses do: script banners and runtime values such as
+`window.next={version:"…"}`, page markup such as `ng-version` and `data-v-`
+attributes and the generator meta, and asset URLs such as a CDN's
+`/npm/vue@3.4.21/` or a `/_next/static/` build directory. The map now reads
+these for about seventy front-end frameworks, CMSs, UI kits, libraries and
+trackers, with Wappalyzer's catalogue as the checklist and Sniper's own rules,
+once per row revision and bounded per map. An asset's technologies go to the
+page that loaded it; cards lead with what the site is built with, and the
+inspector lists them under Front-end (`front_technologies` in the API and the
+CLI). Opening an endpoint
 offers Show parameters, which reads its newest 200 rows on request and lists
 each query, form, JSON or multipart parameter with its row count and up to
 three values (`GET /api/target/service-map/parameters`).

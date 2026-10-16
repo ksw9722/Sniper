@@ -755,6 +755,15 @@ struct CachedServiceMap {
     bytes: bytes::Bytes,
 }
 
+fn merge_libraries(
+    found: &mut Vec<crate::service_map_libraries::Detection>,
+    more: Vec<crate::service_map_libraries::Detection>,
+) {
+    for detection in more {
+        crate::service_map_libraries::merge(found, detection);
+    }
+}
+
 /// A script or page row to scan after the store lock is released.
 struct PendingLibrary {
     key: crate::service_map::EvidenceKey,
@@ -1578,7 +1587,7 @@ impl TransactionStore {
         let mut pending = Vec::new();
         for (row_index, row) in snapshot.rows.iter_mut().enumerate() {
             match library_lookup(inner, &mut caches, row, &mut budget) {
-                Some(Ok(found)) => row.libraries = found,
+                Some(Ok(found)) => merge_libraries(&mut row.libraries, found),
                 Some(Err(item)) => pending.push((row_index, item)),
                 None => {}
             }
@@ -1597,7 +1606,7 @@ impl TransactionStore {
         let mut file = self.transactions_file();
         for (row_index, item) in pending {
             if let Some(found) = self.read_library(&mut file, item) {
-                snapshot.rows[row_index].libraries = found;
+                merge_libraries(&mut snapshot.rows[row_index].libraries, found);
             }
         }
     }
@@ -1760,9 +1769,11 @@ impl TransactionStore {
                         .insert("unsupported_or_oversized_metadata".into());
                     continue;
                 };
+                // A row whose body is still to be read waits with what its URL
+                // named, so the row counts once for each technology.
                 let waiting = match library_lookup(&inner, &mut caches, &row, &mut budget) {
                     Some(Ok(found)) => {
-                        row.libraries = found;
+                        merge_libraries(&mut row.libraries, found);
                         None
                     }
                     Some(Err(item)) => Some((
@@ -1770,6 +1781,7 @@ impl TransactionStore {
                         library_page(&row),
                         row.origin.clone(),
                         row.evidence_id.clone(),
+                        std::mem::take(&mut row.libraries),
                     )),
                     None => None,
                 };
@@ -1787,10 +1799,11 @@ impl TransactionStore {
             next = from;
         }
         let mut file = self.transactions_file();
-        for (item, page, origin, evidence) in pending {
-            if let Some(found) = self.read_library(&mut file, item) {
-                builder.add_libraries(page, origin, found, evidence);
+        for (item, page, origin, evidence, mut found) in pending {
+            if let Some(more) = self.read_library(&mut file, item) {
+                merge_libraries(&mut found, more);
             }
+            builder.add_libraries(page, origin, found, evidence);
         }
         Ok((
             builder.finish(session_id, meta, retained.max(1)),

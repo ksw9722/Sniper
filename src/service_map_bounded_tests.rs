@@ -918,58 +918,66 @@ fn links_count_rows_whose_response_allowed_the_source_origin() {
     }
 }
 
-// A Next.js bundle names its framework version; the map gives it to the page
-// that loaded the bundle, and to the bundle's own origin when no page did.
+// Bundles, pages and asset URLs name front-end technologies; the map gives an
+// asset's to the page that loaded it, to the asset's own origin when no page did,
+// and keeps a page's with the page.
 #[test]
-fn library_versions_go_to_the_page_that_loaded_the_bundle() {
+fn front_technologies_go_to_the_page_that_loaded_the_asset() {
     let session = Uuid::from_u128(100);
-    let script = |host: &str, referer: Option<&str>, body: &str, sequence| {
-        let mut record = filter_fixture(
-            host,
-            "/_next/static/chunks/main-app.js",
-            200,
-            "application/javascript",
-            referer,
-            sequence,
-        );
-        record.response.as_mut().unwrap().body_preview = body.into();
-        record
-    };
+    let asset =
+        |host: &str, path: &str, kind: &str, referer: Option<&str>, body: &str, sequence| {
+            let mut record = filter_fixture(host, path, 200, kind, referer, sequence);
+            record.response.as_mut().unwrap().body_preview = body.into();
+            record
+        };
+    let next = "/_next/static/chunks/main-app.js";
+    let js = "application/javascript";
     let store = TransactionStore::from_records(vec![
         filter_fixture("www.example.com", "/", 200, "text/html", None, 1),
-        script(
+        asset(
             "cdn.example.com",
+            next,
+            js,
             Some("https://www.example.com/"),
             r#"n()}window.next={version:"14.2.3",appDir:!0}"#,
             2,
         ),
-        script(
+        asset(
             "cdn.example.com",
+            next,
+            js,
             Some("https://www.example.com/shop"),
             r#"window.next={version:"14.2.3",appDir:!0}"#,
             3,
         ),
-        script(
+        asset(
             "api.example.com",
+            next,
+            js,
             None,
             r#"let s="13.4.7";window.next={version:s,router:r}"#,
             4,
         ),
-        script("img.example.com", None, "console.log(1)", 5),
-        {
-            // A page's generator stays with the page, whatever its Referer.
-            let mut record = filter_fixture(
-                "blog.example.com",
-                "/",
-                200,
-                "text/html",
-                Some("https://www.example.com/"),
-                6,
-            );
-            record.response.as_mut().unwrap().body_preview =
-                r#"<meta name="generator" content="WordPress 6.5.2">"#.into();
-            record
-        },
+        // Its URL alone says Next.js built it; its body names no version.
+        asset("img.example.com", next, js, None, "console.log(1)", 5),
+        // A stylesheet is read by its URL only.
+        asset(
+            "cdn.example.com",
+            "/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css",
+            "text/css",
+            Some("https://www.example.com/"),
+            "",
+            6,
+        ),
+        // A page's markup and generator stay with the page, whatever its Referer.
+        asset(
+            "blog.example.com",
+            "/",
+            "text/html",
+            Some("https://www.example.com/"),
+            r#"<meta name="generator" content="WordPress 6.5.2"><div data-v-1a2b3c4d>"#,
+            7,
+        ),
     ]);
     let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
         session,
@@ -987,50 +995,60 @@ fn library_versions_go_to_the_page_that_loaded_the_bundle() {
         &[],
     )
     .unwrap();
-    let versions = |host: &str| {
+    let found = |host: &str| {
         map.origins
             .iter()
             .find(|origin| origin.origin == format!("https://{host}"))
             .unwrap()
-            .library_versions
+            .front_technologies
             .iter()
             .map(|item| {
                 (
+                    item.product_id.clone(),
                     item.version.clone(),
-                    item.source_origin.clone(),
+                    item.source_origin
+                        .trim_start_matches("https://")
+                        .to_string(),
                     item.row_count,
                 )
             })
             .collect::<Vec<_>>()
     };
+    let one = |id: &str, version: Option<&str>, source: &str, rows| {
+        (
+            id.to_string(),
+            version.map(str::to_string),
+            source.to_string(),
+            rows,
+        )
+    };
     assert_eq!(
-        versions("www.example.com"),
-        [(
-            "14.2.3".to_string(),
-            "https://cdn.example.com".to_string(),
-            2
-        )]
+        found("www.example.com"),
+        [
+            one("next_js", Some("14.2.3"), "cdn.example.com", 2),
+            one("bootstrap", Some("5.3.2"), "cdn.example.com", 1),
+        ],
+        "each bundle counts once though its URL and body both name Next.js"
     );
     assert!(
-        versions("cdn.example.com").is_empty(),
-        "the CDN only served it"
+        found("cdn.example.com").is_empty(),
+        "the CDN only served them"
     );
     assert_eq!(
-        versions("api.example.com"),
-        [(
-            "13.4.7".to_string(),
-            "https://api.example.com".to_string(),
-            1
-        )]
+        found("api.example.com"),
+        [one("next_js", Some("13.4.7"), "api.example.com", 1)]
     );
-    assert!(versions("img.example.com").is_empty());
     assert_eq!(
-        versions("blog.example.com"),
-        [(
-            "6.5.2".to_string(),
-            "https://blog.example.com".to_string(),
-            1
-        )]
+        found("img.example.com"),
+        [one("next_js", None, "img.example.com", 1)]
+    );
+    assert_eq!(
+        found("blog.example.com"),
+        [
+            one("wordpress", Some("6.5.2"), "blog.example.com", 1),
+            one("vue", None, "blog.example.com", 1),
+        ],
+        "a CMS leads a framework"
     );
 }
 

@@ -4243,16 +4243,27 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     origin["properties"]["technology_observations"] = json!({
         "type":"array","maxItems":32,"items":service_map_technology_schema(false, CatalogVersion::V2)
     });
-    // Optional: older servers, and origins whose bodies name nothing, omit it.
-    origin["properties"]["library_versions"] = json!({
-        "type":"array","maxItems":24,
-        "description":"Library and framework versions retained scripts and pages declare (license banners, Next.js's window.next, React DOM's renderer registration, ng-version, <meta name=generator>). A script's version goes to the page that loaded it when that page is in the map.",
-        "items":service_map_object(json!({
-            "product_id":{"type":"string","pattern":"^[a-z0-9_]{1,40}$"},
-            "name":{"type":"string","pattern":"^[A-Za-z][A-Za-z0-9 .!+_-]{0,39}$"},
-            "version":{"type":"string","pattern":"^[0-9][0-9A-Za-z.+-]{0,39}$"},
-            "source_origin":string,"row_count":count,"evidence":strings
-        }))
+    // Optional: older servers, and origins nothing names, omit it.
+    let mut front = service_map_object(json!({
+        "product_id":{"type":"string","pattern":"^[a-z0-9_]{1,40}$"},
+        "name":{"type":"string","pattern":"^[A-Za-z][A-Za-z0-9 .!+_-]{0,39}$"},
+        "category":{"type":"string","enum":sniper::service_map_libraries::CATEGORIES},
+        "version":{"type":"string","pattern":"^[0-9][0-9A-Za-z.+-]{0,39}$"},
+        "source_origin":string,"row_count":count,"evidence":strings
+    }));
+    // A product named without a version omits it.
+    front["required"] = json!([
+        "product_id",
+        "name",
+        "category",
+        "source_origin",
+        "row_count",
+        "evidence"
+    ]);
+    origin["properties"]["front_technologies"] = json!({
+        "type":"array","maxItems":32,
+        "description":"Front-end frameworks, CMSs, UI kits, libraries and analytics retained scripts, pages and asset URLs name: license banners, runtime values such as Next.js's window.next, page markup such as ng-version or data-v- attributes, <meta name=generator>, CDN package@version paths, versioned file names and build directories such as /_next/static/. An asset's goes to the page that loaded it when that page is in the map.",
+        "items":front
     });
     let mut limits = serde_json::Map::new();
     for field in [
@@ -9657,7 +9668,7 @@ fn validate_service_map_response(
                         && link.cors_credentials_count <= link.cors_allowed_count
                         && link.cors_allowed_count <= link.request_count
                 })
-                && origin.library_versions.iter().all(|item| {
+                && origin.front_technologies.iter().all(|item| {
                     !item.product_id.is_empty()
                         && item.product_id.len() <= 40
                         && item
@@ -9670,12 +9681,15 @@ fn validate_service_map_response(
                             b.is_ascii_alphanumeric()
                                 || matches!(b, b' ' | b'.' | b'!' | b'+' | b'_' | b'-')
                         })
-                        && item.version.len() <= 40
-                        && item.version.starts_with(|c: char| c.is_ascii_digit())
-                        && item
-                            .version
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+                        && sniper::service_map_libraries::CATEGORIES
+                            .contains(&item.category.as_str())
+                        && item.version.as_deref().is_none_or(|version| {
+                            version.len() <= 40
+                                && version.starts_with(|c: char| c.is_ascii_digit())
+                                && version.bytes().all(|b| {
+                                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')
+                                })
+                        })
                         && service_map_safe_origin(&item.source_origin)
                         && item.row_count > 0
                 })

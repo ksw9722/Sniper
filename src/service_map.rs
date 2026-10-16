@@ -184,24 +184,28 @@ pub struct ServiceOrigin {
     /// Library and framework versions retained scripts and pages declare; see
     /// `service_map_libraries`. Absent when none, as on older servers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub library_versions: Vec<LibraryVersion>,
+    pub front_technologies: Vec<FrontTechnology>,
 }
 
-/// A version a retained body declared. A script's goes to the page that loaded
-/// it (its Referer) when that page is in the map, else to the script's own
-/// origin; a page's stays with the page.
+/// A front-end technology a retained script, page or asset URL names. An asset's
+/// goes to the page that loaded it (its Referer) when that page is in the map,
+/// else to the asset's own origin; a page's stays with the page.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LibraryVersion {
+pub struct FrontTechnology {
     pub product_id: String,
     pub name: String,
-    pub version: String,
-    /// Where the first body naming this version was served from.
+    /// One of `service_map_libraries::CATEGORIES`.
+    pub category: String,
+    /// Absent when no row named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Where the first row naming it was served from.
     pub source_origin: String,
     pub row_count: usize,
     pub evidence: Vec<String>,
 }
 
-const MAX_LIBRARY_VERSIONS_PER_ORIGIN: usize = 24;
+const MAX_FRONT_TECHNOLOGIES_PER_ORIGIN: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceEndpoint {
@@ -315,8 +319,8 @@ pub struct ServiceMapRow {
     /// credentials were allowed with it; aggregated onto links only.
     #[serde(skip)]
     pub cors: Option<(String, bool)>,
-    /// The libraries this row's script or page declares; filled in by the
-    /// store, which reads the body once per row revision.
+    /// The technologies this row's URL names, then those its script or page
+    /// body declares, which the store reads once per row revision.
     #[serde(skip)]
     pub libraries: Vec<crate::service_map_libraries::Detection>,
 }
@@ -662,6 +666,11 @@ pub(crate) fn project_record_for_catalog(
         cors: None,
         libraries: Vec::new(),
     };
+    // A script, stylesheet or image URL can name its product without a body.
+    if matches!(row.request_kind, "script" | "static") {
+        row.libraries =
+            crate::service_map_libraries::detect_url(&format!("{}{}", row.origin, row.path));
+    }
     if record
         .response
         .as_ref()
@@ -1048,10 +1057,10 @@ pub(crate) fn build(
     .expect("legacy scope matching is unbounded")
 }
 
-/// The page a script row's libraries belong to: its Referer's origin. A page
-/// row's own libraries stay with it.
+/// The page an asset row's technologies belong to: its Referer's origin. A
+/// page row's own stay with it.
 pub(crate) fn library_page(row: &ServiceMapRow) -> Option<String> {
-    (crate::service_map_libraries::kind(row) == Some(crate::service_map_libraries::Kind::Script))
+    (crate::service_map_libraries::kind(row) != Some(crate::service_map_libraries::Kind::Page))
         .then(|| {
             row.header_links
                 .iter()
@@ -1059,6 +1068,39 @@ pub(crate) fn library_page(row: &ServiceMapRow) -> Option<String> {
                 .map(|link| link.source_origin.clone())
         })
         .flatten()
+}
+
+type FrontKey = (Option<String>, String, String, Option<String>);
+
+struct FrontHit {
+    name: String,
+    category: &'static str,
+    rows: usize,
+    evidence: Vec<String>,
+}
+
+fn hit(
+    hits: &mut BTreeMap<FrontKey, FrontHit>,
+    page: Option<String>,
+    source_origin: &str,
+    detection: crate::service_map_libraries::Detection,
+    evidence: &str,
+) {
+    let hit = hits
+        .entry((
+            page,
+            source_origin.to_string(),
+            detection.product_id,
+            detection.version,
+        ))
+        .or_insert_with(|| FrontHit {
+            name: detection.name,
+            category: detection.category,
+            rows: 0,
+            evidence: Vec::new(),
+        });
+    hit.rows += 1;
+    sample(&mut hit.evidence, evidence);
 }
 
 /// Folds projected rows, newest first, into a map. `build_with_scope` feeds it a
@@ -1071,12 +1113,9 @@ pub(crate) struct MapBuilder {
     origins: BTreeMap<String, ServiceOrigin>,
     endpoint_indexes: BTreeMap<(String, String, String), usize>,
     technology_observation_count: usize,
-    library_hits: Vec<(
-        Option<String>,
-        String,
-        crate::service_map_libraries::Detection,
-        String,
-    )>,
+    /// Rows naming each technology, by the page they may belong to and the
+    /// origin they were served from, attributed once every page is known.
+    front_hits: BTreeMap<FrontKey, FrontHit>,
     projected_rows: usize,
     included_rows: usize,
     excluded_rows: usize,
@@ -1092,7 +1131,7 @@ impl MapBuilder {
             origins: BTreeMap::new(),
             endpoint_indexes: BTreeMap::new(),
             technology_observation_count: 0,
-            library_hits: Vec::new(),
+            front_hits: BTreeMap::new(),
             projected_rows: 0,
             included_rows: 0,
             excluded_rows: 0,
@@ -1101,7 +1140,7 @@ impl MapBuilder {
     }
 
     /// Folds one row. False when the row was excluded or left out by a cap.
-    pub(crate) fn add(&mut self, row: ServiceMapRow, in_scope: bool) -> bool {
+    pub(crate) fn add(&mut self, mut row: ServiceMapRow, in_scope: bool) -> bool {
         self.projected_rows += 1;
         if (self.in_scope_only && !in_scope)
             || self
@@ -1137,7 +1176,7 @@ impl MapBuilder {
                 technology_observations: Some(vec![]),
                 redirects: vec![],
                 header_links: vec![],
-                library_versions: vec![],
+                front_technologies: vec![],
             });
         origin.in_scope |= in_scope;
         origin.request_count += 1;
@@ -1146,13 +1185,14 @@ impl MapBuilder {
         self.included_rows += 1;
         if !row.libraries.is_empty() {
             let page = library_page(&row);
-            for detection in &row.libraries {
-                self.library_hits.push((
+            for detection in std::mem::take(&mut row.libraries) {
+                hit(
+                    &mut self.front_hits,
                     page.clone(),
-                    row.origin.clone(),
-                    detection.clone(),
-                    row.evidence_id.clone(),
-                ));
+                    &row.origin,
+                    detection,
+                    &row.evidence_id,
+                );
             }
         }
         let key = (row.origin.clone(), row.method.clone(), row.path.clone());
@@ -1321,7 +1361,7 @@ impl MapBuilder {
         true
     }
 
-    /// Libraries read from an included row's body after it was folded.
+    /// Technologies read from an included row's body after it was folded.
     pub(crate) fn add_libraries(
         &mut self,
         page: Option<String>,
@@ -1330,12 +1370,13 @@ impl MapBuilder {
         evidence: String,
     ) {
         for detection in found {
-            self.library_hits.push((
+            hit(
+                &mut self.front_hits,
                 page.clone(),
-                source_origin.clone(),
+                &source_origin,
                 detection,
-                evidence.clone(),
-            ));
+                &evidence,
+            );
         }
     }
 
@@ -1346,31 +1387,62 @@ impl MapBuilder {
         snapshot: MetadataSnapshot,
         max_records: usize,
     ) -> ServiceMap {
-        // A script's version belongs to the page that loaded it when that page is
-        // in the map; a CDN serving the bundle is only where it was read.
-        for (page, source_origin, detection, evidence) in self.library_hits {
+        // An asset's technology belongs to the page that loaded it when that
+        // page is in the map; a CDN serving the file is only where it was found.
+        for ((page, source_origin, product_id, version), hit) in
+            std::mem::take(&mut self.front_hits)
+        {
             let owner = page
                 .filter(|page| self.origins.contains_key(page))
                 .unwrap_or_else(|| source_origin.clone());
             let Some(origin) = self.origins.get_mut(&owner) else {
                 continue;
             };
-            if let Some(existing) = origin.library_versions.iter_mut().find(|item| {
-                item.product_id == detection.product_id && item.version == detection.version
-            }) {
-                existing.row_count += 1;
-                sample(&mut existing.evidence, &evidence);
-            } else if origin.library_versions.len() < MAX_LIBRARY_VERSIONS_PER_ORIGIN {
-                origin.library_versions.push(LibraryVersion {
-                    product_id: detection.product_id,
-                    name: detection.name,
-                    version: detection.version,
-                    source_origin,
-                    row_count: 1,
-                    evidence: vec![evidence],
-                });
+            if let Some(existing) = origin
+                .front_technologies
+                .iter_mut()
+                .find(|item| item.product_id == product_id && item.version == version)
+            {
+                existing.row_count += hit.rows;
+                for evidence in &hit.evidence {
+                    sample(&mut existing.evidence, evidence);
+                }
             } else {
-                self.stopped_by.insert("library_versions_limit".into());
+                origin.front_technologies.push(FrontTechnology {
+                    product_id,
+                    name: hit.name,
+                    category: hit.category.into(),
+                    version,
+                    source_origin,
+                    row_count: hit.rows,
+                    evidence: hit.evidence,
+                });
+            }
+        }
+        let rank = |category: &str| {
+            crate::service_map_libraries::CATEGORIES
+                .iter()
+                .position(|known| *known == category)
+        };
+        for origin in self.origins.values_mut() {
+            let found = &mut origin.front_technologies;
+            // A product some row named a version of needs no versionless entry.
+            let versioned: BTreeSet<String> = found
+                .iter()
+                .filter(|item| item.version.is_some())
+                .map(|item| item.product_id.clone())
+                .collect();
+            found.retain(|item| item.version.is_some() || !versioned.contains(&item.product_id));
+            found.sort_by(|a, b| {
+                (rank(&a.category), &a.name, &a.version).cmp(&(
+                    rank(&b.category),
+                    &b.name,
+                    &b.version,
+                ))
+            });
+            if found.len() > MAX_FRONT_TECHNOLOGIES_PER_ORIGIN {
+                found.truncate(MAX_FRONT_TECHNOLOGIES_PER_ORIGIN);
+                self.stopped_by.insert("front_technologies_limit".into());
             }
         }
         let stopped_by: BTreeSet<String> = self
@@ -1380,9 +1452,6 @@ impl MapBuilder {
             .collect();
         let mut origins: Vec<_> = self.origins.into_values().collect();
         for origin in &mut origins {
-            origin
-                .library_versions
-                .sort_by(|a, b| (&a.product_id, &a.version).cmp(&(&b.product_id, &b.version)));
             origin
                 .endpoints
                 .sort_by(|a, b| (&a.path, &a.method).cmp(&(&b.path, &b.method)));

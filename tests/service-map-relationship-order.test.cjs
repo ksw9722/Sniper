@@ -440,10 +440,12 @@ test('a card leads with what its origin serves, or with a declared front-end pro
     ['front', 'api', 'static', 'unknown', 'unknown', 'ref']);
   const next = typed(['application/json'], { technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }] });
   assert.equal(map.originRole(next), 'front', 'Next.js names the front end however its endpoints respond');
-  const react = (origin, types) => typed(types, { library_versions: [{ product_id: 'react', name: 'React', version: '18.2.0', source_origin: origin, row_count: 1, evidence: 'e' }] });
+  const react = (origin, types) => typed(types, { front_technologies: [{ product_id: 'react', name: 'React', category: 'framework', version: '18.2.0', source_origin: origin, row_count: 1, evidence: 'e' }] });
   assert.equal(map.originRole(react('https://a.example.com', ['application/javascript'])), 'static', 'a CDN serving React is not the page');
   assert.equal(map.originRole(react('https://cdn.example.com', ['application/json'])), 'front', 'a page that loaded React is');
   assert.equal(map.originRole(react('https://a.example.com', ['text/html', 'application/javascript', 'application/javascript'])), 'front');
+  const loads = (category) => typed(['application/json'], { front_technologies: [{ product_id: 'x', name: 'X', category, source_origin: 'https://cdn.example.com', row_count: 1, evidence: [] }] });
+  assert.deepEqual(['cms', 'library', 'analytics'].map((category) => map.originRole(loads(category))), ['front', 'api', 'api'], 'a library or tracker a page loads is not what it is built with');
 });
 
 test('only an error or the first load shows above the map; counts sit under Details', async () => {
@@ -461,21 +463,25 @@ test('only an error or the first load shows above the map; counts sit under Deta
   assert.equal(f.els.alert.classList.contains('service-map-error'), true);
 });
 
-test('library versions retained bodies declare show on the card and in the inspector', async () => {
-  const named = { product_id: 'next_js', name: 'Next.js', version: '14.2.3', source_origin: cdn, row_count: 2, evidence: ['evidence-script'] };
-  const react = { product_id: 'react', name: 'React', version: '18.2.0', source_origin: cdn, row_count: 2, evidence: ['evidence-react'] };
-  const core = { product_id: 'core_js', name: 'core-js', version: '3.38.1', source_origin: cdn, row_count: 1, evidence: [] };
-  const header = { technology_observations_present: true, technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }], library_versions: [named] };
+test('front-end technologies show on the card by what the site is built with, and in the inspector', async () => {
+  const named = { product_id: 'next_js', name: 'Next.js', category: 'meta_framework', version: '14.2.3', source_origin: cdn, row_count: 2, evidence: ['evidence-script'] };
+  const react = { product_id: 'react', name: 'React', category: 'framework', version: '18.2.0', source_origin: cdn, row_count: 2, evidence: ['evidence-react'] };
+  const core = { product_id: 'core_js', name: 'core-js', category: 'library', version: '3.38.1', source_origin: cdn, row_count: 1, evidence: [] };
+  const tracker = { product_id: 'google_tag_manager', name: 'Google Tag Manager', category: 'analytics', source_origin: cdn, row_count: 1, evidence: [] };
+  const header = { technology_observations_present: true, technology_observations: [{ product_id: 'next_js', name: 'Next.js', version_status: 'not_reported' }], front_technologies: [named] };
   const [product] = map.reportedProducts(header);
   assert.deepEqual([[...product.versions], [...product.statuses]], [['14.2.3'], []], 'a declared version supersedes a header that named none');
   assert.match(map.productSummaryMarkup(header), />Next\.js 14\.2\.3</);
+  assert.match(map.productSummaryMarkup({ front_technologies: [tracker] }), />Google Tag Manager</, 'a product found without a version is its name alone');
+  assert.doesNotMatch(map.productSummaryMarkup({ front_technologies: [tracker] }), /version unknown/);
 
   const f = fixture();
-  await f.load(snapshot([origin(app, { library_versions: [core, react, named, { ...named, version: '<b>' }, { ...react, product_id: 'Bad-Id' }] }), origin(api, { header_links: [referer(app)] })]));
-  assert.equal(f.state.snapshot.origins.find(item => item.origin === app).library_versions.length, 3, 'unsafe entries are dropped');
-  assert.match(f.els.canvas.innerHTML, /role-front"[^]*?service-map-mark[^>]*>N<[^]*?>Next\.js 14\.2\.3<[^]*?>React 18\.2\.0</, 'the framework leads: its mark, then its chip, then the libraries');
+  await f.load(snapshot([origin(app, { front_technologies: [tracker, core, react, named, { ...named, version: '<b>' }, { ...react, product_id: 'Bad-Id' }, { ...core, category: 'server' }] }), origin(api, { header_links: [referer(app)] })]));
+  assert.equal(f.state.snapshot.origins.find(item => item.origin === app).front_technologies.length, 4, 'unsafe entries are dropped');
+  assert.match(f.els.canvas.innerHTML, /role-front"[^]*?service-map-mark[^>]*>N<[^]*?>Next\.js 14\.2\.3<[^]*?>React 18\.2\.0</, 'the meta-framework leads: its mark, then its chip, then the framework');
   f.controller.selectOrigin(app);
-  assert.match(f.els.detail.innerHTML, /<h4>Library versions<\/h4>[^]*?Next\.js<\/strong> · 14\.2\.3[^]*?Declared in 2 retained rows from https:\/\/x-cdn\.example\.com/);
+  assert.match(f.els.detail.innerHTML, /<h4>Front-end<\/h4>[^]*?Next\.js<\/strong> · 14\.2\.3[^]*?2 retained rows from https:\/\/x-cdn\.example\.com/);
+  assert.match(f.els.detail.innerHTML, /Google Tag Manager<\/strong><p/, 'no version, no version text');
   assert.match(f.els.detail.innerHTML, /data-service-relation-origin="https:\/\/x-cdn\.example\.com" data-service-relation-evidence="evidence-react"/);
 });
 

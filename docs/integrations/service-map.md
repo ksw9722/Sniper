@@ -325,38 +325,57 @@ selects the origin that recorded it (the target of an Origin or Referer link,
 the source of a redirect) and marks the relationship in the inspector, where
 View source opens an example row.
 
-## Library versions
+## Front-end technologies
 
 Response headers name few products and rarely a version: `X-Powered-By: Next.js`
-carries none. Scripts and pages name theirs in fixed places, and the map reads
-those, as Retire.js reads files for their banners:
+carries none. Responses say more in three places, and the map reads all three
+without running anything:
 
-- a license banner, such as `/*! jQuery v3.7.1` or `@license React v18.2.0`
-- a runtime literal, such as Next.js's `window.next={version:"…"}`, Nuxt's
-  `get nuxt(){return"…"}` or React DOM's renderer registration
-- Angular's `ng-version="…"` attribute in a page
-- a page's `<meta name="generator">` that names a version, such as
-  `WordPress 6.5.2`
+- **Scripts:** a license banner, such as `/*! jQuery v3.7.1`, or a runtime value,
+  such as Next.js's `window.next={version:"…"}`, React DOM's renderer
+  registration or Vue's `__v_isRef`.
+- **Pages:** markup a framework renders, such as Angular's `ng-version="…"`,
+  Vue's `data-v-…` attributes, AngularJS's `ng-app`, Nuxt's `__nuxt` root or
+  WordPress's `/wp-content/` paths, and the page's `<meta name="generator">`.
+- **Asset URLs:** a CDN's `package@version` path (`/npm/vue@3.4.21/`,
+  `/ajax/libs/jquery/3.7.1/`), a versioned file name (`jquery-3.6.0.min.js`), or
+  the directory a framework builds into (`/_next/static/`, `/_nuxt/`,
+  `/_app/immutable/`). Paths are matched on any host, so a company's mirror of a
+  public CDN counts. A script, stylesheet or image row's own URL is read without
+  its body; a page's linked scripts and stylesheets are read from its markup.
 
-Scripts are read for React, Vue, Nuxt, Next.js, Angular, AngularJS, jQuery,
-jQuery UI, Bootstrap, core-js, Moment.js, Underscore.js, DOMPurify, Axios,
-Socket.IO, Chart.js, Swiper, GSAP, Video.js, Backbone.js, Knockout, Select2,
-Sentry and PDF.js. Only these anchors count: a bundle holds other libraries'
-`version:"…"` literals too, and a file name is not a declaration.
+About seventy products are covered, in six categories: meta-frameworks (Next.js,
+Nuxt, SvelteKit, Remix, Gatsby, Astro), CMSs and site builders (WordPress, Drupal,
+Joomla, Magento, Shopify, Wix, Squarespace, and any generator a page names),
+frameworks (React, Vue.js, Angular, AngularJS, Svelte, Ember.js, Preact, Lit,
+Qwik, Alpine.js, htmx, Turbo, Livewire, Backbone.js, Knockout), UI kits
+(Bootstrap, Vuetify, Element Plus, Element UI, Quasar, Font Awesome), libraries
+(jQuery and its UI and Migrate, Lodash, Underscore.js, Moment.js, Day.js,
+core-js, Axios, Socket.IO, DOMPurify, Chart.js, D3, three.js, Leaflet,
+Highcharts, ECharts, GSAP, Swiper, Video.js, hls.js, Select2, Popper,
+Handlebars, Modernizr, Zepto, Prototype, MooTools, PDF.js, TinyMCE, CKEditor,
+Quill, SweetAlert2, Hammer.js, Sentry) and analytics (Google Tag Manager, Google
+Analytics). Wappalyzer's catalogue was the checklist; the rules are Sniper's
+own. Only these anchors count: a bundle holds other libraries' `version:"…"`
+literals too. Many signals name a product without its version; the card then
+shows its name alone.
 
-When the map is built, Sniper reads retained JavaScript and HTML responses for
-them, once per row revision; a script served again at the same path with the same
-size is not read again. One map reads at most 256 rows from disk and 32 MiB in
-all, and skips any row larger than 2 MiB; later maps read the rest. A script's
-versions go to the page that loaded it (its Referer) when that page is in the
-map, else to the script's own origin, so a bundle served from a CDN names the
-page's framework. A page's own versions stay with the page.
+Script and page bodies are read once per row revision; a script served again at
+the same path with the same size is not read again. One map reads at most 256
+rows from disk and 32 MiB in all, and skips any row larger than 2 MiB; later maps
+read the rest. An asset's technologies go to the page that loaded it (its
+Referer) when that page is in the map, else to the asset's own origin, so a
+bundle served from a CDN names the page's framework. A page's own stay with the
+page. A row counts once for a product, however many of its signals name it.
 
-The card's product chip then reads, for example, `Next.js 14.2.3`, and the
-inspector lists the rows under **Library versions**, each with View source. The
-API and the CLI carry them on the origin as `library_versions` (`product_id`,
-`name`, `version`, `source_origin` where the declaring row was served,
-`row_count`, `evidence`), at most 24 per origin, omitted when nothing names one.
+The card leads with what the site is built with (a meta-framework, then a CMS,
+then a framework), then the products its headers declare, then UI kits,
+libraries and analytics; a meta-framework, CMS or framework also makes the card
+Front. The inspector lists them under **Front-end**, each with View source. The
+API and the CLI carry them on the origin as `front_technologies` (`product_id`,
+`name`, `category`, `version` when named, `source_origin` where the first naming
+row was served, `row_count`, `evidence`), at most 32 per origin, omitted when
+nothing names one.
 
 ## Endpoint parameters
 
@@ -471,7 +490,7 @@ active-discovery option, or automatic retry with a larger limit.
 The result lists initiator, remote IP, and TLS certificate in `unavailable`.
 The default map continues to list response-body references as `deferred`. The
 only bodies it reads are JavaScript and HTML responses, for
-[Library versions](#library-versions);
+[Front-end technologies](#front-end-technologies);
 its metadata evidence reads none. A separate,
 explicit one-row retained-preview read is described below. It does not enrich the
 default inventory automatically. Do not fill unavailable gaps using hostname

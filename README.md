@@ -254,8 +254,8 @@ A separate, explicit `sniper-cli target service-map body-references --session-id
 UTF-8 HTML/JavaScript response preview. It returns canonical origins and preview
 byte offsets, with truncation and limits; literal references do not prove calls
 or ownership. The session must already be active. Default map/evidence reads
-remain metadata-only apart from scripts and pages, read for the library and
-framework versions they declare, and send no target requests. The UI's map
+remain metadata-only apart from scripts and pages, read for the front-end
+frameworks, CMSs and libraries they name, and send no target requests. The UI's map
 covers every retained row; the CLI reads the newest `--max-records` rows. An endpoint's parameters (query, form and
 JSON fields, with a few values) are read when asked.
 
