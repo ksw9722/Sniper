@@ -28,8 +28,12 @@ function node() {
 function fixture() {
   const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'viewport'].map(name => [name, node()]));
   const requests = [], document = { activeElement: null, body: {}, querySelector: () => null };
+  // Opening an endpoint reads its parameters; these tests are about the other
+  // reads, so that one is kept apart and left pending.
   const controller = context.SniperServiceMap.createController({ elements: els, document, getSessionId: () => 'synthetic-session', request(url, options) {
-    let resolve; const promise = new Promise(done => { resolve = done; }); requests.push({ url, options, resolve }); return promise;
+    let resolve; const promise = new Promise(done => { resolve = done; });
+    if (!url.startsWith('/api/target/service-map/parameters?')) requests.push({ url, options, resolve });
+    return promise;
   } });
   controller.setVisible(true);
   const state = controller.getState();

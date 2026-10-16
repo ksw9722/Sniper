@@ -184,6 +184,17 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
         EXPOSURE,
     ),
     ("backend_host_header", "Backend host header", EXPOSURE),
+    ("source_map", "Source map reference", EXPOSURE),
+    ("aws_access_key", "AWS access key ID", EXPOSURE),
+    ("google_api_key", "Google API key", EXPOSURE),
+    ("slack_token", "Slack token", EXPOSURE),
+    ("slack_webhook", "Slack webhook URL", EXPOSURE),
+    ("github_token", "GitHub token", EXPOSURE),
+    ("stripe_secret_key", "Stripe secret key", EXPOSURE),
+    ("sendgrid_key", "SendGrid API key", EXPOSURE),
+    ("private_key", "Private key", EXPOSURE),
+    ("jwt", "JSON Web Token", EXPOSURE),
+    ("private_ip", "Private IP address", EXPOSURE),
 ];
 
 // (header name, value rule, product). A name ending in `*` is a prefix; an
@@ -259,6 +270,8 @@ const HEADER_RULES: &[(&str, &str, &str)] = &[
     ("x-backend-server", "", "backend_host_header"),
     ("x-backend-host", "", "backend_host_header"),
     ("x-upstream", "", "backend_host_header"),
+    ("sourcemap", "", "source_map"),
+    ("x-sourcemap", "", "source_map"),
     // Server and X-Powered-By products the frozen header catalog does not name.
     ("server", r"(?i)^AmazonS3$", "amazon_s3"),
     ("server", r"(?i)^awselb(?:/§)?", "aws_elb"),
@@ -594,6 +607,41 @@ const BODY_RULES: &[(&str, &str)] = &[
     ),
 ];
 
+// What a script, page or error body gives away by mistake: where its source
+// map is, a credential written into it, an internal address. Only the finding
+// is reported, never the matched value; View source opens the row.
+const EXPOSURE_RULES: &[(&str, &str)] = &[
+    ("source_map", r#"//[#@] ?sourceMappingURL=[^\s'"]"#),
+    ("aws_access_key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    (
+        "google_api_key",
+        r"\bAIza[0-9A-Za-z_-]{35}(?:[^0-9A-Za-z_-]|$)",
+    ),
+    ("slack_token", r"\bxox[baprs]-[0-9A-Za-z-]{10,}"),
+    (
+        "slack_webhook",
+        r"https://hooks\.slack\.com/services/T[0-9A-Z]+/B[0-9A-Z]+/[0-9A-Za-z]+",
+    ),
+    ("github_token", r"\bgh[pousr]_[0-9A-Za-z]{36}\b"),
+    ("stripe_secret_key", r"\b[rs]k_live_[0-9A-Za-z]{24,}"),
+    (
+        "sendgrid_key",
+        r"\bSG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}\b",
+    ),
+    (
+        "private_key",
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----",
+    ),
+    (
+        "jwt",
+        r"\beyJ[0-9A-Za-z_-]{10,}\.eyJ[0-9A-Za-z_-]{10,}\.[0-9A-Za-z_-]{10,}",
+    ),
+];
+// A private address in a URL a script calls (`http://10.1.2.3:8080/api`), or
+// anywhere in an error. A page's prose about routers is not read for these.
+const PRIVATE_URL: &str = r"(?:https?:)?//(?:10\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}\b";
+const PRIVATE_IP: &str = r"(?:^|[^0-9A-Za-z.])(?:10\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}(?:[^0-9A-Za-z.]|$)";
+
 const VERSION: &str = r"([0-9][0-9A-Za-z.+-]{0,39})";
 
 struct Rules {
@@ -654,6 +702,14 @@ static HEADERS: LazyLock<HeaderRules> = LazyLock::new(|| {
 static SEEN: LazyLock<Mutex<HashMap<u64, Vec<Detection>>>> = LazyLock::new(Default::default);
 static COOKIES: LazyLock<Rules> =
     LazyLock::new(|| compile(COOKIE_RULES.iter().map(|(name, _)| *name)));
+static EXPOSURES: LazyLock<Rules> =
+    LazyLock::new(|| compile(EXPOSURE_RULES.iter().map(|(_, pattern)| *pattern)));
+static PRIVATE: LazyLock<(Regex, Regex)> = LazyLock::new(|| {
+    (
+        Regex::new(PRIVATE_URL).expect("valid private URL pattern"),
+        Regex::new(PRIVATE_IP).expect("valid private address pattern"),
+    )
+});
 static BODIES: LazyLock<Rules> =
     LazyLock::new(|| compile(BODY_RULES.iter().map(|(_, pattern)| *pattern)));
 
@@ -812,6 +868,36 @@ pub(crate) fn detect_body(body: &str) -> Vec<Detection> {
             version_of(&BODIES.each[index], body),
             "body",
         ) {
+            crate::service_map_libraries::merge(&mut found, detection);
+        }
+    }
+    found
+}
+
+/// Where a body is, for what it may give away: a script's URLs, or any text
+/// of an error, are read for private addresses; a page's prose is not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exposed {
+    Script,
+    Page,
+    Error,
+}
+
+/// What a body gives away by mistake. The matched values never leave here.
+pub(crate) fn detect_exposures(body: &str, kind: Exposed) -> Vec<Detection> {
+    let mut found = Vec::new();
+    let ids = EXPOSURES
+        .set
+        .matches(body)
+        .into_iter()
+        .map(|index| EXPOSURE_RULES[index].0);
+    let private = match kind {
+        Exposed::Script => PRIVATE.0.is_match(body),
+        Exposed::Error => PRIVATE.1.is_match(body),
+        Exposed::Page => false,
+    };
+    for id in ids.chain(private.then_some("private_ip")) {
+        if let Some(detection) = known(id, None, "body") {
             crate::service_map_libraries::merge(&mut found, detection);
         }
     }
@@ -1316,6 +1402,113 @@ mod tests {
                 found(detect_body(body))
             );
         }
+    }
+
+    // One sample per exposure rule; the finding is reported, not the value.
+    // Each key is split with concat! so secret scanning does not take a test
+    // sample for a leaked key and refuse the push.
+    #[test]
+    fn bodies_give_away_source_maps_credentials_and_internal_addresses() {
+        let samples: &[(&str, &str)] = &[
+            (
+                "console.log(1);\n//# sourceMappingURL=main.3f2a.js.map",
+                "source_map",
+            ),
+            (
+                "//# sourceMappingURL=data:application/json;base64,eyJ2",
+                "source_map",
+            ),
+            (
+                concat!("var k=\"AKIA", "IOSFODNN7EXAMPLE\";"),
+                "aws_access_key",
+            ),
+            (
+                concat!("apiKey:\"AIza", "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q\","),
+                "google_api_key",
+            ),
+            (
+                concat!("token=\"xox", "b-1234567890-abcdefghij\""),
+                "slack_token",
+            ),
+            (
+                concat!(
+                    "https://hooks.slack.com/services/",
+                    "T0123ABC/B0123ABC/a1b2c3d4e5f6"
+                ),
+                "slack_webhook",
+            ),
+            (
+                concat!("\"ghp", "_0123456789abcdefghijklmnopqrstuvwxyz\""),
+                "github_token",
+            ),
+            (
+                concat!("stripe(\"sk", "_live_0123456789abcdefghijklmn\")"),
+                "stripe_secret_key",
+            ),
+            (
+                concat!(
+                    "SG",
+                    ".0123456789abcdefghijkl.0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+                ),
+                "sendgrid_key",
+            ),
+            (
+                concat!("-----BEGIN RSA PRIVATE", " KEY-----\nMIIE"),
+                "private_key",
+            ),
+            (concat!("-----BEGIN PRIVATE", " KEY-----"), "private_key"),
+            (
+                concat!(
+                    "Bearer eyJhbGciOiJIUzI1NiJ9.",
+                    "eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+                ),
+                "jwt",
+            ),
+        ];
+        for (body, id) in samples {
+            for kind in [Exposed::Script, Exposed::Page, Exposed::Error] {
+                assert!(
+                    found(detect_exposures(body, kind)).contains(&one(id, None)),
+                    "{id} in {body}"
+                );
+            }
+        }
+        let address = |body: &str, kind| {
+            found(detect_exposures(body, kind)).contains(&one("private_ip", None))
+        };
+        assert!(address(
+            r#"fetch("http://10.1.2.3:8080/api/items")"#,
+            Exposed::Script
+        ));
+        assert!(address(
+            "connect ECONNREFUSED 192.168.0.12:5432",
+            Exposed::Error
+        ));
+        assert!(
+            !address("<p>Your router is at 192.168.0.1.</p>", Exposed::Page),
+            "a page's prose"
+        );
+        assert!(
+            !address("var version=\"10.0.0.1\";", Exposed::Script),
+            "a script's number, not its URL"
+        );
+        assert!(
+            !address("build 1.10.0.12 and v192.168.1.1", Exposed::Error),
+            "a longer dotted number"
+        );
+        for body in [
+            "var k=\"AKIA\";",
+            "AIzaSy-too-short",
+            concat!("sk", "_test_0123456789abcdefghijklmn"),
+            "-----BEGIN PUBLIC KEY-----",
+            "//# sourceURL=app.js",
+        ] {
+            assert!(detect_exposures(body, Exposed::Script).is_empty(), "{body}");
+        }
+        assert_eq!(
+            found(detect_headers([("SourceMap", "/static/app.js.map")])),
+            [one("source_map", None)]
+        );
     }
 
     #[test]

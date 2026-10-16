@@ -12,7 +12,7 @@
   const MAX_REFERENCE_CARDS = 100;
   const MAX_REFERENCE_SOURCES = 30;
   const API_PAGE_SIZE = 50;
-  const GRAPH_GEOMETRY = Object.freeze({ cardWidth: 220, cardHeight: 104, columnPitch: 300, rowPitch: 124, padding: 24, loopInset: 8, lineHeight: 1.5 });
+  const GRAPH_GEOMETRY = Object.freeze({ cardWidth: 220, cardHeight: 84, columnPitch: 300, rowPitch: 104, padding: 24, loopInset: 8, lineHeight: 1.5 });
   const ZOOM_LIMITS = Object.freeze({ min: 0.1, max: 2, step: 0.1 });
   const BODY_REFERENCE_LIMITS = Object.freeze({ scan_bytes: 262144, serialized_row_bytes: 2097152, origins: 100, candidates: 4096, candidate_bytes: 4096, offsets_per_origin: 5 });
   const BODY_REFERENCE_REASONS = {
@@ -328,9 +328,9 @@
   const CLIENT_KINDS = ["browser", "webview", "app", "tool", "library", "bot", "unknown"];
   const CLIENT_SYSTEMS = ["Windows", "macOS", "iOS", "Android", "ChromeOS", "Linux"];
   const CLIENT_LABELS = { browser: "Browser", webview: "WebView", app: "App", tool: "Tool", library: "Library", bot: "Crawler", unknown: "Client" };
-  const MAX_CLIENT_CARDS = 6;
-  const clientId = (client) => `client:${client.kind}:${client.name}:${client.version ?? ""}:${client.os ?? ""}`;
-  const clientName = (client) => client ? `${client.name}${client.version === undefined ? "" : ` ${client.version}`}` : "";
+  const MAX_CLIENT_CARDS = 4;
+  const clientId = (client) => `client:${client.kind}:${client.name}:${client.os ?? ""}`;
+  const clientName = (client) => client?.name || "";
   const directRows = (item) => Object.values(item.entry_kinds).reduce((sum, rows) => sum + rows, 0);
   const rowCount = (rows) => `${rows.toLocaleString()} row${rows === 1 ? "" : "s"}`;
   // Front-end categories in the order a card presents them. Header-declared
@@ -361,8 +361,8 @@
       ...product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`),
       ...product.declared.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) from ${item.source_origin}`),
       ...product.seen.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) · ${item.signals.join(", ")}`)].filter(Boolean).join("\n");
-    const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : product.statuses.size ? " · version unknown" : ""}${product.versions.size && product.statuses.size ? " + unknown" : ""}`;
-    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${warning}${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" title="${escape(products.slice(2).map(full).join("\n"))}">+${products.length - 2}</span>` : ""}</span>`;
+    const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : ""}`;
+    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${warning}${products.slice(0, 2).map((product) => `<span title="${escape(full(product))}">${escape(label(product))}</span>`).join("")}${products.length > 2 ? `<span class="service-map-products-more" aria-label="${products.length - 2} additional products" data-more="${escape(products.slice(2).map(label).join("\n"))}" title="">+${products.length - 2}</span>` : ""}</span>`;
   }
   // What an origin serves, read from the response types of its loaded
   // endpoints: pages (Front), API data, or static files. A front-end framework
@@ -373,10 +373,13 @@
     if (origin.captured === false || origin.peerInspectionOnly) return "ref";
     const tally = { front: 0, api: 0, static: 0 };
     for (const endpoint of origin.endpoints || []) {
+      // An API's error page is HTML too: a path that only ever failed does
+      // not show that the origin serves pages.
+      const failed = endpoint.statuses?.length > 0 && endpoint.statuses.every((status) => status >= 400);
       for (const type of endpoint.content_types || []) {
         const role = /html/.test(type) ? "front" : /^(?:image|font|audio|video)\/|css|javascript|ecmascript/.test(type) ? "static"
           : /json|xml|protobuf|grpc|graphql/.test(type) ? "api" : null;
-        if (role) tally[role] += 1;
+        if (role && !(failed && role === "front")) tally[role] += 1;
       }
     }
     // A front-end product makes the origin Front when a header names it, the
@@ -984,8 +987,9 @@
     });
     // Clients each row's User-Agent named, and the rows they sent each origin.
     const clients = array(payload.clients).filter((client) => CLIENT_KINDS.includes(client?.kind) && /^[A-Za-z][A-Za-z0-9 ./-]{0,39}$/.test(client.name)
-      && (client.version == null || Number.isSafeInteger(client.version) && client.version >= 0) && (client.os == null || CLIENT_SYSTEMS.includes(client.os)))
-      .slice(0, 16).map((client) => ({ kind: client.kind, name: client.name, ...(client.version == null ? {} : { version: client.version }), ...(client.os == null ? {} : { os: client.os }),
+      && (client.os == null || CLIENT_SYSTEMS.includes(client.os)))
+      .slice(0, 16).map((client) => ({ kind: client.kind, name: client.name, versions: array(client.versions).filter((version) => Number.isSafeInteger(version) && version >= 0).slice(0, 8),
+        ...(client.os == null ? {} : { os: client.os }),
         request_count: count(client.request_count),
         origins: array(client.origins).filter((item) => safeOrigin(item?.origin)).slice(0, 64).map((item) => ({ origin: safeOrigin(item.origin), request_count: count(item.request_count),
           entry_kinds: Object.fromEntries(REQUEST_KINDS.filter((kind) => count(item.entry_kinds?.[kind]) > 0).map((kind) => [kind, count(item.entry_kinds[kind])])) })) }));
@@ -1040,10 +1044,11 @@
   }
   function graphGeometry(textSize = 12) {
     const size = Math.max(8, Math.min(20, Number.isFinite(textSize) ? textSize : 12));
-    // Four text rows, three gaps, two card paddings/borders, and clue borders.
-    // Larger Display text must grow the graph as well as its text, otherwise
-    // fixed compact rows clip glyphs and leave SVG arrows at the wrong height.
-    const cardHeight = Math.max(GRAPH_GEOMETRY.cardHeight, Math.ceil((Math.max(10, size - 1) + 3 * Math.max(9, size - 2)) * GRAPH_GEOMETRY.lineHeight + 36));
+    // Three text rows (name, products, counts), two gaps, two card
+    // paddings/borders, and clue borders. Larger Display text must grow the
+    // graph as well as its text, otherwise fixed compact rows clip glyphs and
+    // leave SVG arrows at the wrong height.
+    const cardHeight = Math.max(GRAPH_GEOMETRY.cardHeight, Math.ceil((Math.max(10, size - 1) + 2 * Math.max(9, size - 2)) * GRAPH_GEOMETRY.lineHeight + 36));
     return { ...GRAPH_GEOMETRY, cardHeight, rowPitch: cardHeight + GRAPH_GEOMETRY.rowPitch - GRAPH_GEOMETRY.cardHeight };
   }
   // Each linked card sits one column right of its furthest linked source
@@ -1158,7 +1163,9 @@
     }
     // Cards are placed by the arrows actually drawn, so a card whose links all
     // fall past the arrow cap is not laid out among linked cards with no arrow.
-    const connections = shown.map((edge) => [edge.source, edge.target]);
+    // Clients are not: they keep the first column, whichever is selected.
+    const clientIds = visibleOrigins.filter((origin) => origin.client).map((origin) => origin.origin);
+    const connections = shown.filter((edge) => !clientIds.includes(edge.source)).map((edge) => [edge.source, edge.target]);
     let preferred;
     if (anchor && bodyEdges.length) {
       // A pinned direct neighborhood is a star. Keep every neighbor
@@ -1168,7 +1175,11 @@
       const neighbors = visibleOrigins.filter((origin) => origin.origin !== anchor);
       preferred = new Map([[anchor, { column: 0, row: Math.floor(Math.max(0, neighbors.length - 1) / 2) }], ...neighbors.map((origin, row) => [origin.origin, { column: 1, row }])]);
     } else {
-      preferred = layeredSlots(visibleOrigins, connections);
+      preferred = layeredSlots(visibleOrigins.filter((origin) => !origin.client), connections);
+      if (clientIds.length) {
+        preferred = new Map([...clientIds.map((id, row) => [id, { column: 0, row }]),
+          ...[...preferred].map(([id, slot]) => [id, { ...slot, column: slot.column + 1 }])]);
+      }
     }
     const slots = new Map(visibleOrigins.filter((origin) => previousSlots.has(origin.origin)).map((origin) => [origin.origin, previousSlots.get(origin.origin)]));
     for (const origin of visibleOrigins) {
@@ -1987,9 +1998,10 @@
       }
       state.detailTab = endpointIndex === null ? "apis" : "evidence";
       render();
+      if (endpoint) loadParameters(origin, endpoint);
     }
-    // An endpoint's parameters are read when asked, as every retained body is:
-    // each name, where it was sent and a few values, from its newest rows.
+    // An endpoint's parameters are read as soon as it is opened, not behind a
+    // button: each name, where it was sent and a few values, from its newest rows.
     async function loadParameters(originId, endpoint) {
       const key = JSON.stringify([originId, endpoint.method, endpoint.path]);
       if (state.parametersKey === key && (state.parameters || state.parametersLoading)) return;
@@ -2454,19 +2466,24 @@
       replace(els.siteControls, `<button class="service-map-kind" type="button" data-service-group-sites="toggle" data-service-focus="sites:group" aria-pressed="${display.groupSites}" title="${display.groupSites ? "Show every origin on its own card" : "Gather the origins of one site onto one card"}">Group by site</button>${display.hidden.length ? `<details class="service-map-hidden-list"><summary data-service-focus="sites:hidden">Hidden ${display.hidden.length}</summary>${display.hidden.map((entry) => `<button class="service-map-kind" type="button" data-service-unhide="${escape(entry)}" data-service-focus="unhide:${escape(entry)}" title="Show ${escape(entry)} on the map again">${escape(entry.includes("://") ? entry : `*.${entry}`)} ✕</button>`).join("")}<button class="service-map-kind" type="button" data-service-unhide-all="all" data-service-focus="sites:unhide-all">Show all</button></details>` : ""}`);
     }
     const clientById = (id) => state.snapshot?.clients?.find((client) => clientId(client) === id) || null;
-    // Clients lead the map: an arrow from each to the cards it sent rows to
-    // itself, with no Origin or Referer (a typed address, a bookmark, an app's
-    // call). A page's own requests already have the page's arrow.
+    // Clients lead the map in a column of their own. Selecting one draws an
+    // arrow to each card it sent rows to itself, with no Origin or Referer (a
+    // typed address, a bookmark, an app's call). A page's own requests already
+    // have the page's arrow.
     function clientCards(grouped, cardOrder, hidden) {
       const known = new Set(grouped.cards.map((card) => card.origin));
       const shown = new Set(cardOrder.filter((id) => known.has(id)).slice(0, MAX_CARDS));
       const cards = [], links = new Map();
       for (const client of state.snapshot?.clients || []) {
-        if (cards.length >= MAX_CLIENT_CARDS) break;
+        // A User-Agent no rule names says nothing about who sent the rows.
+        if (cards.length >= MAX_CLIENT_CARDS || client.kind === "unknown") continue;
         const id = clientId(client);
         const visits = client.origins.filter((item) => shown.has(grouped.card(item.origin)) && Object.keys(item.entry_kinds).some((kind) => !hidden.has(kind)));
         if (!visits.length) continue;
         cards.push({ ...referenceOrigin(id), client, captured: true, in_scope: true, request_count: client.request_count });
+        // Only the selected client's arrows are drawn: an app's background
+        // calls alone covered the map in them.
+        if (state.selectedClient !== id) continue;
         for (const item of visits) {
           const target = grouped.card(item.origin);
           if (!links.has(target)) links.set(target, []);
@@ -2555,7 +2572,7 @@
         // takes the pointer: its tooltip, and a click that opens its entry.
         + layout.edges.map((edge, index) => edge.kind ? `<path class="service-map-hit" data-service-edge="${index}" d="${edge.path}"><title>${title(edge)} · Select to list its rows and open a source</title></path>` : "").join("");
       const cards = layout.nodes.map((origin) => {
-        if (origin.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(origin.address)}" style="left:${origin.x}px;top:${origin.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(origin.address)}">${escape(origin.address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${origin.family.toUpperCase()}</span><span class="service-map-card-meta">Undirected observations only</span><span class="service-map-card-meta">No shared ownership inferred</span></span></div>`;
+        if (origin.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(origin.address)}" style="left:${origin.x}px;top:${origin.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(origin.address)}">${escape(origin.address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${origin.family.toUpperCase()}</span><span class="service-map-card-meta">Undirected observations only; no shared ownership inferred</span></span></div>`;
         if (origin.client) {
           const selected = selectedCard === origin.origin;
           return `<button class="service-map-card service-map-client ${selected ? "selected" : ""}" type="button" data-service-client="${escape(origin.origin)}" data-service-focus="client:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
@@ -2844,16 +2861,14 @@
       return `<section class="service-map-technologies" aria-label="Header-reported technologies"><h4>Header-reported technologies</h4><ul class="service-map-references">${rows}</ul></section>`;
     }
     function parametersMarkup(origin, endpoint) {
-      if (state.parametersKey !== JSON.stringify([origin.origin, endpoint.method, endpoint.path])) {
-        return '<section class="service-map-parameters-section" aria-label="Parameters"><h4>Parameters</h4><button class="secondary-action" type="button" data-service-parameters="read" data-service-focus="parameters:read">Show parameters</button></section>';
-      }
-      const result = state.parameters;
+      const current = state.parametersKey === JSON.stringify([origin.origin, endpoint.method, endpoint.path]);
+      const result = current ? state.parameters : null;
       const rows = (n) => `${n} row${n === 1 ? "" : "s"}`;
       // A narrow inspector stacks each parameter: its name and where it was
       // sent, then its values, so long values never squeeze the name.
       const notes = result ? [result.moreRows && `From the newest ${rows(result.rows)}; older rows not read`,
         result.unreadBodies && `${result.unreadBodies} bodies not read (size limit)`, result.omitted && `${result.omitted} more parameters`].filter(Boolean) : [];
-      const body = state.parametersLoading ? '<p class="service-map-muted">Reading parameters…</p>'
+      const body = !current || state.parametersLoading ? '<p class="service-map-muted">Reading parameters…</p>'
         : state.parametersError ? `<p class="service-map-muted">${escape(state.parametersError)}</p>`
         : !result?.items.length ? `<p class="service-map-muted">No parameters in the newest ${rows(result?.rows || 0)}.</p>`
         : `<ul class="service-map-parameters">${result.items.map((item) => `<li><div><span class="service-map-parameter-name">${escape(item.name)}</span><span class="service-map-muted">${item.location} · ${rows(item.rows)}</span></div>${item.examples.length ? `<div class="service-map-parameter-values">${item.examples.map((value) => `<code>${escape(value)}</code>`).join("")}</div>` : ""}</li>`).join("")}</ul>${notes.length ? `<p class="service-map-muted">${notes.join(" · ")}.</p>` : ""}`;
@@ -2917,7 +2932,7 @@
       }
     }
     function clientDetailMarkup(client) {
-      return `<header class="service-map-detail-header"><div><h3>${escape(clientName(client))}</h3><p>${[CLIENT_LABELS[client.kind], client.os].filter(Boolean).map(escape).join(" · ")}</p></div></header><div class="service-map-detail-body"><p class="service-map-muted">${rowCount(client.request_count)} named by the User-Agent</p><h4>Origins</h4><div class="service-map-evidence-list">${client.origins.map((item) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="client-origin:${escape(item.origin)}"><span>${escape(item.origin)}<br>${rowCount(item.request_count)}${directRows(item) ? ` · ${directRows(item).toLocaleString()} direct` : ""}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
+      return `<header class="service-map-detail-header"><div><h3>${escape(clientName(client))}</h3><p>${[CLIENT_LABELS[client.kind], client.os, client.versions.length ? `Versions ${client.versions.join(", ")}` : ""].filter(Boolean).map(escape).join(" · ")}</p></div></header><div class="service-map-detail-body"><p class="service-map-muted">${rowCount(client.request_count)} named by the User-Agent</p><h4>Origins</h4><div class="service-map-evidence-list">${client.origins.map((item) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="client-origin:${escape(item.origin)}"><span>${escape(item.origin)}<br>${rowCount(item.request_count)}${directRows(item) ? ` · ${directRows(item).toLocaleString()} direct` : ""}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
     }
     function siteDetailMarkup(site) {
       const inScope = site.members.filter((member) => member.in_scope).length;
@@ -3052,10 +3067,6 @@
       else if (data.serviceUnhideAll) saveSiteDisplay({ hidden: [] });
       else if (data.serviceGroupSites) saveSiteDisplay({ groupSites: !siteDisplay().groupSites });
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; renderDetail(); }
-      else if (data.serviceParameters) {
-        const endpoint = state.endpointIndex === null ? null : selectedOrigin()?.endpoints[state.endpointIndex];
-        if (endpoint) loadParameters(state.selectedOrigin, endpoint);
-      }
       else if (data.serviceEndpointFilterClear) setEndpointFilter("clear");
       else if (data.serviceProductFilterClear) setProductFilter("clear");
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
@@ -3174,11 +3185,12 @@
     els.directRelations?.addEventListener("click", () => setMapMode(true));
     els.focusSelection?.addEventListener("click", focusSelection);
     els.search.addEventListener("input", () => { state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
-    els.scope.addEventListener("change", () => {
-      if (state.scopeOnly === els.scope.checked) return;
+    els.scope.addEventListener("click", () => {
+      state.scopeOnly = !state.scopeOnly;
+      els.scope.classList.toggle("active", state.scopeOnly);
+      els.scope.setAttribute("aria-pressed", String(state.scopeOnly));
       state.refreshPaused = false;
       clearOverlay("Temporary body references cleared because the scope filter changed.");
-      state.scopeOnly = els.scope.checked;
       state.page = 0;
       state.snapshot = null;
       state.endpointIndex = null;

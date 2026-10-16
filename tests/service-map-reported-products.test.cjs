@@ -42,8 +42,12 @@ function fixture() {
   const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'viewport', 'productFilters', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(key => [key, element()]));
   els.panel.contains = () => true;
   const requests = [], document = { activeElement: null, body: {}, querySelector: () => null };
+  // Opening an endpoint reads its parameters; these tests are about the other
+  // reads, so that one is kept apart and left pending.
   const controller = map.createController({ elements: els, document, getSessionId: () => session, request(url, options) {
-    let resolve; const promise = new Promise(done => { resolve = done; }); requests.push({ url, options, resolve }); return promise;
+    let resolve; const promise = new Promise(done => { resolve = done; });
+    if (!url.startsWith('/api/target/service-map/parameters?')) requests.push({ url, options, resolve });
+    return promise;
   } });
   controller.setVisible(true);
   const state = controller.getState();
@@ -122,14 +126,14 @@ test('missing, present-empty and reference-only are distinct from an unknown ver
   assert.equal(map.productMatches(c, 'nginx', 'status:not_reported'), true); assert.equal(map.productMatches(c, 'nginx', 'multiple'), false);
 });
 
-test('only same-product distinct literal reported strings conflict; known plus unknown stays explicit', () => {
+test('only same-product distinct literal reported strings conflict; an unknown version stays in the tooltip, not on the chip', () => {
   const item = normalized([observation('php', '8.3'), observation('php', '8.3', 1, { header_name: 'x-powered-by' }), observation('nginx', '1.26')]);
   assert.equal(map.productMatches(item, '', 'multiple'), false); assert.equal(map.productMatches(item, 'nginx', 'reported:8.3'), false);
   assert.equal(map.productMatches(item, 'php', 'reported:8.3'), true);
   const mixed = normalized([observation('nginx', '1'), observation('nginx', null)]);
-  assert.match(map.productSummaryMarkup(mixed), /nginx 1 \+ unknown/); assert.equal(map.productMatches(mixed, 'nginx', 'multiple'), false);
+  assert.match(map.productSummaryMarkup(mixed), />nginx 1<\/span>/); assert.match(map.productSummaryMarkup(mixed), /Reported version: unknown/); assert.equal(map.productMatches(mixed, 'nginx', 'multiple'), false);
   const conflict = normalized([observation('nginx', '1'), observation('nginx', '01'), observation('nginx', '1.0'), observation('nginx', null)]);
-  assert.equal(map.productMatches(conflict, 'nginx', 'multiple'), true); assert.match(map.productSummaryMarkup(conflict), /nginx · 3 versions \+ unknown/);
+  assert.equal(map.productMatches(conflict, 'nginx', 'multiple'), true); assert.match(map.productSummaryMarkup(conflict), />nginx · 3 versions<\/span>/);
   for (const v of ['1', '01', '1.0']) assert.equal(map.productMatches(conflict, 'nginx', `reported:${v}`), true);
   assert.equal(map.productMatches(conflict, 'nginx', 'reported:1.00'), false);
 });
@@ -137,7 +141,8 @@ test('only same-product distinct literal reported strings conflict; known plus u
 for (const [status, product] of [['not_reported', 'nginx'], ['unsupported_format', 'nginx'], ['non_product_version', 'apache_coyote']]) test(`unknown filter requires explicit ${status} observation`, () => {
   const item = normalized([observation(product, null, 1, { version_status: status })]);
   assert.equal(map.productMatches(item, product, `status:${status}`), true);
-  assert.match(map.productSummaryMarkup(item), /version unknown/);
+  // A version not found is not shown: the chip is the name alone.
+  assert.match(map.productSummaryMarkup(item), />(nginx|Apache-Coyote)<\/span>/); assert.doesNotMatch(map.productSummaryMarkup(item), />[^<]*unknown[^<]*</);
   for (const other of ['not_reported', 'unsupported_format', 'non_product_version'].filter(s => s !== status)) assert.equal(map.productMatches(item, '', `status:${other}`), false);
 });
 
@@ -145,6 +150,7 @@ test('summary is bounded, deterministic and preserves separate exact source tupl
   const observations = [observation('php', '8.3'), observation('express', null), observation('nginx', '00000000000000000000000000000001'), observation('php', '8.3', 1, { header_name: 'x-powered-by' })];
   const html = map.productSummaryMarkup(normalized(observations));
   assert.match(html, /\+1<\/span>/); assert.equal((html.match(/<span title=/g) || []).length, 2);
+  assert.match(html, /class="service-map-products-more"[^>]*data-more="PHP 8\.3" title="">\+1</, '+N names what it stands for, with no second tooltip');
   assert.match(html, /server response header/); assert.match(html, /x-powered-by response header/); assert.match(html, /00000000000000000000000000000001/);
   assert.equal(html, map.productSummaryMarkup(normalized([...observations].reverse().sort((a, b) => a.header_name.localeCompare(b.header_name)))));
   const malicious = normalized([observation()]); malicious.technology_observations[0].name = '<img onerror="bad">';
@@ -244,7 +250,7 @@ test('same-session refresh, invalidation and scope preserve filters while exact 
   const invalidation = f.controller.invalidate(); assert.equal(f.state.page, 2); assert.equal(f.state.productId, 'nginx'); assert.equal(f.state.productVersion, 'reported:1.26.2');
   const reordered = clone(value); reordered.origins[0].endpoints.reverse(); f.requests.at(-1).resolve(response(reordered)); await invalidation;
   assert.equal(f.state.endpointIndex, 19); assert.equal(f.state.detailPage, 0); assert.equal(f.state.page, 0); assert.equal(f.state.pageAnchor.path, '/path-100');
-  f.els.scope.checked = true; f.els.scope.dispatch('change'); assert.equal(f.state.productId, 'nginx'); assert.equal(f.state.productVersion, 'reported:1.26.2');
+  f.els.scope.dispatch('click'); assert.equal(f.state.productId, 'nginx'); assert.equal(f.state.productVersion, 'reported:1.26.2');
   f.requests.at(-1).resolve(response(value)); await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.state.productId, 'nginx'); f.controller.reset(); assert.equal(f.state.productId, ''); assert.equal(f.state.productVersion, '');
 });
@@ -270,7 +276,7 @@ test('catalog anchor hidden by products is retained across same-session refresh 
 test('catalog rendering and page reconciliation consistently exclude returned out-of-scope origins', async () => {
   const f = fixture(), outside = origin(B, [observation('php', '8.3', 131)], 60, 131); outside.in_scope = false;
   const value = snapshot([outside, origin(A, [observation()], 130)]); await f.load(value);
-  f.els.scope.checked = true; f.els.scope.dispatch('change'); f.requests.at(-1).resolve(response(value)); await new Promise(resolve => setImmediate(resolve));
+  f.els.scope.dispatch('click'); f.requests.at(-1).resolve(response(value)); await new Promise(resolve => setImmediate(resolve));
   f.click({ servicePage: '2' }); assert.equal(f.state.pageAnchor.origin, A); assert.equal(f.state.pageAnchor.path, '/path-100');
   f.filter('product', 'nginx'); assert.equal(f.state.page, 2); assert.equal(rows(f.els.catalog).length, 30); assert.match(f.els.catalog.innerHTML, /130 loaded/);
   f.filter('product', 'php'); assert.equal(rows(f.els.catalog).length, 0); assert.equal(f.state.page, 0);

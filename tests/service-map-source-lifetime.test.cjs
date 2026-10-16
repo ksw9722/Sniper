@@ -317,7 +317,7 @@ for (const boundary of ['poll', 'force refresh', 'generation', 'query', 'product
   }
   if (boundary === 'query') { f.els.search.value = 'example'; f.els.search.dispatch('input'); }
   if (boundary === 'products') { f.controller.setProductFilter('product', 'nginx'); f.controller.setProductFilter('product', ''); }
-  if (boundary === 'scope filter') { f.els.scope.checked = true; f.els.scope.dispatch('change'); f.requests.at(-1).resolve(result(value)); await new Promise(resolve => setImmediate(resolve)); }
+  if (boundary === 'scope filter') { f.els.scope.dispatch('click'); f.requests.at(-1).resolve(result(value)); await new Promise(resolve => setImmediate(resolve)); }
   if (boundary === 'scope event') { const task = f.controller.scopeChanged({}, { scope_patterns: ['example.com'] }); f.requests.at(-1).resolve(result(value)); await task; }
   if (boundary === 'disconnect/reconnect') { f.setStreamReady(false); f.controller.disconnect(); f.setStreamReady(true); const task = f.controller.invalidate(); f.requests.at(-1).resolve(result(value)); await task; }
   if (boundary === 'hide/show') { f.controller.setVisible(false); f.controller.setVisible(true); }
@@ -384,7 +384,7 @@ for (const kind of KINDS) test(`${kind} bounded partial inspection preserves ear
   await inspect(f, kind, value); assert.equal(f.state.evidence, row); assert.equal(f.state.bodyReferenceOverlay, overlay); assert.equal(f.state.inactiveSessionId, null);
 });
 test('scope-excluded peer seed preserves metadata and an unrelated shown overlay', async () => {
-  const f = fixture(); f.els.scope.checked = true; f.els.scope.dispatch('change'); f.requests.at(-1).resolve(result(snapshot())); await new Promise(resolve => setImmediate(resolve));
+  const f = fixture(); f.els.scope.dispatch('click'); f.requests.at(-1).resolve(result(snapshot())); await new Promise(resolve => setImmediate(resolve));
   await f.verify(); await show(f); const overlay = f.state.bodyReferenceOverlay;
   await f.verify(SECOND_TOKEN, OTHER); const row = f.state.evidence, value = missing('peer', 'source_out_of_scope', SECOND_TOKEN); value.in_scope_only = true;
   await inspect(f, 'peer', value); assert.equal(f.state.evidence, row); assert.equal(f.state.bodyReferenceOverlay, overlay);

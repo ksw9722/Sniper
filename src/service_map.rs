@@ -170,9 +170,10 @@ pub struct ServiceClient {
     /// One of `service_map_clients::KINDS`.
     pub kind: String,
     pub name: String,
-    /// The major version, when the client names one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<u32>,
+    /// The major versions its rows named, newest first: one browser updated
+    /// over a session is one client, not one per version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
     pub request_count: usize,
@@ -1167,6 +1168,7 @@ type FrontKey = (Option<String>, String, String, Option<String>);
 #[derive(Default)]
 struct ClientTally {
     rows: usize,
+    versions: BTreeSet<u32>,
     /// Rows per origin, and its own visits there by request kind.
     origins: BTreeMap<String, (usize, BTreeMap<&'static str, usize>)>,
     evidence: Vec<String>,
@@ -1228,7 +1230,8 @@ pub(crate) struct MapBuilder {
     /// Rows naming each technology, by the page they may belong to and the
     /// origin they were served from, attributed once every page is known.
     front_hits: BTreeMap<FrontKey, FrontHit>,
-    clients: BTreeMap<crate::service_map_clients::Client, ClientTally>,
+    /// By kind, name and operating system; versions are gathered apart.
+    clients: BTreeMap<(&'static str, &'static str, Option<&'static str>), ClientTally>,
     projected_rows: usize,
     included_rows: usize,
     excluded_rows: usize,
@@ -1299,8 +1302,12 @@ impl MapBuilder {
         origin.last_seen = origin.last_seen.max(row.started_at);
         self.included_rows += 1;
         if let Some(client) = row.client {
-            let tally = self.clients.entry(client).or_default();
+            let tally = self
+                .clients
+                .entry((client.kind, client.name, client.os))
+                .or_default();
             tally.rows += 1;
+            tally.versions.extend(client.version);
             sample(&mut tally.evidence, &row.evidence_id);
             let (rows, entries) = tally.origins.entry(row.origin.clone()).or_default();
             *rows += 1;
@@ -1627,7 +1634,7 @@ impl MapBuilder {
         }
         let mut clients: Vec<ServiceClient> = std::mem::take(&mut self.clients)
             .into_iter()
-            .map(|(client, tally)| {
+            .map(|((kind, name, os), tally)| {
                 let mut origins: Vec<ClientOrigin> = tally
                     .origins
                     .into_iter()
@@ -1648,10 +1655,10 @@ impl MapBuilder {
                     self.stopped_by.insert("client_origins_limit".into());
                 }
                 ServiceClient {
-                    kind: client.kind.into(),
-                    name: client.name.into(),
-                    version: client.version,
-                    os: client.os.map(Into::into),
+                    kind: kind.into(),
+                    name: name.into(),
+                    versions: tally.versions.into_iter().rev().take(8).collect(),
+                    os: os.map(Into::into),
                     request_count: tally.rows,
                     origins,
                     evidence: tally.evidence,
@@ -1664,11 +1671,11 @@ impl MapBuilder {
                 .position(|known| *known == kind)
         };
         clients.sort_by(|a, b| {
-            (b.request_count, kind_rank(&a.kind), &a.name, a.version).cmp(&(
+            (b.request_count, kind_rank(&a.kind), &a.name, &a.os).cmp(&(
                 a.request_count,
                 kind_rank(&b.kind),
                 &b.name,
-                b.version,
+                &b.os,
             ))
         });
         if clients.len() > MAX_CLIENTS {

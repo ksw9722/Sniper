@@ -196,7 +196,7 @@ for (const action of ['origin ABA', 'seed reread', 'All origins', 'Clear', 'forc
   else if (action === 'APIs') { f.controller.setVisible(true, 'apis'); f.controller.setVisible(true, 'service-map'); }
   else if (action === 'disconnect') { f.controller.disconnect(); }
   else if (action === 'history') f.controller.markDirty();
-  else if (action === 'scope') { f.els.scope.checked = true; f.els.scope.dispatch('change'); f.requests.at(-1).resolve(response(snapshot())); }
+  else if (action === 'scope') { f.els.scope.dispatch('click'); f.requests.at(-1).resolve(response(snapshot())); }
   else if (action === 'generation') await f.load(snapshot({ generation: ROW }));
   else if (action === 'session ABA') { f.setSession(ROW); f.controller.reset(); f.setSession(SESSION); f.controller.reset(); }
   else await f.load(snapshot({ retained_rows: 4 }));

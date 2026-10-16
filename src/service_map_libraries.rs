@@ -520,7 +520,16 @@ fn scan(signatures: &Signatures, text: &str, found: &mut Vec<Detection>) {
 
 /// Every technology this body declares, one entry per product.
 pub(crate) fn detect(body: &str, kind: Kind) -> Vec<Detection> {
+    use crate::service_map_servers::{detect_exposures, Exposed};
     let mut found = Vec::new();
+    let exposed = match kind {
+        Kind::Script => Exposed::Script,
+        Kind::Page => Exposed::Page,
+        Kind::Data => Exposed::Error,
+    };
+    for detection in detect_exposures(body, exposed) {
+        merge(&mut found, detection);
+    }
     match kind {
         Kind::Script => {
             if let Some(detection) = next_version(body).and_then(|v| known("next_js", Some(&v))) {

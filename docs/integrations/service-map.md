@@ -20,9 +20,9 @@ whatever its endpoints return when a header names it, the origin serves pages, o
 one of its pages loaded the script naming it; a CDN that only serves that script
 stays Static. A declared application product shows its mark in place of the icon. Only an error or the first load shows above the map; the snapshot
 counts, coverage and window sit under **Details** below it, whose summary names
-how many origins the card cap leaves out. Compact 220×104px cards at the default 12px Display
+how many origins the card cap leaves out. Compact 220×84px cards at the default 12px Display
 text size share their geometry with all arrow attachments. Larger Display text
-grows card height and row spacing together (146px cards at 20px), retaining
+grows card height and row spacing together (119px cards at 20px), retaining
 legible line boxes, aligned arrows, selection, and the chosen zoom. Fit, minus, the percentage/reset button, and plus scale
 only the graph from 10% to 200%; the inspector and Scope navigation retain their
 normal size. Fit is a one-shot action for the displayed cards, bounded by those
@@ -153,12 +153,14 @@ keeps the last whole-history map. A poll is answered from it while history is
 unchanged, or while it is younger than four times its build time (at least
 1.2 seconds), and may then show rows removed since. `fresh=true` rebuilds it; the
 GUI sends that on its first read and on Reload. `sniper-cli` keeps the windowed
-read and its `max_records`.
+read and its `max_records` unless `--all-rows` asks for every row.
 
 ## Reported products and local origin filters
 
 Origin cards summarize at most two products from the loaded, validated response-
-header observations, with `+N` for further products. Full hover titles and the
+header observations, with `+N` for further products; hovering `+N`, or focusing
+the card, lists them. A product found without a version shows its name alone.
+Full hover titles and the
 inspector retain each literal version, unknown reason, header source, timestamp
 and exact evidence link separately. Missing product/version metadata is labeled
 unavailable; a present empty observation list says no declarations are loaded.
@@ -254,7 +256,7 @@ The map has its own display filter, as Burp keeps one for its site map. **Filter
 on the map toolbar opens the same dialog as HTTP history's filter, editing the
 map's settings: MIME type, status class, hidden extensions, rows with responses
 only, parameterized rows only, rows with notes only, port and advanced search.
-Scope stays on the map's own **In scope only** toggle, and colour tags stay with
+Scope stays on the map's own **In scope** toggle beside it, as in History, and colour tags stay with
 History. The two filters are saved apart in UI settings; changing one never
 changes the other.
 
@@ -379,15 +381,19 @@ nothing names one.
 
 ## Endpoint parameters
 
-Opening an endpoint shows **Show parameters**. It reads the endpoint's newest
-200 retained rows and lists each parameter by name, where it was sent (`query`,
-`form`, a top-level `json` field, or a `multipart` field name), how many rows
-carried it, and up to three of its values, each cut to 80 characters. Request
-bodies are read for this only, when asked, and only in the active session; a
-body is parsed from its first 64 KiB. The values are shown as captured, as in
-HTTP history. `GET /api/target/service-map/parameters` with `session_id`,
-`origin`, `method` and `path` returns the same result; the CLI does not read it
-yet.
+Opening an endpoint reads its parameters at once, with no button to press: the
+endpoint's newest 200 retained rows, listing each parameter by name, where it
+was sent (`query`, `form`, a top-level `json` field, or a `multipart` field
+name), how many rows carried it, and up to three of its values, each cut to 80
+characters. Request bodies are read for this only when an endpoint is opened,
+and only in the active session; a body is parsed from its first 64 KiB. The
+values are shown as captured, as in HTTP history.
+`GET /api/target/service-map/parameters` with `session_id`, `origin`, `method`
+and `path` returns the same result, and so does the CLI:
+
+```bash
+sniper-cli scope service-map parameters --session-id <active-session-uuid> --origin https://example.com --method GET --path /search
+```
 
 ## Server technologies and exposures
 
@@ -429,7 +435,13 @@ detailed ASP.NET or IIS error, a PHP error or `phpinfo()` page, a Java, .NET,
 Python, Node.js or Go stack trace, an SQL error, a directory listing, Spring
 Boot Actuator, Swagger UI or an OpenAPI document, an Elasticsearch root
 endpoint, a backend address in a BIG-IP cookie, or an `X-Backend-Server`-style
-header. These are what the responses say, not verified identification.
+header. Scripts and pages are read for what they give away too: a
+`sourceMappingURL` comment (`source_map`), an AWS, Google, Slack, GitHub,
+Stripe or SendGrid key, a Slack webhook, a private key block, a JWT, and a
+private (RFC 1918) address in a URL a script calls or anywhere in an error
+(`private_ip`). Only the finding is reported, never the matched value; View
+source opens the row. These are what the responses say, not verified
+identification.
 
 They always belong to the origin that responded, never to the page that
 loaded the row. A card shows `⚠` and the number of exposures before its
@@ -465,14 +477,18 @@ names reach the map; the header itself never does.
 The map counts each client's rows per origin, and apart from them the rows it
 sent itself, with no Origin or Referer: a typed address or bookmark, a
 browser's own background request, an app's or a tool's call. A page's own
-requests carry the page in Referer and already have its arrow. In the GUI the
-clients lead the map, up to six cards beside the origin cap, with a long-dashed
-**Direct request** arrow to each shown card they went to themselves; a request
-kind hidden in the legend hides those arrows too, and a client left with none
-draws no card. Selecting a client lists the origins it sent rows to.
+requests carry the page in Referer and already have its arrow. Rows of one
+kind, name and operating system are one client, whatever versions they named:
+a browser that updated during a session is one Chrome, not one per version. In
+the GUI the clients lead the map in a column of their own, up to four cards
+beside the origin cap; an `unknown` client draws none. Selecting a client lists
+the origins it sent rows to and its versions, and draws a long-dashed **Direct
+request** arrow to each shown card it went to itself; a request kind hidden in
+the legend hides those arrows too, and a client left with none draws no card.
 
 The API and the CLI carry `clients`, busiest first and at most 16 (`kind`,
-`name`, `version` when named, `os` when known, `request_count`, `origins` with
+`name`, `versions`, the major versions its rows named, newest first and at most
+eight, omitted when none, `os` when known, `request_count`, `origins` with
 each origin's `request_count` and `entry_kinds`, the client's own rows there by
 request kind, at most 64 origins, and `evidence`), omitted when no row was
 analyzed.
@@ -511,6 +527,7 @@ sniper-cli schema output target.service_map.get
 sniper-cli examples target.service_map.get
 sniper-cli scope service-map --session-id <session-uuid>
 sniper-cli scope service-map --session-id <session-uuid> --in-scope-only --max-records 10000
+sniper-cli scope service-map --session-id <session-uuid> --all-rows
 sniper-cli scope service-map --session-id <session-uuid> --hidden-extensions png,css,woff2 --mime-types html,script,json,other
 sniper-cli call target.service_map.get --input '{"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":false,"max_records":10000}'
 ```
@@ -527,7 +544,9 @@ evidence reads. Direct commands return the bare result; `call` returns the same
 result in `data`, with the pinned session in `meta.session_id`.
 
 `max_records` defaults to 10,000, accepts integers from 1 through 50,000, and bounds
-retained metadata rows considered. Optional `--origin https://example.com` (or
+retained metadata rows considered. `--all-rows` (`all_rows: true` in `call`)
+reads every retained row instead, as the GUI does, and cannot be combined with
+`max_records`. Optional `--origin https://example.com` (or
 `origin` in `call`) selects one exact canonical HTTP(S) origin. Supply no path,
 query, fragment, credentials, or explicit default port; copy the canonical origin
 from a map card. `in_scope_only` defaults to false and uses the

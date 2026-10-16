@@ -1410,10 +1410,10 @@
                 <button class="secondary-action service-map-zoom-reset" id="serviceMapZoomReset" type="button" aria-label="Zoom 100%. Reset to 100%" title="Reset zoom to 100%">100%</button>
                 <button class="secondary-action" id="serviceMapZoomIn" type="button" aria-label="Zoom in">+</button>
               </div>
-              <label class="service-map-scope"><input id="serviceMapScopeOnly" type="checkbox" /> In scope only</label>
+              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
+              <button class="scope-pill" id="serviceMapScopeOnly" type="button" aria-pressed="false" title="Show only in-scope origins">In scope</button>
               <button class="secondary-action service-map-filter" id="serviceMapFilterButton" type="button" aria-haspopup="dialog" aria-describedby="serviceMapFilterSummary">Filter</button>
               <span class="service-map-filter-summary" id="serviceMapFilterSummary"></span>
-              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
               <details class="service-map-product-filters"><summary>Products / versions</summary><div id="serviceMapProductFilters" class="service-map-product-filter-panel"></div></details>
               <button class="secondary-action service-map-reload" id="serviceMapRefresh" type="button" title="Reload retained HTTP metadata. This view updates automatically while open.">Reload</button>
             </div>

@@ -180,7 +180,7 @@ test('exact revision/sample disappearance removes only affected retained referen
 for(const change of ['generation','scope','disconnect','hide','reload','session','gap']) test(`${change} retires all collection entries and cached peer identities`,async()=>{
   const f=fixture(); await f.load(sourceSnapshot()); await showBody(f); await showLink(f); await showPeer(f);
   if(change==='generation') await f.load({...sourceSnapshot(),snapshot:{...sourceSnapshot().snapshot,generation:UUID_B}});
-  else if(change==='scope'){ f.els.scope.checked=true; f.els.scope.dispatch('change'); f.requests.at(-1).resolve(response(sourceSnapshot())); await Promise.resolve(); }
+  else if(change==='scope'){ f.els.scope.dispatch('click'); f.requests.at(-1).resolve(response(sourceSnapshot())); await Promise.resolve(); }
   else if(change==='disconnect') f.controller.disconnect();
   else if(change==='hide') f.controller.setVisible(false);
   else if(change==='reload') await f.load(sourceSnapshot(),true);

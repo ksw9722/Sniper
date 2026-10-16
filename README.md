@@ -244,7 +244,7 @@ the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`
 
 Each row's User-Agent names the client that sent it (a browser, an app's
 WebView, an app, a tool, a library or a crawler), and the map's first column
-shows the clients with an arrow to each origin they went to themselves.
+shows the clients; selecting one draws an arrow to each origin it went to itself.
 
 Origin and Referer links are sorted by request kind (API call, page navigation,
 frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each
@@ -259,10 +259,12 @@ UTF-8 HTML/JavaScript response preview. It returns canonical origins and preview
 byte offsets, with truncation and limits; literal references do not prove calls
 or ownership. The session must already be active. Default map/evidence reads
 remain metadata-only apart from scripts and pages, read for the front-end
-frameworks, CMSs and libraries they name, and error and debug responses, read for
-the servers behind an origin and what they expose; they send no target requests. The UI's map
-covers every retained row; the CLI reads the newest `--max-records` rows. An endpoint's parameters (query, form and
-JSON fields, with a few values) are read when asked.
+frameworks, CMSs and libraries they name and the keys, source maps and private
+addresses they give away, and error and debug responses, read for the servers
+behind an origin and what they expose; they send no target requests. The UI's map
+covers every retained row; the CLI reads the newest `--max-records` rows, or every
+row with `--all-rows`. An endpoint's parameters (query, form and JSON fields, with
+a few values) are read when it is opened.
 
 In the GUI, explicitly inspected body references, Response Link declarations and
 recorded socket-peer groups can coexist in a session-local map collection, with

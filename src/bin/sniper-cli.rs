@@ -895,6 +895,11 @@ struct ServiceMapArgs {
     /// Bound the retained rows considered; incomplete results say why.
     #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
     max_records: usize,
+    /// Read every retained row, as the desktop map does, instead of the newest
+    /// --max-records rows. The server may answer from its last map of an
+    /// unchanged or recent history.
+    #[arg(long, conflicts_with = "max_records")]
+    all_rows: bool,
     /// Select the literal response-header technology catalog (default: 2).
     #[arg(long, default_value_t = 2, value_parser = parse_service_map_catalog_version)]
     technology_catalog_version: u32,
@@ -976,6 +981,45 @@ enum ServiceMapCommand {
         after_help = "Requires the current active session UUID and unchanged exact-row evidence token. Compares only retained direct-route source, address family, IP and port observations in a bounded latest-row window. No arbitrary IP/host/URL input, target requests, discovery, capture changes, inactive loading, body/header reads, retries, redirects, or fallback. Counts are retained rows, including duplicate transaction UUIDs, and exclude the source. Inspect source.in_window, timestamps, reasons and omissions. Equal recorded peer values do not prove a shared physical endpoint, deployment, ownership, or origin IP."
     )]
     SocketPeerMatches(ServiceMapSocketPeerMatchesArgs),
+    /// List the parameters one endpoint was called with, read from its newest retained rows.
+    #[command(
+        after_help = "Requires the current active session UUID. Reads the endpoint's newest 200 retained rows: query string pairs, and form, top-level JSON or multipart body fields from each body's first 64 KiB, at most 32 MiB of retained rows per read. Lists each parameter's name, where it was sent, the rows that carried it and up to three values as captured, each cut to 80 characters. No target requests, inactive-session loading or automatic reads."
+    )]
+    Parameters(ServiceMapParametersArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapParametersArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Exact canonical HTTP(S) origin of the endpoint.
+    #[arg(long, value_parser = parse_service_map_origin)]
+    origin: String,
+    /// The endpoint's exact method, such as GET or POST.
+    #[arg(long, value_parser = parse_service_map_parameters_method)]
+    method: String,
+    /// The endpoint's exact path, without query or fragment.
+    #[arg(long, value_parser = parse_service_map_parameters_path)]
+    path: String,
+}
+
+fn parse_service_map_parameters_method(value: &str) -> Result<String, String> {
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+    .then(|| value.to_string())
+    .ok_or_else(|| "method must be an HTTP method token of at most 64 characters".to_string())
+}
+
+fn parse_service_map_parameters_path(value: &str) -> Result<String, String> {
+    (value.starts_with('/') && value.len() <= 4096 && !value.contains(['?', '#']))
+        .then(|| value.to_string())
+        .ok_or_else(|| {
+            "path must start with / and carry no query or fragment, at most 4096 bytes".to_string()
+        })
 }
 
 #[derive(Args, Debug)]
@@ -2689,6 +2733,7 @@ impl TargetCommand {
                 Some(ServiceMapCommand::SocketPeerMatches(_)) => {
                     "target.service_map.socket_peer_matches.get"
                 }
+                Some(ServiceMapCommand::Parameters(_)) => "target.service_map.parameters.get",
                 None => "target.service_map.get",
             },
             TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
@@ -3736,6 +3781,42 @@ fn service_map_catalog_output_schema(mut schema: Value, exact_row: bool) -> Valu
     schema
 }
 
+fn service_map_parameters_output_schema() -> Value {
+    use sniper::service_map_parameters::{MAX_EXAMPLES, MAX_PARAMETERS, MAX_ROWS};
+    let count = json!({"type":"integer","minimum":0});
+    let parameter = service_map_object(json!({
+        "name":{"type":"string"},
+        "location":{"type":"string","enum":["query","form","json","multipart"]},
+        "rows":{"type":"integer","minimum":1,"maximum":MAX_ROWS},
+        "examples":{"type":"array","maxItems":MAX_EXAMPLES,"items":{"type":"string"},"description":"Distinct values as captured, each cut to 80 characters."}
+    }));
+    let mut result = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},
+        "session_id":{"type":"string"},
+        "available":{"type":"boolean"},
+        "reasons":{"type":"array","items":{"type":"string"},"description":"Why the read was unavailable, such as inactive_session."},
+        "origin":{"type":"string"},"method":{"type":"string"},"path":{"type":"string"},
+        "rows":{"type":"integer","minimum":0,"maximum":MAX_ROWS,"description":"Matching rows read, newest first."},
+        "more_rows":{"type":"boolean","description":"More rows matched than were read."},
+        "parameters":{"type":"array","maxItems":MAX_PARAMETERS,"items":parameter},
+        "omitted_parameters":count,
+        "unread_bodies":{"type":"integer","minimum":1,"description":"Retained rows whose body was not read once the per-read byte budget was spent; their query strings still count."}
+    }));
+    result["required"] = json!([
+        "schema_version",
+        "session_id",
+        "available",
+        "origin",
+        "method",
+        "path",
+        "rows",
+        "more_rows",
+        "parameters",
+        "omitted_parameters"
+    ]);
+    result
+}
+
 fn service_map_html_generators_output_schema() -> Value {
     use sniper::service_map_html::{ACQUISITION_REASONS, PARSER_STOP_REASONS, TRUNCATION_REASONS};
     let span = service_map_object(json!({
@@ -4079,8 +4160,12 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             | "target.service_map.html_generators.get"
             | "target.service_map.link_declarations.get"
             | "target.service_map.socket_peer_matches.get"
+            | "target.service_map.parameters.get"
     ) {
         return None;
+    }
+    if operation == "target.service_map.parameters.get" {
+        return Some(service_map_parameters_output_schema());
     }
     if operation == "target.service_map.socket_peer_matches.get" {
         return Some(service_map_socket_peer_matches_output_schema());
@@ -4345,7 +4430,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     let mut client = service_map_object(json!({
         "kind":{"type":"string","enum":sniper::service_map_clients::KINDS},
         "name":{"type":"string","enum":sniper::service_map_clients::names()},
-        "version":{"type":"integer","minimum":0,"description":"Major version, when the client names one."},
+        "versions":{"type":"array","maxItems":8,"items":{"type":"integer","minimum":0},"description":"Major versions its rows named, newest first; one client however many versions it updated through."},
         "os":{"type":"string","enum":sniper::service_map_clients::SYSTEMS},
         "request_count":count,
         "origins":{"type":"array","maxItems":64,"items":client_origin},
@@ -4381,6 +4466,7 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "origin":{"type":["string","null"],"description":"Exact canonical HTTP(S) origin (for example https://example.com), without path, credentials, query, fragment, or explicit default port. Omitted or null selects all observed origins."},
                 "in_scope_only":{"type":["boolean","null"],"default":false,"description":"Filter retained rows using the session's current shared scope matcher. Null uses false."},
                 "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."},
+                "all_rows":{"type":["boolean","null"],"default":false,"description":"Read every retained row, as the desktop map does, instead of the newest max_records rows; omit max_records with it. The server may answer from its last map of an unchanged or recent history. Null uses false."},
                 "mime_types":{"type":["array","null"],"items":{"type":"string","enum":SERVICE_MAP_MIME_TYPES},"description":"Display filter: keep only rows in these MIME groups, as HTTP history does. Omitted, null or empty keeps every group; snapshot.filtered_rows counts hidden rows."},
                 "status_classes":{"type":["array","null"],"items":{"type":"string","enum":SERVICE_MAP_STATUS_CLASSES},"description":"Display filter: keep only rows in these status classes. Omitted, null or empty keeps every class."},
                 "hidden_extensions":{"type":["array","null"],"items":{"type":"string","pattern":"^\\.?[A-Za-z0-9]{1,16}$"},"description":"Display filter: hide rows whose path ends in these extensions, such as png or woff2. Omitted, null or empty hides none."},
@@ -4406,6 +4492,15 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged v1 evidence token for one retained row. Explicit one-row retained inspection only; no batch reads or target requests."}
             }
         })),
+        "target.service_map.parameters.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","origin","method","path"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
+                "origin":{"type":"string","description":"Exact canonical HTTP(S) origin of the endpoint, as a map card names it."},
+                "method":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"The endpoint's exact method."},
+                "path":{"type":"string","pattern":"^/[^?#]{0,4095}$","description":"The endpoint's exact path, without query or fragment."}
+            }
+        })),
         "target.service_map.evidence.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
             "properties":{
@@ -4422,7 +4517,11 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
 fn service_map_path(args: &ServiceMapArgs, session_id: Option<Uuid>) -> String {
     let mut params = vec![
         ("in_scope_only".into(), args.in_scope_only.to_string()),
-        ("max_records".into(), args.max_records.to_string()),
+        if args.all_rows {
+            ("all_rows".into(), "true".into())
+        } else {
+            ("max_records".into(), args.max_records.to_string())
+        },
     ];
     if let Some(origin) = &args.origin {
         params.push(("origin".into(), origin.clone()));
@@ -4469,6 +4568,18 @@ fn service_map_body_references_path(args: &ServiceMapBodyReferencesArgs) -> Stri
     )
 }
 
+fn service_map_parameters_path(args: &ServiceMapParametersArgs) -> String {
+    let query = encode_query(vec![
+        ("origin".into(), args.origin.clone()),
+        ("method".into(), args.method.clone()),
+        ("path".into(), args.path.clone()),
+    ]);
+    session_query_path(
+        &format!("/api/target/service-map/parameters?{query}"),
+        Some(args.session_id),
+    )
+}
+
 fn service_map_html_generators_path(args: &ServiceMapHtmlGeneratorsArgs) -> String {
     let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
     session_query_path(
@@ -4506,7 +4617,7 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             CliSideEffect::Read,
             false,
             &[],
-            vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":true,"max_records":10000,"technology_catalog_version":2}), json!({"technology_catalog_version":1})],
+            vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":true,"max_records":10000,"technology_catalog_version":2}), json!({"all_rows":true}), json!({"technology_catalog_version":1})],
         ),
         op(
             "target.service_map.body_references.get",
@@ -4516,6 +4627,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["session_id", "evidence_id"],
             vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "target.service_map.parameters.get",
+            "scope service-map parameters --session-id <uuid> --origin <origin> --method <method> --path <path>",
+            "List the parameters one endpoint was called with, from its newest 200 retained rows: query string pairs and form, top-level JSON or multipart body fields, each with where it was sent, the rows that carried it and up to three values as captured, cut to 80 characters. Active session only; inactive sessions return unavailable without loading or activation. Reads retained request bodies from their first 64 KiB, at most 32 MiB per read; no target requests or automatic reads.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "origin", "method", "path"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com","method":"GET","path":"/search"})],
         ),
         op(
             "target.service_map.html_generators.get",
@@ -5443,6 +5563,7 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "origin",
             "in_scope_only",
             "max_records",
+            "all_rows",
             "technology_catalog_version",
             "mime_types",
             "status_classes",
@@ -5459,6 +5580,7 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "target.service_map.body_references.get"
         | "target.service_map.html_generators.get"
         | "target.service_map.link_declarations.get" => &["session_id", "evidence_id"],
+        "target.service_map.parameters.get" => &["session_id", "origin", "method", "path"],
         "target.service_map.socket_peer_matches.get" => {
             &["session_id", "evidence_id", "in_scope_only", "max_records"]
         }
@@ -5659,13 +5781,27 @@ fn command_input_preview(command: &Command) -> Value {
                     "session_id":args.session_id,"evidence_id":args.evidence_id,
                     "in_scope_only":args.in_scope_only,"max_records":args.max_records,
                 }),
-                None => json!({
-                    "session_id": args.session_id,
-                    "in_scope_only": args.in_scope_only,
-                    "origin": args.origin,
-                    "max_records": args.max_records,
-                    "technology_catalog_version": args.technology_catalog_version,
+                Some(ServiceMapCommand::Parameters(args)) => json!({
+                    "session_id":args.session_id,"origin":args.origin,
+                    "method":args.method,"path":args.path,
                 }),
+                None => {
+                    let mut preview = json!({
+                        "session_id": args.session_id,
+                        "in_scope_only": args.in_scope_only,
+                        "origin": args.origin,
+                        "max_records": args.max_records,
+                        "technology_catalog_version": args.technology_catalog_version,
+                    });
+                    // A whole-history read has no row window to show.
+                    if args.all_rows {
+                        preview["all_rows"] = json!(true);
+                        preview
+                            .as_object_mut()
+                            .map(|fields| fields.remove("max_records"));
+                    }
+                    preview
+                }
             },
             TargetCommand::ServiceMapEvidence(args) => json!({
                 "session_id": args.session_id,
@@ -6075,6 +6211,9 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 }
                 Some(ServiceMapCommand::HtmlGenerators(args)) => {
                     api_preview("GET", service_map_html_generators_path(args), None)
+                }
+                Some(ServiceMapCommand::Parameters(args)) => {
+                    api_preview("GET", service_map_parameters_path(args), None)
                 }
                 Some(ServiceMapCommand::LinkDeclarations(args)) => {
                     api_preview("GET", service_map_link_declarations_path(args), None)
@@ -6578,8 +6717,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             | "target.service_map.html_generators.get"
             | "target.service_map.link_declarations.get"
             | "target.service_map.socket_peer_matches.get"
+            | "target.service_map.parameters.get"
     ) {
-        if command.operation_name() == "target.service_map.socket_peer_matches.get" {
+        if command.operation_name() == "target.service_map.parameters.get" {
+            notes.push("Explicit read of one endpoint's newest 200 retained rows in an already active session. One GET after identity checks; no target requests, inactive-session loading, automatic reads, retries or fallback.");
+            notes.push("Values are shown as captured, each cut to 80 characters, and may hold credentials or personal data. Request bodies are parsed from their first 64 KiB, at most 32 MiB of retained rows per read; unread_bodies counts the rest, whose query strings still count.");
+        } else if command.operation_name() == "target.service_map.socket_peer_matches.get" {
             notes.push("Explicit recorded direct socket peer equality inspection only. Requires an already active session and an unchanged exact source-row token. One feature GET after identity checks; no arbitrary address input, target requests, capture/settings changes, discovery, body/header reads, inactive loading, retries, redirects, or fallback.");
             notes.push("Counts are rows, including duplicate transaction UUIDs, within a latest retained sequence window and exclude the source. Inspect source.in_window, recorded timestamps, diagnostics, origin-group and sample omissions. Equal source/address-family/IP/port values do not prove a shared physical endpoint, deployment, ownership, or origin IP. Samples may become stale; no UUID-only fallback is permitted.");
         } else if command.operation_name() == "target.service_map.link_declarations.get" {
@@ -7112,8 +7255,13 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
             }),
         },
         "target.service_map.get" => {
-            let max_records =
-                call_optional_nonzero_usize(operation, input, "max_records")?.unwrap_or(10_000);
+            let all_rows = call_bool(operation, input, "all_rows")?;
+            let explicit_max_records =
+                call_optional_nonzero_usize(operation, input, "max_records")?;
+            if all_rows && explicit_max_records.is_some() {
+                bail!("field `all_rows` cannot be combined with `max_records`: it reads every retained row");
+            }
+            let max_records = explicit_max_records.unwrap_or(10_000);
             parse_service_map_max_records(&max_records.to_string())
                 .map_err(|message| anyhow!(message))?;
             Command::Scope {
@@ -7127,6 +7275,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                         })
                         .transpose()?,
                     max_records,
+                    all_rows,
                     technology_catalog_version: call_service_map_catalog_version(input)?,
                     filter: ServiceMapFilterArgs {
                         mime_types: call_service_map_tokens(
@@ -7178,6 +7327,31 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     origin: None,
                     in_scope_only: false,
                     max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.parameters.get" => {
+            let text = |field: &str| -> Result<String> { call_required(operation, input, field) };
+            let args = ServiceMapParametersArgs {
+                session_id: call_required(operation, input, "session_id")?,
+                origin: parse_service_map_origin(&text("origin")?)
+                    .map_err(|message| anyhow!(message))?,
+                method: parse_service_map_parameters_method(&text("method")?)
+                    .map_err(|message| anyhow!(message))?,
+                path: parse_service_map_parameters_path(&text("path")?)
+                    .map_err(|message| anyhow!(message))?,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::Parameters(args)),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
                     technology_catalog_version: 2,
                     filter: ServiceMapFilterArgs::default(),
                 }),
@@ -7199,6 +7373,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     origin: None,
                     in_scope_only: false,
                     max_records: 10_000,
+                    all_rows: false,
                     technology_catalog_version: 2,
                     filter: ServiceMapFilterArgs::default(),
                 }),
@@ -7237,6 +7412,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     origin: None,
                     in_scope_only: false,
                     max_records: 10_000,
+                    all_rows: false,
                     technology_catalog_version: 2,
                     filter: ServiceMapFilterArgs::default(),
                 }),
@@ -7258,6 +7434,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     origin: None,
                     in_scope_only: false,
                     max_records: 10_000,
+                    all_rows: false,
                     technology_catalog_version: 2,
                     filter: ServiceMapFilterArgs::default(),
                 }),
@@ -8485,6 +8662,7 @@ async fn run(cli: Cli) -> Result<()> {
                     | "target.service_map.html_generators.get"
                     | "target.service_map.link_declarations.get"
                     | "target.service_map.socket_peer_matches.get"
+                    | "target.service_map.parameters.get"
                     | "capture.http.upstream_peer.get"
                     | "capture.http.upstream_peer.set"
             ) {
@@ -9662,8 +9840,9 @@ fn validate_service_map_response(
         && result.in_scope_only == args.in_scope_only
         && result.origin_filter == args.origin
         && snapshot.window_order == "newest_capture_sequence"
-        && snapshot.limits.max_records == args.max_records
-        && snapshot.considered_rows <= args.max_records
+        // A whole-history read has no window: it considers every retained row.
+        && (args.all_rows || snapshot.limits.max_records == args.max_records)
+        && (args.all_rows || snapshot.considered_rows <= args.max_records)
         && snapshot.considered_rows <= snapshot.retained_rows
         && snapshot.projected_rows <= snapshot.considered_rows
         && snapshot.complete == snapshot.stopped_by.is_empty()
@@ -10541,6 +10720,64 @@ async fn read_service_map_link_declarations(
     Ok(result)
 }
 
+/// One endpoint's parameters, checked against what was asked and the
+/// server's own bounds before any of it is printed.
+fn validate_service_map_parameters_response(
+    result: &sniper::service_map_parameters::EndpointParameters,
+    args: &ServiceMapParametersArgs,
+) -> Result<()> {
+    use sniper::service_map_parameters::{
+        MAX_EXAMPLES, MAX_EXAMPLE_CHARS, MAX_PARAMETERS, MAX_ROWS,
+    };
+    let valid = result.schema_version == 1
+        && result.session_id == args.session_id
+        && result.origin == args.origin
+        && result.method == args.method
+        && result.path == args.path
+        && result.rows <= MAX_ROWS
+        && result.parameters.len() <= MAX_PARAMETERS
+        && (result.available || !result.reasons.is_empty() && result.parameters.is_empty())
+        && result.parameters.iter().all(|parameter| {
+            ["query", "form", "json", "multipart"].contains(&parameter.location.as_str())
+                && (1..=result.rows).contains(&parameter.rows)
+                && parameter.examples.len() <= MAX_EXAMPLES
+                // A cut value ends with an ellipsis.
+                && parameter
+                    .examples
+                    .iter()
+                    .all(|example| example.chars().count() <= MAX_EXAMPLE_CHARS + 1)
+        });
+    if !valid {
+        return Err(service_map_error(
+            "INVALID_RESPONSE",
+            "Endpoint parameters do not match the requested session, endpoint, or bounds",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_service_map_parameters(
+    api: &ApiClient,
+    args: &ServiceMapParametersArgs,
+) -> Result<sniper::service_map_parameters::EndpointParameters> {
+    let client = service_map_read_client()?;
+    let raw: Value = service_map_get(api, &client, &service_map_parameters_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid endpoint parameters envelope",
+        )
+    };
+    let result: sniper::service_map_parameters::EndpointParameters =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    // Unknown fields would be dropped above; refuse them instead.
+    if serde_json::to_value(&result).map_err(|_| invalid())? != raw {
+        return Err(invalid());
+    }
+    validate_service_map_parameters_response(&result, args)?;
+    Ok(result)
+}
+
 async fn read_service_map_html_generators(
     api: &ApiClient,
     args: &ServiceMapHtmlGeneratorsArgs,
@@ -10622,6 +10859,10 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             }
             Some(ServiceMapCommand::HtmlGenerators(args)) => {
                 let result = read_service_map_html_generators(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::Parameters(args)) => {
+                let result = read_service_map_parameters(&api, args).await?;
                 print_session_read_json(&result, args.session_id)
             }
             Some(ServiceMapCommand::LinkDeclarations(args)) => {
@@ -19449,6 +19690,126 @@ mod tests {
             let spec = operation_spec(operation).unwrap();
             assert_eq!(spec.input_schema["additionalProperties"], false);
         }
+    }
+
+    // The desktop map reads every retained row; the CLI can too, without a
+    // row window, and never with one.
+    #[test]
+    fn service_map_all_rows_reads_without_a_window() {
+        let command =
+            command_from_operation_input("target.service_map.get", &json!({"all_rows":true}))
+                .unwrap();
+        assert_eq!(
+            command_input_preview(&command),
+            json!({"session_id":null,"origin":null,"in_scope_only":false,"all_rows":true,"technology_catalog_version":2})
+        );
+        let path = super::command_api_preview(&command).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            path.contains("all_rows=true") && !path.contains("max_records"),
+            "{path}"
+        );
+        let error = command_from_operation_input(
+            "target.service_map.get",
+            &json!({"all_rows":true,"max_records":500}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            cli_error_payload("target.service_map.get", &error).code,
+            "INVALID_INPUT"
+        );
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "scope",
+            "service-map",
+            "--all-rows",
+            "--max-records",
+            "500"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["sniper-cli", "scope", "service-map", "--all-rows"]).is_ok());
+    }
+
+    // An endpoint's parameters: an exact endpoint in, the endpoint asked about
+    // and the server's own bounds out.
+    #[test]
+    fn service_map_parameters_read_one_endpoint_and_check_the_answer() {
+        use sniper::service_map_parameters::{EndpointParameter, EndpointParameters};
+        let session = "00000000-0000-0000-0000-000000000001";
+        let input = json!({"session_id":session,"origin":"https://example.com","method":"POST","path":"/v1/items"});
+        let command =
+            command_from_operation_input("target.service_map.parameters.get", &input).unwrap();
+        assert_eq!(
+            command.operation_name(),
+            "target.service_map.parameters.get"
+        );
+        let path = super::command_api_preview(&command).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            path.starts_with("/api/target/service-map/parameters?")
+                && path.contains("method=POST")
+                && path.contains("path=%2Fv1%2Fitems"),
+            "{path}"
+        );
+        for bad in [
+            json!({"session_id":session,"origin":"https://example.com/x","method":"GET","path":"/"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET POST","path":"/"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET","path":"/?q=1"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET","path":"items"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET"}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.parameters.get", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let args = super::ServiceMapParametersArgs {
+            session_id: session.parse().unwrap(),
+            origin: "https://example.com".into(),
+            method: "POST".into(),
+            path: "/v1/items".into(),
+        };
+        let mut result = EndpointParameters::new(
+            args.session_id,
+            args.origin.clone(),
+            args.method.clone(),
+            args.path.clone(),
+        );
+        result.rows = 2;
+        result.parameters.push(EndpointParameter {
+            name: "q".into(),
+            location: "query".into(),
+            rows: 2,
+            examples: vec!["shoes".into()],
+        });
+        assert!(super::validate_service_map_parameters_response(&result, &args).is_ok());
+        let mut other = result.clone();
+        other.path = "/v1/other".into();
+        assert!(
+            super::validate_service_map_parameters_response(&other, &args).is_err(),
+            "another endpoint"
+        );
+        let mut overcounted = result.clone();
+        overcounted.parameters[0].rows = 3;
+        assert!(
+            super::validate_service_map_parameters_response(&overcounted, &args).is_err(),
+            "more rows than were read"
+        );
+        let mut located = result.clone();
+        located.parameters[0].location = "cookie".into();
+        assert!(super::validate_service_map_parameters_response(&located, &args).is_err());
+        let unavailable = EndpointParameters::unavailable(
+            args.session_id,
+            args.origin.clone(),
+            args.method.clone(),
+            args.path.clone(),
+            "inactive_session",
+        );
+        assert!(super::validate_service_map_parameters_response(&unavailable, &args).is_ok());
     }
 
     #[test]

@@ -366,9 +366,10 @@ once per row revision and bounded per map. An asset's technologies go to the
 page that loaded it; cards lead with what the site is built with, and the
 inspector lists them under Front-end (`front_technologies` in the API and the
 CLI). Opening an endpoint
-offers Show parameters, which reads its newest 200 rows on request and lists
-each query, form, JSON or multipart parameter with its row count and up to
-three values (`GET /api/target/service-map/parameters`).
+reads its newest 200 rows at once and lists each query, form, JSON or multipart
+parameter with its row count and up to three values
+(`GET /api/target/service-map/parameters`, or `sniper-cli scope service-map
+parameters`).
 
 The map also reads what an origin's own responses say about its servers:
 vendor header names (`CF-RAY`, `x-envoy-*`), header values the catalog does not
@@ -376,19 +377,31 @@ name (`Server: AmazonS3`, an operating system in parentheses), the names of the
 cookies it sets (`JSESSIONID`, `AWSALB`, `BIGipServer…`), and error, default and
 debug pages, stack traces and SQL errors. Each finding gets a layer from edge to
 database, and what a response gives away by mistake is an exposure, shown first
-on the card. The API and the CLI carry them as `server_technologies`.
+on the card. Scripts and pages are read for exposures too: a source map comment,
+a cloud, chat, code-hosting or payment key, a private key, a JWT, and a private
+address in a script's URLs or an error, reported without the matched value. The
+API and the CLI carry them as `server_technologies`.
 
 Each row's User-Agent, with Client Hints for Chromium browsers, now names the
 client that sent it: a browser, an app's WebView, an app's HTTP stack, a tool, a
 library or a crawler, from a fixed list of rules. The map counts each client's
-rows per origin and the requests it made itself, with no Origin or Referer. In
-the GUI the clients lead the map with a Direct request arrow to each card they
-went to themselves; the API and the CLI carry them as `clients`. Only the fixed
-names leave the parser, never the header.
+rows per origin and the requests it made itself, with no Origin or Referer.
+One browser, app or tool is one client whatever versions its rows named
+(`versions`). In the GUI the clients lead the map in their own column, an
+unnamed one draws no card, and selecting one draws a Direct request arrow to
+each card it went to itself; the API and the CLI carry them as `clients`. Only
+the fixed names leave the parser, never the header.
+
+Cards are shorter (84px at the default text size) and a product found without a
+version shows its name alone; hovering `+N` lists the products it stands for.
+Every map toolbar control has the compact toolbar size, and the scope toggle is
+the In scope pill beside Filter, as in HTTP history. While the app updates
+itself, the Update button shows a bare ring.
 
 The GUI map also stopped reading only the newest 10,000 rows, where its 8 MiB
 projection limit often stopped it near 6,000. It now asks for `all_rows=true`:
 the server folds every retained row into the map a chunk at a time without
 keeping them, continues past rows that retention removes during the read, and
 keeps the last result to answer polls while history is unchanged or the map is
-recent. Reload asks for a fresh map. The CLI keeps the windowed read.
+recent. Reload asks for a fresh map. The CLI keeps the windowed read unless
+`--all-rows` asks for every row.

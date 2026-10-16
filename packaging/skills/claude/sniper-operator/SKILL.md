@@ -101,9 +101,14 @@ front-end technologies, and error and debug responses read for
 `server_technologies`: the edge, gateway, platform, servers, backend, language,
 database and OS an origin's own headers, cookie names and bodies name, and
 `exposure` entries (debug pages, stack traces, SQL errors, directory listings,
-API documents, a backend address in a BIG-IP cookie). They are what responses
-say, not verified identification. The GUI map covers every retained row, so its counts can exceed
-a CLI read limited to `max_records`.
+API documents, a backend address in a BIG-IP cookie, and from scripts and pages
+a source map comment, a leaked key or JWT, or a private address, never the
+matched value). They are what responses say, not verified identification. The
+GUI map covers every retained row, so its counts can exceed a CLI read limited
+to `max_records`; `--all-rows` (`all_rows: true`) reads every row too.
+`scope service-map parameters --session-id <active-uuid> --origin <origin>
+--method <method> --path <path>` lists one endpoint's parameters from its newest
+retained rows. A client's `versions` are the major versions its rows named.
 
 Ordinary-map failures use fixed CLI codes `SERVICE_MAP_BUSY`,
 `SERVICE_MAP_SCOPE_WORK_LIMIT`, `SERVICE_MAP_SESSION_CHANGED`,

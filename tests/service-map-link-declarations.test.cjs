@@ -260,7 +260,7 @@ test('up to ten mixed typed and reverse arrows have distinct deterministic geome
       for (let i = 0; i < n.length; i += 2) assert.ok(n[i] >= 0 && n[i] <= layout.width);
     }
     assert.equal(paths.size, 10); assert.equal(JSON.stringify(layout.edges), JSON.stringify(map.graphLayout([a,b], [SOURCE,OTHER], layout.slots, SOURCE, links, geometry).edges));
-    assert.equal(geometry.cardWidth, 220); assert.ok(geometry.cardHeight >= 104); if (size === 12) assert.equal(geometry.cardHeight, 104);
+    assert.equal(geometry.cardWidth, 220); assert.ok(geometry.cardHeight >= 84); if (size === 12) assert.equal(geometry.cardHeight, 84);
   }
 });
 

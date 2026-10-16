@@ -7370,7 +7370,11 @@ button.utility-button.replay-tab-add {
 .target-shell > #targetPathsPanel { display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .service-map-workspace { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; padding: 12px; gap: 10px; }
 .service-map-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-height: var(--control-h); padding: 0 3px; position: relative; }
-.service-map-reload { flex: 0 0 auto; min-height: var(--control-h); padding: 4px 14px; font-size: var(--font-xs); border-radius: 6px; white-space: nowrap; }
+/* Every control in the row has the app's compact toolbar box, as in HTTP
+   history. The shared .secondary-action alone is a 40px dialog button, so the
+   zoom and Filter buttons stood a third taller than their neighbours. */
+.service-map-toolbar :is(.secondary-action, .scope-pill, .service-map-mode, .service-map-search, .service-map-product-filters > summary) { min-height: var(--control-h); padding: 4px 14px; font-size: var(--font-xs); border-radius: 6px; }
+.service-map-reload { flex: 0 0 auto; white-space: nowrap; }
 .service-map-reload.service-map-background-refresh:disabled { opacity: 1; cursor: default; }
 .service-map-product-filters { min-width: 0; }
 .service-map-product-filters > summary { padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 7px; cursor: pointer; color: var(--text-soft); }
@@ -7383,19 +7387,21 @@ button.utility-button.replay-tab-add {
 .service-map-product-filter-panel p { margin: 8px 0 0; overflow-wrap: anywhere; }
 .service-map-products > span { min-width: 0; flex: 0 1 auto; }
 .service-map-products > .service-map-products-more { flex: 0 0 auto; }
+/* The products +N stands for show on hover or keyboard focus: the desktop
+   app's web view shows no title tooltip. Placed against the card, below it,
+   so the clipped chip row does not cut the list off. */
+.service-map-products-more:hover::after, .service-map-card:focus-visible .service-map-products-more::after { content: attr(data-more); position: absolute; z-index: 3; left: 52px; top: calc(100% - 6px); min-width: 120px; max-width: 220px; padding: 6px 9px; white-space: pre-line; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--panel-elevated); color: var(--text); font-size: var(--font-xs); line-height: 1.6; text-align: left; box-shadow: 0 4px 18px rgba(0,0,0,.25); pointer-events: none; }
 .service-map-products > .service-map-exposure { flex: 0 0 auto; color: var(--danger); border-color: var(--danger); }
 .service-map-exposures h4 { color: var(--danger); }
 @media (max-width: 560px) { .service-map-product-filter-controls { grid-template-columns: minmax(0, 1fr); } .service-map-product-filter-controls > button { justify-self: start; } }
 .service-map-zoom-controls { display: inline-flex; align-items: center; gap: 3px; }
-.service-map-zoom-controls > button { padding: 5px 8px; min-width: 29px; }
+.service-map-toolbar .service-map-zoom-controls > .secondary-action { padding-inline: 8px; min-width: 29px; }
 .service-map-zoom-controls > .service-map-zoom-reset { min-width: 49px; font-variant-numeric: tabular-nums; }
 .service-map-view-controls { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .service-map-mode { color: var(--text-soft); border: 1px solid var(--line-strong); padding: 6px 10px; border-radius: 7px; background: var(--panel-elevated); font: inherit; min-height: var(--control-h); cursor: pointer; }
 .service-map-mode[aria-pressed="true"] { color: var(--point); border-color: var(--point-border); background: var(--point-soft); }
 .service-map-mode:disabled { opacity: .5; cursor: default; }
 .service-map-mode:focus-visible { outline: 2px solid var(--point); outline-offset: 2px; }
-.service-map-scope { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
-.service-map-scope input { accent-color: var(--point); }
 .service-map-filter-summary { color: var(--text-dim); font-size: var(--font-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 280px; }
 .service-map-search { margin-left: auto; max-width: 260px; min-width: 150px; flex: 1; }
 .service-map-alert { color: var(--text-soft); font-size: var(--font-xs); padding: 0 4px; overflow-wrap: anywhere; }

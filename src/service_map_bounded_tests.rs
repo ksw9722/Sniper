@@ -1202,6 +1202,14 @@ fn clients_count_their_rows_and_their_own_visits() {
             4,
         ),
         row("api.example.com", "application/json", None, None, 5),
+        // The same browser a version older is the same client.
+        row(
+            "www.example.com",
+            "text/html",
+            Some(&chrome.replace("Chrome/141", "Chrome/140")),
+            None,
+            6,
+        ),
     ]);
     let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
         session,
@@ -1225,7 +1233,7 @@ fn clients_count_their_rows_and_their_own_visits() {
         .map(|client| {
             (
                 client.name.as_str(),
-                client.version,
+                client.versions.clone(),
                 client.os.as_deref(),
                 client.request_count,
                 client
@@ -1248,24 +1256,24 @@ fn clients_count_their_rows_and_their_own_visits() {
         [
             (
                 "Chrome",
-                Some(141),
+                vec![141, 140],
                 Some("macOS"),
-                3,
+                4,
                 vec![
                     ("api.example.com", 2, vec![]),
-                    ("www.example.com", 1, kinds("navigation", 1)),
+                    ("www.example.com", 2, kinds("navigation", 2)),
                 ]
             ),
             (
                 "OkHttp",
-                Some(4),
+                vec![4],
                 None,
                 1,
                 vec![("api.example.com", 1, kinds("api", 1))]
             ),
             (
                 "No User-Agent",
-                None,
+                vec![],
                 None,
                 1,
                 vec![("api.example.com", 1, kinds("api", 1))]

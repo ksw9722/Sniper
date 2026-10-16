@@ -44,22 +44,29 @@ function fixture() {
   els.viewport.clientWidth = 620; els.viewport.clientHeight = 500;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty("--ui-root-size", "12px");
-  const controller = map.createController({ elements: els, getSessionId: () => session, document, request(url, options) { const pending = deferred(); requests.push({ url, options, ...pending }); return pending.promise; } });
+  // Opening an endpoint reads its parameters; these tests are about the other
+  // reads, so that one is kept apart and left pending.
+  const parameterRequests = [];
+  const controller = map.createController({ elements: els, getSessionId: () => session, document, request(url, options) { const pending = deferred(); (url.startsWith('/api/target/service-map/parameters?') ? parameterRequests : requests).push({ url, options, ...pending }); return pending.promise; } });
   controller.setVisible(true);
-  return { controller, els, requests, document, state: controller.getState(), setSession(value) { session = value; }, async load(payload = snapshot()) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
+  return { controller, els, requests, parameterRequests, document, state: controller.getState(), setSession(value) { session = value; }, async load(payload = snapshot()) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
 }
 
-test('map Reload uses the standard compact toolbar sizing and a fixed label', () => {
+test('every map toolbar control uses the standard compact toolbar sizing, and Reload a fixed label', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
   assert.match(html, /<button class="secondary-action service-map-reload" id="serviceMapRefresh"[^>]*>Reload<\/button>/);
-  const compact = css.match(/\.service-map-reload \{([^}]+)\}/)?.[1];
+  assert.match(html, /<button class="scope-pill" id="serviceMapScopeOnly" type="button" aria-pressed="false"[^>]*>In scope<\/button>/);
+  assert.ok(html.indexOf('id="serviceMapSearch"') < html.indexOf('id="serviceMapScopeOnly"') && html.indexOf('id="serviceMapScopeOnly"') < html.indexOf('id="serviceMapFilterButton"'), 'search, scope and filter sit together, as in HTTP history');
+  const [, selectors, compact] = css.match(/\.service-map-toolbar :is\(([^)]+)\) \{([^}]+)\}/) || [];
   const standard = css.match(/\.toolbar-actions \.secondary-action \{([^}]+)\}/)?.[1];
   assert.ok(compact); assert.ok(standard);
+  for (const control of ['.secondary-action', '.scope-pill', '.service-map-mode', '.service-map-search', '.service-map-product-filters > summary']) assert.ok(selectors.split(', ').includes(control), control);
   for (const declaration of ['min-height: var(--control-h);', 'padding: 4px 14px;', 'font-size: var(--font-xs);', 'border-radius: 6px;']) {
     assert.ok(compact.includes(declaration)); assert.ok(standard.includes(declaration));
   }
-  assert.match(compact, /flex: 0 0 auto;/); assert.match(compact, /white-space: nowrap;/);
+  const reload = css.match(/\.service-map-reload \{([^}]+)\}/)?.[1];
+  assert.match(reload, /flex: 0 0 auto;/); assert.match(reload, /white-space: nowrap;/);
   assert.match(css, /\.service-map-reload\.service-map-background-refresh:disabled \{[^}]*opacity: 1;/);
 });
 test('map is lazy: construction/hidden refresh cause no request', async () => {
@@ -125,7 +132,7 @@ test('live changes label stale counts and clear verified evidence; next stable r
 });
 test('scope filter forces new read; old-filter responses cannot replace it', async () => {
   const f = fixture(); const old = f.controller.refresh();
-  f.els.scope.checked = true; f.els.scope.dispatch('change');
+  f.els.scope.dispatch('click');
   assert.match(f.requests.at(-1).url, /in_scope_only=true/);
   f.requests[1].resolve(response(snapshot([origin(originB)]))); await new Promise(resolve => setImmediate(resolve));
   f.requests[0].resolve(response(snapshot([origin(originA)]))); await old;
@@ -435,8 +442,7 @@ for (const transition of ['scope filter', 'history invalidation']) test(`${trans
   const oldEvidence = f.controller.loadEvidence('selected');
   let refresh;
   if (transition === 'scope filter') {
-    f.els.scope.checked = true;
-    f.els.scope.dispatch('change');
+    f.els.scope.dispatch('click');
   } else refresh = f.controller.invalidate();
   assert.equal(f.state.snapshot, null);
   assert.equal(f.state.evidence, null);
@@ -720,7 +726,7 @@ for (const transition of ['history', 'scope']) test(`direct anchor survives tran
   const oldEvidence = f.controller.loadEvidence('selected'), oldMap = f.controller.refresh();
   let current;
   if (transition === 'history') current = f.controller.invalidate();
-  else { f.els.scope.checked = true; f.els.scope.dispatch('change'); }
+  else { f.els.scope.dispatch('click'); }
   assert.equal(f.state.snapshot, null);
   assert.equal(f.state.anchorOrigin, originA);
   assert.equal(f.state.neighborhood, null);
@@ -1031,7 +1037,7 @@ for (const [name, change] of [
   ['unannounced session transition', f => f.setSession('session-two')],
   ['history changes', f => f.controller.markDirty()],
   ['retention invalidation', f => f.controller.invalidate()],
-  ['scope change', f => { f.els.scope.checked = true; f.els.scope.dispatch('change'); }],
+  ['scope change', f => { f.els.scope.dispatch('click'); }],
   ['map refresh', f => f.controller.refresh({ force: true })],
   ['hidden map', f => f.controller.setVisible(false)],
 ]) test(`late body-reference responses cannot publish after ${name}`, async () => {
@@ -1945,15 +1951,15 @@ test('compact cards and arrow attachments share geometry at every scale', async 
   const f = fixture(), a = origin(originA), b = origin(originB);
   a.redirects = [redirect(originB)]; await f.load(snapshot([a, b]));
   const geometry = map.GRAPH_GEOMETRY;
-  assert.equal(geometry.cardWidth, 220); assert.equal(geometry.cardHeight, 104);
-  assert.equal(geometry.rowPitch, 124); assert.equal(geometry.columnPitch, 300);
+  assert.equal(geometry.cardWidth, 220); assert.equal(geometry.cardHeight, 84);
+  assert.equal(geometry.rowPitch, 104); assert.equal(geometry.columnPitch, 300);
   const layout = map.graphLayout(f.state.snapshot.origins, f.state.order);
   assertCanvasContainsGeometry(layout);
   const points = layout.edges[0].path.match(/-?\d+(?:\.\d+)?/g).map(Number);
   const from = layout.nodes.find(node => node.origin === originA), to = layout.nodes.find(node => node.origin === originB);
   assert.equal(points[0], from.x + geometry.cardWidth); assert.equal(points[1], from.y + geometry.cardHeight / 2);
   assert.equal(points[6], to.x); assert.equal(points[7], to.y + geometry.cardHeight / 2);
-  assert.match(f.els.canvas.innerHTML, /--service-map-card-width:220px;--service-map-card-height:104px/);
+  assert.match(f.els.canvas.innerHTML, /--service-map-card-width:220px;--service-map-card-height:84px/);
   for (const scale of [0.1, 0.5, 1, 2]) {
     f.controller.setZoom(scale);
     assert.equal(f.els.canvas.style.values['--service-map-scaled-width'], `${layout.width * scale}px`);
@@ -2056,11 +2062,11 @@ test('map keyboard shortcuts are local and accessible toolbar controls use nativ
 
 test('display text geometry keeps compact defaults and grows card, pitch, and arrows together at 20px', () => {
   const base = map.graphGeometry(12), large = map.graphGeometry(20);
-  assert.equal(base.cardHeight, 104); assert.equal(base.rowPitch, 124);
-  assert.equal(large.cardWidth, 220); assert.equal(large.cardHeight, 146); assert.equal(large.rowPitch, 166);
+  assert.equal(base.cardHeight, 84); assert.equal(base.rowPitch, 104);
+  assert.equal(large.cardWidth, 220); assert.equal(large.cardHeight, 119); assert.equal(large.rowPitch, 139);
   for (const size of [8, 12, 14, 16, 18, 20]) {
     const geometry = map.graphGeometry(size), title = Math.max(10, size - 1), small = Math.max(9, size - 2);
-    assert.ok(geometry.cardHeight >= (title + small * 3) * geometry.lineHeight + 36);
+    assert.ok(geometry.cardHeight >= (title + small * 2) * geometry.lineHeight + 36);
     assert.equal(geometry.rowPitch - geometry.cardHeight, 20);
     const a = origin(originA), b = origin(originB), c = origin('https://assets.example.com');
     a.redirects = [redirect(b.origin)]; b.redirects = [redirect(c.origin)]; c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
@@ -2705,7 +2711,7 @@ for (const read of passiveReads) {
       const f = await htmlGeneratorFixture(), pending = read.start(f), old = f.requests.at(-1);
       if (boundary === 'session') { f.setSession('session-two'); f.controller.reset(); await f.load(snapshot(undefined, 'session-two')); }
       else {
-        f.els.scope.checked = true; f.els.scope.dispatch('change');
+        f.els.scope.dispatch('click');
         f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await new Promise(resolve => setImmediate(resolve));
       }
       assert.equal(old.options.signal.aborted, true);
@@ -2862,13 +2868,12 @@ test('paused map local origin/product/version/method/path filters add zero reads
   assert.equal(f.state.evidence, source); assert.equal(f.state.endpointSelection, selection); assert.equal(f.state.refreshPaused, true);
   await pollRealTargetMap(f); assert.equal(f.requests.length, before);
 });
-for (const boundary of ['visibility', 'apis', 'force-only navigation', 'unchanged scope', 'unchanged scope checkbox', 'history dirty', 'history invalidation', 'disconnect/reconnect']) test(`paused map does not retry after ${boundary}`, async () => {
+for (const boundary of ['visibility', 'apis', 'force-only navigation', 'unchanged scope', 'history dirty', 'history invalidation', 'disconnect/reconnect']) test(`paused map does not retry after ${boundary}`, async () => {
   const f = fixture(); await f.load(); await rejectMap(f); const before = f.requests.length;
   if (boundary === 'visibility') { f.controller.setVisible(false); f.controller.setVisible(true); }
   if (boundary === 'apis') { f.controller.setVisible(true, 'apis'); f.controller.setVisible(true); }
   if (boundary === 'force-only navigation') await f.controller.refresh({ force: true });
   if (boundary === 'unchanged scope') assert.equal(f.controller.scopeChanged({ scope_patterns: ['example.com'] }, { scope_patterns: ['example.com'] }), false);
-  if (boundary === 'unchanged scope checkbox') f.els.scope.dispatch('change');
   if (boundary === 'history dirty') f.controller.markDirty();
   if (boundary === 'history invalidation') await f.controller.invalidate();
   if (boundary === 'disconnect/reconnect') { f.controller.disconnect(); await f.controller.invalidate(); }
@@ -2880,11 +2885,11 @@ for (const boundary of ['visibility', 'apis', 'force-only navigation', 'unchange
     assert.match(f.els.status.textContent, /Automatic refresh paused\. Use Reload to retry\./);
   }
 });
-for (const boundary of ['scope rules', 'scope checkbox', 'session reset', 'session detection']) test(`actual ${boundary} clears pause and permits one normal map read`, async () => {
+for (const boundary of ['scope rules', 'scope toggle', 'session reset', 'session detection']) test(`actual ${boundary} clears pause and permits one normal map read`, async () => {
   const f = fixture(); await f.load(); await rejectMap(f); const before = f.requests.length;
   let task, session = 'session-one';
   if (boundary === 'scope rules') task = f.controller.scopeChanged({ scope_patterns: [] }, { scope_patterns: ['example.com'] });
-  if (boundary === 'scope checkbox') { f.els.scope.checked = true; f.els.scope.dispatch('change'); }
+  if (boundary === 'scope toggle') { f.els.scope.dispatch('click'); }
   if (boundary.startsWith('session')) {
     session = 'session-two'; f.setSession(session);
     if (boundary === 'session reset') f.controller.reset();
@@ -2894,11 +2899,11 @@ for (const boundary of ['scope rules', 'scope checkbox', 'session reset', 'sessi
   f.requests.at(-1).resolve(response(snapshot(undefined, session))); await task; await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.state.error, ''); assert.equal(f.state.sessionId, session);
 });
-for (const boundary of ['force replacement', 'scope checkbox', 'scope rules', 'session', 'session ABA']) test(`late bounded error after ${boundary} cannot pause or invalidate the replacement`, async () => {
+for (const boundary of ['force replacement', 'scope toggle', 'scope rules', 'session', 'session ABA']) test(`late bounded error after ${boundary} cannot pause or invalidate the replacement`, async () => {
   const f = fixture(); await f.load(); const oldTask = f.controller.refresh(), old = f.requests.at(-1);
   let task, session = 'session-one';
   if (boundary === 'force replacement') task = f.controller.refresh({ force: true });
-  if (boundary === 'scope checkbox') { f.els.scope.checked = true; f.els.scope.dispatch('change'); }
+  if (boundary === 'scope toggle') { f.els.scope.dispatch('click'); }
   if (boundary === 'scope rules') task = f.controller.scopeChanged({ scope_patterns: [] }, { scope_patterns: ['example.com'] });
   if (boundary.startsWith('session')) {
     session = 'session-two'; f.setSession(session); f.controller.reset();
