@@ -48,7 +48,11 @@ without a path, query, credentials, or fragment. Optional `mime_types`,
 `only_parameterized` hide rows exactly as the HTTP history filter does, for
 example `hidden_extensions: ["png","css","woff2"]` to drop static CDNs;
 `snapshot.filtered_rows` counts them. Omitted, they hide nothing; the GUI's saved
-map filter never applies to these reads. Check `snapshot.complete`, `stopped_by`, counts, limits,
+map filter never applies to these reads. Each `header_links[]` entry counts its
+rows in `request_count` and sorts them in `request_kinds` (`api`, `navigation`,
+`frame`, `script`, `static`, `other`, from `Sec-Fetch-Dest`, else the response
+type). A page's image loads declare Referer too, so read the `api` and
+`navigation` counts before calling a link a service relationship. Check `snapshot.complete`, `stopped_by`, counts, limits,
 `unavailable`, `deferred`, and warnings before claiming coverage. Counts include duplicate-ID
 rows, and even a complete result covers retained captures only.
 

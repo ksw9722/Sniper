@@ -240,6 +240,44 @@ status line reports them. Changing the filter re-reads the map and ranks the car
 again for the rows that remain; a filter restored from settings does the same on
 the next read.
 
+## Links by request kind
+
+An Origin or Referer header says only which page a request came from. A page that
+loads forty images from a CDN declares forty Referer links, and they look the same
+as its API calls. So each `header_links[]` entry counts its rows (`request_count`)
+and sorts them by request kind (`request_kinds`):
+
+| Kind | Rows |
+| --- | --- |
+| `api` | `Sec-Fetch-Dest: empty` (fetch or XHR) |
+| `navigation` | `Sec-Fetch-Dest: document` |
+| `frame` | `Sec-Fetch-Dest` of `iframe`, `frame`, `embed`, `object` or `fencedframe` |
+| `script` | `Sec-Fetch-Dest` of `script`, a worker, a worklet or `xslt` |
+| `static` | `Sec-Fetch-Dest` of `image`, `style`, `font`, `audio`, `video`, `track` or `manifest` |
+| `other` | any other value |
+
+Browsers send `Sec-Fetch-Dest`. Without it (an older browser, a non-browser
+client), the response type decides: HTML is `navigation`; JSON, XML, protobuf,
+gRPC or GraphQL is `api`; JavaScript is `script`; images, fonts, audio, video and
+CSS are `static`. A row with neither is `api` when it has an `Origin` header or a
+method other than GET and HEAD, and `other` otherwise. Every input is a header the
+client or server sent, so a kind describes how a row looked, not what the page
+intended.
+
+The legend under the map has one toggle per kind found in the loaded links, with
+the number of links that include it. Scripts and static files are hidden by
+default, so a page's CDN loads draw no arrows. The rows of a hidden kind do not
+draw, rank or weigh a link: a link made only of hidden kinds is not drawn, and a
+link with other rows is drawn for those rows only. The arrow takes the colour of
+its first shown kind in the order of the table above, so one API call among a
+CDN's image loads still reads as an API link: API calls stand out, and scripts
+and static files recede. More rows draw a heavier line, and the tooltip lists the
+rows by kind.
+The choice is saved in UI settings (`service_map_hidden_link_kinds`). It hides
+arrows, not cards: to drop a CDN's cards too, use the
+[Service Map filter](#service-map-filter). Redirects are always drawn and count
+their rows in `request_count` as well.
+
 ## Read through the CLI
 
 Discover the contract offline before reading a running local instance:
@@ -275,7 +313,10 @@ same session scope matcher as other Sniper views. `--mime-types`,
 `--only-parameterized` (or the same fields in `call`) are the
 [Service Map filter](#service-map-filter)'s conditions. Omitted, they hide
 nothing: the CLI keeps every row unless asked, while the GUI applies its saved
-filter. These are read filters, not capture or scope-setting controls. There is no pagination cursor, URL input,
+filter. These are read filters, not capture or scope-setting controls. Each
+header link carries `request_count` and `request_kinds`, and each redirect
+`request_count` (see [Links by request kind](#links-by-request-kind)); a server
+older than 0.3.1 omits them. There is no pagination cursor, URL input,
 active-discovery option, or automatic retry with a larger limit.
 
 ## What the map means

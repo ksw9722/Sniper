@@ -47,6 +47,16 @@
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char]);
   const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const array = (value) => Array.isArray(value) ? value : [];
+  // What kind of request each Origin/Referer link stood for, as the server
+  // counts it per link (Sec-Fetch-Dest, else the response type).
+  const REQUEST_KINDS = ["api", "navigation", "frame", "script", "static", "other"];
+  const REQUEST_KIND_LABELS = { api: "API calls", navigation: "Page navigations", frame: "Frames", script: "Scripts", static: "Static files", other: "Other requests" };
+  const DEFAULT_HIDDEN_LINK_KINDS = Object.freeze(["script", "static"]);
+  // Older servers count nothing: such a link is one row of an unknown kind.
+  const linkKindCounts = (link) => {
+    const kinds = REQUEST_KINDS.filter((kind) => count(link.request_kinds?.[kind]) > 0).map((kind) => [kind, count(link.request_kinds[kind])]);
+    return kinds.length ? kinds : [["other", Math.max(1, count(link.request_count))]];
+  };
   const safePath = (value) => String(value || "/").split(/[?#]/, 1)[0];
   function safeOrigin(value) {
     try {
@@ -774,10 +784,13 @@
         header_links: array(item.header_links).filter((link) => link.source === "request_header_declaration" && ["origin_header", "referer_header"].includes(link.relationship) && safeOrigin(link.source_origin)).map((link) => ({
           source_origin: safeOrigin(link.source_origin), relationship: link.relationship,
           evidence: array(link.evidence).filter((id) => typeof id === "string" && id.length > 0),
+          request_count: count(link.request_count),
+          request_kinds: Object.fromEntries(REQUEST_KINDS.filter((kind) => count(link.request_kinds?.[kind]) > 0).map((kind) => [kind, count(link.request_kinds[kind])])),
         })),
         redirects: array(item.redirects).filter((redirect) => redirect.relationship === "redirect_instruction" && safeOrigin(redirect.target_origin)).map((redirect) => ({
           target_origin: safeOrigin(redirect.target_origin), target_path: safePath(redirect.target_path),
           evidence: array(redirect.evidence).filter((id) => typeof id === "string" && id.length > 0),
+          request_count: count(redirect.request_count),
         })),
       }];
     });
@@ -794,7 +807,8 @@
   // best-connected captured origin, follow it with its neighbours breadth first,
   // and repeat for each connected group; unrelated and reference-only origins
   // follow by name.
-  function relationshipOrder(origins) {
+  function relationshipOrder(origins, hiddenKinds = []) {
+    const hidden = new Set(hiddenKinds);
     const captured = new Set(origins.filter((origin) => origin.captured !== false).map((origin) => origin.origin));
     const neighbors = new Map();
     const link = (a, b) => {
@@ -806,7 +820,10 @@
     };
     for (const origin of origins) {
       for (const redirect of origin.redirects || []) link(origin.origin, redirect.target_origin);
-      for (const header of origin.header_links || []) link(header.source_origin, origin.origin);
+      // A link made only of hidden kinds (images a page loaded) ranks nothing.
+      for (const header of origin.header_links || []) {
+        if (linkKindCounts(header).some(([kind]) => !hidden.has(kind))) link(header.source_origin, origin.origin);
+      }
     }
     const degree = (id) => neighbors.get(id)?.size || 0;
     const rank = (a, b) => degree(b) - degree(a) || a.localeCompare(b);
@@ -896,26 +913,44 @@
     });
     return slots;
   }
-  function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = [], geometry = GRAPH_GEOMETRY) {
+  function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = [], geometry = GRAPH_GEOMETRY, hiddenKinds = []) {
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS).map((id) => byOrigin.get(id));
     const visibleIds = new Set(visibleOrigins.map((origin) => origin.origin));
+    const hidden = new Set(hiddenKinds);
+    // An Origin/Referer link is drawn for the kinds of request it stood for
+    // that are not hidden, weighted by their rows and coloured by the first of
+    // them in REQUEST_KINDS order: one API call among a CDN's image loads still
+    // reads as an API link, however many images there are.
+    const headerEdge = (origin, link) => {
+      const kinds = linkKindCounts(link).filter(([kind]) => !hidden.has(kind));
+      if (!kinds.length) return [];
+      return [{ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: link.relationship === "origin_header" ? "Origin header" : "Referer header",
+        kind: kinds[0][0], kinds: Object.fromEntries(kinds), count: kinds.reduce((sum, [, rows]) => sum + rows, 0) }];
+    };
     // The explicit overlay gets the first arrow slots. Metadata remains distinct
     // even when the same pair also occurs in a retained response body.
     const declaredEdges = [...bodyEdges, ...visibleOrigins.flatMap((origin) => [
-      ...origin.redirects.map((redirect) => ({ source: origin.origin, target: redirect.target_origin, relationship: "redirect_instruction", label: "Redirect instruction" })),
-      ...origin.header_links.map((link) => ({ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: link.relationship === "origin_header" ? "Origin header" : "Referer header" })),
+      ...origin.redirects.map((redirect) => ({ source: origin.origin, target: redirect.target_origin, relationship: "redirect_instruction", label: "Redirect instruction", kind: "redirect", count: Math.max(1, count(redirect.request_count)) })),
+      ...origin.header_links.flatMap((link) => headerEdge(origin, link)),
     ])];
-    const seen = new Set();
+    const seen = new Map();
     const shown = [];
     let edgeCount = 0;
     for (const edge of declaredEdges) {
       const key = JSON.stringify([edge.source, edge.target, edge.relationship]);
-      if (edge.source === edge.target || !visibleIds.has(edge.source) || !visibleIds.has(edge.target) || seen.has(key)
+      if (edge.source === edge.target || !visibleIds.has(edge.source) || !visibleIds.has(edge.target)
         || anchor && edge.source !== anchor && edge.target !== anchor) continue;
-      seen.add(key);
+      // Redirects to several paths of one origin share an arrow and their rows;
+      // inspected body and Link references count no rows.
+      if (seen.has(key)) {
+        if (edge.count) seen.get(key).count += edge.count;
+        continue;
+      }
+      const drawn = { ...edge };
+      seen.set(key, drawn);
       edgeCount += 1;
-      if (shown.length < MAX_EDGES) shown.push(edge);
+      if (shown.length < MAX_EDGES) shown.push(drawn);
     }
     // Cards are placed by the arrows actually drawn, so a card whose links all
     // fall past the arrow cap is not laid out among linked cards with no arrow.
@@ -1028,7 +1063,12 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, request: sendRequest, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, request: sendRequest, document: doc = root.document }) {
+    // Request kinds whose links are not drawn. The app keeps them in UI
+    // settings; without it they live for this controller only.
+    let localHiddenLinkKinds = [...DEFAULT_HIDDEN_LINK_KINDS];
+    const hiddenLinkKinds = () => array(getHiddenLinkKinds ? getHiddenLinkKinds() : localHiddenLinkKinds).filter((kind) => REQUEST_KINDS.includes(kind));
+    const saveHiddenLinkKinds = (kinds) => { if (setHiddenLinkKinds) setHiddenLinkKinds(kinds); else localHiddenLinkKinds = kinds; };
     // A local retained-data read must not turn an API redirect into another
     // request. Enforce this for every map/inspector read, preserving its signal.
     const request = (path, options) => sendRequest(path, { ...options, redirect: "error" });
@@ -1171,7 +1211,7 @@
           // "a → a" rows in the inspector; arrows already skip it.
           if (link.source_origin === origin.origin) return;
           reference(link.source_origin, origin, `${link.relationship === "origin_header" ? "Origin" : "Referer"} header on`);
-          relation({ sourceOrigin: link.source_origin, targetOrigin: origin.origin, capturedOrigin: origin.origin, label: `${link.relationship === "origin_header" ? "Origin" : "Referer"} header declaration`, evidence: link.evidence[0] || "" });
+          relation({ sourceOrigin: link.source_origin, targetOrigin: origin.origin, capturedOrigin: origin.origin, label: `${link.relationship === "origin_header" ? "Origin" : "Referer"} header declaration`, evidence: link.evidence[0] || "", kinds: linkKindCounts(link) });
         });
         origin.redirects.forEach((redirect) => {
           reference(redirect.target_origin, origin, "Redirect instruction from");
@@ -1773,15 +1813,18 @@
         state.refreshPaused = false;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
-        // Another filter counts other rows, wherever it changed (the dialog, a
-        // loaded setting, another window): rank the cards again for them.
+        // Another filter counts other rows, and other hidden request kinds draw
+        // other links, wherever either changed (the dialog, a loaded setting,
+        // another window): rank the cards again for them.
         const filterSignature = JSON.stringify(filterQuery);
-        if (state.filterSignature !== undefined && state.filterSignature !== filterSignature) {
+        const kindSignature = JSON.stringify(hiddenLinkKinds());
+        if (state.filterSignature !== undefined && (state.filterSignature !== filterSignature || state.kindSignature !== kindSignature)) {
           state.order = [];
           state.layoutSlots = new Map();
         }
         state.filterSignature = filterSignature;
-        state.order = state.order.length ? stableOrder(state.order, allOrigins) : relationshipOrder(allOrigins);
+        state.kindSignature = kindSignature;
+        state.order = state.order.length ? stableOrder(state.order, allOrigins) : relationshipOrder(allOrigins, hiddenLinkKinds());
         if (state.anchorOrigin && !findOrigin(state.anchorOrigin)) {
           state.anchorOrigin = null;
           state.modeNotice = "Direct relations cleared: the pinned origin is absent from this snapshot.";
@@ -2125,6 +2168,22 @@
       els.refresh.classList.toggle("is-working", state.loading && !state.backgroundLoading);
       els.panel.setAttribute("aria-busy", String(state.loading && !state.backgroundLoading));
     }
+    // One toggle per request kind seen in the loaded links, with how many links
+    // include it; a hidden kind's links are not drawn or ranked.
+    function renderLinkKinds() {
+      if (!els.linkKinds) return;
+      const hidden = new Set(hiddenLinkKinds());
+      const links = new Map(REQUEST_KINDS.map((kind) => [kind, 0]));
+      for (const origin of state.snapshot?.origins || []) {
+        for (const link of origin.header_links || []) {
+          // A page naming its own origin is no link and is never drawn.
+          if (link.source_origin === origin.origin) continue;
+          for (const [kind] of linkKindCounts(link)) links.set(kind, links.get(kind) + 1);
+        }
+      }
+      const toggles = REQUEST_KINDS.filter((kind) => links.get(kind) > 0).map((kind) => `<button class="service-map-kind kind-${kind}" type="button" data-link-kind="${kind}" data-service-focus="link-kind:${kind}" aria-pressed="${!hidden.has(kind)}" title="${REQUEST_KIND_LABELS[kind]} in ${links.get(kind)} Origin/Referer link(s). ${hidden.has(kind) ? "Draw" : "Hide"} them.">${REQUEST_KIND_LABELS[kind]} ${links.get(kind)}</button>`).join("");
+      replace(els.linkKinds, toggles ? `<span class="service-map-kinds-label">Links by request:</span>${toggles}` : "");
+    }
     function renderGraph() {
       const selected = selectedOrigin();
       const direct = directNeighborhood();
@@ -2138,11 +2197,12 @@
       const sourceIds = new Set(state.relationLayers.map((layer) => layer.source.origin));
       const order = direct ? [direct.anchor.origin, ...neighborOrder.filter((id) => direct.bodyIds.has(id)), ...neighborOrder.filter((id) => !direct.bodyIds.has(id))]
         : [...allOrder.filter((id) => origins.find((item) => item.origin === id)?.endpointNode), ...allOrder.filter((id) => sourceIds.has(id)), ...allOrder.filter((id) => collectionIds.has(id) && !sourceIds.has(id) && !origins.find((item) => item.origin === id)?.endpointNode), ...allOrder.filter((id) => !collectionIds.has(id))];
-      const filterKey = JSON.stringify([query, state.productId, state.productVersion, state.scopeOnly, state.sessionId, state.anchorOrigin]);
+      const filterKey = JSON.stringify([query, state.productId, state.productVersion, state.scopeOnly, state.sessionId, state.anchorOrigin, hiddenLinkKinds()]);
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
       const textSize = doc?.documentElement && typeof root.getComputedStyle === "function"
         ? Number.parseFloat(root.getComputedStyle(doc.documentElement).getPropertyValue("--ui-root-size")) : 12;
-      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin, overlayEdges(), graphGeometry(textSize));
+      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin, overlayEdges(), graphGeometry(textSize), hiddenLinkKinds());
+      renderLinkKinds();
       state.layoutSlots = layout.slots;
       currentLayout = layout.nodes.length ? layout : null;
       applyGraphScale();
@@ -2170,7 +2230,11 @@
         els.graphBounds.textContent = ["0 matching origins", stages.queryHidden ? `${stages.queryHidden} hidden by query` : "", stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "", state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
       }
-      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}" d="${edge.path}" ${edge.undirected ? "" : 'marker-end="url(#service-map-arrow)"'}><title>${escape(edge.source)} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : edge.target)} · ${escape(edge.label)} · ${edge.relationship}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}</title></path>`).join("");
+      // More rows draw a heavier line, up to about twice the base width.
+      const weight = (rows) => rows > 1 ? Math.round(Math.min(3.25, 1.25 + 0.6 * Math.log2(rows)) * 100) / 100 : 0;
+      const requests = (edge) => edge.count > 1 || edge.kinds
+        ? ` · ${edge.count} request${edge.count === 1 ? "" : "s"}${edge.kinds ? ` (${Object.entries(edge.kinds).map(([kind, rows]) => `${REQUEST_KIND_LABELS[kind]} ${rows}`).join(", ")})` : ""}` : "";
+      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : 'marker-end="url(#service-map-arrow)"'}><title>${escape(edge.source)} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : edge.target)} · ${escape(edge.label)} · ${edge.relationship}${requests(edge)}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}</title></path>`).join("");
       const cards = layout.nodes.map((origin) => {
         if (origin.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(origin.address)}" style="left:${origin.x}px;top:${origin.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(origin.address)}">${escape(origin.address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${origin.family.toUpperCase()}</span><span class="service-map-card-meta">Undirected observations only</span><span class="service-map-card-meta">No shared ownership inferred</span></span></div>`;
         const selected = origin.origin === state.selectedOrigin;
@@ -2333,7 +2397,7 @@
       const metadata = (group?.items || []).slice(0, MAX_REFERENCE_SOURCES);
       const shown = inspected.slice(0, Math.max(0, MAX_REFERENCE_SOURCES - metadata.length));
       const omitted = (group?.omitted || 0) + inspected.length - shown.length;
-      return `<h4>Shown relationships</h4><p class="service-map-muted">Declarations and literal references do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${metadata.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}</span><span>View source ›</span></button>`).join("")}${shown.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.layer.source.origin)}" data-service-relation-evidence="${escape(item.layer.source.evidenceId)}" data-service-focus="relation:${escape(JSON.stringify([layerKey(item.layer), item.target_origin, item.relation || "body", item.header_index ?? 0, item.relation_span?.start ?? 0]))}"><span><strong>${escape(item.layer.kind === "link" ? LINK_RELATIONS[item.relation].label : "Literal body URL reference")}</strong>${escape(item.layer.source.origin)} → ${escape(item.target_origin)}<br>Source sequence ${escape(item.layer.source.sequence)} · ${item.layer.scan.complete ? "Complete" : "Partial"} inspection${item.layer.kind === "body" ? `<br>${item.occurrences} literal occurrences · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets} offsets omitted` : ""}` : `<br>Link header ${item.header_index} · Member bytes ${item.link_value_span.start}–${item.link_value_span.end} · Target ${item.target_span.start}–${item.target_span.end} · Relation ${item.relation_span.start}–${item.relation_span.end}`}</span><span>View source ›</span></button>`).join("")}</div>${omitted ? `<p class="service-map-muted">${omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
+      return `<h4>Shown relationships</h4><p class="service-map-muted">Declarations and literal references do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${metadata.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}${item.kinds ? `<br><span class="service-map-relation-kinds">${item.kinds.map(([kind, rows]) => `${escape(REQUEST_KIND_LABELS[kind])} ${rows}`).join(" · ")}</span>` : ""}</span><span>View source ›</span></button>`).join("")}${shown.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.layer.source.origin)}" data-service-relation-evidence="${escape(item.layer.source.evidenceId)}" data-service-focus="relation:${escape(JSON.stringify([layerKey(item.layer), item.target_origin, item.relation || "body", item.header_index ?? 0, item.relation_span?.start ?? 0]))}"><span><strong>${escape(item.layer.kind === "link" ? LINK_RELATIONS[item.relation].label : "Literal body URL reference")}</strong>${escape(item.layer.source.origin)} → ${escape(item.target_origin)}<br>Source sequence ${escape(item.layer.source.sequence)} · ${item.layer.scan.complete ? "Complete" : "Partial"} inspection${item.layer.kind === "body" ? `<br>${item.occurrences} literal occurrences · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets} offsets omitted` : ""}` : `<br>Link header ${item.header_index} · Member bytes ${item.link_value_span.start}–${item.link_value_span.end} · Target ${item.target_span.start}–${item.target_span.end} · Relation ${item.relation_span.start}–${item.relation_span.end}`}</span><span>View source ›</span></button>`).join("")}</div>${omitted ? `<p class="service-map-muted">${omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
     }
     function bodyReferencesMarkup() {
       const result = state.bodyReferences;
@@ -2641,11 +2705,27 @@
     // Resize only refreshes control availability; Fit is an explicit one-shot
     // action, so resizing or polling cannot silently change the user's zoom.
     if (els.viewport && typeof root.ResizeObserver === "function") new root.ResizeObserver(updateZoomControls).observe(els.viewport);
+    // Showing or hiding a request kind changes which links count, so the cards
+    // are ranked and laid out again for the links that remain.
+    els.linkKinds?.addEventListener("click", (event) => {
+      const kind = event.target?.closest?.("[data-link-kind]")?.dataset.linkKind;
+      if (!REQUEST_KINDS.includes(kind)) return;
+      const hidden = new Set(hiddenLinkKinds());
+      if (hidden.has(kind)) hidden.delete(kind); else hidden.add(kind);
+      saveHiddenLinkKinds(REQUEST_KINDS.filter((item) => hidden.has(item)));
+      if (state.snapshot) {
+        state.order = relationshipOrder(graphOrigins(), hiddenLinkKinds());
+        state.layoutSlots = new Map();
+        // Ranked here already; the next read need not rank again.
+        state.kindSignature = JSON.stringify(hiddenLinkKinds());
+      }
+      renderGraph();
+    });
     els.refresh.addEventListener("click", () => {
       // Polling keeps cards where they are; an explicit Reload may move them so
       // relationships captured since the map opened come within the card cap.
       if (state.snapshot) {
-        state.order = relationshipOrder(graphOrigins());
+        state.order = relationshipOrder(graphOrigins(), hiddenLinkKinds());
         state.layoutSlots = new Map();
       }
       return refresh({ force: true, retry: true });

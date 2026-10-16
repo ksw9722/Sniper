@@ -242,6 +242,11 @@ page's static CDN and its arrows drop out. `sniper-cli scope service-map` takes
 the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`,
 `--hide-without-responses` and `--only-parameterized`.
 
+Origin and Referer links are sorted by request kind (API call, page navigation,
+frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each
+kind; scripts and static files draw no arrows by default, and an arrow grows
+heavier with its rows.
+
 A separate, explicit `sniper-cli target service-map body-references --session-id
 <active-session-uuid> --evidence-id <returned-token>` read can inspect one retained
 UTF-8 HTML/JavaScript response preview. It returns canonical origins and preview

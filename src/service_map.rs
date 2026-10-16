@@ -212,6 +212,9 @@ pub struct RedirectInstruction {
     pub relationship: String,
     pub source: String,
     pub evidence: Vec<String>,
+    /// Analyzed rows that gave this instruction. Absent from older servers.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub request_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +223,12 @@ pub struct HeaderLink {
     pub relationship: String,
     pub source: String,
     pub evidence: Vec<String>,
+    /// Analyzed rows carrying this declaration, and how many were each kind of
+    /// request (see `request_kind`). Absent from older servers.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub request_count: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_kinds: BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -272,6 +281,71 @@ pub struct ServiceMapRow {
     pub header_links: Vec<HeaderLinkSource>,
     pub metadata_complete: bool,
     pub omitted: Vec<String>,
+    /// Aggregated onto links only; exact evidence keeps its earlier shape.
+    #[serde(skip)]
+    pub request_kind: &'static str,
+}
+
+/// Every value `request_kind` returns, in the order clients present them.
+pub const REQUEST_KINDS: [&str; 6] = ["api", "navigation", "frame", "script", "static", "other"];
+
+/// What a row's request was, so a page loading an image is not drawn like a
+/// page calling an API. Browsers declare it in `Sec-Fetch-Dest`; a client that
+/// sends none (an app, a script) is judged by the response type, and then by an
+/// Origin header or a non-GET method, which mark an API call.
+pub(crate) fn request_kind(record: &TransactionRecord) -> &'static str {
+    let header = |name: &str| {
+        let mut values = record
+            .request
+            .headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case(name));
+        match (values.next(), values.next()) {
+            (Some(header), None) => Some(header.value.trim().to_ascii_lowercase()),
+            _ => None,
+        }
+    };
+    if let Some(dest) = header("sec-fetch-dest") {
+        return match dest.as_str() {
+            "empty" => "api",
+            "document" => "navigation",
+            "iframe" | "frame" | "embed" | "object" | "fencedframe" => "frame",
+            "script" | "worker" | "sharedworker" | "serviceworker" | "audioworklet"
+            | "paintworklet" | "xslt" => "script",
+            "image" | "style" | "font" | "audio" | "video" | "track" | "manifest" => "static",
+            _ => "other",
+        };
+    }
+    let content_type = record
+        .response
+        .as_ref()
+        .and_then(|response| response.content_type.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if content_type.contains("html") {
+        return "navigation";
+    }
+    if content_type.contains("javascript") || content_type.contains("ecmascript") {
+        return "script";
+    }
+    // Before the data types: an SVG image is `image/svg+xml`.
+    if ["image/", "font/", "audio/", "video/", "text/css"]
+        .iter()
+        .any(|prefix| content_type.starts_with(prefix))
+        || content_type.contains("font")
+    {
+        return "static";
+    }
+    if ["json", "xml", "protobuf", "grpc", "graphql"]
+        .iter()
+        .any(|kind| content_type.contains(kind))
+    {
+        return "api";
+    }
+    if header("origin").is_some() || !matches!(record.method.as_str(), "GET" | "HEAD") {
+        return "api";
+    }
+    "other"
 }
 
 /// Extensions may be absent on old servers, but a present null is malformed.
@@ -549,6 +623,7 @@ pub(crate) fn project_record_for_catalog(
         header_links: vec![],
         metadata_complete: true,
         omitted: vec![],
+        request_kind: request_kind(record),
     };
     if record
         .response
@@ -1078,6 +1153,11 @@ fn build_with_scope(
             if let Some(existing) = origin.header_links.iter_mut().find(|r| {
                 r.source_origin == link.source_origin && r.relationship == link.relationship
             }) {
+                existing.request_count += 1;
+                *existing
+                    .request_kinds
+                    .entry(row.request_kind.into())
+                    .or_default() += 1;
                 sample(&mut existing.evidence, &row.evidence_id);
             } else if origin.header_links.len() < MAX_HEADER_LINKS_PER_ORIGIN {
                 origin.header_links.push(HeaderLink {
@@ -1085,6 +1165,8 @@ fn build_with_scope(
                     relationship: link.relationship,
                     source: "request_header_declaration".into(),
                     evidence: vec![row.evidence_id.clone()],
+                    request_count: 1,
+                    request_kinds: BTreeMap::from([(row.request_kind.into(), 1)]),
                 });
             } else {
                 stopped_by.insert("header_links_limit".into());
@@ -1094,6 +1176,7 @@ fn build_with_scope(
             if let Some(existing) = origin.redirects.iter_mut().find(|r| {
                 r.target_origin == target.target_origin && r.target_path == target.target_path
             }) {
+                existing.request_count += 1;
                 sample(&mut existing.evidence, &row.evidence_id);
             } else if origin.redirects.len() < MAX_REDIRECTS_PER_ORIGIN {
                 origin.redirects.push(RedirectInstruction {
@@ -1102,6 +1185,7 @@ fn build_with_scope(
                     relationship: "redirect_instruction".into(),
                     source: "response_location_header".into(),
                     evidence: vec![row.evidence_id.clone()],
+                    request_count: 1,
                 });
             } else {
                 stopped_by.insert("redirects_limit".into());

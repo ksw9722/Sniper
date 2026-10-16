@@ -2,7 +2,8 @@
 // cards. Picked by name, related origins fell on either side of the cap, and a
 // real session with 67 relationships among 86 origins drew no arrow at all.
 // Cards are laid out by link depth, so links run between columns, not inside one.
-// Trackpad pinch zooms the graph around the fingers.
+// Trackpad pinch zooms the graph around the fingers. An Origin/Referer link is
+// drawn for the kinds of request behind it, so image loads can stay hidden.
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
@@ -40,7 +41,7 @@ function node() {
 }
 function fixture(options = {}) {
   const requests = [];
-  const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn', 'linkKinds'].map(name => [name, node()]));
   els.viewport.clientWidth = 300; els.viewport.clientHeight = 300;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty('--ui-root-size', '12px');
@@ -293,4 +294,69 @@ test('ctrl+wheel and WebKit pinch gestures zoom around the fingers; a plain whee
   f.els.viewport.dispatch('gesturechange', { scale: 0.5, preventDefault() {} });
   assert.equal(f.state.zoomScale, 2, 'a change after the gesture ended is ignored');
   assert.equal(f.requests.length, 1, 'zooming reads nothing');
+});
+
+// What each Origin/Referer link stood for: an API call, a page load, a frame,
+// or a script or static file the page pulled in.
+const kinded = (sourceOrigin, kinds) => ({ ...referer(sourceOrigin), request_count: Object.values(kinds).reduce((sum, rows) => sum + rows, 0), request_kinds: kinds });
+function kindedOrigins() {
+  // The page's own reloads name itself; that is no link and counts in no toggle.
+  return [origin(app, { header_links: [kinded(app, { navigation: 2 })] }),
+    origin(api, { header_links: [kinded(app, { api: 3 })] }),
+    origin(cdn, { header_links: [kinded(app, { script: 1, static: 4 })] }),
+    origin(login, { header_links: [kinded(app, { navigation: 1, frame: 2 })] })];
+}
+
+test('a link is drawn for the request kinds behind it: hidden kinds drop it, the leading kind colors it, rows weigh it', () => {
+  const normalized = map.normalizeSnapshot(snapshot([origin(app), origin(api, { header_links: [{ ...kinded(app, { api: 2 }), request_kinds: { api: 2, bogus: 5, static: 0 } }] })]), 'session-one');
+  const link = normalized.origins.find(item => item.origin === api).header_links[0];
+  assert.deepEqual({ ...link.request_kinds }, { api: 2 }, 'unknown and empty kinds are dropped');
+  assert.equal(link.request_count, 2);
+
+  const origins = kindedOrigins();
+  const edge = (layout, id) => layout.edges.find(item => item.target === id);
+  const resourcesHidden = map.graphLayout(origins, map.relationshipOrder(origins, ['script', 'static']), new Map(), null, [], undefined, ['script', 'static']);
+  assert.equal(resourcesHidden.edges.length, 2, 'the CDN link stood only for a script and images');
+  assert.equal(edge(resourcesHidden, cdn), undefined);
+  assert.deepEqual([edge(resourcesHidden, api).kind, edge(resourcesHidden, api).count], ['api', 3]);
+  assert.deepEqual([edge(resourcesHidden, login).kind, edge(resourcesHidden, login).count], ['navigation', 3], 'a page load leads its frames, however many');
+  assert.equal(map.relationshipOrder(origins, ['script', 'static']).indexOf(cdn), 3, 'a hidden link ranks nothing');
+
+  const everything = map.graphLayout(origins, map.relationshipOrder(origins), new Map(), null, [], undefined, []);
+  assert.deepEqual([edge(everything, cdn).kind, edge(everything, cdn).count, { ...edge(everything, cdn).kinds }], ['script', 5, { script: 1, static: 4 }]);
+  const mixed = [origin(app), origin(api, { header_links: [kinded(app, { api: 1, static: 9 })] })];
+  assert.equal(map.graphLayout(mixed, [app, api], new Map(), null, [], undefined, []).edges[0].kind, 'api', 'one API call among nine image loads still reads as an API link');
+  const noFrames = map.graphLayout(origins, map.relationshipOrder(origins), new Map(), null, [], undefined, ['frame']);
+  assert.deepEqual([edge(noFrames, login).kind, edge(noFrames, login).count], ['navigation', 1], 'the rows of a hidden kind no longer count');
+  const older = map.graphLayout([origin(app), origin(api, { header_links: [referer(app)] })], [app, api], new Map(), null, [], undefined, ['script', 'static']);
+  assert.deepEqual([older.edges[0].kind, older.edges[0].count], ['other', 1], 'a link from an older server is drawn as other requests');
+});
+
+test('the legend toggles links by request kind: the map redraws, ranks again and saves the choice', async () => {
+  let hidden = ['script', 'static'];
+  const saves = [];
+  const f = fixture({ getHiddenLinkKinds: () => hidden, setHiddenLinkKinds: kinds => { hidden = kinds; saves.push([...kinds]); } });
+  await f.load(snapshot(kindedOrigins()));
+  const toggles = () => Object.fromEntries([...f.els.linkKinds.innerHTML.matchAll(/data-link-kind="(\w+)"[^>]*aria-pressed="(\w+)"[^>]*>([^<]*)</g)].map(([, kind, pressed, label]) => [kind, `${pressed} ${label}`]));
+  assert.deepEqual(toggles(), { api: 'true API calls 1', navigation: 'true Page navigations 1', frame: 'true Frames 1', script: 'false Scripts 1', static: 'false Static files 1' });
+  assert.equal(arrows(f.els.canvas.innerHTML), 2);
+  assert.match(f.els.canvas.innerHTML, /class="service-map-edge header-declaration kind-api [^"]*" data-relationship="referer_header" style="--edge-weight:2.2px"/, 'three rows draw a heavier line');
+  assert.match(f.els.canvas.innerHTML, /3 requests \(API calls 3\)<\/title>/);
+
+  const click = kind => f.els.linkKinds.dispatch('click', { target: { closest: () => ({ dataset: { linkKind: kind } }) } });
+  click('static');
+  assert.deepEqual(saves, [['script']]);
+  assert.equal(toggles().static, 'true Static files 1');
+  assert.equal(arrows(f.els.canvas.innerHTML), 3, 'the CDN link returns for its images');
+  assert.match(f.els.canvas.innerHTML, /kind-static [^"]*" data-relationship="referer_header" style="--edge-weight:2.45px"/);
+  assert.match(f.els.canvas.innerHTML, /4 requests \(Static files 4\)<\/title>/, 'the hidden script row is not counted');
+  click('bogus');
+  assert.equal(saves.length, 1, 'only a known kind toggles');
+
+  // A choice made in another window arrives with settings: the next read ranks again.
+  hidden = ['api', 'navigation', 'frame', 'script', 'static', 'other'];
+  f.state.order = ['https://stale.example.com'];
+  await f.load(snapshot(kindedOrigins()));
+  assert.equal(arrows(f.els.canvas.innerHTML), 0);
+  assert.notEqual(f.state.order[0], 'https://stale.example.com');
 });

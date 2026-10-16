@@ -354,6 +354,8 @@ pub struct AppUiSettingsSnapshot {
     /// Service Map's own display filter, as Burp keeps one for its site map: the
     /// HTTP history conditions, set apart so each view hides what suits it.
     pub service_map_filter_settings: HttpFilterSettingsSnapshot,
+    /// Request kinds whose links the map does not draw; resource loads by default.
+    pub service_map_hidden_link_kinds: Vec<String>,
     pub workbench_height: Option<u16>,
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
@@ -388,6 +390,7 @@ impl Default for AppUiSettingsSnapshot {
             http_sort_direction: "desc".to_string(),
             http_filter_settings: HttpFilterSettingsSnapshot::default(),
             service_map_filter_settings: HttpFilterSettingsSnapshot::default(),
+            service_map_hidden_link_kinds: vec!["script".into(), "static".into()],
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
@@ -431,6 +434,15 @@ impl AppUiSettingsSnapshot {
             sanitize_option(self.http_sort_direction, "desc", &["asc", "desc"]);
         sanitized.http_filter_settings = self.http_filter_settings.sanitized();
         sanitized.service_map_filter_settings = self.service_map_filter_settings.sanitized();
+        sanitized.service_map_hidden_link_kinds = crate::service_map::REQUEST_KINDS
+            .iter()
+            .filter(|kind| {
+                self.service_map_hidden_link_kinds
+                    .iter()
+                    .any(|hidden| hidden == *kind)
+            })
+            .map(|kind| kind.to_string())
+            .collect();
         sanitized.workbench_height = self
             .workbench_height
             .filter(|height| *height > 0)
@@ -2143,5 +2155,29 @@ mod tests {
             reopened.http_filter_settings.hidden_extensions,
             static_files
         );
+    }
+
+    // Resource loads stay hidden on a file saved before the setting existed;
+    // unknown or repeated kinds are dropped, and an empty list shows every kind.
+    #[test]
+    fn service_map_hidden_link_kinds_default_to_resource_loads() {
+        let older: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            older.sanitized().service_map_hidden_link_kinds,
+            ["script", "static"]
+        );
+        let saved: super::AppUiSettingsSnapshot = serde_json::from_value(serde_json::json!({
+            "service_map_hidden_link_kinds": ["static", "bogus", "static", "api"]
+        }))
+        .unwrap();
+        assert_eq!(
+            saved.sanitized().service_map_hidden_link_kinds,
+            ["api", "static"]
+        );
+        let none: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({"service_map_hidden_link_kinds": []}))
+                .unwrap();
+        assert!(none.sanitized().service_map_hidden_link_kinds.is_empty());
     }
 }

@@ -319,3 +319,14 @@ selected redirect takes long dashes so it can flow, and reduced motion keeps
 them still. A Referer or Origin naming the requested origin itself is no longer
 listed as a relationship. A trackpad pinch, or Ctrl with the mouse wheel, zooms
 the graph around the pointer.
+
+An Origin or Referer link no longer looks the same for an API call and an image
+load. Each link counts its rows and sorts them by request kind (API call, page
+navigation, frame, script, static file, other), read from `Sec-Fetch-Dest` and,
+without it, from the response type, the `Origin` header and the method. The
+legend toggles each kind; scripts and static files are hidden by default, so a
+page's CDN loads draw no arrows and rank nothing. An arrow takes the colour of
+its leading kind, so one API call among image loads still reads as an API link,
+and grows heavier with its rows. The links carry
+`request_count` and `request_kinds` in the API and the CLI, redirects carry
+`request_count`, and the hidden kinds are saved in UI settings.

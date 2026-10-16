@@ -1618,6 +1618,43 @@ async fn service_map_display_filter_hides_rows_through_api_and_cli_as_history_do
         all["snapshot"].get("filtered_rows").is_none(),
         "an unfiltered map keeps its earlier shape"
     );
+    // Each link counts its rows by request kind, here from the response type,
+    // and the CLI passes the counts through its output contract.
+    let link = |map: &Value, origin: &str| {
+        map["origins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["origin"] == origin)
+            .unwrap()["header_links"][0]
+            .clone()
+    };
+    assert_eq!(
+        link(&all, "https://cdn.example.com")["request_kinds"],
+        json!({"static": 1})
+    );
+    assert_eq!(
+        link(&all, "https://api.example.com")["request_kinds"],
+        json!({"api": 1})
+    );
+    assert_eq!(link(&all, "https://api.example.com")["request_count"], 1);
+    let cli_all = read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id": session_id}),
+    )
+    .await;
+    for origin in ["https://cdn.example.com", "https://api.example.com"] {
+        assert_eq!(
+            link(&cli_all, origin)["request_kinds"],
+            link(&all, origin)["request_kinds"]
+        );
+        assert_eq!(
+            link(&cli_all, origin)["request_count"],
+            link(&all, origin)["request_count"]
+        );
+    }
 
     let filtered = get("&hidden_extensions=PNG,%20css").await;
     assert!(!origins(&filtered).contains(&cdn));

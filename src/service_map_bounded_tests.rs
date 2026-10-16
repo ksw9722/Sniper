@@ -638,3 +638,182 @@ fn display_filter_drops_rows_as_history_does_and_counts_them() {
         .all(|endpoint| endpoint.path != "/v1/missing"));
     assert_eq!(success_only.snapshot.filtered_rows, 1);
 }
+
+fn with_request_headers(
+    mut record: TransactionRecord,
+    headers: &[(&str, &str)],
+) -> TransactionRecord {
+    for (name, value) in headers {
+        record.request.headers.push(HeaderRecord {
+            name: (*name).into(),
+            value: (*value).into(),
+        });
+    }
+    record
+}
+
+#[test]
+fn request_kind_reads_sec_fetch_dest_then_the_response_type() {
+    let kind = |dest: Option<&str>, content_type: &str, method: &str, origin: bool| {
+        let mut headers = vec![];
+        if let Some(dest) = dest {
+            headers.push(("Sec-Fetch-Dest", dest));
+        }
+        if origin {
+            headers.push(("Origin", "https://b.example.com"));
+        }
+        let mut record = with_request_headers(
+            filter_fixture("a.example.com", "/", 200, content_type, None, 1),
+            &headers,
+        );
+        record.method = method.into();
+        request_kind(&record)
+    };
+    assert_eq!(
+        kind(Some("empty"), "text/html", "GET", false),
+        "api",
+        "the browser's own declaration wins"
+    );
+    assert_eq!(
+        kind(Some("document"), "application/json", "GET", false),
+        "navigation"
+    );
+    assert_eq!(kind(Some("iframe"), "text/html", "GET", false), "frame");
+    assert_eq!(
+        kind(Some("serviceworker"), "text/plain", "GET", false),
+        "script"
+    );
+    assert_eq!(kind(Some("Font"), "text/plain", "GET", false), "static");
+    assert_eq!(kind(Some("report"), "text/plain", "POST", false), "other");
+    assert_eq!(kind(None, "application/problem+json", "GET", false), "api");
+    assert_eq!(kind(None, "text/html", "GET", false), "navigation");
+    assert_eq!(kind(None, "image/webp", "GET", false), "static");
+    assert_eq!(
+        kind(None, "image/svg+xml", "GET", false),
+        "static",
+        "an SVG image is not XML data"
+    );
+    assert_eq!(kind(None, "text/javascript", "GET", false), "script");
+    assert_eq!(
+        kind(None, "application/octet-stream", "GET", true),
+        "api",
+        "an Origin header marks a cross-origin call"
+    );
+    assert_eq!(kind(None, "application/octet-stream", "POST", false), "api");
+    assert_eq!(
+        kind(None, "application/octet-stream", "GET", false),
+        "other"
+    );
+}
+
+// A page loading an image and a page calling an API used to be the same arrow.
+// Each link now counts its rows and what kind of request each one was.
+#[test]
+fn links_count_their_rows_by_request_kind() {
+    let session = Uuid::from_u128(98);
+    let page = "https://www.example.com/";
+    let dest = |record, value| with_request_headers(record, &[("Sec-Fetch-Dest", value)]);
+    let store = TransactionStore::from_records(vec![
+        dest(
+            filter_fixture(
+                "cdn.example.com",
+                "/logo.png",
+                200,
+                "image/png",
+                Some(page),
+                1,
+            ),
+            "image",
+        ),
+        dest(
+            filter_fixture(
+                "cdn.example.com",
+                "/app.js",
+                200,
+                "application/javascript",
+                Some(page),
+                2,
+            ),
+            "script",
+        ),
+        dest(
+            filter_fixture(
+                "api.example.com",
+                "/v1/items",
+                200,
+                "application/json",
+                Some(page),
+                3,
+            ),
+            "empty",
+        ),
+        dest(
+            filter_fixture(
+                "api.example.com",
+                "/v1/items",
+                200,
+                "application/json",
+                Some(page),
+                4,
+            ),
+            "empty",
+        ),
+        // An app sends no Sec-Fetch-Dest: the JSON response marks its API call.
+        filter_fixture(
+            "api.example.com",
+            "/v1/app",
+            200,
+            "application/json",
+            Some(page),
+            5,
+        ),
+        dest(
+            filter_fixture("login.example.com", "/", 200, "text/html", Some(page), 6),
+            "document",
+        ),
+    ]);
+    let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        DEFAULT_MAX_RECORDS,
+        technology::CatalogVersion::V1,
+        &crate::store::ListFilters::default(),
+    );
+    let map = build_bounded(
+        session,
+        snapshot,
+        DEFAULT_MAX_RECORDS,
+        false,
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    let link = |host: &str| {
+        map.origins
+            .iter()
+            .find(|origin| origin.origin == format!("https://{host}"))
+            .unwrap()
+            .header_links[0]
+            .clone()
+    };
+    let kinds = |pairs: &[(&str, usize)]| -> BTreeMap<String, usize> {
+        pairs
+            .iter()
+            .map(|(kind, count)| ((*kind).into(), *count))
+            .collect()
+    };
+    let cdn = link("cdn.example.com");
+    assert_eq!(
+        (cdn.request_count, cdn.request_kinds),
+        (2, kinds(&[("script", 1), ("static", 1)]))
+    );
+    let api = link("api.example.com");
+    assert_eq!(
+        (api.request_count, api.request_kinds),
+        (3, kinds(&[("api", 3)]))
+    );
+    assert_eq!(
+        link("login.example.com").request_kinds,
+        kinds(&[("navigation", 1)])
+    );
+}

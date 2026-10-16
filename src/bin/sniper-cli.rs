@@ -4206,6 +4206,23 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         .as_array_mut()
         .unwrap()
         .extend([json!("source"), json!("evidence")]);
+    // Optional: older servers send neither count.
+    let request_count = json!({"type":"integer","minimum":1,"maximum":50000});
+    links["properties"]["request_count"] = request_count.clone();
+    links["properties"]["request_kinds"] = json!({
+        "type":"object","additionalProperties":false,
+        "properties":sniper::service_map::REQUEST_KINDS
+            .iter()
+            .map(|kind| (kind.to_string(), request_count.clone()))
+            .collect::<serde_json::Map<_, _>>(),
+        "description":"Rows carrying this declaration by request kind: Sec-Fetch-Dest when the client sent it, else the response type, then an Origin header or a non-GET method."
+    });
+    let mut redirect = service_map_object(json!({
+        "target_origin":string,"target_path":string,
+        "relationship":{"type":"string","enum":["redirect_instruction"]},
+        "source":{"type":"string","enum":["response_location_header"]},"evidence":strings
+    }));
+    redirect["properties"]["request_count"] = request_count;
     let mut origin = service_map_object(json!({
         "origin":string,"host":string,"scheme":{"type":"string","enum":["http","https"]},
         "port":port,"in_scope":boolean,"request_count":count,"first_seen":timestamp,"last_seen":timestamp,
@@ -4214,11 +4231,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             "name":string,"source":{"type":"string","enum":["response_header"]},"header_name":string,
             "confidence":{"type":"string","enum":["observed_header"]},"evidence":strings
         }))},
-        "redirects":{"type":"array","items":service_map_object(json!({
-            "target_origin":string,"target_path":string,
-            "relationship":{"type":"string","enum":["redirect_instruction"]},
-            "source":{"type":"string","enum":["response_location_header"]},"evidence":strings
-        }))},
+        "redirects":{"type":"array","items":redirect},
         "header_links":{"type":"array","items":links}
     }));
     origin["properties"]["technology_observations"] = json!({
@@ -9618,6 +9631,10 @@ fn validate_service_map_response(
                             "origin_header" | "referer_header"
                         )
                         && service_map_safe_origin(&link.source_origin)
+                        && link
+                            .request_kinds
+                            .keys()
+                            .all(|kind| sniper::service_map::REQUEST_KINDS.contains(&kind.as_str()))
                 })
         });
     if !valid {
