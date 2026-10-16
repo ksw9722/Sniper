@@ -468,8 +468,8 @@ const state = {
   filterSettings: createDefaultFilterSettings(),
   // Service Map's own display filter, as Burp keeps one for its site map.
   serviceMapFilterSettings: createDefaultFilterSettings(),
-  // Request kinds whose links the map does not draw; resource loads by default.
-  serviceMapHiddenLinkKinds: ["script", "static"],
+  // Request kinds whose links the map does not draw: frames and resource loads by default.
+  serviceMapHiddenLinkKinds: ["frame", "script", "static"],
   targetScopeDraft: "",
   targetScopeExcludeDraft: "",
   targetScopeDirty: false,
@@ -20946,10 +20946,10 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   state.filterSettings = sanitizeHttpFilterSettings(snapshot?.http_filter_settings);
   // The map reads its filter on every refresh and re-ranks when it changed.
   state.serviceMapFilterSettings = sanitizeHttpFilterSettings(snapshot?.service_map_filter_settings);
-  // Settings saved before the list existed hide resource loads, as the server does.
+  // Settings saved before the list existed hide frames and resource loads, as the server does.
   state.serviceMapHiddenLinkKinds = Array.isArray(snapshot?.service_map_hidden_link_kinds)
     ? ["api", "navigation", "frame", "script", "static", "other"].filter((kind) => snapshot.service_map_hidden_link_kinds.includes(kind))
-    : ["script", "static"];
+    : ["frame", "script", "static"];
   if (snapshot?.ws_column_widths && typeof snapshot.ws_column_widths === "object") {
     Object.entries(snapshot.ws_column_widths).forEach(([k, v]) => {
       if (WS_COLUMN_RULES[k] && WS_COLUMN_RULES[k].max > 0 && typeof v === "number") {
@@ -21036,7 +21036,7 @@ function snapshotUiSettings() {
     http_sort_direction: sanitizeHttpSortDirection(state.sortDirection),
     http_filter_settings: serializeHttpFilterSettings(),
     service_map_filter_settings: serializeHttpFilterSettings(state.serviceMapFilterSettings),
-    service_map_hidden_link_kinds: Array.isArray(state.serviceMapHiddenLinkKinds) ? [...state.serviceMapHiddenLinkKinds] : ["script", "static"],
+    service_map_hidden_link_kinds: Array.isArray(state.serviceMapHiddenLinkKinds) ? [...state.serviceMapHiddenLinkKinds] : ["frame", "script", "static"],
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,

@@ -360,3 +360,21 @@ test('the legend toggles links by request kind: the map redraws, ranks again and
   assert.equal(arrows(f.els.canvas.innerHTML), 0);
   assert.notEqual(f.state.order[0], 'https://stale.example.com');
 });
+
+test('an arrow names its CORS rows, and selecting it marks its entry in the inspector', async () => {
+  const f = fixture();
+  const cors = { ...kinded(app, { api: 3 }), cors_allowed_count: 2, cors_credentials_count: 1 };
+  await f.load(snapshot([origin(app), origin(api, { header_links: [cors] }), origin(login, { header_links: [kinded(app, { frame: 2 })] })]));
+  assert.equal(arrows(f.els.canvas.innerHTML), 1, 'frames, scripts and static files are hidden by default');
+  assert.match(f.els.canvas.innerHTML, /3 requests \(API calls 3\) · CORS allowed 2 of 3 rows, 1 with credentials<\/title>/);
+  const hits = [...f.els.canvas.innerHTML.matchAll(/<path class="service-map-hit" data-service-edge="(\d+)"[^>]*><title>([^<]*)<\/title>/g)];
+  assert.equal(hits.length, 1, 'one pointer target per recorded arrow');
+
+  f.controller.selectOrigin(login);
+  f.els.panel.dispatch('click', { target: { closest: selector => selector === '[data-service-edge]' ? { dataset: { serviceEdge: hits[0][1] } } : null } });
+  assert.equal(f.state.selectedOrigin, api, 'the Referer link is recorded on the origin it was sent to');
+  assert.match(f.els.detail.innerHTML, /service-map-relation highlighted"[^]*?API calls 3 · CORS allowed 2 of 3 rows, 1 with credentials/);
+  assert.equal((f.els.detail.innerHTML.match(/highlighted/g) || []).length, 1);
+  f.controller.selectOrigin(app);
+  assert.doesNotMatch(f.els.detail.innerHTML, /highlighted/, 'another selection clears the mark');
+});

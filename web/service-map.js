@@ -51,12 +51,17 @@
   // counts it per link (Sec-Fetch-Dest, else the response type).
   const REQUEST_KINDS = ["api", "navigation", "frame", "script", "static", "other"];
   const REQUEST_KIND_LABELS = { api: "API calls", navigation: "Page navigations", frame: "Frames", script: "Scripts", static: "Static files", other: "Other requests" };
-  const DEFAULT_HIDDEN_LINK_KINDS = Object.freeze(["script", "static"]);
+  // API calls, page navigations and unclassified requests stay drawn.
+  const DEFAULT_HIDDEN_LINK_KINDS = Object.freeze(["frame", "script", "static"]);
   // Older servers count nothing: such a link is one row of an unknown kind.
   const linkKindCounts = (link) => {
     const kinds = REQUEST_KINDS.filter((kind) => count(link.request_kinds?.[kind]) > 0).map((kind) => [kind, count(link.request_kinds[kind])]);
     return kinds.length ? kinds : [["other", Math.max(1, count(link.request_count))]];
   };
+  // Rows whose response let the source origin read it, over all of the link's rows.
+  const linkCors = (link) => count(link.cors_allowed_count)
+    ? [count(link.cors_allowed_count), count(link.cors_credentials_count), Math.max(count(link.request_count), count(link.cors_allowed_count))] : null;
+  const corsText = ([allowed, credentials, rows]) => `CORS allowed ${allowed} of ${rows} row${rows === 1 ? "" : "s"}${credentials ? `, ${credentials} with credentials` : ""}`;
   const safePath = (value) => String(value || "/").split(/[?#]/, 1)[0];
   function safeOrigin(value) {
     try {
@@ -786,6 +791,7 @@
           evidence: array(link.evidence).filter((id) => typeof id === "string" && id.length > 0),
           request_count: count(link.request_count),
           request_kinds: Object.fromEntries(REQUEST_KINDS.filter((kind) => count(link.request_kinds?.[kind]) > 0).map((kind) => [kind, count(link.request_kinds[kind])])),
+          cors_allowed_count: count(link.cors_allowed_count), cors_credentials_count: count(link.cors_credentials_count),
         })),
         redirects: array(item.redirects).filter((redirect) => redirect.relationship === "redirect_instruction" && safeOrigin(redirect.target_origin)).map((redirect) => ({
           target_origin: safeOrigin(redirect.target_origin), target_path: safePath(redirect.target_path),
@@ -926,7 +932,7 @@
       const kinds = linkKindCounts(link).filter(([kind]) => !hidden.has(kind));
       if (!kinds.length) return [];
       return [{ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: link.relationship === "origin_header" ? "Origin header" : "Referer header",
-        kind: kinds[0][0], kinds: Object.fromEntries(kinds), count: kinds.reduce((sum, [, rows]) => sum + rows, 0) }];
+        kind: kinds[0][0], kinds: Object.fromEntries(kinds), count: kinds.reduce((sum, [, rows]) => sum + rows, 0), cors: linkCors(link) }];
     };
     // The explicit overlay gets the first arrow slots. Metadata remains distinct
     // even when the same pair also occurs in a retained response body.
@@ -1211,11 +1217,11 @@
           // "a → a" rows in the inspector; arrows already skip it.
           if (link.source_origin === origin.origin) return;
           reference(link.source_origin, origin, `${link.relationship === "origin_header" ? "Origin" : "Referer"} header on`);
-          relation({ sourceOrigin: link.source_origin, targetOrigin: origin.origin, capturedOrigin: origin.origin, label: `${link.relationship === "origin_header" ? "Origin" : "Referer"} header declaration`, evidence: link.evidence[0] || "", kinds: linkKindCounts(link) });
+          relation({ sourceOrigin: link.source_origin, targetOrigin: origin.origin, capturedOrigin: origin.origin, relationship: link.relationship, label: `${link.relationship === "origin_header" ? "Origin" : "Referer"} header declaration`, evidence: link.evidence[0] || "", kinds: linkKindCounts(link), cors: linkCors(link) });
         });
         origin.redirects.forEach((redirect) => {
           reference(redirect.target_origin, origin, "Redirect instruction from");
-          relation({ sourceOrigin: origin.origin, targetOrigin: redirect.target_origin, targetPath: redirect.target_path, capturedOrigin: origin.origin, label: "Redirect instruction", evidence: redirect.evidence[0] || "" });
+          relation({ sourceOrigin: origin.origin, targetOrigin: redirect.target_origin, targetPath: redirect.target_path, capturedOrigin: origin.origin, relationship: "redirect_instruction", label: "Redirect instruction", evidence: redirect.evidence[0] || "" });
         });
       });
       for (const layer of state.relationLayers) {
@@ -1749,6 +1755,7 @@
       const item = findOrigin(origin);
       if (!item || endpointIndex !== null && (!Number.isSafeInteger(endpointIndex) || !item.endpoints[endpointIndex])) return;
       const changedOrigin = state.selectedOrigin !== origin;
+      state.highlightedRelation = null;
       if (changedOrigin || state.endpointIndex !== endpointIndex) cancelEvidence();
       if (changedOrigin) { state.detailPage = 0; state.detailPageAnchor = null; }
       state.selectedOrigin = origin;
@@ -2233,8 +2240,12 @@
       // More rows draw a heavier line, up to about twice the base width.
       const weight = (rows) => rows > 1 ? Math.round(Math.min(3.25, 1.25 + 0.6 * Math.log2(rows)) * 100) / 100 : 0;
       const requests = (edge) => edge.count > 1 || edge.kinds
-        ? ` · ${edge.count} request${edge.count === 1 ? "" : "s"}${edge.kinds ? ` (${Object.entries(edge.kinds).map(([kind, rows]) => `${REQUEST_KIND_LABELS[kind]} ${rows}`).join(", ")})` : ""}` : "";
-      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : 'marker-end="url(#service-map-arrow)"'}><title>${escape(edge.source)} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : edge.target)} · ${escape(edge.label)} · ${edge.relationship}${requests(edge)}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}</title></path>`).join("");
+        ? ` · ${edge.count} request${edge.count === 1 ? "" : "s"}${edge.kinds ? ` (${Object.entries(edge.kinds).map(([kind, rows]) => `${REQUEST_KIND_LABELS[kind]} ${rows}`).join(", ")})` : ""}${edge.cors ? ` · ${corsText(edge.cors)}` : ""}` : "";
+      const title = (edge) => `${escape(edge.source)} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : edge.target)} · ${escape(edge.label)} · ${edge.relationship}${requests(edge)}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}`;
+      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : 'marker-end="url(#service-map-arrow)"'}><title>${title(edge)}</title></path>`).join("")
+        // Arrows are thin, so a wide transparent stroke over each recorded one
+        // takes the pointer: its tooltip, and a click that opens its entry.
+        + layout.edges.map((edge, index) => edge.kind ? `<path class="service-map-hit" data-service-edge="${index}" d="${edge.path}"><title>${title(edge)} · Select to list its rows and open a source</title></path>` : "").join("");
       const cards = layout.nodes.map((origin) => {
         if (origin.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(origin.address)}" style="left:${origin.x}px;top:${origin.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(origin.address)}">${escape(origin.address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${origin.family.toUpperCase()}</span><span class="service-map-card-meta">Undirected observations only</span><span class="service-map-card-meta">No shared ownership inferred</span></span></div>`;
         const selected = origin.origin === state.selectedOrigin;
@@ -2397,7 +2408,7 @@
       const metadata = (group?.items || []).slice(0, MAX_REFERENCE_SOURCES);
       const shown = inspected.slice(0, Math.max(0, MAX_REFERENCE_SOURCES - metadata.length));
       const omitted = (group?.omitted || 0) + inspected.length - shown.length;
-      return `<h4>Shown relationships</h4><p class="service-map-muted">Declarations and literal references do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${metadata.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}${item.kinds ? `<br><span class="service-map-relation-kinds">${item.kinds.map(([kind, rows]) => `${escape(REQUEST_KIND_LABELS[kind])} ${rows}`).join(" · ")}</span>` : ""}</span><span>View source ›</span></button>`).join("")}${shown.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.layer.source.origin)}" data-service-relation-evidence="${escape(item.layer.source.evidenceId)}" data-service-focus="relation:${escape(JSON.stringify([layerKey(item.layer), item.target_origin, item.relation || "body", item.header_index ?? 0, item.relation_span?.start ?? 0]))}"><span><strong>${escape(item.layer.kind === "link" ? LINK_RELATIONS[item.relation].label : "Literal body URL reference")}</strong>${escape(item.layer.source.origin)} → ${escape(item.target_origin)}<br>Source sequence ${escape(item.layer.source.sequence)} · ${item.layer.scan.complete ? "Complete" : "Partial"} inspection${item.layer.kind === "body" ? `<br>${item.occurrences} literal occurrences · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets} offsets omitted` : ""}` : `<br>Link header ${item.header_index} · Member bytes ${item.link_value_span.start}–${item.link_value_span.end} · Target ${item.target_span.start}–${item.target_span.end} · Relation ${item.relation_span.start}–${item.relation_span.end}`}</span><span>View source ›</span></button>`).join("")}</div>${omitted ? `<p class="service-map-muted">${omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
+      return `<h4>Shown relationships</h4><p class="service-map-muted">Declarations and literal references do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${metadata.map((item) => `<button class="service-map-evidence-button service-map-relation${JSON.stringify([item.sourceOrigin, item.targetOrigin, item.relationship]) === state.highlightedRelation ? " highlighted" : ""}" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}${item.kinds ? `<br><span class="service-map-relation-kinds">${item.kinds.map(([kind, rows]) => `${escape(REQUEST_KIND_LABELS[kind])} ${rows}`).join(" · ")}${item.cors ? ` · ${corsText(item.cors)}` : ""}</span>` : ""}</span><span>View source ›</span></button>`).join("")}${shown.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.layer.source.origin)}" data-service-relation-evidence="${escape(item.layer.source.evidenceId)}" data-service-focus="relation:${escape(JSON.stringify([layerKey(item.layer), item.target_origin, item.relation || "body", item.header_index ?? 0, item.relation_span?.start ?? 0]))}"><span><strong>${escape(item.layer.kind === "link" ? LINK_RELATIONS[item.relation].label : "Literal body URL reference")}</strong>${escape(item.layer.source.origin)} → ${escape(item.target_origin)}<br>Source sequence ${escape(item.layer.source.sequence)} · ${item.layer.scan.complete ? "Complete" : "Partial"} inspection${item.layer.kind === "body" ? `<br>${item.occurrences} literal occurrences · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets} offsets omitted` : ""}` : `<br>Link header ${item.header_index} · Member bytes ${item.link_value_span.start}–${item.link_value_span.end} · Target ${item.target_span.start}–${item.target_span.end} · Relation ${item.relation_span.start}–${item.relation_span.end}`}</span><span>View source ›</span></button>`).join("")}</div>${omitted ? `<p class="service-map-muted">${omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
     }
     function bodyReferencesMarkup() {
       const result = state.bodyReferences;
@@ -2595,7 +2606,21 @@
       els.content.classList.toggle("hidden", state.view === "apis");
       els.catalog.classList.toggle("hidden", state.view !== "apis");
     }
+    // A recorded arrow opens the relationship it stands for: the origin that
+    // recorded it is selected, and its entry (rows by kind, CORS, View source)
+    // is marked and focused in the inspector.
+    function selectEdge(edge) {
+      if (!edge?.kind) return;
+      selectOrigin(edge.relationship === "redirect_instruction" ? edge.source : edge.target);
+      state.highlightedRelation = JSON.stringify([edge.source, edge.target, edge.relationship]);
+      renderDetail();
+      const entry = els.detail.querySelector?.(".service-map-relation.highlighted");
+      entry?.scrollIntoView?.({ block: "nearest" });
+      entry?.focus?.({ preventScroll: true });
+    }
     function handleClick(event) {
+      const hit = event.target.closest?.("[data-service-edge]");
+      if (hit?.dataset?.serviceEdge !== undefined && els.panel.contains(hit)) return selectEdge(currentLayout?.edges[Number(hit.dataset.serviceEdge)]);
       const button = event.target.closest("button");
       if (!button || !els.panel.contains(button)) return;
       const data = button.dataset;

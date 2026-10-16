@@ -52,7 +52,10 @@ map filter never applies to these reads. Each `header_links[]` entry counts its
 rows in `request_count` and sorts them in `request_kinds` (`api`, `navigation`,
 `frame`, `script`, `static`, `other`, from `Sec-Fetch-Dest`, else the response
 type). A page's image loads declare Referer too, so read the `api` and
-`navigation` counts before calling a link a service relationship. Check `snapshot.complete`, `stopped_by`, counts, limits,
+`navigation` counts before calling a link a service relationship.
+`cors_allowed_count` counts rows whose response allowed the source origin (or
+`*`) to read it; `cors_credentials_count`, those that also allowed credentials.
+Both describe responses, not a confirmed cross-origin read. Check `snapshot.complete`, `stopped_by`, counts, limits,
 `unavailable`, `deferred`, and warnings before claiming coverage. Counts include duplicate-ID
 rows, and even a complete result covers retained captures only.
 

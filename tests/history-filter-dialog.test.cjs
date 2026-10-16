@@ -524,10 +524,10 @@ test("the Service Map Filter edits only the map's own settings and saves both fi
   assert.equal(f.state.filterSettings.searchTerm, "saved");
 });
 
-test("the map's hidden link kinds load from settings, default to resource loads, and save back", async () => {
+test("the map's hidden link kinds load from settings, default to frames and resource loads, and save back", async () => {
   const f = fixture();
   f.context.applyUiSettingsSnapshot({});
-  assert.deepEqual([...f.state.serviceMapHiddenLinkKinds], ["script", "static"], "settings saved before the list existed");
+  assert.deepEqual([...f.state.serviceMapHiddenLinkKinds], ["frame", "script", "static"], "settings saved before the list existed");
   f.context.applyUiSettingsSnapshot({ service_map_hidden_link_kinds: ["static", "bogus", "api", "static"] });
   assert.deepEqual([...f.state.serviceMapHiddenLinkKinds], ["api", "static"], "known kinds only, in order");
   f.context.applyUiSettingsSnapshot({ service_map_hidden_link_kinds: [] });

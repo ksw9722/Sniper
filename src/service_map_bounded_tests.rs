@@ -817,3 +817,103 @@ fn links_count_their_rows_by_request_kind() {
         kinds(&[("navigation", 1)])
     );
 }
+
+// A link also counts the rows whose response let its source origin read them,
+// judged as a browser judges: one Access-Control-Allow-Origin, compared as
+// written, and credentials only with a named origin.
+#[test]
+fn links_count_rows_whose_response_allowed_the_source_origin() {
+    let session = Uuid::from_u128(99);
+    let page = "https://www.example.com";
+    let call = |sequence, response_headers: &[(&str, &str)]| {
+        let mut record = with_request_headers(
+            filter_fixture(
+                "api.example.com",
+                "/v1/items",
+                200,
+                "application/json",
+                Some("https://www.example.com/"),
+                sequence,
+            ),
+            &[("Origin", page), ("Sec-Fetch-Dest", "empty")],
+        );
+        for (name, value) in response_headers {
+            record
+                .response
+                .as_mut()
+                .unwrap()
+                .headers
+                .push(HeaderRecord {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                });
+        }
+        record
+    };
+    let store = TransactionStore::from_records(vec![
+        call(
+            1,
+            &[
+                ("Access-Control-Allow-Origin", page),
+                ("Access-Control-Allow-Credentials", "true"),
+            ],
+        ),
+        call(
+            2,
+            &[
+                ("Access-Control-Allow-Origin", "*"),
+                ("Access-Control-Allow-Credentials", "true"),
+            ],
+        ),
+        call(
+            3,
+            &[("Access-Control-Allow-Origin", "https://other.example.com")],
+        ),
+        call(
+            4,
+            &[
+                ("Access-Control-Allow-Origin", page),
+                ("Access-Control-Allow-Origin", "*"),
+            ],
+        ),
+        call(
+            5,
+            &[("Access-Control-Allow-Origin", "https://WWW.example.com:443")],
+        ),
+        call(6, &[]),
+    ]);
+    let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        DEFAULT_MAX_RECORDS,
+        technology::CatalogVersion::V1,
+        &crate::store::ListFilters::default(),
+    );
+    let map = build_bounded(
+        session,
+        snapshot,
+        DEFAULT_MAX_RECORDS,
+        false,
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    let api = map
+        .origins
+        .iter()
+        .find(|origin| origin.origin == "https://api.example.com")
+        .unwrap();
+    assert_eq!(api.header_links.len(), 2, "Origin and Referer");
+    for link in &api.header_links {
+        assert_eq!(
+            (
+                link.request_count,
+                link.cors_allowed_count,
+                link.cors_credentials_count
+            ),
+            (6, 2, 1),
+            "{}: the named origin and * allow, two values or another spelling do not",
+            link.relationship
+        );
+    }
+}

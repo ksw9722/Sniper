@@ -354,7 +354,8 @@ pub struct AppUiSettingsSnapshot {
     /// Service Map's own display filter, as Burp keeps one for its site map: the
     /// HTTP history conditions, set apart so each view hides what suits it.
     pub service_map_filter_settings: HttpFilterSettingsSnapshot,
-    /// Request kinds whose links the map does not draw; resource loads by default.
+    /// Request kinds whose links the map does not draw: by default all but API
+    /// calls, page navigations and other requests.
     pub service_map_hidden_link_kinds: Vec<String>,
     pub workbench_height: Option<u16>,
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
@@ -390,7 +391,7 @@ impl Default for AppUiSettingsSnapshot {
             http_sort_direction: "desc".to_string(),
             http_filter_settings: HttpFilterSettingsSnapshot::default(),
             service_map_filter_settings: HttpFilterSettingsSnapshot::default(),
-            service_map_hidden_link_kinds: vec!["script".into(), "static".into()],
+            service_map_hidden_link_kinds: vec!["frame".into(), "script".into(), "static".into()],
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
@@ -2157,15 +2158,15 @@ mod tests {
         );
     }
 
-    // Resource loads stay hidden on a file saved before the setting existed;
+    // Frames and resource loads stay hidden on a file saved before the setting existed;
     // unknown or repeated kinds are dropped, and an empty list shows every kind.
     #[test]
-    fn service_map_hidden_link_kinds_default_to_resource_loads() {
+    fn service_map_hidden_link_kinds_default_to_frames_and_resource_loads() {
         let older: super::AppUiSettingsSnapshot =
             serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(
             older.sanitized().service_map_hidden_link_kinds,
-            ["script", "static"]
+            ["frame", "script", "static"]
         );
         let saved: super::AppUiSettingsSnapshot = serde_json::from_value(serde_json::json!({
             "service_map_hidden_link_kinds": ["static", "bogus", "static", "api"]

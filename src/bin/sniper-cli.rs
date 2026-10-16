@@ -4217,6 +4217,12 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             .collect::<serde_json::Map<_, _>>(),
         "description":"Rows carrying this declaration by request kind: Sec-Fetch-Dest when the client sent it, else the response type, then an Origin header or a non-GET method."
     });
+    let mut cors = request_count.clone();
+    cors["description"] = json!("Rows whose response let the source origin read it: a single Access-Control-Allow-Origin naming it or *. Absent when none.");
+    links["properties"]["cors_allowed_count"] = cors;
+    let mut credentials = request_count.clone();
+    credentials["description"] = json!("Of those rows, how many named the source origin and sent Access-Control-Allow-Credentials: true. Absent when none.");
+    links["properties"]["cors_credentials_count"] = credentials;
     let mut redirect = service_map_object(json!({
         "target_origin":string,"target_path":string,
         "relationship":{"type":"string","enum":["redirect_instruction"]},
@@ -9635,6 +9641,10 @@ fn validate_service_map_response(
                             .request_kinds
                             .keys()
                             .all(|kind| sniper::service_map::REQUEST_KINDS.contains(&kind.as_str()))
+                        // Every count is a share of the same rows.
+                        && link.request_kinds.values().sum::<usize>() == link.request_count
+                        && link.cors_credentials_count <= link.cors_allowed_count
+                        && link.cors_allowed_count <= link.request_count
                 })
         });
     if !valid {

@@ -1572,12 +1572,29 @@ async fn service_map_display_filter_hides_rows_through_api_and_cli_as_history_do
     for record in [
         filter_row("www.example.com", "/", "text/html", None),
         filter_row("cdn.example.com", "/logo.png", "image/png", Some(page)),
-        filter_row(
-            "api.example.com",
-            "/v1/items",
-            "application/json",
-            Some(page),
-        ),
+        {
+            // The API lets the page read it, credentials included.
+            let mut row = filter_row(
+                "api.example.com",
+                "/v1/items",
+                "application/json",
+                Some(page),
+            );
+            for (name, value) in [
+                ("access-control-allow-origin", "https://www.example.com"),
+                ("access-control-allow-credentials", "true"),
+            ] {
+                row.response
+                    .as_mut()
+                    .unwrap()
+                    .headers
+                    .push(sniper::model::HeaderRecord {
+                        name: name.into(),
+                        value: value.into(),
+                    });
+            }
+            row
+        },
     ] {
         session.store.insert(record).await;
     }
@@ -1638,6 +1655,16 @@ async fn service_map_display_filter_hides_rows_through_api_and_cli_as_history_do
         json!({"api": 1})
     );
     assert_eq!(link(&all, "https://api.example.com")["request_count"], 1);
+    assert_eq!(
+        link(&all, "https://api.example.com")["cors_credentials_count"],
+        1
+    );
+    assert!(
+        link(&all, "https://cdn.example.com")
+            .get("cors_allowed_count")
+            .is_none(),
+        "a link no response allowed omits the count"
+    );
     let cli_all = read(
         &dir,
         &api,
@@ -1646,14 +1673,18 @@ async fn service_map_display_filter_hides_rows_through_api_and_cli_as_history_do
     )
     .await;
     for origin in ["https://cdn.example.com", "https://api.example.com"] {
-        assert_eq!(
-            link(&cli_all, origin)["request_kinds"],
-            link(&all, origin)["request_kinds"]
-        );
-        assert_eq!(
-            link(&cli_all, origin)["request_count"],
-            link(&all, origin)["request_count"]
-        );
+        for field in [
+            "request_kinds",
+            "request_count",
+            "cors_allowed_count",
+            "cors_credentials_count",
+        ] {
+            assert_eq!(
+                link(&cli_all, origin).get(field),
+                link(&all, origin).get(field),
+                "{origin} {field}"
+            );
+        }
     }
 
     let filtered = get("&hidden_extensions=PNG,%20css").await;

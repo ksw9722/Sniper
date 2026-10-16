@@ -244,8 +244,9 @@ the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`
 
 Origin and Referer links are sorted by request kind (API call, page navigation,
 frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each
-kind; scripts and static files draw no arrows by default, and an arrow grows
-heavier with its rows.
+kind; frames, scripts and static files draw no arrows by default, and an arrow
+grows heavier with its rows. Each link also counts the responses that let its
+source read them through CORS, with or without credentials.
 
 A separate, explicit `sniper-cli target service-map body-references --session-id
 <active-session-uuid> --evidence-id <returned-token>` read can inspect one retained

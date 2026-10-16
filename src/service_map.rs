@@ -229,6 +229,13 @@ pub struct HeaderLink {
     pub request_count: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub request_kinds: BTreeMap<String, usize>,
+    /// Of those rows, how many responses let this source origin read them (a
+    /// single Access-Control-Allow-Origin naming it or `*`), and how many named
+    /// it and allowed credentials too. Absent when none, as on older servers.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cors_allowed_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cors_credentials_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -284,6 +291,10 @@ pub struct ServiceMapRow {
     /// Aggregated onto links only; exact evidence keeps its earlier shape.
     #[serde(skip)]
     pub request_kind: &'static str,
+    /// A single Access-Control-Allow-Origin value as sent, and whether
+    /// credentials were allowed with it; aggregated onto links only.
+    #[serde(skip)]
+    pub cors: Option<(String, bool)>,
 }
 
 /// Every value `request_kind` returns, in the order clients present them.
@@ -624,6 +635,7 @@ pub(crate) fn project_record_for_catalog(
         metadata_complete: true,
         omitted: vec![],
         request_kind: request_kind(record),
+        cors: None,
     };
     if record
         .response
@@ -702,6 +714,8 @@ pub(crate) fn project_record_for_catalog(
     };
     let mut header_bytes = request_header_bytes;
     let mut locations = Vec::new();
+    let mut allowed_origins = Vec::new();
+    let mut credentials = false;
     let mut technology_budget = technology::TokenScanBudget::default();
     for (index, header) in response.headers.iter().enumerate() {
         header_bytes = header_bytes
@@ -730,6 +744,13 @@ pub(crate) fn project_record_for_catalog(
         }
         if header_name == "location" {
             locations.push(header.value.as_str());
+        }
+        if header_name == "access-control-allow-origin" {
+            allowed_origins.push(header.value.trim());
+        }
+        // Browsers accept only the exact value `true`.
+        if header_name == "access-control-allow-credentials" {
+            credentials |= header.value.trim() == "true";
         }
         let products: &[(&str, &str)] = match header_name.as_str() {
             "server" => &[
@@ -768,6 +789,19 @@ pub(crate) fn project_record_for_catalog(
     }
     if technology_budget.omitted {
         row.omitted.push("technology_token_scan_limit".into());
+    }
+    // A browser lets another origin read the response only under exactly one
+    // Access-Control-Allow-Origin, which it compares with the origin as written,
+    // so keep the value unnormalized; a partial scan cannot prove there was one.
+    // Credentials never apply to `*`.
+    if allowed_origins.len() == 1
+        && !row
+            .omitted
+            .iter()
+            .any(|reason| reason == "header_scan_limit" || reason == "header_value_limit")
+    {
+        let allowed = allowed_origins[0];
+        row.cors = Some((allowed.into(), credentials && allowed != "*"));
     }
     if record
         .status
@@ -1150,6 +1184,14 @@ fn build_with_scope(
             }
         }
         for link in row.header_links {
+            let (cors_allowed, cors_credentials) = match &row.cors {
+                Some((allowed, credentials))
+                    if allowed == "*" || *allowed == link.source_origin =>
+                {
+                    (1, usize::from(*credentials))
+                }
+                _ => (0, 0),
+            };
             if let Some(existing) = origin.header_links.iter_mut().find(|r| {
                 r.source_origin == link.source_origin && r.relationship == link.relationship
             }) {
@@ -1158,6 +1200,8 @@ fn build_with_scope(
                     .request_kinds
                     .entry(row.request_kind.into())
                     .or_default() += 1;
+                existing.cors_allowed_count += cors_allowed;
+                existing.cors_credentials_count += cors_credentials;
                 sample(&mut existing.evidence, &row.evidence_id);
             } else if origin.header_links.len() < MAX_HEADER_LINKS_PER_ORIGIN {
                 origin.header_links.push(HeaderLink {
@@ -1167,6 +1211,8 @@ fn build_with_scope(
                     evidence: vec![row.evidence_id.clone()],
                     request_count: 1,
                     request_kinds: BTreeMap::from([(row.request_kind.into(), 1)]),
+                    cors_allowed_count: cors_allowed,
+                    cors_credentials_count: cors_credentials,
                 });
             } else {
                 stopped_by.insert("header_links_limit".into());

@@ -265,8 +265,9 @@ client or server sent, so a kind describes how a row looked, not what the page
 intended.
 
 The legend under the map has one toggle per kind found in the loaded links, with
-the number of links that include it. Scripts and static files are hidden by
-default, so a page's CDN loads draw no arrows. The rows of a hidden kind do not
+the number of links that include it. Frames, scripts and static files are hidden
+by default, so API calls, page navigations, unclassified requests and redirects
+draw arrows, and a page's CDN loads draw none. The rows of a hidden kind do not
 draw, rank or weigh a link: a link made only of hidden kinds is not drawn, and a
 link with other rows is drawn for those rows only. The arrow takes the colour of
 its first shown kind in the order of the table above, so one API call among a
@@ -277,6 +278,19 @@ The choice is saved in UI settings (`service_map_hidden_link_kinds`). It hides
 arrows, not cards: to drop a CDN's cards too, use the
 [Service Map filter](#service-map-filter). Redirects are always drawn and count
 their rows in `request_count` as well.
+
+Each link also counts the rows whose response let its source origin read it
+(`cors_allowed_count`): a single `Access-Control-Allow-Origin` naming that origin
+exactly as a browser sends it, or `*`. Of those, `cors_credentials_count` counts
+the rows that named the origin and sent `Access-Control-Allow-Credentials: true`,
+which lets a page read the response with the user's cookies. Both are omitted
+when zero. They describe what the responses allowed, not that a browser read
+them across origins.
+
+Pointing at an arrow shows its rows by kind and its CORS counts. Selecting it
+selects the origin that recorded it (the target of an Origin or Referer link,
+the source of a redirect) and marks the relationship in the inspector, where
+View source opens an example row.
 
 ## Read through the CLI
 
@@ -314,9 +328,11 @@ same session scope matcher as other Sniper views. `--mime-types`,
 [Service Map filter](#service-map-filter)'s conditions. Omitted, they hide
 nothing: the CLI keeps every row unless asked, while the GUI applies its saved
 filter. These are read filters, not capture or scope-setting controls. Each
-header link carries `request_count` and `request_kinds`, and each redirect
-`request_count` (see [Links by request kind](#links-by-request-kind)); a server
-older than 0.3.1 omits them. There is no pagination cursor, URL input,
+header link carries `request_count` and `request_kinds`, plus
+`cors_allowed_count` and `cors_credentials_count` when a response allowed its
+source, and each redirect `request_count` (see
+[Links by request kind](#links-by-request-kind)); a server older than 0.3.1
+omits them. There is no pagination cursor, URL input,
 active-discovery option, or automatic retry with a larger limit.
 
 ## What the map means

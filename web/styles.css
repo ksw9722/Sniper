@@ -7417,6 +7417,8 @@ button.utility-button.replay-tab-add {
 .service-map-edge:where(.kind-api) { stroke: var(--token-url-color); opacity: .85; }
 .service-map-edge:where(.kind-script, .kind-static) { opacity: .3; }
 .service-map-edge.selected { stroke: var(--point); opacity: 1; stroke-width: calc(var(--edge-weight, 1.5px) + 0.5px); }
+/* A wide transparent stroke over each recorded arrow takes the pointer. */
+.service-map-hit { fill: none; stroke: transparent; stroke-width: 10px; pointer-events: stroke; cursor: pointer; }
 .service-map-card { display: flex; gap: 8px; position: absolute; width: var(--service-map-card-width); height: var(--service-map-card-height); box-sizing: border-box; align-items: flex-start; padding: 10px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel-elevated); color: var(--text); text-align: left; cursor: pointer; box-shadow: 0 4px 18px rgba(0,0,0,.12); }
 .service-map-card:hover { border-color: var(--point-border); }
 .service-map-card.pinned { box-shadow: 0 0 0 2px var(--point-soft), 0 4px 18px rgba(0,0,0,.12); }
@@ -7497,6 +7499,7 @@ button.utility-button.replay-tab-add {
 .service-map-evidence-button > :first-child { min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: var(--font-xs); }
 .service-map-evidence-button > :last-child { white-space: nowrap; color: var(--point); font-size: var(--font-xs); }
 .service-map-evidence-button.selected { border-color: var(--point-border); }
+.service-map-evidence-button.highlighted { border-color: var(--point); box-shadow: 0 0 0 1px var(--point); }
 .service-map-verified { padding: 0 12px 8px; border: 1px solid var(--point-border); border-radius: 9px; margin: 12px 0; background: var(--point-soft); }
 .service-map-verified dl, .service-map-socket-peer dl { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 8px 14px; font-size: var(--font-xs); }
 .service-map-verified dt, .service-map-socket-peer dt { color: var(--text-dim); }
