@@ -392,6 +392,13 @@ unnamed one draws no card, and selecting one draws a Direct request arrow to
 each card it went to itself; the API and the CLI carry them as `clients`. Only
 the fixed names leave the parser, never the header.
 
+Each origin also names how its requests authenticate, from names and shapes
+only: the Authorization scheme (telling a JWT from an opaque token), API key
+headers, session and JWT cookies, WWW-Authenticate challenges, credentials in
+the URL, and OAuth, OpenID Connect and SAML parameters. A card shows it as a
+lock chip, the APIs tab lists it first, each endpoint carries its own kinds,
+and the API and the CLI carry it as `auth`.
+
 A card shows its origin's captured favicon in place of a letter mark, when
 history holds one (`favicon` in the API and the CLI); the map never requests an
 icon from a target. Product chips carry the product's logo, bundled from Simple

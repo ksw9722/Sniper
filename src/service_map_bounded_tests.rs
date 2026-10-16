@@ -1580,3 +1580,93 @@ fn origins_keep_their_newest_icon_whatever_the_display_filter_hides() {
     );
     assert_eq!(favicon_type(&vec![0x89; MAX_FAVICON_BYTES + 1]), None);
 }
+
+// An origin lists how its requests authenticate, busiest first, and each
+// endpoint the kinds its own rows showed. No credential value leaves.
+#[test]
+fn origins_and_endpoints_name_how_their_requests_authenticate() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(106);
+    // Split so secret scanning does not take a test sample for a leaked token.
+    let bearer = concat!(
+        "Bearer eyJhbGciOiJIUzI1NiJ9.",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    );
+    let request = |path: &str, headers: &[(&str, &str)], sequence| {
+        let mut record = filter_fixture(
+            "api.example.com",
+            path,
+            200,
+            "application/json",
+            None,
+            sequence,
+        );
+        let mut map = http::HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        record.request = MessageRecord::from_headers_and_body(&map, b"", 0);
+        record
+    };
+    let store = TransactionStore::from_records(vec![
+        request(
+            "/v1/items",
+            &[
+                ("Authorization", bearer),
+                ("Cookie", "JSESSIONID=SYNTHETIC_VALUE"),
+            ],
+            3,
+        ),
+        request("/v1/items", &[("Authorization", bearer)], 2),
+        request("/v1/public", &[], 1),
+    ]);
+    let (all, _) = store
+        .service_map_all_rows_blocking(
+            session,
+            technology::CatalogVersion::V2,
+            &ListFilters::default(),
+            false,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    let origin = &all.origins[0];
+    let methods: Vec<_> = origin
+        .auth
+        .iter()
+        .map(|method| {
+            (
+                method.kind.as_str(),
+                method.name.as_deref(),
+                method.row_count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            ("bearer_jwt", None, 2),
+            ("session_cookie", Some("JSESSIONID"), 1)
+        ]
+    );
+    let endpoint = |path: &str| {
+        origin
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.path == path)
+            .unwrap()
+            .auth
+            .clone()
+    };
+    assert_eq!(endpoint("/v1/items"), ["bearer_jwt", "session_cookie"]);
+    assert!(endpoint("/v1/public").is_empty());
+    let text = serde_json::to_string(&all).unwrap();
+    assert!(
+        !text.contains("SYNTHETIC_VALUE") && !text.contains("eyJzdWIi"),
+        "no credential value leaves"
+    );
+}

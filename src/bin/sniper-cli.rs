@@ -4279,11 +4279,16 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         ]);
         return Some(service_map_catalog_output_schema(schema, true));
     }
-    let endpoint = service_map_object(json!({
+    let mut endpoint = service_map_object(json!({
         "method":string,"path":string,"path_group":{"type":["string","null"]},
         "request_count":count,"statuses":{"type":"array","items":port},
         "content_types":strings,"evidence":strings
     }));
+    // Optional: older servers, and endpoints whose rows named no method, omit it.
+    endpoint["properties"]["auth"] = json!({
+        "type":"array","maxItems":15,"items":{"type":"string","enum":sniper::service_map_auth::KINDS},
+        "description":"How this endpoint's rows authenticated, in the order of the kinds list."
+    });
     let mut links = header_link;
     links["properties"]["source"] = json!({"type":"string","enum":["request_header_declaration"]});
     links["properties"]["evidence"] = strings.clone();
@@ -4365,6 +4370,18 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "type":"array","maxItems":32,
         "description":"What the origin's own responses say about the servers behind it, outermost layer first (edge, gateway, platform, web_server, app_server, backend, language, database, os), and what they expose (category exposure: debug pages, stack traces, SQL errors, directory listings, API documents, a backend address in a BIG-IP cookie). Read from vendor header names, header values the technology catalog does not name, the names of cookies it sets, and error, default and debug page bodies. Never from another origin's rows.",
         "items":server
+    });
+    let mut auth = service_map_object(json!({
+        "kind":{"type":"string","enum":sniper::service_map_auth::KINDS},
+        "name":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$"},
+        "row_count":count,"evidence":strings
+    }));
+    // A kind with no header, cookie, parameter or scheme name omits it.
+    auth["required"] = json!(["kind", "row_count", "evidence"]);
+    origin["properties"]["auth"] = json!({
+        "type":"array","maxItems":16,
+        "description":"How the origin's requests authenticate, busiest first: the Authorization scheme (bearer_jwt, bearer, basic, digest, negotiate, ntlm, aws_sigv4, or another scheme), an API key header, session or JWT cookies by name, a credential in the query string, and OAuth 2.0, OpenID Connect and SAML parameters. Read from names and shapes only; no credential value is kept or reported.",
+        "items":auth
     });
     origin["properties"]["favicon"] = json!({
         "type":"string","pattern":"^v1\\.",
@@ -9925,6 +9942,23 @@ fn validate_service_map_response(
                     .favicon
                     .as_deref()
                     .is_none_or(|token| token.len() <= 200 && token.starts_with("v1."))
+                && origin.auth.iter().all(|method| {
+                    sniper::service_map_auth::KINDS.contains(&method.kind.as_str())
+                        && method.row_count > 0
+                        && method.name.as_deref().is_none_or(|name| {
+                            !name.is_empty()
+                                && name.len() <= 64
+                                && name
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                        })
+                })
+                && origin.endpoints.iter().all(|endpoint| {
+                    endpoint
+                        .auth
+                        .iter()
+                        .all(|kind| sniper::service_map_auth::KINDS.contains(&kind.as_str()))
+                })
                 && origin.server_technologies.iter().all(|item| {
                     !item.product_id.is_empty()
                         && item.product_id.len() <= 40

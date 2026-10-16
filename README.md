@@ -245,6 +245,8 @@ the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`
 Each row's User-Agent names the client that sent it (a browser, an app's
 WebView, an app, a tool, a library or a crawler), and the map's first column
 shows the clients; selecting one draws an arrow to each origin it went to itself.
+How requests authenticate (a bearer JWT, Basic, session cookies, API key headers,
+OAuth, OpenID Connect or SAML) is named from headers and URLs, never their values.
 
 Origin and Referer links are sorted by request kind (API call, page navigation,
 frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each

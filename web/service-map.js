@@ -352,6 +352,20 @@
   // servers in front of it, then the kits, libraries and trackers it loads.
   const RANKS = { meta_framework: 0, cms: 1, framework: 2, backend: 3, app_server: 4, web_server: 5, gateway: 6, edge: 7, platform: 8,
     language: 9, database: 10, os: 11, ui: 12, library: 13, analytics: 14 };
+  // How requests authenticate, as the server names them: what a request
+  // carries first, then the flows that hand credentials out. Each kind has a
+  // word for a card's chip and an endpoint's tag, and a name for the inspector.
+  const AUTH_KINDS = ["bearer_jwt", "bearer", "basic", "digest", "negotiate", "ntlm", "aws_sigv4", "scheme", "api_key_header",
+    "session_cookie", "jwt_cookie", "query_key", "oauth2", "oidc", "saml"];
+  const AUTH_FLOWS = ["oauth2", "oidc", "saml"];
+  const AUTH_LABELS = { bearer_jwt: ["JWT", "Bearer JWT"], bearer: ["Bearer", "Bearer token"], basic: ["Basic", "Basic authentication"],
+    digest: ["Digest", "Digest authentication"], negotiate: ["Negotiate", "Negotiate (Kerberos or NTLM)"], ntlm: ["NTLM", "NTLM"],
+    aws_sigv4: ["SigV4", "AWS Signature Version 4"], scheme: ["Scheme", "Another Authorization scheme"], api_key_header: ["API key", "API key header"],
+    session_cookie: ["Cookie", "Session cookie"], jwt_cookie: ["JWT cookie", "JWT in a cookie"], query_key: ["URL key", "Credential in the URL"],
+    oauth2: ["OAuth", "OAuth 2.0"], oidc: ["OIDC", "OpenID Connect"], saml: ["SAML", "SAML"] };
+  const authWord = (item) => item.kind === "scheme" && item.name ? item.name : AUTH_LABELS[item.kind][0];
+  const authName = (item) => item.kind === "scheme" && item.name ? `${item.name} scheme` : AUTH_LABELS[item.kind][1];
+  const LOCK_ICON = '<svg class="service-map-product-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5Zm-3 8V7a3 3 0 0 1 6 0v3H9Z"/></svg>';
   // What a card's ⚠ chip calls each exposure: short enough to leave a product
   // beside it. The inspector keeps the full name.
   const EXPOSURE_LABELS = { django_debug: "Debug page", werkzeug_debugger: "Debugger", laravel_debug: "Debug page",
@@ -367,19 +381,23 @@
   function productSummaryMarkup(origin) {
     const products = reportedProducts(origin).sort((a, b) => productRank(a) - productRank(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const exposures = (origin?.server_technologies || []).filter((item) => item.category === "exposure");
-    if (!products.length && !exposures.length) return "";
+    const methods = origin?.auth || [];
+    if (!products.length && !exposures.length && !methods.length) return "";
     // Exposures lead: a debug page or a stack trace is the first thing to see.
     // An exposure says what it is: a bare count read as nothing. Hovering it
     // lists them all, as +N does.
     const warning = exposures.length ? `<span class="service-map-exposure" aria-label="Exposures: ${escape(exposures.map((item) => item.name).join(", "))}" data-more="${escape(exposures.map((item) => item.name).join("\n"))}" title="">⚠ ${escape(EXPOSURE_LABELS[exposures[0].product_id] || exposures[0].name)}${exposures.length > 1 ? ` +${exposures.length - 1}` : ""}</span>` : "";
-    // An exposure takes one of the two product places.
-    const shown = warning ? 1 : 2;
+    // A credential leads a sign-in flow, the busiest first, as the server sorts them.
+    const primary = methods.find((item) => !AUTH_FLOWS.includes(item.kind)) || methods[0];
+    const lock = primary ? `<span class="service-map-auth" aria-label="Authentication: ${escape(methods.map(authName).join(", "))}" data-more="${escape(methods.map((item) => `${authName(item)}${item.name && item.kind !== "scheme" ? ` (${item.name})` : ""}`).join("\n"))}" title="">${LOCK_ICON}${escape(authWord(primary))}${methods.length > 1 ? ` +${methods.length - 1}` : ""}</span>` : "";
+    // An exposure and the way requests authenticate each take a product place.
+    const shown = 2 - (warning ? 1 : 0) - (lock ? 1 : 0);
     const full = (product) => [product.observations.length ? "Header-reported declarations; versions unverified." : "",
       ...product.observations.map((item) => `${item.name} · ${technologyVersion(item)} · ${item.header_name} response header · ${item.row_count} retained row(s) · First: ${item.first_seen} · Last: ${item.last_seen}`),
       ...product.declared.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) from ${item.source_origin}`),
       ...product.seen.map((item) => `${item.name}${item.version ? ` ${item.version}` : ""} · ${item.row_count} retained row(s) · ${item.signals.join(", ")}`)].filter(Boolean).join("\n");
     const label = (product) => `${product.name}${product.versions.size > 1 ? ` · ${product.versions.size} versions` : product.versions.size ? ` ${[...product.versions][0]}` : ""}`;
-    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${warning}${products.slice(0, shown).map((product) => `<span title="${escape(full(product))}">${productIcon(product.id)}${escape(label(product))}</span>`).join("")}${products.length > shown ? `<span class="service-map-products-more" aria-label="${products.length - shown} additional products" data-more="${escape(products.slice(shown).map(label).join("\n"))}" title="">+${products.length - shown}</span>` : ""}</span>`;
+    return `<span class="service-map-clues service-map-products" title="${escape(products.map(full).join("\n"))}">${warning}${lock}${products.slice(0, shown).map((product) => `<span title="${escape(full(product))}">${productIcon(product.id)}${escape(label(product))}</span>`).join("")}${products.length > shown ? `<span class="service-map-products-more" aria-label="${products.length - shown} additional products" data-more="${escape(products.slice(shown).map(label).join("\n"))}" title="">+${products.length - shown}</span>` : ""}</span>`;
   }
   // What an origin serves, read from the response types of its loaded
   // endpoints: pages (Front), API data, or static files. A front-end framework
@@ -984,6 +1002,7 @@
           method: String(endpoint.method || "?"), path: safePath(endpoint.path), path_group: safePath(endpoint.path_group || endpoint.path),
           request_count: count(endpoint.request_count), statuses: array(endpoint.statuses), content_types: array(endpoint.content_types),
           evidence: array(endpoint.evidence).filter((id) => typeof id === "string" && id.length > 0),
+          auth: array(endpoint.auth).filter((kind) => AUTH_KINDS.includes(kind)).slice(0, AUTH_KINDS.length),
         })),
         technology_clues: array(item.technology_clues).filter((clue) => clue.source === "response_header" && clue.confidence === "observed_header").map((clue) => ({
           name: String(clue.name || "Header clue"), evidence: array(clue.evidence).filter((id) => typeof id === "string" && id.length > 0),
@@ -1001,6 +1020,10 @@
           request_count: count(redirect.request_count),
         })),
         ...(FAVICON_TOKEN.test(item.favicon) ? { favicon: item.favicon } : {}),
+        // How its requests authenticate, by name and shape only.
+        auth: array(item.auth).filter((entry) => AUTH_KINDS.includes(entry?.kind) && (entry.name == null || /^[A-Za-z0-9._-]{1,64}$/.test(entry.name)))
+          .slice(0, 16).map((entry) => ({ kind: entry.kind, ...(entry.name == null ? {} : { name: entry.name }), row_count: count(entry.row_count),
+            evidence: array(entry.evidence).filter((id) => typeof id === "string" && id.length > 0) })),
         // What the origin's own responses say about its servers, and expose.
         server_technologies: array(item.server_technologies).filter((entry) => /^[a-z0-9_]{1,40}$/.test(entry?.product_id)
           && /^[A-Za-z.][A-Za-z0-9 .()!+_-]{0,39}$/.test(entry.name) && SERVER_CATEGORIES.includes(entry.category)
@@ -2795,7 +2818,7 @@
     function endpointButton(endpoint, origin, index, catalog = false) {
       const method = endpoint.method;
       const tone = method.toUpperCase() === "GET" ? "get" : method.toUpperCase() === "POST" ? "post" : "other";
-      return `<button class="service-map-api-row ${state.selectedOrigin === origin.origin && state.endpointIndex === index ? "selected" : ""}" type="button" data-service-endpoint="${index}" data-service-origin="${escape(origin.origin)}" data-service-focus="api:${escape(JSON.stringify([origin.origin, endpoint.method, endpoint.path]))}"><span class="service-map-method ${tone}" title="${escape(method)}">${escape(method)}</span><span class="service-map-api-copy">${catalog ? `<small title="${escape(origin.origin)}">${escape(origin.origin)}</small>` : ""}<span title="${escape(endpoint.path)}">${escape(endpoint.path)}</span></span><span class="service-map-api-count">${endpoint.request_count.toLocaleString()}<span class="service-map-chevron" aria-hidden="true">›</span></span></button>`;
+      return `<button class="service-map-api-row ${state.selectedOrigin === origin.origin && state.endpointIndex === index ? "selected" : ""}" type="button" data-service-endpoint="${index}" data-service-origin="${escape(origin.origin)}" data-service-focus="api:${escape(JSON.stringify([origin.origin, endpoint.method, endpoint.path]))}"><span class="service-map-method ${tone}" title="${escape(method)}">${escape(method)}</span><span class="service-map-api-copy">${catalog ? `<small title="${escape(origin.origin)}">${escape(origin.origin)}</small>` : ""}<span title="${escape(endpoint.path)}">${escape(endpoint.path)}</span></span>${endpoint.auth?.length ? `<span class="service-map-api-auth" title="${escape(endpoint.auth.map((kind) => AUTH_LABELS[kind][1]).join(", "))}">${LOCK_ICON}${escape(endpoint.auth.map((kind) => AUTH_LABELS[kind][0]).join(" · "))}</span>` : ""}<span class="service-map-api-count">${endpoint.request_count.toLocaleString()}<span class="service-map-chevron" aria-hidden="true">›</span></span></button>`;
     }
     function relationshipMarkup(origin) {
       const group = state.relationsByOrigin?.get(origin.origin);
@@ -2932,6 +2955,12 @@
     // with the rows to open.
     // What the origin's own responses say about its servers, exposures first,
     // each with the rows to open.
+    // How the origin's requests authenticate, busiest first, each with a row to
+    // open. It leads the APIs tab: it is the first thing a test needs.
+    function authMarkup(origin) {
+      if (!origin.auth?.length) return "";
+      return `<section class="service-map-technologies service-map-auth-methods" aria-label="Authentication"><h4>Authentication</h4><ul class="service-map-references">${origin.auth.map((item) => `<li><strong>${escape(authName(item))}</strong>${item.name && item.kind !== "scheme" ? ` · <code>${escape(item.name)}</code>` : ""}<p class="service-map-muted">${rowCount(item.row_count)}</p>${item.evidence.length ? `<div class="service-map-evidence-list"><button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(origin.origin)}" data-service-relation-evidence="${escape(item.evidence[0])}" data-service-focus="auth:${escape(JSON.stringify([item.kind, item.name || "", item.evidence[0]]))}"><span>${escape(authName(item))}</span><span>View source ›</span></button></div>` : ""}</li>`).join("")}</ul></section>`;
+    }
     function serverTechnologiesMarkup(origin) {
       const items = origin.server_technologies || [];
       const list = (entries) => `<ul class="service-map-references">${entries.map((item) => `<li><strong>${escape(item.name)}</strong>${item.version ? ` · ${escape(item.version)}` : ""}${SERVER_LABELS[item.category] ? ` <span class="service-map-muted">${SERVER_LABELS[item.category]}</span>` : ""}<p class="service-map-muted">${rowCount(item.row_count)} · ${item.signals.join(", ")}</p><div class="service-map-evidence-list">${item.evidence.map((id, index) => `<button class="service-map-evidence-button" type="button" data-service-relation-origin="${escape(origin.origin)}" data-service-relation-evidence="${escape(id)}" data-service-focus="server:${escape(JSON.stringify([item.product_id, item.version, id]))}"><span>${escape(item.name)}</span><span>View source${item.evidence.length > 1 ? ` ${index + 1}` : ""} ›</span></button>`).join("")}</div></li>`).join("")}</ul>`;
@@ -3025,7 +3054,7 @@
       if (!state.detailPageAnchor && entries[start]) state.detailPageAnchor = endpointIdentity(entries[start]);
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>${originActionsMarkup(origin)}
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${serverTechnologiesMarkup(origin)}${frontTechnologiesMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${authMarkup(origin)}${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${serverTechnologiesMarkup(origin)}${frontTechnologiesMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
     function renderCatalog() {
       const loaded = loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false);
@@ -3325,5 +3354,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, EXPOSURE_LABELS, relationshipOrder, siteKey, groupSites, originRole, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, EXPOSURE_LABELS, AUTH_KINDS, relationshipOrder, siteKey, groupSites, originRole, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

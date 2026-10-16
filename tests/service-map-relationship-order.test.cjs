@@ -581,6 +581,30 @@ test("a card shows its origin's captured icon once the image has loaded, and kee
   assert.equal(images.length, 2, 'a redraw loads nothing again');
 });
 
+test('a card, the inspector and each endpoint name how requests authenticate', async () => {
+  const rust = fs.readFileSync(path.join(__dirname, '../src/service_map_auth.rs'), 'utf8');
+  const kinds = rust.slice(rust.indexOf('pub const KINDS'), rust.indexOf('];', rust.indexOf('pub const KINDS'))).match(/"([a-z0-9_]+)"/g).map(kind => kind.slice(1, -1));
+  assert.deepEqual([...map.AUTH_KINDS], kinds, 'the same kinds, in the same order, as the server');
+  const method = (kind, row_count, name) => ({ kind, row_count, evidence: [`evidence-${kind}`], ...(name ? { name } : {}) });
+  const f = fixture();
+  await f.load(snapshot([origin(api, {
+    endpoints: [{ method: 'GET', path: '/v1/me', request_count: 3, statuses: [200], content_types: ['application/json'], evidence: ['evidence-me'], auth: ['bearer_jwt', 'session_cookie', 'nope'] },
+      { method: 'GET', path: '/v1/public', request_count: 1, statuses: [200], content_types: ['application/json'], evidence: ['evidence-public'] }],
+    auth: [method('oauth2', 9), method('bearer_jwt', 3), method('session_cookie', 2, 'JSESSIONID'), method('session_cookie', 1, 'bad name'), method('magic', 1)],
+  })]));
+  const normalized = f.state.snapshot.origins[0];
+  assert.deepEqual(normalized.auth.map(item => [item.kind, item.name]), [['oauth2', undefined], ['bearer_jwt', undefined], ['session_cookie', 'JSESSIONID']], 'unknown kinds and unsafe names are dropped');
+  assert.deepEqual([...normalized.endpoints[0].auth], ['bearer_jwt', 'session_cookie']);
+  const card = f.els.canvas.innerHTML.split(`data-service-origin="${api}"`)[1].split('</button>')[0];
+  assert.match(card, /class="service-map-auth" aria-label="Authentication: OAuth 2\.0, Bearer JWT, Session cookie" data-more="OAuth 2\.0\nBearer JWT\nSession cookie \(JSESSIONID\)" title=""><svg[^]*?<\/svg>JWT \+2<\/span>/, 'a credential leads a sign-in flow');
+  f.controller.selectOrigin(api);
+  const detail = f.els.detail.innerHTML;
+  assert.ok(detail.indexOf('<h4>Authentication</h4>') < detail.indexOf('service-map-api-list'), 'it leads the APIs tab');
+  assert.match(detail, /<strong>Session cookie<\/strong> · <code>JSESSIONID<\/code><p class="service-map-muted">2 rows<\/p>[^]*?data-service-relation-evidence="evidence-session_cookie"/);
+  assert.match(detail, /\/v1\/me<\/span><\/span><span class="service-map-api-auth" title="Bearer JWT, Session cookie"><svg[^]*?<\/svg>JWT · Cookie<\/span>/);
+  assert.doesNotMatch(detail.split('/v1/public')[1].split('</button>')[0], /service-map-api-auth/, 'an endpoint whose rows named none has no tag');
+});
+
 test('every exposure the server can report has a short card label', () => {
   const rust = fs.readFileSync(path.join(__dirname, '../src/service_map_servers.rs'), 'utf8');
   const ids = [...rust.matchAll(/\(\s*"([a-z0-9_]+)",\s*"[^"]+",\s*EXPOSURE,?\s*\)/g)].map(match => match[1]);

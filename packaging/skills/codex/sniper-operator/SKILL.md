@@ -109,6 +109,9 @@ to `max_records`; `--all-rows` (`all_rows: true`) reads every row too.
 `scope service-map parameters --session-id <active-uuid> --origin <origin>
 --method <method> --path <path>` lists one endpoint's parameters from its newest
 retained rows. A client's `versions` are the major versions its rows named.
+An origin's `auth` and an endpoint's `auth` name how requests authenticate
+(Authorization scheme, API key header, session or JWT cookie, query key,
+OAuth, OIDC, SAML) from names and shapes only, never values.
 
 Ordinary-map failures use fixed CLI codes `SERVICE_MAP_BUSY`,
 `SERVICE_MAP_SCOPE_WORK_LIMIT`, `SERVICE_MAP_SESSION_CHANGED`,

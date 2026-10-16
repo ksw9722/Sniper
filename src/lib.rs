@@ -28,6 +28,7 @@ pub mod scanner;
 pub mod scope;
 pub mod sequence;
 pub mod service_map;
+pub mod service_map_auth;
 pub mod service_map_body;
 pub mod service_map_clients;
 pub mod service_map_html;

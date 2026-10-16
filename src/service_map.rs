@@ -230,6 +230,23 @@ pub struct ServiceOrigin {
     /// shows. See `favicon_origin`. Absent when none was captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub favicon: Option<String>,
+    /// How its requests authenticate, read from names and shapes only. See
+    /// `service_map_auth`. Absent when no row named a method.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth: Vec<AuthMethod>,
+}
+
+/// One way an origin's requests authenticate: a scheme, an API key header, a
+/// session cookie, or a sign-in flow, with the rows that showed it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthMethod {
+    /// One of `service_map_auth::KINDS`.
+    pub kind: String,
+    /// The header, cookie or parameter name, or the scheme, when the kind has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub row_count: usize,
+    pub evidence: Vec<String>,
 }
 
 /// A server-side technology, or an exposure, an origin's own responses name.
@@ -281,6 +298,9 @@ pub struct ServiceEndpoint {
     pub statuses: Vec<u16>,
     pub content_types: Vec<String>,
     pub evidence: Vec<String>,
+    /// The `service_map_auth::KINDS` its rows showed, in that order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,6 +412,9 @@ pub struct ServiceMapRow {
     /// It sent an Origin or Referer: a page started it, not the client itself.
     #[serde(skip)]
     pub initiated: bool,
+    /// How it authenticated; aggregated only.
+    #[serde(skip)]
+    pub auth: Vec<crate::service_map_auth::AuthSignal>,
 }
 
 /// Every value `request_kind` returns, in the order clients present them.
@@ -694,6 +717,9 @@ fn product(value: &str, expected: &str) -> bool {
             .is_none_or(|b| matches!(b, b'/' | b' ' | b';' | b','))
 }
 
+/// The most ways one origin's requests authenticate that the map lists.
+const MAX_AUTH_METHODS: usize = 16;
+
 /// The largest icon the map serves; a site's favicon is a few KiB.
 pub(crate) const MAX_FAVICON_BYTES: usize = 64 * 1024;
 
@@ -783,6 +809,7 @@ pub(crate) fn project_record_for_catalog(
         libraries: Vec::new(),
         client: None,
         initiated: false,
+        auth: Vec::new(),
     };
     // A script, stylesheet or image URL can name its product without a body.
     if matches!(row.request_kind, "script" | "static") {
@@ -851,6 +878,7 @@ pub(crate) fn project_record_for_catalog(
         user_agent, brands, platform,
     ));
     row.initiated = !origin_values.is_empty() || !referer_values.is_empty();
+    row.auth = crate::service_map_auth::detect(record);
     if !row
         .omitted
         .iter()
@@ -1283,6 +1311,8 @@ pub(crate) struct MapBuilder {
     front_hits: BTreeMap<FrontKey, FrontHit>,
     /// By kind, name and operating system; versions are gathered apart.
     clients: BTreeMap<(&'static str, &'static str, Option<&'static str>), ClientTally>,
+    /// Rows per origin, auth kind and name.
+    auth: BTreeMap<(String, &'static str, Option<String>), (usize, Vec<String>)>,
     projected_rows: usize,
     included_rows: usize,
     excluded_rows: usize,
@@ -1300,6 +1330,7 @@ impl MapBuilder {
             technology_observation_count: 0,
             front_hits: BTreeMap::new(),
             clients: BTreeMap::new(),
+            auth: BTreeMap::new(),
             projected_rows: 0,
             included_rows: 0,
             excluded_rows: 0,
@@ -1347,6 +1378,7 @@ impl MapBuilder {
                 front_technologies: vec![],
                 server_technologies: vec![],
                 favicon: None,
+                auth: vec![],
             });
         origin.in_scope |= in_scope;
         origin.request_count += 1;
@@ -1398,6 +1430,7 @@ impl MapBuilder {
                 statuses: vec![],
                 content_types: vec![],
                 evidence: vec![],
+                auth: vec![],
             });
             Some(index)
         };
@@ -1423,6 +1456,20 @@ impl MapBuilder {
                 }
             }
             sample(&mut endpoint.evidence, &row.evidence_id);
+        }
+        for signal in std::mem::take(&mut row.auth) {
+            if let Some(index) = endpoint_index {
+                let kinds = &mut origin.endpoints[index].auth;
+                if !kinds.iter().any(|kind| kind == signal.kind) {
+                    kinds.push(signal.kind.into());
+                }
+            }
+            let (rows, evidence) = self
+                .auth
+                .entry((row.origin.clone(), signal.kind, signal.name))
+                .or_default();
+            *rows += 1;
+            sample(evidence, &row.evidence_id);
         }
         for clue in row.technology_clues {
             if let Some(existing) = origin
@@ -1574,6 +1621,33 @@ impl MapBuilder {
         for (origin, evidence) in &snapshot.favicons {
             if let Some(item) = self.origins.get_mut(origin) {
                 item.favicon = Some(evidence.clone());
+            }
+        }
+        let rank = |kind: &str| {
+            crate::service_map_auth::KINDS
+                .iter()
+                .position(|known| *known == kind)
+        };
+        for ((origin, kind, name), (row_count, evidence)) in std::mem::take(&mut self.auth) {
+            if let Some(item) = self.origins.get_mut(&origin) {
+                item.auth.push(AuthMethod {
+                    kind: kind.into(),
+                    name,
+                    row_count,
+                    evidence,
+                });
+            }
+        }
+        for item in self.origins.values_mut() {
+            item.auth.sort_by(|a, b| {
+                (b.row_count, rank(&a.kind), &a.name).cmp(&(a.row_count, rank(&b.kind), &b.name))
+            });
+            if item.auth.len() > MAX_AUTH_METHODS {
+                item.auth.truncate(MAX_AUTH_METHODS);
+                self.stopped_by.insert("auth_methods_limit".into());
+            }
+            for endpoint in &mut item.endpoints {
+                endpoint.auth.sort_by_key(|kind| rank(kind));
             }
         }
         // An asset's technology belongs to the page that loaded it when that

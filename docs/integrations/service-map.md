@@ -510,6 +510,40 @@ each origin's `request_count` and `entry_kinds`, the client's own rows there by
 request kind, at most 64 origins, and `evidence`), omitted when no row was
 analyzed.
 
+## Authentication
+
+Each row's request and response say how it authenticates, and the map reads
+names and shapes only:
+
+- the `Authorization` scheme: `bearer_jwt` for a token shaped like a JWT,
+  `bearer`, `basic`, `digest`, `negotiate`, `ntlm`, `aws_sigv4`, or another
+  `scheme`, named only when it is a common spelling (`Token`, `HMAC`, `Hawk`,
+  `SharedKey` and a few more) since an unknown first word may be the
+  credential itself;
+- an API key header by name (`X-API-Key`, `X-Auth-Token`, `X-Goog-Api-Key`,
+  `Ocp-Apim-Subscription-Key` and the like);
+- cookies a request carried or a response set: `session_cookie` when the name
+  says session (`JSESSIONID`, `PHPSESSID`, `connect.sid`, `SESSION`), and
+  `jwt_cookie` when the value is shaped like a JWT;
+- a `WWW-Authenticate` challenge;
+- a credential in the URL (`query_key`: `access_token`, `api_key` and a few
+  more), and signed AWS URLs;
+- OAuth 2.0 (`response_type` with `client_id`), OpenID Connect (`scope=openid`,
+  `/.well-known/openid-configuration`) and SAML (`SAMLRequest`, `SAMLResponse`).
+
+No credential value is kept or reported, and login forms are not read: they
+would need request bodies. ZAP's authentication and session-management passive
+rules were the checklist; the rules are Sniper's own.
+
+A card's lock chip names the busiest credential in a word (`JWT`, `Cookie`,
+`Basic`, `API key`), or a sign-in flow when the origin shows no credential, with
+`+N` for the rest; hovering it lists them all, and it takes one of the two
+product places. The APIs tab leads with **Authentication**, each method with its
+rows and View source, and each endpoint names the kinds its own rows showed.
+The API and the CLI carry `auth` on the origin (`kind`, `name` when it has one,
+`row_count`, `evidence`), busiest first and at most 16, and `auth` kinds on each
+endpoint.
+
 ## Sites and hidden origins
 
 **Group by site** (on by default) gathers two or more origins of one site onto a
