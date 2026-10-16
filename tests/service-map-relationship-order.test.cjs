@@ -41,7 +41,7 @@ function node() {
 }
 function fixture(options = {}) {
   const requests = [];
-  const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn', 'linkKinds'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn', 'linkKinds', 'siteControls'].map(name => [name, node()]));
   els.viewport.clientWidth = 300; els.viewport.clientHeight = 300;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty('--ui-root-size', '12px');
@@ -380,4 +380,56 @@ test('an arrow names its CORS rows, and selecting it marks its entry in the insp
   assert.equal((f.els.detail.innerHTML.match(/highlighted/g) || []).length, 1);
   f.controller.selectOrigin(app);
   assert.doesNotMatch(f.els.detail.innerHTML, /highlighted/, 'another selection clears the mark');
+});
+
+// Two sites: the leading origin's example.com, and example.net with two origins.
+const imgCdn = 'https://img.example.net', cssCdn = 'https://css.example.net';
+function siteOrigins() {
+  return [origin(app),
+    origin(api, { header_links: [kinded(app, { api: 2 })] }),
+    origin(imgCdn, { header_links: [kinded(app, { api: 1, static: 3 })] }),
+    origin(cssCdn, { header_links: [kinded(app, { api: 2 })], redirects: [redirect(imgCdn)] })];
+}
+const press = (f, dataset) => f.els.panel.dispatch('click', { target: { closest: selector => selector === 'button' ? { dataset } : null } });
+
+test('site keys take the last two host labels, three under listed suffixes, and never an address', () => {
+  assert.deepEqual(['https://shop-phinf.pstatic.net', 'https://www.example.co.kr', 'https://example.com', 'http://127.0.0.1:8080', 'http://[::1]:80', 'http://localhost:3000'].map(map.siteKey),
+    ['pstatic.net', 'example.co.kr', 'example.com', null, null, null]);
+});
+
+test("a site's origins share one card and one arrow, and the leading origin's site keeps a card per origin", async () => {
+  let display = { groupSites: true, expandedSites: [], hidden: [] };
+  const saves = [];
+  const f = fixture({ getSiteDisplay: () => display, setSiteDisplay: next => { display = next; saves.push(next); } });
+  await f.load(snapshot(siteOrigins()));
+  const html = () => f.els.canvas.innerHTML;
+  assert.match(html(), /data-service-site="example\.net"/);
+  assert.doesNotMatch(html(), /data-service-origin="https:\/\/img\.example\.net"/);
+  assert.match(html(), /data-service-origin="https:\/\/x-api\.example\.com"/, "the leading origin's site is not grouped");
+  assert.equal(arrows(html()), 2, 'the redirect inside the site is gone');
+  assert.match(html(), /→ \*\.example\.net · Referer header · referer_header · 3 requests \(API calls 3\)<\/title>/, 'both links share the arrow and add up');
+
+  press(f, { serviceSite: 'example.net' });
+  assert.match(f.els.detail.innerHTML, /\*\.example\.net[^]*2 origins grouped by site/);
+  assert.match(html(), /service-map-site\s+selected/);
+  press(f, { serviceOrigin: imgCdn });
+  assert.equal(f.state.selectedOrigin, imgCdn);
+  assert.match(html(), /service-map-site\s+selected/, 'a member keeps its site card selected');
+
+  press(f, { serviceSiteExpand: 'example.net' });
+  assert.deepEqual([...display.expandedSites], ['example.net']);
+  assert.equal(arrows(html()), 4, 'each origin has its card and arrows again');
+  assert.match(f.els.detail.innerHTML, /data-service-site-collapse="example\.net"/, 'an expanded site can be grouped again');
+
+  press(f, { serviceHide: 'example.net' });
+  assert.deepEqual([...display.hidden], ['example.net']);
+  assert.doesNotMatch(html(), /example\.net/);
+  assert.match(f.els.siteControls.innerHTML, /Hidden 1[^]*data-service-unhide="example\.net"/);
+  press(f, { serviceUnhideAll: 'all' });
+  assert.match(html(), /img\.example\.net/);
+
+  press(f, { serviceGroupSites: 'toggle' });
+  assert.equal(display.groupSites, false);
+  assert.match(f.els.siteControls.innerHTML, /data-service-group-sites="toggle"[^>]*aria-pressed="false"/);
+  assert.equal(saves.length, 4, 'expand, hide, show all and the toggle each save once');
 });

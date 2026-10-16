@@ -7426,6 +7426,9 @@ button.utility-button.replay-tab-add {
 .service-map-card.selected { border: 2px solid var(--point); padding: 9px; background: linear-gradient(var(--point-soft), var(--point-soft)), var(--panel); }
 .service-map-card-symbol { border: 1px solid var(--line-strong); border-radius: 50%; width: 26px; height: 26px; display: grid; place-items: center; font-size: 20px; flex: 0 0 26px; color: var(--text-soft); }
 .service-map-card.selected .service-map-card-symbol { border-color: var(--point-border); color: var(--point); }
+/* A site card holds several origins: a double ring sets it apart. */
+.service-map-card.service-map-site .service-map-card-symbol { border-style: double; border-width: 3px; }
+.service-map-origin-actions { padding: 0 18px; }
 .service-map-card-copy { display: grid; gap: 4px; min-width: 0; width: 100%; }
 .service-map-card-copy strong { font-size: var(--font-sm); line-height: var(--service-map-line-height); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 3px; }
 .service-map-card-scheme, .service-map-card-meta { color: var(--text-soft); font-size: var(--font-xs); line-height: var(--service-map-line-height); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -7440,6 +7443,9 @@ button.utility-button.replay-tab-add {
 .service-map-kinds:empty { display: none; }
 .service-map-kind { font: inherit; color: var(--text-soft); background: none; border: 1px solid var(--line-strong); border-radius: 12px; padding: 1px 8px; cursor: pointer; }
 .service-map-kind:hover { border-color: var(--point-border); }
+.service-map-hidden-list { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.service-map-hidden-list > summary { cursor: pointer; color: var(--text-soft); }
+.service-map-hidden-list[open] { flex-basis: 100%; }
 .service-map-kind.kind-api { color: var(--token-url-color); }
 /* Each toggle shows its line: blue API calls, grey page loads and frames, faint
    resource loads. */

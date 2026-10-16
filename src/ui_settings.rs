@@ -83,6 +83,8 @@ const WEBSOCKET_QUERY_MAX_CHARS: usize = 512;
 const HTTP_QUERY_MAX_CHARS: usize = 512;
 const HTTP_FILTER_TEXT_MAX_CHARS: usize = 512;
 const HTTP_FILTER_COLOR_TAG_MAX_COUNT: usize = 16;
+const SERVICE_MAP_ENTRY_MAX_BYTES: usize = 300;
+const SERVICE_MAP_ENTRY_MAX_COUNT: usize = 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -357,6 +359,13 @@ pub struct AppUiSettingsSnapshot {
     /// Request kinds whose links the map does not draw: by default all but API
     /// calls, page navigations and other requests.
     pub service_map_hidden_link_kinds: Vec<String>,
+    /// Service Map cards gather the origins of one site, except the leading
+    /// origin's site and the sites listed in `service_map_expanded_sites`.
+    pub service_map_group_sites: bool,
+    pub service_map_expanded_sites: Vec<String>,
+    /// Origins (`https://host`) and sites (`example.com`) the map hides in
+    /// every session.
+    pub service_map_hidden: Vec<String>,
     pub workbench_height: Option<u16>,
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
@@ -392,6 +401,9 @@ impl Default for AppUiSettingsSnapshot {
             http_filter_settings: HttpFilterSettingsSnapshot::default(),
             service_map_filter_settings: HttpFilterSettingsSnapshot::default(),
             service_map_hidden_link_kinds: vec!["frame".into(), "script".into(), "static".into()],
+            service_map_group_sites: true,
+            service_map_expanded_sites: Vec::new(),
+            service_map_hidden: Vec::new(),
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
@@ -444,6 +456,10 @@ impl AppUiSettingsSnapshot {
             })
             .map(|kind| kind.to_string())
             .collect();
+        sanitized.service_map_group_sites = self.service_map_group_sites;
+        sanitized.service_map_expanded_sites =
+            sanitize_map_entries(self.service_map_expanded_sites);
+        sanitized.service_map_hidden = sanitize_map_entries(self.service_map_hidden);
         sanitized.workbench_height = self
             .workbench_height
             .filter(|height| *height > 0)
@@ -709,6 +725,23 @@ fn sanitize_option(value: String, fallback: &str, allowed: &[&str]) -> String {
     } else {
         fallback.to_string()
     }
+}
+
+/// Service Map site and origin lists: lowercase, unique and bounded, without
+/// the spaces or control characters no origin or host contains.
+fn sanitize_map_entries(entries: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeMap::new();
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| {
+            !entry.is_empty()
+                && entry.len() <= SERVICE_MAP_ENTRY_MAX_BYTES
+                && !entry.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
+        .filter(|entry| seen.insert(entry.clone(), ()).is_none())
+        .take(SERVICE_MAP_ENTRY_MAX_COUNT)
+        .collect()
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -2180,5 +2213,30 @@ mod tests {
             serde_json::from_value(serde_json::json!({"service_map_hidden_link_kinds": []}))
                 .unwrap();
         assert!(none.sanitized().service_map_hidden_link_kinds.is_empty());
+    }
+
+    // Sites group unless switched off; the site and origin lists come back
+    // lowercase, unique and free of spaces, as a hand-edited file may not be.
+    #[test]
+    fn service_map_site_display_defaults_and_sanitizes() {
+        let older: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let older = older.sanitized();
+        assert!(older.service_map_group_sites);
+        assert!(older.service_map_expanded_sites.is_empty());
+        assert!(older.service_map_hidden.is_empty());
+        let saved: super::AppUiSettingsSnapshot = serde_json::from_value(serde_json::json!({
+            "service_map_group_sites": false,
+            "service_map_expanded_sites": [" Example.COM ", "example.com", "", "bad entry"],
+            "service_map_hidden": ["https://cdn.example.com", "example.net", "https://cdn.example.com"]
+        }))
+        .unwrap();
+        let saved = saved.sanitized();
+        assert!(!saved.service_map_group_sites);
+        assert_eq!(saved.service_map_expanded_sites, ["example.com"]);
+        assert_eq!(
+            saved.service_map_hidden,
+            ["https://cdn.example.com", "example.net"]
+        );
     }
 }

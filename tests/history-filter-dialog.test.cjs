@@ -535,3 +535,16 @@ test("the map's hidden link kinds load from settings, default to frames and reso
   await f.save();
   assert.deepEqual([...f.writes.at(-1).service_map_hidden_link_kinds], []);
 });
+
+test("the map's site grouping and hidden origins load from settings and save back", async () => {
+  const f = fixture();
+  f.context.applyUiSettingsSnapshot({});
+  assert.deepEqual(JSON.parse(JSON.stringify(f.state.serviceMapSiteDisplay)), { groupSites: true, expandedSites: [], hidden: [] }, "sites group by default");
+  f.context.applyUiSettingsSnapshot({ service_map_group_sites: false, service_map_expanded_sites: ["example.net", 5], service_map_hidden: ["https://cdn.example.net"] });
+  assert.deepEqual(JSON.parse(JSON.stringify(f.state.serviceMapSiteDisplay)), { groupSites: false, expandedSites: ["example.net"], hidden: ["https://cdn.example.net"] });
+  await f.save();
+  const saved = f.writes.at(-1);
+  assert.equal(saved.service_map_group_sites, false);
+  assert.deepEqual([...saved.service_map_expanded_sites], ["example.net"]);
+  assert.deepEqual([...saved.service_map_hidden], ["https://cdn.example.net"]);
+});

@@ -58,10 +58,58 @@
     const kinds = REQUEST_KINDS.filter((kind) => count(link.request_kinds?.[kind]) > 0).map((kind) => [kind, count(link.request_kinds[kind])]);
     return kinds.length ? kinds : [["other", Math.max(1, count(link.request_count))]];
   };
-  // Rows whose response let the source origin read it, over all of the link's rows.
-  const linkCors = (link) => count(link.cors_allowed_count)
-    ? [count(link.cors_allowed_count), count(link.cors_credentials_count), Math.max(count(link.request_count), count(link.cors_allowed_count))] : null;
-  const corsText = ([allowed, credentials, rows]) => `CORS allowed ${allowed} of ${rows} row${rows === 1 ? "" : "s"}${credentials ? `, ${credentials} with credentials` : ""}`;
+  // Rows whose response let the source origin read it, of all the link's rows.
+  const linkCors = (link) => [count(link.cors_allowed_count), count(link.cors_credentials_count), Math.max(1, count(link.request_count), count(link.cors_allowed_count))];
+  const corsText = ([allowed, credentials, rows]) => allowed ? `CORS allowed ${allowed} of ${rows} row${rows === 1 ? "" : "s"}${credentials ? `, ${credentials} with credentials` : ""}` : "";
+  // Sites group origins by registrable domain, as Caido's sitemap groups
+  // subdomains under their root domain. ponytail: a short list of two-level
+  // public suffixes stands in for the Public Suffix List, so a host under an
+  // unlisted suffix (or a hosting suffix such as github.io) groups by its last
+  // two labels; add the list if that merges different owners.
+  const TWO_LEVEL_SUFFIXES = new Set(["co.kr", "or.kr", "go.kr", "ac.kr", "ne.kr", "re.kr", "pe.kr", "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "com.cn", "com.tw", "com.hk", "com.sg", "com.br", "co.in", "co.nz"]);
+  function siteKey(origin) {
+    let host = "";
+    try { host = new URL(origin).hostname; } catch { return null; }
+    // An address or a single label names one host, not a site.
+    if (!host || host.startsWith("[") || /^\d+(?:\.\d+){3}$/.test(host)) return null;
+    const labels = host.split(".");
+    if (labels.length < 2) return null;
+    return labels.slice(labels.length > 2 && TWO_LEVEL_SUFFIXES.has(labels.slice(-2).join(".")) ? -3 : -2).join(".");
+  }
+  // Two or more origins of one site become one card unless the site is kept
+  // apart. Links follow their origins onto the card: links inside the site
+  // disappear, and links of several members share the card's arrow.
+  function groupSites(origins, keepApart = () => false) {
+    const members = new Map();
+    for (const origin of origins) {
+      const site = origin.endpointNode ? null : siteKey(origin.origin);
+      if (!site || keepApart(site)) continue;
+      if (!members.has(site)) members.set(site, []);
+      members.get(site).push(origin);
+    }
+    for (const [site, items] of members) if (items.length < 2) members.delete(site);
+    if (!members.size) return { cards: origins, card: (id) => id };
+    const cardOf = new Map([...members].flatMap(([site, items]) => items.map((item) => [item.origin, `site:${site}`])));
+    const card = (id) => cardOf.get(id) || id;
+    const relinked = (origin) => ({
+      redirects: origin.redirects.map((redirect) => ({ ...redirect, target_origin: card(redirect.target_origin) })),
+      header_links: origin.header_links.map((link) => ({ ...link, source_origin: card(link.source_origin) })),
+    });
+    const sites = new Map([...members].map(([site, items]) => {
+      const links = items.map(relinked);
+      return [`site:${site}`, { ...referenceOrigin(`site:${site}`), site, members: items, captured: items.some((item) => item.captured !== false),
+        in_scope: items.some((item) => item.in_scope), request_count: items.reduce((sum, item) => sum + count(item.request_count), 0),
+        redirects: links.flatMap((item) => item.redirects), header_links: links.flatMap((item) => item.header_links) }];
+    }));
+    const cards = [];
+    for (const origin of origins) {
+      const site = sites.get(card(origin.origin));
+      if (!site) cards.push(origin.endpointNode ? origin : { ...origin, ...relinked(origin) });
+      else if (!cards.includes(site)) cards.push(site);
+    }
+    return { cards, card };
+  }
   const safePath = (value) => String(value || "/").split(/[?#]/, 1)[0];
   function safeOrigin(value) {
     try {
@@ -947,10 +995,18 @@
       const key = JSON.stringify([edge.source, edge.target, edge.relationship]);
       if (edge.source === edge.target || !visibleIds.has(edge.source) || !visibleIds.has(edge.target)
         || anchor && edge.source !== anchor && edge.target !== anchor) continue;
-      // Redirects to several paths of one origin share an arrow and their rows;
-      // inspected body and Link references count no rows.
+      // Redirects to several paths of one origin share an arrow and their rows,
+      // as do the links of one site's origins; inspected body and Link
+      // references count no rows.
       if (seen.has(key)) {
-        if (edge.count) seen.get(key).count += edge.count;
+        const drawn = seen.get(key);
+        if (edge.count) drawn.count += edge.count;
+        if (edge.kinds) {
+          drawn.kinds = { ...drawn.kinds };
+          for (const [kind, rows] of Object.entries(edge.kinds)) drawn.kinds[kind] = (drawn.kinds[kind] || 0) + rows;
+          drawn.kind = REQUEST_KINDS.find((kind) => drawn.kinds[kind]);
+        }
+        if (edge.cors) drawn.cors = drawn.cors.map((value, index) => value + edge.cors[index]);
         continue;
       }
       const drawn = { ...edge };
@@ -1069,12 +1125,24 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, request: sendRequest, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, document: doc = root.document }) {
     // Request kinds whose links are not drawn. The app keeps them in UI
     // settings; without it they live for this controller only.
     let localHiddenLinkKinds = [...DEFAULT_HIDDEN_LINK_KINDS];
     const hiddenLinkKinds = () => array(getHiddenLinkKinds ? getHiddenLinkKinds() : localHiddenLinkKinds).filter((kind) => REQUEST_KINDS.includes(kind));
     const saveHiddenLinkKinds = (kinds) => { if (setHiddenLinkKinds) setHiddenLinkKinds(kinds); else localHiddenLinkKinds = kinds; };
+    // How the map groups sites and which origins or sites it hides; the app
+    // keeps this in UI settings, shared by every session.
+    let localSiteDisplay = { groupSites: true, expandedSites: [], hidden: [] };
+    const siteDisplay = () => {
+      const value = getSiteDisplay ? getSiteDisplay() : localSiteDisplay;
+      return { groupSites: value?.groupSites !== false, expandedSites: array(value?.expandedSites), hidden: array(value?.hidden) };
+    };
+    const saveSiteDisplay = (changes) => {
+      const next = { ...siteDisplay(), ...changes };
+      if (setSiteDisplay) setSiteDisplay(next); else localSiteDisplay = next;
+      render();
+    };
     // A local retained-data read must not turn an API redirect into another
     // request. Enforce this for every map/inspector read, preserving its signal.
     const request = (path, options) => sendRequest(path, { ...options, redirect: "error" });
@@ -1756,6 +1824,7 @@
       if (!item || endpointIndex !== null && (!Number.isSafeInteger(endpointIndex) || !item.endpoints[endpointIndex])) return;
       const changedOrigin = state.selectedOrigin !== origin;
       state.highlightedRelation = null;
+      state.selectedSite = null;
       if (changedOrigin || state.endpointIndex !== endpointIndex) cancelEvidence();
       if (changedOrigin) { state.detailPage = 0; state.detailPageAnchor = null; }
       state.selectedOrigin = origin;
@@ -2191,11 +2260,22 @@
       const toggles = REQUEST_KINDS.filter((kind) => links.get(kind) > 0).map((kind) => `<button class="service-map-kind kind-${kind}" type="button" data-link-kind="${kind}" data-service-focus="link-kind:${kind}" aria-pressed="${!hidden.has(kind)}" title="${REQUEST_KIND_LABELS[kind]} in ${links.get(kind)} Origin/Referer link(s). ${hidden.has(kind) ? "Draw" : "Hide"} them."><span class="service-map-kind-swatch" aria-hidden="true"></span>${REQUEST_KIND_LABELS[kind]} ${links.get(kind)}</button>`).join("");
       replace(els.linkKinds, toggles ? `<span class="service-map-kinds-label">Links by request:</span>${toggles}` : "");
     }
+    // Group by site, and every origin or site hidden from the map with a way
+    // back for each.
+    function renderSiteControls() {
+      if (!els.siteControls) return;
+      const display = siteDisplay();
+      replace(els.siteControls, `<button class="service-map-kind" type="button" data-service-group-sites="toggle" data-service-focus="sites:group" aria-pressed="${display.groupSites}" title="${display.groupSites ? "Show every origin on its own card" : "Gather the origins of one site onto one card"}">Group by site</button>${display.hidden.length ? `<details class="service-map-hidden-list"><summary data-service-focus="sites:hidden">Hidden ${display.hidden.length}</summary>${display.hidden.map((entry) => `<button class="service-map-kind" type="button" data-service-unhide="${escape(entry)}" data-service-focus="unhide:${escape(entry)}" title="Show ${escape(entry)} on the map again">${escape(entry.includes("://") ? entry : `*.${entry}`)} ✕</button>`).join("")}<button class="service-map-kind" type="button" data-service-unhide-all="all" data-service-focus="sites:unhide-all">Show all</button></details>` : ""}`);
+    }
     function renderGraph() {
       const selected = selectedOrigin();
       const direct = directNeighborhood();
       const query = state.query.trim().toLowerCase();
-      const stages = originFilterStages(direct ? direct.neighbors : graphOrigins().filter((origin) => !state.scopeOnly || origin.in_scope || !origin.captured));
+      const display = siteDisplay();
+      // Origins and sites hidden from the map leave it, whatever else shows them.
+      const shown = (origin) => origin.endpointNode || !display.hidden.includes(origin.origin) && !display.hidden.includes(siteKey(origin.origin));
+      const candidates = direct ? direct.neighbors : graphOrigins().filter((origin) => !state.scopeOnly || origin.in_scope || !origin.captured);
+      const stages = originFilterStages(candidates.filter(shown));
       const matchingNeighbors = direct ? stages.matching : [];
       const origins = direct ? [direct.anchor, ...matchingNeighbors] : stages.matching;
       const neighborOrder = direct ? stableOrder(state.order, matchingNeighbors) : [];
@@ -2204,18 +2284,29 @@
       const sourceIds = new Set(state.relationLayers.map((layer) => layer.source.origin));
       const order = direct ? [direct.anchor.origin, ...neighborOrder.filter((id) => direct.bodyIds.has(id)), ...neighborOrder.filter((id) => !direct.bodyIds.has(id))]
         : [...allOrder.filter((id) => origins.find((item) => item.origin === id)?.endpointNode), ...allOrder.filter((id) => sourceIds.has(id)), ...allOrder.filter((id) => collectionIds.has(id) && !sourceIds.has(id) && !origins.find((item) => item.origin === id)?.endpointNode), ...allOrder.filter((id) => !collectionIds.has(id))];
-      const filterKey = JSON.stringify([query, state.productId, state.productVersion, state.scopeOnly, state.sessionId, state.anchorOrigin, hiddenLinkKinds()]);
+      const filterKey = JSON.stringify([query, state.productId, state.productVersion, state.scopeOnly, state.sessionId, state.anchorOrigin, hiddenLinkKinds(), display]);
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
       const textSize = doc?.documentElement && typeof root.getComputedStyle === "function"
         ? Number.parseFloat(root.getComputedStyle(doc.documentElement).getPropertyValue("--ui-root-size")) : 12;
-      const layout = graphLayout(origins, order, state.layoutSlots, state.anchorOrigin, overlayEdges(), graphGeometry(textSize), hiddenLinkKinds());
+      // A site gathers its origins onto one card, except the leading origin's
+      // site, a site shown separately, and one holding the pinned origin or an
+      // inspection, which need their own cards.
+      const leadingSite = siteKey(allOrder.find((id) => siteKey(id)) || "");
+      const grouped = groupSites(origins, (site) => !display.groupSites || site === leadingSite || display.expandedSites.includes(site)
+        || [state.anchorOrigin, ...collectionIds].some((id) => id && siteKey(id) === site));
+      state.siteCards = new Map(grouped.cards.filter((card) => card.site).map((card) => [card.site, card]));
+      const selectedCard = state.selectedSite ? `site:${state.selectedSite}` : grouped.card(state.selectedOrigin);
+      const layout = graphLayout(grouped.cards, [...new Set(order.map(grouped.card))], state.layoutSlots, state.anchorOrigin, overlayEdges(), graphGeometry(textSize), hiddenLinkKinds());
+      // Status counts origins, not cards: a site card shows all of its own.
+      const shownOrigins = layout.nodes.reduce((sum, node) => sum + (node.members?.length || 1), 0);
       renderLinkKinds();
+      renderSiteControls();
       state.layoutSlots = layout.slots;
       currentLayout = layout.nodes.length ? layout : null;
       applyGraphScale();
       els.boundsDetails?.classList.toggle("hidden", !state.snapshot);
       if (!direct && els.graphDiagnostics) els.graphDiagnostics.textContent = state.snapshot
-        ? `${stages.loaded.length} loaded origins · ${stages.queryHidden} query-hidden · ${stages.productHidden} product/version-hidden · ${stages.matching.length} matching · ${layout.nodes.length} shown · ${Math.max(0, stages.matching.length - layout.nodes.length)} omitted by ${MAX_CARDS}-card cap. Counts describe only loaded origins and reference cards; server projection omissions and omitted reference declarations are separate. Unloaded products and distinct origins are not counted.` : "";
+        ? `${stages.loaded.length} loaded origins · ${stages.queryHidden} query-hidden · ${stages.productHidden} product/version-hidden · ${stages.matching.length} matching · ${shownOrigins} shown · ${Math.max(0, stages.matching.length - shownOrigins)} omitted by ${MAX_CARDS}-card cap. Counts describe only loaded origins and reference cards; server projection omissions and omitted reference declarations are separate. Unloaded products and distinct origins are not counted.` : "";
       els.mapControls?.classList.toggle("hidden", state.view === "apis");
       els.allOrigins?.setAttribute("aria-pressed", String(!state.anchorOrigin));
       els.directRelations?.setAttribute("aria-pressed", String(!!state.anchorOrigin));
@@ -2225,7 +2316,8 @@
         els.focusSelection.disabled = !selected || selected.origin === state.anchorOrigin;
         els.focusSelection.title = selected ? `Pin ${selected.origin} without changing its inspector` : "Select an origin to pin it";
       }
-      const selectionNotice = !selected || layout.nodes.some((origin) => origin.origin === selected.origin) ? ""
+      const selectionNotice = !selected || layout.nodes.some((node) => node.origin === grouped.card(selected.origin)) ? ""
+        : !shown(selected) ? "Selected origin is hidden from the map; inspector retained."
         : direct && !direct.neighbors.some((origin) => origin.origin === selected.origin) ? "Selected origin is outside this direct neighborhood; inspector retained."
         : origins.some((origin) => origin.origin === selected.origin)
         ? `Selected origin is outside the ${MAX_CARDS}-card display; inspector retained.`
@@ -2242,14 +2334,22 @@
       // drew nearly every line at its heaviest.
       const weight = (rows) => rows > 1 ? Math.round(Math.min(2.5, 1.5 + Math.log2(rows) / 6) * 100) / 100 : 0;
       const requests = (edge) => edge.count > 1 || edge.kinds
-        ? ` · ${edge.count} request${edge.count === 1 ? "" : "s"}${edge.kinds ? ` (${Object.entries(edge.kinds).map(([kind, rows]) => `${REQUEST_KIND_LABELS[kind]} ${rows}`).join(", ")})` : ""}${edge.cors ? ` · ${corsText(edge.cors)}` : ""}` : "";
-      const title = (edge) => `${escape(edge.source)} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : edge.target)} · ${escape(edge.label)} · ${edge.relationship}${requests(edge)}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}`;
-      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(state.selectedOrigin) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : `marker-end="url(#service-map-arrow${[edge.source, edge.target].includes(state.selectedOrigin) ? "-selected" : edge.kind === "api" ? "-api" : ""})"`}><title>${title(edge)}</title></path>`).join("")
+        ? ` · ${edge.count} request${edge.count === 1 ? "" : "s"}${edge.kinds ? ` (${REQUEST_KINDS.filter((kind) => edge.kinds[kind]).map((kind) => `${REQUEST_KIND_LABELS[kind]} ${edge.kinds[kind]}`).join(", ")})` : ""}${edge.cors?.[0] ? ` · ${corsText(edge.cors)}` : ""}` : "";
+      const cardName = (id) => String(id).startsWith("site:") ? `*.${id.slice(5)}` : id;
+      const title = (edge) => `${escape(cardName(edge.source))} ${edge.undirected ? "—" : "→"} ${escape(edge.undirected ? findOrigin(edge.target)?.address : cardName(edge.target))} · ${escape(edge.label)} · ${edge.relationship}${requests(edge)}${edge.layers ? ` · ${edge.layers.length} inspected source(s)` : ""}`;
+      const edges = layout.edges.map((edge) => `<path class="service-map-edge ${edge.undirected ? "peer-observation" : edge.relationship === "body_url_reference" ? "body-reference" : edge.relationship === "link_preconnect" ? "preconnect-hint" : edge.relationship.startsWith("link_") ? "link-declaration" : edge.relationship !== "redirect_instruction" ? "header-declaration" : ""}${edge.kind ? ` kind-${edge.kind}` : ""} ${[edge.source, edge.target].includes(selectedCard) ? "selected" : ""}" data-relationship="${edge.relationship}"${weight(edge.count) ? ` style="--edge-weight:${weight(edge.count)}px"` : ""} d="${edge.path}" ${edge.undirected ? "" : `marker-end="url(#service-map-arrow${[edge.source, edge.target].includes(selectedCard) ? "-selected" : edge.kind === "api" ? "-api" : ""})"`}><title>${title(edge)}</title></path>`).join("")
         // Arrows are thin, so a wide transparent stroke over each recorded one
         // takes the pointer: its tooltip, and a click that opens its entry.
         + layout.edges.map((edge, index) => edge.kind ? `<path class="service-map-hit" data-service-edge="${index}" d="${edge.path}"><title>${title(edge)} · Select to list its rows and open a source</title></path>` : "").join("");
       const cards = layout.nodes.map((origin) => {
         if (origin.endpointNode) return `<div class="service-map-card service-map-peer-address" role="group" aria-label="Recorded address match, direct route, ${escape(origin.address)}" style="left:${origin.x}px;top:${origin.y}px"><span class="service-map-card-symbol" aria-hidden="true">◇</span><span class="service-map-card-copy"><strong title="${escape(origin.address)}">${escape(origin.address)}</strong><span class="service-map-card-scheme">Recorded address · direct · ${origin.family.toUpperCase()}</span><span class="service-map-card-meta">Undirected observations only</span><span class="service-map-card-meta">No shared ownership inferred</span></span></div>`;
+        if (origin.site) {
+          const selected = selectedCard === origin.origin;
+          return `<button class="service-map-card service-map-site ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""}" type="button" data-service-site="${escape(origin.site)}" data-service-focus="site:${escape(origin.site)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
+          <span class="service-map-card-symbol" aria-hidden="true">◈</span><span class="service-map-card-copy"><strong title="${escape(origin.members.map((member) => member.origin).join(" · "))}">*.${escape(origin.site)}</strong><span class="service-map-card-scheme">site · ${origin.members.length} origins</span><span class="service-map-card-meta">${origin.members.reduce((sum, member) => sum + member.endpoints.length, 0)} API paths · ${origin.request_count.toLocaleString()} sampled rows</span></span>
+          <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
+        </button>`;
+        }
         const selected = origin.origin === state.selectedOrigin;
         const url = new URL(origin.origin);
         const pinned = origin.origin === state.anchorOrigin;
@@ -2266,8 +2366,8 @@
       if (state.relationLayers.some((layer) => layer.kind === "peer")
         || new Set(state.relationLayers.map((layer) => layer.kind)).size > 1) {
         const addressCount = layout.nodes.filter((item) => item.endpointNode).length;
-        const originCount = layout.nodes.length - addressCount;
-        const omitted = Math.max(0, origins.length - layout.nodes.length);
+        const originCount = shownOrigins - addressCount;
+        const omitted = Math.max(0, origins.length - shownOrigins);
         const spokes = layout.edges.filter((edge) => edge.undirected).length;
         const allEdges = overlayEdges();
         const shownIds = new Set(layout.nodes.map((item) => item.origin));
@@ -2341,7 +2441,7 @@
         ];
         els.graphBounds.textContent = summary.filter(Boolean).join(" · ");
         if (els.graphDiagnostics) els.graphDiagnostics.textContent = diagnostics.join(" · ");
-      } else els.graphBounds.textContent = `${layout.nodes.length} / ${origins.length} matching origins${stages.queryHidden ? ` · ${stages.queryHidden} hidden by query` : ""}${stages.productHidden ? ` · ${stages.productHidden} hidden by products/versions` : ""}${origins.length > layout.nodes.length ? ` · ${origins.length - layout.nodes.length} omitted by ${MAX_CARDS}-card cap` : ""}${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
+      } else els.graphBounds.textContent = `${shownOrigins} / ${origins.length} matching origins${stages.queryHidden ? ` · ${stages.queryHidden} hidden by query` : ""}${stages.productHidden ? ` · ${stages.productHidden} hidden by products/versions` : ""}${origins.length > shownOrigins ? ` · ${origins.length - shownOrigins} omitted by ${MAX_CARDS}-card cap` : ""}${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
     }
     function endpointMatches(endpoint) {
       return (!state.endpointMethod || endpoint.method === state.endpointMethod) && endpoint.path.includes(state.endpointPath);
@@ -2414,7 +2514,7 @@
       const metadata = (group?.items || []).slice(0, MAX_REFERENCE_SOURCES);
       const shown = inspected.slice(0, Math.max(0, MAX_REFERENCE_SOURCES - metadata.length));
       const omitted = (group?.omitted || 0) + inspected.length - shown.length;
-      return `<h4>Shown relationships</h4><p class="service-map-muted">Declarations and literal references do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${metadata.map((item) => `<button class="service-map-evidence-button service-map-relation${JSON.stringify([item.sourceOrigin, item.targetOrigin, item.relationship]) === state.highlightedRelation ? " highlighted" : ""}" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}${item.kinds ? `<br><span class="service-map-relation-kinds">${item.kinds.map(([kind, rows]) => `${escape(REQUEST_KIND_LABELS[kind])} ${rows}`).join(" · ")}${item.cors ? ` · ${corsText(item.cors)}` : ""}</span>` : ""}</span><span>View source ›</span></button>`).join("")}${shown.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.layer.source.origin)}" data-service-relation-evidence="${escape(item.layer.source.evidenceId)}" data-service-focus="relation:${escape(JSON.stringify([layerKey(item.layer), item.target_origin, item.relation || "body", item.header_index ?? 0, item.relation_span?.start ?? 0]))}"><span><strong>${escape(item.layer.kind === "link" ? LINK_RELATIONS[item.relation].label : "Literal body URL reference")}</strong>${escape(item.layer.source.origin)} → ${escape(item.target_origin)}<br>Source sequence ${escape(item.layer.source.sequence)} · ${item.layer.scan.complete ? "Complete" : "Partial"} inspection${item.layer.kind === "body" ? `<br>${item.occurrences} literal occurrences · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets} offsets omitted` : ""}` : `<br>Link header ${item.header_index} · Member bytes ${item.link_value_span.start}–${item.link_value_span.end} · Target ${item.target_span.start}–${item.target_span.end} · Relation ${item.relation_span.start}–${item.relation_span.end}`}</span><span>View source ›</span></button>`).join("")}</div>${omitted ? `<p class="service-map-muted">${omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
+      return `<h4>Shown relationships</h4><p class="service-map-muted">Declarations and literal references do not prove service calls. Select a relationship to verify its exact source.</p><div class="service-map-evidence-list">${metadata.map((item) => `<button class="service-map-evidence-button service-map-relation${JSON.stringify([item.sourceOrigin, item.targetOrigin, item.relationship]) === state.highlightedRelation ? " highlighted" : ""}" type="button" data-service-relation-origin="${escape(item.capturedOrigin)}" data-service-relation-evidence="${escape(item.evidence)}" data-service-focus="relation:${escape(JSON.stringify([item.sourceOrigin, item.targetOrigin, item.targetPath || "", item.label]))}"><span><strong>${escape(item.label)}</strong>${escape(item.sourceOrigin)} → ${escape(item.targetOrigin)}${escape(item.targetPath || "")}${item.kinds ? `<br><span class="service-map-relation-kinds">${item.kinds.map(([kind, rows]) => `${escape(REQUEST_KIND_LABELS[kind])} ${rows}`).join(" · ")}${item.cors?.[0] ? ` · ${corsText(item.cors)}` : ""}</span>` : ""}</span><span>View source ›</span></button>`).join("")}${shown.map((item) => `<button class="service-map-evidence-button service-map-relation" type="button" data-service-relation-origin="${escape(item.layer.source.origin)}" data-service-relation-evidence="${escape(item.layer.source.evidenceId)}" data-service-focus="relation:${escape(JSON.stringify([layerKey(item.layer), item.target_origin, item.relation || "body", item.header_index ?? 0, item.relation_span?.start ?? 0]))}"><span><strong>${escape(item.layer.kind === "link" ? LINK_RELATIONS[item.relation].label : "Literal body URL reference")}</strong>${escape(item.layer.source.origin)} → ${escape(item.target_origin)}<br>Source sequence ${escape(item.layer.source.sequence)} · ${item.layer.scan.complete ? "Complete" : "Partial"} inspection${item.layer.kind === "body" ? `<br>${item.occurrences} literal occurrences · Preview byte offsets: ${item.preview_byte_offsets.join(", ")}${item.omitted_offsets ? ` · ${item.omitted_offsets} offsets omitted` : ""}` : `<br>Link header ${item.header_index} · Member bytes ${item.link_value_span.start}–${item.link_value_span.end} · Target ${item.target_span.start}–${item.target_span.end} · Relation ${item.relation_span.start}–${item.relation_span.end}`}</span><span>View source ›</span></button>`).join("")}</div>${omitted ? `<p class="service-map-muted">${omitted} additional relationship declarations omitted from this pane.</p>` : ""}`;
     }
     function bodyReferencesMarkup() {
       const result = state.bodyReferences;
@@ -2567,7 +2667,22 @@
         if (list && listScroll !== undefined) list.scrollTop = listScroll;
       }
     }
+    function siteDetailMarkup(site) {
+      const inScope = site.members.filter((member) => member.in_scope).length;
+      return `<header class="service-map-detail-header"><div><h3 title="${escape(site.site)}">*.${escape(site.site)}</h3><p>${site.members.length} origins grouped by site</p></div><span class="detail-chip ${inScope ? "ok" : "none"}">${inScope === site.members.length ? "In scope" : inScope ? "Partly in scope" : "Out of scope"}</span></header><div class="service-map-detail-body"><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-site-expand="${escape(site.site)}" data-service-focus="site:expand">Show origins separately</button><button class="secondary-action" type="button" data-service-hide="${escape(site.site)}" data-service-focus="site:hide">Hide site from map</button></div><h4>Origins</h4><div class="service-map-evidence-list">${site.members.map((member) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(member.origin)}" data-service-focus="site-member:${escape(member.origin)}"><span>${escape(member.origin)}<br>${member.captured === false ? "Referenced only in this snapshot" : `${member.endpoints.length} API paths · ${count(member.request_count).toLocaleString()} sampled rows`}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
+    }
+    // Hide or show an origin, and group its site again once shown separately.
+    function originActionsMarkup(origin) {
+      const display = siteDisplay();
+      const site = siteKey(origin.origin);
+      const hiddenAs = display.hidden.includes(origin.origin) ? origin.origin : site && display.hidden.includes(site) ? site : null;
+      const regroup = site && display.groupSites && display.expandedSites.includes(site);
+      return `<div class="service-map-overlay-actions service-map-origin-actions">${hiddenAs ? `<button class="secondary-action" type="button" data-service-unhide="${escape(hiddenAs)}" data-service-focus="origin:unhide">${hiddenAs === origin.origin ? "Show on map" : `Show *.${escape(site)} on map`}</button>` : `<button class="secondary-action" type="button" data-service-hide="${escape(origin.origin)}" data-service-focus="origin:hide">Hide from map</button>`}${regroup ? `<button class="secondary-action" type="button" data-service-site-collapse="${escape(site)}" data-service-focus="origin:regroup">Group *.${escape(site)} again</button>` : ""}</div>`;
+    }
     function renderDetail() {
+      const site = state.selectedSite ? state.siteCards?.get(state.selectedSite) : null;
+      if (site) { replaceDetail(siteDetailMarkup(site)); return; }
+      state.selectedSite = null;
       const origin = selectedOrigin();
       if (!origin) { replaceDetail('<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
       if (origin.peerInspectionOnly) {
@@ -2576,7 +2691,7 @@
       }
       if (!origin.captured) {
         const bodyReference = overlayReferences().some((item) => item.target_origin === origin.origin);
-        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header><div class="service-map-detail-body">${endpointSelectionNotice(origin)}<h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in loaded declarations${bodyReference ? " or explicitly shown retained references" : ""}. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
+        replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div></header>${originActionsMarkup(origin)}<div class="service-map-detail-body">${endpointSelectionNotice(origin)}<h4>Referenced only in this snapshot</h4><p class="service-map-muted">This origin appears only in loaded declarations${bodyReference ? " or explicitly shown retained references" : ""}. No captured rows are shown for this origin. Scope and projection bounds may omit captured history; no service role or request count is established here.</p>${relationshipMarkup(origin)}<h4>Captured origins</h4><div class="service-map-evidence-list">${origin.references.map((ref) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(ref.origin)}" data-service-focus="reference:${escape(ref.origin)}"><span>${escape(ref.label)} ${escape(ref.origin)}</span><span>Inspect source ›</span></button>`).join("")}</div>${origin.referencesOmitted ? `<p class="service-map-muted">${origin.referencesOmitted} additional source references omitted from this pane.</p>` : ""}</div>`);
         return;
       }
       const entries = loadedEndpointEntries([origin]);
@@ -2584,7 +2699,7 @@
       state.detailPage = Math.min(state.detailPage, pageCount - 1);
       const start = state.detailPage * API_PAGE_SIZE;
       if (!state.detailPageAnchor && entries[start]) state.detailPageAnchor = endpointIdentity(entries[start]);
-      replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>
+      replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>${originActionsMarkup(origin)}
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
         <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><p class="service-map-muted">${origin.technology_clues.length ? `${origin.technology_clues.length} response-header clue(s). ` : ""}No captured browser initiator, verified infrastructure inventory or certificate identity is available. Optional recorded socket observations can be added from exact source evidence; address equality does not prove shared ownership or backend.</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
@@ -2617,12 +2732,29 @@
     // is marked and focused in the inspector.
     function selectEdge(edge) {
       if (!edge?.kind) return;
-      selectOrigin(edge.relationship === "redirect_instruction" ? edge.source : edge.target);
+      const recordedBy = edge.relationship === "redirect_instruction" ? edge.source : edge.target;
+      // A site card's arrow stands for links of several origins: open the site.
+      if (recordedBy.startsWith("site:")) return selectSite(recordedBy.slice(5));
+      selectOrigin(recordedBy);
       state.highlightedRelation = JSON.stringify([edge.source, edge.target, edge.relationship]);
       renderDetail();
       const entry = els.detail.querySelector?.(".service-map-relation.highlighted");
       entry?.scrollIntoView?.({ block: "nearest" });
       entry?.focus?.({ preventScroll: true });
+    }
+    // A site card selects the site; its inspector lists the origins it holds.
+    function selectSite(site) {
+      if (!state.siteCards?.has(site)) return;
+      cancelEvidence();
+      Object.assign(state, { selectedSite: site, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
+      render();
+    }
+    // Showing a site's origins separately selects the first of them, so the
+    // inspector stays on what was being looked at.
+    function expandSite(site) {
+      const first = state.siteCards?.get(site)?.members[0]?.origin;
+      saveSiteDisplay({ expandedSites: [...new Set([...siteDisplay().expandedSites, site])] });
+      if (first) selectOrigin(first);
     }
     function handleClick(event) {
       const hit = event.target.closest?.("[data-service-edge]");
@@ -2646,6 +2778,15 @@
         selectOrigin(data.serviceOrigin, Number(data.serviceEndpoint));
         if (state.view === "apis") { state.view = "service-map"; onViewChange?.("service-map"); render(); }
       } else if (data.serviceOrigin) selectOrigin(data.serviceOrigin);
+      else if (data.serviceSite) selectSite(data.serviceSite);
+      else if (data.serviceSiteExpand) expandSite(data.serviceSiteExpand);
+      else if (data.serviceSiteCollapse) saveSiteDisplay({ expandedSites: siteDisplay().expandedSites.filter((site) => site !== data.serviceSiteCollapse) });
+      else if (data.serviceHide) {
+        if (state.selectedSite === data.serviceHide) state.selectedSite = null;
+        saveSiteDisplay({ hidden: [...new Set([...siteDisplay().hidden, data.serviceHide])] });
+      } else if (data.serviceUnhide) saveSiteDisplay({ hidden: siteDisplay().hidden.filter((entry) => entry !== data.serviceUnhide) });
+      else if (data.serviceUnhideAll) saveSiteDisplay({ hidden: [] });
+      else if (data.serviceGroupSites) saveSiteDisplay({ groupSites: !siteDisplay().groupSites });
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; renderDetail(); }
       else if (data.serviceEndpointFilterClear) setEndpointFilter("clear");
       else if (data.serviceProductFilterClear) setProductFilter("clear");
@@ -2850,5 +2991,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, relationshipOrder, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, relationshipOrder, siteKey, groupSites, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

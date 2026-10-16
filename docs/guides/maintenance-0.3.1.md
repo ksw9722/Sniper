@@ -335,3 +335,11 @@ with View source for an example row. The links carry `request_count`,
 `request_kinds`, `cors_allowed_count` and `cors_credentials_count` in the API
 and the CLI, redirects carry `request_count`, and the hidden kinds are saved in
 UI settings.
+
+Origins of one site now share a card (Group by site, on by default): a site is a
+host's last two labels, or three under common two-level suffixes such as
+`co.kr`. Their links share the card's arrow with their counts added up. The
+leading origin's site, and sites shown separately, keep a card per origin. An
+origin or a whole site can be hidden from the map in every session, and the
+legend's Hidden list brings each back. Both are saved in UI settings and change
+the map only; the API and the CLI still return every origin.

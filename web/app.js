@@ -470,6 +470,8 @@ const state = {
   serviceMapFilterSettings: createDefaultFilterSettings(),
   // Request kinds whose links the map does not draw: frames and resource loads by default.
   serviceMapHiddenLinkKinds: ["frame", "script", "static"],
+  // How the map groups sites and what it hides, in every session.
+  serviceMapSiteDisplay: { groupSites: true, expandedSites: [], hidden: [] },
   targetScopeDraft: "",
   targetScopeExcludeDraft: "",
   targetScopeDirty: false,
@@ -14752,6 +14754,7 @@ function initializeTargetWorkspace() {
       zoomIn: document.getElementById("serviceMapZoomIn"),
       graphBounds: document.getElementById("serviceMapGraphBounds"),
       linkKinds: document.getElementById("serviceMapLinkKinds"),
+      siteControls: document.getElementById("serviceMapSiteControls"),
       boundsDetails: document.getElementById("serviceMapBoundsDetails"),
       graphDiagnostics: document.getElementById("serviceMapGraphDiagnostics"),
       overlayStatus: document.getElementById("serviceMapBodyOverlay"),
@@ -14766,6 +14769,11 @@ function initializeTargetWorkspace() {
     getHiddenLinkKinds: () => state.serviceMapHiddenLinkKinds,
     setHiddenLinkKinds: (kinds) => {
       state.serviceMapHiddenLinkKinds = kinds;
+      scheduleUiSettingsSave();
+    },
+    getSiteDisplay: () => state.serviceMapSiteDisplay,
+    setSiteDisplay: (display) => {
+      state.serviceMapSiteDisplay = display;
       scheduleUiSettingsSave();
     },
     request: (path, options) => fetch(path, options),
@@ -20950,6 +20958,12 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   state.serviceMapHiddenLinkKinds = Array.isArray(snapshot?.service_map_hidden_link_kinds)
     ? ["api", "navigation", "frame", "script", "static", "other"].filter((kind) => snapshot.service_map_hidden_link_kinds.includes(kind))
     : ["frame", "script", "static"];
+  // Sites group unless switched off; lists saved before they existed are empty.
+  state.serviceMapSiteDisplay = {
+    groupSites: snapshot?.service_map_group_sites !== false,
+    expandedSites: Array.isArray(snapshot?.service_map_expanded_sites) ? snapshot.service_map_expanded_sites.filter((item) => typeof item === "string") : [],
+    hidden: Array.isArray(snapshot?.service_map_hidden) ? snapshot.service_map_hidden.filter((item) => typeof item === "string") : [],
+  };
   if (snapshot?.ws_column_widths && typeof snapshot.ws_column_widths === "object") {
     Object.entries(snapshot.ws_column_widths).forEach(([k, v]) => {
       if (WS_COLUMN_RULES[k] && WS_COLUMN_RULES[k].max > 0 && typeof v === "number") {
@@ -21037,6 +21051,9 @@ function snapshotUiSettings() {
     http_filter_settings: serializeHttpFilterSettings(),
     service_map_filter_settings: serializeHttpFilterSettings(state.serviceMapFilterSettings),
     service_map_hidden_link_kinds: Array.isArray(state.serviceMapHiddenLinkKinds) ? [...state.serviceMapHiddenLinkKinds] : ["frame", "script", "static"],
+    service_map_group_sites: state.serviceMapSiteDisplay?.groupSites !== false,
+    service_map_expanded_sites: Array.isArray(state.serviceMapSiteDisplay?.expandedSites) ? [...state.serviceMapSiteDisplay.expandedSites] : [],
+    service_map_hidden: Array.isArray(state.serviceMapSiteDisplay?.hidden) ? [...state.serviceMapSiteDisplay.hidden] : [],
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,

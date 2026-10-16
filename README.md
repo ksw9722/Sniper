@@ -246,7 +246,8 @@ Origin and Referer links are sorted by request kind (API call, page navigation,
 frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each
 kind; frames, scripts and static files draw no arrows by default, and an arrow
 grows heavier with its rows. Each link also counts the responses that let its
-source read them through CORS, with or without credentials.
+source read them through CORS, with or without credentials. Origins of one site
+share a card by default, and any origin or site can be hidden from the map.
 
 A separate, explicit `sniper-cli target service-map body-references --session-id
 <active-session-uuid> --evidence-id <returned-token>` read can inspect one retained

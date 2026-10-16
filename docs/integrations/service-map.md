@@ -295,6 +295,30 @@ selects the origin that recorded it (the target of an Origin or Referer link,
 the source of a redirect) and marks the relationship in the inspector, where
 View source opens an example row.
 
+## Sites and hidden origins
+
+**Group by site** (on by default) gathers two or more origins of one site onto a
+single card, as Caido's sitemap groups subdomains under their root domain. A site
+is a host's last two labels, or three under common two-level suffixes such as
+`co.kr` and `co.uk`; addresses and single-label hosts never group. The short
+suffix list stands in for the Public Suffix List, so a host under an unlisted
+suffix, or a hosting suffix such as `github.io`, groups by its last two labels.
+
+Links follow their origins onto the card: links inside the site disappear, and
+links of several members share the card's arrow with their rows, kinds and CORS
+counts added up. The leading origin's site (the first card, usually the page
+under test) keeps a card per origin, as does a site holding the pinned origin or
+an inspection. Selecting a site card lists its origins; **Show origins
+separately** keeps that site apart, and **Group again** on one of its origins
+undoes it.
+
+**Hide from map** on an origin, or **Hide site from map** on a site card, removes
+it and its links from the map in every session. The legend's **Hidden** list
+shows each entry with a way back, and **Show all** clears it. Grouping and
+hiding change the map only: the API and the CLI still return every origin.
+Both are saved in UI settings (`service_map_group_sites`,
+`service_map_expanded_sites`, `service_map_hidden`).
+
 ## Read through the CLI
 
 Discover the contract offline before reading a running local instance:
