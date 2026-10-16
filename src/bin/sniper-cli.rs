@@ -4366,6 +4366,10 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "description":"What the origin's own responses say about the servers behind it, outermost layer first (edge, gateway, platform, web_server, app_server, backend, language, database, os), and what they expose (category exposure: debug pages, stack traces, SQL errors, directory listings, API documents, a backend address in a BIG-IP cookie). Read from vendor header names, header values the technology catalog does not name, the names of cookies it sets, and error, default and debug page bodies. Never from another origin's rows.",
         "items":server
     });
+    origin["properties"]["favicon"] = json!({
+        "type":"string","pattern":"^v1\\.",
+        "description":"Evidence of the origin's newest retained icon: a GET answered 200 with a raster image at a favicon or apple-touch-icon path, kept whole. The GUI's card shows it. Found before the display filter; never fetched from the target. Absent when none was captured."
+    });
     origin["properties"]["front_technologies"] = json!({
         "type":"array","maxItems":32,
         "description":"Front-end frameworks, CMSs, UI kits, libraries and analytics retained scripts, pages and asset URLs name: license banners, runtime values such as Next.js's window.next, page markup such as ng-version or data-v- attributes, <meta name=generator>, CDN package@version paths, versioned file names and build directories such as /_next/static/. An asset's goes to the page that loaded it when that page is in the map.",
@@ -9917,6 +9921,10 @@ fn validate_service_map_response(
                         && link.cors_credentials_count <= link.cors_allowed_count
                         && link.cors_allowed_count <= link.request_count
                 })
+                && origin
+                    .favicon
+                    .as_deref()
+                    .is_none_or(|token| token.len() <= 200 && token.starts_with("v1."))
                 && origin.server_technologies.iter().all(|item| {
                     !item.product_id.is_empty()
                         && item.product_id.len() <= 40

@@ -18,7 +18,15 @@ origin only referenced, and **Site** a card of grouped origins. A front-end
 product or CMS (Next.js, React, Vue, WordPress and the like) makes it Front
 whatever its endpoints return when a header names it, the origin serves pages, or
 one of its pages loaded the script naming it; a CDN that only serves that script
-stays Static. A declared application product shows its mark in place of the icon. Only an error or the first load shows above the map; the snapshot
+stays Static. A declared application product shows its mark in place of the icon,
+and an origin whose own icon was captured shows that instead: the newest GET
+answered 200 with a raster image at a `favicon…` or `apple-touch-icon…` path,
+kept whole, found even when the display filter hides `ico` and `png` rows. The
+map never asks a target for an icon. The card loads it from
+`GET /api/target/service-map/favicon`, which serves the active session's
+retained bytes only when they are a PNG, ICO, GIF, JPEG or WebP image (never
+SVG), with `nosniff` and a sandbox policy; one that fails to load keeps the
+mark. The API and the CLI carry its evidence as the origin's `favicon`. Only an error or the first load shows above the map; the snapshot
 counts, coverage and window sit under **Details** below it, whose summary names
 how many origins the card cap leaves out. Compact 220×84px cards at the default 12px Display
 text size share their geometry with all arrow attachments. Larger Display text
@@ -1327,6 +1335,7 @@ point-in-time peer results; no substitute UUID lookup occurs.
 - `GET /api/target/service-map?session_id=<uuid>&in_scope_only=false&max_records=10000`
 - `GET /api/target/service-map?session_id=<uuid>&in_scope_only=false&all_rows=true&fresh=true`
 - `GET /api/target/service-map/parameters?session_id=<active-uuid>&origin=<origin>&method=<method>&path=<path>`
+- `GET /api/target/service-map/favicon?session_id=<active-uuid>&evidence_id=<origin-favicon-token>`
 - `GET /api/target/service-map/evidence?session_id=<uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/socket-peer-matches?session_id=<active-uuid>&evidence_id=<opaque-token>`
 - `GET /api/target/service-map/body-references?session_id=<active-uuid>&evidence_id=<opaque-token>`

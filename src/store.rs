@@ -602,6 +602,19 @@ fn service_map_row_index(
     Ok(index)
 }
 
+/// Notes the newest icon row of each origin. It runs before the display
+/// filter, which hides `ico` and `png` rows by default, so an origin keeps its
+/// icon whatever the map shows.
+fn note_favicon(
+    favicons: &mut std::collections::BTreeMap<String, String>,
+    record: &TransactionRecord,
+    evidence: impl FnOnce() -> String,
+) {
+    if let Some(origin) = crate::service_map::favicon_origin(record) {
+        favicons.entry(origin).or_insert_with(evidence);
+    }
+}
+
 fn service_map_body_row_index(
     inner: &StoreInner,
     key: &crate::service_map::EvidenceKey,
@@ -1705,6 +1718,7 @@ impl TransactionStore {
             omitted_rows: 0,
             stopped_by: Default::default(),
             rows: Vec::new(),
+            favicons: Default::default(),
         };
         let mut budget = LibraryBudget::default();
         let mut pending = Vec::new();
@@ -1735,6 +1749,14 @@ impl TransactionStore {
                     meta.non_http_rows += 1;
                     continue;
                 }
+                note_favicon(&mut meta.favicons, record, || {
+                    evidence_id(
+                        session_id,
+                        self.saved_cursor_generation,
+                        inner.body_generations[index],
+                        record,
+                    )
+                });
                 if !matches_filters(
                     &inner.summaries[index],
                     None,
@@ -1895,6 +1917,7 @@ impl TransactionStore {
             omitted_rows: 0,
             stopped_by: Default::default(),
             rows: Vec::new(),
+            favicons: Default::default(),
         };
         let mut bytes = 0usize;
         for ((record, revision), cached) in inner
@@ -1923,6 +1946,9 @@ impl TransactionStore {
                 snapshot.non_http_rows += 1;
                 continue;
             }
+            note_favicon(&mut snapshot.favicons, record, || {
+                evidence_id(session_id, self.saved_cursor_generation, *revision, record)
+            });
             if !matches_filters(
                 cached,
                 None,
@@ -2300,6 +2326,28 @@ impl TransactionStore {
             hook,
         )
         .await
+    }
+
+    /// The icon a map named by evidence: the row's whole retained body, when it
+    /// is still that icon row and its bytes are a raster image.
+    pub async fn service_map_favicon(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> Option<(&'static str, Vec<u8>)> {
+        let key = crate::service_map::EvidenceKey::parse(id)?;
+        if key.session_id != session_id || key.generation != self.saved_cursor_generation {
+            return None;
+        }
+        let record = {
+            let inner = self.inner.read().await;
+            let index = service_map_body_row_index(&inner, &key).ok()?;
+            let record = &inner.entries[index];
+            crate::service_map::favicon_origin(record)?;
+            self.rehydrate(record, &inner)
+        };
+        let bytes = record.response?.body_bytes();
+        crate::service_map::favicon_type(&bytes).map(|kind| (kind, bytes))
     }
 
     /// A separate opt-in operation; default metadata and body-reference reads

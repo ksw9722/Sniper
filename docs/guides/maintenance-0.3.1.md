@@ -392,6 +392,10 @@ unnamed one draws no card, and selecting one draws a Direct request arrow to
 each card it went to itself; the API and the CLI carry them as `clients`. Only
 the fixed names leave the parser, never the header.
 
+A card shows its origin's captured favicon in place of a letter mark, when
+history holds one (`favicon` in the API and the CLI); the map never requests an
+icon from a target.
+
 Cards are shorter (84px at the default text size) and a product found without a
 version shows its name alone; hovering `+N` lists the products it stands for.
 Every map toolbar control has the compact toolbar size, and the scope toggle is

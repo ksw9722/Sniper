@@ -98,7 +98,7 @@
     });
     const sites = new Map([...members].map(([site, items]) => {
       const links = items.map(relinked);
-      return [`site:${site}`, { ...referenceOrigin(`site:${site}`), site, members: items, captured: items.some((item) => item.captured !== false),
+      return [`site:${site}`, { ...referenceOrigin(`site:${site}`), site, members: items, favicon: items.find((item) => item.favicon)?.favicon, captured: items.some((item) => item.captured !== false),
         in_scope: items.some((item) => item.in_scope), request_count: items.reduce((sum, item) => sum + count(item.request_count), 0),
         redirects: links.flatMap((item) => item.redirects), header_links: links.flatMap((item) => item.header_links) }];
     }));
@@ -329,6 +329,8 @@
   const CLIENT_SYSTEMS = ["Windows", "macOS", "iOS", "Android", "ChromeOS", "Linux"];
   const CLIENT_LABELS = { browser: "Browser", webview: "WebView", app: "App", tool: "Tool", library: "Library", bot: "Crawler", unknown: "Client" };
   const MAX_CLIENT_CARDS = 4;
+  // An evidence token, v1.<session>.<generation>.<sequence>.<revision>.<record>.
+  const FAVICON_TOKEN = /^v1\.[0-9a-f-]{36}\.[0-9a-f-]{36}\.[0-9]{1,20}\.[0-9a-f-]{36}\.[0-9a-f-]{36}$/;
   const clientId = (client) => `client:${client.kind}:${client.name}:${client.os ?? ""}`;
   const clientName = (client) => client?.name || "";
   const directRows = (item) => Object.values(item.entry_kinds).reduce((sum, rows) => sum + rows, 0);
@@ -423,12 +425,13 @@
     jquery: ["$", "#0769ad", "#fff"], express: ["ex", "#353535", "#fff"], asp_net: [".N", "#512bd4", "#fff"], php: ["php", "#777bb4", "#fff"],
     spring_boot: ["S", "#6db33f", "#fff"], django: ["dj", "#0c4b33", "#fff"], laravel: ["L", "#ff2d20", "#fff"], ruby_on_rails: ["R", "#cc0000", "#fff"],
     fastapi: ["F", "#009688", "#fff"], symfony: ["sf", "#000", "#fff"], asp_net_core: [".N", "#512bd4", "#fff"] };
-  function roleMarkup(origin, pinned = false) {
+  function roleMarkup(origin, pinned = false, favicon = null) {
     const role = originRole(origin);
     const products = reportedProducts(origin);
     const product = products.filter((item) => PRODUCT_MARKS[item.id]).sort((a, b) => productRank(a) - productRank(b))[0];
     const [text, background, color] = product ? PRODUCT_MARKS[product.id] : [];
-    const icon = product ? `<span class="service-map-mark" style="background:${background};color:${color}" title="${escape(product.name)}">${escape(text)}</span>` : ROLE_ICONS[role];
+    const icon = favicon ? `<img class="service-map-favicon" src="${escape(favicon)}" alt="">`
+      : product ? `<span class="service-map-mark" style="background:${background};color:${color}" title="${escape(product.name)}">${escape(text)}</span>` : ROLE_ICONS[role];
     return `<span class="service-map-card-role role-${role}" title="${pinned ? "Pinned anchor · " : ""}${ROLE_TITLES[role]}"><span class="service-map-card-symbol" aria-hidden="true">${icon}</span><span class="service-map-card-role-label">${ROLE_LABELS[role]}</span></span>`;
   }
   function normalizeEvidenceObservations(row, catalogVersion) {
@@ -967,6 +970,7 @@
           evidence: array(redirect.evidence).filter((id) => typeof id === "string" && id.length > 0),
           request_count: count(redirect.request_count),
         })),
+        ...(FAVICON_TOKEN.test(item.favicon) ? { favicon: item.favicon } : {}),
         // What the origin's own responses say about its servers, and expose.
         server_technologies: array(item.server_technologies).filter((entry) => /^[a-z0-9_]{1,40}$/.test(entry?.product_id)
           && /^[A-Za-z.][A-Za-z0-9 .()!+_-]{0,39}$/.test(entry.name) && SERVER_CATEGORIES.includes(entry.category)
@@ -2492,6 +2496,26 @@
       }
       return { cards, links };
     }
+    // A card shows its origin's icon only once the image has loaded, so a
+    // failed one keeps the role mark rather than a broken image. Loads redraw
+    // the graph once between them.
+    const favicons = new Map();
+    let faviconRedraw = null;
+    function faviconSource(origin) {
+      if (!origin.favicon || typeof Image !== "function") return null;
+      const token = origin.favicon;
+      const source = `/api/target/service-map/favicon?${new URLSearchParams({ session_id: token.split(".")[1], evidence_id: token })}`;
+      if (!favicons.has(token)) {
+        favicons.set(token, false);
+        const image = new Image();
+        image.onload = () => {
+          favicons.set(token, true);
+          faviconRedraw ??= setTimeout(() => { faviconRedraw = null; renderGraph(); }, 0);
+        };
+        image.src = source;
+      }
+      return favicons.get(token) ? source : null;
+    }
     function renderGraph() {
       const selected = selectedOrigin();
       const direct = directNeighborhood();
@@ -2582,7 +2606,7 @@
         if (origin.site) {
           const selected = selectedCard === origin.origin;
           return `<button class="service-map-card service-map-site ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""}" type="button" data-service-site="${escape(origin.site)}" data-service-focus="site:${escape(origin.site)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
-          ${roleMarkup(origin)}<span class="service-map-card-copy"><strong title="${escape(origin.members.map((member) => member.origin).join(" · "))}">*.${escape(origin.site)}</strong><span class="service-map-card-meta">${origin.members.length} origins</span><span class="service-map-card-meta">${origin.members.reduce((sum, member) => sum + member.endpoints.length, 0)} API paths · ${origin.request_count.toLocaleString()} sampled rows</span></span>
+          ${roleMarkup(origin, false, faviconSource(origin))}<span class="service-map-card-copy"><strong title="${escape(origin.members.map((member) => member.origin).join(" · "))}">*.${escape(origin.site)}</strong><span class="service-map-card-meta">${origin.members.length} origins</span><span class="service-map-card-meta">${origin.members.reduce((sum, member) => sum + member.endpoints.length, 0)} API paths · ${origin.request_count.toLocaleString()} sampled rows</span></span>
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
         }
@@ -2590,7 +2614,7 @@
         const url = new URL(origin.origin);
         const pinned = origin.origin === state.anchorOrigin;
         return `<button class="service-map-card ${!origin.captured ? "referenced" : ""} ${selected ? "selected" : ""} ${pinned ? "pinned" : ""}" type="button" data-service-origin="${escape(origin.origin)}" data-service-focus="origin:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
-          ${roleMarkup(origin, pinned)}<span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong>${productSummaryMarkup(origin)}<span class="service-map-card-meta">${origin.peerInspectionOnly ? "Captured in peer inspection · see evidence" : origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : "Referenced only in this snapshot"}</span></span>
+          ${roleMarkup(origin, pinned, faviconSource(origin))}<span class="service-map-card-copy"><strong title="${escape(origin.origin)}">${escape(url.host)}</strong>${productSummaryMarkup(origin)}<span class="service-map-card-meta">${origin.peerInspectionOnly ? "Captured in peer inspection · see evidence" : origin.captured ? `${origin.endpoints.length} API paths · ${origin.request_count.toLocaleString()} sampled rows` : "Referenced only in this snapshot"}</span></span>
           <span class="service-map-scope-dot ${!origin.captured ? "hidden" : ""} ${origin.in_scope ? "in-scope" : ""}" title="${origin.in_scope ? "In scope" : "Out of scope"}"></span>
         </button>`;
       }).join("");

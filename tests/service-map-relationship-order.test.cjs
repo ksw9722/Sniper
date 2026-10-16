@@ -39,13 +39,13 @@ function node() {
     get innerHTML() { return html; }, set innerHTML(value) { html = value; },
   };
 }
-function fixture(options = {}) {
+function fixture(options = {}, sniperMap = map) {
   const requests = [];
   const els = Object.fromEntries(['panel', 'status', 'filterSummary', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn', 'linkKinds', 'siteControls', 'alert', 'detailsSummary'].map(name => [name, node()]));
   els.viewport.clientWidth = 300; els.viewport.clientHeight = 300;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty('--ui-root-size', '12px');
-  const controller = map.createController({ ...options, elements: els, getSessionId: () => 'session-one', document, request(path) { const pending = deferred(); pending.path = path; requests.push(pending); return pending.promise; } });
+  const controller = sniperMap.createController({ ...options, elements: els, getSessionId: () => 'session-one', document, request(path) { const pending = deferred(); pending.path = path; requests.push(pending); return pending.promise; } });
   controller.setVisible(true);
   return { controller, els, requests, state: controller.getState(), async load(payload) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
 }
@@ -558,6 +558,27 @@ test('clients lead the map in their own column and draw arrows only once selecte
   f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceOrigin: api } }) } });
   assert.equal(f.state.selectedClient, null, 'inspecting an origin leaves the client');
   assert.doesNotMatch(f.els.canvas.innerHTML, /data-relationship="client_request"/);
+});
+
+test("a card shows its origin's captured icon once the image has loaded, and keeps its mark otherwise", async () => {
+  const images = [];
+  const iconContext = vm.createContext({ URL, URLSearchParams, AbortController, console, setTimeout, getComputedStyle: element => ({ getPropertyValue: name => element.style.values[name] || '' }),
+    ResizeObserver: class { observe() {} }, Image: class { constructor() { images.push(this); } } });
+  vm.runInContext(source, iconContext);
+  const uuid = (n) => `00000000-0000-0000-0000-00000000000${n}`;
+  const token = (record) => `v1.${uuid(1)}.${uuid(2)}.7.${uuid(3)}.${uuid(record)}`;
+  const f = fixture({}, iconContext.SniperServiceMap);
+  await f.load(snapshot([origin(app, { favicon: token(4) }), origin(api, { favicon: token(5) }), origin(cdn, { favicon: 'v1.<img src=x>' })]));
+  assert.equal(f.state.snapshot.origins.find(item => item.origin === cdn).favicon, undefined, 'a malformed token is dropped');
+  assert.doesNotMatch(f.els.canvas.innerHTML, /service-map-favicon/, 'nothing shows before it loads');
+  assert.deepEqual(images.map(image => image.src).sort(), [token(4), token(5)].map(id => `/api/target/service-map/favicon?session_id=${uuid(1)}&evidence_id=${encodeURIComponent(id)}`));
+  images.find(image => image.src.endsWith(token(4))).onload();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const card = (id) => f.els.canvas.innerHTML.split(`data-service-origin="${id}"`)[1].split('</button>')[0];
+  assert.match(card(app), /<img class="service-map-favicon" src="\/api\/target\/service-map\/favicon\?session_id=[^"]+&amp;evidence_id=v1\.[^"]+" alt="">/);
+  assert.doesNotMatch(card(api), /service-map-favicon/, 'an icon that never loaded keeps the mark');
+  f.controller.selectOrigin(api);
+  assert.equal(images.length, 2, 'a redraw loads nothing again');
 });
 
 test('server technologies show on the card after the backend, exposures first, and in the inspector', async () => {

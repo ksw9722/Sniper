@@ -479,6 +479,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_parameters),
         )
         .route(
+            "/api/target/service-map/favicon",
+            get(get_target_service_map_favicon),
+        )
+        .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
         )
@@ -5788,6 +5792,42 @@ async fn get_target_service_map_parameters(
             .await,
     )
     .into_response()
+}
+
+// An origin's icon from retained history, for its map card. It reads a
+// retained body, so like the other body reads it serves the active session
+// only. Only raster images whose own bytes say so are served, never SVG, and a
+// sandbox policy keeps a page opened at this address from running anything.
+async fn get_target_service_map_favicon(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+) -> Response {
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match session
+        .store
+        .service_map_favicon(session.id(), &query.evidence_id)
+        .await
+    {
+        Some((content_type, bytes)) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src 'none'; sandbox",
+                ),
+                // The evidence names one revision of one row, so its bytes
+                // never change.
+                (header::CACHE_CONTROL, "private, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn get_target_service_map_html_generators(
@@ -16241,6 +16281,68 @@ mod tests {
         )
         .await;
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    // A card's icon: raster bytes only, with headers that keep a browser from
+    // sniffing or running them, and nothing for a session that is not active.
+    #[tokio::test]
+    async fn service_map_favicon_serves_raster_icons_of_the_active_session_only() {
+        let (state, data_dir) = test_state("sniper-service-map-favicon");
+        let active = state.active_session_for_read().await;
+        use axum::http::header;
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nIHDR";
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+        let mut record = test_replay_response_record("/favicon.ico", 200);
+        record.host = "example.com".into();
+        record.response = Some(MessageRecord::from_headers_and_body(&headers, png, 1024));
+        active.store.insert(record).await;
+        let token = active
+            .store
+            .service_map_snapshot(active.id(), 1)
+            .await
+            .favicons
+            .remove("https://example.com")
+            .unwrap();
+        let read = |session_id, evidence_id| {
+            super::get_target_service_map_favicon(
+                State(state.clone()),
+                Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id,
+                    evidence_id,
+                }),
+            )
+        };
+        let response = read(active.id(), token.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; sandbox"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], png);
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive favicon fixture".into()))
+            .unwrap();
+        assert_eq!(
+            read(inactive.id, token).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            read(active.id(), "invalid".into()).await.status(),
+            StatusCode::NOT_FOUND
+        );
         drop(active);
         drop(state);
         let _ = std::fs::remove_dir_all(data_dir);

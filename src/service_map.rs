@@ -226,6 +226,10 @@ pub struct ServiceOrigin {
     /// none, as on older servers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_technologies: Vec<ServerTechnology>,
+    /// The evidence of the origin's newest retained icon, which the GUI's card
+    /// shows. See `favicon_origin`. Absent when none was captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon: Option<String>,
 }
 
 /// A server-side technology, or an exposure, an origin's own responses name.
@@ -568,6 +572,9 @@ pub(crate) struct MetadataSnapshot {
     pub omitted_rows: usize,
     pub stopped_by: BTreeSet<String>,
     pub rows: Vec<ServiceMapRow>,
+    /// Each origin's newest icon row by evidence, read before the display
+    /// filter, which hides `ico` and `png` rows by default.
+    pub favicons: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -685,6 +692,50 @@ fn product(value: &str, expected: &str) -> bool {
             .as_bytes()
             .get(expected.len())
             .is_none_or(|b| matches!(b, b'/' | b' ' | b';' | b','))
+}
+
+/// The largest icon the map serves; a site's favicon is a few KiB.
+pub(crate) const MAX_FAVICON_BYTES: usize = 64 * 1024;
+
+/// The origin whose own icon this row is: a GET answered 200 with an image
+/// at a `favicon…` or `apple-touch-icon…` path, kept whole. The map shows it
+/// instead of a letter; it never asks a target for one.
+pub(crate) fn favicon_origin(record: &TransactionRecord) -> Option<String> {
+    if record.method != "GET" || record.status != Some(200) {
+        return None;
+    }
+    // The file name first: it rules out nearly every row without allocating.
+    let name = record.path.split(['?', '#']).next()?.rsplit('/').next()?;
+    let named = |prefix: &str| {
+        name.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    };
+    if !named("favicon") && !named("apple-touch-icon") {
+        return None;
+    }
+    let response = record.response.as_ref()?;
+    let image = response.content_type.as_deref().is_some_and(|value| {
+        let value = value.trim_start().to_ascii_lowercase();
+        value.starts_with("image/") && !value.contains("svg")
+    });
+    if !image || response.preview_truncated || response.body_size > MAX_FAVICON_BYTES {
+        return None;
+    }
+    Some(request_target(record)?.0.origin().ascii_serialization())
+}
+
+/// The type an icon's own bytes declare. Only raster formats: an SVG can carry
+/// script, and the response header may say anything.
+pub(crate) fn favicon_type(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        _ if bytes.len() > MAX_FAVICON_BYTES => None,
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0, 0, 1, 0, ..] => Some("image/x-icon"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
 }
 
 pub(crate) fn project_record(record: &TransactionRecord, id: String) -> Option<ServiceMapRow> {
@@ -1295,6 +1346,7 @@ impl MapBuilder {
                 header_links: vec![],
                 front_technologies: vec![],
                 server_technologies: vec![],
+                favicon: None,
             });
         origin.in_scope |= in_scope;
         origin.request_count += 1;
@@ -1519,6 +1571,11 @@ impl MapBuilder {
         snapshot: MetadataSnapshot,
         max_records: usize,
     ) -> ServiceMap {
+        for (origin, evidence) in &snapshot.favicons {
+            if let Some(item) = self.origins.get_mut(origin) {
+                item.favicon = Some(evidence.clone());
+            }
+        }
         // An asset's technology belongs to the page that loaded it when that
         // page is in the map; a CDN serving the file is only where it was found.
         for ((page, source_origin, product_id, version), hit) in

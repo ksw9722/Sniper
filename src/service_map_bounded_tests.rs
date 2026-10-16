@@ -1386,3 +1386,197 @@ fn server_technologies_stay_with_the_origin_that_responded() {
         "the page only loaded them"
     );
 }
+
+// An origin keeps its newest icon even when the display filter hides `ico` and
+// `png` rows, as it does by default. Only a GET answered 200 with a raster
+// image at an icon path counts, and only bytes that are an image are served.
+#[test]
+fn origins_keep_their_newest_icon_whatever_the_display_filter_hides() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(105);
+    let png: &[u8] = b"\x89PNG\r\n\x1a\nIHDR";
+    let icon = |host: &str, path: &str, status, kind: &str, body: &[u8], sequence| {
+        let mut record = filter_fixture(host, path, status, kind, None, sequence);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, kind.parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(&headers, body, 1024));
+        record
+    };
+    // Newest first, as `from_records` takes them.
+    let store = TransactionStore::from_records(vec![
+        filter_fixture("www.example.com", "/", 200, "text/html", None, 1),
+        icon(
+            "www.example.com",
+            "/static/Favicon-32x32.png",
+            200,
+            "image/png",
+            png,
+            2,
+        ),
+        icon(
+            "www.example.com",
+            "/favicon.ico",
+            200,
+            "image/x-icon",
+            png,
+            3,
+        ),
+        filter_fixture(
+            "api.example.com",
+            "/v1/items",
+            200,
+            "application/json",
+            None,
+            4,
+        ),
+        icon(
+            "api.example.com",
+            "/favicon.ico",
+            404,
+            "image/x-icon",
+            png,
+            5,
+        ),
+        icon(
+            "api.example.com",
+            "/favicon.svg",
+            200,
+            "image/svg+xml",
+            b"<svg/>",
+            6,
+        ),
+        icon("api.example.com", "/logo.png", 200, "image/png", png, 7),
+        icon(
+            "api.example.com",
+            "/favicon.ico",
+            200,
+            "text/html",
+            b"<html>",
+            8,
+        ),
+        filter_fixture(
+            "cdn.example.com",
+            "/app.js",
+            200,
+            "text/javascript",
+            None,
+            9,
+        ),
+        icon(
+            "cdn.example.com",
+            "/apple-touch-icon.png",
+            200,
+            "image/png",
+            b"<html>no</html>",
+            10,
+        ),
+    ]);
+    let hidden = ListFilters {
+        hidden_extensions: vec!["ico".into(), "png".into()],
+        ..ListFilters::default()
+    };
+    let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        DEFAULT_MAX_RECORDS,
+        technology::CatalogVersion::V2,
+        &hidden,
+    );
+    let windowed = build_bounded(
+        session,
+        snapshot,
+        DEFAULT_MAX_RECORDS,
+        false,
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    let (all, _) = store
+        .service_map_all_rows_blocking(
+            session,
+            technology::CatalogVersion::V2,
+            &hidden,
+            false,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    for map in [&windowed, &all] {
+        let favicon = |host: &str| {
+            map.origins
+                .iter()
+                .find(|origin| origin.origin == format!("https://{host}"))
+                .unwrap()
+                .favicon
+                .clone()
+        };
+        // The evidence ends with the row's record ID: the fixture's sequence + 1.
+        let row = |token: Option<String>| {
+            token.map(|token| token.rsplit('.').next().unwrap().parse::<Uuid>().unwrap())
+        };
+        assert_eq!(
+            row(favicon("www.example.com")),
+            Some(Uuid::from_u128(3)),
+            "the newest icon"
+        );
+        assert_eq!(
+            favicon("api.example.com"),
+            None,
+            "a failure, an SVG, a logo and a page"
+        );
+        assert_eq!(row(favicon("cdn.example.com")), Some(Uuid::from_u128(11)));
+        assert!(
+            map.origins.iter().all(|origin| origin
+                .endpoints
+                .iter()
+                .all(
+                    |endpoint| !endpoint.path.ends_with(".ico") && !endpoint.path.ends_with(".png")
+                )),
+            "the icon rows themselves stay filtered out"
+        );
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let origin = |host: &str| {
+        all.origins
+            .iter()
+            .find(|origin| origin.origin == format!("https://{host}"))
+            .unwrap()
+    };
+    let token = origin("www.example.com").favicon.clone().unwrap();
+    assert_eq!(
+        runtime.block_on(store.service_map_favicon(session, &token)),
+        Some(("image/png", png.to_vec()))
+    );
+    assert_eq!(
+        runtime.block_on(store.service_map_favicon(Uuid::from_u128(1), &token)),
+        None,
+        "another session"
+    );
+    let cdn = origin("cdn.example.com").favicon.clone().unwrap();
+    assert_eq!(
+        runtime.block_on(store.service_map_favicon(session, &cdn)),
+        None,
+        "bytes that are not an image are not served, whatever the header says"
+    );
+    let page = origin("www.example.com").endpoints[0].evidence[0].clone();
+    assert_eq!(
+        runtime.block_on(store.service_map_favicon(session, &page)),
+        None,
+        "a page row"
+    );
+    assert_eq!(
+        favicon_type(b"\x00\x00\x01\x00\x01\x00"),
+        Some("image/x-icon")
+    );
+    assert_eq!(
+        favicon_type(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+        Some("image/webp")
+    );
+    assert_eq!(
+        favicon_type(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+        None
+    );
+    assert_eq!(favicon_type(&vec![0x89; MAX_FAVICON_BYTES + 1]), None);
+}
