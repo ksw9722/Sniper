@@ -18,7 +18,14 @@ origin only referenced, and **Site** a card of grouped origins. A front-end
 product or CMS (Next.js, React, Vue, WordPress and the like) makes it Front
 whatever its endpoints return when a header names it, the origin serves pages, or
 one of its pages loaded the script naming it; a CDN that only serves that script
-stays Static. A declared application product shows its mark in place of the icon,
+stays Static. An origin that serves pages and API data names both, Front over
+API (a manifest or a JSON error is not API data for this). **Auth** marks an
+authentication server: an identity provider by product (Keycloak), an origin
+whose typed paths are mostly sign-in, token and logout endpoints (OAuth,
+OpenID Connect, SAML, CAS) with at least two of them, one a client asked for a
+token with OAuth parameters, or one whose host is named for it (`sso.`,
+`auth.`, `login.`, `accounts.`, `idp.` and a few more) with such a path. An app
+that also signs its users in keeps its own role. A declared application product shows its mark in place of the icon,
 and an origin whose own icon was captured shows that instead: the newest GET
 answered 200 with a raster image at a `favicon…` or `apple-touch-icon…` path,
 kept whole, found even when the display filter hides `ico` and `png` rows. The
@@ -408,6 +415,30 @@ API and the CLI carry them on the origin as `front_technologies` (`product_id`,
 `name`, `category`, `version` when named, `source_origin` where the first naming
 row was served, `row_count`, `evidence`), at most 32 per origin, omitted when
 nothing names one.
+
+## API paths
+
+The inspector's APIs tab and the API catalog list an origin's endpoints by
+method and path. Paths that differ only in an ID share one row: the template
+with its ID segments marked, how many paths and rows it stands for, and their
+sign-in kinds; opening it lists the paths, each selectable. A segment is an ID
+when it is all digits (up to 18), a UUID, or 16 to 128 hex digits with at
+least one digit and one letter, as a MongoDB ObjectId or a hash is; the API and
+the CLI carry the template as the endpoint's `path_group`
+(`/web/chats/{number}/posts/{hex}`), the same as `path` when it has no ID.
+
+## Unnamed signals
+
+What an origin's responses carry that no rule names is kept for a reader to
+judge, person or agent: a `Server` or `X-Powered-By` value (`server: HeRay`),
+a response header name no server sends by default (`heray-cache-status`), and
+a cookie name (`WMONID`). Standard headers, a named header and a catalog
+product are left out, and so is a `Via` value, which can name an internal
+host; no other header value is kept. The inspector folds them under **Unnamed
+signals**, each with View source; the API and the CLI carry them as the
+origin's `unnamed` (`banners`, `headers`, `cookies`, each busiest first and at
+most 16, with `value`, `row_count` and `evidence`), omitted when everything was
+named.
 
 ## Endpoint parameters
 

@@ -200,6 +200,8 @@ pub struct ClientOrigin {
 const MAX_CLIENTS: usize = 16;
 const MAX_CLIENT_ORIGINS: usize = 64;
 const MAX_CLIENT_ADDRESSES: usize = 8;
+const MAX_UNNAMED: usize = 16;
+const MAX_UNNAMED_PER_ROW: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceOrigin {
@@ -239,6 +241,38 @@ pub struct ServiceOrigin {
     /// `service_map_auth`. Absent when no row named a method.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth: Vec<AuthMethod>,
+    /// What its responses carried that no rule names, for a reader to judge:
+    /// a `Server` or `X-Powered-By` value, a header name, a cookie name.
+    /// Absent when everything was named.
+    #[serde(default, skip_serializing_if = "Unnamed::is_empty")]
+    pub unnamed: Unnamed,
+}
+
+/// Signals no rule names, busiest first, at most 16 of each.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Unnamed {
+    /// `Server` and `X-Powered-By` values, as `server: HeRay`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub banners: Vec<UnnamedSignal>,
+    /// Response header names no server sends by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<UnnamedSignal>,
+    /// Names of the cookies its responses set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cookies: Vec<UnnamedSignal>,
+}
+
+impl Unnamed {
+    pub fn is_empty(&self) -> bool {
+        self.banners.is_empty() && self.headers.is_empty() && self.cookies.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnnamedSignal {
+    pub value: String,
+    pub row_count: usize,
+    pub evidence: Vec<String>,
 }
 
 /// One way an origin's requests authenticate: a scheme, an API key header, a
@@ -414,6 +448,9 @@ pub struct ServiceMapRow {
     /// The client its User-Agent and Client Hints name; aggregated only.
     #[serde(skip)]
     pub client: Option<crate::service_map_clients::Client>,
+    /// Response headers no rule named: (`banner`, `header` or `cookie`, value).
+    #[serde(skip)]
+    pub unnamed: Vec<(&'static str, String)>,
     /// Sent from Replay: a request a tester chose, whose answer is read
     /// whatever its status.
     #[serde(skip)]
@@ -820,6 +857,7 @@ pub(crate) fn project_record_for_catalog(
         cors: None,
         libraries: Vec::new(),
         client: None,
+        unnamed: Vec::new(),
         sent_from_replay: record
             .notes
             .iter()
@@ -1048,16 +1086,61 @@ pub(crate) fn project_record_for_catalog(
         }
     }
     // What the responding servers say about themselves: vendor headers, values
-    // the catalog does not name, and the cookies they set.
-    for detection in crate::service_map_servers::detect_headers(
-        response
-            .headers
-            .iter()
-            .take(MAX_HEADERS)
-            .filter(|header| header.value.len() <= MAX_HEADER_VALUE_BYTES)
-            .map(|header| (header.name.as_str(), header.value.as_str())),
-    ) {
-        crate::service_map_libraries::merge(&mut row.libraries, detection);
+    // the catalog does not name, and the cookies they set. A header neither
+    // names is kept for a reader to judge; a `Via` value can name an internal
+    // host, so only its presence counts.
+    for (index, header) in response.headers.iter().enumerate().take(MAX_HEADERS) {
+        if header.value.len() > MAX_HEADER_VALUE_BYTES {
+            continue;
+        }
+        let detections = crate::service_map_servers::detect_header(&header.name, &header.value);
+        let named = !detections.is_empty()
+            || row
+                .technology_observations
+                .iter()
+                .flatten()
+                .any(|observation| observation.header_index == index);
+        for detection in detections {
+            crate::service_map_libraries::merge(&mut row.libraries, detection);
+        }
+        if named {
+            continue;
+        }
+        let name = header.name.to_ascii_lowercase();
+        let value = header.value.trim();
+        let unnamed = match name.as_str() {
+            "server" | "x-powered-by"
+                if (1..=64).contains(&value.len())
+                    && value.bytes().all(|b| (0x20..0x7f).contains(&b)) =>
+            {
+                Some(("banner", format!("{name}: {value}")))
+            }
+            "set-cookie" => value
+                .split(['=', ';'])
+                .next()
+                .map(str::trim)
+                .filter(|cookie| {
+                    (1..=64).contains(&cookie.len())
+                        && cookie
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+                })
+                .map(|cookie| ("cookie", cookie.to_string())),
+            _ if name.len() <= 64
+                && !crate::service_map_servers::standard_header(&name)
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+            {
+                Some(("header", name))
+            }
+            _ => None,
+        };
+        if let Some(signal) = unnamed {
+            if row.unnamed.len() < MAX_UNNAMED_PER_ROW {
+                row.unnamed.push(signal);
+            }
+        }
     }
     row.omitted.sort();
     row.omitted.dedup();
@@ -1340,6 +1423,8 @@ pub(crate) struct MapBuilder {
     clients: BTreeMap<(&'static str, &'static str, Option<&'static str>), ClientTally>,
     /// Rows per origin, auth kind and name.
     auth: BTreeMap<(String, &'static str, Option<String>), (usize, Vec<String>)>,
+    /// Rows per origin, unnamed signal kind and value.
+    unnamed: BTreeMap<(String, &'static str, String), (usize, Vec<String>)>,
     projected_rows: usize,
     included_rows: usize,
     excluded_rows: usize,
@@ -1358,6 +1443,7 @@ impl MapBuilder {
             front_hits: BTreeMap::new(),
             clients: BTreeMap::new(),
             auth: BTreeMap::new(),
+            unnamed: BTreeMap::new(),
             projected_rows: 0,
             included_rows: 0,
             excluded_rows: 0,
@@ -1408,6 +1494,7 @@ impl MapBuilder {
                 server_technologies: vec![],
                 favicon: None,
                 auth: vec![],
+                unnamed: Unnamed::default(),
             });
         origin.in_scope |= in_scope;
         origin.request_count += 1;
@@ -1490,6 +1577,14 @@ impl MapBuilder {
                 }
             }
             sample(&mut endpoint.evidence, &row.evidence_id);
+        }
+        for (kind, value) in std::mem::take(&mut row.unnamed) {
+            let (rows, evidence) = self
+                .unnamed
+                .entry((row.origin.clone(), kind, value))
+                .or_default();
+            *rows += 1;
+            sample(evidence, &row.evidence_id);
         }
         for signal in std::mem::take(&mut row.auth) {
             if let Some(index) = endpoint_index {
@@ -1701,7 +1796,29 @@ impl MapBuilder {
                 });
             }
         }
+        for ((origin, kind, value), (row_count, evidence)) in std::mem::take(&mut self.unnamed) {
+            if let Some(item) = self.origins.get_mut(&origin) {
+                let signals = match kind {
+                    "banner" => &mut item.unnamed.banners,
+                    "header" => &mut item.unnamed.headers,
+                    _ => &mut item.unnamed.cookies,
+                };
+                signals.push(UnnamedSignal {
+                    value,
+                    row_count,
+                    evidence,
+                });
+            }
+        }
         for item in self.origins.values_mut() {
+            for signals in [
+                &mut item.unnamed.banners,
+                &mut item.unnamed.headers,
+                &mut item.unnamed.cookies,
+            ] {
+                signals.sort_by(|a, b| (b.row_count, &a.value).cmp(&(a.row_count, &b.value)));
+                signals.truncate(MAX_UNNAMED);
+            }
             item.auth.sort_by(|a, b| {
                 (b.row_count, rank(&a.kind), &a.name).cmp(&(a.row_count, rank(&b.kind), &b.name))
             });

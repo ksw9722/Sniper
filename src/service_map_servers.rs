@@ -1059,6 +1059,23 @@ pub(crate) fn detect_headers<'a>(
         }
     };
     for (name, value) in headers {
+        for detection in detect_header(name, value) {
+            add(Some(detection));
+        }
+    }
+    found
+}
+
+/// What one response header says about the servers behind it; empty when no
+/// rule names anything from it.
+pub(crate) fn detect_header(name: &str, value: &str) -> Vec<Detection> {
+    let mut found = Vec::new();
+    let mut add = |detection: Option<Detection>| {
+        if let Some(detection) = detection {
+            crate::service_map_libraries::merge(&mut found, detection);
+        }
+    };
+    {
         let name = name.to_ascii_lowercase();
         let value = value.trim();
         let valued = name == "set-cookie" || HEADERS.values.contains_key(name.as_str());
@@ -1078,7 +1095,7 @@ pub(crate) fn detect_headers<'a>(
             for index in rules.chain(prefixed) {
                 add(known(HEADER_RULES[index].2, None, "header"));
             }
-            continue;
+            return found;
         }
         let mut hasher = DefaultHasher::new();
         (name.as_str(), value).hash(&mut hasher);
@@ -1104,6 +1121,84 @@ pub(crate) fn detect_headers<'a>(
         }
     }
     found
+}
+
+// Response headers any server sends, which say nothing about which one did.
+const STANDARD_HEADERS: &[&str] = &[
+    "accept-ch",
+    "accept-ranges",
+    "age",
+    "allow",
+    "alt-svc",
+    "cache-control",
+    "clear-site-data",
+    "connection",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-location",
+    "content-range",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "content-type",
+    "critical-ch",
+    "cross-origin-embedder-policy",
+    "cross-origin-embedder-policy-report-only",
+    "cross-origin-opener-policy",
+    "cross-origin-opener-policy-report-only",
+    "cross-origin-resource-policy",
+    "date",
+    "document-policy",
+    "etag",
+    "expect-ct",
+    "expires",
+    "feature-policy",
+    "keep-alive",
+    "last-modified",
+    "link",
+    "location",
+    "nel",
+    "origin-agent-cluster",
+    "p3p",
+    "permissions-policy",
+    "pragma",
+    "proxy-authenticate",
+    "referrer-policy",
+    "refresh",
+    "report-to",
+    "reporting-endpoints",
+    "retry-after",
+    "server-timing",
+    "service-worker-allowed",
+    "set-cookie",
+    "strict-transport-security",
+    "timing-allow-origin",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "vary",
+    "via",
+    "warning",
+    "www-authenticate",
+    "x-content-type-options",
+    "x-dns-prefetch-control",
+    "x-download-options",
+    "x-frame-options",
+    "x-permitted-cross-domain-policies",
+    "x-request-id",
+    "x-correlation-id",
+    "x-robots-tag",
+    "x-ua-compatible",
+    "x-xss-protection",
+];
+
+/// Whether a response header is one any server sends; the rest may name a
+/// server no rule knows.
+pub(crate) fn standard_header(name: &str) -> bool {
+    STANDARD_HEADERS.contains(&name)
+        || name.starts_with("access-control-")
+        || name.starts_with("sec-")
 }
 
 /// A Set-Cookie's name, or a header whose value its rules read.

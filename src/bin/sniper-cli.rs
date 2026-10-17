@@ -4383,6 +4383,20 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "description":"How the origin's requests authenticate, busiest first: the Authorization scheme (bearer_jwt, bearer, basic, digest, negotiate, ntlm, aws_sigv4, or another scheme), an API key header, session or JWT cookies by name, a credential in the query string, and OAuth 2.0, OpenID Connect and SAML parameters. Read from names and shapes only; no credential value is kept or reported.",
         "items":auth
     });
+    let unnamed_signal = service_map_object(json!({
+        "value":{"type":"string","pattern":"^[\\x20-\\x7e]{1,80}$"},
+        "row_count":count,"evidence":strings
+    }));
+    let unnamed_list = |what: &str| json!({"type":"array","maxItems":16,"items":unnamed_signal.clone(),"description":what});
+    origin["properties"]["unnamed"] = json!({
+        "type":"object","additionalProperties":false,
+        "properties":{
+            "banners":unnamed_list("Server and X-Powered-By values no rule names, as `server: HeRay`."),
+            "headers":unnamed_list("Response header names no rule names and no server sends by default."),
+            "cookies":unnamed_list("Names of cookies the origin set that no rule names.")
+        },
+        "description":"What the origin's responses carried that no rule names, busiest first and at most 16 of each, for the reader to judge: a banner, a header name, a cookie name. Only the Server and X-Powered-By values are kept, never another header's value; each entry's evidence opens a row that carried it. Absent when everything was named, and on older servers."
+    });
     origin["properties"]["favicon"] = json!({
         "type":"string","pattern":"^v1\\.",
         "description":"Evidence of the origin's newest retained icon: a GET answered 200 with a raster image at a favicon or apple-touch-icon path, kept whole. The GUI's card shows it. Found before the display filter; never fetched from the target. Absent when none was captured."
@@ -9943,6 +9957,20 @@ fn validate_service_map_response(
                     .favicon
                     .as_deref()
                     .is_none_or(|token| token.len() <= 200 && token.starts_with("v1."))
+                && [
+                    &origin.unnamed.banners,
+                    &origin.unnamed.headers,
+                    &origin.unnamed.cookies,
+                ]
+                .iter()
+                .all(|signals| {
+                    signals.len() <= 16
+                        && signals.iter().all(|signal| {
+                            signal.row_count > 0
+                                && (1..=80).contains(&signal.value.len())
+                                && signal.value.bytes().all(|b| (0x20..0x7f).contains(&b))
+                        })
+                })
                 && origin.auth.iter().all(|method| {
                     sniper::service_map_auth::KINDS.contains(&method.kind.as_str())
                         && method.row_count > 0

@@ -268,6 +268,45 @@ Accepted spans use retained UTF-8 preview byte offsets; the parser stop cursor
 may split a UTF-8 character and must never be used to slice text. There is no map
 aggregation, automatic body scan, or persistence of this supplementary result.
 
+### Reading the map as an agent
+
+The map is built for a model to read as well as a person. A workable order:
+
+1. Read the map for the session (`scope service-map --session-id <uuid>
+   --all-rows`), or one origin with `--origin`. Each origin carries what its
+   own responses name, by layer (`server_technologies[].category`: edge,
+   gateway, platform, web_server, app_server, backend, monitoring, language,
+   database, os, exposure), what its pages load (`front_technologies`, with
+   `source_origin`), how its requests authenticate (`auth`), its endpoints
+   (`endpoints[]`, each with `path_group`, the path with ID segments as
+   `{number}`, `{uuid}` or `{hex}`), and `unnamed`: the `Server` and
+   `X-Powered-By` values, header names and cookie names no rule names.
+   `clients[]` lists what sent the traffic, with the `addresses` it connected
+   from.
+2. Treat every entry as a claim with evidence, not as proof. Open the rows
+   behind a claim with `scope service-map-evidence` and the tokens from the
+   same read, and an endpoint's parameters with `scope service-map
+   parameters`.
+3. Judge `unnamed` yourself: a banner such as `server: HeRay` or a header such
+   as `x-cdn-pop` may name a product the rules do not know. Open its evidence
+   row, read the other headers and the body, and decide; say how sure you are
+   and why.
+4. Group endpoints by `path_group` before describing an API; one template
+   stands for many concrete IDs.
+5. Roles are not in the JSON. An origin that serves HTML pages and API data
+   (JSON, XML) is both; one whose typed endpoints are mostly sign-in, token and
+   logout paths (OAuth, OIDC, SAML, CAS), or that names an identity provider,
+   is an authentication server.
+6. Record a conclusion on the row it rests on with `capture http annotate --id
+   <transaction-uuid> --note "<what you concluded and why>"`, dry run first, so
+   the next reader sees it in history. The transaction UUID is the last part
+   of the evidence token.
+
+None of this sends traffic to a target. Probing is a separate, deliberate step:
+a request sent from Replay is read by the map whatever its status, so a
+deliberate probe (a missing path for the default error page, `/actuator`,
+`/.git/config`) names what it reveals on the next read.
+
 ## Saved data and session management
 
 ### Prefer the saved-data v1 contract

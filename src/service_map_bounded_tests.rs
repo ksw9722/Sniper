@@ -2032,6 +2032,70 @@ fn a_narrow_map_keeps_what_its_pages_loaded_from_elsewhere() {
     }
 }
 
+// What no rule names is kept for a reader to judge: a banner, a header name, a
+// cookie name. A named header, a standard one, and a Via value are not.
+#[test]
+fn an_origin_lists_what_no_rule_names() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(112);
+    let row = |pairs: &[(&str, &str)], sequence| {
+        let mut record = filter_fixture("www.example.com", "/", 200, "text/html", None, sequence);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, "text/html".parse().unwrap());
+        for (name, value) in pairs {
+            headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        record.response = Some(MessageRecord::from_headers_and_body(&headers, b"", 0));
+        record
+    };
+    let store = TransactionStore::from_records(vec![
+        row(
+            &[
+                ("Server", "HeRay"),
+                ("heray-cache-status", "HIT"),
+                ("x-request-id", "1"),
+                ("CF-RAY", "8d2c1e9a7b3f1a2b-ICN"),
+                ("Via", "1.1 cache-1.internal.example.com"),
+                ("Set-Cookie", "WMONID=abc; Path=/"),
+                ("Set-Cookie", "JSESSIONID=ABC123; Path=/"),
+            ],
+            1,
+        ),
+        row(
+            &[("Server", "nginx/1.25.3"), ("heray-cache-status", "MISS")],
+            2,
+        ),
+    ]);
+    let (map, _) = store
+        .service_map_all_rows_blocking(
+            session,
+            technology::CatalogVersion::V2,
+            &ListFilters::default(),
+            false,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    let unnamed = &map.origins[0].unnamed;
+    let values = |signals: &[UnnamedSignal]| {
+        signals
+            .iter()
+            .map(|signal| (signal.value.clone(), signal.row_count))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values(&unnamed.banners), [("server: HeRay".to_string(), 1)]);
+    assert_eq!(
+        values(&unnamed.headers),
+        [("heray-cache-status".to_string(), 2)]
+    );
+    assert_eq!(values(&unnamed.cookies), [("WMONID".to_string(), 1)]);
+    assert!(unnamed.banners[0].evidence.len() == 1);
+}
+
 // An API's successful answer is not read, but the same answer to a request a
 // tester sent from Replay is, as is what a diagnostic path answers.
 #[test]

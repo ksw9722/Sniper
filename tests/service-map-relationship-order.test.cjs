@@ -578,6 +578,19 @@ test('clients lead the map in their own column and draw arrows only once selecte
   assert.doesNotMatch(f.els.canvas.innerHTML, /data-relationship="client_request"/);
 });
 
+test('the inspector folds away what no rule names, each with its source', async () => {
+  const f = fixture();
+  await f.load(snapshot([origin(api, { unnamed: {
+    banners: [{ value: 'server: HeRay', row_count: 2, evidence: ['evidence-heray'] }],
+    headers: [{ value: '<b>x-cdn-pop</b>', row_count: 1, evidence: ['evidence-pop'] }, { value: 'bad\u0001', row_count: 1, evidence: [] }],
+  } })]));
+  f.controller.selectOrigin(api);
+  const detail = f.els.detail.innerHTML;
+  assert.match(detail, /<details class="service-map-technologies service-map-unnamed"><summary[^>]*>Unnamed signals · 2<\/summary>/, 'a control character drops one');
+  assert.match(detail, /data-service-relation-evidence="evidence-heray"[^>]*><span><code>server: HeRay<\/code> · 2 rows/);
+  assert.match(detail, /<code>&lt;b&gt;x-cdn-pop&lt;\/b&gt;<\/code>/, 'escaped');
+});
+
 test('a client card names the address it connected from, and the inspector every one', async () => {
   const client = (name, addresses) => ({ kind: 'app', name, versions: [], request_count: 2, evidence: [], addresses,
     origins: [{ origin: api, request_count: 2, entry_kinds: { api: 2 } }] });
