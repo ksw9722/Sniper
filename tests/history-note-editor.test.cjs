@@ -91,6 +91,7 @@ function fixture({ joinAnnotations = false } = {}) {
   ];
   if (joinAnnotations) functions.push(
     "updateAnnotations", "flushPendingAnnotations", "currentHistoryNoteEditWindow", "syncHistoryNoteEditWindow",
+    "flushTransactionDeltas", "applyLiveSummaryUpdate", "canMergeRecentTransactions",
     "retainFilteredHistoryNote", "releaseDetachedHistoryNoteEdits", "renderHistory", "getHistoryRowHeight", "renderHistoryVirtual",
     "renderHistoryCell", "escapeHtml", "isSessionEmpty", "historyEmptyMessage",
     "rebuildHistoryItemIndex", "getHistoryItemIndex", "resortLoadedHistoryItemsForCurrentSort",
@@ -119,7 +120,9 @@ function fixture({ joinAnnotations = false } = {}) {
     fetch(url, options) { const request = { url, options, ...deferred() }; requests.push(request); return request.promise; },
     showToast(...args) { toasts.push(args); },
     updateAnnotations(...args) { saves.push(args); },
-    state, annotationClientId: "fixture-client", nextAnnotationClientVersion: () => ++clientVersion,
+    state, _pendingTransactionSummaries: [], _historyFullLoadInFlight: 0, _searchActiveUntil: 0,
+    scheduleTransactionDeltaFlush() {}, scheduleIncrementalRefresh() {},
+    annotationClientId: "fixture-client", nextAnnotationClientVersion: () => ++clientVersion,
     sessionWritePath: (url, session) => `fixture-only:${session}${url}`, observeAnnotationRevision() {},
     getHistoryItemIndex: (id) => state.items.findIndex((entry) => entry.id === id),
     prepareHistoryItem() {},
@@ -157,6 +160,9 @@ function fixture({ joinAnnotations = false } = {}) {
     },
     document: {
       ...document,
+      querySelectorAll(selector) {
+        return selector === "input.note-inline-input" ? cells.filter(cell => cell.isConnected).map(cell => cell.querySelector()).filter(Boolean) : [];
+      },
       createElement(tag) {
         assert.equal(tag, "input");
         const listeners = {};
@@ -1752,4 +1758,57 @@ test("note ordinary Enter after composition commits final text exactly once", as
   assert.equal(f.saves.length, 1);
   assert.equal(f.saves[0][1].user_note, "한국어");
   assert.equal(f.timers.size, 0);
+});
+
+for (const acknowledgementFirst of [false, true]) {
+  test(`live completion preserves a composing note editor ${acknowledgementFirst ? "after a clear acknowledgement" : "before its first save"}`, async () => {
+    const f = fixture({ joinAnnotations: true });
+    f.state.filterSettings.onlyNotes = true;
+    Object.assign(f.item, { method: "GET", status: 200, note_count: 1 });
+    const input = await openSavedNote(f);
+    if (acknowledgementFirst) {
+      input.value = ""; input.dispatch("input"); runTimers(f);
+      await acknowledgeAnnotation(f, annotationRequests(f)[0]);
+    } else {
+      f.item.has_user_note = false;
+    }
+    input.dispatch("compositionstart");
+    input.value = "한글"; input.dispatch("input", undefined, { isComposing: true });
+    f.context._pendingTransactionSummaries.push({ sessionId: f.context.session, summary: { ...f.item, note_count: 0 } });
+    f.context.flushTransactionDeltas();
+    assert.equal(f.state.items.length, 0);
+    assert.equal(f.state.historyPaging.filteredTotal, 0);
+    assert.equal(f.cell.querySelector(), input, "completion must not detach the IME input");
+    assert.equal(input.value, "한글");
+    assert.ok(f.state._historyNoteEditWindow, "live filtering preserves the editor's row recovery");
+    input.dispatch("compositionend"); runTimers(f);
+    await acknowledgeAnnotation(f, annotationRequests(f).at(-1));
+    assert.equal(f.state.items.length, 1);
+    assert.equal(f.state.items[0].note_preview, "한글");
+    assert.equal(f.state.historyPaging.filteredTotal, 1);
+    assert.equal(f.state.historyPaging.total, 1);
+    input.dispatch("blur");
+  });
+}
+
+test("unrelated live completion preserves a filtered composing editor's recovery", async () => {
+  const f = fixture({ joinAnnotations: true });
+  f.state.filterSettings.onlyNotes = true;
+  Object.assign(f.item, { method: "GET", status: 200, note_count: 1, has_user_note: false });
+  const other = { id: "other-record", sequence: 2, method: "GET", status: 200, note_count: 1, has_user_note: true, note_preview: "Other" };
+  f.state.items.push(other); f.context.rebuildHistoryItemIndex();
+  Object.assign(f.state.historyPaging, { total: 2, filteredTotal: 2, offset: 2 });
+  const input = await openSavedNote(f, "");
+  input.dispatch("compositionstart");
+  input.value = "한글"; input.dispatch("input", undefined, { isComposing: true });
+  f.context._pendingTransactionSummaries.push({ sessionId: f.context.session, summary: { ...f.item, note_count: 0 } });
+  f.context.flushTransactionDeltas();
+  assert.equal(f.state.items.length, 1);
+  f.context._pendingTransactionSummaries.push({ sessionId: f.context.session, summary: { ...other, response_bytes: 42 } });
+  f.context.flushTransactionDeltas();
+  assert.equal(f.cell.querySelector(), input);
+  input.dispatch("compositionend"); runTimers(f);
+  await acknowledgeAnnotation(f, annotationRequests(f).at(-1));
+  assert.equal(f.state.items.length, 2, "saved nonempty note must restore its matching row after unrelated completion");
+  assert.equal(f.context.getHistoryItem(f.item.id).note_preview, "한글");
 });

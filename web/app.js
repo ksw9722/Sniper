@@ -5772,48 +5772,62 @@ async function loadTransactionDetail(id) {
   const generation = ++_historyDetailGeneration;
   const sessionId = currentSessionId();
   const reconcileRetention = state._historyRetentionReconcile === true;
-  const response = await fetch(transactionPath(id, sessionId));
-  if (generation !== _historyDetailGeneration || sessionId !== currentSessionId()) {
-    return null;
-  }
-  if (!response.ok) {
-    if (response.status === 404) {
-      if (reconcileRetention) {
-        applyConfirmedHistoryRemoval([id], sessionId);
-        return null;
-      }
-      const index = state.items.findIndex((item) => item.id === id);
-      let nextSelectedId = null;
-      if (index >= 0) {
-        state.items.splice(index, 1);
-        nextSelectedId = state.items[Math.min(index, state.items.length - 1)]?.id ?? null;
-        state._itemsVersion += 1;
-        adjustHistoryPagingAfterLocalRemoval(1);
-        precomputeItemIndexes();
-        invalidateVisibleEntriesCache();
-        refreshHistoryPagingCursorFromItems();
-        renderHistory();
-      }
-      if (state.selectedId === id) {
-        await selectHistoryTransaction(nextSelectedId, { scroll: true });
-      }
-    } else if (state.selectedId === id) {
-      state.selectedId = null;
-      updateHistorySelection(null);
-      renderEmptyDetail();
+  while (true) {
+    const annotationGeneration = state._historyDetailAnnotationGeneration || 0;
+    const response = await fetch(transactionPath(id, sessionId));
+    if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
+      return null;
     }
-    return null;
-  }
+    if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
+    if (!response.ok) {
+      if (response.status === 404) {
+        if (reconcileRetention) {
+          applyConfirmedHistoryRemoval([id], sessionId);
+          return null;
+        }
+        const index = state.items.findIndex((item) => item.id === id);
+        let nextSelectedId = null;
+        if (index >= 0) {
+          state.items.splice(index, 1);
+          nextSelectedId = state.items[Math.min(index, state.items.length - 1)]?.id ?? null;
+          state._itemsVersion += 1;
+          adjustHistoryPagingAfterLocalRemoval(1);
+          precomputeItemIndexes();
+          invalidateVisibleEntriesCache();
+          refreshHistoryPagingCursorFromItems();
+          renderHistory();
+        }
+        if (state.selectedId === id) {
+          await selectHistoryTransaction(nextSelectedId, { scroll: true });
+        }
+      } else if (state.selectedId === id) {
+        state.selectedId = null;
+        updateHistorySelection(null);
+        renderEmptyDetail();
+      }
+      return null;
+    }
 
-  const record = await response.json();
-  if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
-    return null;
+    const record = await response.json();
+    if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
+      return null;
+    }
+    // A successful save can finish after this read captured its annotations. The
+    // pending overlay is gone by then, and a summary only has a truncated note.
+    // Read again under the same selection owner rather than display stale text.
+    if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
+    const pending = state._pendingAnnotations?.get(id);
+    if (pending?.sessionId === sessionId) {
+      for (const key of ["user_note", "color_tag"]) {
+        if (pending.payload?.[key] !== undefined) record[key] = pending.payload[key];
+      }
+    }
+    state.loadingDetailId = null;
+    observeAnnotationRevision(record);
+    state.selectedRecord = record;
+    renderDetail(state.selectedRecord);
+    return record;
   }
-  state.loadingDetailId = null;
-  observeAnnotationRevision(record);
-  state.selectedRecord = record;
-  renderDetail(state.selectedRecord);
-  return record;
 }
 
 function historyRecordSummarySignature(source) {
@@ -8444,10 +8458,13 @@ function flushTransactionDeltas() {
   let totalAdded = 0;
   let hiddenConnectAdded = 0;
   let updated = 0;
+  let noteWindow = state._historyNoteEditWindow ? currentHistoryNoteEditWindow() : null;
+  const removed = [];
   for (const summary of latest.values()) {
     const existing = getHistoryItem(summary.id);
     if (existing) {
       applyLiveSummaryUpdate(existing, summary);
+      if (!summaryMatchesActiveHistoryFilters(existing)) removed.push(existing);
       updated += 1;
       continue;
     }
@@ -8462,7 +8479,35 @@ function flushTransactionDeltas() {
 
   if (fresh.length && state.historyPaging?.trimmedHeadCount > 0 && canUseSequenceCursorForHistoryPaging()) {
     scheduleIncrementalRefresh();
-    return;
+    fresh.length = 0;
+    totalAdded = 0;
+    hiddenConnectAdded = 0;
+  }
+
+  if (removed.length) {
+    const inputs = typeof document === "undefined" ? [] : document.querySelectorAll("input.note-inline-input");
+    for (const item of removed) {
+      const input = Array.from(inputs).find((input) => input.historyRetentionNote?.transactionId === item.id
+        && input.historyRetentionNote.sessionId === activeSessionId);
+      const pendingEdit = state._pendingAnnotations?.get(item.id);
+      const editor = input?.historyRetentionNote?.editor
+        || (pendingEdit?.sessionId === activeSessionId ? pendingEdit.noteEdit : null);
+      noteWindow = retainFilteredHistoryNote(editor, item, noteWindow);
+    }
+    const removedIds = new Set(removed.map((item) => item.id));
+    for (let index = state.items.length - 1; index >= 0; index -= 1) {
+      if (removedIds.has(state.items[index].id)) state.items.splice(index, 1);
+    }
+    // Filter membership changed, but the records are still retained. This also
+    // invalidates overlapping pages so they cannot resurrect the old matches.
+    adjustHistoryPagingAfterLocalRemoval(removed.length, { decrementTotal: false });
+    rebuildHistoryItemIndex();
+    refreshHistoryPagingCursorFromItems();
+    if (removedIds.has(state.selectedId)) {
+      state.loadingDetailId = null;
+      state._selectionPastEndId = null;
+      clearHttpHistorySelectionPreview();
+    }
   }
 
   fresh.sort((a, b) => Number(b.sequence ?? 0) - Number(a.sequence ?? 0));
@@ -8489,7 +8534,8 @@ function flushTransactionDeltas() {
   }
   if (totalAdded || added || updated) {
     state.historyDirty = false;
-    renderHistory();
+    if (noteWindow) syncHistoryNoteEditWindow(noteWindow);
+    renderHistory({ preserveNoteEditor: true });
   }
 }
 
@@ -26550,7 +26596,7 @@ async function beginNoteEdit(cell, transactionId) {
     || truncateUtf8(input.value, MAX_ANNOTATION_NOTE_BYTES).trim() !== lastSaved);
   const noteEdit = { cell, input, sessionId, closed: false, removed: null };
   input.historyRetentionNote = {
-    transactionId, sessionId,
+    transactionId, sessionId, editor: noteEdit,
     cancel: () => {
       const result = { text: input.value, dirty: input.hasPendingNoteEdit() };
       window.clearTimeout(debounce);
@@ -26883,6 +26929,9 @@ async function flushPendingAnnotations(transactionId, options = {}) {
     observeAnnotationRevision(summary);
     saved = true;
     if (currentSessionId() !== sessionId) return saved;
+    if (state.selectedId === transactionId) {
+      state._historyDetailAnnotationGeneration = (state._historyDetailAnnotationGeneration || 0) + 1;
+    }
     if (retentionEpoch !== (state._historyRetentionEpoch || 0)) {
       // An unrelated deletion can overlap this successful annotation. Its first
       // refetch may have preceded the save; reconcile again without merging the
