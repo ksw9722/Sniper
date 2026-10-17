@@ -1308,7 +1308,17 @@ mod tests {
         let first = lock_profiles(&root.0).unwrap();
         assert!(lock_profiles(&root.0).is_err());
         drop(first);
-        assert!(lock_profiles(&root.0).is_ok());
+        // flock belongs to the open file, not the descriptor. A child that another
+        // test thread is spawning holds a copy of this descriptor until its exec
+        // closes it, so the release can trail `drop` by a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while lock_profiles(&root.0).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock was never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     #[test]
