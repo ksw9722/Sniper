@@ -405,7 +405,11 @@ loaded it (its Referer) when that page is in the map, else to the asset's own or
 bundle served from a CDN names the page's framework. A one-origin, in-scope or
 origin-capped map leaves the CDN out but keeps what the page took from it, so
 it names the same front end the whole map does. A page's own stay with the
-page. A row counts once for a product, however many of its signals name it.
+page. Scoped whole-history maps first identify their admitted origins using
+captured host scope and the display filters, with the same chunked locking and
+bounded scope work. Only those origins and assets referring to their pages
+spend body reads, so unrelated pages and CDN traffic cannot starve them. A row
+counts once for a product, however many of its signals name it.
 
 The card leads with what the site is built with (a meta-framework, then a CMS,
 then a framework), then the products its headers declare, then UI kits,

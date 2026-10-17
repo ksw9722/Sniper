@@ -1951,7 +1951,7 @@ fn a_narrow_map_keeps_what_its_pages_loaded_from_elsewhere() {
             Some("https://www.example.com".to_string()),
             vec![],
         ),
-        (0, true, None, vec!["www.example.com".to_string()]),
+        (300, true, None, vec!["www.example.com".to_string()]),
     ] {
         let (map, _) = store(others)
             .service_map_all_rows_blocking(
@@ -2257,4 +2257,338 @@ fn service_map_cache_duplicate_bodies_converge_within_read_budget() {
     );
     assert_eq!(second.origins[0].front_technologies[0].row_count, count);
     assert!(read().1, "a fully cached map needs no body reads");
+}
+
+#[test]
+fn scoped_map_body_budget_skips_excluded_pages() {
+    let session = Uuid::from_u128(9877);
+    let page = |host: &str, sequence| {
+        let mut record = cache_body_record(
+            "/",
+            "text/html",
+            r#"<meta name="generator" content="WordPress 6.5.2">"#,
+            sequence,
+        );
+        record.host = host.into();
+        record
+    };
+    for (include, exclude) in [
+        (vec!["www.example.com".to_string()], vec![]),
+        (vec![], vec!["p*.example.com".to_string()]),
+    ] {
+        let mut records: Vec<_> = (0..300)
+            .map(|i| page(&format!("p{i}.example.com"), 1000 - i))
+            .collect();
+        let target = page("www.example.com", 1);
+        let id = target.id.to_string();
+        records.push(target);
+        let store = TransactionStore::from_records(records);
+        for _ in 0..3 {
+            let (map, complete) = store
+                .service_map_all_rows_blocking(
+                    session,
+                    technology::CatalogVersion::V2,
+                    &crate::store::ListFilters::default(),
+                    true,
+                    None,
+                    &include,
+                    &exclude,
+                )
+                .unwrap();
+            assert_eq!(map.origins.len(), 1);
+            let found = &map.origins[0].front_technologies;
+            assert_eq!(found.len(), 1, "excluded pages cannot consume body reads");
+            assert_eq!(found[0].product_id, "wordpress");
+            assert_eq!(found[0].version.as_deref(), Some("6.5.2"));
+            assert_eq!(found[0].row_count, 1);
+            assert!(found[0].evidence[0].ends_with(&id));
+            assert!(complete);
+            assert!(
+                map.snapshot.complete,
+                "body budget does not change metadata completeness"
+            );
+            assert_eq!(map.snapshot.considered_rows, 301);
+            assert_eq!(map.snapshot.included_rows, 1);
+            assert_eq!(map.snapshot.excluded_rows, 300);
+            assert_eq!(map.snapshot.omitted_rows, 0);
+        }
+    }
+}
+
+#[test]
+fn scoped_map_cdn_bodies_use_captured_page_scope_spelling() {
+    for (host, referer) in [
+        ("bücher.example.com", "https://xn--bcher-kva.example.com/"),
+        ("[2001:0db8::1]:443", "https://[2001:db8::1]/"),
+        ("WWW.Example.COM.:443", "https://www.example.com./"),
+    ] {
+        let page = filter_fixture(host, "/", 200, "text/html", None, 1);
+        let mut script = filter_fixture(
+            "cdn.example.com",
+            "/vendor.js",
+            200,
+            "application/javascript",
+            Some(referer),
+            2,
+        );
+        script.response.as_mut().unwrap().body_preview =
+            "/*! jQuery v3.7.1 | (c) OpenJS Foundation */".into();
+        let id = script.id.to_string();
+        let store = TransactionStore::from_records(vec![script, page]);
+        let (map, complete) = store
+            .service_map_all_rows_blocking(
+                Uuid::nil(),
+                technology::CatalogVersion::V2,
+                &crate::store::ListFilters::default(),
+                true,
+                None,
+                &[host.into()],
+                &[],
+            )
+            .unwrap();
+        assert!(complete);
+        assert_eq!(map.origins.len(), 1, "{host}");
+        let found = &map.origins[0].front_technologies;
+        assert_eq!(found.len(), 1, "{host}");
+        assert_eq!(found[0].product_id, "jquery");
+        assert_eq!(found[0].version.as_deref(), Some("3.7.1"));
+        assert_eq!(found[0].source_origin, "https://cdn.example.com");
+        assert!(found[0].evidence[0].ends_with(&id));
+    }
+}
+
+#[test]
+fn scoped_map_cdn_read_budget_converges_without_double_counting() {
+    let count = crate::service_map_libraries::MAX_READS + 1;
+    let mut records: Vec<_> = (1..=count)
+        .map(|i| {
+            let mut row = filter_fixture(
+                "cdn.example.com",
+                "/vendor.js",
+                200,
+                "application/javascript",
+                Some("https://www.example.com/"),
+                i as u64 + 1,
+            );
+            row.response.as_mut().unwrap().body_preview =
+                "/*! jQuery v3.7.1 | (c) OpenJS Foundation */".into();
+            row
+        })
+        .collect();
+    records.push(filter_fixture(
+        "www.example.com",
+        "/",
+        200,
+        "text/html",
+        None,
+        1,
+    ));
+    let store = TransactionStore::from_records(records);
+    let read = || {
+        store
+            .service_map_all_rows_blocking(
+                Uuid::nil(),
+                technology::CatalogVersion::V2,
+                &crate::store::ListFilters::default(),
+                true,
+                None,
+                &["www.example.com".into()],
+                &[],
+            )
+            .unwrap()
+    };
+    let (first, complete) = read();
+    assert!(!complete);
+    assert!(first.snapshot.complete);
+    assert_eq!(first.origins[0].front_technologies[0].row_count, count - 1);
+    let (second, complete) = read();
+    assert!(complete);
+    assert_eq!(second.origins[0].front_technologies[0].row_count, count);
+    assert!(read().1);
+}
+
+#[test]
+fn scoped_map_keeps_the_body_byte_budget() {
+    use crate::service_map_libraries::{MAX_BYTES_PER_MAP, MAX_ROW_BYTES};
+    let mut body = r#"<meta name="generator" content="WordPress 6.5.2">"#.to_string();
+    body.extend(std::iter::repeat_n(' ', MAX_ROW_BYTES - body.len()));
+    let count = MAX_BYTES_PER_MAP / MAX_ROW_BYTES + 1;
+    let records = (1..=count)
+        .map(|i| cache_body_record("/", "text/html", &body, i as u64))
+        .collect();
+    let store = TransactionStore::from_records(records);
+    let read = || {
+        store
+            .service_map_all_rows_blocking(
+                Uuid::nil(),
+                technology::CatalogVersion::V2,
+                &crate::store::ListFilters::default(),
+                true,
+                None,
+                &["www.example.com".into()],
+                &[],
+            )
+            .unwrap()
+    };
+    let (first, complete) = read();
+    assert!(!complete);
+    assert_eq!(first.origins[0].front_technologies[0].row_count, count - 1);
+    let (second, complete) = read();
+    assert!(complete);
+    assert_eq!(second.origins[0].front_technologies[0].row_count, count);
+}
+
+#[test]
+fn scoped_map_prepass_keeps_scope_work_bounded() {
+    let (include, exclude) = expensive_scope();
+    let store = TransactionStore::from_records(
+        (1..=40)
+            .map(|i| fixture_record(&long_host(i), i as u64))
+            .collect(),
+    );
+    assert!(matches!(
+        store.service_map_all_rows_blocking(
+            Uuid::nil(),
+            technology::CatalogVersion::V2,
+            &crate::store::ListFilters::default(),
+            true,
+            None,
+            &include,
+            &exclude,
+        ),
+        Err(crate::store::ServiceMapStreamError::ScopeWorkLimit)
+    ));
+}
+
+#[test]
+fn scoped_map_assets_of_filtered_pages_do_not_use_body_reads() {
+    let mut records: Vec<_> = (0..300)
+        .map(|i| {
+            let mut script = filter_fixture(
+                "cdn.example.com",
+                "/vendor.js",
+                200,
+                "application/javascript",
+                Some("https://ghost.example.com/"),
+                1000 - i,
+            );
+            script.user_note = Some("synthetic note".into());
+            script.response.as_mut().unwrap().body_preview =
+                "/*! jQuery v3.7.1 | (c) OpenJS Foundation */".into();
+            script
+        })
+        .collect();
+    records.push(filter_fixture(
+        "ghost.example.com",
+        "/",
+        200,
+        "text/html",
+        None,
+        2,
+    ));
+    let mut target = cache_body_record(
+        "/",
+        "text/html",
+        r#"<meta name="generator" content="WordPress 6.5.2">"#,
+        1,
+    );
+    target.user_note = Some("synthetic note".into());
+    records.push(target);
+    let store = TransactionStore::from_records(records);
+    let (map, complete) = store
+        .service_map_all_rows_blocking(
+            Uuid::nil(),
+            technology::CatalogVersion::V2,
+            &crate::store::ListFilters {
+                only_notes: true,
+                ..Default::default()
+            },
+            true,
+            None,
+            &["*.example.com".into()],
+            &["cdn.example.com".into()],
+        )
+        .unwrap();
+    assert!(complete);
+    assert_eq!(map.origins.len(), 1);
+    assert_eq!(map.origins[0].front_technologies[0].product_id, "wordpress");
+    assert_eq!(map.snapshot.filtered_rows, 1);
+    assert_eq!(map.snapshot.excluded_rows, 300);
+    assert_eq!(map.snapshot.included_rows, 1);
+}
+
+#[test]
+fn scoped_map_assets_of_capped_origins_do_not_use_body_reads() {
+    let mut records: Vec<_> = (0..300)
+        .map(|i| {
+            let mut script = filter_fixture(
+                "cdn.example.com",
+                "/vendor.js",
+                200,
+                "application/javascript",
+                Some("https://omitted.example.com/"),
+                10_000 - i,
+            );
+            script.response.as_mut().unwrap().body_preview =
+                "/*! jQuery v3.7.1 | (c) OpenJS Foundation */".into();
+            script
+        })
+        .collect();
+    records.extend((0..MAX_ORIGINS - 1).map(|i| {
+        filter_fixture(
+            &format!("p{i}.example.com"),
+            "/",
+            200,
+            "application/octet-stream",
+            None,
+            3000 - i as u64,
+        )
+    }));
+    records.push(cache_body_record(
+        "/",
+        "text/html",
+        r#"<meta name="generator" content="WordPress 6.5.2">"#,
+        2,
+    ));
+    records.push(filter_fixture(
+        "omitted.example.com",
+        "/",
+        200,
+        "text/html",
+        None,
+        1,
+    ));
+    let store = TransactionStore::from_records(records);
+    let (map, complete) = store
+        .service_map_all_rows_blocking(
+            Uuid::nil(),
+            technology::CatalogVersion::V2,
+            &crate::store::ListFilters::default(),
+            true,
+            None,
+            &["*.example.com".into()],
+            &["cdn.example.com".into()],
+        )
+        .unwrap();
+    assert!(complete, "unrepresented pages need no body reads");
+    assert_eq!(map.origins.len(), MAX_ORIGINS);
+    assert!(map
+        .origins
+        .iter()
+        .all(|origin| origin.origin != "https://omitted.example.com"));
+    let target = map
+        .origins
+        .iter()
+        .find(|origin| origin.origin == "https://www.example.com")
+        .unwrap();
+    assert_eq!(target.front_technologies[0].product_id, "wordpress");
+    assert!(
+        !map.snapshot.complete,
+        "metadata still reports its origin cap"
+    );
+    assert!(map
+        .snapshot
+        .stopped_by
+        .contains(&"origins_limit".to_string()));
+    assert_eq!(map.snapshot.omitted_rows, 1);
 }

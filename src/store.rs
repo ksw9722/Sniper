@@ -745,6 +745,8 @@ pub(crate) enum ServiceMapStreamError {
     ScopeWorkLimit,
 }
 
+const SERVICE_MAP_CHUNK: usize = 8_192;
+
 /// Where the rows a whole-history read has yet to fold end, after rows were
 /// removed: at the oldest row of its last chunk that is still retained, found
 /// by ID and body generation. Nothing read yet starts again from the newest.
@@ -1681,6 +1683,76 @@ impl TransactionStore {
             .and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok())
     }
 
+    /// Discover admissible page origins before charging for bodies. Scripts
+    /// usually follow their page in capture order, so a newest-first fold has
+    /// not seen that page yet. Matching the canonical Referer against scope
+    /// would also lose the captured host spelling used for IDNs and IPv6.
+    fn service_map_scoped_origins(
+        &self,
+        (mut structure, mut next): (Uuid, usize),
+        scope: &mut crate::service_map::BoundedScope,
+        origin_filter: Option<&String>,
+        filters: &ListFilters,
+        advanced_matcher: Option<&AdvancedSearchMatcher>,
+    ) -> Result<HashSet<String>, ServiceMapStreamError> {
+        use crate::service_map::{request_target, MAX_ORIGINS};
+        let mut origins = HashSet::new();
+        let mut read = Vec::new();
+        while next > 0 {
+            let inner = self.inner.blocking_read();
+            if inner.service_map_structure_epoch != structure {
+                next = resume_below(&inner, &read).ok_or(ServiceMapStreamError::HistoryChanged)?;
+                structure = inner.service_map_structure_epoch;
+            }
+            let from = next.saturating_sub(SERVICE_MAP_CHUNK);
+            for index in (from..next).rev() {
+                let record = &inner.entries[index];
+                if record.method == "CONNECT"
+                    || !matches_filters(
+                        &inner.summaries[index],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        filters,
+                        advanced_matcher,
+                        false,
+                    )
+                {
+                    continue;
+                }
+                // These are the same admission checks as row projection and
+                // MapBuilder, without headers, body copies or derived clues.
+                let Some((target, _)) = request_target(record) else {
+                    continue;
+                };
+                if !scope
+                    .contains(&record.host)
+                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?
+                {
+                    continue;
+                }
+                let origin = target.origin().ascii_serialization();
+                if origin_filter.is_some_and(|only| only != &origin) {
+                    continue;
+                }
+                origins.insert(origin);
+                if origins.len() == MAX_ORIGINS {
+                    return Ok(origins);
+                }
+            }
+            read.clear();
+            read.extend(
+                (from..next).map(|index| (inner.entries[index].id, inner.body_generations[index])),
+            );
+            next = from;
+        }
+        Ok(origins)
+    }
+
     /// The map over every retained row, newest first. Rows are folded as they
     /// are projected, so none are kept, and the store lock is held a chunk at a
     /// time, so captures continue while a large session is read. Appends and
@@ -1704,7 +1776,6 @@ impl TransactionStore {
             evidence_id, library_page, project_record, project_record_for_catalog, BoundedScope,
             MapBuilder, MetadataSnapshot,
         };
-        const CHUNK: usize = 8_192;
         let mut scope = BoundedScope::new(include, exclude)
             .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
         let advanced_matcher = AdvancedSearchMatcher::new(filters);
@@ -1738,6 +1809,17 @@ impl TransactionStore {
             rows: Vec::new(),
             favicons: Default::default(),
         };
+        let scoped_origins = in_scope_only
+            .then(|| {
+                self.service_map_scoped_origins(
+                    (structure, retained),
+                    &mut scope,
+                    only.as_ref(),
+                    filters,
+                    advanced_matcher.as_ref(),
+                )
+            })
+            .transpose()?;
         let mut budget = LibraryBudget::default();
         let mut pending = Vec::new();
         let mut next = retained;
@@ -1751,7 +1833,7 @@ impl TransactionStore {
             }
             let mut caches = self.library_caches();
             caches.trim();
-            let from = next.saturating_sub(CHUNK);
+            let from = next.saturating_sub(SERVICE_MAP_CHUNK);
             for index in (from..next).rev() {
                 let record = &inner.entries[index];
                 meta.considered_rows += 1;
@@ -1809,18 +1891,26 @@ impl TransactionStore {
                         .insert("unsupported_or_oversized_metadata".into());
                     continue;
                 };
-                // A row whose body is still to be read waits with what its URL
-                // named, so the row counts once for each technology. A
-                // one-origin map reads its own rows and the scripts its pages
-                // loaded from elsewhere, not every other origin's.
+                let in_scope = scope
+                    .contains(&row.scope_host)
+                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
+                // Charge only for included origins or assets their pages took
+                // from elsewhere. Excluded pages cannot use a read that would
+                // then be discarded, starving older included pages forever.
                 let page = library_page(&row);
-                let wanted = builder.wants_page(page.as_ref());
-                let elsewhere =
-                    !wanted && only.as_ref().is_some_and(|origin| *origin != row.origin);
-                let lookup = if elsewhere {
-                    None
-                } else {
+                let wanted = builder.wants_page(page.as_ref())
+                    && scoped_origins.as_ref().is_none_or(|origins| {
+                        page.as_ref().is_some_and(|page| origins.contains(page))
+                    });
+                let included = (!in_scope_only || in_scope)
+                    && only.as_ref().is_none_or(|origin| *origin == row.origin)
+                    && scoped_origins
+                        .as_ref()
+                        .is_none_or(|origins| origins.contains(&row.origin));
+                let lookup = if included || wanted {
                     library_lookup(&inner, &mut caches, &row, &mut budget)
+                } else {
+                    None
                 };
                 let waiting = match lookup {
                     Some(Ok(found)) => {
@@ -1836,9 +1926,6 @@ impl TransactionStore {
                     )),
                     None => None,
                 };
-                let in_scope = scope
-                    .contains(&row.scope_host)
-                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
                 if builder.add(row, in_scope) || wanted {
                     pending.extend(waiting);
                 }
