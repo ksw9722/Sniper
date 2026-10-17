@@ -1786,6 +1786,19 @@ async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
     ] {
         session.store.insert(record).await;
     }
+    let custom_methods = [
+        "M-SEARCH2!",
+        "X.CUSTOM",
+        "X+CUSTOM",
+        "gEt-Custom",
+        "!#$%&'*+-.^_`|~",
+    ];
+    for method in custom_methods {
+        session
+            .store
+            .insert(request(method, "/custom?q=token", None, b""))
+            .await;
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
     let app = sniper::api::router(state.clone());
@@ -1845,6 +1858,43 @@ async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
             ("json".into(), "q".into(), 1, json!(["bags"])),
         ]
     );
+    // Every exact method advertised in the map must remain inspectable through
+    // the CLI, including punctuation and case that a normalized verb would lose.
+    let map = self::read(
+        &dir,
+        &api,
+        "target.service_map.get",
+        json!({"session_id":session_id,"origin":origin}),
+    )
+    .await;
+    for method in custom_methods {
+        assert!(map["origins"][0]["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|endpoint| endpoint["method"] == method && endpoint["path"] == "/custom"));
+        let parameters: Value = read(session_id, origin, method, "/custom")
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(parameters["method"], method);
+        assert_eq!(parameters["rows"], 1);
+        assert_eq!(
+            names(&parameters),
+            [("query".into(), "q".into(), 1, json!(["token"]))]
+        );
+        let called = self::read(
+            &dir,
+            &api,
+            "target.service_map.parameters.get",
+            json!({
+                "session_id":session_id,"origin":origin,"method":method,"path":"/custom"
+            }),
+        )
+        .await;
+        assert_eq!(called, parameters);
+    }
     let other: Value = read(Uuid::new_v4(), origin, "GET", "/search")
         .await
         .json()
