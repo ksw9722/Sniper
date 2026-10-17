@@ -115,7 +115,7 @@ for (const [ip, route, port, expected] of [
 ]) test(`address eligibility ${ip}/${route}/${port}`, async () => {
   const peer = map.normalizeSocketPeer(observation(ip, route, port)); assert.equal(map.usableSocketPeer(peer), expected);
   if (!expected) { const f = fixture(); await f.load(); await f.verify(TOKEN, SOURCE, evidence(TOKEN, SOURCE, observation(ip, route, port))); const before = f.requests.length;
-    assert.equal(await f.controller.loadPeerMatches(), false); assert.equal(f.requests.length, before); assert.match(f.els.detail.innerHTML, /diagnostics only/); }
+    assert.equal(await f.controller.loadPeerMatches(), false); assert.equal(f.requests.length, before); assert.doesNotMatch(f.els.detail.innerHTML, /data-service-peer-matches="inspect"/, 'an unusable address offers no matching'); }
 });
 test('IPv4-mapped IPv6 stays distinct while Rust dotted and exact peer canonical spelling agree', () => {
   const value = matches(); value.peer.address_family = 'ipv6'; value.peer.address.ip = '::ffff:192.0.2.10';
@@ -362,12 +362,11 @@ test('only three-sample omissions cannot claim projection_byte_limit even with v
   assert.equal(normalize(value).counts.omitted_sample_rows, 1);
   value.reasons = ['projection_byte_limit', 'sample_limit']; assert.throws(() => normalize(value));
 });
-test('peer-only exact sample explains unavailable supplementary reads instead of exposing dead actions', async () => {
+test('peer-only exact sample offers no supplementary reads it cannot make', async () => {
   const f = fixture(); await f.show(); const task = f.controller.loadPeerEvidence(SAMPLE, MATCH); f.requests.at(-1).resolve(response(evidence(SAMPLE, MATCH))); assert.equal(await task, true);
   const count = f.requests.length;
   assert.equal(await f.controller.loadBodyReferences(), false); assert.equal(await f.controller.loadHtmlGenerators(), false);
   f.controller.setRelationshipKind('link'); assert.equal(await f.controller.loadLinkDeclarations(), false); assert.equal(f.requests.length, count);
-  assert.match(f.els.detail.innerHTML, /unavailable for this source outside the default metadata projection/);
   assert.doesNotMatch(f.els.detail.innerHTML, /data-service-(?:body-references|link-declarations|html-generators)="inspect"/);
   assert.match(f.els.detail.innerHTML, /Verified retained source/); assert.match(f.els.detail.innerHTML, /Upstream socket peer/); assert.match(f.els.detail.innerHTML, /Find matching recorded peer/);
 });

@@ -96,7 +96,7 @@ function runStartupColumnBindings(f) {
     "loadDisplaySettings", "loadHistoryColumnWidths", "loadWorkbenchLayout",
     "bindColumnDragAndDrop", "renderSortHeaders", "bindMessagePaneActivation",
     "bindPaneResizer", "bindWorkbenchStackResizer", "bindWebsocketPaneResizer",
-    "bindWebsocketStackResizer", "applyWsColumnWidths", "bindWsColumnResizers",
+    "bindWebsocketStackResizer", "bindServiceMapResizer", "applyWsColumnWidths", "bindWsColumnResizers",
   ]) f.c[name] = () => {};
   const bindStart = appSource.indexOf("  bindMessagePaneActivation();");
   const bindEnd = appSource.indexOf("  // WS Handshake Request/Response tab toggle", bindStart);

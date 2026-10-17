@@ -54,13 +54,13 @@ for (const [ip, port, route, label] of [['192.0.2.10', 443, 'direct', 'Direct'],
   assert.equal(f.requests.length, 2); assert.equal(f.els.canvas.innerHTML, beforeCanvas);
   assert.match(f.els.detail.innerHTML, /Upstream socket peer/); assert.ok(f.els.detail.innerHTML.includes(ip));
   assert.ok(f.els.detail.innerHTML.includes(label)); assert.match(f.els.detail.innerHTML, /Response headers observed at/);
-  assert.match(f.els.detail.innerHTML, /does not establish the origin’s IP address/);
   assert.doesNotMatch(f.els.canvas.innerHTML, /192\.0|2001:db8|Upstream socket peer/);
 });
-for (const [value, phrase] of [[{ status: 'not_recorded', observation: null }, 'Not recorded for this row.'], [undefined, 'not available from this server'], [{ status: 'unavailable', observation: { ...observed().observation, address: null, reason: 'remote_addr_unavailable' } }, 'Unavailable at response headers']]) test(`legacy, optional and unavailable are distinct: ${phrase}`, async () => {
+for (const [value, phrase, name] of [[{ status: 'not_recorded', observation: null }, null, 'not recorded'], [undefined, null, 'from an older server'], [{ status: 'unavailable', observation: { ...observed().observation, address: null, reason: 'remote_addr_unavailable' } }, 'Unavailable at response headers', 'unavailable']]) test(`a socket peer shows only when one was recorded: ${name}`, async () => {
   const f = fixture(); await f.load(); f.controller.selectOrigin(originA); const pending = f.controller.loadEvidence('evidence-one');
   f.requests.at(-1).resolve(response(evidence('evidence-one', originA, { socket_peer: value }))); await pending;
-  assert.ok(f.els.detail.innerHTML.includes(phrase)); assert.doesNotMatch(f.els.detail.innerHTML, /was enabled|was disabled|was Off|capture failed/);
+  if (phrase) assert.ok(f.els.detail.innerHTML.includes(phrase)); else assert.doesNotMatch(f.els.detail.innerHTML, /Upstream socket peer|Matching recorded socket peers/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /was enabled|was disabled|was Off|capture failed/);
 });
 const invalid = [null, {}, { status: 'not_recorded', observation: observed().observation }, ...[
   { source: '<img onerror=alert(1)>' }, { route: { raw: 'secret' } }, { observed_at: '<img src=x>' }, { observed_at: 'yesterday' },

@@ -7410,7 +7410,8 @@ button.utility-button.replay-tab-add {
 .service-map-filter-summary { color: var(--text-dim); font-size: var(--font-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 280px; }
 .service-map-search { margin-left: auto; max-width: 260px; min-width: 150px; flex: 1; }
 .service-map-alert { color: var(--text-soft); font-size: var(--font-xs); padding: 0 4px; overflow-wrap: anywhere; }
-.service-map-content { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(280px, 34%); gap: 12px; min-width: 0; min-height: 0; }
+.service-map-content { display: grid; grid-template-columns: minmax(360px, 1fr) 10px clamp(260px, var(--service-map-detail-width, max(280px, 34%)), calc(100% - 372px)); gap: 12px 1px; min-width: 0; min-height: 0; }
+.service-map-resizer { min-width: 10px; }
 .service-map-graph, .service-map-detail, .service-map-api-catalog { border: 1px solid var(--line-strong); border-radius: var(--radius-lg); min-width: 0; min-height: 0; background: linear-gradient(135deg, var(--bg-glow), transparent 65%), var(--panel); }
 .service-map-graph { display: flex; flex-direction: column; overflow: hidden; }
 .service-map-graph > .service-map-viewport { flex: 1; }
@@ -7419,11 +7420,16 @@ button.utility-button.replay-tab-add {
 /* Clip the unscaled absolute box so scroll bounds follow the scaled graph. */
 .service-map-scaled { position: relative; overflow: hidden; width: var(--service-map-scaled-width); height: var(--service-map-scaled-height); }
 .service-map-layout { position: absolute; top: 0; left: 0; transform: scale(var(--service-map-scale, 1)); transform-origin: top left; }
-.service-map-edges { position: absolute; inset: 0; color: var(--point); pointer-events: none; }
+.service-map-edges { position: absolute; inset: 0; color: var(--point); pointer-events: none; --service-map-api-edge: var(--token-url-color); }
+/* API links are many; a muted blue keeps them apart from the rest without
+   flooding the map. Selection still turns an arrow gold. */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  .service-map-edges { --service-map-api-edge: color-mix(in srgb, var(--token-url-color) 55%, var(--text-dim)); }
+}
 .service-map-edge { fill: none; stroke: var(--text-dim); stroke-width: var(--edge-weight, 1.5px); opacity: .6; }
 /* A header link takes the color of its leading request kind: API calls stand
    out and resource loads recede. Selection still turns it gold. */
-.service-map-edge:where(.kind-api) { stroke: var(--token-url-color); opacity: .85; }
+.service-map-edge:where(.kind-api) { stroke: var(--service-map-api-edge); opacity: .5; }
 .service-map-edge:where(.kind-script, .kind-static) { opacity: .3; }
 .service-map-edge.selected { stroke: var(--point); opacity: 1; stroke-width: calc(var(--edge-weight, 1.5px) + 0.5px); }
 /* A wide transparent stroke over each recorded arrow takes the pointer. */
@@ -7575,13 +7581,14 @@ button.utility-button.replay-tab-add {
 .service-map-workspace button:focus-visible { outline: 2px solid var(--point); outline-offset: 3px; }
 .target-tab:focus-visible { outline: 2px solid var(--point); outline-offset: -2px; }
 @media (max-width: 1000px) {
-  .service-map-content { grid-template-columns: minmax(280px, 1fr) minmax(260px, 38%); }
+  .service-map-content { grid-template-columns: minmax(280px, 1fr) 10px clamp(260px, var(--service-map-detail-width, max(260px, 38%)), calc(100% - 292px)); }
   .target-passive-label { display: none; }
   .service-map-detail-header { flex-wrap: wrap; }
 }
 @media (max-width: 720px) {
   .service-map-workspace { overflow: auto; grid-template-rows: auto auto auto auto; padding: 8px; }
   .service-map-content { grid-template-columns: minmax(0, 1fr); grid-template-rows: 340px minmax(280px, auto); }
+  .service-map-resizer { display: none; }
   .service-map-detail { max-height: 560px; }
   .service-map-search { margin-left: 0; max-width: none; }
   .service-map-toolbar { gap: 10px; }

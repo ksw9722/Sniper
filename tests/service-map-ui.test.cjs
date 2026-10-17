@@ -337,7 +337,7 @@ test('exact evidence includes source observations and any incomplete-metadata no
   Object.assign(value.row, { metadata_complete: false, omitted: ['header_limit'], header_links: [{ source_origin: originB, relationship: 'origin_header' }], redirect: { target_origin: originB, target_path: '/next?private=omitted' }, technology_clues: [{ name: 'nginx', header_name: 'server' }] });
   f.requests.at(-1).resolve(response(value)); await pending;
   assert.match(f.els.detail.innerHTML, /header_limit/); assert.match(f.els.detail.innerHTML, /Origin header:/);
-  assert.match(f.els.detail.innerHTML, /Redirect instruction:/); assert.doesNotMatch(f.els.detail.innerHTML, /private=omitted/);
+  assert.match(f.els.detail.innerHTML, /Redirect: https:\/\/api\.example\.com\/next</); assert.doesNotMatch(f.els.detail.innerHTML, /private=omitted/);
 });
 
 const { loadFunctions, appSource } = require('./frontend-test-helpers.cjs');
@@ -975,7 +975,6 @@ test('body inspection is opt-in: map, source verification, tabs, filters and ref
   assert.doesNotMatch(f.els.detail.innerHTML, /data-service-body-references/);
   f.requests.at(-1).resolve(response(evidence())); await sourceRead;
   assert.match(f.els.detail.innerHTML, /Inspect retained body references/);
-  assert.match(f.els.detail.innerHTML, /Active session only/);
   f.els.search.value = 'app'; f.els.search.dispatch('input');
   f.controller.setVisible(false); f.controller.setVisible(true); await f.load();
   assert.equal(f.requests.length, 3);
@@ -990,16 +989,15 @@ test('body inspection is opt-in: map, source verification, tabs, filters and ref
   assert.equal(f.state.bodyReferences.status, 'scanned');
 });
 
-test('body references remain supplemental plaintext evidence with exact UTF-8 preview offsets', async () => {
+test('body references remain supplemental plaintext evidence', async () => {
   const f = await verifiedBodyFixture(), graph = f.els.canvas.innerHTML, graphBounds = boundsText(f);
   const payload = bodyReferences({ raw_body: 'private synthetic content', response: { body_preview: 'not for the inspector' } });
   await resolveBodyReferences(f, payload);
   assert.match(f.els.detail.innerHTML, /2 literal URL occurrences/);
   assert.match(f.els.detail.innerHTML, /https:\/\/assets\.example\.com/);
-  assert.match(f.els.detail.innerHTML, /Preview byte offsets: 24, 148/);
+  assert.match(f.els.detail.innerHTML, /2 occurrences</);
   assert.match(f.els.detail.innerHTML, /Complete retained-preview scan/);
   assert.match(f.els.detail.innerHTML, /zero-based bytes relative to the retained UTF-8 preview/);
-  assert.match(f.els.detail.innerHTML, /does not prove a request, call, or service ownership/);
   assert.doesNotMatch(f.els.detail.innerHTML, /href=|src=|private synthetic|not for the inspector/);
   assert.doesNotMatch(JSON.stringify(f.state.bodyReferences), /raw_body|response|private synthetic/);
   assert.equal(f.els.canvas.innerHTML, graph); assert.equal(boundsText(f), graphBounds);
@@ -1129,7 +1127,6 @@ test('partial output exposes truncation, omissions, long origins and full indepe
   assert.match(f.els.detail.innerHTML, /100 referenced origins · 700 literal URL occurrences/);
   assert.match(f.els.detail.innerHTML, /Partial retained-preview scan/);
   assert.match(f.els.detail.innerHTML, /30 reference occurrence\(s\) omitted/);
-  assert.match(f.els.detail.innerHTML, /2 more offset\(s\) omitted/);
   assert.match(f.els.detail.innerHTML, /Scan: 262,144 bytes · Serialized row read: 2,097,152 bytes · Origins: 100 · URL candidates: 4,096 · Candidate: 4,096 bytes · Offsets per origin: 5/);
   assert.ok(f.els.detail.innerHTML.includes(longOrigin));
   assert.equal((f.els.detail.innerHTML.match(/class="service-map-body-reference-origin"/g) || []).length, 100);
@@ -1594,8 +1591,8 @@ test('metadata chain reads left to right, one column per link, inside its canvas
   const order = [a.origin, b.origin, c.origin];
   const layout = map.graphLayout(data.origins, order);
   assert.deepEqual([a, b, c].map(item => layout.slots.get(item.origin).column), [0, 1, 2]);
-  assert.equal(layout.edges.length, 4); assert.equal(new Set(layout.edges.map(edge => edge.path)).size, 4);
-  assert.deepEqual([...new Set(layout.edges.map(edge => edge.relationship))].sort(), ['origin_header', 'redirect_instruction', 'referer_header']);
+  assert.equal(layout.edges.length, 2, 'one arrow per direction'); assert.equal(new Set(layout.edges.map(edge => edge.path)).size, 2);
+  assert.deepEqual([...layout.edges.map(edge => [...edge.relationships])], [['redirect_instruction'], ['redirect_instruction', 'origin_header', 'referer_header']]);
   assertCanvasContainsGeometry(layout);
   const refreshed = map.graphLayout(data.origins, order, layout.slots);
   assert.deepEqual([...refreshed.slots], [...layout.slots]);
@@ -1608,11 +1605,12 @@ test('reciprocal metadata curves and direct relations remain unclipped without b
   b.header_links = [header(c.origin), header(c.origin, 'referer_header'), header(b.origin)];
   c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
   const data = map.normalizeSnapshot(snapshot([a, b, c]), 'session-one');
-  for (const anchor of [null, b.origin]) {
+  // The overview draws one arrow per direction; Direct relations one per relationship.
+  for (const [anchor, arrows] of [[null, 3], [b.origin, 7]]) {
     const layout = map.graphLayout(data.origins, [a.origin, b.origin, c.origin], new Map(), anchor);
-    assert.equal(layout.edges.length, 7); assert.equal(layout.edgeCount, 7);
-    assert.equal(layout.edges.filter(edge => edge.source !== a.origin).length, 6);
-    assert.equal(new Set(layout.edges.map(edge => edge.path)).size, 7);
+    assert.equal(layout.edges.length, arrows); assert.equal(layout.edgeCount, arrows);
+    assert.equal(layout.edges.filter(edge => edge.source !== a.origin).length, arrows - 1);
+    assert.equal(new Set(layout.edges.map(edge => edge.path)).size, arrows);
     assertCanvasContainsGeometry(layout);
   }
 });
@@ -1742,26 +1740,25 @@ test('all exact catalog products, both PHP headers and complete numeric versions
   for (const version of ['0', '001', '2.4.62', '1'.repeat(32)]) assert.equal(map.normalizeRowTechnologies([technologyRow(undefined, version)])[0].reported_version, version);
 });
 
-test('Apache plus PHP remains two source observations with explicit byte provenance and no inferred stack relationship', async () => {
+test('Apache plus PHP remains two source observations and no inferred stack relationship', async () => {
   const apache = technologyRow(technologyProducts[1], '2.4.62'), php = technologyRow(technologyProducts[6], '8.3.12', { product_span: { start: 14, end: 17 }, version_span: { start: 18, end: 24 } });
   const f = await technologyFixture(technologySnapshot([technologyAggregate(apache), technologyAggregate(php)]));
-  assert.match(f.els.detail.innerHTML, /Apache.*Reported version: 2\.4\.62/s); assert.match(f.els.detail.innerHTML, /PHP.*Reported version: 8\.3\.12/s);
-  assert.match(f.els.detail.innerHTML, /Catalog: Web server/); assert.match(f.els.detail.innerHTML, /Catalog: Language runtime/);
+  assert.match(f.els.detail.innerHTML, /<strong>Apache 2\.4\.62<\/strong>/); assert.match(f.els.detail.innerHTML, /<strong>PHP 8\.3\.12<\/strong>/);
+  assert.match(f.els.detail.innerHTML, /Web server · server header · 1 row/); assert.match(f.els.detail.innerHTML, /Language runtime · /);
   assert.equal(f.requests.length, 1); assert.equal(await resolveTechnologySource(f, technologyEvidence([apache, php])), true);
-  assert.match(f.els.detail.innerHTML, /UTF-8 product bytes 14–17 · Version bytes 18–24/);
-  assert.match(f.els.detail.innerHTML, /Response header index 0 \(zero-based\)/);
+  const exact = f.els.detail.innerHTML.match(/<div class="service-map-verified">([^]*?)<\/div>/)[1];
+  assert.equal((exact.match(/<strong>(?:Apache 2\.4\.62|PHP 8\.3\.12)<\/strong>/g) || []).length, 2, 'the exact source names both, apart');
   assert.doesNotMatch(f.els.detail.innerHTML, /WEB.?→.?WAS|vulnerable|raw_header|<a\b|href=/);
   assert.equal(f.requests.length, 2); assert.doesNotMatch(f.requests.map(r => r.url).join(' '), /body-references|transactions|replay|scan|capture/);
 });
 
-test('conflicting versions stay separate with per-observation source/time and exact View source navigation', async () => {
+test('conflicting versions stay separate, each with exact View source navigation', async () => {
   const first = technologyAggregate(technologyRow(undefined, '1.24.0'));
   const second = technologyAggregate(technologyRow(undefined, '1.26.2'), { first_seen: technologyLast, last_seen: technologyLast, evidence: [technologyToken('2')] });
   const f = await technologyFixture(technologySnapshot([first, second]));
   assert.equal(f.state.snapshot.origins[0].technology_observations.length, 2);
-  assert.match(f.els.detail.innerHTML, /Reported version: 1\.24\.0/); assert.match(f.els.detail.innerHTML, /Reported version: 1\.26\.2/);
-  assert.match(f.els.detail.innerHTML, /First: 2026-10-12T02:00:00Z/);
-  assert.match(f.els.detail.innerHTML, /Source: server response header/);
+  assert.match(f.els.detail.innerHTML, /<strong>nginx 1\.24\.0<\/strong>/); assert.match(f.els.detail.innerHTML, /<strong>nginx 1\.26\.2<\/strong>/);
+  assert.match(f.els.detail.innerHTML, /Web server · server header · 1 row/);
   f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceRelationOrigin: originA, serviceRelationEvidence: technologyToken('2') } }) } });
   assert.equal(f.requests.length, 2); assert.equal(new URL(f.requests.at(-1).url, originA).searchParams.get('evidence_id'), technologyToken('2'));
   f.requests.at(-1).resolve(response(technologyEvidence([technologyRow()], technologyToken('2')))); await new Promise(resolve => setImmediate(resolve));
@@ -1770,12 +1767,12 @@ test('conflicting versions stay separate with per-observation source/time and ex
   assert.doesNotMatch(f.requests.map(r => r.url).join(' '), /body-references|transactions/);
 });
 
-for (const [status, product, expected] of [
-  ['not_reported', technologyProducts[0], 'unknown (not reported)'],
-  ['unsupported_format', technologyProducts[0], 'unknown (unsupported format)'],
-  ['non_product_version', technologyProducts[8], 'unknown (non-product version)'],
-]) test(`reported-version status is honest in aggregate and exact source: ${status}`, async () => {
-  const row = technologyRow(product, null, { version_status: status });
+for (const [status, product] of [
+  ['not_reported', technologyProducts[0]],
+  ['unsupported_format', technologyProducts[0]],
+  ['non_product_version', technologyProducts[8]],
+]) test(`an unreported version shows the product alone in aggregate and exact source: ${status}`, async () => {
+  const row = technologyRow(product, null, { version_status: status }), expected = `<strong>${product[1]}</strong>`;
   const f = await technologyFixture(technologySnapshot([technologyAggregate(row)]));
   assert.ok(f.els.detail.innerHTML.includes(expected));
   assert.equal(await resolveTechnologySource(f, technologyEvidence([row])), true);
@@ -1906,7 +1903,7 @@ test('header evidence polls preserve exact source; observation removal clears it
   const exact = f.state.evidence, count = f.requests.length, replacements = f.els.detail.replacements;
   await f.load(payload); assert.equal(f.state.evidence, exact); assert.equal(f.els.detail.replacements, replacements); assert.equal(f.requests.length, count + 1);
   await f.load(technologySnapshot()); assert.equal(f.state.evidence, null); assert.equal(f.state.evidenceId, null);
-  assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source|Reported version: 1\.24\.0/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source|nginx 1\.24\.0/);
 });
 
 for (const transition of ['selection', 'session', 'deletion', 'generation', 'dirty', 'disconnect']) test(`late header evidence cannot republish after ${transition}`, async () => {
@@ -2014,7 +2011,7 @@ test('zoom and Fit never replace graph or inspector, alter selection, abort evid
   const pending = f.controller.loadEvidence('evidence-one'), read = f.requests.at(-1);
   const before = { canvas: f.els.canvas.replacements, detail: f.els.detail.replacements, slots: JSON.stringify([...f.state.layoutSlots]), requests: f.requests.length, evidenceRequestId: f.state.evidenceRequestId };
   const focused = { dataset: { serviceFocus: 'origin:synthetic' } }; f.document.activeElement = focused;
-  for (const name of ['zoomOut', 'zoomIn', 'zoomFit', 'zoomReset']) f.els[name].dispatch('click');
+  for (const name of ['zoomOut', 'zoomIn', 'zoomReset']) f.els[name].dispatch('click');
   assert.equal(f.state.selectedOrigin, originA); assert.equal(f.state.endpointIndex, 0);
   assert.equal(f.state.evidenceRequestId, before.evidenceRequestId); assert.equal(read.options.signal.aborted, false);
   assert.equal(f.els.canvas.replacements, before.canvas); assert.equal(f.els.detail.replacements, before.detail);
@@ -2052,13 +2049,14 @@ test('plus and minus preserve the viewport center with bounded scale and reset',
   f.controller.setZoom(99); assert.equal(f.state.zoomScale, 2); assert.equal(f.els.zoomIn.disabled, true);
   f.controller.setZoom(-10); assert.equal(f.state.zoomScale, 0.1); assert.equal(f.els.zoomOut.disabled, true);
   assert.equal(f.els.viewport.scrollLeft, 0); assert.equal(f.els.viewport.scrollTop, 0);
-  f.els.zoomReset.dispatch('click'); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomReset.textContent, '100%');
+  f.els.zoomReset.dispatch('click'); assert.ok(f.state.zoomScale > 0.1 && f.state.zoomScale < 1, 'the percentage fits the map');
+  f.els.zoomReset.dispatch('click'); assert.equal(f.state.zoomScale, 1, 'fitted, it returns to 100%'); assert.equal(f.els.zoomReset.textContent, '100%');
   assert.equal(f.controller.setZoom(NaN), false); assert.equal(f.controller.setZoom(Infinity), false);
 });
 
 test('Fit is safe for empty, one-origin, and dense maps and never changes display caps', async () => {
   const f = fixture(); await f.load(snapshot([]));
-  assert.equal(f.controller.fitGraph(), false); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomFit.disabled, true);
+  assert.equal(f.controller.fitGraph(), false); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomReset.disabled, true);
   await f.load(snapshot([origin(originA)])); f.controller.fitGraph(); assert.equal(f.state.zoomScale, 1);
   const nodes = Array.from({ length: 30 }, (_, i) => origin(`https://node${i}.example.com`));
   nodes.forEach(node => { node.redirects = nodes.filter(other => other !== node).map(other => redirect(other.origin)); });
@@ -2073,9 +2071,9 @@ test('Fit is safe for empty, one-origin, and dense maps and never changes displa
 test('zero-size, hidden, and API views cannot change zoom; resize and polling never refit', async () => {
   const f = fixture(); await f.load(); f.controller.setZoom(0.7);
   const observer = resizeObservers.at(-1); assert.equal(observer.element, f.els.viewport);
-  f.els.viewport.clientWidth = 0; observer.callback(); assert.equal(f.els.zoomFit.disabled, true);
+  f.els.viewport.clientWidth = 0; observer.callback(); assert.equal(f.els.zoomReset.disabled, true);
   assert.equal(f.controller.fitGraph(), false); assert.equal(f.controller.setZoom(1.5), false);
-  f.els.viewport.clientWidth = 350; observer.callback(); assert.equal(f.els.zoomFit.disabled, false); assert.equal(f.state.zoomScale, 0.7);
+  f.els.viewport.clientWidth = 350; observer.callback(); assert.equal(f.els.zoomReset.disabled, false); assert.equal(f.state.zoomScale, 0.7);
   f.controller.setVisible(false); assert.equal(f.controller.setZoom(1.5), false);
   f.controller.setVisible(true, 'apis'); assert.equal(f.controller.fitGraph(), false); assert.equal(f.els.zoomControls.classList.contains('hidden'), true);
   f.controller.setVisible(true, 'service-map'); assert.equal(f.state.zoomScale, 0.7);
@@ -2084,7 +2082,7 @@ test('zero-size, hidden, and API views cannot change zoom; resize and polling ne
   assert.equal(f.els.canvas.replacements, replacements);
   f.els.viewport.clientHeight = 0; observer.callback(); assert.equal(f.controller.setZoom(1), false);
   f.els.viewport.clientHeight = 800; observer.callback(); assert.equal(f.state.zoomScale, 0.7);
-  f.setSession('session-two'); f.controller.reset(); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomFit.disabled, true);
+  f.setSession('session-two'); f.controller.reset(); assert.equal(f.state.zoomScale, 1); assert.equal(f.els.zoomReset.disabled, true);
 });
 
 test('map keyboard shortcuts are local and accessible toolbar controls use native buttons', async () => {
@@ -2096,7 +2094,9 @@ test('map keyboard shortcuts are local and accessible toolbar controls use nativ
   for (const extra of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { target: f.els.search }]) press('+', extra);
   press('ArrowDown'); assert.equal(prevented, 5); assert.equal(f.requests.length, 1);
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-  for (const id of ['serviceMapZoomFit', 'serviceMapZoomOut', 'serviceMapZoomReset', 'serviceMapZoomIn']) assert.match(html, new RegExp(`<button[^>]+id="${id}"[^>]+type="button"`));
+  for (const id of ['serviceMapZoomOut', 'serviceMapZoomReset', 'serviceMapZoomIn']) assert.match(html, new RegExp(`<button[^>]+id="${id}"[^>]+type="button"`));
+  assert.doesNotMatch(html, /id="serviceMapZoomFit"/, 'the percentage fits the map; no Fit button beside it');
+  assert.match(html, /<div class="pane-resizer service-map-resizer" id="serviceMapResizer" role="separator" aria-orientation="vertical"[^>]*tabindex="0"/);
   assert.match(html, /id="serviceMapViewport" tabindex="0" aria-label=/);
 });
 
@@ -2278,7 +2278,7 @@ for (const product of catalogV2Products) test(`v2 literal ${product[0]} is scope
     assert.equal(await resolveTechnologySource(f, withCatalog(technologyEvidence([row]))), true);
     assert.equal(f.state.evidence.technology_observations.length, 1);
     assert.equal(f.state.evidence.technology_observations[0].product_id, product[0]);
-    assert.ok(f.els.detail.innerHTML.includes(version ? `Reported version: ${version}` : `unknown (${status === 'not_reported' ? 'not reported' : 'unsupported format'})`));
+    assert.ok(f.els.detail.innerHTML.includes(version ? `<strong>${product[1]} ${version}</strong>` : `<strong>${product[1]}</strong>`));
     assert.equal(await resolveTechnologySource(f, technologyEvidence([row])), false, 'a v2 map never permits v2 evidence in an unmarked response');
     assert.equal(f.requests.length, 3);
   }
@@ -2431,15 +2431,14 @@ test('HTML generator action is independent, explicit and uses one exact token GE
   assert.doesNotMatch(htmlSection(f), /data-service-show|Show references on map/);
 });
 
-test('HTML generators retain conflicting literal reports, category, exact provenance and qualified versions', async () => {
+test('HTML generators retain conflicting literal reports, each named with its version', async () => {
   const f = await htmlGeneratorFixture();
   const observations = [htmlGeneratorObservation(), htmlGeneratorObservation('wordpress', '6.7.2', 90),
     htmlGeneratorObservation('drupal', null, 170), htmlGeneratorObservation('drupal', null, 240, 'unsupported_format')];
   assert.equal(await resolveHtmlGenerators(f, htmlGenerators({ observations, tag_candidates_inspected: 7 })), true);
   const html = htmlSection(f);
-  for (const text of ['WordPress', 'Drupal', 'Reported version: 6.8.1', 'Reported version: 6.7.2', 'unknown (not reported)', 'unknown (unsupported format)',
-    'Catalog: CMS', 'tag 12–61', 'content 44–59', 'product 44–53', 'version 54–59', 'zero-based, end exclusive', 'Sequence 1', technologyTime,
-    'reported generators, not proven backend/runtime technologies or installed versions']) assert.ok(html.includes(text), text);
+  for (const text of ['<strong>WordPress 6.8.1</strong>', '<strong>WordPress 6.7.2</strong>', 'meta generator']) assert.ok(html.includes(text), text);
+  assert.equal((html.match(/<strong>Drupal<\/strong>/g) || []).length, 2, 'an unreported or unsupported version names the product alone');
   assert.equal(f.state.htmlGenerators.observations.length, 4); assert.doesNotMatch(html, /<meta|<script|Show references on map/);
 });
 
@@ -2451,7 +2450,7 @@ for (const [name, patch, expected] of [
 ]) test(`HTML generator ${name} labels head and overall coverage separately`, async () => {
   const f = await htmlGeneratorFixture(); assert.equal(await resolveHtmlGenerators(f, htmlGenerators(patch)), true);
   assert.match(htmlSection(f), expected); assert.match(htmlSection(f), /Supported explicit head closed: yes/);
-  assert.match(htmlSection(f), /body after the head is not parsed/); assert.match(htmlSection(f), /offered to the parser/);
+  assert.match(htmlSection(f), /offered to the parser/);
 });
 
 for (const reason of ['end_of_preview', 'input_limit', 'tag_candidate_limit', 'tag_byte_limit', 'attribute_limit', 'observation_limit',

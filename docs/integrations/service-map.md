@@ -41,12 +41,16 @@ counts, coverage and window sit under **Details** below it, whose summary names
 how many origins the card cap leaves out. Compact 220×84px cards at the default 12px Display
 text size share their geometry with all arrow attachments. Larger Display text
 grows card height and row spacing together (119px cards at 20px), retaining
-legible line boxes, aligned arrows, selection, and the chosen zoom. Fit, minus, the percentage/reset button, and plus scale
-only the graph from 10% to 200%; the inspector and Scope navigation retain their
-normal size. Fit is a one-shot action for the displayed cards, bounded by those
-scale limits. Polling and resizing never refit or change the chosen zoom. Plus
-and minus preserve the viewport center where scroll bounds allow. With the map
-viewport focused, +/−, 0, and F provide zoom, reset, and Fit shortcuts. A trackpad
+legible line boxes, aligned arrows, selection, and the chosen zoom. Minus, the
+percentage and plus scale only the graph from 10% to 200%; the inspector and
+Scope navigation retain their normal size. The percentage fits the displayed
+cards in the map, a one-shot action bounded by those scale limits, and once
+fitted returns to 100%. Polling and resizing never refit or change the chosen
+zoom. Plus and minus preserve the viewport center where scroll bounds allow.
+With the map viewport focused, +/−, 0, and F provide zoom, reset, and fit
+shortcuts. The bar between the map and the inspector sets the inspector's width
+(drag it, or focus it and use the arrow keys; double-click restores the
+default), kept in UI settings as `service_map_detail_width`. A trackpad
 pinch, or Ctrl with the mouse wheel, zooms around the pointer instead of zooming
 the whole page; a plain wheel still scrolls the map. The selected card's gold
 arrows flow from source to target: their own dashes move along the line, and a
@@ -325,11 +329,16 @@ the number of links that include it. Frames, scripts and static files are hidden
 by default, so API calls, page navigations, unclassified requests and redirects
 draw arrows, and a page's CDN loads draw none. The rows of a hidden kind do not
 draw, rank or weigh a link: a link made only of hidden kinds is not drawn, and a
-link with other rows is drawn for those rows only. The arrow takes the colour of
-its first shown kind in the order of the table above: API calls are blue; page
-navigations, frames and other requests grey; scripts and static files faint
-grey; the selected card's arrows gold. So one API call among a CDN's image loads
-still reads as an API link. Each legend toggle shows its colour. More rows draw
+link with other rows is drawn for those rows only. The map draws one arrow per
+direction between two cards: a redirect, Origin and Referer links and a shown
+inspection share it, drawn as the first of them, and its tooltip names them all.
+Direct relations keeps one arrow per relationship, the typed view it is for.
+The arrow takes the colour of its first shown kind in the order of the table
+above: API calls a muted blue, half transparent so that many of them do not
+flood the map; page navigations, frames and other requests grey; scripts and
+static files faint grey; the selected card's arrows gold. So one API call among
+a CDN's image loads still reads as an API link. Each legend toggle shows its
+colour. More rows draw
 a slightly heavier line, from 1.5px for one row to 2.5px from 64 rows, and an
 arrowhead takes its line's colour at one size. The tooltip lists the rows by
 kind.

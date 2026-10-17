@@ -1405,9 +1405,8 @@
                 <button class="secondary-action hidden" id="serviceMapFocusSelection" type="button">Focus selection</button>
               </div>
               <div class="service-map-zoom-controls" id="serviceMapZoomControls" role="group" aria-label="Map zoom">
-                <button class="secondary-action" id="serviceMapZoomFit" type="button" title="Fit displayed origins in the map">Fit</button>
                 <button class="secondary-action" id="serviceMapZoomOut" type="button" aria-label="Zoom out">−</button>
-                <button class="secondary-action service-map-zoom-reset" id="serviceMapZoomReset" type="button" aria-label="Zoom 100%. Reset to 100%" title="Reset zoom to 100%">100%</button>
+                <button class="secondary-action service-map-zoom-reset" id="serviceMapZoomReset" type="button" aria-label="Zoom 100%. Fit the map, or back to 100% once fitted" title="Fit the map; fitted, back to 100%">100%</button>
                 <button class="secondary-action" id="serviceMapZoomIn" type="button" aria-label="Zoom in">+</button>
               </div>
               <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
@@ -1424,6 +1423,7 @@
                 <div class="service-map-viewport" id="serviceMapViewport" tabindex="0" aria-label="Service map. Plus or minus to zoom, zero to reset, F to fit."><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
                 <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer <span class="service-map-line dotted" aria-hidden="true"></span>Body URL <span class="service-map-line link-declaration" aria-hidden="true"></span>Link header <span class="service-map-line preconnect-hint" aria-hidden="true"></span>Preconnect <span class="service-map-line peer-observation" aria-hidden="true"></span>Same address <span class="service-map-line client-request" aria-hidden="true"></span>Direct request<span id="serviceMapLinkKinds" class="service-map-kinds" role="group" aria-label="Origin and Referer links by request kind"></span><span id="serviceMapSiteControls" class="service-map-kinds" role="group" aria-label="Site grouping and origins hidden from the map"></span><details class="service-map-bounds-details hidden" id="serviceMapBoundsDetails"><summary id="serviceMapDetailsSummary">Details</summary><p class="service-map-status" id="serviceMapStatus"></p><p id="serviceMapGraphBounds"></p><p id="serviceMapGraphDiagnostics"></p></details></div>
               </section>
+              <div class="pane-resizer service-map-resizer" id="serviceMapResizer" role="separator" aria-orientation="vertical" aria-label="Resize the map and the inspector" tabindex="0" title="Drag to resize; double-click to reset"></div>
               <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
             </div>
             <section class="service-map-api-catalog hidden" id="serviceMapApiCatalog" aria-label="Observed API paths"></section>

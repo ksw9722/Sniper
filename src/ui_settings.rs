@@ -370,6 +370,8 @@ pub struct AppUiSettingsSnapshot {
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
     pub websocket_pane_width: Option<u16>,
+    /// The Service Map inspector's width, once dragged.
+    pub service_map_detail_width: Option<u16>,
     pub websocket_query: String,
     pub websocket_sort_key: String,
     pub websocket_sort_direction: String,
@@ -407,6 +409,7 @@ impl Default for AppUiSettingsSnapshot {
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
+            service_map_detail_width: None,
             websocket_query: String::new(),
             websocket_sort_key: "started_at".to_string(),
             websocket_sort_direction: "desc".to_string(),
@@ -469,6 +472,10 @@ impl AppUiSettingsSnapshot {
             .websocket_pane_width
             .filter(|width| *width > 0)
             .map(|width| width.clamp(300, 4_096));
+        sanitized.service_map_detail_width = self
+            .service_map_detail_width
+            .filter(|width| *width > 0)
+            .map(|width| width.clamp(260, 4_096));
         sanitized.websocket_query =
             trim_to_char_limit(self.websocket_query.trim(), WEBSOCKET_QUERY_MAX_CHARS);
         sanitized.websocket_sort_key = sanitize_option(
@@ -1605,6 +1612,7 @@ mod tests {
         snapshot.workbench_pane_widths.response_percent = Some(41);
         snapshot.workbench_pane_widths.inspector_width = Some(390);
         snapshot.websocket_pane_width = Some(444);
+        snapshot.service_map_detail_width = Some(512);
         snapshot.websocket_query = "chat.example".to_string();
         snapshot.websocket_sort_key = "host".to_string();
         snapshot.websocket_sort_direction = "asc".to_string();
@@ -1651,6 +1659,7 @@ mod tests {
         assert_eq!(persisted.workbench_pane_widths.response_percent, Some(41));
         assert_eq!(persisted.workbench_pane_widths.inspector_width, Some(390));
         assert_eq!(persisted.websocket_pane_width, Some(444));
+        assert_eq!(persisted.service_map_detail_width, Some(512));
         assert_eq!(persisted.websocket_query, "chat.example");
         assert_eq!(persisted.websocket_sort_key, "host");
         assert_eq!(persisted.websocket_sort_direction, "asc");

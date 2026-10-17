@@ -202,8 +202,9 @@ test('arrows between neighbouring columns turn at their own points, the longest 
 });
 
 test('cards whose arrows all fall past the arrow cap sit with the unlinked cards', () => {
-  const hub = origin('https://hub.example.com');
-  const targets = Array.from({ length: 20 }, (_, i) => origin(`https://t${String(i).padStart(2, '0')}.example.com`, { header_links: [referer(hub.origin), { ...referer(hub.origin), relationship: 'origin_header' }] }));
+  // Each target and the hub link both ways: two arrows each, past the cap.
+  const targets = Array.from({ length: 20 }, (_, i) => origin(`https://t${String(i).padStart(2, '0')}.example.com`, { header_links: [referer('https://hub.example.com')] }));
+  const hub = origin('https://hub.example.com', { header_links: targets.map(target => referer(target.origin)) });
   const p = origin('https://p.example.com'), q = origin('https://q.example.com', { header_links: [referer('https://p.example.com')] });
   const origins = [hub, ...targets, p, q];
   const layout = map.graphLayout(origins, map.relationshipOrder(origins));
@@ -538,6 +539,16 @@ test('the map reads every retained row, and asks for a fresh map only on the fir
   const reload = f.controller.refresh({ force: true });
   assert.match(f.requests.at(-1).path, /[?&]fresh=true(&|$)/, 'Reload');
   f.requests.at(-1).resolve(response(snapshot(relatedOrigins()))); await reload;
+});
+
+test('one arrow per direction carries every relationship between two cards', () => {
+  const a = origin(app, { redirects: [redirect(api)] }), b = origin(api, { header_links: [referer(app), { ...referer(app), relationship: 'origin_header' }] });
+  const layout = map.graphLayout([a, b], [app, api]);
+  assert.equal(layout.edges.length, 1);
+  assert.deepEqual([...layout.edges[0].relationships], ['redirect_instruction', 'referer_header', 'origin_header']);
+  assert.equal(layout.edges[0].relationship, 'redirect_instruction', 'drawn as the first of them');
+  const pinned = map.graphLayout([a, b], [app, api], new Map(), app);
+  assert.equal(pinned.edges.length, 3, 'Direct relations keeps each relationship apart');
 });
 
 test('clients lead the map in their own column and point at the cards where it starts', async () => {

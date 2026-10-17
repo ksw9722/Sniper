@@ -193,7 +193,7 @@ test('canonical shared address merges spokes without summing overlapping peer-wi
   const f=fixture(); await f.load(sourceSnapshot()); await showPeer(f); const first=f.state.relationLayers[0]; await showPeer(f,B,OTHER,[{id:TOKEN,origin:SOURCE}]);
   const second=f.state.relationLayers[1]; assert.equal(typeof first.source.mapKey,'object'); assert.equal(first.source.mapKey,second.source.mapKey); assert.deepEqual(Object.keys(first.source.mapKey),[]);
   assert.equal((f.els.canvas.innerHTML.match(/service-map-peer-address/g)||[]).length,1); assert.equal(paths(f).filter(path=>path.includes('recorded_peer_observation')).length,2);
-  f.controller.selectOrigin(SOURCE); assert.equal((f.els.detail.innerHTML.match(/other matching rows in this inspection/g)||[]).length,2); assert.doesNotMatch(f.els.detail.innerHTML,/2 other matching rows in this inspection/);
+  f.controller.selectOrigin(SOURCE); assert.equal((f.els.detail.innerHTML.match(/other matching rows</g)||[]).length,2); assert.doesNotMatch(f.els.detail.innerHTML,/2 other matching rows</);
   remove(f,first); assert.equal(paths(f).filter(path=>path.includes('recorded_peer_observation')).length,2); assert.equal(f.state.relationLayers[0],second);
   f.controller.clearBodyReferenceOverlay(); assert.equal(f.state.peerProjection,null);
 });

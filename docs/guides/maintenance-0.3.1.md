@@ -328,7 +328,7 @@ navigation, frame, script, static file, other), read from `Sec-Fetch-Dest` and,
 without it, from the response type, the `Origin` header and the method. The
 legend toggles each kind; frames, scripts and static files are hidden by
 default, so a page's CDN loads draw no arrows and rank nothing. An arrow takes
-the colour of its leading kind (API calls blue, shown on each legend toggle), so
+the colour of its leading kind (API calls a muted blue, shown on each legend toggle), so
 one API call among image loads still reads as an API link, and grows slightly
 heavier with its rows; its head keeps one size in the line's colour. Each link also counts the rows
 whose response let its source read it through CORS, and those that allowed
@@ -439,6 +439,14 @@ from every retained row and holding no captured value. Each operation sends its
 newest row to Replay, and the document copies as JSON. An origin whose rows
 carried no typed response now stays off the map unless selected or searched
 for.
+
+The overview draws one arrow per direction between two cards, whatever links
+them, where an Origin and a Referer link had drawn two. The zoom percentage fits
+the map, and fitted returns to 100%, in place of a Fit button; the bar between
+the map and the inspector resizes them, and the width is kept. The inspector
+leaves out what it had explained at length: an empty observation, a socket peer
+not recorded, a matching inspection with no usable address, byte offsets, and
+the preambles of the optional inspections, whose limits fold away.
 
 Cards are shorter (84px at the default text size) and a product found without a
 version shows its name alone; hovering `+N` lists the products it stands for.

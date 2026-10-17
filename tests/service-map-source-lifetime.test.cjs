@@ -346,8 +346,7 @@ for (const ordinary of [true, false]) test(`inactive peer-bound ${ordinary ? 'or
   assert.equal(f.state.peerEvidenceBinding, null); assert.equal(f.state.bodyReferenceOverlay, null); assert.equal(!!f.state.evidence, ordinary); noSupplements(f);
   if (ordinary) await blocked(f); else assert.match(f.els.status.textContent, /session must be active/);
 });
-test('exact row omitted and inspected-empty product metadata remain visibly distinct without inheritance', async () => {
-  const markup = [];
+test('an exact row never inherits its origin products, whether its own were omitted or empty', async () => {
   for (const present of [false, true]) {
     const f = fixture(), metadata = snapshot();
     metadata.origins[0].first_seen = metadata.origins[0].last_seen = STARTED;
@@ -356,14 +355,9 @@ test('exact row omitted and inspected-empty product metadata remain visibly dist
     assert.equal(await f.load(metadata), true); f.controller.selectOrigin(SOURCE, 0);
     const task = f.controller.loadEvidence(TOKEN), payload = evidence(); if (present) payload.row.technology_observations = [];
     f.requests.at(-1).resolve(result(payload)); assert.equal(await task, true);
-    assert.equal(f.state.evidence.technology_observations_present, present); markup.push(f.els.detail.innerHTML);
-    assert.doesNotMatch(f.els.detail.innerHTML, /nginx|1\.26\.2/, 'exact source never inherits its origin aggregate');
-    assert.match(f.els.detail.innerHTML, /Missing or empty observations do not prove that a product is absent/);
+    assert.equal(f.state.evidence.technology_observations_present, present);
+    assert.doesNotMatch(f.els.detail.innerHTML, /nginx|1\.26\.2|Header-reported technologies/, 'exact source never inherits its origin aggregate');
   }
-  assert.match(markup[0], /Product\/version metadata unavailable for this source\./);
-  assert.doesNotMatch(markup[0], /No header-reported product declarations in the inspected source metadata/);
-  assert.match(markup[1], /No header-reported product declarations in the inspected source metadata\./);
-  assert.doesNotMatch(markup[1], /Product\/version metadata unavailable for this source/);
 });
 test('production activation and external session changes use the existing workspace reset chain', () => {
   const { loadFunctions } = require('./frontend-test-helpers.cjs');
@@ -455,7 +449,7 @@ for (const [label, mutate] of [
   const f = fixture(); await f.load(snapshot([origin(SOURCE, id)]));
   assert.equal(await f.verify(id), false);
   assert.equal(f.state.evidence, null);
-  assert.doesNotMatch(f.els.detail.innerHTML, /Exact retained source verified/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Verified retained source/);
 });
 
 test('identity mismatch clears only the affected shown source', async () => {
@@ -480,5 +474,5 @@ test('exact source preserves uint64 precision through maximum sequence', async (
   const f = fixture(); await f.load(snapshot([origin(SOURCE, id)]));
   assert.equal(await f.verify(id), true);
   assert.equal(f.state.evidence.sequence, sequence);
-  assert.match(f.els.detail.innerHTML, /Exact retained source verified/);
+  assert.match(f.els.detail.innerHTML, /Verified retained source/);
 });

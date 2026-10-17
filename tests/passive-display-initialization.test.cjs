@@ -109,7 +109,7 @@ function fixture() {
     "sanitizeActiveTool", "sanitizeActiveProxyTab", "sanitizeHttpQuery", "sanitizeHttpMethod",
     "sanitizeHttpSortKey", "sanitizeHttpSortDirection", "sanitizeHttpFilterSettings",
     "sanitizeHistoryColumnWidths", "sanitizeHistoryColumnOrder", "sanitizeWorkbenchHeight",
-    "sanitizeWorkbenchPaneWidths", "sanitizeWebsocketPaneWidth", "sanitizeWebsocketQuery",
+    "sanitizeWorkbenchPaneWidths", "sanitizeWebsocketPaneWidth", "sanitizeServiceMapDetailWidth", "applyServiceMapDetailWidth", "sanitizeWebsocketQuery",
     "sanitizeWebsocketSortKey", "sanitizeWebsocketSortDirection", "sanitizeWebsocketStackHeight",
     "sanitizeWsReplayLeftWidth", "sanitizeWsReplayFrameDetailHeight",
   ]) globals[name] = value => value;

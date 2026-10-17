@@ -155,7 +155,7 @@ test('only explicit Link Inspect issues one exact GET without catalog headers; p
   request.resolve(result(linkScan())); await read;
   assert.match(f.els.detail.innerHTML, /Retained relationships/); assert.equal((f.els.detail.innerHTML.match(/<select /g) || []).length, 1);
   assert.match(f.els.detail.innerHTML, /Sequence 18446744073709551615/); assert.match(f.els.detail.innerHTML, /Response Link headers · Complete inspection/);
-  assert.match(f.els.detail.innerHTML, /header index 0/); assert.match(f.els.detail.innerHTML, /not original wire offsets/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /Response Link header index/, 'no byte positions in the list');
   assert.doesNotMatch(f.els.detail.innerHTML, /PRIVATE_TOKEN|private-path|private-query|<a\s/);
   assert.equal(f.controller.showLinkDeclarationsOnMap(), true); assert.equal(f.requests.length, count + 1);
   for (const type of LINK_TYPES) assert.match(f.els.canvas.innerHTML, new RegExp(`data-relationship="${type}"`));

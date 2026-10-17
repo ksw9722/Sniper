@@ -556,6 +556,7 @@ const state = {
   workbenchHeight: null,
   workbenchPaneWidths: null,
   websocketPaneWidth: null,
+  serviceMapDetailWidth: null,
   wsReplayLeftWidth: null,
   wsReplayFrameDetailHeight: null,
 };
@@ -2787,6 +2788,7 @@ function bindEvents() {
   bindWorkbenchStackResizer(els.historyWorkbenchResizer);
   bindWebsocketPaneResizer(els.websocketSplitResizer);
   bindWebsocketStackResizer(els.websocketStackResizer);
+  bindServiceMapResizer(document.getElementById("serviceMapResizer"));
   applyWsColumnWidths();
   bindWsColumnResizers();
 
@@ -14747,7 +14749,6 @@ function initializeTargetWorkspace() {
       canvas: document.getElementById("serviceMapCanvas"),
       viewport: document.getElementById("serviceMapViewport"),
       zoomControls: document.getElementById("serviceMapZoomControls"),
-      zoomFit: document.getElementById("serviceMapZoomFit"),
       zoomOut: document.getElementById("serviceMapZoomOut"),
       zoomReset: document.getElementById("serviceMapZoomReset"),
       zoomIn: document.getElementById("serviceMapZoomIn"),
@@ -20985,6 +20986,8 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   state.workbenchHeight = sanitizeWorkbenchHeight(snapshot?.workbench_height);
   state.workbenchPaneWidths = sanitizeWorkbenchPaneWidths(snapshot?.workbench_pane_widths);
   state.websocketPaneWidth = sanitizeWebsocketPaneWidth(snapshot?.websocket_pane_width);
+  state.serviceMapDetailWidth = sanitizeServiceMapDetailWidth(snapshot?.service_map_detail_width);
+  applyServiceMapDetailWidth();
   state.websocketQuery = sanitizeWebsocketQuery(snapshot?.websocket_query);
   state.websocketSortKey = sanitizeWebsocketSortKey(snapshot?.websocket_sort_key);
   state.websocketSortDirection = sanitizeWebsocketSortDirection(snapshot?.websocket_sort_direction);
@@ -21068,6 +21071,7 @@ function snapshotUiSettings() {
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,
+    service_map_detail_width: state.serviceMapDetailWidth > 0 ? state.serviceMapDetailWidth : null,
     websocket_query: sanitizeWebsocketQuery(state.websocketQuery),
     websocket_sort_key: sanitizeWebsocketSortKey(state.websocketSortKey),
     websocket_sort_direction: sanitizeWebsocketSortDirection(state.websocketSortDirection),
@@ -21240,6 +21244,63 @@ function sanitizeWebsocketPaneWidth(candidate) {
   return Number.isFinite(parsed) && parsed > 0
     ? clamp(Math.round(parsed), WEBSOCKET_WORKBENCH_MIN_WIDTHS.handshake, 4096)
     : null;
+}
+
+const SERVICE_MAP_DETAIL_MIN_WIDTH = 260;
+// The map's minimum, its resizer and the gaps beside it.
+const SERVICE_MAP_GRAPH_MIN_WIDTH = 372;
+
+function sanitizeServiceMapDetailWidth(candidate) {
+  const parsed = Number(candidate);
+  return Number.isFinite(parsed) && parsed > 0 ? clamp(Math.round(parsed), SERVICE_MAP_DETAIL_MIN_WIDTH, 4096) : null;
+}
+
+// The inspector beside the Service Map keeps the width it was dragged to; the
+// stylesheet still leaves the map its minimum on a narrow window.
+function applyServiceMapDetailWidth() {
+  const content = document.getElementById("serviceMapContent");
+  if (!content) return;
+  if (state.serviceMapDetailWidth > 0) content.style.setProperty("--service-map-detail-width", `${state.serviceMapDetailWidth}px`);
+  else content.style.removeProperty("--service-map-detail-width");
+}
+
+function bindServiceMapResizer(handle) {
+  if (!handle) return;
+  const content = document.getElementById("serviceMapContent");
+  const detail = document.getElementById("serviceMapDetail");
+  const setWidth = (width) => {
+    const room = (content?.getBoundingClientRect().width || 0) - SERVICE_MAP_GRAPH_MIN_WIDTH;
+    state.serviceMapDetailWidth = clamp(Math.round(width), SERVICE_MAP_DETAIL_MIN_WIDTH, Math.max(SERVICE_MAP_DETAIL_MIN_WIDTH, room));
+    applyServiceMapDetailWidth();
+  };
+  handle.addEventListener("dblclick", () => {
+    state.serviceMapDetailWidth = null;
+    applyServiceMapDetailWidth();
+    scheduleUiSettingsSave();
+  });
+  handle.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    setWidth((detail?.getBoundingClientRect().width || SERVICE_MAP_DETAIL_MIN_WIDTH) + (event.key === "ArrowLeft" ? 24 : -24));
+    scheduleUiSettingsSave();
+  });
+  handle.addEventListener("mousedown", (event) => {
+    if (!detail || window.matchMedia("(max-width: 720px)").matches) return;
+    event.preventDefault();
+    const startX = event.clientX, startWidth = detail.getBoundingClientRect().width;
+    document.body.classList.add("pane-resizing-x");
+    handle.classList.add("active");
+    const onMove = (moveEvent) => setWidth(startWidth - (moveEvent.clientX - startX));
+    const onUp = () => {
+      document.body.classList.remove("pane-resizing-x");
+      handle.classList.remove("active");
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      scheduleUiSettingsSave();
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
 }
 
 function serializeWorkbenchPaneWidths() {

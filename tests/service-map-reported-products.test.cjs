@@ -131,7 +131,7 @@ test('only same-product distinct literal reported strings conflict; an unknown v
   assert.equal(map.productMatches(item, '', 'multiple'), false); assert.equal(map.productMatches(item, 'nginx', 'reported:8.3'), false);
   assert.equal(map.productMatches(item, 'php', 'reported:8.3'), true);
   const mixed = normalized([observation('nginx', '1'), observation('nginx', null)]);
-  assert.match(map.productSummaryMarkup(mixed), />nginx 1<\/span>/); assert.match(map.productSummaryMarkup(mixed), /Reported version: unknown/); assert.equal(map.productMatches(mixed, 'nginx', 'multiple'), false);
+  assert.match(map.productSummaryMarkup(mixed), />nginx 1<\/span>/); assert.match(map.productSummaryMarkup(mixed), /nginx · server header/, 'the unknown version keeps its own tooltip line'); assert.equal(map.productMatches(mixed, 'nginx', 'multiple'), false);
   const conflict = normalized([observation('nginx', '1'), observation('nginx', '01'), observation('nginx', '1.0'), observation('nginx', null)]);
   assert.equal(map.productMatches(conflict, 'nginx', 'multiple'), true); assert.match(map.productSummaryMarkup(conflict), />nginx · 3 versions<\/span>/);
   for (const v of ['1', '01', '1.0']) assert.equal(map.productMatches(conflict, 'nginx', `reported:${v}`), true);
@@ -151,7 +151,7 @@ test('summary is bounded, deterministic and preserves separate exact source tupl
   const html = map.productSummaryMarkup(normalized(observations));
   assert.match(html, /\+1<\/span>/); assert.equal((html.match(/<span title=/g) || []).length, 2);
   assert.match(html, /class="service-map-products-more"[^>]*data-more="PHP 8\.3" title="">\+1</, '+N names what it stands for, with no second tooltip');
-  assert.match(html, /server response header/); assert.match(html, /x-powered-by response header/); assert.match(html, /00000000000000000000000000000001/);
+  assert.match(html, /server header/); assert.match(html, /x-powered-by header/); assert.match(html, /00000000000000000000000000000001/);
   assert.equal(html, map.productSummaryMarkup(normalized([...observations].reverse().sort((a, b) => a.header_name.localeCompare(b.header_name)))));
   const malicious = normalized([observation()]); malicious.technology_observations[0].name = '<img onerror="bad">';
   const escaped = map.productSummaryMarkup(malicious); assert.doesNotMatch(escaped, /<img|title="[^>]*"bad"/); assert.match(escaped, /&lt;img onerror=&quot;bad&quot;&gt;/);
@@ -366,6 +366,6 @@ test('peer source-origin extra matches remain separate per-inspection facts, wit
   const scan = peerScan(); scan.origins[0].origin = A; scan.origins.sort((a, b) => a.origin.localeCompare(b.origin));
   const task = f.controller.loadPeerMatches(); f.requests.at(-1).resolve(response(scan)); assert.equal(await task, true); assert.equal(f.controller.showPeerMatchesOnMap(), true);
   f.filter('product', 'php'); assert.deepEqual(cards(f), []);
-  assert.match(f.els.detail.innerHTML, /1 other matching rows in this inspection/);
+  assert.match(f.els.detail.innerHTML, /1 other matching rows</);
   assert.equal(f.state.relationLayers.length, 1);
 });
