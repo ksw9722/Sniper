@@ -632,8 +632,10 @@ which no longer show as unnamed signals.
 
 A response header longer than 4 KiB, which a site's Content-Security-Policy
 often is, is skipped by itself. The page is still read for its front end and
-servers, and its redirect and CORS answer still count, unless the long header
-is the `Location` or `Access-Control-Allow-Origin` itself. Before this, one
+servers, and its redirect and CORS answer still count. An oversized `Location`
+suppresses only the redirect; an oversized `Access-Control-Allow-Origin`
+suppresses only the CORS answer. A count or total-byte scan limit still suppresses
+both because unread headers could contain duplicates. Before this, one
 long policy left the whole page unread: in the two crawls, 123 pages, 13
 redirects and 192 CORS answers.
 

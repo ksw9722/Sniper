@@ -968,7 +968,8 @@ pub(crate) fn project_record_for_catalog(
     // A value too long to read hides only what its own header says: an unread
     // Location or Access-Control-Allow-Origin leaves the redirect or the CORS
     // answer unproven, a long Content-Security-Policy does not.
-    let mut unread_link_header = false;
+    let mut unread_location = false;
+    let mut unread_allowed_origin = false;
     let mut technology_budget = technology::TokenScanBudget::default();
     for (index, header) in response.headers.iter().enumerate() {
         header_bytes = header_bytes
@@ -982,9 +983,10 @@ pub(crate) fn project_record_for_catalog(
         }
         if header.value.len() > MAX_HEADER_VALUE_BYTES {
             row.omitted.push("header_value_limit".into());
-            unread_link_header |= ["location", "access-control-allow-origin"]
-                .iter()
-                .any(|name| header.name.eq_ignore_ascii_case(name));
+            unread_location |= header.name.eq_ignore_ascii_case("location");
+            unread_allowed_origin |= header
+                .name
+                .eq_ignore_ascii_case("access-control-allow-origin");
             continue;
         }
         let header_name = header.name.to_ascii_lowercase();
@@ -1050,12 +1052,11 @@ pub(crate) fn project_record_for_catalog(
     // Access-Control-Allow-Origin, which it compares with the origin as written,
     // so keep the value unnormalized; a partial scan cannot prove there was one.
     // Credentials never apply to `*`.
-    let partial_scan = unread_link_header
-        || row
-            .omitted
-            .iter()
-            .any(|reason| reason == "header_scan_limit");
-    if allowed_origins.len() == 1 && !partial_scan {
+    let partial_scan = row
+        .omitted
+        .iter()
+        .any(|reason| reason == "header_scan_limit");
+    if allowed_origins.len() == 1 && !partial_scan && !unread_allowed_origin {
         let allowed = allowed_origins[0];
         row.cors = Some((allowed.into(), credentials && allowed != "*"));
     }
@@ -1067,7 +1068,7 @@ pub(crate) fn project_record_for_catalog(
             row.omitted.push("ambiguous_location_headers".into());
         } else if let Some(location) = locations.first() {
             // A partial header scan cannot prove there was only one Location.
-            if !partial_scan {
+            if !partial_scan && !unread_location {
                 let request_url = Url::parse(&format!("{}{}", row.origin, row.path)).ok();
                 let target = request_url.and_then(|url| url.join(location.trim()).ok());
                 match target.filter(|url| {
@@ -2679,6 +2680,175 @@ mod tests {
             .unwrap()
             .redirect
             .is_none());
+    }
+
+    fn link_header_record() -> TransactionRecord {
+        let mut row = record("/start");
+        row.status = Some(302);
+        row.request.headers = headers(&[("Origin", "https://page.example.com")]);
+        row.response.as_mut().unwrap().headers = headers(&[
+            ("Location", "https://next.example.com/next"),
+            ("Access-Control-Allow-Origin", "https://page.example.com"),
+            ("Access-Control-Allow-Credentials", "true"),
+        ]);
+        row
+    }
+
+    fn assert_independent_link_header_limit(unread_location: bool) {
+        for catalog in [
+            technology::CatalogVersion::V1,
+            technology::CatalogVersion::V2,
+        ] {
+            for duplicate in [false, true] {
+                for reverse in [false, true] {
+                    for wildcard in [false, true] {
+                        let mut row = link_header_record();
+                        let response = row.response.as_mut().unwrap();
+                        if wildcard {
+                            response.headers[1].value = "*".into();
+                        }
+                        let index = usize::from(!unread_location);
+                        let mut oversized = response.headers[index].clone();
+                        oversized.name = if unread_location {
+                            "lOcAtIoN".into()
+                        } else {
+                            "aCcEsS-cOnTrOl-AlLoW-oRiGiN".into()
+                        };
+                        oversized.value = "x".repeat(MAX_HEADER_VALUE_BYTES + 1);
+                        if duplicate {
+                            response.headers.push(oversized);
+                        } else {
+                            response.headers[index] = oversized;
+                        }
+                        if reverse {
+                            response.headers.reverse();
+                        }
+                        let projected =
+                            project_record_for_catalog(&row, "test".into(), catalog).unwrap();
+                        assert!(!projected.metadata_complete);
+                        assert_eq!(projected.omitted, ["header_value_limit"]);
+                        assert_eq!(projected.redirect.is_some(), !unread_location);
+                        assert_eq!(projected.cors.is_some(), unread_location);
+                        if let Some(redirect) = projected.redirect {
+                            assert_eq!(redirect.target_origin, "https://next.example.com");
+                            assert_eq!(redirect.target_path, "/next");
+                        }
+                        if let Some(cors) = projected.cors {
+                            assert_eq!(
+                                cors,
+                                (
+                                    if wildcard {
+                                        "*"
+                                    } else {
+                                        "https://page.example.com"
+                                    }
+                                    .into(),
+                                    !wildcard,
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn service_map_oversized_location_preserves_independent_cors() {
+        assert_independent_link_header_limit(true);
+    }
+
+    #[test]
+    fn service_map_oversized_acao_preserves_independent_redirect() {
+        assert_independent_link_header_limit(false);
+    }
+
+    #[test]
+    fn service_map_link_header_value_boundary_and_duplicates_remain_conservative() {
+        for index in [0, 1] {
+            for length in [MAX_HEADER_VALUE_BYTES, MAX_HEADER_VALUE_BYTES + 1] {
+                for duplicate in [false, true] {
+                    let mut row = link_header_record();
+                    let response = row.response.as_mut().unwrap();
+                    let mut bounded = response.headers[index].clone();
+                    bounded
+                        .value
+                        .push_str(&" ".repeat(length - bounded.value.len()));
+                    if duplicate {
+                        response.headers.push(bounded);
+                    } else {
+                        response.headers[index] = bounded;
+                    }
+                    let projected = project_record(&row, "test".into()).unwrap();
+                    let own_admitted = !duplicate && length == MAX_HEADER_VALUE_BYTES;
+                    assert_eq!(projected.redirect.is_some(), index != 0 || own_admitted);
+                    assert_eq!(projected.cors.is_some(), index != 1 || own_admitted);
+                    assert_eq!(
+                        projected.omitted.contains(&"header_value_limit".into()),
+                        length > MAX_HEADER_VALUE_BYTES
+                    );
+                    assert_eq!(
+                        projected
+                            .omitted
+                            .contains(&"ambiguous_location_headers".into()),
+                        index == 0 && duplicate && length == MAX_HEADER_VALUE_BYTES
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn service_map_partial_link_header_scan_still_suppresses_both_proofs() {
+        for byte_cap in [false, true] {
+            for reverse in [false, true] {
+                let mut row = link_header_record();
+                if byte_cap {
+                    let mut used: usize = row
+                        .request
+                        .headers
+                        .iter()
+                        .chain(&row.response.as_ref().unwrap().headers)
+                        .map(|header| header.name.len() + header.value.len())
+                        .sum();
+                    let response = row.response.as_mut().unwrap();
+                    while used < MAX_HEADER_BYTES {
+                        let size = (MAX_HEADER_BYTES - used).min(MAX_HEADER_VALUE_BYTES + 1);
+                        response.headers.push(HeaderRecord {
+                            name: "x".into(),
+                            value: "a".repeat(size - 1),
+                        });
+                        used += size;
+                    }
+                } else {
+                    let needed = MAX_HEADERS
+                        - row.request.headers.len()
+                        - row.response.as_ref().unwrap().headers.len();
+                    row.response
+                        .as_mut()
+                        .unwrap()
+                        .headers
+                        .extend(headers(&vec![("x", "a"); needed]));
+                }
+                if reverse {
+                    row.response.as_mut().unwrap().headers.reverse();
+                }
+                let exact = project_record(&row, "test".into()).unwrap();
+                assert!(exact.redirect.is_some());
+                assert!(exact.cors.is_some());
+                assert!(exact.metadata_complete);
+                // Even an unrelated unread header could hide later duplicates.
+                row.response.as_mut().unwrap().headers.push(HeaderRecord {
+                    name: "x".into(),
+                    value: String::new(),
+                });
+                let over = project_record(&row, "test".into()).unwrap();
+                assert!(over.redirect.is_none());
+                assert!(over.cors.is_none());
+                assert_eq!(over.omitted, ["header_scan_limit"]);
+                assert!(!over.metadata_complete);
+            }
+        }
     }
 
     #[tokio::test]
