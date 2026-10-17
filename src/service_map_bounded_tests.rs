@@ -1670,3 +1670,48 @@ fn origins_and_endpoints_name_how_their_requests_authenticate() {
         "no credential value leaves"
     );
 }
+
+// A one-origin map spends its body reads on that origin: three hundred newer
+// pages of other origins no longer use the budget up before its own page.
+#[test]
+fn a_one_origin_map_reads_its_own_pages() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(107);
+    let page = |host: &str, sequence| {
+        let mut record = filter_fixture(host, "/", 200, "text/html", None, sequence);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, "text/html".parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            br#"<meta name="generator" content="WordPress 6.5.2">"#,
+            1024,
+        ));
+        record
+    };
+    // Newest first: the page asked about is the oldest.
+    let mut records: Vec<_> = (0..300)
+        .map(|i| page(&format!("p{i}.example.com"), 1_000 - i))
+        .collect();
+    records.push(page("www.example.com", 1));
+    let store = TransactionStore::from_records(records);
+    let (map, _) = store
+        .service_map_all_rows_blocking(
+            session,
+            technology::CatalogVersion::V2,
+            &ListFilters::default(),
+            false,
+            Some("https://www.example.com".into()),
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(map.origins.len(), 1);
+    assert!(
+        map.origins[0]
+            .front_technologies
+            .iter()
+            .any(|item| item.product_id == "wordpress"),
+        "{:?}",
+        map.origins[0].front_technologies
+    );
+}

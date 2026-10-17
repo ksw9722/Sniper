@@ -1694,6 +1694,10 @@ impl TransactionStore {
         let mut scope = BoundedScope::new(include, exclude)
             .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
         let advanced_matcher = AdvancedSearchMatcher::new(filters);
+        // A one-origin map reads only that origin's bodies: the builder leaves
+        // every other row out, so reading theirs would spend the read budget on
+        // nothing, and a large session could leave the origin's own pages unread.
+        let only = origin_filter.clone();
         let mut builder = MapBuilder::new(in_scope_only, origin_filter);
         let (mut structure, retained, first, last) = {
             let inner = self.inner.blocking_read();
@@ -1793,7 +1797,13 @@ impl TransactionStore {
                 };
                 // A row whose body is still to be read waits with what its URL
                 // named, so the row counts once for each technology.
-                let waiting = match library_lookup(&inner, &mut caches, &row, &mut budget) {
+                let elsewhere = only.as_ref().is_some_and(|origin| *origin != row.origin);
+                let lookup = if elsewhere {
+                    None
+                } else {
+                    library_lookup(&inner, &mut caches, &row, &mut budget)
+                };
+                let waiting = match lookup {
                     Some(Ok(found)) => {
                         merge_libraries(&mut row.libraries, found);
                         None
