@@ -1365,7 +1365,7 @@
       sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectedClient: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null,
-      loading: false, backgroundLoading: false, error: "", refreshPaused: false, requestId: 0, evidenceRequestId: 0, evidence: null,
+      expandedEndpointGroups: new Set(), loading: false, backgroundLoading: false, error: "", refreshPaused: false, requestId: 0, evidenceRequestId: 0, evidence: null,
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       peerMatches: null, peerMatchesSource: null, peerMatchesLoading: false, peerMatchesError: "", peerMatchesRequestId: 0, peerEvidenceBinding: null,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
@@ -2033,7 +2033,7 @@
       state.parametersRequestId += 1;
       Object.assign(state, { parameters: null, parametersKey: null, parametersLoading: false, parametersError: "" });
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null,
-        inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
+        inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, expandedEndpointGroups: new Set(), loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
     function selectOrigin(origin, endpointIndex = null) {
@@ -2771,6 +2771,20 @@
       return origins.flatMap((origin) => origin.endpoints.map((endpoint, index) => ({ origin, endpoint, index })))
         .filter((entry) => !filtered || endpointMatches(entry.endpoint));
     }
+    // Paths that differ only in an ID (/web/chats/{number}/posts) share one
+    // row, opened to list them; a page counts these rows, not every path.
+    function endpointUnits(entries) {
+      const units = [], templates = new Map();
+      for (const entry of entries) {
+        const template = entry.endpoint.path_group !== entry.endpoint.path ? entry.endpoint.path_group : null;
+        const key = template && JSON.stringify([entry.origin.origin, entry.endpoint.method, template]);
+        if (key && templates.has(key)) { templates.get(key).members.push(entry); continue; }
+        const unit = { key, template, members: [entry] };
+        if (key) templates.set(key, unit);
+        units.push(unit);
+      }
+      return units;
+    }
     const endpointIdentity = ({ origin, endpoint }) => ({ origin: origin.origin, method: endpoint.method, path: endpoint.path });
     const sameEndpoint = (entry, identity) => !!identity && entry.origin.origin === identity.origin
       && entry.endpoint.method === identity.method && entry.endpoint.path === identity.path;
@@ -2781,14 +2795,15 @@
         ["page", "pageAnchor", loadedEndpointEntries()],
         ["detailPage", "detailPageAnchor", loadedEndpointEntries(selectedOrigin() ? [selectedOrigin()] : [])],
       ]) {
-        const index = entries.findIndex((entry) => sameEndpoint(entry, state[anchorKey]));
-        state[pageKey] = Math.min(index < 0 ? state[pageKey] : Math.floor(index / API_PAGE_SIZE), Math.max(0, Math.ceil(entries.length / API_PAGE_SIZE) - 1));
+        const units = endpointUnits(entries);
+        const index = units.findIndex((unit) => unit.members.some((entry) => sameEndpoint(entry, state[anchorKey])));
+        state[pageKey] = Math.min(index < 0 ? state[pageKey] : Math.floor(index / API_PAGE_SIZE), Math.max(0, Math.ceil(units.length / API_PAGE_SIZE) - 1));
         // A local origin filter can hide an otherwise retained catalog anchor.
         // Keep it so clearing the filter returns to that exact endpoint; a
         // genuinely removed endpoint still adopts the clamped fallback page.
         const hiddenLoadedAnchor = pageKey === "page" && loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false)
           .some((entry) => sameEndpoint(entry, state[anchorKey]));
-        if (index < 0 && !hiddenLoadedAnchor) state[anchorKey] = entries[state[pageKey] * API_PAGE_SIZE] ? endpointIdentity(entries[state[pageKey] * API_PAGE_SIZE]) : null;
+        if (index < 0 && !hiddenLoadedAnchor) state[anchorKey] = units[state[pageKey] * API_PAGE_SIZE] ? endpointIdentity(units[state[pageKey] * API_PAGE_SIZE].members[0]) : null;
       }
     }
     function setEndpointFilter(kind, value) {
@@ -2820,13 +2835,29 @@
       if (query && !origin.origin.toLowerCase().includes(query)) notices.push("Selected origin is outside the origin search. Its inspector remains open.");
       return notices.length ? `<p class="service-map-filter-notice" role="status">${notices.join(" ")}</p>` : "";
     }
-    function endpointCoverageMarkup(matching, loaded, start, hiddenOrigins = 0, hiddenProducts = 0) {
-      return `<p class="service-map-muted service-map-endpoint-counts" role="status">${matching ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, matching)} / ${matching.toLocaleString()} matching · ${loaded.toLocaleString()} loaded · ${(loaded - hiddenOrigins - hiddenProducts - matching).toLocaleString()} hidden by endpoint filters${hiddenProducts ? ` · ${hiddenProducts.toLocaleString()} hidden by origin products/versions` : ""}${hiddenOrigins ? ` · ${hiddenOrigins.toLocaleString()} hidden by origin search` : ""}.</p>`;
+    function endpointCoverageMarkup(matching, loaded, start, hiddenOrigins = 0, hiddenProducts = 0, paths = matching) {
+      return `<p class="service-map-muted service-map-endpoint-counts" role="status">${matching ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, matching)} / ${matching.toLocaleString()} matching${paths !== matching ? ` (${paths.toLocaleString()} paths)` : ""} · ${loaded.toLocaleString()} loaded · ${(loaded - hiddenOrigins - hiddenProducts - paths).toLocaleString()} hidden by endpoint filters${hiddenProducts ? ` · ${hiddenProducts.toLocaleString()} hidden by origin products/versions` : ""}${hiddenOrigins ? ` · ${hiddenOrigins.toLocaleString()} hidden by origin search` : ""}.</p>`;
     }
+    const methodTone = (method) => method.toUpperCase() === "GET" ? "get" : method.toUpperCase() === "POST" ? "post" : "other";
+    const apiAuthTag = (kinds) => kinds.length ? `<span class="service-map-api-auth" title="${escape(kinds.map((kind) => AUTH_LABELS[kind][1]).join(", "))}">${LOCK_ICON}${escape(kinds.map((kind) => AUTH_LABELS[kind][0]).join(" · "))}</span>` : "";
     function endpointButton(endpoint, origin, index, catalog = false) {
       const method = endpoint.method;
-      const tone = method.toUpperCase() === "GET" ? "get" : method.toUpperCase() === "POST" ? "post" : "other";
-      return `<button class="service-map-api-row ${state.selectedOrigin === origin.origin && state.endpointIndex === index ? "selected" : ""}" type="button" data-service-endpoint="${index}" data-service-origin="${escape(origin.origin)}" data-service-focus="api:${escape(JSON.stringify([origin.origin, endpoint.method, endpoint.path]))}"><span class="service-map-method ${tone}" title="${escape(method)}">${escape(method)}</span><span class="service-map-api-copy">${catalog ? `<small title="${escape(origin.origin)}">${escape(origin.origin)}</small>` : ""}<span title="${escape(endpoint.path)}">${escape(endpoint.path)}</span></span>${endpoint.auth?.length ? `<span class="service-map-api-auth" title="${escape(endpoint.auth.map((kind) => AUTH_LABELS[kind][1]).join(", "))}">${LOCK_ICON}${escape(endpoint.auth.map((kind) => AUTH_LABELS[kind][0]).join(" · "))}</span>` : ""}<span class="service-map-api-count">${endpoint.request_count.toLocaleString()}<span class="service-map-chevron" aria-hidden="true">›</span></span></button>`;
+      return `<button class="service-map-api-row ${state.selectedOrigin === origin.origin && state.endpointIndex === index ? "selected" : ""}" type="button" data-service-endpoint="${index}" data-service-origin="${escape(origin.origin)}" data-service-focus="api:${escape(JSON.stringify([origin.origin, endpoint.method, endpoint.path]))}"><span class="service-map-method ${methodTone(method)}" title="${escape(method)}">${escape(method)}</span><span class="service-map-api-copy">${catalog ? `<small title="${escape(origin.origin)}">${escape(origin.origin)}</small>` : ""}<span title="${escape(endpoint.path)}">${escape(endpoint.path)}</span></span>${apiAuthTag(endpoint.auth || [])}<span class="service-map-api-count">${endpoint.request_count.toLocaleString()}<span class="service-map-chevron" aria-hidden="true">›</span></span></button>`;
+    }
+    // A template's row: its ID segments marked, how many paths and rows it
+    // stands for; open, it lists them. The selected path keeps it open.
+    function endpointUnitMarkup(unit, catalog = false) {
+      if (unit.members.length === 1) {
+        const [{ endpoint, origin, index }] = unit.members;
+        return endpointButton(endpoint, origin, index, catalog);
+      }
+      const { origin, endpoint } = unit.members[0];
+      const selected = unit.members.some((entry) => state.selectedOrigin === entry.origin.origin && state.endpointIndex === entry.index);
+      const open = selected || state.expandedEndpointGroups.has(unit.key);
+      const rows = unit.members.reduce((sum, entry) => sum + entry.endpoint.request_count, 0);
+      const kinds = AUTH_KINDS.filter((kind) => unit.members.some((entry) => entry.endpoint.auth?.includes(kind)));
+      const template = escape(unit.template).replace(/\{(number|uuid|hex)\}/g, '<span class="service-map-path-id">{$1}</span>');
+      return `<button class="service-map-api-row service-map-api-group${selected ? " selected" : ""}" type="button" aria-expanded="${open}" data-service-endpoint-group="${escape(unit.key)}" data-service-focus="api-group:${escape(unit.key)}"><span class="service-map-method ${methodTone(endpoint.method)}" title="${escape(endpoint.method)}">${escape(endpoint.method)}</span><span class="service-map-api-copy">${catalog ? `<small title="${escape(origin.origin)}">${escape(origin.origin)}</small>` : ""}<span title="${escape(unit.template)}">${template}</span><small>${unit.members.length.toLocaleString()} paths</small></span>${apiAuthTag(kinds)}<span class="service-map-api-count">${rows.toLocaleString()}<span class="service-map-chevron" aria-hidden="true">${open ? "⌄" : "›"}</span></span></button>${open ? `<div class="service-map-api-members">${unit.members.map((entry) => endpointButton(entry.endpoint, entry.origin, entry.index)).join("")}</div>` : ""}`;
     }
     function relationshipMarkup(origin) {
       const group = state.relationsByOrigin?.get(origin.origin);
@@ -3056,13 +3087,14 @@
         return;
       }
       const entries = loadedEndpointEntries([origin]);
-      const pageCount = Math.max(1, Math.ceil(entries.length / API_PAGE_SIZE));
+      const units = endpointUnits(entries);
+      const pageCount = Math.max(1, Math.ceil(units.length / API_PAGE_SIZE));
       state.detailPage = Math.min(state.detailPage, pageCount - 1);
       const start = state.detailPage * API_PAGE_SIZE;
-      if (!state.detailPageAnchor && entries[start]) state.detailPageAnchor = endpointIdentity(entries[start]);
+      if (!state.detailPageAnchor && units[start]) state.detailPageAnchor = endpointIdentity(units[start].members[0]);
       replaceDetail(`<header class="service-map-detail-header"><div><h3 title="${escape(new URL(origin.origin).host)}">${escape(new URL(origin.origin).host)}</h3><p title="${escape(origin.origin)}">${escape(origin.origin)}</p></div><span class="detail-chip ${origin.in_scope ? "ok" : "none"}">${origin.in_scope ? "In scope" : "Out of scope"}</span></header>${originActionsMarkup(origin)}
         <div class="service-map-detail-tabs" role="tablist" aria-label="Origin details"><button type="button" role="tab" id="serviceMapDetailApisTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "apis"}" tabindex="${state.detailTab === "apis" ? 0 : -1}" data-service-detail-tab="apis" data-service-focus="detail:apis">APIs</button><button type="button" role="tab" id="serviceMapDetailEvidenceTab" aria-controls="serviceMapDetailBody" aria-selected="${state.detailTab === "evidence"}" tabindex="${state.detailTab === "evidence" ? 0 : -1}" data-service-detail-tab="evidence" data-service-focus="detail:evidence">Evidence</button></div>
-        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${authMarkup(origin)}${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(entries.length, origin.endpoints.length, start)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ endpoint, index }) => endpointButton(endpoint, origin, index)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${serverTechnologiesMarkup(origin)}${frontTechnologiesMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
+        <div class="service-map-detail-body" id="serviceMapDetailBody" role="tabpanel" aria-labelledby="${state.detailTab === "apis" ? "serviceMapDetailApisTab" : "serviceMapDetailEvidenceTab"}">${endpointSelectionNotice(origin)}${state.detailTab === "evidence" ? evidenceMarkup(origin) : `${authMarkup(origin)}${endpointFiltersMarkup("serviceMapDetail")}${endpointCoverageMarkup(units.length, origin.endpoints.length, start, 0, 0, entries.length)}<div class="service-map-api-list">${units.slice(start, start + API_PAGE_SIZE).map((unit) => endpointUnitMarkup(unit)).join("") || '<p class="empty-copy">No loaded endpoints match these filters for this origin.</p>'}</div>${pageCount > 1 ? `<div class="service-map-pagination"><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage - 1}" ${state.detailPage === 0 ? "disabled" : ""}>Previous</button><span>${state.detailPage + 1} / ${pageCount}</span><button class="secondary-action" type="button" data-service-detail-page="${state.detailPage + 1}" ${state.detailPage + 1 >= pageCount ? "disabled" : ""}>Next</button></div>` : ""}${peerOriginMarkup(origin)}${technologyMarkup(origin.technology_observations, origin)}${serverTechnologiesMarkup(origin)}${frontTechnologiesMarkup(origin)}${relationshipMarkup(origin)}<div class="service-map-evidence-summary"><h4>Evidence summary</h4><p>${origin.request_count.toLocaleString()} sampled HTTP rows in this snapshot. ${origin.redirects.length} redirect instruction(s).</p><button class="secondary-action" type="button" data-service-detail-tab="evidence" data-service-focus="view:evidence">${state.endpointSelection ? "View selected endpoint evidence" : "View evidence"}</button></div>`}</div>`);
     }
     function renderCatalog() {
       const loaded = loadedEndpointEntries((state.snapshot?.origins || []).filter((origin) => !state.scopeOnly || origin.in_scope), false);
@@ -3070,13 +3102,14 @@
       const searchedEntries = loadedEndpointEntries(stages.searched, false);
       const originEntries = loadedEndpointEntries(stages.matching, false);
       const entries = originEntries.filter(({ endpoint }) => endpointMatches(endpoint));
-      const pages = Math.max(1, Math.ceil(entries.length / API_PAGE_SIZE));
+      const units = endpointUnits(entries);
+      const pages = Math.max(1, Math.ceil(units.length / API_PAGE_SIZE));
       // Invalidation temporarily removes the snapshot. Keep the previous page
       // as the fallback if its identity anchor is absent from the next result.
       if (state.snapshot) state.page = Math.min(state.page, pages - 1);
       const start = state.page * API_PAGE_SIZE;
-      if (!state.pageAnchor && entries[start]) state.pageAnchor = endpointIdentity(entries[start]);
-      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(entries.length, loaded.length, start, loaded.length - searchedEntries.length, searchedEntries.length - originEntries.length)}<div class="service-map-api-list">${entries.slice(start, start + API_PAGE_SIZE).map(({ origin, endpoint, index }) => endpointButton(endpoint, origin, index, true)).join("") || `<p class="empty-copy">${state.loading && !state.snapshot ? "Loading retained API paths…" : "No loaded endpoints match these filters, origin search and origin products/versions."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${entries.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, entries.length)} / ${entries.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
+      if (!state.pageAnchor && units[start]) state.pageAnchor = endpointIdentity(units[start].members[0]);
+      replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(units.length, loaded.length, start, loaded.length - searchedEntries.length, searchedEntries.length - originEntries.length, entries.length)}<div class="service-map-api-list">${units.slice(start, start + API_PAGE_SIZE).map((unit) => endpointUnitMarkup(unit, true)).join("") || `<p class="empty-copy">${state.loading && !state.snapshot ? "Loading retained API paths…" : "No loaded endpoints match these filters, origin search and origin products/versions."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${units.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, units.length)} / ${units.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
     }
     function render() {
       renderStatus();
@@ -3158,7 +3191,12 @@
       else if (data.serviceUnhideAll) saveSiteDisplay({ hidden: [] });
       else if (data.serviceGroupSites) saveSiteDisplay({ groupSites: !siteDisplay().groupSites });
       else if (data.serviceDetailTab) { state.detailTab = data.serviceDetailTab; renderDetail(); }
-      else if (data.serviceEndpointFilterClear) setEndpointFilter("clear");
+      else if (data.serviceEndpointGroup) {
+        const groups = state.expandedEndpointGroups;
+        if (groups.has(data.serviceEndpointGroup)) groups.delete(data.serviceEndpointGroup);
+        else groups.add(data.serviceEndpointGroup);
+        if (state.view === "apis") renderCatalog(); else renderDetail();
+      } else if (data.serviceEndpointFilterClear) setEndpointFilter("clear");
       else if (data.serviceProductFilterClear) setProductFilter("clear");
       else if (data.serviceEvidence) loadEvidence(data.serviceEvidence);
       else if (data.serviceBodyReferences) loadBodyReferences();

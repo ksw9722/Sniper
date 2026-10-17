@@ -7519,6 +7519,9 @@ button.utility-button.replay-tab-add {
 .service-map-method.post { color: var(--token-method-color); border-color: var(--token-method-color); background: rgba(90,160,100,.07); }
 .service-map-api-copy { display: grid; gap: 5px; min-width: 0; flex: 1; font-family: var(--mono); overflow-wrap: anywhere; font-size: var(--font-xs); }
 .service-map-api-copy small { color: var(--text-dim); font-family: var(--sans); }
+/* An ID template's placeholders, and the paths it stands for once opened. */
+.service-map-path-id { color: var(--token-url-color); }
+.service-map-api-members { margin-left: 18px; border-left: 1px solid var(--line); }
 .service-map-api-count { display: flex; gap: 12px; color: var(--text-dim); font-size: var(--font-xs); }
 .service-map-chevron { font-size: 20px; line-height: 14px; }
 .service-map-evidence-summary { margin-top: 24px; padding-top: 10px; border-top: 1px solid var(--line); }

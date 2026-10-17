@@ -1113,6 +1113,15 @@ pub fn path_group(path: &str) -> Option<String> {
             {
                 changed = true;
                 "{uuid}"
+            } else if (16..=128).contains(&part.len())
+                && part.bytes().all(|b| b.is_ascii_hexdigit())
+                && part.bytes().any(|b| b.is_ascii_digit())
+                && part.bytes().any(|b| b.is_ascii_alphabetic())
+            {
+                // A MongoDB ObjectId (24 hex digits) or a hash names one
+                // object as a number does; a word never has a digit in it.
+                changed = true;
+                "{hex}"
             } else {
                 part
             }
@@ -2041,6 +2050,17 @@ mod tests {
             Some("/users/{uuid}".into())
         );
         assert_eq!(path_group("/static/v2/0x10/1234567890123456789"), None);
+        assert_eq!(
+            path_group("/web/chats/481708212407212/posts/6ac5f9f2e9cba87a1381140d"),
+            Some("/web/chats/{number}/posts/{hex}".into())
+        );
+        assert_eq!(
+            path_group("/users/73c4fa901f2b13362bd79cdaae2488a2f4cc29c5055df2e1b74a0967962840d2"),
+            Some("/users/{hex}".into())
+        );
+        // Short hex, or hex letters with no digit, is a word or a version.
+        assert_eq!(path_group("/static/deadbeef/cafe/facade"), None);
+        assert_eq!(path_group("/assets/abcdefabcdefabcdef"), None);
     }
 
     #[tokio::test]

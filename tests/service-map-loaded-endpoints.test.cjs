@@ -65,6 +65,28 @@ test('page 3 endpoint evidence/APIs roundtrip keeps exact endpoint and page with
   assert.equal(f.requests.length, 2);
 });
 
+test('paths that differ only in an ID share one row, opened to list them', async () => {
+  const ids = [
+    { ...endpoint('/web/chats/481708212407212/posts'), path_group: '/web/chats/{number}/posts', request_count: 5 },
+    { ...endpoint('/web/chats/445871621677916/posts'), path_group: '/web/chats/{number}/posts', request_count: 1 },
+    { ...endpoint('/web/chats/481708212407212/posts/6ac5f9f2e9cba87a1381140d'), path_group: '/web/chats/{number}/posts/{hex}', request_count: 2 },
+    endpoint('/health'),
+  ];
+  const f = fixture(); await f.load(snapshot([origin(A, ids)]));
+  f.controller.selectOrigin(A);
+  const html = f.els.detail.innerHTML;
+  assert.match(html, /data-service-endpoint-group="[^"]+"[^>]*>[^]*?\/web\/chats\/<span class="service-map-path-id">\{number\}<\/span>\/posts<\/span><small>2 paths<\/small>[^]*?>6</, 'one row, its rows summed');
+  assert.deepEqual(rows(f.els.detail), [2, 3], 'closed, and a template seen once keeps its own path');
+  assert.match(html, /1–3 \/ 3 matching \(4 paths\) · 4 loaded · 0 hidden by endpoint filters/);
+  const key = JSON.stringify([A, 'GET', '/web/chats/{number}/posts']);
+  f.click({ serviceEndpointGroup: key });
+  assert.deepEqual(rows(f.els.detail), [0, 1, 2, 3], 'open, it lists its paths');
+  f.click({ serviceEndpointGroup: key });
+  assert.deepEqual(rows(f.els.detail), [2, 3]);
+  f.controller.selectOrigin(A, 1); tab(f, 'apis');
+  assert.deepEqual(rows(f.els.detail), [0, 1, 2, 3], 'the selected path keeps its group open');
+});
+
 test('keyboard API/Evidence tabs keep selected identity and page', async () => {
   const f = fixture(); await f.load(); f.controller.selectOrigin(A, 110);
   const target = { closest: () => ({ dataset: { serviceDetailTab: 'evidence' } }) };
