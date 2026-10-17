@@ -103,6 +103,7 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("shopify", "Shopify", CMS),
     ("wix", "Wix", CMS),
     ("squarespace", "Squarespace", CMS),
+    ("adobe_experience_manager", "Adobe Experience Manager", CMS),
     ("react", "React", FRAMEWORK),
     ("vue", "Vue.js", FRAMEWORK),
     ("angular", "Angular", FRAMEWORK),
@@ -159,8 +160,35 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("sweetalert2", "SweetAlert2", LIBRARY),
     ("hammer_js", "Hammer.js", LIBRARY),
     ("sentry", "Sentry", LIBRARY),
+    ("slick", "Slick", LIBRARY),
+    ("aos", "AOS", LIBRARY),
+    ("html5shiv", "html5shiv", LIBRARY),
+    ("respond_js", "Respond.js", LIBRARY),
+    ("fullpage_js", "fullPage.js", LIBRARY),
+    ("scrollmagic", "ScrollMagic", LIBRARY),
+    ("mcustomscrollbar", "malihu custom scrollbar", LIBRARY),
+    ("netfunnel", "NetFUNNEL", LIBRARY),
+    ("onetrust", "OneTrust", LIBRARY),
+    ("google_translate", "Google Translate", LIBRARY),
+    ("recaptcha", "reCAPTCHA", LIBRARY),
+    ("ie9_js", "IE9.js", LIBRARY),
+    ("jquery_blockui", "BlockUI", LIBRARY),
+    ("jquery_cookie", "jquery-cookie", LIBRARY),
+    ("simplemodal", "SimpleModal", LIBRARY),
+    ("bxslider", "bxSlider", LIBRARY),
+    ("jquery_easing", "jQuery Easing", LIBRARY),
+    ("owl_carousel", "Owl Carousel", LIBRARY),
+    ("jquery_form", "jQuery Form", LIBRARY),
+    ("naver_login", "NAVER Login", LIBRARY),
+    ("nprotect", "nProtect Online Security", LIBRARY),
     ("google_tag_manager", "Google Tag Manager", ANALYTICS),
     ("google_analytics", "Google Analytics", ANALYTICS),
+    ("naver_analytics", "NAVER Analytics", ANALYTICS),
+    ("cloudflare_insights", "Cloudflare Web Analytics", ANALYTICS),
+    ("google_ad_manager", "Google Ad Manager", ANALYTICS),
+    ("google_adsense", "Google AdSense", ANALYTICS),
+    ("google_ads", "Google Ads", ANALYTICS),
+    ("marketo", "Marketo", ANALYTICS),
 ];
 
 // Each rule names a product in PRODUCTS. `§` is the version: a digit, then
@@ -342,6 +370,85 @@ const URL_MARKERS: &[(&str, &str)] = &[
     ("wix", r"static\.(?:wixstatic|parastorage)\.com/"),
     ("squarespace", r"(?:static1|assets)\.squarespace\.com/"),
     ("livewire", r"/livewire(?:\.min)?\.js"),
+    ("slick", r"(?i)/slick(?:\.min)?\.js(?:$|[?#])"),
+    ("aos", r"(?i)/aos(?:\.min)?\.js(?:$|[?#])"),
+    (
+        "html5shiv",
+        r"(?i)/html5shiv(?:-printshiv)?(?:\.min)?\.js|/trunk/html5\.js(?:$|[?#])",
+    ),
+    ("respond_js", r"(?i)/respond(?:\.min|\.src)?\.js(?:$|[?#])"),
+    (
+        "fullpage_js",
+        r"(?i)/(?:jquery\.)?fullpage(?:\.min)?\.js(?:$|[?#])",
+    ),
+    ("scrollmagic", r"(?i)/scrollmagic(?:\.min)?\.js(?:$|[?#])"),
+    (
+        "mcustomscrollbar",
+        r"(?i)/jquery\.mcustomscrollbar(?:\.concat)?(?:\.min)?\.js",
+    ),
+    // STCLab's NetFUNNEL waiting room, which Korean sites put before a sale
+    // or a sign-up.
+    ("netfunnel", r"(?i)/netfunnel(?:\.min)?\.js(?:$|[?#])"),
+    ("naver_analytics", r"wcs\.naver\.net/wcslog\.js"),
+    ("moment", r"(?i)/moment(?:\.min)?\.js(?:$|[?#])"),
+    (
+        "onetrust",
+        r"(?i)cdn\.cookielaw\.org/|/scripttemplates/otsdkstub\.js",
+    ),
+    (
+        "cloudflare_insights",
+        r"static\.cloudflareinsights\.com/beacon\.min\.js",
+    ),
+    (
+        "google_ad_manager",
+        r"securepubads\.g\.doubleclick\.net/tag/js/gpt\.js",
+    ),
+    ("google_adsense", r"/pagead/js/adsbygoogle\.js"),
+    (
+        "google_ads",
+        r"googleadservices\.com/pagead/conversion(?:_async)?\.js|googleads\.g\.doubleclick\.net/pagead/viewthroughconversion/",
+    ),
+    (
+        "google_translate",
+        r"translate\.google\.com/translate_a/element\.js",
+    ),
+    (
+        "recaptcha",
+        r"(?:www\.google\.com|www\.recaptcha\.net)/recaptcha/(?:api|enterprise)\.js",
+    ),
+    (
+        "marketo",
+        r"(?i)marketo\.com/js/forms2/|munchkin\.marketo\.net/",
+    ),
+    // AEM's client libraries and the Granite UI they build on.
+    (
+        "adobe_experience_manager",
+        r"/etc\.clientlibs/|/libs/granite/|/etc/designs/",
+    ),
+    ("ie9_js", r"(?i)/ie(?:7|8|9)(?:\.min)?\.js(?:$|[?#])"),
+    ("jquery_blockui", r"(?i)/jquery\.blockui(?:\.min)?\.js"),
+    ("jquery_cookie", r"(?i)/jquery\.cookie(?:\.min)?\.js"),
+    (
+        "simplemodal",
+        r"(?i)/jquery\.simplemodal(?:-§)?(?:\.min)?\.js",
+    ),
+    ("bxslider", r"(?i)/jquery\.bxslider(?:\.min)?\.js"),
+    (
+        "jquery_easing",
+        r"(?i)/jquery\.easing(?:\.§)?(?:\.min)?\.js",
+    ),
+    ("owl_carousel", r"(?i)/owl\.carousel(?:\.min)?\.js"),
+    ("jquery_form", r"(?i)/jquery\.form(?:\.min)?\.js"),
+    (
+        "naver_login",
+        r"(?i)/naveridlogin_js_sdk_§\.js|static\.nid\.naver\.com/js/naveridlogin",
+    ),
+    // INCA Internet's nProtect, the keyboard and firewall plug-in Korean
+    // banks load before a sign-in.
+    (
+        "nprotect",
+        r"(?i)/nppfs-§\.js|/nppfs(?:\.min)?\.js|/nppfsstartup\.js",
+    ),
     ("google_tag_manager", r"googletagmanager\.com/gtm\.js"),
     (
         "google_analytics",
@@ -477,6 +584,18 @@ fn package_product(name: &str) -> Option<&'static str> {
         "sweetalert2" => "sweetalert2",
         "hammer.js" | "hammerjs" => "hammer_js",
         "@sentry/browser" => "sentry",
+        "slick-carousel" => "slick",
+        "aos" => "aos",
+        "html5shiv" => "html5shiv",
+        "respond.js" => "respond_js",
+        "fullpage.js" => "fullpage_js",
+        "scrollmagic" => "scrollmagic",
+        "malihu-custom-scrollbar-plugin" => "mcustomscrollbar",
+        "owl.carousel" => "owl_carousel",
+        "bxslider" => "bxslider",
+        "jquery.easing" => "jquery_easing",
+        "jquery-form" => "jquery_form",
+        "jquery-cookie" | "jquery.cookie" => "jquery_cookie",
         _ => return None,
     })
 }
@@ -610,7 +729,11 @@ pub(crate) fn detect_url(url: &str) -> Vec<Detection> {
         add(Some(product), captures.get(2).map(|v| v.as_str()));
     }
     for index in MARKERS.set.matches(url).iter() {
-        add(Some(MARKERS.ids[index]), None);
+        let version = MARKERS.each[index]
+            .as_ref()
+            .and_then(|rule| rule.captures(url))
+            .and_then(|captures| captures.get(1));
+        add(Some(MARKERS.ids[index]), version.map(|v| v.as_str()));
     }
     found
 }
@@ -622,6 +745,19 @@ fn generator(content: &str) -> Option<Detection> {
     let mut words = Vec::new();
     let mut version = None;
     for word in content.split_whitespace().take(6) {
+        if words.is_empty() {
+            let word = word.trim_end_matches([',', ';']);
+            if let Some((name, number)) = word.rsplit_once('-').filter(|(name, number)| {
+                name.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && number
+                        .trim_start_matches(['v', 'V'])
+                        .starts_with(|c: char| c.is_ascii_digit())
+            }) {
+                words.push(name);
+                version = Some(number.trim_start_matches(['v', 'V']).to_string());
+                break;
+            }
+        }
         let candidate = word
             .strip_prefix(['v', 'V'])
             .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
@@ -1035,6 +1171,16 @@ mod tests {
             "wix"
         );
         assert_eq!(generator("VuePress 2.0.0").unwrap().product_id, "vuepress");
+        let mkdocs = generator("mkdocs-1.6.1, mkdocs-material-9.7.6").unwrap();
+        assert_eq!(
+            (mkdocs.product_id.as_str(), mkdocs.version.as_deref()),
+            ("mkdocs", Some("1.6.1"))
+        );
+        let zensical = generator("zensical-0.0.65").unwrap();
+        assert_eq!(
+            (zensical.product_id.as_str(), zensical.version.as_deref()),
+            ("zensical", Some("0.0.65"))
+        );
         assert!(detect("<p>plain page</p>", Kind::Page).is_empty());
     }
 
@@ -1068,6 +1214,37 @@ mod tests {
             ("https://cdn.shopify.com/s/files/1/theme.js", "shopify", None),
             ("https://static.parastorage.com/services/wix-thunderbolt/dist/main.js", "wix", None),
             ("https://assets.squarespace.com/universal/scripts-compressed/common.js", "squarespace", None),
+            ("https://example.com/lib/slick/slick.min.js", "slick", None),
+            ("https://cdn.example.com/npm/slick-carousel@1.8.1/slick/slick.min.js", "slick", Some("1.8.1")),
+            ("https://example.com/js/aos.js", "aos", None),
+            ("https://html5shim.example.com/svn/trunk/html5.js", "html5shiv", None),
+            ("https://example.com/js/html5shiv.min.js", "html5shiv", None),
+            ("https://example.com/js/respond.min.js", "respond_js", None),
+            ("https://example.com/js/jquery.fullpage.min.js", "fullpage_js", None),
+            ("https://example.com/vendor/ScrollMagic.min.js", "scrollmagic", None),
+            ("https://example.com/js/jquery.mCustomScrollbar.concat.min.js", "mcustomscrollbar", None),
+            ("https://example.com/netfunnel/netfunnel.js", "netfunnel", None),
+            ("https://wcs.naver.net/wcslog.js", "naver_analytics", None),
+            ("https://example.com/js/moment.min.js", "moment", None),
+            ("https://cdn.cookielaw.org/scripttemplates/otSDKStub.js", "onetrust", None),
+            ("https://static.cloudflareinsights.com/beacon.min.js/v8b253dfea2ab4077af8c6f58422dfbfd1689876627854", "cloudflare_insights", None),
+            ("https://securepubads.g.doubleclick.net/tag/js/gpt.js", "google_ad_manager", None),
+            ("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-1", "google_adsense", None),
+            ("https://www.googleadservices.com/pagead/conversion_async.js", "google_ads", None),
+            ("https://translate.google.com/translate_a/element.js?cb=init", "google_translate", None),
+            ("https://www.google.com/recaptcha/api.js", "recaptcha", None),
+            ("https://app-ab01.marketo.com/js/forms2/js/forms2.min.js", "marketo", None),
+            ("https://example.com/etc.clientlibs/clientlibs/granite/jquery.lc-7842899024219bcbdb5e72c946870b79-lc.min.js", "adobe_experience_manager", None),
+            ("https://ie7-js.example.com/svn/version/2.1(beta4)/IE9.js", "ie9_js", None),
+            ("https://example.com/js/jquery.blockUI.js", "jquery_blockui", None),
+            ("https://example.com/js/jquery.cookie.js", "jquery_cookie", None),
+            ("https://example.com/js/jquery.simplemodal-1.4.4.js", "simplemodal", Some("1.4.4")),
+            ("https://example.com/_lib/jquery.bxslider.min.js", "bxslider", None),
+            ("https://example.com/js/jquery.easing.1.3.js", "jquery_easing", Some("1.3")),
+            ("https://example.com/js/owl.carousel.min.js", "owl_carousel", None),
+            ("https://example.com/js/jquery.form.min.js", "jquery_form", None),
+            ("https://static.nid.example.com/js/naveridlogin_js_sdk_2.0.0.js", "naver_login", Some("2.0.0")),
+            ("https://example.com/pluginfree/js/nppfs-1.13.0.js", "nprotect", Some("1.13.0")),
             ("https://example.com/livewire/livewire.min.js", "livewire", None),
             ("https://www.googletagmanager.com/gtm.js", "google_tag_manager", None),
             ("https://www.google-analytics.com/analytics.js", "google_analytics", None),

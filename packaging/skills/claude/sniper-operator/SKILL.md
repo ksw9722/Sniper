@@ -99,7 +99,8 @@ adds no target traffic, body reads, fallback reads, or automatic retries. Defaul
 map and evidence reads remain metadata-only apart from scripts and pages read for
 front-end technologies, and error and debug responses read for
 `server_technologies`: the edge, gateway, platform, servers, backend, language,
-database and OS an origin's own headers, cookie names and bodies name, and
+database and OS, and the APM agents (`monitoring`), an origin's own headers,
+cookie names, session ID shapes and bodies name, and
 `exposure` entries (debug pages, stack traces, SQL errors, directory listings,
 API documents, a backend address in a BIG-IP cookie, and from scripts and pages
 a source map comment, a leaked key or JWT, or a private address, never the

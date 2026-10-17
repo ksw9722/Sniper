@@ -406,6 +406,18 @@ Icons (`web/product-icons.js`, permissive licences only), and the ⚠ chip names
 its exposure in a word or two instead of counting it. A private key now needs key material after
 its header, and a JWT counts only in scripts and errors.
 
+The server rules were checked against 26 real web servers and WAS run in a
+lab, then against 667 public sites' homepages visited through Sniper. What
+they missed was added: WildFly, Undertow, Open Liberty, Payara, GlassFish and
+Grafana pages; TmaxSoft WebtoB, Google's and NAVER's front ends, CDNetworks,
+BunnyCDN, Apache Traffic Server and a few more by `Server`; APM agents
+(Scouter, WhaTap, eLevisor) in a new `monitoring` layer, LENA, eGovFrame,
+DataDome and Azure App Service by cookie name; and the servlet engine a
+session ID's shape names (JEUS, WebLogic, WebSphere, Jetty). The front end
+gained the libraries the crawl loaded most, Korean ones among them
+(NetFUNNEL, NAVER Analytics and Login, nProtect), and reads a
+`name-version` generator such as `mkdocs-1.6.1`.
+
 Cards are shorter (84px at the default text size) and a product found without a
 version shows its name alone; hovering `+N` lists the products it stands for.
 Every map toolbar control has the compact toolbar size, and the scope toggle is

@@ -344,14 +344,14 @@
     uvicorn: "app_server", waitress: "app_server", nginx: "web_server", apache_http_server: "web_server", microsoft_iis: "web_server",
     caddy: "web_server", openresty: "web_server", litespeed: "web_server", envoy: "gateway", cloudflare: "edge", php: "language" };
   // Server layers, outermost first, as the origin's own responses name them.
-  const SERVER_CATEGORIES = ["exposure", "edge", "gateway", "platform", "web_server", "app_server", "backend", "language", "database", "os"];
+  const SERVER_CATEGORIES = ["exposure", "edge", "gateway", "platform", "web_server", "app_server", "backend", "monitoring", "language", "database", "os"];
   const SERVER_SIGNALS = ["header", "cookie", "body"];
   const SERVER_LABELS = { edge: "Edge", gateway: "Gateway", platform: "Platform", web_server: "Web server", app_server: "App server",
-    backend: "Backend", language: "Language", database: "Database", os: "OS" };
+    backend: "Backend", monitoring: "Monitoring", language: "Language", database: "Database", os: "OS" };
   // What the site is built with leads a card, then the backend and the
   // servers in front of it, then the kits, libraries and trackers it loads.
   const RANKS = { meta_framework: 0, cms: 1, framework: 2, backend: 3, app_server: 4, web_server: 5, gateway: 6, edge: 7, platform: 8,
-    language: 9, database: 10, os: 11, ui: 12, library: 13, analytics: 14 };
+    language: 9, database: 10, os: 11, monitoring: 11.5, ui: 12, library: 13, analytics: 14 };
   // How requests authenticate, as the server names them: what a request
   // carries first, then the flows that hand credentials out. Each kind has a
   // word for a card's chip and an endpoint's tag, and a name for the inspector.

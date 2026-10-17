@@ -170,7 +170,7 @@ header observations, with `+N` for further products; hovering `+N`, or focusing
 the card, lists them. A product found without a version shows its name alone.
 A product's chip carries its logo, and a card with no captured favicon shows
 the leading product's logo on its brand colour. The logos come from Simple
-Icons 16.35.0, bundled in `web/product-icons.js`: 110 products share 97 icons
+Icons 16.35.0, bundled in `web/product-icons.js`: 127 products share 108 icons
 released under CC0, MIT, Apache-2.0, BSD or CC-BY, each licence noted in the
 file. Icons under a copyleft, non-commercial or custom licence (Vue.js, PHP,
 Ruby, Jenkins, Debian, Keycloak, Quasar) are left out, and those products keep
@@ -423,13 +423,24 @@ the map now reads four places for that, without sending anything:
   `awselb/2.0`, `Kestrel`, `Werkzeug/3.0.1 Python/3.12.0`, an operating system
   in parentheses (`Apache/2.4.52 (Ubuntu)`), `Via: 1.1 … (CloudFront)`,
   `X-Powered-By: Servlet/4.0`, `X-AspNet-Version: 4.0.30319`,
-  `Payara Server 6.2024.6`, `GlassFish Server Open Source Edition 4.1.2`.
+  `Payara Server 6.2024.6`, `GlassFish Server Open Source Edition 4.1.2`,
+  TmaxSoft `WebtoB`, Google's own front ends (`gws`, `sffe`, `ESF`, `GSE`),
+  NAVER's (`nfront`, `Testa/6.2.14`), CDNetworks' `PWS/8.3`, `BunnyCDN-…`,
+  Apache Traffic Server's `ATS`, Baidu's `BLB`, ByteDance's `TLB`, Adobe
+  Experience Platform's `jag`, JD.com's `jfe`, and Rocky Linux or AlmaLinux in
+  parentheses.
 - **Names of the cookies a response sets:** `JSESSIONID` (Java servlet),
   `PHPSESSID`, `ASP.NET_SessionId`, `laravel_session`, `connect.sid`
   (Express), `AWSALB`, `BIGipServer…` (F5), `TS…` (F5 WAF), `__cf_bm`,
-  `incap_ses_…`, `ak_bmsc`, `KEYCLOAK_SESSION`. A value is never read, except a
-  BIG-IP cookie's, to tell whether it encodes the pool member's address; the
-  address itself is not reported.
+  `incap_ses_…`, `ak_bmsc`, `AKA_A2`, `datadome`, `ARRAffinity` (Azure App
+  Service), `SERVERID` (HAProxy), `KEYCLOAK_SESSION`, and from Korean sites
+  `LENA-UID` (LENA), `egovLatestServerTime` (eGovFrame) and the APM agents'
+  `SCOUTER`, `WHATAP` and `elevisor_for_j2ee_uid`. A value is never read,
+  except a BIG-IP cookie's, to tell whether it encodes the pool member's
+  address, and a session ID's shape, which names the servlet engine that
+  issued it: JEUS appends its domain and server in base64, WebLogic a JVM hash
+  after `!`, WebSphere a `0000` prefix and a clone ID after `:`, Jetty
+  `node0…`. Neither the address nor the server name is reported.
 - **Bodies:** default error pages (`<center>nginx/1.25.3</center>`,
   `<address>Apache/… Server at …</address>`, `Apache Tomcat/9.0.83`, Spring
   Boot's Whitelabel page and JSON error, Express's `Cannot GET`, Werkzeug's
@@ -450,12 +461,19 @@ OpenResty, Caddy, Traefik, HAProxy, Varnish, Envoy, PHP on Apache,
 OpenLiteSpeed, Kestrel, Express, gunicorn, uvicorn, Django's and Flask's
 development servers, Kong, Jenkins, Grafana and Elasticsearch, each answering
 its root and a missing path. Traefik's not-found page is Go's own, so it reads
-as Go.
+as Go. They were then run over 667 public sites' homepages, Korean government,
+public, finance, university and company sites among them, visited in a
+headless browser through Sniper (Kakao and Daum hosts and private addresses
+refused): every header value, cookie name, generator and script path seen on
+more than a few origins was traced to its hosts, and those Sniper could name
+were added. JEUS, invisible behind a masked `Server` on many Korean sites,
+showed in 59 hosts' session IDs; `WMONID`, set by 86, appears beside JEUS and
+other engines alike, so it names nothing.
 
 Each finding gets a layer, outermost first: `edge` (CDN and WAF), `gateway`
 (load balancer, API gateway, proxy cache), `platform` (hosting and storage),
-`web_server`, `app_server`, `backend` (framework or application), `language`,
-`database`, `os`. What a response gives away by mistake is an `exposure`: a
+`web_server`, `app_server`, `backend` (framework or application),
+`monitoring` (APM agents), `language`, `database`, `os`. What a response gives away by mistake is an `exposure`: a
 Django, Laravel, Symfony or Rails debug page, the Werkzeug debugger, a
 detailed ASP.NET or IIS error, a PHP error or `phpinfo()` page, a Java, .NET,
 Python, Node.js or Go stack trace, an SQL error, a directory listing, Spring
