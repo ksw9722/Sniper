@@ -7440,6 +7440,9 @@ button.utility-button.replay-tab-add {
 .service-map-card-role { display: grid; justify-items: center; align-content: start; gap: 4px; flex: 0 0 34px; }
 .service-map-card-role-label { font-size: 10px; line-height: 1; color: var(--text-dim); white-space: nowrap; }
 .service-map-card-symbol svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+/* A logo is a filled shape: the role icons' outline would draw over its thin
+   lines, as on React's orbits, in the card's accent colour. */
+.service-map-card-symbol .service-map-mark svg { stroke: none; }
 .service-map-card-role.role-api .service-map-card-symbol { color: var(--token-url-color); }
 .service-map-card.pinned .service-map-card-symbol { box-shadow: 0 0 0 2px var(--point-soft); color: var(--point); }
 .service-map-favicon { display: block; width: 16px; height: 16px; object-fit: contain; }

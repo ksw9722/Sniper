@@ -626,6 +626,9 @@ test('a product chip carries its logo, and the card mark is the logo on its bran
   })]));
   const card = (id) => f.els.canvas.innerHTML.split(`data-service-origin="${id}"`)[1].split('</button>')[0];
   assert.match(card(app), /<span class="service-map-mark" style="background:#000000" title="Next\.js"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#fff" d="M[^"]+"\/><\/svg><\/span>/, 'white on Next.js black');
+  const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  assert.match(css, /\.service-map-card-symbol svg \{[^}]*stroke: currentColor/, 'role icons are outlines');
+  assert.match(css, /\.service-map-card-symbol \.service-map-mark svg \{[^}]*stroke: none/, 'a logo mark is not outlined in the accent colour');
   assert.match(card(app), /<svg class="service-map-product-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M[^"]+"\/><\/svg>Next\.js 14\.2\.3</, 'black would vanish on the dark theme');
   assert.match(card(app), /<path fill="#F8DC75" d="[^"]+"\/><\/svg>Apache Tomcat</, "Tomcat's own yellow");
   assert.match(card(api), /<span title="[^"]*">Werkzeug<\/span>/, 'a product with no allowed logo keeps its bare name');
