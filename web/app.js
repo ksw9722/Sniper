@@ -1558,6 +1558,7 @@ function bindEvents() {
           await requireOkResponse(response, "Failed to clear the history.");
           const result = await response.json();
           if (sessionId !== currentSessionId()) return;
+          targetServiceMapController?.invalidate();
           clearHttpHistorySelectionPreview();
           state.selectedId = null;
           state.selectedRecord = null;

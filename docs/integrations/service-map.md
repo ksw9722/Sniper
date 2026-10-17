@@ -446,9 +446,13 @@ Opening an endpoint reads its parameters at once, with no button to press: the
 endpoint's newest 200 retained rows, listing each parameter by name, where it
 was sent (`query`, `form`, a top-level `json` field, or a `multipart` field
 name), how many rows carried it, and up to three of its values, each cut to 80
-characters. Request bodies are read for this only when an endpoint is opened,
+characters. Request bodies are read for this only while an endpoint is open,
 and only in the active session; a body is parsed from its first 64 KiB. The
 values are shown as captured, as in HTTP history.
+Closing and reopening an endpoint reads its newest rows again. Reload and
+history, session or filter invalidation discard the old values and fence late
+responses; a still-open endpoint is read again after a current map verifies it.
+An unchanged background map refresh does not restart a parameter read.
 `GET /api/target/service-map/parameters` with `session_id`, `origin`, `method`
 and `path` returns the same result, and so does the CLI:
 
@@ -684,6 +688,8 @@ undoes it.
 it and its links from the map in every session. The legend's **Hidden** list
 shows each entry with a way back, and **Show all** clears it. Grouping and
 hiding change the map only: the API and the CLI still return every origin.
+Hiding a pinned origin also removes its card, while keeping Direct relations,
+its visible neighbors and the inspector. Show restores the same pinned card.
 Both are saved in UI settings (`service_map_group_sites`,
 `service_map_expanded_sites`, `service_map_hidden`).
 
