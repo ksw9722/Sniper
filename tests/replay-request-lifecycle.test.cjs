@@ -77,6 +77,47 @@ function setup() {
   return f;
 }
 
+for (const host of ["127.0.0.1", "[2001:db8::7]", "example.com"]) {
+  for (const scheme of ["http", "https"]) {
+    const defaultPort = scheme === "https" ? "443" : "80";
+    for (const port of ["", defaultPort, "8443"]) {
+      for (const relative of [false, true]) {
+        const authority = host + (port && port !== defaultPort ? `:${port}` : "");
+        const sourceAuthority = host + (port ? `:${port}` : "");
+        const url = `${scheme}://${sourceAuthority}`;
+        test(`followRedirect preserves ${url} authority for ${relative ? "relative" : "absolute"} locations`, async () => {
+          const f = setup();
+          if (relative) {
+            Object.assign(f.a, {
+              baseRequest: { ...f.a.baseRequest, scheme, host: sourceAuthority },
+              requestText: `GET /a HTTP/1.1\r\nHost: ${sourceAuthority}\r\n\r\n`,
+              targetScheme: scheme, targetHost: host.replace(/^\[|\]$/g, ""), targetPort: port || defaultPort,
+            });
+          }
+          f.a.responseRecord.response.headers[0].value = `${relative ? "" : url}/next?key=value#fragment`;
+          f.syncDom();
+          const pending = f.context.followRedirect();
+          // Preflight also persists this base request, so it must already agree
+          // with the target before either workspace validation or dispatch.
+          assert.equal(f.a.baseRequest.host, authority);
+          await f.resolvePreflight();
+          const sent = JSON.parse(f.replays[0].options.body);
+          assert.equal(sent.request.host, authority);
+          assert.equal(sent.request.scheme, scheme);
+          assert.equal(sent.request.path, "/next?key=value");
+          assert.equal(sent.request.headers.find(header => header.name === "host").value, authority);
+          assert.equal(sent.target, null, "redirect destination is the request authority, not an override");
+          await f.finish(pending);
+          assert.equal(f.a.targetManuallyEdited, false);
+          assert.equal(f.a.historyEntries[0].request.host, authority);
+          assert.equal(f.context.deriveRepeaterRequest(f.a).host, authority);
+          assert.equal(f.a.historyEntries[0].targetPort, port || defaultPort);
+        });
+      }
+    }
+  }
+}
+
 for (const action of ["sendReplay", "followRedirect"]) {
   test(`${action} owns the tab before workspace preflight and blocks repeated actions`, async () => {
     const f = setup(), pending = f.context[action]();

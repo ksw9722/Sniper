@@ -18074,7 +18074,8 @@ async function followRedirect() {
 
   // Add updated host
   const newHostPort = isDefaultPortForScheme(newScheme, newPort) ? "" : newPort;
-  newHeaders.unshift({ name: "host", value: joinAuthority(newHost, newHostPort) });
+  const newAuthority = joinAuthority(newHost, newHostPort);
+  newHeaders.unshift({ name: "host", value: newAuthority });
 
   // Add merged cookies
   if (cookieMap.size > 0) {
@@ -18083,7 +18084,7 @@ async function followRedirect() {
 
   const newRequest = {
     scheme: newScheme,
-    host: newHost,
+    host: newAuthority,
     method: newMethod,
     path: newPath,
     headers: newHeaders,
@@ -18151,7 +18152,7 @@ async function followRedirect() {
           expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
           expected_workspace_revision: expectedWorkspaceRevision,
           request: newRequest,
-          target,
+          target: replayTargetOverridePayload(tab, newRequest, target),
           source_transaction_id: null,
           http_version: httpVersion,
         }),
