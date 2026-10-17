@@ -179,6 +179,7 @@ test('background refresh keeps Reload label and presentation stable while retain
     assert.equal(f.els.refresh.disabled, true); assert.equal(f.els.panel.attributes['aria-busy'], 'false');
     assert.equal(f.els.refresh.classList.contains('service-map-background-refresh'), true);
     assert.equal(f.els.refresh.classList.contains('is-working'), false);
+    assert.equal(f.els.refresh.classList.contains('is-working-shown'), false, 'no ring while polling');
     assert.equal(f.els.canvas.replacements, canvasReplacements);
     f.requests.at(-1).resolve(response(snapshot())); await pending;
     assert.equal(f.els.status.textContent, summary);
@@ -212,12 +213,14 @@ test('initial and manual Reload keep the label fixed, show busy state and resume
   assert.equal(f.els.refresh.disabled, true);
   assert.equal(f.els.refresh.classList.contains('service-map-background-refresh'), false);
   assert.equal(f.els.refresh.classList.contains('is-working'), true);
+  assert.equal(f.els.refresh.classList.contains('is-working-shown'), true, 'the ring turns in place of the label');
   assert.equal(f.els.panel.attributes['aria-busy'], 'true');
   assert.equal(await f.controller.refresh(), false);
   assert.equal(f.requests.length, 2);
   f.requests.at(-1).resolve(response(snapshot())); await manual;
   assert.equal(f.els.refresh.disabled, false);
   assert.equal(f.els.refresh.classList.contains('is-working'), false);
+  assert.equal(f.els.refresh.classList.contains('is-working-shown'), false);
   assert.equal(f.els.panel.attributes['aria-busy'], 'false');
   await f.load(); assert.equal(f.requests.length, 3);
 });

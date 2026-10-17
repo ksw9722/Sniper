@@ -2496,7 +2496,11 @@
       // request guard, but reserve visible progress for initial/manual loads.
       els.refresh.textContent = "Reload";
       els.refresh.classList.toggle("service-map-background-refresh", state.loading && state.backgroundLoading);
+      // An initial or manual load turns the shared progress ring in place of
+      // the label, as other buttons do; it always reads a fresh map, so the
+      // ring would rarely just flash.
       els.refresh.classList.toggle("is-working", state.loading && !state.backgroundLoading);
+      els.refresh.classList.toggle("is-working-shown", state.loading && !state.backgroundLoading);
       els.panel.setAttribute("aria-busy", String(state.loading && !state.backgroundLoading));
     }
     // One toggle per request kind seen in the loaded links, with how many links
