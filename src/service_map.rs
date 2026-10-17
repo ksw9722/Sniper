@@ -1348,6 +1348,7 @@ impl MapBuilder {
                 .is_some_and(|origin| origin != &row.origin)
         {
             self.excluded_rows += 1;
+            self.keep_for_page(&mut row);
             return false;
         }
         for reason in &row.omitted {
@@ -1356,6 +1357,7 @@ impl MapBuilder {
         if !self.origins.contains_key(&row.origin) && self.origins.len() == MAX_ORIGINS {
             self.stopped_by.insert("origins_limit".into());
             self.omitted_rows += 1;
+            self.keep_for_page(&mut row);
             return false;
         }
         let origin = self
@@ -1592,7 +1594,36 @@ impl MapBuilder {
         true
     }
 
-    /// Technologies read from an included row's body after it was folded.
+    /// Whether what a row names may go to the page that loaded it: any page,
+    /// or in a one-origin map only the origin asked about.
+    pub(crate) fn wants_page(&self, page: Option<&String>) -> bool {
+        page.is_some_and(|page| {
+            self.origin_filter
+                .as_ref()
+                .is_none_or(|origin| origin == page)
+        })
+    }
+
+    /// What a row left out of the map names still belongs to the page that
+    /// loaded it, as in a whole map: a one-origin, in-scope or capped map keeps
+    /// the jQuery a page took from a CDN. `finish` drops it unless that page is
+    /// in the map.
+    fn keep_for_page(&mut self, row: &mut ServiceMapRow) {
+        let page = library_page(row);
+        if self.wants_page(page.as_ref()) {
+            for detection in std::mem::take(&mut row.libraries) {
+                hit(
+                    &mut self.front_hits,
+                    page.clone(),
+                    &row.origin,
+                    detection,
+                    &row.evidence_id,
+                );
+            }
+        }
+    }
+
+    /// Technologies read from a row's body after it was folded or left out.
     pub(crate) fn add_libraries(
         &mut self,
         page: Option<String>,

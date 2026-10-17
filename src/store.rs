@@ -1797,8 +1797,13 @@ impl TransactionStore {
                     continue;
                 };
                 // A row whose body is still to be read waits with what its URL
-                // named, so the row counts once for each technology.
-                let elsewhere = only.as_ref().is_some_and(|origin| *origin != row.origin);
+                // named, so the row counts once for each technology. A
+                // one-origin map reads its own rows and the scripts its pages
+                // loaded from elsewhere, not every other origin's.
+                let page = library_page(&row);
+                let wanted = builder.wants_page(page.as_ref());
+                let elsewhere =
+                    !wanted && only.as_ref().is_some_and(|origin| *origin != row.origin);
                 let lookup = if elsewhere {
                     None
                 } else {
@@ -1811,7 +1816,7 @@ impl TransactionStore {
                     }
                     Some(Err(item)) => Some((
                         item,
-                        library_page(&row),
+                        page,
                         row.origin.clone(),
                         row.evidence_id.clone(),
                         std::mem::take(&mut row.libraries),
@@ -1821,7 +1826,7 @@ impl TransactionStore {
                 let in_scope = scope
                     .contains(&row.scope_host)
                     .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
-                if builder.add(row, in_scope) {
+                if builder.add(row, in_scope) || wanted {
                     pending.extend(waiting);
                 }
             }

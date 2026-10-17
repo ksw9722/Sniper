@@ -1050,6 +1050,39 @@ fn front_technologies_go_to_the_page_that_loaded_the_asset() {
         ],
         "a CMS leads a framework"
     );
+    // A one-origin or in-scope map leaves the CDN out, but not what the page
+    // took from it.
+    let whole = |map: &ServiceMap| {
+        let www = map
+            .origins
+            .iter()
+            .find(|origin| origin.origin == "https://www.example.com")
+            .unwrap();
+        serde_json::to_value(&www.front_technologies).unwrap()
+    };
+    for (in_scope_only, origin_filter, include) in [
+        (false, Some("https://www.example.com".to_string()), vec![]),
+        (true, None, vec!["www.example.com".to_string()]),
+    ] {
+        let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+            session,
+            DEFAULT_MAX_RECORDS,
+            technology::CatalogVersion::V1,
+            &crate::store::ListFilters::default(),
+        );
+        let narrow = build_bounded(
+            session,
+            snapshot,
+            DEFAULT_MAX_RECORDS,
+            in_scope_only,
+            origin_filter,
+            &include,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(narrow.origins.len(), 1);
+        assert_eq!(whole(&narrow), whole(&map), "{include:?}");
+    }
 }
 
 // A page may load one library from several origins. Each source button must
@@ -1859,4 +1892,91 @@ fn a_one_origin_map_reads_its_own_pages() {
         "{:?}",
         map.origins[0].front_technologies
     );
+}
+
+// A one-origin or in-scope map over the whole history leaves a CDN out but
+// keeps the jQuery the asked origin's page took from it, and a one-origin map
+// spends no reads on the scripts other pages loaded.
+#[test]
+fn a_narrow_map_keeps_what_its_pages_loaded_from_elsewhere() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(108);
+    let script = |path: &str, referer: &str, sequence| {
+        let mut record = filter_fixture(
+            "cdn.example.com",
+            path,
+            200,
+            "application/javascript",
+            Some(referer),
+            sequence,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/javascript".parse().unwrap(),
+        );
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            b"/*! jQuery v3.7.1 | (c) OpenJS Foundation */",
+            1024,
+        ));
+        record
+    };
+    let store = |others: u64| {
+        // Newest first: other pages' scripts come before www's.
+        let mut records: Vec<_> = (0..others)
+            .map(|i| {
+                script(
+                    &format!("/js/{i}/jquery.min.js"),
+                    &format!("https://p{i}.example.com/"),
+                    1_000 - i,
+                )
+            })
+            .collect();
+        records.push(script("/js/jquery.min.js", "https://www.example.com/", 2));
+        records.push(filter_fixture(
+            "www.example.com",
+            "/",
+            200,
+            "text/html",
+            None,
+            1,
+        ));
+        TransactionStore::from_records(records)
+    };
+    for (others, in_scope_only, only, include) in [
+        (
+            300,
+            false,
+            Some("https://www.example.com".to_string()),
+            vec![],
+        ),
+        (0, true, None, vec!["www.example.com".to_string()]),
+    ] {
+        let (map, _) = store(others)
+            .service_map_all_rows_blocking(
+                session,
+                technology::CatalogVersion::V2,
+                &ListFilters::default(),
+                in_scope_only,
+                only,
+                &include,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(map.origins.len(), 1);
+        assert_eq!(
+            map.origins[0]
+                .front_technologies
+                .iter()
+                .map(|item| (
+                    item.product_id.as_str(),
+                    item.version.as_deref(),
+                    item.source_origin.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("jquery", Some("3.7.1"), "https://cdn.example.com")],
+            "{include:?}"
+        );
+    }
 }
