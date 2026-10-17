@@ -2209,6 +2209,7 @@
       // not erase an explicit inspection or continually abort its pending read.
       if (force) {
         clearOverlay("Temporary body references cleared by Reload. Inspect and show references again when ready.");
+        closeApiDocs();
         cancelBodyReferences();
         cancelHtmlGenerators();
         cancelPeerMatches();
@@ -2242,7 +2243,10 @@
           !(layer.kind === "peer" ? peerSourceIsCurrent(layer.source, snapshot) : layer.kind === "link"
             ? htmlGeneratorSourceIsRetained(layer.source, snapshot) : sourceIsRetained(layer.source, snapshot)));
         if (state.snapshot && (state.snapshot.snapshot.generation !== snapshot.snapshot.generation
-          || state.snapshot.technologyCatalogVersion !== snapshot.technologyCatalogVersion)) cancelEvidence();
+          || state.snapshot.technologyCatalogVersion !== snapshot.technologyCatalogVersion)) {
+          cancelEvidence();
+          closeApiDocs();
+        }
         if (state.peerMatchesSource && !peerSourceIsCurrent(state.peerMatchesSource, snapshot)) cancelPeerMatches();
         if (state.linkDeclarationsSource && !htmlGeneratorSourceIsRetained(state.linkDeclarationsSource, snapshot)) cancelBodyReferences();
         if (state.htmlGeneratorsSource && !htmlGeneratorSourceIsRetained(state.htmlGeneratorsSource, snapshot)) cancelHtmlGenerators();
@@ -2291,7 +2295,10 @@
         cancelHtmlGenerators();
         state.loading = false;
         cancelPeerMatches();
-        if (failure?.status === 409) cancelEvidence();
+        if (failure?.status === 409) {
+          cancelEvidence();
+          closeApiDocs();
+        }
         // Polling, visibility and event reconnects must not turn a bounded
         // failure into an automatic retry loop, including with older servers.
         state.refreshPaused = true;
@@ -3498,6 +3505,9 @@
           (layer) => !recordId || layer.kind === "peer" || !validTechnologyEvidence(layer.source.evidenceId, layer.source.sessionId, layer.source.generation) || layer.source.evidenceId.split(".")[5].toLowerCase() === recordId);
         state.historyVersion += 1;
         state.stale = true;
+        // Docs include retained counts and a Replay row ID. Clear the visible
+        // document and fence late reads whenever those observations go stale.
+        closeApiDocs();
         cancelEvidence();
         render();
       },
@@ -3508,6 +3518,7 @@
           cancelHtmlGenerators();
           cancelPeerMatches();
         }
+        if (!value || view !== state.view) closeApiDocs();
         visible = value;
         state.view = view;
         if (state.sessionId !== getSessionId()) reset();
@@ -3522,6 +3533,7 @@
         abort = null;
         state.loading = false;
         state.stale = true;
+        closeApiDocs();
         cancelEvidence();
         render();
       },
@@ -3533,6 +3545,7 @@
         state.loading = false;
         state.snapshot = null;
         state.endpointIndex = null;
+        closeApiDocs();
         cancelEvidence();
         render();
         return refresh();
