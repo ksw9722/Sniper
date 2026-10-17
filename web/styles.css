@@ -7444,6 +7444,7 @@ button.utility-button.replay-tab-add {
    lines, as on React's orbits, in the card's accent colour. */
 .service-map-card-symbol .service-map-mark svg { stroke: none; }
 .service-map-card-role.role-api .service-map-card-symbol { color: var(--token-url-color); }
+.service-map-card-role.role-auth .service-map-card-symbol { color: var(--token-url-color); }
 .service-map-card.pinned .service-map-card-symbol { box-shadow: 0 0 0 2px var(--point-soft); color: var(--point); }
 .service-map-favicon { display: block; width: 16px; height: 16px; object-fit: contain; }
 .service-map-mark { display: grid; place-items: center; width: 100%; height: 100%; border-radius: 50%; font: 700 11px/1 var(--sans); letter-spacing: -.02em; }

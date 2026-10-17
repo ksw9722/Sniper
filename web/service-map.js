@@ -403,17 +403,38 @@
   // endpoints: pages (Front), API data, or static files. A front-end framework
   // or CMS names the front end however its endpoints respond.
   const FRONT_BUILT_WITH = new Set(["meta_framework", "cms", "framework"]);
+  // An authentication server: an identity provider's own product, or an
+  // origin whose typed paths are mostly sign-in, token and logout endpoints
+  // (OAuth, OpenID Connect, SAML, CAS), or that a client asked for a token by
+  // OAuth parameters, or whose host says so. An app that also signs its users
+  // in keeps its own role: its other pages and APIs outnumber those paths.
+  const AUTH_PATH = /(?:^|\/)(?:oauth2?|openid-connect|oidc|saml2?|sso|cas|adfs|idp|authorize|token|userinfo|jwks(?:\.json)?|login|logout|signin|sign-in|signout|sign-out|openid-configuration|oauth-authorization-server)(?=[/?.;]|$)/i;
+  const AUTH_HOST = /^(?:sso|auth|login|accounts?|id|idp|oauth2?|signin|cas|iam|keycloak)[.-]/i;
+  const AUTH_PRODUCTS = new Set(["keycloak"]);
+  const STATIC_TYPE = /^(?:image|font|audio|video)\/|css|javascript|ecmascript/;
+  function authServer(origin) {
+    if (reportedProducts(origin).some((product) => AUTH_PRODUCTS.has(product.id))) return true;
+    const typed = (origin.endpoints || []).filter((endpoint) => !(endpoint.content_types || []).some((type) => STATIC_TYPE.test(type)));
+    const signIn = typed.filter((endpoint) => AUTH_PATH.test(endpoint.path || ""));
+    if (!signIn.length) return false;
+    let host = "";
+    try { host = new URL(origin.origin).hostname; } catch (_) { /* a site card has no URL */ }
+    return signIn.length >= 2 && signIn.length * 2 >= typed.length || AUTH_HOST.test(host)
+      || (origin.auth || []).some((item) => item.kind === "oauth2" || item.kind === "oidc");
+  }
   function originRole(origin) {
     if (origin.site) return "site";
     if (origin.captured === false || origin.peerInspectionOnly) return "ref";
+    if (authServer(origin)) return "auth";
     const tally = { front: 0, api: 0, static: 0 };
     for (const endpoint of origin.endpoints || []) {
       // An API's error page is HTML too: a path that only ever failed does
       // not show that the origin serves pages.
       const failed = endpoint.statuses?.length > 0 && endpoint.statuses.every((status) => status >= 400);
       for (const type of endpoint.content_types || []) {
+        // A web app manifest is JSON, but it is page metadata, not API data.
         const role = /html/.test(type) ? "front" : /^(?:image|font|audio|video)\/|css|javascript|ecmascript/.test(type) ? "static"
-          : /json|xml|protobuf|grpc|graphql/.test(type) ? "api" : null;
+          : /json|xml|protobuf|grpc|graphql/.test(type) && !/manifest/.test(type) ? "api" : null;
         if (role && !(failed && role === "front")) tally[role] += 1;
       }
     }
@@ -425,12 +446,23 @@
     const [role, endpoints] = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
     return endpoints ? role : "unknown";
   }
-  const ROLE_LABELS = { front: "Front", api: "API", static: "Static", unknown: "Unknown", ref: "Ref", site: "Site" };
-  const ROLE_TITLES = { front: "Serves pages", api: "Serves API data", static: "Serves static files", unknown: "No typed responses loaded", ref: "Referenced only", site: "Origins of one site" };
+  // A card that serves pages and API data both names both: a Next.js app with
+  // its /api routes, a Spring app with its pages. A manifest or a JSON error is
+  // not an API.
+  function originRoles(origin) {
+    const role = originRole(origin);
+    if (role !== "front" && role !== "api") return [role];
+    const serves = (pattern) => (origin.endpoints || []).some((endpoint) => !(endpoint.statuses?.length && endpoint.statuses.every((status) => status >= 400))
+      && !/manifest/i.test(endpoint.path || "") && (endpoint.content_types || []).some((type) => pattern.test(type) && !/manifest/i.test(type)));
+    return (role === "front" ? serves(/json|xml|protobuf|grpc|graphql/) : serves(/html/)) ? ["front", "api"] : [role];
+  }
+  const ROLE_LABELS = { front: "Front", api: "API", auth: "Auth", static: "Static", unknown: "Unknown", ref: "Ref", site: "Site" };
+  const ROLE_TITLES = { front: "Serves pages", api: "Serves API data", auth: "Signs users in: an authentication server", static: "Serves static files", unknown: "No typed responses loaded", ref: "Referenced only", site: "Origins of one site" };
   const svg = (paths) => `<svg viewBox="0 0 16 16" aria-hidden="true">${paths}</svg>`;
   const ROLE_ICONS = {
     front: svg('<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M1.5 5.5h13"/>'),
     api: svg('<path d="M6 2.5c-1.4 0-2 .6-2 2v1.6c0 .9-.5 1.4-1.5 1.9 1 .5 1.5 1 1.5 1.9v1.6c0 1.4.6 2 2 2M10 2.5c1.4 0 2 .6 2 2v1.6c0 .9.5 1.4 1.5 1.9-1 .5-1.5 1-1.5 1.9v1.6c0 1.4-.6 2-2 2"/>'),
+    auth: svg('<rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>'),
     static: svg('<rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="6" cy="6.5" r="1.2"/><path d="M2.5 12l3.5-3.5 2.5 2.5 2-2 3 3"/>'),
     unknown: svg('<path d="M6 6a2 2 0 1 1 3 1.7c-.7.4-1 .8-1 1.6M8 11.6v.4"/>'),
     ref: svg('<path d="M7 3H3v10h10V9M9.5 3H13v3.5M13 3 7.5 8.5"/>'),
@@ -472,7 +504,8 @@
     return logo ? `<svg class="service-map-product-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="${logo.light < 0.2 || logo.light > 0.92 ? "currentColor" : logo.hex}" d="${logo.path}"/></svg>` : "";
   };
   function roleMarkup(origin, pinned = false, favicon = null) {
-    const role = originRole(origin);
+    const roles = originRoles(origin);
+    const role = roles[0];
     const products = reportedProducts(origin);
     const product = products.filter((item) => productLogo(item.id) || PRODUCT_MARKS[item.id]).sort((a, b) => productRank(a) - productRank(b))[0];
     const logo = product && productLogo(product.id);
@@ -480,7 +513,7 @@
     const icon = favicon ? `<img class="service-map-favicon" src="${escape(favicon)}" alt="">`
       : logo ? `<span class="service-map-mark" style="background:${logo.hex}" title="${escape(product.name)}"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="${logo.light > 0.6 ? "#000" : "#fff"}" d="${logo.path}"/></svg></span>`
       : product ? `<span class="service-map-mark" style="background:${background};color:${color}" title="${escape(product.name)}">${escape(text)}</span>` : ROLE_ICONS[role];
-    return `<span class="service-map-card-role role-${role}" title="${pinned ? "Pinned anchor · " : ""}${ROLE_TITLES[role]}"><span class="service-map-card-symbol" aria-hidden="true">${icon}</span><span class="service-map-card-role-label">${ROLE_LABELS[role]}</span></span>`;
+    return `<span class="service-map-card-role role-${role}" title="${pinned ? "Pinned anchor · " : ""}${roles.map((item) => ROLE_TITLES[item]).join(" · ")}"><span class="service-map-card-symbol" aria-hidden="true">${icon}</span><span class="service-map-card-role-label">${roles.map((item) => ROLE_LABELS[item]).join("<br>")}</span></span>`;
   }
   function normalizeEvidenceObservations(row, catalogVersion) {
     const invalid = () => { throw new Error("Invalid retained source observations"); };
@@ -3400,5 +3433,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, EXPOSURE_LABELS, AUTH_KINDS, relationshipOrder, siteKey, groupSites, originRole, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, EXPOSURE_LABELS, AUTH_KINDS, relationshipOrder, siteKey, groupSites, originRole, originRoles, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

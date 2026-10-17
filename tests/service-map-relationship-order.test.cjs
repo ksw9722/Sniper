@@ -452,6 +452,24 @@ test('a card leads with what its origin serves, or with a declared front-end pro
   assert.deepEqual(['cms', 'library', 'analytics'].map((category) => map.originRole(loads(category))), ['front', 'api', 'api'], 'a library or tracker a page loads is not what it is built with');
 });
 
+test('an authentication server is Auth, and an origin serving pages and API data names both', () => {
+  const at = (origin, paths, extra = {}) => ({ origin, captured: true, technology_observations_present: true, technology_observations: [],
+    endpoints: paths.map(([path, type, status = 200]) => ({ path, content_types: [type], statuses: [status] })), ...extra });
+  const roles = (origin) => [...map.originRoles(origin)];
+  const idp = at('https://idp.example.net', [['/oauth2/authorize', 'text/html'], ['/oauth2/token', 'application/json'], ['/login', 'text/html'], ['/css/site.css', 'text/css'], ['/js/app.js', 'application/javascript']]);
+  assert.equal(map.originRole(idp), 'auth', 'its typed paths are sign-in and token endpoints; its assets do not count');
+  const app = at('https://app.example.com', [['/login', 'text/html'], ['/logout', 'text/html'], ['/', 'text/html'], ['/orders', 'text/html'], ['/cart', 'text/html'], ['/api/items', 'application/json']]);
+  assert.notEqual(map.originRole(app), 'auth', 'an app that also signs its users in keeps its own role');
+  assert.equal(map.originRole(at('https://app.example.com', [['/login', 'text/html']])), 'front', 'one login page is not enough');
+  assert.equal(map.originRole(at('https://sso.example.com', [['/login', 'text/html'], ['/home', 'text/html']])), 'auth', 'a host named for sign-in with a sign-in path');
+  assert.equal(map.originRole(at('https://www.example.com', [['/authorize', 'text/html'], ['/', 'text/html'], ['/a', 'text/html']], { auth: [{ kind: 'oauth2', name: null, row_count: 1, evidence: [] }] })), 'auth', 'a client asked it for a token');
+  assert.equal(map.originRole(at('https://www.example.com', [['/', 'text/html']], { server_technologies: [{ product_id: 'keycloak', name: 'Keycloak', category: 'app_server', signals: ['cookie'], row_count: 1, evidence: [] }] })), 'auth', 'an identity provider by product');
+  assert.deepEqual(roles(at('https://a.example.com', [['/', 'text/html'], ['/api/items', 'application/json']])), ['front', 'api']);
+  assert.deepEqual(roles(at('https://a.example.com', [['/', 'text/html'], ['/manifest.json', 'application/manifest+json'], ['/api/missing', 'application/json', 404]])), ['front'], 'a manifest or a JSON error is not an API');
+  assert.deepEqual(roles(at('https://a.example.com', [['/v1/items', 'application/json'], ['/v1/users', 'application/json'], ['/docs', 'text/html']])), ['front', 'api']);
+  assert.deepEqual(roles(idp), ['auth']);
+});
+
 test('only an error or the first load shows above the map; counts sit under Details', async () => {
   const f = fixture();
   const reading = f.controller.refresh();
