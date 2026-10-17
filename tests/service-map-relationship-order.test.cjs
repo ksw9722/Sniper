@@ -397,6 +397,90 @@ test('site keys take the last two host labels, three under listed suffixes, and 
     ['pstatic.net', 'example.co.kr', 'example.com', null, null, null]);
 });
 
+test('site keys ignore one DNS root dot before applying the existing suffix rules', () => {
+  for (const [host, expected] of [
+    ['example.com', 'example.com'], ['a.example.com', 'example.com'],
+    ['a.example.co.uk', 'example.co.uk'], ['b.example.org.uk', 'example.org.uk'],
+    ['a.example.co.kr', 'example.co.kr'], ['a.example.com.au', 'example.com.au'],
+    ['co.uk', 'co.uk'], ['a.example.co.test', 'co.test'],
+    ['localhost', null], ['127.0.0.1', null], ['0x7f000001', null],
+    ['bücher.example.com', 'example.com'],
+  ]) {
+    for (const suffix of ['', '.']) {
+      assert.equal(map.siteKey(`https://${host}${suffix}:8443`), expected, `${host}${suffix}`);
+    }
+  }
+  assert.equal(map.siteKey('https://A.EXAMPLE.CO.UK.:8443'), 'example.co.uk');
+  assert.equal(map.siteKey('https://a.example.com\u3002'), 'example.com', 'URL parsing normalizes the Unicode root dot');
+  assert.equal(map.siteKey('http://[::1]:8080'), null);
+  assert.equal(map.siteKey('http://[::ffff:192.0.2.1]:8080'), null);
+  for (const origin of ['not a URL', 'https://.', 'https://..', 'https://example.com..', 'https://a..example.com']) {
+    assert.equal(map.siteKey(origin), null, 'empty hostname labels must not merge unrelated origins');
+  }
+});
+
+test('site grouping keeps root-dotted public suffixes separate and retains exact origin identities', () => {
+  const ids = ['https://a.example.co.uk.', 'https://b.example.co.uk', 'http://a.example.co.uk.:8080',
+    'https://a.example.org.uk.', 'https://b.example.org.uk.', 'http://localhost.', 'http://127.0.0.1', 'http://[::1]'];
+  const origins = ids.map(id => origin(id));
+  origins[3].header_links = [referer(ids[0])];
+  const grouped = map.groupSites(origins);
+  assert.deepEqual([...grouped.cards].map(item => item.origin),
+    ['site:example.co.uk', 'site:example.org.uk', ...ids.slice(5)]);
+  assert.deepEqual([...grouped.cards[0].members].map(item => item.origin), ids.slice(0, 3));
+  assert.deepEqual([...grouped.cards[1].members].map(item => item.origin), ids.slice(3, 5));
+  assert.equal(grouped.cards[1].header_links[0].source_origin, 'site:example.co.uk');
+  assert.deepEqual(origins.map(item => item.origin), ids, 'site display normalization never rewrites captured origins');
+  assert.equal(origins[3].header_links[0].source_origin, ids[0], 'original relationship evidence stays exact');
+  const apart = map.groupSites(origins, site => site === 'example.co.uk');
+  assert.deepEqual([...apart.cards].map(item => item.origin), [...ids.slice(0, 3), 'site:example.org.uk', ...ids.slice(5)]);
+});
+
+test('root-dotted site selection, expand, hide and regroup stay local to the correct site', async () => {
+  let display = { groupSites: true, expandedSites: [], hidden: [] };
+  const f = fixture({ getSiteDisplay: () => display, setSiteDisplay: next => { display = next; } });
+  const leading = 'https://app.example.com';
+  const uk = ['https://a.example.co.uk.', 'https://b.example.co.uk'];
+  const org = ['https://a.example.org.uk.', 'https://b.example.org.uk.'];
+  const data = snapshot([origin(leading), ...[...uk, ...org].map(id => origin(id, { header_links: [referer(leading)] }))]);
+  await f.load(data);
+  const html = () => f.els.canvas.innerHTML;
+  assert.match(html(), /data-service-site="example\.co\.uk"/);
+  assert.match(html(), /data-service-site="example\.org\.uk"/);
+  assert.doesNotMatch(html(), /data-service-site="uk\."/);
+  assert.equal(arrows(html()), 2, 'separate sites keep separate relationship arrows');
+
+  press(f, { serviceSite: 'example.co.uk' });
+  assert.equal(f.state.selectedSite, 'example.co.uk');
+  assert.ok(f.els.detail.innerHTML.includes(uk[0]));
+  assert.ok(f.els.detail.innerHTML.includes(uk[1]));
+  assert.ok(!f.els.detail.innerHTML.includes(org[0]));
+  press(f, { serviceOrigin: uk[0] });
+  assert.equal(f.state.selectedOrigin, uk[0], 'inspector uses the exact root-dotted origin');
+  press(f, { serviceSiteExpand: 'example.co.uk' });
+  assert.deepEqual([...display.expandedSites], ['example.co.uk']);
+  assert.match(html(), /data-service-origin="https:\/\/a\.example\.co\.uk\."/);
+  assert.match(html(), /data-service-site="example\.org\.uk"/);
+  assert.equal(arrows(html()), 3);
+
+  press(f, { serviceHide: 'example.co.uk' });
+  assert.doesNotMatch(html(), /example\.co\.uk/);
+  assert.match(html(), /data-service-site="example\.org\.uk"/);
+  press(f, { serviceUnhide: 'example.co.uk' });
+  press(f, { serviceSiteCollapse: 'example.co.uk' });
+  assert.match(html(), /data-service-site="example\.co\.uk"/);
+  assert.equal(arrows(html()), 2);
+  assert.equal(f.requests.length, 1, 'site display actions do not fetch or probe origins');
+
+  await f.load(snapshot([...data.origins].reverse()));
+  assert.equal(f.state.selectedOrigin, uk[0], 'refresh preserves exact origin selection');
+  assert.match(html(), /data-service-site="example\.co\.uk"/);
+  press(f, { serviceGroupSites: 'toggle' });
+  for (const id of [...uk, ...org]) assert.ok(html().includes(`data-service-origin="${id}"`));
+  assert.equal(arrows(html()), 4);
+  assert.equal(f.requests.length, 2, 'only explicit map refreshes read metadata');
+});
+
 test("a site's origins share one card and one arrow, and the leading origin's site keeps a card per origin", async () => {
   let display = { groupSites: true, expandedSites: [], hidden: [] };
   const saves = [];
