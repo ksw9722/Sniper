@@ -564,9 +564,16 @@ mod tests {
         );
         row.response.as_mut().unwrap().content_decoded = true;
         assert!(BodySource::from_html_record(&row).is_ok());
+        // A policy longer than one value's cap still leaves the page readable;
+        // only the headers' total stops the read.
+        row.response.as_mut().unwrap().headers = vec![HeaderRecord {
+            name: "Content-Security-Policy".into(),
+            value: "x".repeat(crate::service_map::MAX_HEADER_VALUE_BYTES * 2),
+        }];
+        assert!(BodySource::from_html_record(&row).is_ok());
         row.response.as_mut().unwrap().headers = vec![HeaderRecord {
             name: "X-Test".into(),
-            value: "PRIVATE".repeat(crate::service_map::MAX_HEADER_VALUE_BYTES),
+            value: "PRIVATE".repeat(crate::service_map::MAX_HEADER_BYTES / 7 + 1),
         }];
         assert_eq!(
             BodySource::from_html_record(&row).unwrap_err(),

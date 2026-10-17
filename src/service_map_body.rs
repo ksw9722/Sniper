@@ -190,6 +190,9 @@ impl BodySource {
     ) -> Result<Self, &'static str> {
         let response = record.response.as_ref().ok_or("response_unavailable")?;
         // An encoding hidden beyond the metadata cap must not be assumed absent.
+        // One long value hides nothing: every name is still read below, and a
+        // site's Content-Security-Policy often runs past 4 KiB, which once left
+        // its page unread.
         let mut header_bytes = 0usize;
         if response.headers.len() > MAX_HEADERS {
             return Err("metadata_limit");
@@ -198,10 +201,7 @@ impl BodySource {
             header_bytes = header_bytes
                 .saturating_add(header.name.len())
                 .saturating_add(header.value.len());
-            if header_bytes > MAX_HEADER_BYTES
-                || header.name.len() > MAX_HEADER_VALUE_BYTES
-                || header.value.len() > MAX_HEADER_VALUE_BYTES
-            {
+            if header_bytes > MAX_HEADER_BYTES || header.name.len() > MAX_HEADER_VALUE_BYTES {
                 return Err("metadata_limit");
             }
         }

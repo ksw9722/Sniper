@@ -825,6 +825,7 @@ fn links_count_their_rows_by_request_kind() {
 fn links_count_rows_whose_response_allowed_the_source_origin() {
     let session = Uuid::from_u128(99);
     let page = "https://www.example.com";
+    let long = "x".repeat(crate::service_map::MAX_HEADER_VALUE_BYTES + 1);
     let call = |sequence, response_headers: &[(&str, &str)]| {
         let mut record = with_request_headers(
             filter_fixture(
@@ -881,6 +882,22 @@ fn links_count_rows_whose_response_allowed_the_source_origin() {
             &[("Access-Control-Allow-Origin", "https://WWW.example.com:443")],
         ),
         call(6, &[]),
+        // A long policy hides no second Access-Control-Allow-Origin; an unread
+        // one may be one.
+        call(
+            7,
+            &[
+                ("Access-Control-Allow-Origin", page),
+                ("Content-Security-Policy", long.as_str()),
+            ],
+        ),
+        call(
+            8,
+            &[
+                ("Access-Control-Allow-Origin", page),
+                ("Access-Control-Allow-Origin", long.as_str()),
+            ],
+        ),
     ]);
     let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
         session,
@@ -911,7 +928,7 @@ fn links_count_rows_whose_response_allowed_the_source_origin() {
                 link.cors_allowed_count,
                 link.cors_credentials_count
             ),
-            (6, 2, 1),
+            (8, 3, 1),
             "{}: the named origin and * allow, two values or another spelling do not",
             link.relationship
         );

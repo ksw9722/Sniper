@@ -965,6 +965,10 @@ pub(crate) fn project_record_for_catalog(
     let mut locations = Vec::new();
     let mut allowed_origins = Vec::new();
     let mut credentials = false;
+    // A value too long to read hides only what its own header says: an unread
+    // Location or Access-Control-Allow-Origin leaves the redirect or the CORS
+    // answer unproven, a long Content-Security-Policy does not.
+    let mut unread_link_header = false;
     let mut technology_budget = technology::TokenScanBudget::default();
     for (index, header) in response.headers.iter().enumerate() {
         header_bytes = header_bytes
@@ -978,6 +982,9 @@ pub(crate) fn project_record_for_catalog(
         }
         if header.value.len() > MAX_HEADER_VALUE_BYTES {
             row.omitted.push("header_value_limit".into());
+            unread_link_header |= ["location", "access-control-allow-origin"]
+                .iter()
+                .any(|name| header.name.eq_ignore_ascii_case(name));
             continue;
         }
         let header_name = header.name.to_ascii_lowercase();
@@ -1043,12 +1050,12 @@ pub(crate) fn project_record_for_catalog(
     // Access-Control-Allow-Origin, which it compares with the origin as written,
     // so keep the value unnormalized; a partial scan cannot prove there was one.
     // Credentials never apply to `*`.
-    if allowed_origins.len() == 1
-        && !row
+    let partial_scan = unread_link_header
+        || row
             .omitted
             .iter()
-            .any(|reason| reason == "header_scan_limit" || reason == "header_value_limit")
-    {
+            .any(|reason| reason == "header_scan_limit");
+    if allowed_origins.len() == 1 && !partial_scan {
         let allowed = allowed_origins[0];
         row.cors = Some((allowed.into(), credentials && allowed != "*"));
     }
@@ -1060,11 +1067,7 @@ pub(crate) fn project_record_for_catalog(
             row.omitted.push("ambiguous_location_headers".into());
         } else if let Some(location) = locations.first() {
             // A partial header scan cannot prove there was only one Location.
-            if !row
-                .omitted
-                .iter()
-                .any(|reason| reason == "header_scan_limit" || reason == "header_value_limit")
-            {
+            if !partial_scan {
                 let request_url = Url::parse(&format!("{}{}", row.origin, row.path)).ok();
                 let target = request_url.and_then(|url| url.join(location.trim()).ok());
                 match target.filter(|url| {
@@ -2660,6 +2663,22 @@ mod tests {
         assert!(projected
             .omitted
             .contains(&"ambiguous_location_headers".into()));
+        // A long policy hides no Location; an unread Location may be a second.
+        row.response.as_mut().unwrap().headers = headers(&[
+            ("Location", "/next"),
+            (
+                "Content-Security-Policy",
+                &"x".repeat(MAX_HEADER_VALUE_BYTES + 1),
+            ),
+        ]);
+        let projected = project_record(&row, "test".into()).unwrap();
+        assert_eq!(projected.redirect.unwrap().target_path, "/next");
+        assert!(projected.omitted.contains(&"header_value_limit".into()));
+        row.response.as_mut().unwrap().headers[1].name = "location".into();
+        assert!(project_record(&row, "test".into())
+            .unwrap()
+            .redirect
+            .is_none());
     }
 
     #[tokio::test]
