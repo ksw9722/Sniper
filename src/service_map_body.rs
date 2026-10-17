@@ -144,6 +144,7 @@ impl BodySource {
                 "text/ecmascript",
                 "application/x-javascript",
             ],
+            false,
         )
     }
 
@@ -168,11 +169,14 @@ impl BodySource {
                 "application/xml",
                 "text/xml",
             ],
+            // Scanned for ASCII signatures only, so a page stored as base64
+            // because it is not UTF-8 (an EUC-KR page) is read too.
+            true,
         )
     }
 
     pub(crate) fn from_html_record(record: &TransactionRecord) -> Result<Self, &'static str> {
-        Self::from_record_for_types(record, &["text/html"])
+        Self::from_record_for_types(record, &["text/html"], false)
     }
 
     pub(crate) fn capture_preview_truncated(&self) -> bool {
@@ -182,6 +186,7 @@ impl BodySource {
     fn from_record_for_types(
         record: &TransactionRecord,
         content_types: &[&str],
+        any_encoding: bool,
     ) -> Result<Self, &'static str> {
         let response = record.response.as_ref().ok_or("response_unavailable")?;
         // An encoding hidden beyond the metadata cap must not be assumed absent.
@@ -215,7 +220,7 @@ impl BodySource {
         {
             return Err("unsupported_content_type");
         }
-        if response.body_encoding != BodyEncoding::Utf8 {
+        if response.body_encoding != BodyEncoding::Utf8 && !any_encoding {
             return Err("unsupported_body_encoding");
         }
         if !response.content_decoded

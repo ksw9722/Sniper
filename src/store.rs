@@ -724,7 +724,14 @@ fn library_lookup(
             while !response.body_preview.is_char_boundary(end) {
                 end -= 1;
             }
-            LibrarySource::Resident(response.body_preview[..end].to_string())
+            if response.body_encoding == crate::model::BodyEncoding::Base64 {
+                // Whole base64 quanta only, so the copy still decodes.
+                end -= end % 4;
+            }
+            LibrarySource::Resident(
+                response.body_preview[..end].to_string(),
+                response.body_encoding.clone(),
+            )
         }
     };
     Some(Err(PendingLibrary {
@@ -786,8 +793,8 @@ struct PendingLibrary {
 }
 
 enum LibrarySource {
-    /// A copy of a body still in memory.
-    Resident(String),
+    /// A copy of a body still in memory, as stored.
+    Resident(String, crate::model::BodyEncoding),
     /// Where a retained body sits in transactions.ndjson, and in which file.
     Retained(crate::session::BodyLocator, Uuid),
 }
@@ -1631,9 +1638,9 @@ impl TransactionStore {
         file: &mut Option<fs::File>,
         item: PendingLibrary,
     ) -> Option<Vec<crate::service_map_libraries::Detection>> {
-        use crate::service_map_libraries::{detect, drop_library_source_map, read_body};
+        use crate::service_map_libraries::{detect, drop_library_source_map, read_body, scan_text};
         let body = match item.source {
-            LibrarySource::Resident(body) => body,
+            LibrarySource::Resident(body, encoding) => scan_text(body, encoding)?,
             LibrarySource::Retained(locator, file_generation) => {
                 let file = file.as_mut()?;
                 validate_service_map_body_locator(

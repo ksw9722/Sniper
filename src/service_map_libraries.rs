@@ -185,6 +185,9 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("nprotect", "nProtect Online Security", LIBRARY),
     ("highlight_js", "highlight.js", LIBRARY),
     ("requirejs", "RequireJS", LIBRARY),
+    ("fontfaceobserver", "Font Face Observer", LIBRARY),
+    ("webcomponentsjs", "Web Components polyfills", LIBRARY),
+    ("web_animations_js", "Web Animations polyfill", LIBRARY),
     ("polyfill_io", "Polyfill.io", LIBRARY),
     ("firebase", "Firebase", LIBRARY),
     ("google_maps", "Google Maps", LIBRARY),
@@ -340,6 +343,12 @@ const SCRIPT_SIGNATURES: &[(&str, &str)] = &[
 
 const PAGE_SIGNATURES: &[(&str, &str)] = &[
     ("new_relic", r"window\.NREUM\|\|\(NREUM=\{\}\)"),
+    // The settings an inline snippet leaves before its loader runs.
+    ("chartbeat", r"\b_sf_async_config\b"),
+    (
+        "plausible",
+        r"window\.plausible\s*=\s*window\.plausible\s*\|\|",
+    ),
     ("angular", r#"\bng-version="§""#),
     (
         "angular",
@@ -537,6 +546,18 @@ const URL_MARKERS: &[(&str, &str)] = &[
         r"(?i)/highlight\.(?:pack|min)\.js(?:$|[?#])",
     ),
     ("requirejs", r"(?i)/require(?:\.min)?\.js(?:$|[?#])"),
+    (
+        "fontfaceobserver",
+        r"(?i)/fontfaceobserver(?:\.standalone)?(?:\.min)?\.js(?:$|[?#])",
+    ),
+    (
+        "webcomponentsjs",
+        r"(?i)/webcomponents-[a-z-]+(?:\.min)?\.js(?:$|[?#])",
+    ),
+    (
+        "web_animations_js",
+        r"(?i)/web-animations(?:-next)?(?:-lite)?(?:\.min)?\.js(?:$|[?#])",
+    ),
     // The domain a new owner used to serve malware from in 2024.
     ("polyfill_io", r"(?i)//(?:cdn\.)?polyfill\.io/"),
     ("firebase", r"//www\.gstatic\.com/firebasejs/"),
@@ -580,7 +601,12 @@ const URL_MARKERS: &[(&str, &str)] = &[
         "microsoft_clarity",
         r"//www\.clarity\.ms/tag/|//scripts\.clarity\.ms/",
     ),
-    ("plausible", r"//plausible\.io/js/"),
+    // Its 2025 script is `pa-` and the site's own ID, on plausible.io or a
+    // proxy the site runs.
+    (
+        "plausible",
+        r"//plausible\.io/js/|/js/pa-[A-Za-z0-9_-]{20,24}\.js(?:$|[?#])",
+    ),
     ("matomo", r"(?i)/(?:matomo|piwik)\.js(?:$|[?#])"),
     ("chartbeat", r"//static\.chartbeat\.com/js/"),
     ("akamai_mpulse", r"//s\.go-mpulse\.net/boomerang/"),
@@ -754,6 +780,9 @@ fn package_product(name: &str) -> Option<&'static str> {
         "jquery-cookie" | "jquery.cookie" => "jquery_cookie",
         "highlight.js" | "@highlightjs/cdn-assets" => "highlight_js",
         "requirejs" | "require.js" => "requirejs",
+        "fontfaceobserver" => "fontfaceobserver",
+        "@webcomponents/webcomponentsjs" => "webcomponentsjs",
+        "web-animations-js" => "web_animations_js",
         "firebase" => "firebase",
         "@amplitude/analytics-browser" | "amplitude-js" => "amplitude",
         "mixpanel-browser" => "mixpanel",
@@ -1072,8 +1101,22 @@ struct DiskResponse {
     body_encoding: BodyEncoding,
 }
 
-/// One retained row's response body, or None when it cannot be shown to be
-/// this record's UTF-8 body.
+/// A body as text to scan: as stored when UTF-8, or, when it was stored as
+/// base64 because it is not (an EUC-KR page), its bytes read lossily. Every
+/// signature is ASCII, which any of those encodings keeps.
+pub(crate) fn scan_text(body: String, encoding: BodyEncoding) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    match encoding {
+        BodyEncoding::Utf8 => Some(body),
+        BodyEncoding::Base64 => STANDARD
+            .decode(body.as_bytes())
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+    }
+}
+
+/// One retained row's response body as text to scan, or None when it cannot
+/// be shown to be this record's body.
 pub(crate) fn read_body(file: &mut File, locator: BodyLocator, record_id: Uuid) -> Option<String> {
     let len = locator.len as usize;
     if len == 0 || len > MAX_ROW_BYTES {
@@ -1084,8 +1127,8 @@ pub(crate) fn read_body(file: &mut File, locator: BodyLocator, record_id: Uuid) 
     file.read_exact(&mut bytes).ok()?;
     let row: DiskRow = serde_json::from_slice(&bytes).ok()?;
     let response = row.response?;
-    (row.id == record_id && response.body_encoding == BodyEncoding::Utf8)
-        .then_some(response.body_preview)
+    (row.id == record_id).then_some(())?;
+    scan_text(response.body_preview, response.body_encoding)
 }
 
 #[cfg(test)]
@@ -1246,6 +1289,16 @@ mod tests {
             (r#"<div _ngcontent-ng-c2087410263="">"#, "angular", None),
             (r#"<html ng-app="shop">"#, "angularjs", None),
             (";window.NREUM||(NREUM={});NREUM.init={}", "new_relic", None),
+            (
+                "var _sf_async_config = _sf_async_config || {};",
+                "chartbeat",
+                None,
+            ),
+            (
+                "window.plausible = window.plausible || function() {}",
+                "plausible",
+                None,
+            ),
             (r#"<div data-ng-controller="Cart">"#, "angularjs", None),
             (
                 r#"<script id="__NEXT_DATA__" type="application/json">"#,
@@ -1500,6 +1553,10 @@ mod tests {
             ("https://static.hotjar.com/c/hotjar-123456.js?sv=6", "hotjar", None),
             ("https://www.clarity.ms/tag/abc123", "microsoft_clarity", None),
             ("https://plausible.io/js/script.js", "plausible", None),
+            ("https://analytics.example.com/js/pa-Z-QYGvOKHwfKWak0xljXn.js", "plausible", None),
+            ("https://example.com/js/fontfaceobserver.js", "fontfaceobserver", None),
+            ("https://example.com/s/webcomponents-all-noPatch.js", "webcomponentsjs", None),
+            ("https://example.com/s/web-animations-next-lite.min.js", "web_animations_js", None),
             ("https://example.com/matomo.js", "matomo", None),
             ("https://static.chartbeat.com/js/chartbeat_mab.js", "chartbeat", None),
             ("https://s.go-mpulse.net/boomerang/ABCDE-FGHIJ", "akamai_mpulse", None),
@@ -1548,6 +1605,8 @@ mod tests {
             "https://example.com/js/required.js",
             "https://example.com/js/jquery-plugins.js",
             "https://example.com/js/highlight.js",
+            "https://example.com/js/pa-short.js",
+            "https://example.com/js/web-animations-demo.js",
         ] {
             assert!(detect_url(url).is_empty(), "{url}");
         }

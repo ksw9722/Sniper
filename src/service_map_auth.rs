@@ -94,7 +94,7 @@ pub fn detect(record: &TransactionRecord) -> Vec<AuthSignal> {
                     found.extend(cookie(name.trim(), value));
                 }
             }
-            _ if API_KEY_HEADERS.contains(&name.as_str()) => found.push(AuthSignal {
+            _ if api_key_header(&name) => found.push(AuthSignal {
                 kind: "api_key_header",
                 name: Some(name),
             }),
@@ -116,6 +116,19 @@ pub fn detect(record: &TransactionRecord) -> Vec<AuthSignal> {
     found.sort();
     found.dedup();
     found
+}
+
+/// A header that carries an API key or token by name: one of the fixed names,
+/// or a vendor's own spelling of one (`x-airbnb-api-key`, `phantom-token`).
+/// A CSRF or CAPTCHA token says nothing about who sent the request.
+fn api_key_header(name: &str) -> bool {
+    API_KEY_HEADERS.contains(&name)
+        || (["api-key", "apikey", "api_key", "-token", "_token"]
+            .iter()
+            .any(|end| name.ends_with(end))
+            && !["csrf", "xsrf", "captcha", "turnstile"]
+                .iter()
+                .any(|word| name.contains(word)))
 }
 
 fn bounded(headers: &[HeaderRecord]) -> impl Iterator<Item = &HeaderRecord> {
@@ -370,6 +383,25 @@ mod tests {
                 kinds(detect(&record("/", &[("Authorization", value)], &[]))),
                 [expected.clone()],
                 "{value}"
+            );
+        }
+        // A vendor's own key or token header counts; a CSRF or CAPTCHA token
+        // does not.
+        for (name, expected) in [
+            ("X-Airbnb-API-Key", Some("x-airbnb-api-key")),
+            ("Phantom-Token", Some("phantom-token")),
+            ("X-Amz-Security-Token", Some("x-amz-security-token")),
+            ("X-CSRF-Token", None),
+            ("X-XSRF-TOKEN", None),
+            ("X-Recaptcha-Token", None),
+        ] {
+            assert_eq!(
+                kinds(detect(&record("/", &[(name, "v")], &[]))),
+                expected
+                    .map(|name| ("api_key_header", Some(name.to_string())))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{name}"
             );
         }
         // An unknown first word may be the credential itself: no name leaves.

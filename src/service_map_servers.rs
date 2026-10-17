@@ -54,6 +54,7 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("cdnetworks", "CDNetworks", EDGE),
     ("bunnycdn", "BunnyCDN", EDGE),
     ("tencent_edgeone", "Tencent EdgeOne", EDGE),
+    ("alibaba_cloud_cdn", "Alibaba Cloud CDN", EDGE),
     ("datadome", "DataDome", EDGE),
     ("azure_front_door", "Azure Front Door", EDGE),
     ("imperva", "Imperva", EDGE),
@@ -93,6 +94,7 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ),
     ("google_cloud_storage", "Google Cloud Storage", PLATFORM),
     ("azure_storage", "Azure Storage", PLATFORM),
+    ("alibaba_cloud_oss", "Alibaba Cloud OSS", PLATFORM),
     ("vercel", "Vercel", PLATFORM),
     ("netlify", "Netlify", PLATFORM),
     ("fly_io", "Fly.io", PLATFORM),
@@ -139,6 +141,8 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("webrick", "WEBrick", APP_SERVER),
     ("cowboy", "Cowboy", APP_SERVER),
     ("spring_boot", "Spring Boot", BACKEND),
+    ("spring_session", "Spring Session", BACKEND),
+    ("nextjs_server", "Next.js server", BACKEND),
     ("express", "Express", BACKEND),
     ("django", "Django", BACKEND),
     ("django_rest_framework", "Django REST framework", BACKEND),
@@ -251,11 +255,26 @@ const HEADER_RULES: &[(&str, &str, &str)] = &[
     ("x-sigsci-requestid", "", "fastly_next_gen_waf"),
     ("eo-log-uuid", "", "tencent_edgeone"),
     ("eo-cache-status", "", "tencent_edgeone"),
+    // When an Alibaba Cloud CDN node first cached the object, and its trace.
+    ("ali-swift-global-savetime", "", "alibaba_cloud_cdn"),
+    ("x-swift-savetime", "", "alibaba_cloud_cdn"),
+    ("x-swift-cachetime", "", "alibaba_cloud_cdn"),
+    ("eagleid", "", "alibaba_cloud_cdn"),
+    ("x-oss-request-id", "", "alibaba_cloud_oss"),
     ("x-iplb-request-id", "", "ovhcloud"),
-    ("akamai-grn", "", "akamai"),
+    // BIG-IP's OneConnect marks a client connection to close this way (F5
+    // SOL6997); some deployments let it through.
+    ("x-cnection", "", "f5_big_ip"),
+    // Meta's edge reports the connection it measured.
+    ("x-fb-debug", "", "proxygen"),
+    ("x-fb-connection-quality", "", "proxygen"),
+    ("akamai-*", "", "akamai"),
+    // The cache tags Akamai purges by.
+    ("edge-cache-tag", "", "akamai"),
     ("x-akamai-transformed", "", "akamai"),
     ("x-akamai-request-id", "", "akamai"),
     ("x-azure-ref", "", "azure_front_door"),
+    ("x-msedge-ref", "", "azure_front_door"),
     ("x-iinfo", "", "imperva"),
     ("x-cdn", r"(?i)imperva|incapsula", "imperva"),
     ("x-sucuri-id", "", "sucuri"),
@@ -287,11 +306,17 @@ const HEADER_RULES: &[(&str, &str, &str)] = &[
     ("x-debug-token-link", "", "symfony_profiler"),
     ("x-aspnet-version", "^§", "asp_net"),
     ("x-aspnetmvc-version", "^§", "asp_net_mvc"),
+    // Emptied to hide the version, the header still names the framework.
+    ("x-aspnet-version", "", "asp_net"),
+    ("x-aspnetmvc-version", "", "asp_net_mvc"),
+    // A Next.js server's own page cache.
+    ("x-nextjs-cache", "", "nextjs_server"),
     ("x-drupal-cache", "", "drupal"),
     ("x-drupal-dynamic-cache", "", "drupal"),
     ("x-litespeed-cache", "", "litespeed"),
     ("x-turbo-charged-by", r"(?i)litespeed", "litespeed"),
     ("x-pingback", r"/xmlrpc\.php$", "wordpress"),
+    ("x-redirect-by", r"(?i)^wordpress$", "wordpress"),
     ("x-shopify-stage", "", "shopify"),
     ("x-shopid", "", "shopify"),
     ("x-wix-request-id", "", "wix"),
@@ -448,7 +473,7 @@ const COOKIE_RULES: &[(&str, &str)] = &[
     ),
     (r"^(?:incap_ses_|visid_incap_|nlbi_|___utmvc$)", "imperva"),
     (
-        r"^(?:ak_bmsc|bm_sz|_abck|bm_sv|bm_mi|bm_s|bm_so|AKA_A2)$",
+        r"^(?:ak_bmsc|bm_sz|_abck|bm_sv|bm_mi|bm_s|bm_so|AKA_A2|ak-inject-mpulse)$",
         "akamai",
     ),
     (r"^datadome$", "datadome"),
@@ -942,6 +967,9 @@ fn valued_header(name: &str, value: &str) -> Vec<Detection> {
         if cookie.to_ascii_uppercase().contains("JSESSIONID") {
             add(servlet_engine(value).and_then(|id| known(id, None, "cookie")));
         }
+        if cookie == "SESSION" && spring_session(value) {
+            add(known("spring_session", None, "cookie"));
+        }
         return found;
     }
     for index in HEADERS.exact.get(name).into_iter().flatten() {
@@ -989,6 +1017,31 @@ fn bigip_address(set_cookie: &str) -> bool {
 /// The servlet engine a session ID's shape names. JEUS appends its domain and
 /// server in base64 (`.amV1c19kb21haW4vc2VydmVyMQ` is `jeus_domain/server1`),
 /// WebLogic the JVM's hash after `!`, WebSphere a `0000` cache prefix and a
+/// Spring Session's cookie: `SESSION`, holding a UUID in base64. Many stacks
+/// name a cookie `SESSION`; only Spring's value has this shape.
+fn spring_session(set_cookie: &str) -> bool {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let value = set_cookie
+        .split_once('=')
+        .map_or("", |(_, rest)| rest)
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let Some(id) = STANDARD
+        .decode(value)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return false;
+    };
+    id.len() == 36
+        && id.char_indices().all(|(index, c)| match index {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 /// clone ID after `:`, Jetty its node (`node0…`). Only the engine leaves this
 /// function: never the value, nor the server name a JEUS ID carries.
 fn servlet_engine(set_cookie: &str) -> Option<&'static str> {
@@ -1155,6 +1208,40 @@ mod tests {
             ("EO-LOG-UUID", "1234567890", "tencent_edgeone", None),
             ("EO-Cache-Status", "HIT", "tencent_edgeone", None),
             ("X-IPLB-Request-ID", "A1B2C3D4", "ovhcloud", None),
+            (
+                "akamai-amd-bc-debug",
+                "[a=23.0.0.1,c=g,n=KR_11_SEOUL]",
+                "akamai",
+                None,
+            ),
+            ("Edge-Cache-Tag", "statics", "akamai", None),
+            ("X-MSEdge-Ref", "Ref A: 1A2B", "azure_front_door", None),
+            (
+                "Ali-Swift-Global-Savetime",
+                "1784261214",
+                "alibaba_cloud_cdn",
+                None,
+            ),
+            (
+                "X-Swift-SaveTime",
+                "Mon, 20 Jul 2026 09:12:38 GMT",
+                "alibaba_cloud_cdn",
+                None,
+            ),
+            ("EagleId", "7cb5a1f2", "alibaba_cloud_cdn", None),
+            ("x-oss-request-id", "6A1B2C", "alibaba_cloud_oss", None),
+            ("X-Cnection", "close", "f5_big_ip", None),
+            ("x-fb-debug", "abc==", "proxygen", None),
+            (
+                "x-fb-connection-quality",
+                "EXCELLENT; q=0.9, rtt=1",
+                "proxygen",
+                None,
+            ),
+            ("X-AspNet-Version", "", "asp_net", None),
+            ("X-AspNetMvc-Version", "", "asp_net_mvc", None),
+            ("x-nextjs-cache", "HIT", "nextjs_server", None),
+            ("X-Redirect-By", "WordPress", "wordpress", None),
             ("Server", "proxygen-bolt", "proxygen", None),
             ("Server", "tRPC-Gateway", "trpc_gateway", None),
             ("Server", "gabia server", "gabia", None),
@@ -1491,6 +1578,11 @@ mod tests {
             ("TS01a2b3c4=01abcdef; Path=/", "f5_advanced_waf"),
             ("TS195f5110029=01abcdef; Path=/app", "f5_advanced_waf"),
             ("HH_JSESSIONID=ABC123; Path=/", "java_servlet"),
+            ("ak-inject-mpulse=false; Path=/", "akamai"),
+            (
+                "SESSION=ZGM1ZTc0YjQtN2Q2Zi00YmMzLWIzNmQtNWE0ZjA5ZjBmMDNj; Path=/; HttpOnly",
+                "spring_session",
+            ),
             (
                 "__cf_bm=abc; path=/; domain=.example.com; HttpOnly; Secure",
                 "cloudflare",
@@ -1590,6 +1682,18 @@ mod tests {
             "JSESSIONID_HMPG=0Wb8tdVwpTGaTIHUzbHWwcTpaTTwcX2UInYlJ8f8dEvdP8u9SlEiDY8BUQd0ZKyW.amV1c19kb21haW4vc2VydmVyMQ==; Path=/"
         )]))
         .contains(&one("jeus", None)));
+        // Only Spring Session's `SESSION` holds a UUID in base64.
+        for cookie in [
+            "SESSION=abc123; Path=/",
+            "SESSION=dc5e74b4-7d6f-4bc3-b36d-5a4f09f0f03c; Path=/",
+            "SESSION=aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8gd29y; Path=/",
+        ] {
+            assert!(
+                !found(detect_headers([("Set-Cookie", cookie)]))
+                    .contains(&one("spring_session", None)),
+                "{cookie}"
+            );
+        }
     }
 
     #[test]

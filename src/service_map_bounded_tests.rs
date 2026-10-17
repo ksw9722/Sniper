@@ -1980,3 +1980,44 @@ fn a_narrow_map_keeps_what_its_pages_loaded_from_elsewhere() {
         );
     }
 }
+
+// A page that is not UTF-8, as many Korean sites still serve in EUC-KR, is
+// stored as base64; the map reads it all the same, for ASCII signatures.
+#[test]
+fn a_page_stored_as_base64_is_read_too() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(109);
+    let mut record = filter_fixture("www.example.com", "/", 200, "text/html", None, 1);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        "text/html; charset=euc-kr".parse().unwrap(),
+    );
+    // "한글" in EUC-KR, which is not UTF-8.
+    let body = b"<meta name=\"generator\" content=\"WordPress 6.5.2\"><p>\xc7\xd1\xb1\xdb</p>";
+    record.response = Some(MessageRecord::from_headers_and_body(&headers, body, 1024));
+    assert_eq!(
+        record.response.as_ref().unwrap().body_encoding,
+        crate::model::BodyEncoding::Base64
+    );
+    let store = TransactionStore::from_records(vec![record]);
+    let (map, _) = store
+        .service_map_all_rows_blocking(
+            session,
+            technology::CatalogVersion::V2,
+            &ListFilters::default(),
+            false,
+            Some("https://www.example.com".into()),
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert!(
+        map.origins[0]
+            .front_technologies
+            .iter()
+            .any(|item| item.product_id == "wordpress" && item.version.as_deref() == Some("6.5.2")),
+        "{:?}",
+        map.origins[0].front_technologies
+    );
+}

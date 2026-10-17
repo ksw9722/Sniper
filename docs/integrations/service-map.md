@@ -170,7 +170,7 @@ header observations, with `+N` for further products; hovering `+N`, or focusing
 the card, lists them. A product found without a version shows its name alone.
 A product's chip carries its logo, and a card with no captured favicon shows
 the leading product's logo on its brand colour. The logos come from Simple
-Icons 16.35.0, bundled in `web/product-icons.js`: 152 products share 126 icons
+Icons 16.35.0, bundled in `web/product-icons.js`: 157 products share 129 icons
 released under CC0, MIT, Apache-2.0, BSD or CC-BY, each licence noted in the
 file. Icons under a copyleft, non-commercial or custom licence (Vue.js, PHP,
 Ruby, Jenkins, Debian, Keycloak, Quasar) are left out, and those products keep
@@ -377,10 +377,11 @@ loads: payments (Stripe.js, PayPal, PortOne, Toss Payments, KG Inicis,
 NICEPAY), maps (Google Maps, NAVER Maps), CAPTCHAs (reCAPTCHA, hCaptcha,
 Cloudflare Turnstile), Firebase, chat (Channel Talk, Intercom, Zendesk),
 consent managers (OneTrust, Cookiebot, Didomi, TrustArc, Usercentrics,
-Sourcepoint, Quantcast Choice) and Polyfill.io, whose domain served malware in
-2024) and analytics (Google Tag Manager, Google Analytics, NAVER Analytics,
+Sourcepoint, Quantcast Choice), Polyfill.io, whose domain served malware in
+2024, Font Face Observer and the Web Components and Web Animations polyfills) and analytics (Google Tag Manager, Google Analytics, NAVER Analytics,
 Tealium, Adobe Launch, Amplitude, Mixpanel, Segment, Hotjar, Microsoft Clarity,
-Plausible, Matomo, Chartbeat, Akamai mPulse, New Relic, Datadog RUM, HubSpot,
+Plausible (and its `pa-…` scripts on a site's own proxy), Matomo, Chartbeat
+(and its inline `_sf_async_config`), Akamai mPulse, New Relic, Datadog RUM, HubSpot,
 the Meta, TikTok, LinkedIn and X pixels, ad networks, AceCounter, Beusable and
 Dable). Wappalyzer's catalogue was the checklist; the rules are Sniper's
 own. Only these anchors count: a bundle holds other libraries' `version:"…"`
@@ -388,7 +389,9 @@ literals too. Many signals name a product without its version; the card then
 shows its name alone.
 
 Script and page bodies are read once per row revision; a script served again at
-the same path with the same size is not read again. One map reads at most 256
+the same path with the same size is not read again. A page that is not UTF-8,
+such as an EUC-KR page, is stored as base64 and read all the same: every
+signature is ASCII. One map reads at most 256
 rows from disk and 32 MiB in all, and skips any row larger than 8 MiB; later maps
 read the rest. An asset's technologies go to the page that loaded it (its
 Referer) when that page is in the map, else to the asset's own origin, so a
@@ -433,7 +436,12 @@ the map now reads four places for that, without sending anything:
   `X-Varnish`, `x-amz-id-2` (S3), `X-Vercel-Id`, `X-Jenkins: 2.426.1`,
   `kbn-version` (Kibana), Fastly's `X-Timer` and Next-Gen WAF's
   `X-SigSci-RequestID`, Tencent EdgeOne's `EO-Cache-Status`, OVHcloud's
-  `X-IPLB-Request-ID`, and about sixty more.
+  `X-IPLB-Request-ID`, any `Akamai-…` header and Akamai's `Edge-Cache-Tag`,
+  Alibaba Cloud CDN's `Ali-Swift-Global-Savetime` and `EagleId`, Alibaba Cloud
+  OSS's `x-oss-request-id`, Azure Front Door's `X-MSEdge-Ref`, F5 BIG-IP's
+  `X-Cnection` (its OneConnect marker), Meta's `x-fb-debug`, a Next.js
+  server's `x-nextjs-cache`, `X-Redirect-By: WordPress`, an `X-AspNet-Version`
+  emptied to hide the version, and about sixty more.
 - **Header values the catalog does not name:** `Server: AmazonS3`,
   `awselb/2.0`, `Kestrel`, `Werkzeug/3.0.1 Python/3.12.0`, an operating system
   in parentheses (`Apache/2.4.52 (Ubuntu)`), `Via: 1.1 … (CloudFront)`,
@@ -449,8 +457,10 @@ the map now reads four places for that, without sending anything:
   also under a changed name such as `HH_JSESSIONID`), `PHPSESSID`,
   `ASP.NET_SessionId`, `laravel_session`, `connect.sid` (Express), `AWSALB`,
   `BIGipServer…` (F5), `TS…` (F5 WAF, with a path's own `TS…029`), `__cf_bm`,
-  `incap_ses_…`, `ak_bmsc`, `AKA_A2`, `datadome`, `ARRAffinity` (Azure App
-  Service), `SERVERID` (HAProxy), `KEYCLOAK_SESSION`, and from Korean sites
+  `incap_ses_…`, `ak_bmsc`, `AKA_A2`, `ak-inject-mpulse`, `datadome`,
+  `ARRAffinity` (Azure App Service), `SERVERID` (HAProxy), `KEYCLOAK_SESSION`,
+  Spring Session's `SESSION` (only when its value is a UUID in base64, as
+  Spring writes it; other stacks use the name too), and from Korean sites
   `LENA-UID` (LENA), `egovLatestServerTime` (eGovFrame) and the APM agents'
   `SCOUTER`, `WHATAP` and `elevisor_for_j2ee_uid`. A value is never read,
   except a BIG-IP cookie's, to tell whether it encodes the pool member's
@@ -570,7 +580,9 @@ names and shapes only:
   `SharedKey` and a few more) since an unknown first word may be the
   credential itself;
 - an API key header by name (`X-API-Key`, `X-Auth-Token`, `X-Goog-Api-Key`,
-  `Ocp-Apim-Subscription-Key` and the like);
+  `Ocp-Apim-Subscription-Key` and the like), or a vendor's own spelling of one
+  ending in `-api-key` or `-token` (`X-Airbnb-API-Key`, `Phantom-Token`); a
+  CSRF or CAPTCHA token does not count;
 - cookies a request carried or a response set: `session_cookie` when the name
   says session (`JSESSIONID`, `PHPSESSID`, `connect.sid`, `SESSION`), and
   `jwt_cookie` when the value is shaped like a JWT;
