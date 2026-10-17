@@ -170,7 +170,7 @@ header observations, with `+N` for further products; hovering `+N`, or focusing
 the card, lists them. A product found without a version shows its name alone.
 A product's chip carries its logo, and a card with no captured favicon shows
 the leading product's logo on its brand colour. The logos come from Simple
-Icons 16.35.0, bundled in `web/product-icons.js`: 127 products share 108 icons
+Icons 16.35.0, bundled in `web/product-icons.js`: 152 products share 126 icons
 released under CC0, MIT, Apache-2.0, BSD or CC-BY, each licence noted in the
 file. Icons under a copyleft, non-commercial or custom licence (Vue.js, PHP,
 Ruby, Jenkins, Debian, Keycloak, Quasar) are left out, and those products keep
@@ -354,13 +354,15 @@ without running anything:
   Vue's `data-v-…` attributes, AngularJS's `ng-app`, Nuxt's `__nuxt` root or
   WordPress's `/wp-content/` paths, and the page's `<meta name="generator">`.
 - **Asset URLs:** a CDN's `package@version` path (`/npm/vue@3.4.21/`,
-  `/ajax/libs/jquery/3.7.1/`), a versioned file name (`jquery-3.6.0.min.js`), or
+  `/ajax/libs/jquery/3.7.1/`), a versioned file name (`jquery-3.6.0.min.js`), a
+  library's own file without a version (`jquery.min.js`, `bootstrap.min.css`),
   the directory a framework builds into (`/_next/static/`, `/_nuxt/`,
-  `/_app/immutable/`). Paths are matched on any host, so a company's mirror of a
+  `/_app/immutable/`), or the host a third-party service serves its script
+  from (`js.tosspayments.com`, `cdn.amplitude.com`). Paths are matched on any host, so a company's mirror of a
   public CDN counts. A script, stylesheet or image row's own URL is read without
   its body; a page's linked scripts and stylesheets are read from its markup.
 
-About seventy products are covered, in six categories: meta-frameworks (Next.js,
+About 150 products are covered, in six categories: meta-frameworks (Next.js,
 Nuxt, SvelteKit, Remix, Gatsby, Astro), CMSs and site builders (WordPress, Drupal,
 Joomla, Magento, Shopify, Wix, Squarespace, and any generator a page names),
 frameworks (React, Vue.js, Angular, AngularJS, Svelte, Ember.js, Preact, Lit,
@@ -370,18 +372,29 @@ Qwik, Alpine.js, htmx, Turbo, Livewire, Backbone.js, Knockout), UI kits
 core-js, Axios, Socket.IO, DOMPurify, Chart.js, D3, three.js, Leaflet,
 Highcharts, ECharts, GSAP, Swiper, Video.js, hls.js, Select2, Popper,
 Handlebars, Modernizr, Zepto, Prototype, MooTools, PDF.js, TinyMCE, CKEditor,
-Quill, SweetAlert2, Hammer.js, Sentry) and analytics (Google Tag Manager, Google
-Analytics). Wappalyzer's catalogue was the checklist; the rules are Sniper's
+Quill, SweetAlert2, Hammer.js, Sentry, and the third-party services a page
+loads: payments (Stripe.js, PayPal, PortOne, Toss Payments, KG Inicis,
+NICEPAY), maps (Google Maps, NAVER Maps), CAPTCHAs (reCAPTCHA, hCaptcha,
+Cloudflare Turnstile), Firebase, chat (Channel Talk, Intercom, Zendesk),
+consent managers (OneTrust, Cookiebot, Didomi, TrustArc, Usercentrics,
+Sourcepoint, Quantcast Choice) and Polyfill.io, whose domain served malware in
+2024) and analytics (Google Tag Manager, Google Analytics, NAVER Analytics,
+Tealium, Adobe Launch, Amplitude, Mixpanel, Segment, Hotjar, Microsoft Clarity,
+Plausible, Matomo, Chartbeat, Akamai mPulse, New Relic, Datadog RUM, HubSpot,
+the Meta, TikTok, LinkedIn and X pixels, ad networks, AceCounter, Beusable and
+Dable). Wappalyzer's catalogue was the checklist; the rules are Sniper's
 own. Only these anchors count: a bundle holds other libraries' `version:"…"`
 literals too. Many signals name a product without its version; the card then
 shows its name alone.
 
 Script and page bodies are read once per row revision; a script served again at
 the same path with the same size is not read again. One map reads at most 256
-rows from disk and 32 MiB in all, and skips any row larger than 2 MiB; later maps
+rows from disk and 32 MiB in all, and skips any row larger than 8 MiB; later maps
 read the rest. An asset's technologies go to the page that loaded it (its
 Referer) when that page is in the map, else to the asset's own origin, so a
-bundle served from a CDN names the page's framework. A page's own stay with the
+bundle served from a CDN names the page's framework. A one-origin, in-scope or
+origin-capped map leaves the CDN out but keeps what the page took from it, so
+it names the same front end the whole map does. A page's own stay with the
 page. A row counts once for a product, however many of its signals name it.
 
 The card leads with what the site is built with (a meta-framework, then a CMS,
@@ -418,7 +431,9 @@ the map now reads four places for that, without sending anything:
 - **Vendor header names:** `CF-RAY` (Cloudflare), `X-Amz-Cf-Id` (CloudFront),
   `X-Served-By: cache-…` (Fastly), `x-envoy-*` (Envoy), `x-kong-*` (Kong),
   `X-Varnish`, `x-amz-id-2` (S3), `X-Vercel-Id`, `X-Jenkins: 2.426.1`,
-  `kbn-version` (Kibana), and about sixty more.
+  `kbn-version` (Kibana), Fastly's `X-Timer` and Next-Gen WAF's
+  `X-SigSci-RequestID`, Tencent EdgeOne's `EO-Cache-Status`, OVHcloud's
+  `X-IPLB-Request-ID`, and about sixty more.
 - **Header values the catalog does not name:** `Server: AmazonS3`,
   `awselb/2.0`, `Kestrel`, `Werkzeug/3.0.1 Python/3.12.0`, an operating system
   in parentheses (`Apache/2.4.52 (Ubuntu)`), `Via: 1.1 … (CloudFront)`,
@@ -427,11 +442,13 @@ the map now reads four places for that, without sending anything:
   TmaxSoft `WebtoB`, Google's own front ends (`gws`, `sffe`, `ESF`, `GSE`),
   NAVER's (`nfront`, `Testa/6.2.14`), CDNetworks' `PWS/8.3`, `BunnyCDN-…`,
   Apache Traffic Server's `ATS`, Baidu's `BLB`, ByteDance's `TLB`, Adobe
-  Experience Platform's `jag`, JD.com's `jfe`, and Rocky Linux or AlmaLinux in
-  parentheses.
-- **Names of the cookies a response sets:** `JSESSIONID` (Java servlet),
-  `PHPSESSID`, `ASP.NET_SessionId`, `laravel_session`, `connect.sid`
-  (Express), `AWSALB`, `BIGipServer…` (F5), `TS…` (F5 WAF), `__cf_bm`,
+  Experience Platform's `jag`, JD.com's `jfe`, Meta's `proxygen-bolt`,
+  Tencent's `tRPC-Gateway`, Gabia's `gabia server`, and Rocky Linux or
+  AlmaLinux in parentheses.
+- **Names of the cookies a response sets:** `JSESSIONID` (Java servlet,
+  also under a changed name such as `HH_JSESSIONID`), `PHPSESSID`,
+  `ASP.NET_SessionId`, `laravel_session`, `connect.sid` (Express), `AWSALB`,
+  `BIGipServer…` (F5), `TS…` (F5 WAF, with a path's own `TS…029`), `__cf_bm`,
   `incap_ses_…`, `ak_bmsc`, `AKA_A2`, `datadome`, `ARRAffinity` (Azure App
   Service), `SERVERID` (HAProxy), `KEYCLOAK_SESSION`, and from Korean sites
   `LENA-UID` (LENA), `egovLatestServerTime` (eGovFrame) and the APM agents'

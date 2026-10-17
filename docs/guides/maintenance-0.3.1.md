@@ -360,8 +360,8 @@ carries none), but responses do: script banners and runtime values such as
 `window.next={version:"…"}`, page markup such as `ng-version` and `data-v-`
 attributes and the generator meta, and asset URLs such as a CDN's
 `/npm/vue@3.4.21/` or a `/_next/static/` build directory. The map now reads
-these for about seventy front-end frameworks, CMSs, UI kits, libraries and
-trackers, with Wappalyzer's catalogue as the checklist and Sniper's own rules,
+these for about 150 front-end frameworks, CMSs, UI kits, libraries,
+third-party services and trackers, with Wappalyzer's catalogue as the checklist and Sniper's own rules,
 once per row revision and bounded per map. An asset's technologies go to the
 page that loaded it; cards lead with what the site is built with, and the
 inspector lists them under Front-end (`front_technologies` in the API and the
@@ -418,6 +418,16 @@ session ID's shape names (JEUS, WebLogic, WebSphere, Jetty). The front end
 gained the libraries the crawl loaded most, Korean ones among them
 (NetFUNNEL, NAVER Analytics and Login, nProtect), and reads a
 `name-version` generator such as `mkdocs-1.6.1`.
+
+A second pass over the same crawl counted each site where its visit landed,
+and only the 499 sites that served a homepage; the rest answered the headless
+browser with a block or a challenge. It found that a one-origin or in-scope
+map left out what a page loaded from a CDN, which the whole map gave the page;
+both now name the same front end. It also added Meta's, Tencent's and
+OVHcloud's edges, Fastly's timing header, a renamed `JSESSIONID`, F5's
+per-path cookies, the third-party services pages load (payments, maps,
+CAPTCHAs, chat, consent managers, analytics and ad tags) and library files
+named without a version, and reads bundles up to 8 MiB.
 
 Cards are shorter (84px at the default text size) and a product found without a
 version shows its name alone; hovering `+N` lists the products it stands for.
