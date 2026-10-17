@@ -790,10 +790,9 @@ async fn crawl(
             .unwrap_or("")
             .to_ascii_lowercase();
         if !(content_type.contains("html")
-            || content_type.contains("javascript")
+            || recon_sources::is_javascript_document(&url, &content_type)
             || content_type.contains("xml")
             || content_type.contains("text/plain")
-            || url.path().ends_with(".js")
             || url.path().ends_with("robots.txt"))
         {
             continue;
@@ -808,7 +807,15 @@ async fn crawl(
                 continue;
             }
         };
-        let findings = recon_sources::extract_document(&url, &content_type, &body);
+        let (findings, clipped) = recon_sources::extract_document(&url, &content_type, &body);
+        if clipped {
+            report.truncated = true;
+            let warning =
+                "A static document extraction limit was reached; more evidence may exist.";
+            if report.warnings.len() < 20 && !report.warnings.iter().any(|item| item == warning) {
+                report.warnings.push(warning.into());
+            }
+        }
         for finding in &findings {
             if !recon_sources::is_followable(finding) {
                 continue;
@@ -1084,6 +1091,131 @@ mod tests {
         let _ = server.await;
         // The debounced writer may still own this isolated directory; unlike a
         // real session it is left for the OS temporary-directory cleanup.
+    }
+
+    async fn crawl_static_fixture(
+        content_type: &str,
+        body: &str,
+        path: &str,
+    ) -> (SourceReport, ReconSnapshot, Vec<String>) {
+        use axum::{routing::get, Router};
+        let requested = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = requested.clone();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        let fixture_path = path.to_string();
+        let router = Router::new().fallback(get(move |uri: axum::http::Uri| {
+            let captured = captured.clone();
+            let content_type = content_type.clone();
+            let body = body.clone();
+            let fixture_path = fixture_path.clone();
+            async move {
+                captured.lock().unwrap().push(uri.path().to_string());
+                if uri.path() == fixture_path {
+                    ([(axum::http::header::CONTENT_TYPE, content_type)], body)
+                } else {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/plain".into())],
+                        String::new(),
+                    )
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("sniper-recon-static-{}", Uuid::new_v4()));
+        let (_, session) = crate::session::SessionRegistry::load_or_create(&dir, 32, 32).unwrap();
+        let request: StartRecon = serde_json::from_value(serde_json::json!({
+            "session_id": session.id(), "target_url": format!("http://{address}{path}"),
+            "sources": ["crawler"], "max_requests": 8
+        }))
+        .unwrap();
+        let scope = validate(&request).unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let report = crawl(
+            &session,
+            Uuid::new_v4(),
+            &request,
+            &scope,
+            &client,
+            &AtomicBool::new(false),
+        )
+        .await;
+        let snapshot = session.recon.snapshot();
+        let paths = requested.lock().unwrap().clone();
+        server.abort();
+        let _ = server.await;
+        (report, snapshot, paths)
+    }
+
+    #[tokio::test]
+    async fn crawl_extracts_ecmascript_and_javascript_aliases_without_executing_candidates() {
+        for content_type in [
+            "application/ecmascript",
+            "text/ecmascript",
+            "APPLICATION/ECMASCRIPT; charset=UTF-8",
+            "application/javascript",
+            "text/javascript; charset=utf-8",
+            "application/x-javascript",
+        ] {
+            let (report, snapshot, paths) =
+                crawl_static_fixture(content_type, "fetch('/candidate')", "/extensionless").await;
+            assert_eq!(report.requests, 3, "{content_type}");
+            assert!(!report.truncated, "{content_type}");
+            assert!(
+                snapshot
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.url.ends_with("/candidate")
+                        && endpoint
+                            .evidence
+                            .iter()
+                            .any(|evidence| evidence.kind == "candidate")),
+                "{content_type}"
+            );
+            assert!(!paths.contains(&"/candidate".into()), "{content_type}");
+        }
+        let (_, snapshot, _) =
+            crawl_static_fixture("", "fetch('/extension-candidate')", "/bundle.js").await;
+        assert!(snapshot
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.url.ends_with("/extension-candidate")));
+    }
+
+    #[tokio::test]
+    async fn crawl_reports_html_token_clipping_without_relaxing_the_bound() {
+        for spans in [4999, 5000] {
+            let body = format!(
+                "{}<a href='/late-link'>link</a>",
+                "<span></span>".repeat(spans)
+            );
+            let (report, snapshot, paths) = crawl_static_fixture("text/html", &body, "/tags").await;
+            let clipped = spans == 5000;
+            assert_eq!(report.truncated, clipped, "{spans} spans");
+            assert_eq!(
+                snapshot
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.url.ends_with("/late-link")),
+                !clipped
+            );
+            assert_eq!(paths.contains(&"/late-link".into()), !clipped);
+            assert_eq!(report.requests, if clipped { 3 } else { 4 });
+            assert_eq!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("extraction limit")),
+                clipped
+            );
+        }
     }
 
     #[tokio::test]

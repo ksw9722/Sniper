@@ -220,6 +220,25 @@ test("successful start and stop use pinned sessions and retain inventory", async
   f.controller.dispose();
 });
 
+test("completed sources retain partial extraction warnings and accurate counts", async () => {
+  const f = controllerFixture(); await settled();
+  f.snapshots.a.endpoints = f.snapshots.a.endpoints.slice(0, 1);
+  f.snapshots.a.jobs = [{ id: "bounded-job", status: "completed", target_url: "https://example.com/tags", sources: [{
+    source: "crawler", status: "completed", requests: 3, discovered: 1, truncated: true,
+    warnings: ["A static document extraction limit was reached; more evidence may exist.", "Collection was bounded; more evidence may exist."],
+  }] }];
+  await f.controller.refresh();
+  assert.match(f.node("Jobs").textContent, /completed.*3 requests.*1 discovered.*LIMIT REACHED \/ PARTIAL/);
+  assert.match(f.node("Jobs").textContent, /static document extraction limit/);
+  assert.match(f.node("InventoryMeta").textContent, /^1 endpoints in this session$/);
+  assert.equal(descendants(f.node("Jobs")).some(item => item.dataset.stopJob), false);
+  f.snapshots.a.jobs[0].sources[0] = { source: "crawler", status: "completed", requests: 4, discovered: 2, truncated: false, warnings: [] };
+  await f.controller.refresh();
+  assert.match(f.node("Jobs").textContent, /4 requests.*2 discovered/);
+  assert.doesNotMatch(f.node("Jobs").textContent, /LIMIT REACHED|extraction limit/);
+  f.controller.dispose();
+});
+
 test("late GET cannot replace a new session's endpoints, including A → B → A", async () => {
   const f = controllerFixture(); await settled();
   f.hold = "GET"; void f.controller.refresh(); await settled();
