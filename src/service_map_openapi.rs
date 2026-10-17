@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::{service_map_auth::AuthSignal, service_map_parameters::EndpointParameter};
+use crate::{
+    service_map_auth::AuthSignal,
+    service_map_parameters::{body_parameter_location, EndpointParameter},
+};
 
 /// Operations described per origin, the most recently used first.
 pub const MAX_OPERATIONS: usize = 500;
@@ -324,15 +327,7 @@ fn request_body(operation: &Operation) -> Option<Value> {
         .request_types
         .iter()
         .map(|media| {
-            let location = if media.contains("x-www-form-urlencoded") {
-                "form"
-            } else if media.contains("json") {
-                "json"
-            } else if media.contains("multipart/form-data") {
-                "multipart"
-            } else {
-                ""
-            };
+            let location = body_parameter_location(media).unwrap_or("");
             let properties: Map<String, Value> = operation
                 .parameters
                 .iter()
@@ -444,6 +439,41 @@ mod tests {
             rows: 1,
             examples: examples.iter().map(|value| value.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn body_schemas_use_the_same_exact_media_types_as_parameter_extraction() {
+        let operation = Operation {
+            request_types: [
+                "application/json",
+                "application/problem+json",
+                "application/notjson",
+                "application/x-www-form-urlencoded-fake",
+                "multipart/form-data",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            parameters: vec![
+                parameter("json", "json_field", &["42"]),
+                parameter("form", "form_field", &["value"]),
+                parameter("multipart", "file", &[]),
+            ],
+            ..Operation::default()
+        };
+        let body = request_body(&operation).unwrap();
+        let content = &body["content"];
+        assert!(content["application/json"]["schema"]["properties"]
+            .get("json_field")
+            .is_some());
+        assert!(content["application/problem+json"]["schema"]["properties"]
+            .get("json_field")
+            .is_some());
+        assert!(content["multipart/form-data"]["schema"]["properties"]
+            .get("file")
+            .is_some());
+        assert_eq!(content["application/notjson"], json!({}));
+        assert_eq!(content["application/x-www-form-urlencoded-fake"], json!({}));
     }
 
     fn signal(kind: &'static str, name: Option<&str>) -> AuthSignal {

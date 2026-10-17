@@ -1782,6 +1782,30 @@ async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
             Some("application/json"),
             br#"{"q":"bags","limit":5}"#,
         ),
+        request(
+            "POST",
+            "/upload",
+            Some("multipart/form-data; boundary=control"),
+            b"--control\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.txt\"\r\n\r\nSYNTHETIC_PRIVATE_UPLOAD ; name=\"invented\"\r\nContent-Disposition: form-data; name=\"header_fake\"\r\n\r\n--control--\r\n",
+        ),
+        request(
+            "POST",
+            "/upload",
+            Some("multipart/form-data; boundary=\"json-Boundary\""),
+            b"--json-Boundary\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nSYNTHETIC_PRIVATE_UPLOAD\r\n--json-Boundary--\r\n",
+        ),
+        request(
+            "POST",
+            "/suffix-json",
+            Some("application/problem+json; profile=x-www-form-urlencoded"),
+            br#"{"message":"value"}"#,
+        ),
+        request(
+            "POST",
+            "/unsupported",
+            Some("text/plain; profile=application/json"),
+            br#"{"invented":"value"}"#,
+        ),
         request("GET", "/other?x=1", None, b""),
     ] {
         session.store.insert(record).await;
@@ -1845,6 +1869,32 @@ async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
             ("json".into(), "q".into(), 1, json!(["bags"])),
         ]
     );
+    let upload: Value = read(session_id, origin, "POST", "/upload")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(upload["rows"], 2);
+    assert_eq!(
+        names(&upload),
+        [("multipart".into(), "file".into(), 2, json!([]))]
+    );
+    assert!(!upload.to_string().contains("SYNTHETIC_PRIVATE_UPLOAD"));
+    let suffix: Value = read(session_id, origin, "POST", "/suffix-json")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&suffix),
+        [("json".into(), "message".into(), 1, json!(["value"]))]
+    );
+    let unsupported: Value = read(session_id, origin, "POST", "/unsupported")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(names(&unsupported).is_empty());
     let other: Value = read(Uuid::new_v4(), origin, "GET", "/search")
         .await
         .json()

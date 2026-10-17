@@ -448,7 +448,11 @@ was sent (`query`, `form`, a top-level `json` field, or a `multipart` field
 name), how many rows carried it, and up to three of its values, each cut to 80
 characters. Request bodies are read for this only when an endpoint is opened,
 and only in the active session; a body is parsed from its first 64 KiB. The
-values are shown as captured, as in HTTP history.
+values are shown as captured, as in HTTP history. Body formats are selected by
+media type, ignoring parameters; JSON includes structured `+json` media types.
+Multipart names come only from complete top-level `Content-Disposition:
+form-data` part headers within that prefix, using the declared boundary. File
+contents and multipart values are never returned; nested multipart is not expanded.
 `GET /api/target/service-map/parameters` with `session_id`, `origin`, `method`
 and `path` returns the same result, and so does the CLI:
 
