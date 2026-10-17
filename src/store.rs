@@ -2823,6 +2823,7 @@ impl TransactionStore {
                             body.as_deref().unwrap_or(""),
                         );
                     }
+                    operation.json_types = tally.json_types();
                     operation.parameters = tally.finish().0;
                     (key, operation)
                 })

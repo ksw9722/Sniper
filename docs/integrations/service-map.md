@@ -463,10 +463,14 @@ users in, copies an OpenAPI 3.1 description of what its retained rows show, for
 Swagger UI, Postman, Burp or an agent, as Burp's API Exporter and
 mitmproxy2swagger build one from captured traffic. It lists each method and path
 template, with the ID segments as named path parameters (`{number}`, `{uuid}`,
-`{hex}`); the query, form, top-level JSON and multipart field names from each
-operation's newest 20 rows, with a type guessed from their values; each response
-status with the media types it came with; and the credentials the rows showed,
-as security schemes. Each scheme is one alternative: the rows show what was
+`{hex}`). If ID kinds differ in the same path position, one `{id}` path
+parameter accepts the observed kinds and the operations' counts and evidence
+are combined. It includes the query, form, top-level JSON and multipart field
+names from each observed method/path variant's newest 20 rows. JSON fields keep
+their parsed types (including null and mixed types); text fields use types
+guessed from their values. It also lists each response status with its media
+types and the credentials the rows showed, as security schemes. Each scheme
+is one alternative: the rows show what was
 sent, not what the server requires. Every retained row of the origin counts,
 and each operation's `x-sniper-requests` says how many it stands for.
 

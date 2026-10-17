@@ -146,6 +146,9 @@ pub(crate) struct ParameterRow {
 #[derive(Default)]
 pub(crate) struct ParameterTally {
     by_key: BTreeMap<(&'static str, String), (usize, Vec<String>)>,
+    // Keep parsed JSON types separately from the bounded, unquoted UI examples.
+    // A numeric-looking string and a number can have identical display text.
+    json_types: BTreeMap<String, BTreeSet<&'static str>>,
 }
 
 impl ParameterTally {
@@ -171,6 +174,23 @@ impl ParameterTally {
             } else if mime.contains("json") {
                 if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(body) {
                     for (name, value) in fields {
+                        let kind = match &value {
+                            serde_json::Value::Null => "null",
+                            serde_json::Value::Bool(_) => "boolean",
+                            serde_json::Value::Number(number)
+                                if number.is_i64() || number.is_u64() =>
+                            {
+                                "integer"
+                            }
+                            serde_json::Value::Number(_) => "number",
+                            serde_json::Value::String(_) => "string",
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                        };
+                        self.json_types
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(kind);
                         let value = match value {
                             serde_json::Value::String(text) => text,
                             other => other.to_string(),
@@ -201,6 +221,10 @@ impl ParameterTally {
                 }
             }
         }
+    }
+
+    pub(crate) fn json_types(&self) -> BTreeMap<String, BTreeSet<&'static str>> {
+        self.json_types.clone()
     }
 
     /// Query first, then bodies; the most frequent first within each.
@@ -294,5 +318,42 @@ mod tests {
         let (parameters, _) = tally.finish();
         assert_eq!(parameters[0].examples[0].chars().count(), MAX_EXAMPLE_CHARS);
         assert!(parameters.iter().any(|item| item.name == "b"));
+    }
+
+    #[test]
+    fn native_json_types_survive_identical_and_capped_display_examples() {
+        let mut tally = ParameterTally::default();
+        for body in [
+            r#"{"value":"42","other":"false"}"#,
+            r#"{"value":42,"other":false}"#,
+            r#"{"value":null}"#,
+            r#"{"value":[],"other":"[draft"}"#,
+            r#"{"value":{},"other":"{draft"}"#,
+            r#"{"value":true}"#,
+            r#"{"value":1.5}"#,
+        ] {
+            tally.add_row(None, Some("application/json"), body);
+        }
+        assert_eq!(
+            tally.json_types()["value"],
+            BTreeSet::from(["string", "integer", "null", "array", "object", "boolean", "number"])
+        );
+        assert_eq!(
+            tally.json_types()["other"],
+            BTreeSet::from(["string", "boolean"])
+        );
+        let (parameters, _) = tally.finish();
+        let value = parameters
+            .iter()
+            .find(|parameter| parameter.name == "value")
+            .unwrap();
+        assert_eq!(value.examples, ["42", "null", "[]"]);
+        assert_eq!(value.rows, 7);
+        let serialized = serde_json::to_value(value).unwrap();
+        assert_eq!(
+            serialized.as_object().unwrap().len(),
+            4,
+            "parameter display wire shape stays unchanged"
+        );
     }
 }
