@@ -1142,6 +1142,8 @@ pub(crate) fn project_record_for_catalog(
         if let Some(signal) = unnamed {
             if row.unnamed.len() < MAX_UNNAMED_PER_ROW {
                 row.unnamed.push(signal);
+            } else {
+                row.omitted.push("unnamed_signals_per_row_limit".into());
             }
         }
     }
@@ -1820,7 +1822,11 @@ impl MapBuilder {
                 &mut item.unnamed.cookies,
             ] {
                 signals.sort_by(|a, b| (b.row_count, &a.value).cmp(&(a.row_count, &b.value)));
-                signals.truncate(MAX_UNNAMED);
+                if signals.len() > MAX_UNNAMED {
+                    signals.truncate(MAX_UNNAMED);
+                    self.stopped_by
+                        .insert("unnamed_signals_per_origin_limit".into());
+                }
             }
             item.auth.sort_by(|a, b| {
                 (b.row_count, rank(&a.kind), &a.name).cmp(&(a.row_count, rank(&b.kind), &b.name))
@@ -2710,6 +2716,79 @@ mod tests {
             .stopped_by
             .contains(&"unsupported_or_oversized_metadata".into()));
         assert!(result.origins[0].redirects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_map_unnamed_row_cap_reports_signal_loss_without_omitting_rows() {
+        for count in [0, MAX_UNNAMED_PER_ROW, MAX_UNNAMED_PER_ROW + 1, 24] {
+            let mut row = record("/unnamed");
+            row.response.as_mut().unwrap().headers = (0..count)
+                .map(|index| HeaderRecord {
+                    name: format!("x-synthetic-{index:02}"),
+                    value: "fixture".into(),
+                })
+                .collect();
+            let projected = project_record(&row, "test".into()).unwrap();
+            assert_eq!(projected.unnamed.len(), count.min(MAX_UNNAMED_PER_ROW));
+            let expected = if count > MAX_UNNAMED_PER_ROW {
+                vec!["unnamed_signals_per_row_limit".to_string()]
+            } else {
+                vec![]
+            };
+            assert_eq!(projected.omitted, expected);
+            assert_eq!(projected.metadata_complete, expected.is_empty());
+            let result = map(vec![row]).await;
+            assert_eq!(result.snapshot.stopped_by, expected);
+            assert_eq!(result.snapshot.complete, expected.is_empty());
+            assert_eq!(result.snapshot.omitted_rows, 0);
+            assert_eq!(result.snapshot.included_rows, 1);
+            assert_eq!(
+                result.origins[0].unnamed.headers.len(),
+                count.min(MAX_UNNAMED_PER_ROW)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_unnamed_origin_caps_report_each_kind_and_keep_exact_available_counts() {
+        for kind in ["banner", "header", "cookie"] {
+            for count in [MAX_UNNAMED, MAX_UNNAMED + 1, 24] {
+                let records = (0..count)
+                    .map(|index| {
+                        let mut row = record("/unnamed");
+                        let (name, value) = match kind {
+                            "banner" => ("Server".into(), format!("Synthetic{index:02}")),
+                            "cookie" => {
+                                ("Set-Cookie".into(), format!("synthetic_{index:02}=fixture"))
+                            }
+                            _ => (format!("x-synthetic-{index:02}"), "fixture".into()),
+                        };
+                        row.response.as_mut().unwrap().headers = vec![HeaderRecord { name, value }];
+                        row
+                    })
+                    .collect();
+                let result = map(records).await;
+                let expected = if count > MAX_UNNAMED {
+                    vec!["unnamed_signals_per_origin_limit".to_string()]
+                } else {
+                    vec![]
+                };
+                assert_eq!(result.snapshot.stopped_by, expected, "{kind} {count}");
+                assert_eq!(result.snapshot.complete, expected.is_empty());
+                assert_eq!(result.snapshot.omitted_rows, 0);
+                assert_eq!(result.snapshot.included_rows, count);
+                let unnamed = &result.origins[0].unnamed;
+                let signals = match kind {
+                    "banner" => &unnamed.banners,
+                    "cookie" => &unnamed.cookies,
+                    _ => &unnamed.headers,
+                };
+                assert_eq!(signals.len(), MAX_UNNAMED);
+                assert!(signals
+                    .iter()
+                    .all(|signal| signal.row_count == 1 && signal.evidence.len() == 1));
+            }
+        }
     }
 
     #[tokio::test]

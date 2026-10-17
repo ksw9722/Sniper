@@ -462,6 +462,17 @@ whose it is; a header that always travels with one product
 (`cdn-pullzone` beside BunnyCDN) is likely that product's own. A name many
 vendors use (`uid`, `x-trace-id`) names nothing on its own.
 
+The summary carries the source map's `snapshot` unchanged: inspect `complete`,
+`stopped_by`, `omitted_rows`, row counts, timestamps and limits before treating
+it as exhaustive. `distinct_signals` counts only available signals after
+`--kind`; `omitted_signals` counts only those hidden by `--limit`. Zero omitted
+signals does not mean the source map was complete. The source keeps at most 16
+unnamed signals per row and 16 of each kind per origin; exceeding either marks
+`unnamed_signals_per_row_limit` or `unnamed_signals_per_origin_limit` in
+`snapshot.stopped_by`. These are signal omissions, so `omitted_rows` may still
+be zero. Older servers may not report these unnamed-signal caps. Filtering to
+one kind does not recalculate or erase the source map's coverage warnings.
+
 ```bash
 sniper-cli scope service-map unnamed --kind headers --limit 50
 ```

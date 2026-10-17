@@ -993,7 +993,7 @@ enum ServiceMapCommand {
     Openapi(ServiceMapOpenApiArgs),
     /// List what no rule names across the whole map, most widespread first.
     #[command(
-        after_help = "Reads the session's whole map (every retained row) and gathers each origin's unnamed signals: Server and X-Powered-By banners, header names and cookie names no rule names. Each signal comes with how many origins and rows carried it, up to five of those origins and three evidence tokens to open with `scope service-map-evidence`. Most widespread first; --kind keeps one kind and --limit bounds the list. No target requests or body reads beyond the map's own."
+        after_help = "Reads the session's whole map (every retained row) and gathers each origin's unnamed signals: Server and X-Powered-By banners, header names and cookie names no rule names. Each signal comes with how many origins and rows carried it, up to five of those origins and three evidence tokens to open with `scope service-map-evidence`. Most widespread first; --kind keeps one kind and --limit bounds the list. snapshot preserves source-map coverage, including complete, stopped_by and omitted_rows; omitted_signals counts only signals hidden by --limit, after --kind. No target requests or body reads beyond the map's own."
     )]
     Unnamed(ServiceMapUnnamedArgs),
 }
@@ -1058,6 +1058,8 @@ struct NamedAlongside {
 struct UnnamedSummary {
     schema_version: u32,
     session_id: Uuid,
+    /// Source-map coverage is independent of the summary's kind and limit.
+    snapshot: sniper::service_map::ServiceMapSnapshot,
     origins_read: usize,
     origins_with_unnamed: usize,
     distinct_signals: usize,
@@ -1065,12 +1067,8 @@ struct UnnamedSummary {
     signals: Vec<UnnamedSignalSummary>,
 }
 
-fn summarize_unnamed(
-    session_id: Uuid,
-    origins: &[sniper::service_map::ServiceOrigin],
-    kind: Option<&str>,
-    limit: usize,
-) -> UnnamedSummary {
+fn summarize_unnamed(map: &ServiceMap, kind: Option<&str>, limit: usize) -> UnnamedSummary {
+    let origins = &map.origins;
     let mut by_value: std::collections::BTreeMap<(&'static str, String), UnnamedSignalSummary> =
         Default::default();
     let mut carrying = 0;
@@ -1149,7 +1147,8 @@ fn summarize_unnamed(
     }
     UnnamedSummary {
         schema_version: 1,
-        session_id,
+        session_id: map.session_id,
+        snapshot: map.snapshot.clone(),
         origins_read: origins.len(),
         origins_with_unnamed: carrying,
         distinct_signals: distinct,
@@ -4019,16 +4018,76 @@ fn service_map_openapi_output_schema() -> Value {
     })
 }
 
+fn service_map_snapshot_schema() -> Value {
+    let strings = json!({"type":"array","items":{"type":"string"}});
+    let count = json!({"type":"integer","minimum":0});
+    let timestamp = json!({"type":"string","format":"date-time"});
+    let nullable_timestamp = json!({"type":["string","null"],"format":"date-time"});
+    let uuid = json!({"type":"string","format":"uuid"});
+    let boolean = json!({"type":"boolean"});
+    let mut limits = serde_json::Map::new();
+    for field in [
+        "max_records",
+        "metadata_bytes",
+        "origins",
+        "endpoints",
+        "endpoints_per_origin",
+        "evidence_per_item",
+        "redirects_per_origin",
+        "header_links_per_origin",
+        "technology_clues_per_row",
+        "statuses_per_endpoint",
+        "content_types_per_endpoint",
+        "path_bytes",
+        "host_bytes",
+        "method_bytes",
+        "headers_per_row",
+        "header_bytes_per_row",
+        "header_value_bytes",
+    ] {
+        limits.insert(field.into(), json!({"type":"integer","minimum":1}));
+    }
+    let mut limits = service_map_object(Value::Object(limits));
+    for (name, cap) in [
+        ("technology_observations_per_row", 8),
+        ("technology_observations_per_origin", 32),
+        ("technology_observations", 2000),
+        ("technology_version_bytes", 32),
+        ("technology_token_candidates_per_row", 128),
+    ] {
+        limits["properties"][name] = json!({"type":"integer","enum":[cap]});
+    }
+    let mut snapshot = service_map_object(json!({
+        "id":uuid,"generation":uuid,"captured_at":timestamp,
+        "first_retained_started_at":nullable_timestamp,"last_retained_started_at":nullable_timestamp,
+        "window_order":{"type":"string","enum":["newest_capture_sequence"]},
+        "oldest_considered_at":nullable_timestamp,"latest_considered_at":nullable_timestamp,
+        "retained_rows":count,"considered_rows":count,"non_http_rows":count,"filtered_rows":count,"projected_rows":count,"included_rows":count,
+        "excluded_rows":count,"omitted_rows":count,"origin_count":count,"endpoint_count":count,
+        "complete":boolean,"stopped_by":strings,"limits":limits
+    }));
+    // Present only when a display filter hid rows; older servers never send it.
+    snapshot["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|name| name != "filtered_rows");
+    snapshot["description"] = json!("Coverage of the source map before summary kind/limit filtering. complete is false when stopped_by reports a source limit or omission; omitted_rows counts omitted rows, not omitted signals. No completeness claim about removed or uncaptured traffic.");
+    snapshot
+}
+
 fn service_map_unnamed_output_schema() -> Value {
     let count = json!({"type":"integer","minimum":0});
     json!({
         "type":"object", "additionalProperties":false,
         "description":"What no rule names across the session's whole map, most widespread first. A signal is a Server or X-Powered-By banner (`server: <value>`), a response header name, or a Set-Cookie name; never a header or cookie value. Open a signal's evidence tokens with `scope service-map-evidence` to judge it.",
-        "required":["schema_version","session_id","origins_read","origins_with_unnamed","distinct_signals","omitted_signals","signals"],
+        "required":["schema_version","session_id","snapshot","origins_read","origins_with_unnamed","distinct_signals","omitted_signals","signals"],
         "properties":{
             "schema_version":{"type":"integer","enum":[1]},
             "session_id":{"type":"string"},
-            "origins_read":count, "origins_with_unnamed":count, "distinct_signals":count, "omitted_signals":count,
+            "snapshot":service_map_snapshot_schema(),
+            "origins_read":count, "origins_with_unnamed":count,
+            "distinct_signals":{"type":"integer","minimum":0,"description":"Distinct available source-map signals after --kind, before --limit; not a count of all captured or uncaptured signals."},
+            "omitted_signals":{"type":"integer","minimum":0,"description":"Signals hidden only by --limit, after --kind. Zero does not imply complete source coverage; inspect snapshot.complete and snapshot.stopped_by."},
             "signals":{"type":"array","maxItems":1000,"items":{
                 "type":"object", "additionalProperties":false,
                 "required":["kind","value","origins","rows","sample_origins","evidence","named_alongside"],
@@ -4420,7 +4479,6 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     let strings = json!({"type":"array","items":string});
     let count = json!({"type":"integer","minimum":0});
     let timestamp = json!({"type":"string","format":"date-time"});
-    let nullable_timestamp = json!({"type":["string","null"],"format":"date-time"});
     let uuid = json!({"type":"string","format":"uuid"});
     let boolean = json!({"type":"boolean"});
     let port = json!({"type":"integer","minimum":0,"maximum":65535});
@@ -4646,52 +4704,6 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "description":"Front-end frameworks, CMSs, UI kits, libraries and analytics retained scripts, pages and asset URLs name: license banners, runtime values such as Next.js's window.next, page markup such as ng-version or data-v- attributes, <meta name=generator>, CDN package@version paths, versioned file names and build directories such as /_next/static/. An asset's goes to the page that loaded it when that page is in the map.",
         "items":front
     });
-    let mut limits = serde_json::Map::new();
-    for field in [
-        "max_records",
-        "metadata_bytes",
-        "origins",
-        "endpoints",
-        "endpoints_per_origin",
-        "evidence_per_item",
-        "redirects_per_origin",
-        "header_links_per_origin",
-        "technology_clues_per_row",
-        "statuses_per_endpoint",
-        "content_types_per_endpoint",
-        "path_bytes",
-        "host_bytes",
-        "method_bytes",
-        "headers_per_row",
-        "header_bytes_per_row",
-        "header_value_bytes",
-    ] {
-        limits.insert(field.into(), json!({"type":"integer","minimum":1}));
-    }
-    let mut limits = service_map_object(Value::Object(limits));
-    for (name, cap) in [
-        ("technology_observations_per_row", 8),
-        ("technology_observations_per_origin", 32),
-        ("technology_observations", 2000),
-        ("technology_version_bytes", 32),
-        ("technology_token_candidates_per_row", 128),
-    ] {
-        limits["properties"][name] = json!({"type":"integer","enum":[cap]});
-    }
-    let mut snapshot = service_map_object(json!({
-        "id":uuid,"generation":uuid,"captured_at":timestamp,
-        "first_retained_started_at":nullable_timestamp,"last_retained_started_at":nullable_timestamp,
-        "window_order":{"type":"string","enum":["newest_capture_sequence"]},
-        "oldest_considered_at":nullable_timestamp,"latest_considered_at":nullable_timestamp,
-        "retained_rows":count,"considered_rows":count,"non_http_rows":count,"filtered_rows":count,"projected_rows":count,"included_rows":count,
-        "excluded_rows":count,"omitted_rows":count,"origin_count":count,"endpoint_count":count,
-        "complete":boolean,"stopped_by":strings,"limits":limits
-    }));
-    // Present only when a display filter hid rows; older servers never send it.
-    snapshot["required"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|name| name != "filtered_rows");
     let entry_kinds = sniper::service_map::REQUEST_KINDS
         .iter()
         .map(|kind| (kind.to_string(), json!({"type":"integer","minimum":1})))
@@ -4714,7 +4726,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     }));
     client["required"] = json!(["kind", "name", "request_count", "origins", "evidence"]);
     let mut map = service_map_object(json!({
-        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":snapshot,
+        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":service_map_snapshot_schema(),
         "in_scope_only":boolean,"origin_filter":{"type":["string","null"]},
         "origins":{"type":"array","items":origin},
         "clients":{"type":"array","maxItems":16,"items":client,
@@ -7054,7 +7066,7 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             | "target.service_map.unnamed.get"
     ) {
         if command.operation_name() == "target.service_map.unnamed.get" {
-            notes.push("Reads the session's whole map, as `scope service-map --all-rows` does, and gathers its unnamed signals locally. One GET; no target requests, retries or fallback.");
+            notes.push("Reads the session's whole map, as `scope service-map --all-rows` does, and gathers its unnamed signals locally. snapshot preserves source-map coverage; omitted_signals counts only --limit truncation after --kind. One GET; no target requests, retries or fallback.");
             notes.push("Signals are banner values, header names and cookie names, never header or cookie values. Counts are origins and rows in this map; open the evidence tokens before naming anything.");
         } else if command.operation_name() == "target.service_map.openapi.get" {
             notes.push("Explicit read of every retained row of one origin in an already active session. One GET after identity checks; no target requests, inactive-session loading, automatic reads, retries or fallback.");
@@ -11360,12 +11372,7 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             }
             Some(ServiceMapCommand::Unnamed(args)) => {
                 let map = read_service_map(&api, &args.map_args()).await?;
-                let summary = summarize_unnamed(
-                    map.session_id,
-                    &map.origins,
-                    args.kind.as_deref(),
-                    args.limit as usize,
-                );
+                let summary = summarize_unnamed(&map, args.kind.as_deref(), args.limit as usize);
                 print_session_read_json(&summary, summary.session_id)
             }
             Some(ServiceMapCommand::LinkDeclarations(args)) => {
@@ -20377,7 +20384,42 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
         let session: Uuid = "00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let all = super::summarize_unnamed(session, &origins, None, 10);
+        let mut limits = serde_json::Map::new();
+        for name in [
+            "max_records",
+            "metadata_bytes",
+            "origins",
+            "endpoints",
+            "endpoints_per_origin",
+            "evidence_per_item",
+            "redirects_per_origin",
+            "header_links_per_origin",
+            "technology_clues_per_row",
+            "statuses_per_endpoint",
+            "content_types_per_endpoint",
+            "path_bytes",
+            "host_bytes",
+            "method_bytes",
+            "headers_per_row",
+            "header_bytes_per_row",
+            "header_value_bytes",
+        ] {
+            limits.insert(name.into(), json!(100));
+        }
+        let mut map: sniper::service_map::ServiceMap = serde_json::from_value(json!({
+            "schema_version":1, "session_id":session, "origins":origins,
+            "snapshot":{
+                "id":Uuid::nil(), "generation":Uuid::nil(), "captured_at":"2026-10-17T00:00:00Z",
+                "first_retained_started_at":null, "last_retained_started_at":null,
+                "oldest_considered_at":null, "latest_considered_at":null,
+                "window_order":"newest_capture_sequence", "retained_rows":8, "considered_rows":8,
+                "non_http_rows":0, "projected_rows":8, "included_rows":8, "excluded_rows":0,
+                "omitted_rows":0, "origin_count":3, "endpoint_count":0,
+                "complete":true, "stopped_by":[], "limits":limits
+            },
+            "in_scope_only":false, "origin_filter":null, "unavailable":[], "deferred":[], "warnings":[]
+        })).unwrap();
+        let all = super::summarize_unnamed(&map, None, 10);
         assert_eq!(
             (
                 all.origins_read,
@@ -20408,7 +20450,7 @@ mod tests {
             serialized["named_alongside"][0],
             json!({"name": "HeRayCDN", "origins": 2})
         );
-        let headers = super::summarize_unnamed(session, &origins, Some("headers"), 1);
+        let headers = super::summarize_unnamed(&map, Some("headers"), 1);
         assert_eq!(
             (
                 headers.distinct_signals,
@@ -20421,6 +20463,46 @@ mod tests {
             .signals
             .iter()
             .all(|signal| signal.kind == "headers"));
+
+        // Summary filtering must not overwrite source coverage or count source
+        // losses as if they were a known number of distinct omitted signals.
+        for reasons in [
+            vec![],
+            vec!["unnamed_signals_per_origin_limit"],
+            vec!["header_value_limit", "origins_limit"],
+        ] {
+            map.snapshot.stopped_by = reasons.into_iter().map(str::to_string).collect();
+            map.snapshot.complete = map.snapshot.stopped_by.is_empty();
+            map.snapshot.omitted_rows = usize::from(map.snapshot.stopped_by.len() == 2);
+            for kind in [None, Some("headers"), Some("cookies")] {
+                for limit in [1, 100] {
+                    let summary = super::summarize_unnamed(&map, kind, limit);
+                    let output = serde_json::to_value(&summary).unwrap();
+                    assert_eq!(
+                        output["snapshot"],
+                        serde_json::to_value(&map.snapshot).unwrap()
+                    );
+                    assert_eq!(
+                        summary.omitted_signals,
+                        summary.distinct_signals.saturating_sub(limit)
+                    );
+                    assert_eq!(
+                        summary.signals.len() + summary.omitted_signals,
+                        summary.distinct_signals
+                    );
+                }
+            }
+        }
+        let summary_schema = super::service_map_unnamed_output_schema();
+        let map_schema = super::service_map_output_schema("target.service_map.get").unwrap();
+        assert_eq!(
+            summary_schema["properties"]["snapshot"],
+            map_schema["properties"]["snapshot"]
+        );
+        assert!(summary_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("snapshot")));
     }
 
     // An origin's OpenAPI document: an exact origin in, a document for that
