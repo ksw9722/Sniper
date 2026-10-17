@@ -27419,7 +27419,7 @@ function isHttpPseudoHeaderName(name) {
 }
 
 function requestToPython(parsed) {
-  if (!parsed) return "";
+  if (!parsed || requestFormatExportBlockedReason(parsed, "python")) return "";
   const py = (s) => JSON.stringify(String(s));
   const lines = [`import requests`, ""];
   const hasBody = parsed.bodyProvided || parsed.body.length > 0;
@@ -27477,7 +27477,7 @@ function hostHeaderDiffersFromUrl(hostHeader, url) {
 function requestToFetch(parsed) {
   if (!parsed) return "";
   const js = (s) => JSON.stringify(String(s));
-  if (fetchExportBlockedReason(parsed)) {
+  if (requestFormatExportBlockedReason(parsed, "fetch")) {
     return "";
   }
   const headerObj = exportableHeadersForUrl(parsed.headers, parsed.url);
@@ -27507,8 +27507,29 @@ function fetchExportBlockedReason(parsed) {
   return "";
 }
 
-function requestToPowerShell(parsed) {
+function requestFormatExportBlockedReason(parsed, format) {
   if (!parsed) return "";
+  if (format === "fetch") {
+    const blocked = fetchExportBlockedReason(parsed);
+    if (blocked) return blocked;
+  }
+  const label = { python: "Python", fetch: "Fetch", powershell: "PowerShell" }[format];
+  if (!label) return "";
+  // These APIs use header maps or combine field values. Neither can preserve
+  // arbitrary repeated fields, and comma-joining changes some header semantics.
+  const names = new Set();
+  for (const header of exportableHeadersForUrl(parsed.headers, parsed.url)) {
+    const name = header.name.toLowerCase();
+    if (names.has(name)) {
+      return `${label} cannot preserve repeated headers safely. Use cURL export instead.`;
+    }
+    names.add(name);
+  }
+  return "";
+}
+
+function requestToPowerShell(parsed) {
+  if (!parsed || requestFormatExportBlockedReason(parsed, "powershell")) return "";
   const esc = (s) => s.replace(/'/g, "''");
   const parts = [`Invoke-WebRequest -Uri '${esc(parsed.url)}'`];
   if (parsed.method !== "GET") parts.push(`-Method ${parsed.method}`);
@@ -27565,12 +27586,10 @@ function replayRequestToFormat(format, tab = getActiveReplayTab()) {
     target.host || "",
     target.port || "",
   );
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
+  const formatBlocked = requestFormatExportBlockedReason(parsed, format);
+  if (formatBlocked) {
+    showToast(formatBlocked, "error");
+    return "";
   }
   if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
@@ -27633,19 +27652,28 @@ function recordToFormat(record, format) {
     showToast(blocked, "error");
     return "";
   }
-  const rawText = buildRawRequest(record);
+  const request = record.request || {};
+  // Captured previews can be decoded while their display headers still describe
+  // the wire bytes. Match the backend's decoded-body resend contract on a copy.
+  const exportRecord = request.content_decoded ? {
+    ...record,
+    request: {
+      ...request,
+      headers: normalizedHeaders(request.headers).filter((header) =>
+        !headerNameEquals(header, "content-encoding") && !headerNameEquals(header, "content-length")),
+    },
+  } : record;
+  const rawText = buildRawRequest(exportRecord);
   const scheme = record.scheme || "https";
   const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
   const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
   const host = record.host || hostHeader?.value || authorityHeader?.value || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
+  const formatBlocked = requestFormatExportBlockedReason(parsed, format);
+  if (formatBlocked) {
+    showToast(formatBlocked, "error");
+    return "";
   }
   if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
@@ -27661,30 +27689,7 @@ async function historyRequestToFormat(transactionId, format) {
   if (!response.ok) return "";
   const record = await response.json();
   if (currentSessionId() !== sessionId) return "";
-  const blocked = historyRequestExportBlockedReason(record);
-  if (blocked) {
-    showToast(blocked, "error");
-    return "";
-  }
-  const rawText = buildRawRequest(record);
-  const scheme = record.scheme || "https";
-  const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
-  const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
-  const host = record.host || hostHeader?.value || authorityHeader?.value || "";
-  const parsed = parseRequestForExport(rawText, scheme, host, "");
-  if (!parsed) return "";
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
-  }
-  if (format === "curl") return requestToCurl(parsed);
-  if (format === "python") return requestToPython(parsed);
-  if (format === "fetch") return requestToFetch(parsed);
-  if (format === "powershell") return requestToPowerShell(parsed);
-  return "";
+  return recordToFormat(record, format);
 }
 
 function copyTransactionUrl(transactionId) {

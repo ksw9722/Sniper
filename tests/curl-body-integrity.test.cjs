@@ -13,7 +13,7 @@ const c = loadFunctions([
   "requestToCurl", "curlHttpVersionFlag", "urlNeedsPathAsIs", "rawPathFromUrlString",
   "shellQuote", "exportableHeaders", "exportableHeadersForUrl", "isHttpPseudoHeaderName",
   "hostHeaderDiffersFromUrl", "httpRequestAuthoritiesEquivalent", "normalizeHttpRequestAuthority",
-  "requestToPython", "requestToFetch", "fetchExportBlockedReason", "requestToPowerShell",
+  "requestToPython", "requestToFetch", "fetchExportBlockedReason", "requestFormatExportBlockedReason", "requestToPowerShell",
   "parseCurlCommand", "splitShellWords", "decodeAnsiCStringEscape",
   "encodeCurlDataUrlencode", "curlDataBinaryBodyIsPlainText", "appendCurlGetQuery",
 ], {
