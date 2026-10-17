@@ -414,6 +414,10 @@ pub struct ServiceMapRow {
     /// The client its User-Agent and Client Hints name; aggregated only.
     #[serde(skip)]
     pub client: Option<crate::service_map_clients::Client>,
+    /// Sent from Replay: a request a tester chose, whose answer is read
+    /// whatever its status.
+    #[serde(skip)]
+    pub sent_from_replay: bool,
     /// The address the client connected to the proxy from, when kept.
     #[serde(skip)]
     pub client_address: Option<std::net::IpAddr>,
@@ -816,6 +820,10 @@ pub(crate) fn project_record_for_catalog(
         cors: None,
         libraries: Vec::new(),
         client: None,
+        sent_from_replay: record
+            .notes
+            .iter()
+            .any(|note| note == crate::model::REPLAY_NOTE),
         client_address: record.client_address,
         initiated: false,
         auth: Vec::new(),

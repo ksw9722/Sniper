@@ -214,6 +214,17 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("sql_error", "SQL error message", EXPOSURE),
     ("directory_listing", "Directory listing", EXPOSURE),
     ("spring_actuator", "Spring Boot Actuator", EXPOSURE),
+    ("git_config", "Git repository config", EXPOSURE),
+    ("dotenv", ".env file", EXPOSURE),
+    ("go_expvar", "Go expvar", EXPOSURE),
+    ("go_pprof", "Go pprof", EXPOSURE),
+    ("jolokia", "Jolokia", EXPOSURE),
+    ("apache_server_status", "Apache server-status", EXPOSURE),
+    ("apache_server_info", "Apache server-info", EXPOSURE),
+    ("nginx_status", "nginx stub_status", EXPOSURE),
+    ("prometheus_metrics", "Prometheus metrics", EXPOSURE),
+    ("h2_console", "H2 console", EXPOSURE),
+    ("graphql_ide", "GraphQL IDE", EXPOSURE),
     ("api_docs", "API documentation", EXPOSURE),
     (
         "elasticsearch_root",
@@ -522,6 +533,47 @@ const BODY_RULES: &[(&str, &str)] = &[
     ("rocky_linux", r"<address>Apache/[^ <]+ \(Rocky Linux\)"),
     ("almalinux", r"<address>Apache/[^ <]+ \(AlmaLinux\)"),
     ("directory_listing", r"<title>Index of /[^<]{0,300}</title>"),
+    // What a management or debug endpoint answers when a tester asks for it.
+    (
+        "git_config",
+        r"\[core\][\s\S]{0,200}?\brepositoryformatversion\s*=",
+    ),
+    (
+        "dotenv",
+        r"(?m)^(?:APP_KEY|APP_SECRET|DB_PASSWORD|DATABASE_URL|SECRET_KEY|JWT_SECRET|MAIL_PASSWORD|REDIS_PASSWORD|AWS_SECRET_ACCESS_KEY)=",
+    ),
+    (
+        "go_expvar",
+        // Its JSON opens with the command line; a bounded gap to "memstats"
+        // would not fit the rule set.
+        r#"\A\s*\{\s*"cmdline"\s*:\s*\["#,
+    ),
+    ("go_pprof", r"<title>/debug/pprof/</title>"),
+    (
+        "jolokia",
+        r#""request"\s*:\s*\{\s*"type"\s*:\s*"(?:version|read|list|search|exec)""#,
+    ),
+    (
+        "apache_server_status",
+        r"<title>Apache Status</title>|<h1>Apache Server Status for ",
+    ),
+    (
+        "apache_server_info",
+        r"<h1[^>]*>Apache Server Information</h1>",
+    ),
+    (
+        "nginx_status",
+        r"\AActive connections: [0-9]+ \s*\nserver accepts handled requests",
+    ),
+    (
+        "prometheus_metrics",
+        r"(?m)^# HELP [A-Za-z_:][A-Za-z0-9_:]* .*\n# TYPE [A-Za-z_:][A-Za-z0-9_:]* (?:counter|gauge|histogram|summary|untyped)$",
+    ),
+    ("h2_console", r"<title>H2 Console</title>"),
+    (
+        "graphql_ide",
+        r"<title>(?:GraphiQL|GraphQL Playground)</title>",
+    ),
     ("microsoft_iis", r"<title>IIS §\s*Detailed Error"),
     ("iis_error", r"<title>IIS [0-9.]+\s*Detailed Error"),
     ("microsoft_iis", r"<title>IIS Windows Server</title>"),
@@ -644,13 +696,15 @@ const BODY_RULES: &[(&str, &str)] = &[
     ),
     ("php", r"<title>PHP § - phpinfo\(\)</title>"),
     ("phpinfo", r"<title>PHP [^<]{0,20}phpinfo\(\)</title>"),
+    // A frame after a tab, or after `\t` where a JSON error escaped it, as
+    // Spring's `trace` field does.
     (
         "java",
-        r"\bat (?:java|javax|jakarta|sun|org\.springframework|org\.apache|org\.hibernate|com\.sun)\.[\w.$]+\([\w$]*\.java:[0-9]+\)",
+        r"(?:\b|\\t)at (?:java|javax|jakarta|sun|org\.springframework|org\.apache|org\.hibernate|com\.sun)\.[\w.$]+\([\w$]*\.java:[0-9]+\)",
     ),
     (
         "java_stack_trace",
-        r"\bat (?:java|javax|jakarta|sun|org\.springframework|org\.apache|org\.hibernate|com\.sun)\.[\w.$]+\([\w$]*\.java:[0-9]+\)",
+        r"(?:\b|\\t)at (?:java|javax|jakarta|sun|org\.springframework|org\.apache|org\.hibernate|com\.sun)\.[\w.$]+\([\w$]*\.java:[0-9]+\)",
     ),
     (
         "dotnet",
@@ -1732,6 +1786,17 @@ mod tests {
             ("<address>Apache/2.4.58 (Win64) OpenSSL/3.1.3 Server at example.com Port 80</address>", "windows", None),
             ("<address>Apache/2.4.58 (Unix) Server at example.com Port 80</address>", "unix", None),
             ("<title>Index of /uploads</title>", "directory_listing", None),
+            ("[core]\n\trepositoryformatversion = 0\n\tfilemode = true", "git_config", None),
+            ("APP_NAME=Shop\nAPP_KEY=base64:x\n", "dotenv", None),
+            ("{\n\"cmdline\": [\"/app\"],\n\"memstats\": {\"Alloc\": 1}}", "go_expvar", None),
+            ("<html><head><title>/debug/pprof/</title>", "go_pprof", None),
+            (r#"{"request":{"type":"version"},"value":{"agent":"1.7.1"}}"#, "jolokia", None),
+            ("<title>Apache Status</title>", "apache_server_status", None),
+            ("<h1 align=\"center\">Apache Server Information</h1>", "apache_server_info", None),
+            ("Active connections: 2 \nserver accepts handled requests\n 10 10 20 \n", "nginx_status", None),
+            ("# HELP http_requests_total Requests.\n# TYPE http_requests_total counter\n", "prometheus_metrics", None),
+            ("<title>H2 Console</title>", "h2_console", None),
+            ("<title>GraphiQL</title>", "graphql_ide", None),
             ("<title>IIS 10.0 Detailed Error - 404.0 - Not Found</title>", "microsoft_iis", Some("10.0")),
             ("<title>IIS 10.0 Detailed Error - 500.19</title>", "iis_error", None),
             ("<title>IIS Windows Server</title>", "microsoft_iis", None),
@@ -1778,6 +1843,11 @@ mod tests {
             ("<title>PHP 8.2.12 - phpinfo()</title>", "phpinfo", None),
             ("\tat org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)", "java", None),
             ("\tat java.lang.Thread.run(Thread.java:840)", "java_stack_trace", None),
+            (
+                r#"{"trace":"java.lang.IllegalStateException\n\tat org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)"}"#,
+                "java_stack_trace",
+                None,
+            ),
             ("   at System.Web.Mvc.Controller.Execute(RequestContext ctx) in C:\\src\\Home.cs:line 42", "dotnet", None),
             ("--- End of stack trace from previous location ---", "dotnet_stack_trace", None),
             ("Traceback (most recent call last):\n  File \"app.py\", line 3", "python", None),

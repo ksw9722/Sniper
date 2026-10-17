@@ -479,6 +479,9 @@ pub struct TransactionRecord {
     pub client_address: Option<std::net::IpAddr>,
 }
 
+/// The note a row sent from Replay carries.
+pub const REPLAY_NOTE: &str = "Sent from Replay.";
+
 impl TransactionRecord {
     pub fn http(
         started_at: DateTime<Utc>,

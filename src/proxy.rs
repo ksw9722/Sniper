@@ -639,7 +639,7 @@ pub async fn try_send_replay_request_for_session(
     .map_err(ReplaySendError::without_record)?;
     let outbound_uri_authority = build_replay_outbound_uri_authority(&request, target.as_ref())
         .map_err(ReplaySendError::without_record)?;
-    notes.push("Sent from Replay.".to_string());
+    notes.push(crate::model::REPLAY_NOTE.to_string());
     let exchange = execute_http_exchange(
         state.clone(),
         session.clone(),

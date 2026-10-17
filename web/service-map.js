@@ -374,6 +374,9 @@
     dotnet_stack_trace: "Stack trace", python_traceback: "Traceback", node_stack_trace: "Stack trace", go_panic: "Go panic",
     sql_error: "SQL error", directory_listing: "Dir listing", spring_actuator: "Actuator", api_docs: "API docs",
     elasticsearch_root: "Elasticsearch", backend_address: "Backend IP", backend_host_header: "Backend host",
+    git_config: "Git config", dotenv: ".env file", go_expvar: "Go expvar", go_pprof: "Go pprof", jolokia: "Jolokia",
+    apache_server_status: "server-status", apache_server_info: "server-info", nginx_status: "nginx status",
+    prometheus_metrics: "Metrics", h2_console: "H2 console", graphql_ide: "GraphQL IDE",
     source_map: "Source map", aws_access_key: "AWS key", google_api_key: "Google key", slack_token: "Slack token",
     slack_webhook: "Slack hook", github_token: "GitHub token", stripe_secret_key: "Stripe key", sendgrid_key: "SendGrid key",
     private_key: "Private key", jwt: "JWT", private_ip: "Private IP" };

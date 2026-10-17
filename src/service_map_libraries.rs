@@ -68,17 +68,57 @@ pub(crate) fn kind(row: &ServiceMapRow) -> Option<Kind> {
         Some(Kind::Page)
     } else if (mime.contains("json") || mime.contains("xml") || mime.starts_with("text/"))
         && (row.status.is_some_and(|status| status >= 400)
-            || row.path == "/"
-            || row.path.starts_with("/actuator")
-            || ["/api-docs", "openapi.json", "swagger.json"]
-                .iter()
-                .any(|end| row.path.ends_with(end)))
+            || row.sent_from_replay
+            || diagnostic_path(&row.path))
     {
         // Only these are read: an API's every success would spend the budget.
+        // A request a tester sent from Replay is few and chosen, so its answer
+        // is read whatever its status.
         Some(Kind::Data)
     } else {
         None
     }
+}
+
+/// A path whose own answer says what runs there: the root, Spring's Actuator,
+/// an API document, and the management and debug endpoints a tester or a
+/// scanner asks for (`/.git/config`, `/.env`, Go's `/debug/vars`, Jolokia,
+/// Apache's `server-status`, Prometheus's `/metrics`).
+fn diagnostic_path(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    path == "/"
+        || [
+            "/actuator",
+            "/jolokia",
+            "/debug/pprof",
+            "/manage",
+            "/management",
+            "/h2-console",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || ["/api-docs", "openapi.json", "swagger.json"]
+            .iter()
+            .any(|end| path.ends_with(end))
+        || [
+            "/.git/config",
+            "/.env",
+            "/debug/vars",
+            "/server-status",
+            "/server-info",
+            "/nginx_status",
+            "/stub_status",
+            "/metrics",
+            "/prometheus",
+            "/health",
+            "/healthz",
+            "/info",
+            "/env",
+            "/version",
+            "/graphiql",
+            "/playground",
+        ]
+        .contains(&path)
 }
 
 pub const META_FRAMEWORK: &str = "meta_framework";

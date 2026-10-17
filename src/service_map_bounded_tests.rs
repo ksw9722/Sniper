@@ -2032,6 +2032,76 @@ fn a_narrow_map_keeps_what_its_pages_loaded_from_elsewhere() {
     }
 }
 
+// An API's successful answer is not read, but the same answer to a request a
+// tester sent from Replay is, as is what a diagnostic path answers.
+#[test]
+fn a_replayed_answer_and_a_diagnostic_path_are_read() {
+    use crate::store::ListFilters;
+    let session = Uuid::from_u128(111);
+    let answer = |host: &str, path: &str, kind: &str, body: &[u8], replayed: bool, sequence| {
+        let mut record = filter_fixture(host, path, 200, kind, None, sequence);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, kind.parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(&headers, body, 4096));
+        if replayed {
+            record.notes.push(crate::model::REPLAY_NOTE.to_string());
+        }
+        record
+    };
+    let trace =
+        br#"{"error":"java.lang.NullPointerException\n\tat org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)"}"#;
+    let store = TransactionStore::from_records(vec![
+        answer(
+            "a.example.com",
+            "/api/cart",
+            "application/json",
+            trace,
+            false,
+            1,
+        ),
+        answer(
+            "b.example.com",
+            "/api/cart",
+            "application/json",
+            trace,
+            true,
+            2,
+        ),
+        answer(
+            "c.example.com",
+            "/.git/config",
+            "text/plain",
+            b"[core]\n\trepositoryformatversion = 0\n",
+            false,
+            3,
+        ),
+    ]);
+    let found = |origin: &str| {
+        let (map, _) = store
+            .service_map_all_rows_blocking(
+                session,
+                technology::CatalogVersion::V2,
+                &ListFilters::default(),
+                false,
+                Some(origin.into()),
+                &[],
+                &[],
+            )
+            .unwrap();
+        map.origins[0]
+            .server_technologies
+            .iter()
+            .map(|item| item.product_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !found("https://a.example.com").contains(&"java_stack_trace".to_string()),
+        "an API's success is not read"
+    );
+    assert!(found("https://b.example.com").contains(&"java_stack_trace".to_string()));
+    assert!(found("https://c.example.com").contains(&"git_config".to_string()));
+}
+
 // A page that is not UTF-8, as many Korean sites still serve in EUC-KR, is
 // stored as base64; the map reads it all the same, for ASCII signatures.
 #[test]

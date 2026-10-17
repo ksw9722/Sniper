@@ -479,8 +479,12 @@ the map now reads four places for that, without sending anything:
   debug pages, stack traces, SQL errors, and banners such as Elasticsearch's.
   Pages are read as for the front end; JSON, XML and plain-text responses are
   read only when they are errors (status 400 or above), an origin's root, an
-  `/actuator` path or an API document, so an API's successes do not spend the
-  read budget.
+  `/actuator` path, an API document or another management or debug path
+  (`/.git/config`, `/.env`, `/debug/vars`, `/debug/pprof`, `/jolokia`,
+  `/metrics`, `/server-status`, `/health`, `/info` and a few more), or when a
+  tester sent the request from Replay, whatever its status, so an API's
+  successes do not spend the read budget. A Java stack trace counts in a JSON
+  error too, where `\tat` escapes the tab before each frame.
 
 The server rules were checked against real servers run in a lab: nginx,
 Apache httpd, Tomcat 9 and 10, Jetty, WildFly, Open Liberty, Payara,
@@ -505,8 +509,10 @@ Django, Laravel, Symfony or Rails debug page, the Werkzeug debugger, a
 detailed ASP.NET or IIS error, a PHP error or `phpinfo()` page, a Java, .NET,
 Python, Node.js or Go stack trace, an SQL error, a directory listing, Spring
 Boot Actuator, Swagger UI or an OpenAPI document, an Elasticsearch root
-endpoint, a backend address in a BIG-IP cookie, or an `X-Backend-Server`-style
-header. Scripts and pages are read for what they give away too: a
+endpoint, a Git repository's `config`, an `.env` file, Go's expvar and pprof,
+Jolokia, Apache's `server-status` and `server-info`, nginx's `stub_status`,
+Prometheus metrics, an H2 console, a GraphiQL or GraphQL Playground page, a
+backend address in a BIG-IP cookie, or an `X-Backend-Server`-style header. Scripts and pages are read for what they give away too: a
 `sourceMappingURL` comment (`source_map`; not in a library's own file, such as
 `jquery.min.js` saying jQuery, whose map is the library's public source), an
 AWS, Google, Slack, GitHub, Stripe or SendGrid key, a Slack webhook, a private
