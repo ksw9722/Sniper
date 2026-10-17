@@ -3837,7 +3837,7 @@ fn service_map_openapi_output_schema() -> Value {
     use sniper::service_map_openapi::MAX_OPERATIONS;
     json!({
         "type":"object",
-        "description":"An OpenAPI 3.1 document of what one origin's retained rows showed (https://spec.openapis.org/oas/v3.1.0). Path templates mark ID segments as {number}, {uuid} and {hex}; parameter and body field types are guessed from captured values, which are not included. Each operation's x-sniper-requests counts the rows it stands for; security lists each credential the rows showed as an alternative, not what the server requires.",
+        "description":"An OpenAPI 3.1 document of what one origin's retained rows showed (https://spec.openapis.org/oas/v3.1.0). Path templates mark ID segments as {number}, {uuid} and {hex}; parameter and body field types are guessed from captured values, which are not included. Each operation's x-sniper-requests counts the rows it stands for and x-sniper-newest-transaction names the newest of them (open it with capture http get); security lists each credential the rows showed as an alternative, not what the server requires.",
         "required":["openapi","info","servers","paths"],
         "properties":{
             "openapi":{"type":"string","enum":["3.1.0"]},

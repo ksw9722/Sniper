@@ -112,7 +112,9 @@ to `max_records`; `--all-rows` (`all_rows: true`) reads every row too.
 retained rows, and `scope service-map openapi --session-id <active-uuid>
 --origin <origin>` describes the origin's API as an OpenAPI 3.1 document: path
 templates, parameter and body field names with guessed types, statuses, media
-types and the credentials its rows showed, never captured values. A client's `versions` are the major versions its rows named.
+types and the credentials its rows showed, never captured values; each
+operation's `x-sniper-newest-transaction` is its newest row for `capture http
+get --id`. A client's `versions` are the major versions its rows named.
 An origin's `auth` and an endpoint's `auth` name how requests authenticate
 (Authorization scheme, API key header, session or JWT cookie, query key,
 OAuth, OIDC, SAML) from names and shapes only, never values.

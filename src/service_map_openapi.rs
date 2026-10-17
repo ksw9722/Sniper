@@ -3,10 +3,12 @@
 //! traffic. It lists only what the rows showed: each method and path template,
 //! the parameter names its requests carried with a type guessed from their
 //! values, the statuses and media types it answered with, and the credentials
-//! its rows showed. No captured value is copied into it.
+//! its rows showed. No captured value is copied into it; each operation names
+//! its newest row (`x-sniper-newest-transaction`), Sniper's own ID for it.
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
 use crate::{service_map_auth::AuthSignal, service_map_parameters::EndpointParameter};
 
@@ -29,7 +31,16 @@ pub struct Operation {
     pub request_types: BTreeSet<String>,
     pub auth: BTreeSet<AuthSignal>,
     pub parameters: Vec<EndpointParameter>,
+    /// The newest row's transaction ID, to open or send on.
+    pub newest: Option<Uuid>,
 }
+
+/// A path ending in one of these names a static file, whatever it was answered
+/// with: a font sent as `application/octet-stream`, a 304 with no type.
+const STATIC_EXTENSIONS: [&str; 22] = [
+    "css", "js", "mjs", "map", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif", "bmp",
+    "woff", "woff2", "ttf", "otf", "eot", "mp4", "webm", "mp3", "wav",
+];
 
 /// The OpenAPI path for a captured path: its ID segments as templates
 /// (`path_group`), and a brace it had escaped so it is not read as one.
@@ -55,7 +66,7 @@ pub fn document(
     let (mut requests, mut site_only) = (0, 0);
     for ((path, method), operation) in operations {
         requests += operation.requests;
-        if !api(operation) {
+        if !api(path, operation) {
             site_only += 1;
             continue;
         }
@@ -68,6 +79,9 @@ pub fn document(
             "responses": responses(operation),
             "x-sniper-requests": operation.requests,
         });
+        if let Some(newest) = operation.newest {
+            value["x-sniper-newest-transaction"] = newest.to_string().into();
+        }
         let query: Vec<Value> = operation
             .parameters
             .iter()
@@ -124,10 +138,16 @@ pub fn document(
 }
 
 /// An operation that only ever answered with pages or static files (HTML,
-/// styles, scripts, images, fonts, media, a web app manifest) belongs to the
-/// site rather than its API. One that answered with anything else, or with no
-/// typed body, is kept.
-fn api(operation: &Operation) -> bool {
+/// styles, scripts, images, fonts, media, a web app manifest), or whose path
+/// names a static file, belongs to the site rather than its API. One that
+/// answered with anything else, or with no typed body, is kept.
+fn api(path: &str, operation: &Operation) -> bool {
+    let file = path.rsplit('/').next().unwrap_or("");
+    if file.rsplit_once('.').is_some_and(|(_, extension)| {
+        STATIC_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+    }) {
+        return false;
+    }
     let mut types = operation.responses.values().flatten().peekable();
     types.peek().is_none()
         || types.any(|media| {
@@ -389,6 +409,7 @@ mod tests {
                     signal("session_cookie", Some("SID")),
                 ]),
                 parameters: vec![parameter("query", "page", &["2"])],
+                newest: Some(Uuid::from_u128(7)),
             },
         );
         operations.insert(
@@ -402,6 +423,7 @@ mod tests {
                 request_types: BTreeSet::from(["application/json".to_string()]),
                 auth: BTreeSet::from([signal("oauth2", None)]),
                 parameters: vec![parameter("json", "name", &["kim-secret-value"])],
+                newest: None,
             },
         );
         operations.insert(
@@ -416,6 +438,14 @@ mod tests {
             ("/beacon".to_string(), "post".to_string()),
             Operation {
                 requests: 1,
+                ..Default::default()
+            },
+        );
+        operations.insert(
+            ("/fonts/Brand.woff2".to_string(), "get".to_string()),
+            Operation {
+                requests: 1,
+                responses: BTreeMap::from([(304, BTreeSet::new())]),
                 ..Default::default()
             },
         );
@@ -450,6 +480,10 @@ mod tests {
             json!([{"bearer_jwt": []}, {"session_cookie_SID": []}])
         );
         assert_eq!(get["x-sniper-requests"], 3);
+        assert_eq!(
+            get["x-sniper-newest-transaction"],
+            "00000000-0000-0000-0000-000000000007"
+        );
         let post = &paths["/api/users"]["post"];
         assert_eq!(
             post["requestBody"],
@@ -468,8 +502,11 @@ mod tests {
             })
         );
         let description = document["info"]["description"].as_str().unwrap();
-        assert!(description.contains("10 captured requests"));
-        assert!(description.contains("1 operations that only answered with pages"));
+        assert!(description.contains("11 captured requests"));
+        assert!(
+            description.contains("2 operations that only answered with pages"),
+            "a page, and a font by its name"
+        );
         assert!(description.contains("2 less recently used operations"));
         assert!(!document.to_string().contains("kim-secret-value"));
     }

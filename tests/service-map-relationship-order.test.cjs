@@ -540,7 +540,7 @@ test('the map reads every retained row, and asks for a fresh map only on the fir
   f.requests.at(-1).resolve(response(snapshot(relatedOrigins()))); await reload;
 });
 
-test('clients lead the map in their own column and draw arrows only once selected', async () => {
+test('clients lead the map in their own column and point at the cards where it starts', async () => {
   const chrome = { kind: 'browser', name: 'Chrome', versions: [141, 140], os: 'macOS', request_count: 5, evidence: [],
     origins: [{ origin: api, request_count: 3 }, { origin: app, request_count: 2, entry_kinds: { navigation: 1 } }] };
   const okhttp = { kind: 'app', name: 'OkHttp', versions: [4], request_count: 2, evidence: [], origins: [{ origin: api, request_count: 2, entry_kinds: { api: 2 } }] };
@@ -557,7 +557,9 @@ test('clients lead the map in their own column and draw arrows only once selecte
   assert.match(html, /data-service-client="client:app:OkHttp:"[^]*?>App</);
   assert.doesNotMatch(html, /data-service-client="client:tool:curl/, 'a client whose own requests are all of a hidden kind draws no card');
   assert.doesNotMatch(html, /data-service-client="client:unknown/, 'an unnamed User-Agent draws no card');
-  assert.doesNotMatch(html, /data-relationship="client_request"/, 'no client arrows until a client is selected');
+  assert.equal((html.match(/data-relationship="client_request"/g) || []).length, 1, 'unselected, a client points only at cards nothing else links to');
+  assert.match(html, /Chrome → https:\/\/x-app\.example\.com · Direct request/);
+  assert.doesNotMatch(html, /OkHttp → /, 'the app page already links to the API it called');
   // The client column sits left of the cards it points at.
   const left = (markup, attribute, id) => Number(markup.split(`${attribute}="${id}"`)[1]?.match(/left:(\d+)px/)?.[1]);
   assert.ok(left(html, 'data-service-client', 'client:browser:Chrome:macOS') < left(html, 'data-service-origin', app));
@@ -573,9 +575,12 @@ test('clients lead the map in their own column and draw arrows only once selecte
     assert.equal(left(selected, attribute, id), left(html, attribute, id), 'selecting a client moves no card');
   assert.match(f.els.detail.innerHTML, /<h3>Chrome<\/h3><p>Browser · macOS · Versions 141, 140<\/p>[^]*?https:\/\/x-api\.example\.com<br>3 rows[^]*?https:\/\/x-app\.example\.com<br>2 rows · 1 direct/);
   assert.match(selected, />OkHttp<[^]*?2 rows</);
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceClient: 'client:app:OkHttp:' } }) } });
+  assert.match(f.els.canvas.innerHTML, /OkHttp → https:\/\/x-api\.example\.com · Direct request/, 'selected, a client points at every card it called');
   f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceOrigin: api } }) } });
   assert.equal(f.state.selectedClient, null, 'inspecting an origin leaves the client');
-  assert.doesNotMatch(f.els.canvas.innerHTML, /data-relationship="client_request"/);
+  assert.doesNotMatch(f.els.canvas.innerHTML, /OkHttp → /);
+  assert.match(f.els.canvas.innerHTML, /Chrome → https:\/\/x-app\.example\.com/);
 });
 
 test('the inspector folds away what no rule names, each with its source', async () => {
@@ -716,4 +721,21 @@ test('server technologies show on the card after the backend, exposures first, a
   assert.match(detail, /<h4>Exposures<\/h4>[^]*?Java stack trace[^]*?<h4>Server<\/h4>[^]*?Cloudflare<\/strong> <span class="service-map-muted">Edge<\/span><p class="service-map-muted">1 row · header/);
   assert.match(detail, /data-service-relation-origin="https:\/\/x-api\.example\.com" data-service-relation-evidence="evidence-spring_boot"/);
   assert.ok(map.reportedProducts(f.state.snapshot.origins[0]).every(product => product.id !== 'java_stack_trace'), 'an exposure is not a product');
+});
+
+test('an origin whose rows carried no typed response leaves the map until it is selected or searched for', async () => {
+  const beacon = 'https://x-log.example.com';
+  const untyped = origin(beacon, { endpoints: [{ method: 'POST', path: '/log', request_count: 3, statuses: [204], content_types: [], evidence: ['evidence-log'] }] });
+  const f = fixture();
+  await f.load(snapshot([origin(app), untyped]));
+  const card = /data-service-origin="https:\/\/x-log\.example\.com"/;
+  assert.doesNotMatch(f.els.canvas.innerHTML, card);
+  assert.match(f.els.graphBounds.textContent, /1 \/ 1 matching origins · 1 with no typed response hidden/);
+  f.els.search.value = 'x-log'; f.els.search.dispatch('input');
+  assert.match(f.els.canvas.innerHTML, card, 'searched for, it shows');
+  f.els.search.value = ''; f.els.search.dispatch('input');
+  assert.doesNotMatch(f.els.canvas.innerHTML, card);
+  f.controller.selectOrigin(beacon);
+  assert.match(f.els.canvas.innerHTML, card, 'selected, it shows');
+  assert.match(f.els.canvas.innerHTML, />Unknown</);
 });

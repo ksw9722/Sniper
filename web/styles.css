@@ -7523,6 +7523,22 @@ button.utility-button.replay-tab-add {
 /* An ID template's placeholders, and the paths it stands for once opened. */
 .service-map-path-id { color: var(--token-url-color); }
 .service-map-api-members { margin-left: 18px; border-left: 1px solid var(--line); }
+/* API docs: an origin's OpenAPI document laid out as Swagger UI lays one out. */
+.service-map-api-docs .modal-body { display: grid; gap: 8px; align-content: start; }
+.service-map-api-docs h2 { overflow-wrap: anywhere; }
+.service-map-api-docs h4 { margin: 8px 0 0; }
+.service-map-api-op { border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
+.service-map-api-op > summary { display: flex; align-items: center; gap: 10px; padding: 7px 10px; cursor: pointer; list-style: none; }
+.service-map-api-op > summary::-webkit-details-marker { display: none; }
+.service-map-api-op > summary code { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.service-map-api-op[open] > summary { border-bottom: 1px solid var(--line); }
+.service-map-api-op-body { display: grid; gap: 6px; padding: 8px 12px 12px; }
+.service-map-api-op-body h5 { margin: 6px 0 0; color: var(--text-dim); font-size: var(--font-xs); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.service-map-api-op-body p { margin: 0; }
+.service-map-api-op-body .secondary-action { justify-self: start; margin-top: 4px; }
+.service-map-api-docs-table { width: 100%; border-collapse: collapse; font-size: var(--font-sm); }
+.service-map-api-docs-table th, .service-map-api-docs-table td { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.service-map-api-docs-table th { color: var(--text-dim); font-weight: 500; }
 .service-map-api-count { display: flex; gap: 12px; color: var(--text-dim); font-size: var(--font-xs); }
 .service-map-chevron { font-size: 20px; line-height: 14px; }
 .service-map-evidence-summary { margin-top: 24px; padding-top: 10px; border-top: 1px solid var(--line); }

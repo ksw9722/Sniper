@@ -40,7 +40,7 @@ function node() {
 function fixture(options = {}) {
   let session = 'session-one';
   const requests = [];
-  const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'apiDocs', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
   els.viewport.clientWidth = 620; els.viewport.clientHeight = 500;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty("--ui-root-size", "12px");
@@ -2970,29 +2970,67 @@ test('a failed explicit retry pauses again without automatic fallback', async ()
   assert.equal(f.requests.length, before + 1); assert.equal(f.state.refreshPaused, true);
 });
 
-test('Copy OpenAPI reads the selected origin from the active session and hands the clipboard the reading', async () => {
-  const copies = [];
-  const f = fixture({ copyText(button, text, label) { copies.push({ button, text, label }); return text.catch(() => {}); } });
-  await f.load(); f.controller.selectOrigin(originB);
-  assert.match(f.els.detail.innerHTML, /data-service-openapi="https:\/\/api\.example\.com"[^>]*>Copy OpenAPI</);
-  const button = { dataset: { serviceOpenapi: originB } };
-  f.els.panel.dispatch('click', { target: { closest: () => button } });
+const apiDocument = {
+  openapi: '3.1.0', info: { title: originB, version: 'observed', description: 'Observed by Sniper in 3 captured requests to it.' }, servers: [{ url: originB }],
+  paths: {
+    '/v1/items': { post: { requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { name: { type: 'string' } } } } } }, responses: { default: { description: 'No response was captured' } }, 'x-sniper-requests': 1, 'x-sniper-newest-transaction': '<b>' } },
+    '/v1/items/{number}': { parameters: [{ name: 'number', in: 'path', required: true, schema: { type: 'integer' } }],
+      get: { parameters: [{ name: '<q>', in: 'query', schema: { type: 'string' } }], responses: { 200: { description: 'OK', content: { 'application/json': {} } } }, security: [{ bearer_jwt: [] }], 'x-sniper-requests': 2, 'x-sniper-newest-transaction': '22222222-2222-4222-8222-222222222222' } },
+  },
+  components: { securitySchemes: { bearer_jwt: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } } },
+};
+const newerRow = '22222222-2222-4222-8222-222222222222';
+function apiDocsFixture() {
+  const copies = [], replays = [];
+  const f = fixture({ copyText(text, label) { copies.push({ text, label }); }, sendToReplay(id) { replays.push(id); } });
+  return { f, copies, replays };
+}
+const items = () => origin(originB, [endpoint('/v1/items/12'), endpoint('/v1/items', 'POST', 'evidence-post')]);
+test('API docs read the selected origin and lay out its OpenAPI document, escaped', async () => {
+  const { f, copies, replays } = apiDocsFixture();
+  await f.load(snapshot([origin(originA), items()])); f.controller.selectOrigin(originB);
+  assert.match(f.els.detail.innerHTML, /data-service-api-docs="https:\/\/api\.example\.com"[^>]*>API docs</);
+  assert.equal(f.els.apiDocs.classList.contains('hidden'), true, 'closed until asked for');
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceApiDocs: originB } }) } });
+  assert.equal(f.els.apiDocs.classList.contains('hidden'), false);
+  assert.match(f.els.apiDocs.innerHTML, /Reading retained rows/);
   const read = f.requests.at(-1);
   assert.equal(read.url, '/api/target/service-map/openapi?session_id=session-one&origin=https%3A%2F%2Fapi.example.com');
   assert.equal(read.options.redirect, 'error');
-  assert.equal(copies.length, 1); assert.equal(copies[0].button, button); assert.equal(copies[0].label, 'Copied OpenAPI');
-  read.resolve(response({ openapi: '3.1.0', paths: {} }));
-  assert.equal(await copies[0].text, JSON.stringify({ openapi: '3.1.0', paths: {} }, null, 2));
+  read.resolve(response(apiDocument)); await new Promise(resolve => setImmediate(resolve));
+  const html = f.els.apiDocs.innerHTML;
+  assert.match(html, /<h2 id="serviceMapApiDocsTitle"[^>]*>https:\/\/api\.example\.com<\/h2>/);
+  assert.match(html, /Observed by Sniper in 3 captured requests/);
+  assert.match(html, /<code>bearer_jwt<\/code><\/td><td>HTTP bearer \(JWT\)/);
+  assert.match(html, /Operations · 2/);
+  assert.match(html, /class="service-map-method post">POST<\/span><code title="\/v1\/items">\/v1\/items<\/code>[^]*?1 row</);
+  assert.match(html, /<code>name<\/code><\/td><td>string/);
+  assert.match(html, /class="service-map-method get">GET<\/span><code title="\/v1\/items\/\{number\}">/);
+  assert.match(html, /<code>number<\/code> <span class="service-map-muted">required<\/span><\/td><td>path<\/td><td>integer/);
+  assert.match(html, /<code>&lt;q&gt;<\/code><\/td><td>query/, 'escaped');
+  assert.doesNotMatch(html, /<q>/);
+  assert.match(html, /<td>200<\/td><td>OK<\/td><td><code>application\/json<\/code>/);
+  assert.match(html, /Credentials sent<\/h5><p><code>bearer_jwt<\/code>/);
+  assert.equal((html.match(/data-api-docs-replay=/g) || []).length, 1, 'only a transaction ID is sent on');
+  assert.match(html, new RegExp(`data-api-docs-replay="${newerRow}"`), 'the newest row of the template');
+  f.els.apiDocs.dispatch('click', { target: { closest: () => ({ dataset: { apiDocsCopy: '' } }) } });
+  assert.deepEqual(copies, [{ text: JSON.stringify(apiDocument, null, 2), label: 'Copied OpenAPI' }]);
+  f.els.apiDocs.dispatch('click', { target: { closest: () => ({ dataset: { apiDocsReplay: newerRow } }) } });
+  assert.deepEqual(replays, [newerRow]);
+  assert.equal(f.els.apiDocs.classList.contains('hidden'), true, 'Replay takes over from the docs');
 });
-test('Copy OpenAPI names an inactive session, and only API origins offer it', async () => {
-  const copies = [];
-  const f = fixture({ copyText(button, text) { copies.push(text); return text.catch(() => {}); } });
-  await f.load(); f.controller.selectOrigin(originB);
-  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceOpenapi: originB } }) } });
-  f.requests.at(-1).resolve(response({}, 409));
-  await assert.rejects(copies[0], /active session only/);
+test('API docs close on Escape and name an inactive session, and only API origins offer them', async () => {
+  const { f } = apiDocsFixture();
+  await f.load(snapshot([items()])); f.controller.selectOrigin(originB);
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceApiDocs: originB } }) } });
+  f.requests.at(-1).resolve(response({}, 409)); await new Promise(resolve => setImmediate(resolve));
+  assert.match(f.els.apiDocs.innerHTML, /API docs are read from the active session only\./);
+  assert.match(f.els.apiDocs.innerHTML, /data-api-docs-copy disabled/);
+  f.els.apiDocs.dispatch('keydown', { key: 'Escape' });
+  assert.equal(f.els.apiDocs.classList.contains('hidden'), true);
+  assert.equal(f.els.apiDocs.innerHTML, '');
   const page = origin('https://www.example.com', [{ method: 'GET', path: '/', request_count: 1, statuses: [200], content_types: ['text/html'], evidence: ['page-one'] }]);
   await f.load(snapshot([page])); f.controller.selectOrigin('https://www.example.com');
   assert.match(f.els.detail.innerHTML, /Hide from map/);
-  assert.doesNotMatch(f.els.detail.innerHTML, /data-service-openapi/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /data-service-api-docs/);
 });

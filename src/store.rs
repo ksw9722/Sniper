@@ -2768,6 +2768,8 @@ impl TransactionStore {
                         continue;
                     }
                     let (operation, rows) = found.entry(key).or_default();
+                    // Rows are read newest first.
+                    operation.newest.get_or_insert(record.id);
                     operation.requests += 1;
                     if let Some(status) = record.status.filter(|status| (100..600).contains(status))
                     {

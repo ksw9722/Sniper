@@ -12014,21 +12014,6 @@ async function copyTextToClipboard(text) {
   }
 }
 
-// Copies text that is still being read. WebKit keeps a click's permission to
-// write the clipboard across the read only when it is handed the promise.
-async function copyPromisedTextToClipboard(text) {
-  if (navigator.clipboard?.write && window.ClipboardItem) {
-    try {
-      const blob = text.then((value) => new Blob([value], { type: "text/plain" }));
-      await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
-      return;
-    } catch (_) {
-      // Fall through: copy the text once it is read.
-    }
-  }
-  await copyTextToClipboard(await text);
-}
-
 function selectCodePaneContents(targetPane) {
   const codeView = getCMView(targetPane);
   const cmView = codeView?.view;
@@ -14777,6 +14762,7 @@ function initializeTargetWorkspace() {
       detail: document.getElementById("serviceMapDetail"),
       content: document.getElementById("serviceMapContent"),
       catalog: document.getElementById("serviceMapApiCatalog"),
+      apiDocs: document.getElementById("serviceMapApiDocs"),
     },
     getSessionId: currentSessionId,
     getEventStreamReady: () => targetServiceMapEventStreamReady(),
@@ -14793,9 +14779,15 @@ function initializeTargetWorkspace() {
       scheduleUiSettingsSave();
     },
     request: (path, options) => fetch(path, options),
-    copyText: (button, text, label) => withButtonProgress(button, () => copyPromisedTextToClipboard(text)
+    copyText: (text, label) => copyTextToClipboard(text)
       .then(() => showToast(label))
-      .catch((error) => showToast(error?.message || "Failed to copy", "error"))),
+      .catch(() => showToast("Failed to copy", "error")),
+    sendToReplay: (id) => loadTransactionRecordById(id)
+      .then((record) => {
+        if (!record) throw new Error("The row could not be loaded.");
+        openTransactionRecordInReplay(record);
+      })
+      .catch((error) => showToast(error?.message || "Failed to open Replay", "error")),
   });
   document.getElementById("serviceMapFilterButton")?.addEventListener("click", () => openFilterModal("serviceMap"));
   // Inspector-to-map navigation already owns a verified snapshot. Keep the

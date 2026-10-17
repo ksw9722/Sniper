@@ -1915,6 +1915,7 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
         )
     };
     let bearer = [("authorization", "Bearer SYNTHETIC_PRIVATE_TOKEN")];
+    let mut ids = Vec::new();
     for record in [
         row(
             "GET",
@@ -1963,6 +1964,15 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
         ),
         row(
             "GET",
+            "api.example.com",
+            "/fonts/Brand.woff2",
+            &[],
+            b"",
+            200,
+            Some("application/octet-stream"),
+        ),
+        row(
+            "GET",
             "other.example.com",
             "/v1/elsewhere",
             &[],
@@ -1971,6 +1981,7 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
             Some("application/json"),
         ),
     ] {
+        ids.push(record.id);
         session.store.insert(record).await;
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2022,6 +2033,11 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
     assert_eq!(item["get"]["security"], json!([{"bearer": []}]));
     assert_eq!(item["get"]["x-sniper-requests"], 2);
     assert_eq!(
+        item["get"]["x-sniper-newest-transaction"],
+        ids[1].to_string(),
+        "the newest of its rows"
+    );
+    assert_eq!(
         paths["/v1/items"]["post"]["requestBody"],
         json!({"content": {"application/json": {"schema": {"type": "object", "properties": {
             "count": {"type": "integer"},
@@ -2035,7 +2051,7 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
     assert!(document["info"]["description"]
         .as_str()
         .unwrap()
-        .contains("1 operations that only answered with pages or static files are left out"));
+        .contains("2 operations that only answered with pages or static files are left out"));
     assert!(!document.to_string().contains("SYNTHETIC_PRIVATE"));
 
     let via_cli = read(

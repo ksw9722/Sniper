@@ -1381,7 +1381,7 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, sendToReplay = null, document: doc = root.document }) {
     // Request kinds whose links are not drawn. The app keeps them in UI
     // settings; without it they live for this controller only.
     let localHiddenLinkKinds = [...DEFAULT_HIDDEN_LINK_KINDS];
@@ -1411,7 +1411,7 @@
       evidenceLoading: false, evidenceError: "", evidenceId: null, evidenceCatalogVersion: null, evidenceLegacyCatalog: false, socketPeer: null, page: 0, detailPage: 0,
       peerMatches: null, peerMatchesSource: null, peerMatchesLoading: false, peerMatchesError: "", peerMatchesRequestId: 0, peerEvidenceBinding: null,
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
-      bodyReferencesSource: null, relationLayers: Object.freeze([]), bodyOverlayNotice: "",
+      bodyReferencesSource: null, relationLayers: Object.freeze([]), bodyOverlayNotice: "", apiDocs: null, apiDocsRequestId: 0,
       relationshipKind: "body", linkDeclarations: null, linkDeclarationsSource: null, linkDeclarationsError: "",
       parameters: null, parametersKey: null, parametersLoading: false, parametersError: "", parametersRequestId: 0,
       htmlGenerators: null, htmlGeneratorsLoading: false, htmlGeneratorsError: "", htmlGeneratorsRequestId: 0, htmlGeneratorsSource: null,
@@ -2072,6 +2072,7 @@
       abort?.abort();
       abort = null;
       cancelEvidence();
+      closeApiDocs();
       state.parametersRequestId += 1;
       Object.assign(state, { parameters: null, parametersKey: null, parametersLoading: false, parametersError: "" });
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null,
@@ -2103,20 +2104,65 @@
       render();
       if (endpoint) loadParameters(origin, endpoint);
     }
+    // An origin's API docs: its OpenAPI document laid out as Swagger UI lays
+    // one out, read when asked for. Burp's OpenAPI Parser lists operations the
+    // same way and sends each on to Repeater; here the newest row an operation
+    // stands for (`x-sniper-newest-transaction`) goes to Replay. Every string
+    // came from captured traffic, so all of it is escaped like the rest of the map.
+    const API_DOC_METHODS = ["get", "post", "put", "patch", "delete", "head", "trace"];
+    const TRANSACTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    async function openApiDocs(originId) {
+      if (!els.apiDocs) return;
+      const requestId = ++state.apiDocsRequestId;
+      state.apiDocs = { origin: originId, document: null, error: "" };
+      renderApiDocs();
+      try {
+        const response = await request(`/api/target/service-map/openapi?${new URLSearchParams({ session_id: getSessionId(), origin: originId })}`);
+        if (!response.ok) throw new Error(response.status === 409 ? "API docs are read from the active session only." : "API docs unavailable.");
+        const document = await response.json();
+        if (requestId !== state.apiDocsRequestId) return;
+        if (document?.openapi !== "3.1.0" || document.servers?.[0]?.url !== originId || typeof document.paths !== "object" || !document.paths) throw new Error("API docs unavailable.");
+        state.apiDocs = { origin: originId, document, error: "" };
+      } catch (error) {
+        if (requestId !== state.apiDocsRequestId) return;
+        state.apiDocs = { origin: originId, document: null, error: error.message || "API docs unavailable." };
+      }
+      renderApiDocs();
+    }
+    function closeApiDocs() {
+      state.apiDocsRequestId += 1;
+      state.apiDocs = null;
+      renderApiDocs();
+    }
+    function renderApiDocs() {
+      if (!els.apiDocs) return;
+      els.apiDocs.classList.toggle("hidden", !state.apiDocs);
+      replace(els.apiDocs, state.apiDocs ? apiDocsMarkup(state.apiDocs) : "");
+      if (state.apiDocs) els.apiDocs.querySelector?.("[data-api-docs-close]")?.focus();
+    }
+    function apiDocsMarkup({ origin, document, error }) {
+      const body = error ? `<p class="service-map-filter-notice" role="status">${escape(error)}</p>`
+        : document ? apiDocsBodyMarkup(document) : '<p class="service-map-muted" role="status">Reading retained rows…</p>';
+      return `<div class="modal-card modal-card-wide service-map-api-docs" role="dialog" aria-modal="true" aria-labelledby="serviceMapApiDocsTitle"><header class="modal-header"><div><p class="placeholder-kicker">API docs · OpenAPI 3.1</p><h2 id="serviceMapApiDocsTitle" title="${escape(origin)}">${escape(origin)}</h2></div></header><div class="modal-body">${body}</div><footer class="modal-footer"><button class="secondary-action" type="button" data-api-docs-copy ${document ? "" : "disabled"}>Copy OpenAPI JSON</button><button class="secondary-action" type="button" data-api-docs-close>Close</button></footer></div>`;
+    }
+    function apiDocsBodyMarkup(document) {
+      const schemes = document.components?.securitySchemes || {};
+      const schemeText = (scheme) => scheme?.type === "http" ? `HTTP ${scheme.scheme}${scheme.bearerFormat ? ` (${scheme.bearerFormat})` : ""}`
+        : `${{ cookie: "Cookie", query: "Query parameter" }[scheme?.in] || "Header"} ${scheme?.name || ""}`;
+      const typeOf = (schema) => [schema?.type, schema?.format].filter(Boolean).join(" · ") || "any";
+      const table = (head, rows) => rows.length ? `<table class="service-map-api-docs-table"><thead><tr>${head.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</tbody></table>` : "";
+      const operations = Object.entries(document.paths).flatMap(([path, item]) => API_DOC_METHODS.filter((method) => item?.[method]).map((method) => ({ path, method, item, operation: item[method] })));
+      const operationMarkup = ({ path, method, item, operation }) => {
+        const parameters = [...array(item.parameters), ...array(operation.parameters)];
+        const bodies = Object.entries(operation.requestBody?.content || {});
+        const security = array(operation.security).flatMap((requirement) => Object.keys(requirement || {}));
+        const row = TRANSACTION_ID.test(operation["x-sniper-newest-transaction"] || "") ? operation["x-sniper-newest-transaction"] : null;
+        return `<details class="service-map-api-op"><summary><span class="service-map-method ${methodTone(method)}">${escape(method.toUpperCase())}</span><code title="${escape(path)}">${escape(path)}</code>${security.length ? `<span class="service-map-api-auth" title="${escape(security.join(", "))}">${LOCK_ICON}</span>` : ""}<span class="service-map-muted">${rowCount(count(operation["x-sniper-requests"]))}</span></summary><div class="service-map-api-op-body">${parameters.length ? `<h5>Parameters</h5>${table(["Name", "In", "Type"], parameters.map((parameter) => [`<code>${escape(parameter.name)}</code>${parameter.required ? ' <span class="service-map-muted">required</span>' : ""}`, escape(parameter.in), escape(typeOf(parameter.schema))]))}` : ""}${bodies.length ? `<h5>Request body</h5>${bodies.map(([media, value]) => `<p><code>${escape(media)}</code></p>${table(["Field", "Type"], Object.entries(value?.schema?.properties || {}).map(([name, schema]) => [`<code>${escape(name)}</code>`, escape(typeOf(schema))]))}`).join("")}` : ""}<h5>Responses</h5>${table(["Status", "Description", "Media type"], Object.entries(operation.responses || {}).map(([status, response]) => [escape(status), escape(response?.description || ""), Object.keys(response?.content || {}).map((media) => `<code>${escape(media)}</code>`).join(" ")]))}${security.length ? `<h5>Credentials sent</h5><p>${security.map((key) => `<code>${escape(key)}</code>`).join(" · ")}</p>` : ""}${row ? `<button class="secondary-action" type="button" data-api-docs-replay="${escape(row)}">Send newest row to Replay</button>` : ""}</div></details>`;
+      };
+      return `<p class="service-map-muted">${escape(document.info?.description || "")}</p>${Object.keys(schemes).length ? `<h4>Credentials</h4>${table(["Scheme", "Sent as"], Object.entries(schemes).map(([key, scheme]) => [`<code>${escape(key)}</code>`, escape(schemeText(scheme))]))}` : ""}<h4>Operations · ${operations.length.toLocaleString()}</h4>${operations.map(operationMarkup).join("") || "<p class=\"empty-copy\">No API operations in this origin's retained rows.</p>"}`;
+    }
     // An endpoint's parameters are read as soon as it is opened, not behind a
     // button: each name, where it was sent and a few values, from its newest rows.
-    // An origin's API as an OpenAPI document, for Swagger UI, Postman or Burp.
-    // The text goes to the clipboard while it is still being read: WebKit lets
-    // a click write the clipboard after a read only when handed the promise.
-    function copyOpenApi(button, originId) {
-      if (!copyText) return;
-      const params = new URLSearchParams({ session_id: getSessionId(), origin: originId });
-      const text = request(`/api/target/service-map/openapi?${params}`).then((response) => {
-        if (!response.ok) throw new Error(response.status === 409 ? "OpenAPI is read from the active session only" : "OpenAPI unavailable");
-        return response.json();
-      }).then((document) => JSON.stringify(document, null, 2));
-      return copyText(button, text, "Copied OpenAPI");
-    }
     async function loadParameters(originId, endpoint) {
       const key = JSON.stringify([originId, endpoint.method, endpoint.path]);
       if (state.parametersKey === key && (state.parameters || state.parametersLoading)) return;
@@ -2585,13 +2631,21 @@
       replace(els.siteControls, `<button class="service-map-kind" type="button" data-service-group-sites="toggle" data-service-focus="sites:group" aria-pressed="${display.groupSites}" title="${display.groupSites ? "Show every origin on its own card" : "Gather the origins of one site onto one card"}">Group by site</button>${display.hidden.length ? `<details class="service-map-hidden-list"><summary data-service-focus="sites:hidden">Hidden ${display.hidden.length}</summary>${display.hidden.map((entry) => `<button class="service-map-kind" type="button" data-service-unhide="${escape(entry)}" data-service-focus="unhide:${escape(entry)}" title="Show ${escape(entry)} on the map again">${escape(entry.includes("://") ? entry : `*.${entry}`)} ✕</button>`).join("")}<button class="service-map-kind" type="button" data-service-unhide-all="all" data-service-focus="sites:unhide-all">Show all</button></details>` : ""}`);
     }
     const clientById = (id) => state.snapshot?.clients?.find((client) => clientId(client) === id) || null;
-    // Clients lead the map in a column of their own. Selecting one draws an
-    // arrow to each card it sent rows to itself, with no Origin or Referer (a
-    // typed address, a bookmark, an app's call). A page's own requests already
-    // have the page's arrow.
+    // Clients lead the map in a column of their own, with an arrow to each card
+    // they sent rows to themselves, with no Origin or Referer (a typed address,
+    // a bookmark, an app's call). A page's own requests already have the page's
+    // arrow. Unselected, a client points only at cards no other card links to,
+    // where the map starts; an app's background calls to every card it also
+    // reached through a page covered the map. Selected, it points at them all.
     function clientCards(grouped, cardOrder, hidden) {
       const known = new Set(grouped.cards.map((card) => card.origin));
       const shown = new Set(cardOrder.filter((id) => known.has(id)).slice(0, MAX_CARDS));
+      const linked = new Set();
+      for (const card of grouped.cards.filter((item) => shown.has(item.origin))) {
+        for (const redirect of card.redirects) if (redirect.target_origin !== card.origin) linked.add(redirect.target_origin);
+        if (card.header_links.some((link) => link.source_origin !== card.origin && shown.has(link.source_origin)
+          && linkKindCounts(link).some(([kind]) => !hidden.has(kind)))) linked.add(card.origin);
+      }
       const cards = [], links = new Map();
       for (const client of state.snapshot?.clients || []) {
         // A User-Agent no rule names says nothing about who sent the rows.
@@ -2600,10 +2654,7 @@
         const visits = client.origins.filter((item) => shown.has(grouped.card(item.origin)) && Object.keys(item.entry_kinds).some((kind) => !hidden.has(kind)));
         if (!visits.length) continue;
         cards.push({ ...referenceOrigin(id), client, captured: true, in_scope: true, request_count: client.request_count });
-        // Only the selected client's arrows are drawn: an app's background
-        // calls alone covered the map in them.
-        if (state.selectedClient !== id) continue;
-        for (const item of visits) {
+        for (const item of state.selectedClient === id ? visits : visits.filter((visit) => !linked.has(grouped.card(visit.origin)))) {
           const target = grouped.card(item.origin);
           if (!links.has(target)) links.set(target, []);
           links.get(target).push({ source_origin: id, relationship: "client_request", request_kinds: item.entry_kinds, request_count: directRows(item) });
@@ -2637,8 +2688,14 @@
       const query = state.query.trim().toLowerCase();
       const display = siteDisplay();
       // Origins and sites hidden from the map leave it, whatever else shows them.
-      const shown = (origin) => origin.endpointNode || !display.hidden.includes(origin.origin) && !display.hidden.includes(siteKey(origin.origin));
+      // So does an origin whose rows carried no typed response, which names no
+      // role, unless it is selected, pinned or searched for; the API list and
+      // the inspector keep it.
+      const typed = (origin) => origin.captured === false || originRole(origin) !== "unknown" || origin.origin === state.selectedOrigin
+        || origin.origin === state.anchorOrigin || !!query && origin.origin.toLowerCase().includes(query);
+      const shown = (origin) => origin.endpointNode || typed(origin) && !display.hidden.includes(origin.origin) && !display.hidden.includes(siteKey(origin.origin));
       const candidates = direct ? direct.neighbors : graphOrigins().filter((origin) => !state.scopeOnly || origin.in_scope || !origin.captured);
+      const untyped = candidates.filter((origin) => !origin.endpointNode && !typed(origin)).length;
       const stages = originFilterStages(candidates.filter(shown));
       const matchingNeighbors = direct ? stages.matching : [];
       const origins = direct ? [direct.anchor, ...matchingNeighbors] : stages.matching;
@@ -2695,7 +2752,7 @@
           : "Selected origin is outside this filter; inspector retained.";
       if (!origins.length) {
         replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading && !state.snapshot ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly || state.productId || state.productVersion ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly || state.productId || state.productVersion ? "Change the origin search, product/version filters or In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
-        els.graphBounds.textContent = ["0 matching origins", stages.queryHidden ? `${stages.queryHidden} hidden by query` : "", stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "", state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
+        els.graphBounds.textContent = ["0 matching origins", untyped ? `${untyped} with no typed response hidden` : "", stages.queryHidden ? `${stages.queryHidden} hidden by query` : "", stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "", state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
       }
       // More rows draw a slightly heavier line: 1.5px for one row, 2.5px from 64
@@ -2752,6 +2809,7 @@
           `${layout.edges.length} / ${layout.edgeCount} links between shown cards · ${spokes} undirected observation spokes`,
           state.relationLayers.length ? `${state.relationLayers.length} / ${MAX_RELATION_LAYERS} shown inspections` : "",
           stages.queryHidden ? `${stages.queryHidden} hidden by query` : "",
+          untyped ? `${untyped} with no typed response hidden` : "",
           stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "",
           omitted ? `${omitted} nodes omitted by ${MAX_CARDS}-card cap` : "",
           layout.edgeCount > MAX_EDGES ? `${layout.edgeCount - MAX_EDGES} links omitted by ${MAX_EDGES}-edge cap` : "",
@@ -2790,6 +2848,7 @@
           state.bodyReferenceOverlay ? `${metadataArrows} metadata / ${overlayCount} ${linkOverlay ? "Link" : "body URL"} links` : "",
           state.bodyReferenceOverlay ? `${shownBodyArrows} / ${overlayCount} ${linkOverlay ? "Link" : "body"} arrows shown` : "",
           queryHidden ? `${queryHidden} hidden by query` : "",
+          untyped ? `${untyped} with no typed response hidden` : "",
           productHidden ? `${productHidden} hidden by products/versions` : "",
           state.productId || state.productVersion ? `${matchingNeighbors.length} matching neighbors · pinned anchor is context only` : "",
           capOmitted ? `${capOmitted} omitted by ${MAX_CARDS}-card cap` : "",
@@ -2816,7 +2875,7 @@
         ];
         els.graphBounds.textContent = summary.filter(Boolean).join(" · ");
         if (els.graphDiagnostics) els.graphDiagnostics.textContent = diagnostics.join(" · ");
-      } else els.graphBounds.textContent = `${shownOrigins} / ${origins.length} matching origins${stages.queryHidden ? ` · ${stages.queryHidden} hidden by query` : ""}${stages.productHidden ? ` · ${stages.productHidden} hidden by products/versions` : ""}${origins.length > shownOrigins ? ` · ${origins.length - shownOrigins} omitted by ${MAX_CARDS}-card cap` : ""}${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
+      } else els.graphBounds.textContent = `${shownOrigins} / ${origins.length} matching origins${untyped ? ` · ${untyped} with no typed response hidden` : ""}${stages.queryHidden ? ` · ${stages.queryHidden} hidden by query` : ""}${stages.productHidden ? ` · ${stages.productHidden} hidden by products/versions` : ""}${origins.length > shownOrigins ? ` · ${origins.length - shownOrigins} omitted by ${MAX_CARDS}-card cap` : ""}${state.omittedGraphReferences ? ` · Reference-card cap ${MAX_REFERENCE_CARDS}; ${state.omittedGraphReferences} reference declarations omitted` : ""}${origins.length > MAX_CARDS ? " · Filter to find more" : ""}${layout.edgeCount > MAX_EDGES ? ` · ${MAX_EDGES} / ${layout.edgeCount} arrows shown` : ""}${selectionNotice ? ` · ${selectionNotice}` : ""}${state.modeNotice ? ` · ${state.modeNotice}` : ""}`;
     }
     function endpointMatches(endpoint) {
       return (!state.endpointMethod || endpoint.method === state.endpointMethod) && endpoint.path.includes(state.endpointPath);
@@ -3129,7 +3188,7 @@
       const hiddenAs = display.hidden.includes(origin.origin) ? origin.origin : site && display.hidden.includes(site) ? site : null;
       const regroup = site && display.groupSites && display.expandedSites.includes(site);
       const openApi = origin.captured && originRoles(origin).some((role) => role === "api" || role === "auth")
-        ? `<button class="secondary-action" type="button" data-service-openapi="${escape(origin.origin)}" data-service-focus="origin:openapi" title="Copy an OpenAPI 3.1 description of what this origin's retained rows show, without their values">Copy OpenAPI</button>` : "";
+        ? `<button class="secondary-action" type="button" data-service-api-docs="${escape(origin.origin)}" data-service-focus="origin:api-docs" title="This origin's API as OpenAPI 3.1, from its retained rows and without their values">API docs</button>` : "";
       return `<div class="service-map-overlay-actions service-map-origin-actions">${openApi}${hiddenAs ? `<button class="secondary-action" type="button" data-service-unhide="${escape(hiddenAs)}" data-service-focus="origin:unhide">${hiddenAs === origin.origin ? "Show on map" : `Show *.${escape(site)} on map`}</button>` : `<button class="secondary-action" type="button" data-service-hide="${escape(origin.origin)}" data-service-focus="origin:hide">Hide from map</button>`}${regroup ? `<button class="secondary-action" type="button" data-service-site-collapse="${escape(site)}" data-service-focus="origin:regroup">Group *.${escape(site)} again</button>` : ""}</div>`;
     }
     function renderDetail() {
@@ -3248,7 +3307,7 @@
       else if (data.serviceClient) selectClient(data.serviceClient);
       else if (data.serviceSiteExpand) expandSite(data.serviceSiteExpand);
       else if (data.serviceSiteCollapse) saveSiteDisplay({ expandedSites: siteDisplay().expandedSites.filter((site) => site !== data.serviceSiteCollapse) });
-      else if (data.serviceOpenapi) copyOpenApi(button, data.serviceOpenapi);
+      else if (data.serviceApiDocs) openApiDocs(data.serviceApiDocs);
       else if (data.serviceHide) {
         if (state.selectedSite === data.serviceHide) state.selectedSite = null;
         saveSiteDisplay({ hidden: [...new Set([...siteDisplay().hidden, data.serviceHide])] });
@@ -3300,6 +3359,20 @@
       renderDetail();
       const next = [...els.detail.querySelectorAll('[role="tab"][data-service-detail-tab]')].find((button) => button.dataset.serviceDetailTab === state.detailTab);
       next?.focus();
+    });
+    els.apiDocs?.addEventListener("click", (event) => {
+      if (event.target === els.apiDocs) return closeApiDocs();
+      const data = event.target.closest?.("button")?.dataset;
+      if (!data) return;
+      if (data.apiDocsClose !== undefined) closeApiDocs();
+      // The text is already read, so the copy runs within the click.
+      else if (data.apiDocsCopy !== undefined && state.apiDocs?.document) copyText?.(JSON.stringify(state.apiDocs.document, null, 2), "Copied OpenAPI");
+      else if (data.apiDocsReplay) { closeApiDocs(); sendToReplay?.(data.apiDocsReplay); }
+    });
+    els.apiDocs?.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault?.();
+      closeApiDocs();
     });
     els.zoomFit?.addEventListener("click", fitGraph);
     els.zoomOut?.addEventListener("click", () => setZoom(state.zoomScale - ZOOM_LIMITS.step));

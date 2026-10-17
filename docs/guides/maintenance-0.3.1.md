@@ -389,8 +389,9 @@ library or a crawler, from a fixed list of rules. The map counts each client's
 rows per origin and the requests it made itself, with no Origin or Referer.
 One browser, app or tool is one client whatever versions its rows named
 (`versions`). In the GUI the clients lead the map in their own column, an
-unnamed one draws no card, and selecting one draws a Direct request arrow to
-each card it went to itself; the API and the CLI carry them as `clients`. Only
+unnamed one draws no card, each draws a Direct request arrow to the cards it
+went to itself that nothing else links to, and selecting one draws its arrow to
+every card it went to itself; the API and the CLI carry them as `clients`. Only
 the fixed names leave the parser, never the header.
 
 Each origin also names how its requests authenticate, from names and shapes
@@ -429,12 +430,15 @@ per-path cookies, the third-party services pages load (payments, maps,
 CAPTCHAs, chat, consent managers, analytics and ad tags) and library files
 named without a version, and reads bundles up to 8 MiB.
 
-An origin that serves API data can be copied as an OpenAPI 3.1 document
-(**Copy OpenAPI** in its inspector, `GET /api/target/service-map/openapi`, and
-`scope service-map openapi` in the CLI): its path templates, parameter and body
-field names with guessed types, response statuses and media types, and the
-credentials its rows showed, built from every retained row and holding no
-captured value.
+An origin that serves API data opens as API docs, an OpenAPI 3.1 document laid
+out as Swagger UI lays one out (**API docs** in its inspector, `GET
+/api/target/service-map/openapi`, and `scope service-map openapi` in the CLI):
+its path templates, parameter and body field names with guessed types,
+response statuses and media types, and the credentials its rows showed, built
+from every retained row and holding no captured value. Each operation sends its
+newest row to Replay, and the document copies as JSON. An origin whose rows
+carried no typed response now stays off the map unless selected or searched
+for.
 
 Cards are shorter (84px at the default text size) and a product found without a
 version shows its name alone; hovering `+N` lists the products it stands for.

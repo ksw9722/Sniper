@@ -244,13 +244,16 @@ the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`
 
 Each row's User-Agent names the client that sent it (a browser, an app's
 WebView, an app, a tool, a library or a crawler), and the map's first column
-shows the clients; selecting one draws an arrow to each origin it went to itself.
+shows the clients, each with an arrow to the origins where the map starts;
+selecting one draws an arrow to each origin it went to itself. An origin whose
+rows carried no typed response stays off the map unless selected or searched for.
 How requests authenticate (a bearer JWT, Basic, session cookies, API key headers,
 OAuth, OpenID Connect or SAML) is named from headers and URLs, never their values.
-An origin that serves API data can be copied from its inspector, or read with
-`sniper-cli scope service-map openapi`, as an OpenAPI 3.1 document of what its
-rows showed: path templates, parameter and body field names with guessed types,
-statuses and media types, and the credentials sent, never their values.
+An origin that serves API data opens as API docs from its inspector, laid out
+as Swagger UI lays them out and sent on to Replay a row at a time, and
+`sniper-cli scope service-map openapi` reads the same OpenAPI 3.1 document: path
+templates, parameter and body field names with guessed types, statuses and
+media types, and the credentials sent, never their values.
 
 Origin and Referer links are sorted by request kind (API call, page navigation,
 frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each

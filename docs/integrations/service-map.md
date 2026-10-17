@@ -14,7 +14,10 @@ an APIs/Evidence inspector. Each card leads with what its origin serves, read
 from the response types of its loaded endpoints: **Front** (HTML pages), **API**
 (JSON, XML, protobuf, gRPC or GraphQL), **Static** (images, fonts, styles,
 scripts), or **Unknown** when no typed response is loaded; **Ref** marks an
-origin only referenced, and **Site** a card of grouped origins. A front-end
+origin only referenced, and **Site** a card of grouped origins. An Unknown
+origin, often a beacon answering 204, leaves the map unless it is selected,
+pinned or searched for; the bounds line counts them (`N with no typed response
+hidden`), and the APIs list and the inspector keep them. A front-end
 product or CMS (Next.js, React, Vue, WordPress and the like) makes it Front
 whatever its endpoints return when a header names it, the origin serves pages, or
 one of its pages loaded the script naming it; a CDN that only serves that script
@@ -458,20 +461,27 @@ sniper-cli scope service-map parameters --session-id <active-session-uuid> --ori
 
 ## OpenAPI
 
-**Copy OpenAPI**, in the inspector of an origin that serves API data or signs
-users in, copies an OpenAPI 3.1 description of what its retained rows show, for
-Swagger UI, Postman, Burp or an agent, as Burp's API Exporter and
-mitmproxy2swagger build one from captured traffic. It lists each method and path
+**API docs**, in the inspector of an origin that serves API data or signs
+users in, opens an OpenAPI 3.1 description of what its retained rows show, laid
+out as Swagger UI lays one out: each operation opens to its parameters, request
+body, responses and credentials, and **Send newest row to Replay** opens the
+newest row it stands for in Replay, as Burp's OpenAPI Parser sends an operation
+on to Repeater. **Copy OpenAPI JSON** copies the document for Swagger UI,
+Postman, Burp or an agent, as Burp's API Exporter and mitmproxy2swagger build
+one from captured traffic. There is no Try it out: a request goes through
+Replay, and so through the proxy. The document lists each method and path
 template, with the ID segments as named path parameters (`{number}`, `{uuid}`,
 `{hex}`); the query, form, top-level JSON and multipart field names from each
 operation's newest 20 rows, with a type guessed from their values; each response
 status with the media types it came with; and the credentials the rows showed,
 as security schemes. Each scheme is one alternative: the rows show what was
 sent, not what the server requires. Every retained row of the origin counts,
-and each operation's `x-sniper-requests` says how many it stands for.
+each operation's `x-sniper-requests` says how many it stands for, and
+`x-sniper-newest-transaction` names the newest of them (`capture http get --id`).
 
 No captured value is copied; a type is all that is kept of one. Operations that
-only answered with pages or static files are left out, and so are OPTIONS
+only answered with pages or static files, or whose path names one (`.woff2`,
+`.png`, `.js` and the like), are left out, and so are OPTIONS
 requests, nearly always CORS preflights, and methods OpenAPI cannot hold. At
 most 500 operations are listed, the most recently used, and `info.description`
 says what was left out. Like the parameters, it reads the active session only.
@@ -632,12 +642,14 @@ kind, name and operating system are one client, whatever versions they named:
 a browser that updated during a session is one Chrome, not one per version. In
 the GUI the clients lead the map in a column of their own, centred against the
 tallest column, up to four cards beside the origin cap; an `unknown` client
-draws none. Selecting a client lists the origins it sent rows to, its versions
-and the addresses it connected from, and draws a long-dashed **Direct
-request** arrow to each shown card it went to itself; the arrows wait for the
-selection because an app's background calls alone would cover the map. A
-request kind hidden in the legend hides those arrows too, and a client left
-with none draws no card.
+draws none. Each client draws a long-dashed **Direct request** arrow to the
+shown cards it went to itself that no other shown card links to, where the map
+starts; a card a page links to already shows how it was reached, and an app's
+background calls to every such card would cover the map. Selecting a client
+lists the origins it sent rows to, its versions and the addresses it connected
+from, and draws its arrow to every shown card it went to itself. A request kind
+hidden in the legend hides those arrows too, and a client left with none draws
+no card.
 
 Each captured row keeps the address of the client that sent it to the proxy
 (`client_address`): a browser on this machine is `127.0.0.1`, a phone on the
