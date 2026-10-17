@@ -170,7 +170,7 @@ header observations, with `+N` for further products; hovering `+N`, or focusing
 the card, lists them. A product found without a version shows its name alone.
 A product's chip carries its logo, and a card with no captured favicon shows
 the leading product's logo on its brand colour. The logos come from Simple
-Icons 16.35.0, bundled in `web/product-icons.js`: 157 products share 129 icons
+Icons 16.35.0, bundled in `web/product-icons.js`: 170 products share 139 icons
 released under CC0, MIT, Apache-2.0, BSD or CC-BY, each licence noted in the
 file. Icons under a copyleft, non-commercial or custom licence (Vue.js, PHP,
 Ruby, Jenkins, Debian, Keycloak, Quasar) are left out, and those products keep
@@ -441,7 +441,9 @@ the map now reads four places for that, without sending anything:
   OSS's `x-oss-request-id`, Azure Front Door's `X-MSEdge-Ref`, F5 BIG-IP's
   `X-Cnection` (its OneConnect marker), Meta's `x-fb-debug`, a Next.js
   server's `x-nextjs-cache`, `X-Redirect-By: WordPress`, an `X-AspNet-Version`
-  emptied to hide the version, and about sixty more.
+  emptied to hide the version, IIS Express's `X-SourceFiles`, the PageSpeed
+  module's `X-Mod-Pagespeed`, a Kubernetes API server's `X-Kubernetes-PF-…`,
+  Consul's `X-Consul-Index`, `X-Influxdb-Version`, and about sixty more.
 - **Header values the catalog does not name:** `Server: AmazonS3`,
   `awselb/2.0`, `Kestrel`, `Werkzeug/3.0.1 Python/3.12.0`, an operating system
   in parentheses (`Apache/2.4.52 (Ubuntu)`), `Via: 1.1 … (CloudFront)`,
@@ -451,8 +453,16 @@ the map now reads four places for that, without sending anything:
   NAVER's (`nfront`, `Testa/6.2.14`), CDNetworks' `PWS/8.3`, `BunnyCDN-…`,
   Apache Traffic Server's `ATS`, Baidu's `BLB`, ByteDance's `TLB`, Adobe
   Experience Platform's `jag`, JD.com's `jfe`, Meta's `proxygen-bolt`,
-  Tencent's `tRPC-Gateway`, Gabia's `gabia server`, and Rocky Linux or
-  AlmaLinux in parentheses.
+  Tencent's `tRPC-Gateway`, Gabia's `gabia server`, Rocky Linux, AlmaLinux,
+  Fedora, SUSE, Raspbian or Gentoo in parentheses, Windows behind
+  `Microsoft-IIS` or `Microsoft-HTTPAPI`, Ubuntu or Debian in a distribution's
+  PHP build (`PHP/7.4.3-4ubuntu2.19`, `PHP/7.4.33-1+deb11u4`), enterprise
+  application servers (`Resin`, Oracle iPlanet, `SAP NetWeaver Application
+  Server`, `Lotus-Domino`, Zope), Python's own servers (`TwistedWeb`,
+  aiohttp, `WSGIServer`, `BaseHTTP`/`SimpleHTTP`), Mojolicious, H2O, Yaws,
+  the servers embedded in routers and cameras (Mongoose, GoAhead, Boa,
+  thttpd, RomPager, Appweb), Wix's `Pepyaka`, CouchDB, MinIO, and
+  `X-Powered-By: JSF` or `HHVM`.
 - **Names of the cookies a response sets:** `JSESSIONID` (Java servlet,
   also under a changed name such as `HH_JSESSIONID`), `PHPSESSID`,
   `ASP.NET_SessionId`, `laravel_session`, `connect.sid` (Express), `AWSALB`,
