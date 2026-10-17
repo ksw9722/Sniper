@@ -172,3 +172,25 @@ test("fallback search after expanding Unicode highlights the displayed character
   assert.deepEqual(marked.map(({ from, to }) => [from, to]), [[1, 2]]);
   assert.equal(result.firstMatch.textContent, "x");
 });
+
+for (const [texts, query, expected] of [
+  [["foo", " ", "foo "], " ", [[3, 4], [7, 8]]],
+  [["foo ", " foo  "], "  ", [[3, 5], [8, 10]]],
+  [["foo ", "foo "], " foo", [[3, 7]]],
+  [["foo ", "foo "], "  foo", []],
+  [["foo", " foo "], "foo ", [[0, 4], [4, 8]]],
+  [["foo\n", "foo \n"], "\nfoo ", [[3, 8]]],
+  [["foo\n", "foo\n"], "\n", [[3, 4], [7, 8]]],
+  [["foo\t", "foo\t"], "\t", [[3, 4], [7, 8]]],
+  [[" İ", " \n i", "\u0307 "], " İ ", [[0, 3], [4, 8]]],
+  [["İ😀", " \n😀 "], "😀 ", [[1, 4], [5, 8]]],
+  [["foo\u00a0", "foo\u00a0"], "\u00a0", [[3, 4], [7, 8]]],
+  [["foo ", "foo "], "", []],
+]) {
+  test(`fallback search preserves literal ${JSON.stringify(query)} across text nodes`, () => {
+    const { result, marked } = domSearch(texts, query);
+    assert.equal(result.count, expected.length);
+    assert.deepEqual(marked.map(({ from, to }) => [from, to]).reverse(), expected);
+    assert.deepEqual(ranges(search(texts.join(""), query)), expected);
+  });
+}
