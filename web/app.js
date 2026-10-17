@@ -24708,6 +24708,7 @@ function truncateSetupLabel(body, kind = "text") {
 async function wsConnect() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
+  if (tab.wsStatus === "connecting" || tab.wsStatus === "connected") return;
   const sessionId = state.activeSession?.id || null;
 
   // Sync fields from UI
@@ -24751,30 +24752,38 @@ async function wsConnect() {
   renderWsSetupQueue();
   renderWsFrameList();
 
+  const isCurrentConnection = () => isWsReplayTabAlive(tab, lifecycleToken)
+    && (state.activeSession?.id || null) === sessionId;
   try {
+    // The shared editor may belong to another tab by the time persistence
+    // finishes. Capture the complete connection while this tab owns the UI.
+    const connection = {
+      session_id: sessionId,
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+      id: tab.id,
+      scheme: tab.wsScheme,
+      host: tab.wsHost,
+      port: Number(wsPort),
+      path: wsPath,
+      headers: parseWsHandshakeHeaders(tab),
+    };
     const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
-    const headers = parseWsHandshakeHeaders(tab);
+    if (!isCurrentConnection()) return;
     const resp = await fetch("/api/replay/ws-connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        session_id: sessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+        ...connection,
         expected_workspace_revision: expectedWorkspaceRevision,
-        id: tab.id,
-        scheme: tab.wsScheme,
-        host: tab.wsHost,
-        port: Number(wsPort),
-        path: wsPath,
-        headers,
       }),
     });
-    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+    if (!isCurrentConnection()) {
       await disconnectWsReplayBackend(tab.id, { remove: true, sessionId });
       return;
     }
     if (!resp.ok) {
       const workspaceConflict = await readWorkspaceRevisionConflictPayload(resp);
+      if (!isCurrentConnection()) return;
       if (workspaceConflict) {
         restoreReplayTabConflictState(tab, conflictSnapshot);
         handleReplayWorkspaceRevisionConflict(workspaceConflict);
@@ -24796,7 +24805,7 @@ async function wsConnect() {
     // Auto-send setup queue after connection
     await runSetupQueue(tab, lifecycleToken);
   } catch (e) {
-    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+    if (!isCurrentConnection()) {
       return;
     }
     if (e instanceof WorkspaceStateConflictError) {

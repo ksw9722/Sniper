@@ -304,7 +304,8 @@ function setupPreflight(action) {
     snapshotWsReplayFrameWindowStart: () => null,
   });
   for (const name of [action, "flushWorkspaceStateForReplayAction", "isWsReplayTabAlive", "isReplayTabStillCurrent",
-    "buildUrlFromTarget", "joinAuthority", "isDefaultPortForScheme", "isRedirectRequestBodyHeader"]) {
+    "buildUrlFromTarget", "joinAuthority", "isDefaultPortForScheme", "isRedirectRequestBodyHeader",
+    "parseWsHandshakeHeaders", "wsReplayHostHeaderValue", "defaultWsPortForScheme"]) {
     vm.runInContext(appSource.match(new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}`, "m"))[0], f.context);
   }
   if (action === "followRedirect") {
