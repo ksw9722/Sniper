@@ -1225,7 +1225,7 @@ mod history_fixture {
             (json!(["unnamed_signals_per_origin_limit"]), 0),
             (json!(["header_value_limit", "origins_limit"]), 3),
         ] {
-            for count in [0, 2, 16] {
+            for count in [0_usize, 2, 16] {
                 let mut payload = map_payload();
                 payload["snapshot"]["complete"] = json!(reasons.as_array().unwrap().is_empty());
                 payload["snapshot"]["stopped_by"] = reasons.clone();
