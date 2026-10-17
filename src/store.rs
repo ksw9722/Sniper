@@ -1631,7 +1631,7 @@ impl TransactionStore {
         file: &mut Option<fs::File>,
         item: PendingLibrary,
     ) -> Option<Vec<crate::service_map_libraries::Detection>> {
-        use crate::service_map_libraries::{detect, read_body};
+        use crate::service_map_libraries::{detect, drop_library_source_map, read_body};
         let body = match item.source {
             LibrarySource::Resident(body) => body,
             LibrarySource::Retained(locator, file_generation) => {
@@ -1646,7 +1646,8 @@ impl TransactionStore {
                 read_body(file, locator, item.key.record_id)?
             }
         };
-        let found = detect(&body, item.kind);
+        let mut found = detect(&body, item.kind);
+        drop_library_source_map(&mut found, &item.asset.0);
         let mut caches = self.library_caches();
         caches
             .rows

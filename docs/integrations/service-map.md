@@ -480,8 +480,10 @@ Python, Node.js or Go stack trace, an SQL error, a directory listing, Spring
 Boot Actuator, Swagger UI or an OpenAPI document, an Elasticsearch root
 endpoint, a backend address in a BIG-IP cookie, or an `X-Backend-Server`-style
 header. Scripts and pages are read for what they give away too: a
-`sourceMappingURL` comment (`source_map`), an AWS, Google, Slack, GitHub,
-Stripe or SendGrid key, a Slack webhook, a private key block with key material
+`sourceMappingURL` comment (`source_map`; not in a library's own file, such as
+`jquery.min.js` saying jQuery, whose map is the library's public source), an
+AWS, Google, Slack, GitHub, Stripe or SendGrid key, a Slack webhook, a private
+key block with key material
 after its header (a PEM parser's bare header constant does not count), a JWT
 in a script or an error (a page's is usually the visitor's own token), and a
 private (RFC 1918) address in a URL a script calls or anywhere in an error

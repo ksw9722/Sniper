@@ -377,10 +377,11 @@ name (`Server: AmazonS3`, an operating system in parentheses), the names of the
 cookies it sets (`JSESSIONID`, `AWSALB`, `BIGipServer…`), and error, default and
 debug pages, stack traces and SQL errors. Each finding gets a layer from edge to
 database, and what a response gives away by mistake is an exposure, shown first
-on the card. Scripts and pages are read for exposures too: a source map comment,
-a cloud, chat, code-hosting or payment key, a private key, a JWT, and a private
-address in a script's URLs or an error, reported without the matched value. The
-API and the CLI carry them as `server_technologies`.
+on the card. Scripts and pages are read for exposures too: a source map comment
+(but not a library's own, as in `jquery.min.js`), a cloud, chat, code-hosting or
+payment key, a private key, a JWT, and a private address in a script's URLs or
+an error, reported without the matched value. The API and the CLI carry them as
+`server_technologies`.
 
 Each row's User-Agent, with Client Hints for Chromium browsers, now names the
 client that sent it: a browser, an app's WebView, an app's HTTP stack, a tool, a
