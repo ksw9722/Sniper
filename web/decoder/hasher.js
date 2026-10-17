@@ -57,7 +57,14 @@ function utf8StringToBytes(value) {
 }
 
 function bytesToUtf8String(bytes) {
-  return new TextDecoder().decode(bytes);
+  // U+FEFF belongs to the input here; dropping it breaks encode/decode round trips.
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+}
+
+function utf8StringToByteString(value) {
+  // These legacy hash libraries consume one byte per character, unlike CryptoJS.
+  // Use the same strict UTF-8 conversion as the other text hash tools.
+  return CryptoJS.enc.Latin1.stringify(CryptoJS.enc.Utf8.parse(value));
 }
 
 var hasher = {
@@ -125,7 +132,7 @@ var hasher = {
       tab : tabs.hash,
       title: "MD4",
       calculate: function (input) {
-        return hex_md4(input);
+        return hex_md4(utf8StringToByteString(input));
       }
     },
     h9 : {
@@ -133,7 +140,7 @@ var hasher = {
       tab : tabs.hash,
       title: "Whirlpool",
       calculate: function (input) {
-        return Whirlpool(input);
+        return Whirlpool(utf8StringToByteString(input));
       }
     },
 
@@ -199,7 +206,7 @@ var hasher = {
       tab : tabs.hmac,
       title : "HMAC-MD4",
       calculate : function (input, password) {
-        return hex_hmac_md4(password, input);
+        return hex_hmac_md4(utf8StringToByteString(password), utf8StringToByteString(input));
       }
     },
 
@@ -209,7 +216,7 @@ var hasher = {
       tab : tabs.crc,
       title: "CRC-8",
       calculate: function (input) {
-        return Hex8(Crc8Str(input));
+        return Hex8(Crc8Str(utf8StringToByteString(input)));
       }
     },
     c2 : {
@@ -217,7 +224,7 @@ var hasher = {
       tab : tabs.crc,
       title: "CRC-16",
       calculate: function (input) {
-        return Hex16(Crc16Str(input));
+        return Hex16(Crc16Str(utf8StringToByteString(input)));
       }
     },
     c3 : {
@@ -225,7 +232,7 @@ var hasher = {
       tab : tabs.crc,
       title: "FCS-16",
       calculate: function (input) {
-        return Hex16(Fcs16Str(input));
+        return Hex16(Fcs16Str(utf8StringToByteString(input)));
       }
     },
     c4 : {
@@ -233,7 +240,7 @@ var hasher = {
       tab : tabs.crc,
       title: "FCS/CRC-32",
       calculate: function (input) {
-        return Hex32(Crc32Str(input));
+        return Hex32(Crc32Str(utf8StringToByteString(input)));
       }
     },
 
@@ -879,12 +886,11 @@ var hasher = {
       title : "HTML special chars decode",
       calculate : function (input) {
         function unescapeHtml(html) {
-          return html
-            .replace(/&amp;/g, "&")
-            .replace(/&lt;/g, "<")
-            .replace(/&gt;/g, ">")
-            .replace(/&quot;/g, '"')
-            .replace(/&#039;/g, "'");
+          var entities = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#039;": "'" };
+          // A decoded ampersand must not start a second decode in the same pass.
+          return html.replace(/&(?:amp|lt|gt|quot|#039);/g, function (entity) {
+            return entities[entity];
+          });
         }          
 
         return unescapeHtml(input);
