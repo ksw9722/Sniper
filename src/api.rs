@@ -5569,7 +5569,8 @@ async fn get_target_service_map_impl(
         Err(response) => return response,
     };
     let (include, exclude) = session.runtime.scope_lists().await;
-    let cache_key = format!("{catalog:?}|{cache_query:?}|{include:?}|{exclude:?}");
+    let cache_key =
+        format!("{catalog:?}|{catalog_marker:?}|{cache_query:?}|{include:?}|{exclude:?}");
     let worker_include = include.clone();
     let worker_exclude = exclude.clone();
     let worker_session = session.clone();

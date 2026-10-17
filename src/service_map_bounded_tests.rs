@@ -2021,3 +2021,240 @@ fn a_page_stored_as_base64_is_read_too() {
         map.origins[0].front_technologies
     );
 }
+
+#[test]
+fn service_map_cache_same_length_bundle_keeps_exact_version() {
+    let session = Uuid::from_u128(9876);
+    let asset = |version: &str, sequence| {
+        let mut record = filter_fixture(
+            "www.example.com",
+            "/js/vendor.js",
+            200,
+            "application/javascript",
+            None,
+            sequence,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert("content-type", "application/javascript".parse().unwrap());
+        let body = format!("/*! jQuery v{version} | (c) OpenJS Foundation */");
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            body.as_bytes(),
+            1024,
+        ));
+        record
+    };
+    let old = asset("3.6.0", 1);
+    let new = asset("3.7.1", 2);
+    assert_eq!(
+        old.response.as_ref().unwrap().body_size,
+        new.response.as_ref().unwrap().body_size
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let store = TransactionStore::from_records(vec![old]);
+    let map = |store: &TransactionStore| {
+        store
+            .service_map_all_rows_blocking(
+                session,
+                technology::CatalogVersion::V2,
+                &crate::store::ListFilters::default(),
+                false,
+                None,
+                &[],
+                &[],
+            )
+            .unwrap()
+            .0
+    };
+    let first = map(&store);
+    assert_eq!(
+        first.origins[0].front_technologies[0].version.as_deref(),
+        Some("3.6.0")
+    );
+    let new_id = new.id;
+    rt.block_on(store.insert(new));
+    let second = map(&store);
+    let fresh = TransactionStore::from_records(rt.block_on(store.snapshot(None)));
+    let third = map(&fresh);
+    assert_eq!(
+        second.origins[0].front_technologies.len(),
+        third.origins[0].front_technologies.len()
+    );
+    let entry = second.origins[0]
+        .front_technologies
+        .iter()
+        .find(|technology| {
+            technology
+                .evidence
+                .iter()
+                .any(|id| id.ends_with(&new_id.to_string()))
+        })
+        .unwrap();
+    assert_eq!(
+        entry.version.as_deref(),
+        Some("3.7.1"),
+        "evidence for the new bundle must name its actual version"
+    );
+}
+
+fn cache_body_record(path: &str, mime: &str, body: &str, sequence: u64) -> TransactionRecord {
+    let mut record = filter_fixture("www.example.com", path, 200, mime, None, sequence);
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", mime.parse().unwrap());
+    record.response = Some(MessageRecord::from_headers_and_body(
+        &headers,
+        body.as_bytes(),
+        body.len(),
+    ));
+    record
+}
+
+#[test]
+fn service_map_cache_separates_body_kind_and_url_suppression() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let session = Uuid::new_v4();
+    let store = TransactionStore::from_records(vec![]);
+    let scan = |row: TransactionRecord| {
+        let id = row.id;
+        runtime.block_on(store.insert(row));
+        let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+            session,
+            100,
+            technology::CatalogVersion::V2,
+            &crate::store::ListFilters::default(),
+        );
+        snapshot
+            .rows
+            .into_iter()
+            .find(|row| row.record_id == id)
+            .unwrap()
+            .libraries
+    };
+    let body = r#"<meta name="generator" content="WordPress 6.5.2">"#;
+    assert!(scan(cache_body_record(
+        "/content",
+        "application/javascript",
+        body,
+        1
+    ))
+    .is_empty());
+    let page = scan(cache_body_record("/content", "text/html", body, 2));
+    assert!(page.iter().any(|item| item.product_id == "wordpress"));
+
+    let body = "/*! jQuery v3.7.1 | (c) OpenJS Foundation */\n//# sourceMappingURL=vendor.js.map";
+    let library = scan(cache_body_record(
+        "/jquery.min.js",
+        "application/javascript",
+        body,
+        3,
+    ));
+    assert!(!library.iter().any(|item| item.product_id == "source_map"));
+    let bundle = scan(cache_body_record(
+        "/vendor.js",
+        "application/javascript",
+        body,
+        4,
+    ));
+    assert!(bundle.iter().any(|item| item.product_id == "source_map"));
+    let library = scan(cache_body_record(
+        "/jquery.js",
+        "application/javascript",
+        body,
+        5,
+    ));
+    assert!(!library.iter().any(|item| item.product_id == "source_map"));
+}
+
+#[test]
+fn service_map_cache_retained_bundles_keep_each_rows_version() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let session = Uuid::new_v4();
+    let dir = std::env::temp_dir().join(format!("sniper-map-cache-retained-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let asset = |version: &str, sequence| {
+        cache_body_record(
+            "/vendor.js",
+            "application/javascript",
+            &format!("/*! jQuery v{version} | (c) OpenJS Foundation */"),
+            sequence,
+        )
+    };
+    let mut records = vec![asset("3.7.1", 2), asset("3.6.0", 1)];
+    records[1].user_note = Some("synthetic note".into());
+    let locators =
+        crate::session::write_transactions_file_for_test_returning_locators(&dir, &records)
+            .unwrap();
+    let store = TransactionStore::from_records_with_journal(
+        records.clone(),
+        dir.join("transactions.journal"),
+        None,
+    );
+    runtime.block_on(store.adopt_written_locators(locators));
+    // Warm only the oldest response, then read both persisted bodies.
+    let filter = crate::store::ListFilters {
+        only_notes: true,
+        ..Default::default()
+    };
+    let (old, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        100,
+        technology::CatalogVersion::V2,
+        &filter,
+    );
+    assert_eq!(old.rows.len(), 1);
+    assert_eq!(old.rows[0].libraries[0].version.as_deref(), Some("3.6.0"));
+    let (all, _) = store.service_map_snapshot_blocking_for_catalog(
+        session,
+        100,
+        technology::CatalogVersion::V2,
+        &crate::store::ListFilters::default(),
+    );
+    for (id, version) in [(records[0].id, "3.7.1"), (records[1].id, "3.6.0")] {
+        let row = all.rows.iter().find(|row| row.record_id == id).unwrap();
+        assert_eq!(row.libraries[0].version.as_deref(), Some(version));
+    }
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn service_map_cache_duplicate_bodies_converge_within_read_budget() {
+    let count = crate::service_map_libraries::MAX_READS + 1;
+    let records = (1..=count)
+        .map(|i| {
+            cache_body_record(
+                "/vendor.js",
+                "application/javascript",
+                "/*! jQuery v3.7.1 | (c) OpenJS Foundation */",
+                i as u64,
+            )
+        })
+        .collect();
+    let store = TransactionStore::from_records(records);
+    let read = || {
+        store
+            .service_map_all_rows_blocking(
+                Uuid::nil(),
+                technology::CatalogVersion::V2,
+                &crate::store::ListFilters::default(),
+                false,
+                None,
+                &[],
+                &[],
+            )
+            .unwrap()
+    };
+    let (first, complete) = read();
+    assert!(
+        !complete,
+        "each distinct response must be verified within the read cap"
+    );
+    assert_eq!(first.origins[0].front_technologies[0].row_count, count - 1);
+    let (second, complete) = read();
+    assert!(
+        complete,
+        "row caches let the next map finish the remaining response"
+    );
+    assert_eq!(second.origins[0].front_technologies[0].row_count, count);
+    assert!(read().1, "a fully cached map needs no body reads");
+}

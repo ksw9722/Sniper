@@ -53,7 +53,7 @@ pub struct Detection {
 
 /// What a row's body can declare: a script's technologies, a page's, or what
 /// an error, a root or an API document response says about its servers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Kind {
     Script,
     Page,
