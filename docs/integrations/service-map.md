@@ -452,6 +452,20 @@ origin's `unnamed` (`banners`, `headers`, `cookies`, each busiest first and at
 most 16, with `value`, `row_count` and `evidence`), omitted when everything was
 named.
 
+`sniper-cli scope service-map unnamed` gathers them across the session's whole
+map, as an agent working through them needs: each signal with how many origins
+and rows carried it, up to five of those origins and three evidence tokens,
+and `named_alongside`, the products the map named on the same origins with how
+many of them, most widespread first, `--kind` keeping one kind and `--limit`
+bounding the list. The origins a signal came from are often the best clue to
+whose it is; a header that always travels with one product
+(`cdn-pullzone` beside BunnyCDN) is likely that product's own. A name many
+vendors use (`uid`, `x-trace-id`) names nothing on its own.
+
+```bash
+sniper-cli scope service-map unnamed --kind headers --limit 50
+```
+
 ## Endpoint parameters
 
 Opening an endpoint reads its parameters at once, with no button to press: the
@@ -587,6 +601,41 @@ more than a few origins was traced to its hosts, and those Sniper could name
 were added. JEUS, invisible behind a masked `Server` on many Korean sites,
 showed in 59 hosts' session IDs; `WMONID`, set by 86, appears beside JEUS and
 other engines alike, so it names nothing.
+
+Two later passes worked down the unnamed signals of that crawl and of 358 more
+sites (Japanese, Chinese, European, Russian, American and Asia-Pacific sites,
+developer tools and CMS vendors), each signal traced to the hosts it came
+from. They added Tencent's (`NWS…`, `stgw`, `x-cos-*`), Baidu's (`JSP3`,
+`ohc-*`, `BceBos`), ByteDance's Volcengine (`x-tt-logid`, `ImageX`),
+Kasada's `x-kpsdk-*`, Atlassian's edge (`AtlassianEdge`, `atl-traceid`),
+Automattic's on WordPress.com, Tumblr and WooCommerce (`x-hacker`,
+`x-remembering`, an `x-nc` such as `HIT ord 2`), `X-Powered-By: WordPress VIP`,
+BunnyCDN's `CDN-PullZone` and the rest of its `CDN-…` headers, Fly.io's
+`Fly/…` banner, Arc XP's `x-arc-*`, Sanity's `sanity-*`, Read the Docs'
+`x-rtd-*`, Magnolia's `x-magnolia-*`, the imgix, Cloudinary, imgproxy,
+Contentful, DataDome and Framer banners, Vercel's `x-matched-path`, a Next.js
+server's other `x-nextjs-*` headers, S3's and Cloud Storage's object metadata
+(`x-amz-meta-*`, `x-amz-expiration`, `x-goog-meta-*`, `x-guploader-*`), API
+Gateway's `x-amzn-Remapped-*`, AppDynamics' `ADRUM` and Dynatrace's
+`dtCookie` and `rxVisitor` cookies, ingress-nginx's `INGRESSCOOKIE`, and the
+cookies ad and analytics services set on their own hosts (Magnite's `khaos`,
+LiveRamp's `pxrc`, Sovrn's `ljt_reader`, PubMatic's `KADUSERCOOKIE`,
+StackAdapt's `sa-user-id`, Segment's `ajs_anonymous_id`, Meta's `_fbp`,
+server-side Tag Manager's `FPID`, LinkedIn's `bcookie`, X's
+`personalization_id`, Adobe Advertising's `everest_g_v2`, Yahoo! JAPAN's
+`_yjsu_yjad`, and more). Pages now also name the APM agents and tags they
+load: Dynatrace's `ruxitagentjs_…`, AppDynamics' `adrum-…`, Klaviyo, Clearbit,
+EthicalAds and Yahoo! JAPAN's `ytag.js`. A name many vendors use (`uid`,
+`audit`, `MUID`, a `_gid` that NetEase sets too) was left unnamed, and so were
+generic headers such as `X-Cache`, `traceparent` and the rate-limit family,
+which no longer show as unnamed signals.
+
+A response header longer than 4 KiB, which a site's Content-Security-Policy
+often is, is skipped by itself. The page is still read for its front end and
+servers, and its redirect and CORS answer still count, unless the long header
+is the `Location` or `Access-Control-Allow-Origin` itself. Before this, one
+long policy left the whole page unread: in the two crawls, 123 pages, 13
+redirects and 192 CORS answers.
 
 Each finding gets a layer, outermost first: `edge` (CDN and WAF), `gateway`
 (load balancer, API gateway, proxy cache), `platform` (hosting and storage),

@@ -430,6 +430,25 @@ per-path cookies, the third-party services pages load (payments, maps,
 CAPTCHAs, chat, consent managers, analytics and ad tags) and library files
 named without a version, and reads bundles up to 8 MiB.
 
+Two more passes worked down what no rule named, over that crawl and 358 more
+sites from Japan, China, Europe, Russia, the Americas and Asia-Pacific. Each
+signal was traced to the hosts it came from and named only when those hosts
+said whose it was: Tencent's, Baidu's and ByteDance's clouds, Atlassian's and
+Automattic's edges, BunnyCDN's `CDN-…` headers, Fly.io, Arc XP, Sanity, Read the
+Docs, image CDNs, S3 and Cloud Storage object metadata, Dynatrace, and the
+cookies ad and analytics services set on their own hosts. A name many vendors
+use stays unnamed, and generic headers (`X-Cache`, `traceparent`, rate limits)
+no longer show as unnamed signals. `scope service-map unnamed` gathers what is
+left across the whole map, each signal with its origins, evidence and
+`named_alongside`, the products named on the same origins, so an agent can
+judge the rest the same way.
+
+A response header over 4 KiB, such as a long Content-Security-Policy, no
+longer stops the map from reading the page: only that header is skipped, and
+the redirect and CORS answer still count unless it is the `Location` or
+`Access-Control-Allow-Origin` itself. It had left 123 crawled pages unread,
+monzo.com's Next.js among them.
+
 An origin that serves API data opens as API docs, an OpenAPI 3.1 document laid
 out as Swagger UI lays one out (**API docs** in its inspector, `GET
 /api/target/service-map/openapi`, and `scope service-map openapi` in the CLI):

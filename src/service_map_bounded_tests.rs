@@ -2074,6 +2074,12 @@ fn an_origin_lists_what_no_rule_names() {
                 ("Server", "HeRay"),
                 ("heray-cache-status", "HIT"),
                 ("x-request-id", "1"),
+                // Any cache or tracer sends these; they name no server.
+                ("X-Cache", "HIT"),
+                (
+                    "traceparent",
+                    "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                ),
                 ("CF-RAY", "8d2c1e9a7b3f1a2b-ICN"),
                 ("Via", "1.1 cache-1.internal.example.com"),
                 ("Set-Cookie", "WMONID=abc; Path=/"),

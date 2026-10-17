@@ -421,6 +421,12 @@ test('front-end technology evidence stays bound to each serving origin', async (
   await f.load(snapshot([page, ...sources.map(([source, id]) => origin(source, [endpoint('/users', 'GET', id)]))]));
   const normalized = f.state.snapshot.origins.find(item => item.origin === originA);
   assert.equal(normalized.front_technologies.length, 2);
+  // A brand that opens with a digit is kept like any other.
+  const digit = origin(originA);
+  digit.front_technologies = [{ product_id: 'sixsense', name: '6sense', category: 'analytics', source_origin: originA, row_count: 1, evidence: ['six'] }];
+  const g = fixture();
+  await g.load(snapshot([digit]));
+  assert.deepEqual(g.state.snapshot.origins[0].front_technologies.map(item => item.name), ['6sense']);
   const products = map.reportedProducts(normalized);
   assert.equal(products.length, 1);
   assert.equal(products[0].id, 'react');

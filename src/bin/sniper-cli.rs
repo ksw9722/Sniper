@@ -991,6 +991,171 @@ enum ServiceMapCommand {
         after_help = "Requires the current active session UUID. Reads every retained row of the origin: each method and path template (ID segments as {number}, {uuid} and {hex}), query and form, top-level JSON or multipart body field names from each operation's newest 20 rows with a type guessed from their values, response statuses with media types, and the credentials the rows showed as security schemes. No captured value is included. Operations that only answered with pages or static files, OPTIONS requests and methods OpenAPI cannot hold are left out; at most 500 operations are listed. No target requests, inactive-session loading or automatic reads."
     )]
     Openapi(ServiceMapOpenApiArgs),
+    /// List what no rule names across the whole map, most widespread first.
+    #[command(
+        after_help = "Reads the session's whole map (every retained row) and gathers each origin's unnamed signals: Server and X-Powered-By banners, header names and cookie names no rule names. Each signal comes with how many origins and rows carried it, up to five of those origins and three evidence tokens to open with `scope service-map-evidence`. Most widespread first; --kind keeps one kind and --limit bounds the list. No target requests or body reads beyond the map's own."
+    )]
+    Unnamed(ServiceMapUnnamedArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapUnnamedArgs {
+    /// Session UUID; the active session when omitted.
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Keep only banners, headers or cookies.
+    #[arg(long, value_parser = ["banners", "headers", "cookies"])]
+    kind: Option<String>,
+    /// Signals returned, most widespread first.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
+}
+
+impl ServiceMapUnnamedArgs {
+    /// The whole-history map this summary reads.
+    fn map_args(&self) -> ServiceMapArgs {
+        ServiceMapArgs {
+            command: None,
+            session_id: self.session_id,
+            origin: None,
+            in_scope_only: false,
+            max_records: 10_000,
+            all_rows: true,
+            technology_catalog_version: 2,
+            filter: ServiceMapFilterArgs::default(),
+        }
+    }
+}
+
+const UNNAMED_SAMPLE_ORIGINS: usize = 5;
+const UNNAMED_SAMPLE_EVIDENCE: usize = 3;
+
+/// One signal no rule names, with where it was seen.
+#[derive(Debug, Serialize)]
+struct UnnamedSignalSummary {
+    kind: &'static str,
+    value: String,
+    origins: usize,
+    rows: usize,
+    sample_origins: Vec<String>,
+    evidence: Vec<String>,
+    /// What the map named on the same origins, most often first: a signal
+    /// that travels with one product is likely that product's own.
+    named_alongside: Vec<NamedAlongside>,
+    #[serde(skip)]
+    alongside: std::collections::BTreeMap<String, usize>,
+}
+
+/// A product the map named on the origins that carried a signal.
+#[derive(Debug, Serialize)]
+struct NamedAlongside {
+    name: String,
+    origins: usize,
+}
+
+/// What no rule names across one map: the queue an agent or a reader judges.
+#[derive(Debug, Serialize)]
+struct UnnamedSummary {
+    schema_version: u32,
+    session_id: Uuid,
+    origins_read: usize,
+    origins_with_unnamed: usize,
+    distinct_signals: usize,
+    omitted_signals: usize,
+    signals: Vec<UnnamedSignalSummary>,
+}
+
+fn summarize_unnamed(
+    session_id: Uuid,
+    origins: &[sniper::service_map::ServiceOrigin],
+    kind: Option<&str>,
+    limit: usize,
+) -> UnnamedSummary {
+    let mut by_value: std::collections::BTreeMap<(&'static str, String), UnnamedSignalSummary> =
+        Default::default();
+    let mut carrying = 0;
+    for origin in origins {
+        // The origin's own products: its servers, and what it served or set.
+        let named: std::collections::BTreeSet<&str> = origin
+            .server_technologies
+            .iter()
+            .map(|product| product.name.as_str())
+            .chain(
+                origin
+                    .front_technologies
+                    .iter()
+                    .filter(|product| product.source_origin == origin.origin)
+                    .map(|product| product.name.as_str()),
+            )
+            .collect();
+        let groups = [
+            ("banners", &origin.unnamed.banners),
+            ("headers", &origin.unnamed.headers),
+            ("cookies", &origin.unnamed.cookies),
+        ];
+        let mut any = false;
+        for (name, signals) in groups {
+            if kind.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            for signal in signals {
+                any = true;
+                let entry = by_value
+                    .entry((name, signal.value.clone()))
+                    .or_insert_with(|| UnnamedSignalSummary {
+                        kind: name,
+                        value: signal.value.clone(),
+                        origins: 0,
+                        rows: 0,
+                        sample_origins: Vec::new(),
+                        evidence: Vec::new(),
+                        named_alongside: Vec::new(),
+                        alongside: Default::default(),
+                    });
+                entry.origins += 1;
+                entry.rows += signal.row_count;
+                for name in &named {
+                    *entry.alongside.entry((*name).to_string()).or_default() += 1;
+                }
+                if entry.sample_origins.len() < UNNAMED_SAMPLE_ORIGINS {
+                    entry.sample_origins.push(origin.origin.clone());
+                }
+                for token in &signal.evidence {
+                    if entry.evidence.len() < UNNAMED_SAMPLE_EVIDENCE {
+                        entry.evidence.push(token.clone());
+                    }
+                }
+            }
+        }
+        carrying += usize::from(any);
+    }
+    let mut signals: Vec<_> = by_value.into_values().collect();
+    signals.sort_by(|a, b| {
+        (b.origins, b.rows)
+            .cmp(&(a.origins, a.rows))
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    let distinct = signals.len();
+    signals.truncate(limit);
+    for signal in &mut signals {
+        let mut named: Vec<_> = std::mem::take(&mut signal.alongside).into_iter().collect();
+        named.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        signal.named_alongside = named
+            .into_iter()
+            .take(UNNAMED_SAMPLE_ORIGINS)
+            .map(|(name, origins)| NamedAlongside { name, origins })
+            .collect();
+    }
+    UnnamedSummary {
+        schema_version: 1,
+        session_id,
+        origins_read: origins.len(),
+        origins_with_unnamed: carrying,
+        distinct_signals: distinct,
+        omitted_signals: distinct - signals.len(),
+        signals,
+    }
 }
 
 #[derive(Args, Debug)]
@@ -2750,6 +2915,7 @@ impl TargetCommand {
                 }
                 Some(ServiceMapCommand::Parameters(_)) => "target.service_map.parameters.get",
                 Some(ServiceMapCommand::Openapi(_)) => "target.service_map.openapi.get",
+                Some(ServiceMapCommand::Unnamed(_)) => "target.service_map.unnamed.get",
                 None => "target.service_map.get",
             },
             TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
@@ -3853,6 +4019,36 @@ fn service_map_openapi_output_schema() -> Value {
     })
 }
 
+fn service_map_unnamed_output_schema() -> Value {
+    let count = json!({"type":"integer","minimum":0});
+    json!({
+        "type":"object", "additionalProperties":false,
+        "description":"What no rule names across the session's whole map, most widespread first. A signal is a Server or X-Powered-By banner (`server: <value>`), a response header name, or a Set-Cookie name; never a header or cookie value. Open a signal's evidence tokens with `scope service-map-evidence` to judge it.",
+        "required":["schema_version","session_id","origins_read","origins_with_unnamed","distinct_signals","omitted_signals","signals"],
+        "properties":{
+            "schema_version":{"type":"integer","enum":[1]},
+            "session_id":{"type":"string"},
+            "origins_read":count, "origins_with_unnamed":count, "distinct_signals":count, "omitted_signals":count,
+            "signals":{"type":"array","maxItems":1000,"items":{
+                "type":"object", "additionalProperties":false,
+                "required":["kind","value","origins","rows","sample_origins","evidence","named_alongside"],
+                "properties":{
+                    "kind":{"type":"string","enum":["banners","headers","cookies"]},
+                    "value":{"type":"string"},
+                    "origins":{"type":"integer","minimum":1,"description":"Origins whose responses carried it."},
+                    "rows":count,
+                    "sample_origins":{"type":"array","maxItems":UNNAMED_SAMPLE_ORIGINS,"items":{"type":"string"}},
+                    "evidence":{"type":"array","maxItems":UNNAMED_SAMPLE_EVIDENCE,"items":{"type":"string"},"description":"Evidence tokens for `scope service-map-evidence`."},
+                    "named_alongside":{"type":"array","maxItems":UNNAMED_SAMPLE_ORIGINS,"description":"Products the map named on the same origins, most often first. A signal whose origins all carry one product is likely that product's own.","items":{
+                        "type":"object", "additionalProperties":false, "required":["name","origins"],
+                        "properties":{"name":{"type":"string"},"origins":{"type":"integer","minimum":1}}
+                    }}
+                }
+            }}
+        }
+    })
+}
+
 fn service_map_html_generators_output_schema() -> Value {
     use sniper::service_map_html::{ACQUISITION_REASONS, PARSER_STOP_REASONS, TRUNCATION_REASONS};
     let span = service_map_object(json!({
@@ -4198,8 +4394,12 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             | "target.service_map.socket_peer_matches.get"
             | "target.service_map.parameters.get"
             | "target.service_map.openapi.get"
+            | "target.service_map.unnamed.get"
     ) {
         return None;
+    }
+    if operation == "target.service_map.unnamed.get" {
+        return Some(service_map_unnamed_output_schema());
     }
     if operation == "target.service_map.parameters.get" {
         return Some(service_map_parameters_output_schema());
@@ -4376,7 +4576,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     // Optional: older servers, and origins nothing names, omit it.
     let mut front = service_map_object(json!({
         "product_id":{"type":"string","pattern":"^[a-z0-9_]{1,40}$"},
-        "name":{"type":"string","pattern":"^[A-Za-z][A-Za-z0-9 .!+_-]{0,39}$"},
+        "name":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9 .!+_-]{0,39}$"},
         "category":{"type":"string","enum":sniper::service_map_libraries::CATEGORIES},
         "version":{"type":"string","pattern":"^[0-9][0-9A-Za-z.+-]{0,39}$"},
         "source_origin":string,"row_count":count,"evidence":strings
@@ -4577,6 +4777,14 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "path":{"type":"string","pattern":"^/[^?#]{0,4095}$","description":"The endpoint's exact path, without query or fragment."}
             }
         })),
+        "target.service_map.unnamed.get" => Some(json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Session UUID; the active session when omitted."),
+                "kind":{"type":"string","enum":["banners","headers","cookies"],"description":"Keep only one kind of signal."},
+                "limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Signals returned, most widespread first."}
+            }
+        })),
         "target.service_map.openapi.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","origin"],
             "properties":{
@@ -4727,6 +4935,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["session_id", "origin", "method", "path"],
             vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com","method":"GET","path":"/search"})],
+        ),
+        op(
+            "target.service_map.unnamed.get",
+            "scope service-map unnamed [--session-id <uuid>] [--kind banners|headers|cookies] [--limit <n>]",
+            "List what no rule names across the session's whole map: Server and X-Powered-By banners, response header names and Set-Cookie names, each with how many origins and rows carried it, up to five of those origins and three evidence tokens. Most widespread first. Reads the same whole-history map as `scope service-map --all-rows`; no target requests. Judge a signal by opening its evidence, then record a conclusion with `capture http annotate`.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "kind", "limit"],
+            vec![json!({}), json!({"kind":"headers","limit":50})],
         ),
         op(
             "target.service_map.openapi.get",
@@ -5682,6 +5899,7 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         | "target.service_map.link_declarations.get" => &["session_id", "evidence_id"],
         "target.service_map.parameters.get" => &["session_id", "origin", "method", "path"],
         "target.service_map.openapi.get" => &["session_id", "origin"],
+        "target.service_map.unnamed.get" => &["session_id", "kind", "limit"],
         "target.service_map.socket_peer_matches.get" => {
             &["session_id", "evidence_id", "in_scope_only", "max_records"]
         }
@@ -5888,6 +6106,9 @@ fn command_input_preview(command: &Command) -> Value {
                 }),
                 Some(ServiceMapCommand::Openapi(args)) => json!({
                     "session_id":args.session_id,"origin":args.origin,
+                }),
+                Some(ServiceMapCommand::Unnamed(args)) => json!({
+                    "session_id":args.session_id,"kind":args.kind,"limit":args.limit,
                 }),
                 None => {
                     let mut preview = json!({
@@ -6322,6 +6543,10 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 Some(ServiceMapCommand::Openapi(args)) => {
                     api_preview("GET", service_map_openapi_path(args), None)
                 }
+                Some(ServiceMapCommand::Unnamed(args)) => service_map_catalog_api_preview(
+                    service_map_path(&args.map_args(), args.session_id),
+                    2,
+                ),
                 Some(ServiceMapCommand::LinkDeclarations(args)) => {
                     api_preview("GET", service_map_link_declarations_path(args), None)
                 }
@@ -6826,8 +7051,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             | "target.service_map.socket_peer_matches.get"
             | "target.service_map.parameters.get"
             | "target.service_map.openapi.get"
+            | "target.service_map.unnamed.get"
     ) {
-        if command.operation_name() == "target.service_map.openapi.get" {
+        if command.operation_name() == "target.service_map.unnamed.get" {
+            notes.push("Reads the session's whole map, as `scope service-map --all-rows` does, and gathers its unnamed signals locally. One GET; no target requests, retries or fallback.");
+            notes.push("Signals are banner values, header names and cookie names, never header or cookie values. Counts are origins and rows in this map; open the evidence tokens before naming anything.");
+        } else if command.operation_name() == "target.service_map.openapi.get" {
             notes.push("Explicit read of every retained row of one origin in an already active session. One GET after identity checks; no target requests, inactive-session loading, automatic reads, retries or fallback.");
             notes.push("The document holds names, guessed types, statuses, media types and security schemes, never captured values. Parameters come from each operation's newest 20 rows, at most 32 MiB of retained rows per read; at most 500 operations are listed.");
         } else if command.operation_name() == "target.service_map.parameters.get" {
@@ -7434,6 +7663,36 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                             evidence_id,
                         },
                     )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.unnamed.get" => {
+            let kind: Option<String> = call_present(operation, input, "kind")?;
+            if kind
+                .as_deref()
+                .is_some_and(|kind| !["banners", "headers", "cookies"].contains(&kind))
+            {
+                return Err(anyhow!("kind must be banners, headers or cookies"));
+            }
+            let limit: u32 = call_present(operation, input, "limit")?.unwrap_or(100);
+            if !(1..=1000).contains(&limit) {
+                return Err(anyhow!("limit must be between 1 and 1000"));
+            }
+            let args = ServiceMapUnnamedArgs {
+                session_id: call_present(operation, input, "session_id")?,
+                kind,
+                limit,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::Unnamed(args)),
                     session_id: None,
                     origin: None,
                     in_scope_only: false,
@@ -8794,6 +9053,7 @@ async fn run(cli: Cli) -> Result<()> {
                     | "target.service_map.socket_peer_matches.get"
                     | "target.service_map.parameters.get"
                     | "target.service_map.openapi.get"
+                    | "target.service_map.unnamed.get"
                     | "capture.http.upstream_peer.get"
                     | "capture.http.upstream_peer.set"
             ) {
@@ -10128,7 +10388,8 @@ fn validate_service_map_response(
                             .bytes()
                             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
                         && item.name.len() <= 40
-                        && item.name.starts_with(|c: char| c.is_ascii_alphabetic())
+                        // A brand may open with a digit: 6sense, 33Across.
+                        && item.name.starts_with(|c: char| c.is_ascii_alphanumeric())
                         && item.name.bytes().all(|b| {
                             b.is_ascii_alphanumeric()
                                 || matches!(b, b' ' | b'.' | b'!' | b'+' | b'_' | b'-')
@@ -11096,6 +11357,16 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             Some(ServiceMapCommand::Openapi(args)) => {
                 let result = read_service_map_openapi(&api, args).await?;
                 print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::Unnamed(args)) => {
+                let map = read_service_map(&api, &args.map_args()).await?;
+                let summary = summarize_unnamed(
+                    map.session_id,
+                    &map.origins,
+                    args.kind.as_deref(),
+                    args.limit as usize,
+                );
+                print_session_read_json(&summary, summary.session_id)
             }
             Some(ServiceMapCommand::LinkDeclarations(args)) => {
                 let result = read_service_map_link_declarations(&api, args).await?;
@@ -20042,6 +20313,114 @@ mod tests {
             "inactive_session",
         );
         assert!(super::validate_service_map_parameters_response(&unavailable, &args).is_ok());
+    }
+
+    // What no rule names: gathered across origins, most widespread first,
+    // with a few origins and evidence tokens each.
+    #[test]
+    fn service_map_unnamed_gathers_signals_across_origins() {
+        let input = json!({"kind":"headers","limit":2});
+        let command =
+            command_from_operation_input("target.service_map.unnamed.get", &input).unwrap();
+        assert_eq!(command.operation_name(), "target.service_map.unnamed.get");
+        let preview = super::command_api_preview(&command).unwrap();
+        let path = preview["path"].as_str().unwrap();
+        assert!(
+            path.starts_with("/api/target/service-map?") && path.contains("all_rows=true"),
+            "{path}"
+        );
+        for bad in [
+            json!({"kind":"values"}),
+            json!({"limit":0}),
+            json!({"limit":1001}),
+            json!({"origin":"https://example.com"}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.unnamed.get", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let origin = |id: &str,
+                      headers: &[(&str, usize)],
+                      banners: &[(&str, usize)],
+                      named: &[&str]| {
+            let signal = |(value, rows): &(&str, usize)| json!({"value": value, "row_count": rows, "evidence": [format!("token-{id}-{value}")]});
+            let product = |name: &&str| json!({"product_id": name.to_ascii_lowercase(), "name": name, "category": "edge", "signals": ["header"], "row_count": 1, "evidence": []});
+            json!({
+                "origin": id, "host": id.trim_start_matches("https://"), "scheme": "https", "port": 443,
+                "in_scope": true, "request_count": 1, "first_seen": "2026-10-17T00:00:00Z", "last_seen": "2026-10-17T00:00:00Z",
+                "endpoints": [], "technology_clues": [], "redirects": [], "header_links": [],
+                "server_technologies": named.iter().map(product).collect::<Vec<_>>(),
+                "unnamed": {
+                    "banners": banners.iter().map(signal).collect::<Vec<_>>(),
+                    "headers": headers.iter().map(signal).collect::<Vec<_>>(),
+                    "cookies": [],
+                }
+            })
+        };
+        let origins: Vec<sniper::service_map::ServiceOrigin> = [
+            origin(
+                "https://a.example.com",
+                &[("x-cdn-pop", 3), ("x-trace", 1)],
+                &[("server: HeRay", 2)],
+                &["HeRayCDN", "Envoy"],
+            ),
+            origin(
+                "https://b.example.com",
+                &[("x-cdn-pop", 4)],
+                &[],
+                &["HeRayCDN"],
+            ),
+            origin("https://c.example.com", &[], &[], &["HeRayCDN"]),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+        let session: Uuid = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let all = super::summarize_unnamed(session, &origins, None, 10);
+        assert_eq!(
+            (
+                all.origins_read,
+                all.origins_with_unnamed,
+                all.distinct_signals
+            ),
+            (3, 2, 3)
+        );
+        assert_eq!(all.signals[0].value, "x-cdn-pop", "most widespread first");
+        assert_eq!((all.signals[0].origins, all.signals[0].rows), (2, 7));
+        assert_eq!(
+            all.signals[0].sample_origins,
+            ["https://a.example.com", "https://b.example.com"]
+        );
+        assert_eq!(all.signals[0].evidence.len(), 2);
+        // Only the carrying origins count: c names HeRayCDN but carries none.
+        assert_eq!(
+            all.signals[0]
+                .named_alongside
+                .iter()
+                .map(|named| (named.name.as_str(), named.origins))
+                .collect::<Vec<_>>(),
+            [("HeRayCDN", 2), ("Envoy", 1)]
+        );
+        let serialized = serde_json::to_value(&all.signals[0]).unwrap();
+        assert!(serialized.get("alongside").is_none(), "{serialized}");
+        assert_eq!(
+            serialized["named_alongside"][0],
+            json!({"name": "HeRayCDN", "origins": 2})
+        );
+        let headers = super::summarize_unnamed(session, &origins, Some("headers"), 1);
+        assert_eq!(
+            (
+                headers.distinct_signals,
+                headers.omitted_signals,
+                headers.signals.len()
+            ),
+            (2, 1, 1)
+        );
+        assert!(headers
+            .signals
+            .iter()
+            .all(|signal| signal.kind == "headers"));
     }
 
     // An origin's OpenAPI document: an exact origin in, a document for that

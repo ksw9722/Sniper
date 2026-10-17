@@ -293,9 +293,22 @@ The map is built for a model to read as well as a person. A workable order:
    same read, and an endpoint's parameters with `scope service-map
    parameters`.
 3. Judge `unnamed` yourself: a banner such as `server: HeRay` or a header such
-   as `x-cdn-pop` may name a product the rules do not know. Open its evidence
-   row, read the other headers and the body, and decide; say how sure you are
-   and why.
+   as `x-cdn-pop` may name a product the rules do not know. `scope service-map
+   unnamed` gathers them across the whole map, most widespread first, each
+   with how many origins and rows carried it, a few of those origins, evidence
+   tokens, and `named_alongside`: what the map named on the same origins
+   (`--kind banners|headers|cookies`, `--limit`). Work down that list. Three
+   clues, strongest first:
+   - The origins' own domain: a cookie set only on `rubiconproject.com` hosts
+     is Magnite's; one on `qq.com`, `gtimg.com` and `qpic.cn` is Tencent's.
+   - `named_alongside`: a header every carrying origin shares with one product
+     (`cdn-pullzone` beside BunnyCDN) is likely that product's own.
+   - The value: open an evidence row and read the header's value and the
+     other headers; a fixed format (`HIT ord 2`) is a stronger sign than a
+     name.
+   A name many vendors use (`uid`, `x-cache`, `x-trace-id`) names nothing on
+   its own; leave it. Say how sure you are and why, and name a product only on
+   that evidence, never on a guess.
 4. Group endpoints by `path_group` before describing an API; one template
    stands for many concrete IDs. `scope service-map openapi` gives an origin's
    API grouped that way, as OpenAPI 3.1, to hand to another tool.

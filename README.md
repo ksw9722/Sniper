@@ -253,7 +253,11 @@ An origin that serves API data opens as API docs from its inspector, laid out
 as Swagger UI lays them out and sent on to Replay a row at a time, and
 `sniper-cli scope service-map openapi` reads the same OpenAPI 3.1 document: path
 templates, parameter and body field names with guessed types, statuses and
-media types, and the credentials sent, never their values.
+media types, and the credentials sent, never their values. What no rule names
+(a `Server` value, a vendor header or cookie name) is kept for a person or an
+agent to judge; `sniper-cli scope service-map unnamed` lists it across the
+whole map, most widespread first, with the origins, evidence and the products
+named beside each signal.
 
 Origin and Referer links are sorted by request kind (API call, page navigation,
 frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each

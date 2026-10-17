@@ -1066,7 +1066,8 @@
         })),
         // Front-end technologies retained scripts, pages and asset URLs name.
         front_technologies: array(item.front_technologies).filter((entry) => /^[a-z0-9_]{1,40}$/.test(entry?.product_id)
-          && /^[A-Za-z][A-Za-z0-9 .!+_-]{0,39}$/.test(entry.name) && FRONT_CATEGORIES.includes(entry.category)
+          // A brand may open with a digit: 6sense, 33Across.
+          && /^[A-Za-z0-9][A-Za-z0-9 .!+_-]{0,39}$/.test(entry.name) && FRONT_CATEGORIES.includes(entry.category)
           && (entry.version == null || /^[0-9][0-9A-Za-z.+-]{0,39}$/.test(entry.version)) && safeOrigin(entry.source_origin)).map((entry) => ({
           product_id: entry.product_id, name: entry.name, category: entry.category, ...(entry.version == null ? {} : { version: entry.version }),
           source_origin: safeOrigin(entry.source_origin), row_count: count(entry.row_count),

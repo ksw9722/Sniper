@@ -146,6 +146,8 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("wix", "Wix", CMS),
     ("squarespace", "Squarespace", CMS),
     ("adobe_experience_manager", "Adobe Experience Manager", CMS),
+    ("framer", "Framer", CMS),
+    ("magnolia", "Magnolia", CMS),
     ("react", "React", FRAMEWORK),
     ("vue", "Vue.js", FRAMEWORK),
     ("angular", "Angular", FRAMEWORK),
@@ -288,6 +290,29 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("acecounter", "AceCounter", ANALYTICS),
     ("beusable", "Beusable", ANALYTICS),
     ("dable", "Dable", ANALYTICS),
+    ("the_trade_desk", "The Trade Desk", ANALYTICS),
+    ("pubmatic", "PubMatic", ANALYTICS),
+    ("tapad", "Tapad", ANALYTICS),
+    ("sixsense", "6sense", ANALYTICS),
+    ("snap_pixel", "Snap Pixel", ANALYTICS),
+    ("pinterest_tag", "Pinterest Tag", ANALYTICS),
+    ("klaviyo", "Klaviyo", ANALYTICS),
+    ("clearbit", "Clearbit", ANALYTICS),
+    ("dynatrace_rum", "Dynatrace RUM", ANALYTICS),
+    ("appdynamics_browser", "AppDynamics Browser RUM", ANALYTICS),
+    ("yahoo_japan_ads", "Yahoo! JAPAN Ads", ANALYTICS),
+    ("ethicalads", "EthicalAds", ANALYTICS),
+    ("adobe_advertising", "Adobe Advertising", ANALYTICS),
+    ("exelbid", "Exelbid", ANALYTICS),
+    ("magnite", "Magnite", ANALYTICS),
+    ("liveramp", "LiveRamp", ANALYTICS),
+    ("sovrn", "Sovrn", ANALYTICS),
+    ("deepintent", "DeepIntent", ANALYTICS),
+    ("thirty_three_across", "33Across", ANALYTICS),
+    ("adkernel", "AdKernel", ANALYTICS),
+    ("stackadapt", "StackAdapt", ANALYTICS),
+    ("semasio", "Semasio", ANALYTICS),
+    ("conversant", "Conversant", ANALYTICS),
 ];
 
 // Each rule names a product in PRODUCTS. `§` is the version: a digit, then
@@ -676,6 +701,31 @@ const URL_MARKERS: &[(&str, &str)] = &[
     ("acecounter", r"\.acecounter\.com[:/]"),
     ("beusable", r"\.beusable\.net/"),
     ("dable", r"\.dable\.io/"),
+    // Each service's documented tag.
+    ("the_trade_desk", r"//js\.adsrvr\.org/"),
+    ("pubmatic", r"//ads\.pubmatic\.com/AdServer/js/"),
+    ("sixsense", r"//j\.6sc\.co/"),
+    ("snap_pixel", r"//sc-static\.net/scevent\.min\.js"),
+    ("pinterest_tag", r"//s\.pinimg\.com/ct/core\.js"),
+    (
+        "klaviyo",
+        r"//static(?:-tracking)?\.klaviyo\.com/onsite/js/",
+    ),
+    ("clearbit", r"//tag\.clearbitscripts\.com/"),
+    (
+        "yahoo_japan_ads",
+        r"//s\.yimg\.jp/images/listing/tool/cv/ytag\.js",
+    ),
+    (
+        "ethicalads",
+        r"//media\.ethicalads\.io/media/client/(?:v[0-9.]+/)?ethicalads(?:\.min)?\.js",
+    ),
+    // APM agents, served by the monitored site itself or the vendor's CDN.
+    ("dynatrace_rum", r"/ruxitagent(?:js)?_"),
+    (
+        "appdynamics_browser",
+        r"/adrum(?:-ext|-latest|-[0-9][0-9.]*)?(?:\.[0-9a-f]{8,})?\.js(?:$|[?#])",
+    ),
 ];
 
 const VERSION: &str = r"([0-9][0-9A-Za-z.+-]{0,39})";
@@ -1195,8 +1245,11 @@ mod tests {
         {
             assert!(known(id, None).is_some(), "{id} is not in PRODUCTS");
         }
-        for (_, _, category) in PRODUCTS {
+        // Every name is one the UI and the CLI accept, or they drop it.
+        let shape = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9 .!+_-]{0,39}$").unwrap();
+        for (id, name, category) in PRODUCTS {
             assert!(CATEGORIES.contains(category));
+            assert!(shape.is_match(name), "{id}: {name}");
         }
         assert_eq!(SCRIPTS.ids.len(), SCRIPT_SIGNATURES.len());
         assert_eq!(PAGES.ids.len(), PAGE_SIGNATURES.len());
@@ -1613,6 +1666,51 @@ mod tests {
             ("https://widgets.outbrain.com/outbrain.js", "outbrain", None),
             ("https://mc.yandex.ru/metrika/tag.js", "yandex_metrica", None),
             ("https://hm.baidu.com/hm.js?abc", "baidu_tongji", None),
+            ("https://js.adsrvr.org/up_loader.1.1.0.js", "the_trade_desk", None),
+            ("https://ads.pubmatic.com/AdServer/js/pwt/123/456/pwt.js", "pubmatic", None),
+            ("https://j.6sc.co/6si.min.js", "sixsense", None),
+            ("https://sc-static.net/scevent.min.js", "snap_pixel", None),
+            ("https://s.pinimg.com/ct/core.js", "pinterest_tag", None),
+            (
+                "https://static.klaviyo.com/onsite/js/klaviyo.js?company_id=Ab12Cd",
+                "klaviyo",
+                None,
+            ),
+            (
+                "https://tag.clearbitscripts.com/v1/example/tags.js",
+                "clearbit",
+                None,
+            ),
+            (
+                "https://www.example.com/ruxitagentjs_ICA2NVfgqrux_10255221207133004.js",
+                "dynatrace_rum",
+                None,
+            ),
+            (
+                "https://js-cdn.dynatrace.com/jstag/1624d0f62e6/ruxitagent_D_10255221207133004.js",
+                "dynatrace_rum",
+                None,
+            ),
+            (
+                "https://cdn.appdynamics.com/adrum/adrum-latest.js",
+                "appdynamics_browser",
+                None,
+            ),
+            (
+                "https://static.example.com/js/adrum-ext.0123456789abcdef0123456789abcdef.js",
+                "appdynamics_browser",
+                None,
+            ),
+            (
+                "https://s.yimg.jp/images/listing/tool/cv/ytag.js",
+                "yahoo_japan_ads",
+                None,
+            ),
+            (
+                "https://media.ethicalads.io/media/client/v1.4.0/ethicalads.min.js",
+                "ethicalads",
+                None,
+            ),
             ("https://se.monetate.net/js/2/a-1/p/example.com/entry.js", "monetate", None),
             ("https://cdn.optimizely.com/js/123456.js", "optimizely", None),
             ("https://dev.visualwebsiteoptimizer.com/j.php?a=1", "vwo", None),
