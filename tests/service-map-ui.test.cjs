@@ -404,6 +404,44 @@ test('individual relationship click reads the source token owned by the captured
   assert.equal(f.state.evidence.origin, originB);
 });
 
+test('front-end technology evidence stays bound to each serving origin', async () => {
+  const sources = [
+    ['https://cdn-a.example.com', 'asset-a'],
+    ['https://cdn-b.example.com', 'asset-b'],
+  ];
+  const page = origin(originA);
+  page.front_technologies = sources.map(([source_origin, id]) => ({
+    product_id: 'react', name: 'React', category: 'framework', version: '18.2.0',
+    source_origin, row_count: 1, evidence: [id],
+  }));
+  const f = fixture();
+  await f.load(snapshot([page, ...sources.map(([source, id]) => origin(source, [endpoint('/users', 'GET', id)]))]));
+  const normalized = f.state.snapshot.origins.find(item => item.origin === originA);
+  assert.equal(normalized.front_technologies.length, 2);
+  const products = map.reportedProducts(normalized);
+  assert.equal(products.length, 1);
+  assert.equal(products[0].id, 'react');
+  assert.deepEqual([...products[0].versions], ['18.2.0']);
+  for (const [source, id] of sources) {
+    f.controller.selectOrigin(originA);
+    const rendered = [...f.els.detail.innerHTML.matchAll(/data-service-relation-origin="([^"]+)" data-service-relation-evidence="([^"]+)"/g)]
+      .find(match => match[2] === id);
+    assert.ok(rendered, 'each retained source has a rendered evidence button');
+    assert.equal(rendered[1], source);
+    const before = f.requests.length;
+    const button = { dataset: { serviceRelationOrigin: rendered[1], serviceRelationEvidence: rendered[2] } };
+    f.els.panel.dispatch('click', { target: { closest: () => button } });
+    assert.equal(f.state.selectedOrigin, source);
+    assert.equal(f.requests.length, before + 1);
+    assert.equal(new URL(f.requests.at(-1).url, originA).searchParams.get('evidence_id'), id);
+    f.requests.at(-1).resolve(response(evidence(id, source)));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.state.evidenceId, id);
+    assert.equal(f.state.evidence.origin, source);
+    assert.match(f.els.detail.innerHTML, /Verified retained source/);
+  }
+});
+
 for (const hidden of [false, true]) test(`a scope-rule save fences old map data even while ${hidden ? 'hidden' : 'a map read is running'}`, async () => {
   const f = fixture(); await f.load(); const oldMap = f.controller.refresh();
   if (hidden) f.controller.setVisible(false);

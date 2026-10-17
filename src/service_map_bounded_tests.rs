@@ -1052,6 +1052,151 @@ fn front_technologies_go_to_the_page_that_loaded_the_asset() {
     );
 }
 
+// A page may load one library from several origins. Each source button must
+// keep the origin that actually served its evidence, even for the same version.
+#[test]
+fn front_technologies_keep_evidence_with_each_source_origin() {
+    let session = Uuid::from_u128(102);
+    let mut records = vec![filter_fixture(
+        "www.example.com",
+        "/",
+        200,
+        "text/html",
+        None,
+        1,
+    )];
+    for (sequence, host) in [
+        (2, "cdn-a.example.com"),
+        (3, "cdn-b.example.com"),
+        (4, "cdn-a.example.com"),
+    ] {
+        let mut record = filter_fixture(
+            host,
+            "/_next/static/chunks/main-app.js",
+            200,
+            "application/javascript",
+            Some("https://www.example.com/"),
+            sequence,
+        );
+        record.response.as_mut().unwrap().body_preview =
+            r#"window.next={version:"14.2.3",appDir:!0}"#.into();
+        records.push(record);
+    }
+    let store = TransactionStore::from_records(records);
+    let filters = crate::store::ListFilters::default();
+    for catalog in [
+        technology::CatalogVersion::V1,
+        technology::CatalogVersion::V2,
+    ] {
+        let (snapshot, _) = store.service_map_snapshot_blocking_for_catalog(
+            session,
+            DEFAULT_MAX_RECORDS,
+            catalog,
+            &filters,
+        );
+        let evidence_origins: BTreeMap<_, _> = snapshot
+            .rows
+            .iter()
+            .map(|row| (row.evidence_id.clone(), row.origin.clone()))
+            .collect();
+        let bounded = build_bounded(
+            session,
+            snapshot,
+            DEFAULT_MAX_RECORDS,
+            false,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (all, _) = store
+            .service_map_all_rows_blocking(session, catalog, &filters, false, None, &[], &[])
+            .unwrap();
+        for map in [bounded, all] {
+            let page = map
+                .origins
+                .iter()
+                .find(|origin| origin.origin == "https://www.example.com")
+                .unwrap();
+            let found = &page.front_technologies;
+            assert_eq!(found.len(), 2, "one source group per CDN");
+            for (item, (host, count)) in found.iter().zip([
+                ("https://cdn-a.example.com", 2),
+                ("https://cdn-b.example.com", 1),
+            ]) {
+                assert_eq!(item.product_id, "next_js");
+                assert_eq!(item.version.as_deref(), Some("14.2.3"));
+                assert_eq!(item.source_origin, host);
+                assert_eq!(item.row_count, count);
+                assert_eq!(item.evidence.len(), count);
+                for evidence in &item.evidence {
+                    assert_eq!(
+                        evidence_origins[evidence], item.source_origin,
+                        "View source must select the evidence's own origin"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn front_technology_source_groups_keep_the_origin_output_bound() {
+    let session = Uuid::from_u128(103);
+    let mut records = vec![filter_fixture(
+        "www.example.com",
+        "/",
+        200,
+        "text/html",
+        None,
+        1,
+    )];
+    for index in 0..=MAX_FRONT_TECHNOLOGIES_PER_ORIGIN {
+        records.push(filter_fixture(
+            &format!("cdn-{index:02}.example.com"),
+            "/_next/static/chunks/main-app.js",
+            200,
+            "application/javascript",
+            Some("https://www.example.com/"),
+            index as u64 + 2,
+        ));
+    }
+    let store = TransactionStore::from_records(records);
+    let (map, _) = store
+        .service_map_all_rows_blocking(
+            session,
+            technology::CatalogVersion::V1,
+            &crate::store::ListFilters::default(),
+            false,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    let page = map
+        .origins
+        .iter()
+        .find(|origin| origin.origin == "https://www.example.com")
+        .unwrap();
+    assert_eq!(
+        page.front_technologies.len(),
+        MAX_FRONT_TECHNOLOGIES_PER_ORIGIN
+    );
+    assert!(!map.snapshot.complete);
+    assert!(map
+        .snapshot
+        .stopped_by
+        .contains(&"front_technologies_limit".into()));
+    for (index, item) in page.front_technologies.iter().enumerate() {
+        assert_eq!(
+            item.source_origin,
+            format!("https://cdn-{index:02}.example.com")
+        );
+        assert_eq!(item.row_count, 1);
+        assert_eq!(item.evidence.len(), 1);
+    }
+}
+
 // The UI's whole-history map folds every retained row, newest first, keeping
 // none: where the windowed map holds every row it is the same map, and past
 // the window's row and byte caps every row still counts. The window held only

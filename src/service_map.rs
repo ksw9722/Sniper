@@ -279,7 +279,7 @@ pub struct FrontTechnology {
     /// Absent when no row named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Where the first row naming it was served from.
+    /// Where every retained evidence row in this group was served from.
     pub source_origin: String,
     pub row_count: usize,
     pub evidence: Vec<String>,
@@ -1690,11 +1690,13 @@ impl MapBuilder {
                 }
                 continue;
             }
-            if let Some(existing) = origin
-                .front_technologies
-                .iter_mut()
-                .find(|item| item.product_id == product_id && item.version == version)
-            {
+            // Source buttons use this origin for every evidence token. Merging
+            // two serving origins would make the later origin's rows unverifiable.
+            if let Some(existing) = origin.front_technologies.iter_mut().find(|item| {
+                item.product_id == product_id
+                    && item.version == version
+                    && item.source_origin == source_origin
+            }) {
                 existing.row_count += hit.rows;
                 for evidence in &hit.evidence {
                     sample(&mut existing.evidence, evidence);
@@ -1726,10 +1728,11 @@ impl MapBuilder {
                 .collect();
             found.retain(|item| item.version.is_some() || !versioned.contains(&item.product_id));
             found.sort_by(|a, b| {
-                (rank(&a.category), &a.name, &a.version).cmp(&(
+                (rank(&a.category), &a.name, &a.version, &a.source_origin).cmp(&(
                     rank(&b.category),
                     &b.name,
                     &b.version,
+                    &b.source_origin,
                 ))
             });
             if found.len() > MAX_FRONT_TECHNOLOGIES_PER_ORIGIN {
