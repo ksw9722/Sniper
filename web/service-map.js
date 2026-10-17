@@ -1234,7 +1234,11 @@
     } else {
       preferred = layeredSlots(visibleOrigins.filter((origin) => !origin.client), connections);
       if (clientIds.length) {
-        preferred = new Map([...clientIds.map((id, row) => [id, { column: 0, row }]),
+        // The column sits level with the middle of the graph, not above it, so
+        // it reads as where the traffic came from however tall the map grows.
+        const rows = Math.max(0, ...[...preferred.values()].map((slot) => slot.row)) + 1;
+        const top = Math.max(0, Math.floor((rows - clientIds.length) / 2));
+        preferred = new Map([...clientIds.map((id, row) => [id, { column: 0, row: top + row }]),
           ...[...preferred].map(([id, slot]) => [id, { ...slot, column: slot.column + 1 }])]);
       }
     }

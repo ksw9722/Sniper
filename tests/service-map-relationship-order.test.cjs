@@ -560,6 +560,19 @@ test('clients lead the map in their own column and draw arrows only once selecte
   assert.doesNotMatch(f.els.canvas.innerHTML, /data-relationship="client_request"/);
 });
 
+test('the client column sits level with the middle of the map, not above it', async () => {
+  const chrome = { kind: 'browser', name: 'Chrome', versions: [141], os: 'macOS', request_count: 2, evidence: [],
+    origins: [{ origin: app, request_count: 2, entry_kinds: { navigation: 2 } }] };
+  const others = Array.from({ length: 8 }, (_, index) => `https://n${index}.example.com`);
+  const f = fixture();
+  await f.load({ ...snapshot([origin(app), ...others.map(id => origin(id))]), clients: [chrome] });
+  const html = f.els.canvas.innerHTML;
+  const top = (attribute, id) => Number(html.split(`${attribute}="${id}"`)[1]?.match(/top:(\d+)px/)?.[1]);
+  const rows = [...new Set([app, ...others].map(id => top('data-service-origin', id)).filter(Number.isFinite))].sort((a, b) => a - b);
+  assert.ok(rows.length >= 3, `${rows.length} rows to centre against`);
+  assert.equal(top('data-service-client', 'client:browser:Chrome:macOS'), rows[Math.floor((rows.length - 1) / 2)]);
+});
+
 test("a card shows its origin's captured icon once the image has loaded, and keeps its mark otherwise", async () => {
   const images = [];
   const iconContext = vm.createContext({ URL, URLSearchParams, AbortController, console, setTimeout, getComputedStyle: element => ({ getPropertyValue: name => element.style.values[name] || '' }),
