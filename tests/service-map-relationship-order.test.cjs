@@ -578,6 +578,19 @@ test('clients lead the map in their own column and draw arrows only once selecte
   assert.doesNotMatch(f.els.canvas.innerHTML, /data-relationship="client_request"/);
 });
 
+test('a client card names the address it connected from, and the inspector every one', async () => {
+  const client = (name, addresses) => ({ kind: 'app', name, versions: [], request_count: 2, evidence: [], addresses,
+    origins: [{ origin: api, request_count: 2, entry_kinds: { api: 2 } }] });
+  const f = fixture();
+  await f.load({ ...snapshot([origin(api)]), clients: [client('OkHttp', ['192.168.0.12', '<b>']), client('Alamofire', ['10.0.0.2', '10.0.0.3'])] });
+  assert.deepEqual([...f.state.snapshot.clients[0].addresses], ['192.168.0.12'], 'only IP addresses are kept');
+  const html = f.els.canvas.innerHTML;
+  assert.match(html, />OkHttp<[^]*?192\.168\.0\.12 · 2 rows/);
+  assert.match(html, />Alamofire<[^]*?2 addresses · 2 rows/);
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceClient: 'client:app:Alamofire:' } }) } });
+  assert.match(f.els.detail.innerHTML, /<h4>Connected from<\/h4><p><code>10\.0\.0\.2<\/code> <code>10\.0\.0\.3<\/code><\/p>/);
+});
+
 test('the client column sits level with the middle of the map, not above it', async () => {
   const chrome = { kind: 'browser', name: 'Chrome', versions: [141], os: 'macOS', request_count: 2, evidence: [],
     origins: [{ origin: app, request_count: 2, entry_kinds: { navigation: 2 } }] };

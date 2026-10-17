@@ -177,6 +177,10 @@ pub struct ServiceClient {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
     pub request_count: usize,
+    /// The addresses it connected to the proxy from: this machine, or a phone
+    /// on the network. At most 8; absent when none was kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
     /// Busiest first.
     pub origins: Vec<ClientOrigin>,
     pub evidence: Vec<String>,
@@ -195,6 +199,7 @@ pub struct ClientOrigin {
 
 const MAX_CLIENTS: usize = 16;
 const MAX_CLIENT_ORIGINS: usize = 64;
+const MAX_CLIENT_ADDRESSES: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceOrigin {
@@ -409,6 +414,9 @@ pub struct ServiceMapRow {
     /// The client its User-Agent and Client Hints name; aggregated only.
     #[serde(skip)]
     pub client: Option<crate::service_map_clients::Client>,
+    /// The address the client connected to the proxy from, when kept.
+    #[serde(skip)]
+    pub client_address: Option<std::net::IpAddr>,
     /// It sent an Origin or Referer: a page started it, not the client itself.
     #[serde(skip)]
     pub initiated: bool,
@@ -808,6 +816,7 @@ pub(crate) fn project_record_for_catalog(
         cors: None,
         libraries: Vec::new(),
         client: None,
+        client_address: record.client_address,
         initiated: false,
         auth: Vec::new(),
     };
@@ -1257,6 +1266,7 @@ type FrontKey = (Option<String>, String, String, Option<String>);
 struct ClientTally {
     rows: usize,
     versions: BTreeSet<u32>,
+    addresses: BTreeSet<std::net::IpAddr>,
     /// Rows per origin, and its own visits there by request kind.
     origins: BTreeMap<String, (usize, BTreeMap<&'static str, usize>)>,
     evidence: Vec<String>,
@@ -1403,6 +1413,11 @@ impl MapBuilder {
                 .or_default();
             tally.rows += 1;
             tally.versions.extend(client.version);
+            if let Some(address) = row.client_address {
+                if tally.addresses.len() < MAX_CLIENT_ADDRESSES {
+                    tally.addresses.insert(address);
+                }
+            }
             sample(&mut tally.evidence, &row.evidence_id);
             let (rows, entries) = tally.origins.entry(row.origin.clone()).or_default();
             *rows += 1;
@@ -1834,6 +1849,7 @@ impl MapBuilder {
                     versions: tally.versions.into_iter().rev().take(8).collect(),
                     os: os.map(Into::into),
                     request_count: tally.rows,
+                    addresses: tally.addresses.iter().map(ToString::to_string).collect(),
                     origins,
                     evidence: tally.evidence,
                 }

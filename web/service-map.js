@@ -1081,6 +1081,8 @@
       .slice(0, 16).map((client) => ({ kind: client.kind, name: client.name, versions: array(client.versions).filter((version) => Number.isSafeInteger(version) && version >= 0).slice(0, 8),
         ...(client.os == null ? {} : { os: client.os }),
         request_count: count(client.request_count),
+        // The addresses it connected to the proxy from, kept only as IPs.
+        addresses: array(client.addresses).filter((address) => typeof address === "string" && /^[0-9A-Fa-f:.]{2,45}$/.test(address)).slice(0, 8),
         origins: array(client.origins).filter((item) => safeOrigin(item?.origin)).slice(0, 64).map((item) => ({ origin: safeOrigin(item.origin), request_count: count(item.request_count),
           entry_kinds: Object.fromEntries(REQUEST_KINDS.filter((kind) => count(item.entry_kinds?.[kind]) > 0).map((kind) => [kind, count(item.entry_kinds[kind])])) })) }));
     return { snapshot: payload.snapshot, origins, clients, warningCount: array(payload.warnings).length, technologyCatalogVersion: catalogVersion, legacyCatalog: catalogVersion !== requestedVersion };
@@ -2694,7 +2696,7 @@
         if (origin.client) {
           const selected = selectedCard === origin.origin;
           return `<button class="service-map-card service-map-client ${selected ? "selected" : ""}" type="button" data-service-client="${escape(origin.origin)}" data-service-focus="client:${escape(origin.origin)}" aria-current="${selected}" style="left:${origin.x}px;top:${origin.y}px">
-          ${clientRoleMarkup(origin.client)}<span class="service-map-card-copy"><strong title="${escape(clientName(origin.client))}">${escape(clientName(origin.client))}</strong><span class="service-map-card-meta">${origin.client.os ? `${escape(origin.client.os)} · ` : ""}${rowCount(origin.client.request_count)}</span></span>
+          ${clientRoleMarkup(origin.client)}<span class="service-map-card-copy"><strong title="${escape(clientName(origin.client))}">${escape(clientName(origin.client))}</strong><span class="service-map-card-meta">${origin.client.os ? `${escape(origin.client.os)} · ` : ""}${origin.client.addresses.length === 1 ? `${escape(origin.client.addresses[0])} · ` : origin.client.addresses.length ? `${origin.client.addresses.length} addresses · ` : ""}${rowCount(origin.client.request_count)}</span></span>
         </button>`;
         }
         if (origin.site) {
@@ -3087,7 +3089,7 @@
       }
     }
     function clientDetailMarkup(client) {
-      return `<header class="service-map-detail-header"><div><h3>${escape(clientName(client))}</h3><p>${[CLIENT_LABELS[client.kind], client.os, client.versions.length ? `Versions ${client.versions.join(", ")}` : ""].filter(Boolean).map(escape).join(" · ")}</p></div></header><div class="service-map-detail-body"><p class="service-map-muted">${rowCount(client.request_count)} named by the User-Agent</p><h4>Origins</h4><div class="service-map-evidence-list">${client.origins.map((item) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="client-origin:${escape(item.origin)}"><span>${escape(item.origin)}<br>${rowCount(item.request_count)}${directRows(item) ? ` · ${directRows(item).toLocaleString()} direct` : ""}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
+      return `<header class="service-map-detail-header"><div><h3>${escape(clientName(client))}</h3><p>${[CLIENT_LABELS[client.kind], client.os, client.versions.length ? `Versions ${client.versions.join(", ")}` : ""].filter(Boolean).map(escape).join(" · ")}</p></div></header><div class="service-map-detail-body"><p class="service-map-muted">${rowCount(client.request_count)} named by the User-Agent</p>${client.addresses.length ? `<h4>Connected from</h4><p>${client.addresses.map((address) => `<code>${escape(address)}</code>`).join(" ")}</p>` : ""}<h4>Origins</h4><div class="service-map-evidence-list">${client.origins.map((item) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(item.origin)}" data-service-focus="client-origin:${escape(item.origin)}"><span>${escape(item.origin)}<br>${rowCount(item.request_count)}${directRows(item) ? ` · ${directRows(item).toLocaleString()} direct` : ""}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
     }
     function siteDetailMarkup(site) {
       const inScope = site.members.filter((member) => member.in_scope).length;

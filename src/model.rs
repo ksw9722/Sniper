@@ -471,6 +471,12 @@ pub struct TransactionRecord {
         deserialize_with = "deserialize_observed_socket_peer"
     )]
     pub observed_socket_peer: Option<ObservedSocketPeer>,
+    /// The address of the client that sent this request to the proxy, as the
+    /// proxy accepted its connection: a browser on this machine, a phone on
+    /// the same network. Absent for what Sniper sent itself, and on records
+    /// from before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_address: Option<std::net::IpAddr>,
 }
 
 impl TransactionRecord {
@@ -521,6 +527,7 @@ impl TransactionRecord {
             http_version: None,
             response_http_version: None,
             observed_socket_peer: None,
+            client_address: None,
         }
     }
 
@@ -531,6 +538,11 @@ impl TransactionRecord {
 
     pub(crate) fn with_observed_socket_peer(mut self, peer: Option<ObservedSocketPeer>) -> Self {
         self.observed_socket_peer = peer;
+        self
+    }
+
+    pub(crate) fn with_client_address(mut self, address: Option<std::net::IpAddr>) -> Self {
+        self.client_address = address;
         self
     }
 
@@ -588,6 +600,7 @@ impl TransactionRecord {
             http_version: None,
             response_http_version: None,
             observed_socket_peer: None,
+            client_address: None,
         }
     }
 
@@ -1142,6 +1155,21 @@ mod tests {
                     .is_none());
             }
         }
+    }
+
+    #[test]
+    fn client_address_round_trips_and_older_records_have_none() {
+        let address: std::net::IpAddr = "192.168.0.12".parse().unwrap();
+        let record = peer_test_record().with_client_address(Some(address));
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["client_address"], "192.168.0.12");
+        let loaded: TransactionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.client_address, Some(address));
+        let mut legacy = serde_json::to_value(peer_test_record()).unwrap();
+        assert!(legacy.get("client_address").is_none(), "absent, not null");
+        legacy.as_object_mut().unwrap().remove("client_address");
+        let loaded: TransactionRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.client_address, None);
     }
 
     #[test]

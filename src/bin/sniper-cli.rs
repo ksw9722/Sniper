@@ -4454,6 +4454,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "versions":{"type":"array","maxItems":8,"items":{"type":"integer","minimum":0},"description":"Major versions its rows named, newest first; one client however many versions it updated through."},
         "os":{"type":"string","enum":sniper::service_map_clients::SYSTEMS},
         "request_count":count,
+        "addresses":{"type":"array","maxItems":8,"items":{"type":"string","pattern":"^[0-9A-Fa-f:.]{2,45}$"},"description":"IP addresses the client connected to the proxy from (this machine, a phone on the network). Absent when none was kept, and on older servers."},
         "origins":{"type":"array","maxItems":64,"items":client_origin},
         "evidence":strings
     }));

@@ -556,15 +556,25 @@ browser's own background request, an app's or a tool's call. A page's own
 requests carry the page in Referer and already have its arrow. Rows of one
 kind, name and operating system are one client, whatever versions they named:
 a browser that updated during a session is one Chrome, not one per version. In
-the GUI the clients lead the map in a column of their own, up to four cards
-beside the origin cap; an `unknown` client draws none. Selecting a client lists
-the origins it sent rows to and its versions, and draws a long-dashed **Direct
-request** arrow to each shown card it went to itself; a request kind hidden in
-the legend hides those arrows too, and a client left with none draws no card.
+the GUI the clients lead the map in a column of their own, centred against the
+tallest column, up to four cards beside the origin cap; an `unknown` client
+draws none. Selecting a client lists the origins it sent rows to, its versions
+and the addresses it connected from, and draws a long-dashed **Direct
+request** arrow to each shown card it went to itself; the arrows wait for the
+selection because an app's background calls alone would cover the map. A
+request kind hidden in the legend hides those arrows too, and a client left
+with none draws no card.
+
+Each captured row keeps the address of the client that sent it to the proxy
+(`client_address`): a browser on this machine is `127.0.0.1`, a phone on the
+network its own address. A card names that address when there is one, or how
+many. Rows Sniper sent itself carry none, nor do rows captured before it was
+kept.
 
 The API and the CLI carry `clients`, busiest first and at most 16 (`kind`,
 `name`, `versions`, the major versions its rows named, newest first and at most
-eight, omitted when none, `os` when known, `request_count`, `origins` with
+eight, omitted when none, `os` when known, `request_count`, `addresses`, the IP
+addresses it connected from, at most eight, omitted when none, `origins` with
 each origin's `request_count` and `entry_kinds`, the client's own rows there by
 request kind, at most 64 origins, and `evidence`), omitted when no row was
 analyzed.

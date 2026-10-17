@@ -1337,6 +1337,57 @@ fn whole_history_cache_serves_an_unchanged_or_recent_map() {
     );
 }
 
+// A client lists the addresses it connected to the proxy from, at most eight;
+// a row from before addresses were kept adds none.
+#[test]
+fn clients_name_the_addresses_they_connected_from() {
+    let session = Uuid::from_u128(110);
+    let chrome = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+    let row = |user_agent: &str, address: Option<&str>, sequence| {
+        let mut record = filter_fixture("www.example.com", "/", 200, "text/html", None, sequence);
+        let mut request = http::HeaderMap::new();
+        request.insert(http::header::USER_AGENT, user_agent.parse().unwrap());
+        record.request = MessageRecord::from_headers_and_body(&request, b"", 0);
+        record.client_address = address.map(|value| value.parse().unwrap());
+        record
+    };
+    let mut records = vec![
+        row(chrome, Some("127.0.0.1"), 1),
+        row(chrome, Some("192.168.0.12"), 2),
+        row(chrome, Some("127.0.0.1"), 3),
+        row(chrome, None, 4),
+    ];
+    records.extend((0..10).map(|index| {
+        row(
+            "okhttp/4.12.0",
+            Some(&format!("192.168.0.{}", 30 + index)),
+            10 + index,
+        )
+    }));
+    let store = TransactionStore::from_records(records);
+    let (map, _) = store
+        .service_map_all_rows_blocking(
+            session,
+            technology::CatalogVersion::V2,
+            &crate::store::ListFilters::default(),
+            false,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    let addresses = |name: &str| {
+        map.clients
+            .iter()
+            .find(|client| client.name == name)
+            .unwrap()
+            .addresses
+            .clone()
+    };
+    assert_eq!(addresses("Chrome"), ["127.0.0.1", "192.168.0.12"]);
+    assert_eq!(addresses("OkHttp").len(), 8, "at most eight");
+}
+
 // Each row's User-Agent names its client; the map counts its rows per origin,
 // and apart those it sent itself, with no Origin or Referer.
 #[test]

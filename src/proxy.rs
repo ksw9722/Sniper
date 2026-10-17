@@ -141,6 +141,26 @@ impl FrozenSocketPeerCapture {
     }
 }
 
+tokio::task_local! {
+    /// The address of the client whose connection this task serves, for the
+    /// records it makes. Set once per accepted connection, and carried into
+    /// the tunnel, MITM and WebSocket work that connection starts.
+    static CLIENT_ADDRESS: IpAddr;
+}
+
+fn current_client_address() -> Option<IpAddr> {
+    CLIENT_ADDRESS.try_with(|address| *address).ok()
+}
+
+/// Gives a record the address of the client this task serves, unless it
+/// already carries one.
+fn with_client_address(mut record: TransactionRecord) -> TransactionRecord {
+    if record.client_address.is_none() {
+        record.client_address = current_client_address();
+    }
+    record
+}
+
 struct StreamedRecordContext {
     state: Arc<AppState>,
     session: Arc<SessionContext>,
@@ -162,6 +182,8 @@ struct StreamedRecordContext {
     request_version: Option<Version>,
     response_version: Version,
     observed_socket_peer: Option<ObservedSocketPeer>,
+    /// Kept here because the body completes in a task of its own.
+    client_address: Option<IpAddr>,
     max_preview: usize,
 }
 
@@ -470,8 +492,12 @@ pub async fn serve_proxy(listener: TcpListener, state: Arc<AppState>) -> Result<
         let (abort, registration) = AbortHandle::new_pair();
         remember_proxy_connection(connection_id, abort);
         tokio::spawn(async move {
-            let service =
-                service_fn(move |request| handle_request(request, state.clone(), peer_addr));
+            let service = service_fn(move |request| {
+                CLIENT_ADDRESS.scope(
+                    peer_addr.ip(),
+                    handle_request(request, state.clone(), peer_addr),
+                )
+            });
 
             let connection = http1::Builder::new()
                 .preserve_header_case(true)
@@ -2492,7 +2518,10 @@ async fn serve_passthrough_tunnel(
         Some(Version::HTTP_11),
     );
     let record_id = record.id;
-    let (insert_outcome, _record_protection) = session.store.insert_in_progress(record).await;
+    let (insert_outcome, _record_protection) = session
+        .store
+        .insert_in_progress(with_client_address(record))
+        .await;
     persist_transaction_insert_outcome(&state, &session, insert_outcome).await;
 
     let result = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
@@ -3587,7 +3616,7 @@ async fn insert_transaction_quiet(
     record: TransactionRecord,
     _context: &'static str,
 ) -> crate::store::TransactionInsertOutcome {
-    session.store.insert(record).await
+    session.store.insert(with_client_address(record)).await
 }
 
 async fn update_transaction_record_quiet(
@@ -3911,6 +3940,7 @@ async fn execute_streaming_http_exchange(
                 request_version: request_http_version,
                 response_version,
                 observed_socket_peer,
+                client_address: current_client_address(),
                 max_preview: state.config.body_preview_bytes,
             };
 
@@ -4130,7 +4160,11 @@ impl StreamedRecordContext {
         notes.push("Streaming response capture is still in progress.".to_string());
         let record = self.build_record(Vec::new(), 0, notes);
         self.record_id = Some(record.id);
-        let (insert_outcome, protection) = self.session.store.insert_in_progress(record).await;
+        let (insert_outcome, protection) = self
+            .session
+            .store
+            .insert_in_progress(with_client_address(record))
+            .await;
         self._record_protection = Some(protection);
         persist_transaction_insert_outcome(&self.state, &self.session, insert_outcome).await;
     }
@@ -4201,6 +4235,7 @@ impl StreamedRecordContext {
             Some(self.response_version),
         )
         .with_observed_socket_peer(self.observed_socket_peer.clone())
+        .with_client_address(self.client_address)
     }
 }
 
@@ -5833,9 +5868,14 @@ where
     let session_owner = remember_active_proxy_session_owner(session_id, reason);
     remember_proxy_connection(connection_id, abort.clone());
     remember_session_task(session_id, connection_id, reason, abort);
+    let client = current_client_address();
     tokio::spawn(async move {
         let _session_owner = session_owner;
-        let _ = Abortable::new(future, registration).await;
+        let work = Abortable::new(future, registration);
+        let _ = match client {
+            Some(address) => CLIENT_ADDRESS.scope(address, work).await,
+            None => work.await,
+        };
         forget_session_task(session_id, connection_id);
         forget_proxy_connection(connection_id);
     });
@@ -6799,6 +6839,7 @@ mod tests {
             request_version: Some(Version::HTTP_11),
             response_version: response.version(),
             observed_socket_peer: peer_capture.observe_response(response),
+            client_address: None,
             max_preview: 1024,
         }
     }
@@ -7688,6 +7729,7 @@ mod tests {
             request_version: Some(Version::HTTP_11),
             response_version: Version::HTTP_11,
             observed_socket_peer: None,
+            client_address: None,
             max_preview: 1024,
         };
 
@@ -7758,6 +7800,7 @@ mod tests {
             request_version: Some(Version::HTTP_11),
             response_version: Version::HTTP_11,
             observed_socket_peer: observed_socket_peer.clone(),
+            client_address: None,
             max_preview: 1024,
         };
 
