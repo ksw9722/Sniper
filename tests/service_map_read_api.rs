@@ -1860,3 +1860,200 @@ async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
     drop(state);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// An origin's API as OpenAPI 3.1: ID segments as path templates, query and
+// body fields typed but without their values, statuses with media types and
+// the credentials the rows showed. Pages, preflights and other origins are
+// left out, and only the active session is read, by the API and the CLI alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_map_openapi_describes_an_origins_api_without_its_values() {
+    let dir = std::env::temp_dir().join(format!("sniper-map-openapi-{}", Uuid::new_v4()));
+    let state = Arc::new(
+        AppState::new(AppConfig {
+            data_dir: dir.clone(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 1024,
+        })
+        .unwrap(),
+    );
+    let session = state.session().await;
+    let session_id = session.id();
+    let row = |method: &str,
+               host: &str,
+               path: &str,
+               request: &[(&str, &str)],
+               body: &[u8],
+               status: u16,
+               response_type: Option<&str>| {
+        let mut headers = HeaderMap::new();
+        for (name, value) in request {
+            headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        let mut response = HeaderMap::new();
+        if let Some(content_type) = response_type {
+            response.insert("content-type", content_type.parse().unwrap());
+        }
+        TransactionRecord::http(
+            chrono::Utc::now(),
+            method.into(),
+            "https".into(),
+            host.into(),
+            path.into(),
+            Some(status),
+            1,
+            MessageRecord::from_headers_and_body(&headers, body, 4096),
+            Some(MessageRecord::from_headers_and_body(&response, b"", 1024)),
+            Vec::new(),
+            None,
+            None,
+        )
+    };
+    let bearer = [("authorization", "Bearer SYNTHETIC_PRIVATE_TOKEN")];
+    for record in [
+        row(
+            "GET",
+            "api.example.com",
+            "/v1/items/12?page=2",
+            &bearer,
+            b"",
+            200,
+            Some("application/json"),
+        ),
+        row(
+            "GET",
+            "api.example.com",
+            "/v1/items/34?page=3",
+            &bearer,
+            b"",
+            404,
+            None,
+        ),
+        row(
+            "POST",
+            "api.example.com",
+            "/v1/items",
+            &[("content-type", "application/json")],
+            br#"{"name":"SYNTHETIC_PRIVATE_NAME","count":5}"#,
+            201,
+            Some("application/json; charset=utf-8"),
+        ),
+        row(
+            "OPTIONS",
+            "api.example.com",
+            "/v1/items",
+            &[],
+            b"",
+            204,
+            None,
+        ),
+        row(
+            "GET",
+            "api.example.com",
+            "/",
+            &[],
+            b"",
+            200,
+            Some("text/html"),
+        ),
+        row(
+            "GET",
+            "other.example.com",
+            "/v1/elsewhere",
+            &[],
+            b"",
+            200,
+            Some("application/json"),
+        ),
+    ] {
+        session.store.insert(record).await;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let app = sniper::api::router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let origin = "https://api.example.com";
+    let get = |session: Uuid, origin: &str| {
+        client
+            .get(format!("{api}/api/target/service-map/openapi"))
+            .query(&[
+                ("session_id", session.to_string()),
+                ("origin", origin.to_string()),
+            ])
+            .send()
+    };
+
+    let document: Value = get(session_id, origin).await.unwrap().json().await.unwrap();
+    assert_eq!(document["openapi"], "3.1.0");
+    assert_eq!(document["servers"], json!([{"url": origin}]));
+    let paths = document["paths"].as_object().unwrap();
+    assert_eq!(
+        paths.keys().collect::<Vec<_>>(),
+        ["/v1/items", "/v1/items/{number}"]
+    );
+    assert_eq!(
+        paths["/v1/items"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["post"]
+    );
+    let item = &paths["/v1/items/{number}"];
+    assert_eq!(item["parameters"][0]["name"], "number");
+    assert_eq!(item["parameters"][0]["in"], "path");
+    assert_eq!(
+        item["get"]["parameters"],
+        json!([{"name": "page", "in": "query", "schema": {"type": "integer"}}])
+    );
+    assert_eq!(
+        item["get"]["responses"],
+        json!({
+            "200": {"description": "OK", "content": {"application/json": {}}},
+            "404": {"description": "Not Found"},
+        })
+    );
+    assert_eq!(item["get"]["security"], json!([{"bearer": []}]));
+    assert_eq!(item["get"]["x-sniper-requests"], 2);
+    assert_eq!(
+        paths["/v1/items"]["post"]["requestBody"],
+        json!({"content": {"application/json": {"schema": {"type": "object", "properties": {
+            "count": {"type": "integer"},
+            "name": {"type": "string"},
+        }}}}})
+    );
+    assert_eq!(
+        document["components"]["securitySchemes"],
+        json!({"bearer": {"type": "http", "scheme": "bearer"}})
+    );
+    assert!(document["info"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("1 operations that only answered with pages or static files are left out"));
+    assert!(!document.to_string().contains("SYNTHETIC_PRIVATE"));
+
+    let via_cli = read(
+        &dir,
+        &api,
+        "target.service_map.openapi.get",
+        json!({"session_id": session_id, "origin": origin}),
+    )
+    .await;
+    assert_eq!(via_cli, document);
+
+    let inactive = get(Uuid::new_v4(), origin).await.unwrap();
+    assert_eq!(inactive.status(), reqwest::StatusCode::CONFLICT);
+    let bad = get(session_id, "https://api.example.com/").await.unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+    drop(session);
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
+}

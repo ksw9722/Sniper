@@ -480,6 +480,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_parameters),
         )
         .route(
+            "/api/target/service-map/openapi",
+            get(get_target_service_map_openapi),
+        )
+        .route(
             "/api/target/service-map/favicon",
             get(get_target_service_map_favicon),
         )
@@ -5793,6 +5797,49 @@ async fn get_target_service_map_parameters(
             .await,
     )
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceMapOpenApiQuery {
+    session_id: Uuid,
+    origin: String,
+}
+
+// One origin's API as an OpenAPI 3.1 document, built from its retained rows.
+// Its parameters come from retained request bodies, so like the parameters of
+// one endpoint it serves the active session only.
+async fn get_target_service_map_openapi(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapOpenApiQuery>,
+) -> Response {
+    if crate::service_map::canonical_origin(&query.origin).as_deref() != Some(query.origin.as_str())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "origin must be a canonical HTTP(S) origin without credentials, path, query, or fragment",
+        )
+            .into_response();
+    }
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return (
+            StatusCode::CONFLICT,
+            "Only the active session's rows can be read; open that session first",
+        )
+            .into_response();
+    }
+    match session
+        .store
+        .service_map_openapi(session.id(), &query.origin)
+        .await
+    {
+        Some(document) => Json(document).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The OpenAPI description could not be built",
+        )
+            .into_response(),
+    }
 }
 
 // An origin's icon from retained history, for its map card. It reads a

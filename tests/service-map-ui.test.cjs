@@ -37,7 +37,7 @@ function node() {
     get replacements() { return replacements; },
   };
 }
-function fixture() {
+function fixture(options = {}) {
   let session = 'session-one';
   const requests = [];
   const els = Object.fromEntries(['panel', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
@@ -47,7 +47,7 @@ function fixture() {
   // Opening an endpoint reads its parameters; these tests are about the other
   // reads, so that one is kept apart and left pending.
   const parameterRequests = [];
-  const controller = map.createController({ elements: els, getSessionId: () => session, document, request(url, options) { const pending = deferred(); (url.startsWith('/api/target/service-map/parameters?') ? parameterRequests : requests).push({ url, options, ...pending }); return pending.promise; } });
+  const controller = map.createController({ elements: els, getSessionId: () => session, document, request(url, options) { const pending = deferred(); (url.startsWith('/api/target/service-map/parameters?') ? parameterRequests : requests).push({ url, options, ...pending }); return pending.promise; }, ...options });
   controller.setVisible(true);
   return { controller, els, requests, parameterRequests, document, state: controller.getState(), setSession(value) { session = value; }, async load(payload = snapshot()) { const pending = controller.refresh(); requests.at(-1).resolve(response(payload)); await pending; } };
 }
@@ -2968,4 +2968,31 @@ test('a failed explicit retry pauses again without automatic fallback', async ()
   f.requests.at(-1).resolve(boundedMapError(500, 'build_failed')); await new Promise(resolve => setImmediate(resolve));
   await pollRealTargetMap(f); await f.controller.refresh({ force: true });
   assert.equal(f.requests.length, before + 1); assert.equal(f.state.refreshPaused, true);
+});
+
+test('Copy OpenAPI reads the selected origin from the active session and hands the clipboard the reading', async () => {
+  const copies = [];
+  const f = fixture({ copyText(button, text, label) { copies.push({ button, text, label }); return text.catch(() => {}); } });
+  await f.load(); f.controller.selectOrigin(originB);
+  assert.match(f.els.detail.innerHTML, /data-service-openapi="https:\/\/api\.example\.com"[^>]*>Copy OpenAPI</);
+  const button = { dataset: { serviceOpenapi: originB } };
+  f.els.panel.dispatch('click', { target: { closest: () => button } });
+  const read = f.requests.at(-1);
+  assert.equal(read.url, '/api/target/service-map/openapi?session_id=session-one&origin=https%3A%2F%2Fapi.example.com');
+  assert.equal(read.options.redirect, 'error');
+  assert.equal(copies.length, 1); assert.equal(copies[0].button, button); assert.equal(copies[0].label, 'Copied OpenAPI');
+  read.resolve(response({ openapi: '3.1.0', paths: {} }));
+  assert.equal(await copies[0].text, JSON.stringify({ openapi: '3.1.0', paths: {} }, null, 2));
+});
+test('Copy OpenAPI names an inactive session, and only API origins offer it', async () => {
+  const copies = [];
+  const f = fixture({ copyText(button, text) { copies.push(text); return text.catch(() => {}); } });
+  await f.load(); f.controller.selectOrigin(originB);
+  f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceOpenapi: originB } }) } });
+  f.requests.at(-1).resolve(response({}, 409));
+  await assert.rejects(copies[0], /active session only/);
+  const page = origin('https://www.example.com', [{ method: 'GET', path: '/', request_count: 1, statuses: [200], content_types: ['text/html'], evidence: ['page-one'] }]);
+  await f.load(snapshot([page])); f.controller.selectOrigin('https://www.example.com');
+  assert.match(f.els.detail.innerHTML, /Hide from map/);
+  assert.doesNotMatch(f.els.detail.innerHTML, /data-service-openapi/);
 });

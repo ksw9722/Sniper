@@ -1381,7 +1381,7 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, document: doc = root.document }) {
     // Request kinds whose links are not drawn. The app keeps them in UI
     // settings; without it they live for this controller only.
     let localHiddenLinkKinds = [...DEFAULT_HIDDEN_LINK_KINDS];
@@ -2105,6 +2105,18 @@
     }
     // An endpoint's parameters are read as soon as it is opened, not behind a
     // button: each name, where it was sent and a few values, from its newest rows.
+    // An origin's API as an OpenAPI document, for Swagger UI, Postman or Burp.
+    // The text goes to the clipboard while it is still being read: WebKit lets
+    // a click write the clipboard after a read only when handed the promise.
+    function copyOpenApi(button, originId) {
+      if (!copyText) return;
+      const params = new URLSearchParams({ session_id: getSessionId(), origin: originId });
+      const text = request(`/api/target/service-map/openapi?${params}`).then((response) => {
+        if (!response.ok) throw new Error(response.status === 409 ? "OpenAPI is read from the active session only" : "OpenAPI unavailable");
+        return response.json();
+      }).then((document) => JSON.stringify(document, null, 2));
+      return copyText(button, text, "Copied OpenAPI");
+    }
     async function loadParameters(originId, endpoint) {
       const key = JSON.stringify([originId, endpoint.method, endpoint.path]);
       if (state.parametersKey === key && (state.parameters || state.parametersLoading)) return;
@@ -3116,7 +3128,9 @@
       const site = siteKey(origin.origin);
       const hiddenAs = display.hidden.includes(origin.origin) ? origin.origin : site && display.hidden.includes(site) ? site : null;
       const regroup = site && display.groupSites && display.expandedSites.includes(site);
-      return `<div class="service-map-overlay-actions service-map-origin-actions">${hiddenAs ? `<button class="secondary-action" type="button" data-service-unhide="${escape(hiddenAs)}" data-service-focus="origin:unhide">${hiddenAs === origin.origin ? "Show on map" : `Show *.${escape(site)} on map`}</button>` : `<button class="secondary-action" type="button" data-service-hide="${escape(origin.origin)}" data-service-focus="origin:hide">Hide from map</button>`}${regroup ? `<button class="secondary-action" type="button" data-service-site-collapse="${escape(site)}" data-service-focus="origin:regroup">Group *.${escape(site)} again</button>` : ""}</div>`;
+      const openApi = origin.captured && originRoles(origin).some((role) => role === "api" || role === "auth")
+        ? `<button class="secondary-action" type="button" data-service-openapi="${escape(origin.origin)}" data-service-focus="origin:openapi" title="Copy an OpenAPI 3.1 description of what this origin's retained rows show, without their values">Copy OpenAPI</button>` : "";
+      return `<div class="service-map-overlay-actions service-map-origin-actions">${openApi}${hiddenAs ? `<button class="secondary-action" type="button" data-service-unhide="${escape(hiddenAs)}" data-service-focus="origin:unhide">${hiddenAs === origin.origin ? "Show on map" : `Show *.${escape(site)} on map`}</button>` : `<button class="secondary-action" type="button" data-service-hide="${escape(origin.origin)}" data-service-focus="origin:hide">Hide from map</button>`}${regroup ? `<button class="secondary-action" type="button" data-service-site-collapse="${escape(site)}" data-service-focus="origin:regroup">Group *.${escape(site)} again</button>` : ""}</div>`;
     }
     function renderDetail() {
       const client = state.selectedClient ? clientById(state.selectedClient) : null;
@@ -3234,6 +3248,7 @@
       else if (data.serviceClient) selectClient(data.serviceClient);
       else if (data.serviceSiteExpand) expandSite(data.serviceSiteExpand);
       else if (data.serviceSiteCollapse) saveSiteDisplay({ expandedSites: siteDisplay().expandedSites.filter((site) => site !== data.serviceSiteCollapse) });
+      else if (data.serviceOpenapi) copyOpenApi(button, data.serviceOpenapi);
       else if (data.serviceHide) {
         if (state.selectedSite === data.serviceHide) state.selectedSite = null;
         saveSiteDisplay({ hidden: [...new Set([...siteDisplay().hidden, data.serviceHide])] });

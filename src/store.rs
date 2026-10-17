@@ -642,6 +642,94 @@ fn validate_service_map_body_locator(
     Ok(())
 }
 
+/// A path without its fragment, split from its query string.
+fn path_and_query(path: &str) -> (&str, Option<&str>) {
+    let path = path.split('#').next().unwrap_or("");
+    match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    }
+}
+
+/// A row for a parameter read: its query, and its request body or, when the
+/// row still owns one, the locator to read it from.
+fn parameter_row(
+    inner: &StoreInner,
+    index: usize,
+    session_id: Uuid,
+    generation: Uuid,
+    query: Option<&str>,
+) -> crate::service_map_parameters::ParameterRow {
+    let record = &inner.entries[index];
+    let locator = (inner.by_id.get(&record.id) == Some(&index))
+        .then(|| inner.locators.get(&record.id).copied())
+        .flatten();
+    crate::service_map_parameters::ParameterRow {
+        key: crate::service_map::EvidenceKey {
+            session_id,
+            generation,
+            sequence: record.sequence,
+            revision: inner.body_generations[index],
+            record_id: record.id,
+        },
+        query: query.map(str::to_string),
+        content_type: record.request.content_type.clone(),
+        // Only a body's start is parsed (`ParameterTally::add_row`), so only
+        // that much of an unsaved one is copied.
+        body: (locator.is_none() && record.request.body_encoding == BodyEncoding::Utf8).then(
+            || {
+                let body = &record.request.body_preview;
+                let mut end = body
+                    .len()
+                    .min(crate::service_map_parameters::MAX_BODY_BYTES);
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body[..end].to_string()
+            },
+        ),
+        locator,
+    }
+}
+
+/// A parameter row's request body: held in memory, or read from its locator
+/// while `budget` lasts. None when the budget did not cover it; empty when it
+/// cannot be shown to be this row's UTF-8 body.
+fn parameter_body(
+    inner: &RwLock<StoreInner>,
+    file: Option<&mut fs::File>,
+    file_generation: Uuid,
+    budget: &mut usize,
+    row: &mut crate::service_map_parameters::ParameterRow,
+) -> Option<String> {
+    match (row.body.take(), row.locator, file) {
+        (Some(body), _, _) => Some(body),
+        (None, Some(locator), Some(_)) if locator.len as usize > *budget => None,
+        (None, Some(locator), Some(file)) => {
+            *budget -= locator.len as usize;
+            let current = validate_service_map_body_locator(
+                &inner.blocking_read(),
+                &row.key,
+                file_generation,
+                locator,
+            );
+            Some(
+                current
+                    .ok()
+                    .and_then(|_| {
+                        crate::service_map_parameters::read_request_body(
+                            file,
+                            locator,
+                            row.key.record_id,
+                        )
+                    })
+                    .unwrap_or_default(),
+            )
+        }
+        _ => Some(String::new()),
+    }
+}
+
 #[cfg(test)]
 type ServiceMapBodyReadHook = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -2553,8 +2641,7 @@ impl TransactionStore {
         path: &str,
     ) -> crate::service_map_parameters::EndpointParameters {
         use crate::service_map_parameters::{
-            read_request_body, EndpointParameters, ParameterRow, ParameterTally, MAX_ROWS,
-            MAX_TOTAL_BODY_BYTES,
+            EndpointParameters, ParameterTally, MAX_ROWS, MAX_TOTAL_BODY_BYTES,
         };
         let mut result =
             EndpointParameters::new(session_id, origin.into(), method.into(), path.into());
@@ -2562,11 +2649,7 @@ impl TransactionStore {
         let file_generation = {
             let inner = self.inner.read().await;
             for (index, record) in inner.entries.iter().enumerate().rev() {
-                let (record_path, query) =
-                    match record.path.split('#').next().unwrap_or("").split_once('?') {
-                        Some((record_path, query)) => (record_path, Some(query)),
-                        None => (record.path.split('#').next().unwrap_or(""), None),
-                    };
+                let (record_path, query) = path_and_query(&record.path);
                 if record.method != method
                     || record_path != path
                     || crate::service_map::canonical_origin(&format!(
@@ -2582,23 +2665,13 @@ impl TransactionStore {
                     result.more_rows = true;
                     break;
                 }
-                let locator = (inner.by_id.get(&record.id) == Some(&index))
-                    .then(|| inner.locators.get(&record.id).copied())
-                    .flatten();
-                rows.push(ParameterRow {
-                    key: crate::service_map::EvidenceKey {
-                        session_id,
-                        generation: self.saved_cursor_generation,
-                        sequence: record.sequence,
-                        revision: inner.body_generations[index],
-                        record_id: record.id,
-                    },
-                    query: query.map(str::to_string),
-                    content_type: record.request.content_type.clone(),
-                    body: (locator.is_none() && record.request.body_encoding == BodyEncoding::Utf8)
-                        .then(|| record.request.body_preview.clone()),
-                    locator,
-                });
+                rows.push(parameter_row(
+                    &inner,
+                    index,
+                    session_id,
+                    self.saved_cursor_generation,
+                    query,
+                ));
             }
             inner.file_generation
         };
@@ -2611,32 +2684,20 @@ impl TransactionStore {
                 storage_dir.and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok());
             let mut tally = ParameterTally::default();
             let (mut read, mut budget, mut unread) = (0, MAX_TOTAL_BODY_BYTES, 0);
-            for row in rows {
-                let body = match (row.body, row.locator, file.as_mut()) {
-                    (Some(body), _, _) => body,
-                    (None, Some(locator), Some(_)) if locator.len as usize > budget => {
-                        unread += 1;
-                        String::new()
-                    }
-                    (None, Some(locator), Some(file)) => {
-                        budget -= locator.len as usize;
-                        let current = validate_service_map_body_locator(
-                            &inner.blocking_read(),
-                            &row.key,
-                            file_generation,
-                            locator,
-                        );
-                        match current
-                            .ok()
-                            .and_then(|_| read_request_body(file, locator, row.key.record_id))
-                        {
-                            Some(body) => body,
-                            None => String::new(),
-                        }
-                    }
-                    _ => String::new(),
-                };
-                tally.add_row(row.query.as_deref(), row.content_type.as_deref(), &body);
+            for mut row in rows {
+                let body = parameter_body(
+                    &inner,
+                    file.as_mut(),
+                    file_generation,
+                    &mut budget,
+                    &mut row,
+                );
+                unread += usize::from(body.is_none());
+                tally.add_row(
+                    row.query.as_deref(),
+                    row.content_type.as_deref(),
+                    body.as_deref().unwrap_or(""),
+                );
                 read += 1;
             }
             (tally.finish(), read, unread)
@@ -2654,6 +2715,121 @@ impl TransactionStore {
             }
         }
         result
+    }
+
+    /// One origin's API in OpenAPI (`service_map_openapi`), from every retained
+    /// row of it. Parameters come from each operation's newest rows, within the
+    /// same body budget as one endpoint's parameters.
+    pub async fn service_map_openapi(
+        &self,
+        session_id: Uuid,
+        origin: &str,
+    ) -> Option<serde_json::Value> {
+        use crate::service_map_openapi::{
+            document, media_type, operation_path, Operation, MAX_OPERATIONS,
+            MAX_ROWS_PER_OPERATION, METHODS,
+        };
+        use crate::service_map_parameters::{ParameterTally, MAX_TOTAL_BODY_BYTES};
+        let inner = Arc::clone(&self.inner);
+        let storage_dir = self.storage_dir.clone();
+        let generation = self.saved_cursor_generation;
+        let origin = origin.to_string();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut found: std::collections::BTreeMap<(String, String), (Operation, Vec<_>)> =
+                Default::default();
+            let mut omitted = std::collections::BTreeSet::new();
+            let mut held = 0;
+            // ponytail: one read-locked pass over the history; read it in
+            // chunks as the map does if exporting a huge session stalls capture.
+            let file_generation = {
+                let inner = inner.blocking_read();
+                let mut same_origin = HashMap::new();
+                for (index, record) in inner.entries.iter().enumerate().rev() {
+                    let method = record.method.to_ascii_lowercase();
+                    let (path, query) = path_and_query(&record.path);
+                    if !METHODS.contains(&method.as_str())
+                        || !path.starts_with('/')
+                        || !*same_origin
+                            .entry((record.scheme.as_str(), record.host.as_str()))
+                            .or_insert_with(|| {
+                                crate::service_map::canonical_origin(&format!(
+                                    "{}://{}",
+                                    record.scheme, record.host
+                                ))
+                                .as_deref()
+                                    == Some(origin.as_str())
+                            })
+                    {
+                        continue;
+                    }
+                    let key = (operation_path(path), method);
+                    if found.len() == MAX_OPERATIONS && !found.contains_key(&key) {
+                        omitted.insert(key);
+                        continue;
+                    }
+                    let (operation, rows) = found.entry(key).or_default();
+                    operation.requests += 1;
+                    if let Some(status) = record.status.filter(|status| (100..600).contains(status))
+                    {
+                        let types = operation.responses.entry(status).or_default();
+                        types.extend(
+                            record
+                                .response
+                                .as_ref()
+                                .and_then(|response| response.content_type.as_deref())
+                                .and_then(media_type),
+                        );
+                    }
+                    if record.request.body_size > 0 {
+                        let request_type = record.request.content_type.as_deref();
+                        operation
+                            .request_types
+                            .extend(request_type.and_then(media_type));
+                    }
+                    operation
+                        .auth
+                        .extend(crate::service_map_auth::detect(record));
+                    if rows.len() < MAX_ROWS_PER_OPERATION {
+                        let mut row = parameter_row(&inner, index, session_id, generation, query);
+                        // Unsaved bodies held for the read share its budget,
+                        // so thousands of them cannot pile up in memory.
+                        held += row.body.as_ref().map_or(0, String::len);
+                        if held > MAX_TOTAL_BODY_BYTES {
+                            row.body = None;
+                        }
+                        rows.push(row);
+                    }
+                }
+                inner.file_generation
+            };
+            let mut file =
+                storage_dir.and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok());
+            let mut budget = MAX_TOTAL_BODY_BYTES;
+            let operations = found
+                .into_iter()
+                .map(|(key, (mut operation, rows))| {
+                    let mut tally = ParameterTally::default();
+                    for mut row in rows {
+                        let body = parameter_body(
+                            &inner,
+                            file.as_mut(),
+                            file_generation,
+                            &mut budget,
+                            &mut row,
+                        );
+                        tally.add_row(
+                            row.query.as_deref(),
+                            row.content_type.as_deref(),
+                            body.as_deref().unwrap_or(""),
+                        );
+                    }
+                    operation.parameters = tally.finish().0;
+                    (key, operation)
+                })
+                .collect();
+            document(&origin, &operations, omitted.len())
+        });
+        task.await.ok()
     }
 
     pub async fn site_map_records(&self) -> Vec<SiteMapRecord> {

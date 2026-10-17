@@ -109,7 +109,10 @@ GUI map covers every retained row, so its counts can exceed a CLI read limited
 to `max_records`; `--all-rows` (`all_rows: true`) reads every row too.
 `scope service-map parameters --session-id <active-uuid> --origin <origin>
 --method <method> --path <path>` lists one endpoint's parameters from its newest
-retained rows. A client's `versions` are the major versions its rows named.
+retained rows, and `scope service-map openapi --session-id <active-uuid>
+--origin <origin>` describes the origin's API as an OpenAPI 3.1 document: path
+templates, parameter and body field names with guessed types, statuses, media
+types and the credentials its rows showed, never captured values. A client's `versions` are the major versions its rows named.
 An origin's `auth` and an endpoint's `auth` name how requests authenticate
 (Authorization scheme, API key header, session or JWT cookie, query key,
 OAuth, OIDC, SAML) from names and shapes only, never values.
@@ -292,7 +295,8 @@ The map is built for a model to read as well as a person. A workable order:
    row, read the other headers and the body, and decide; say how sure you are
    and why.
 4. Group endpoints by `path_group` before describing an API; one template
-   stands for many concrete IDs.
+   stands for many concrete IDs. `scope service-map openapi` gives an origin's
+   API grouped that way, as OpenAPI 3.1, to hand to another tool.
 5. Roles are not in the JSON. An origin that serves HTML pages and API data
    (JSON, XML) is both; one whose typed endpoints are mostly sign-in, token and
    logout paths (OAuth, OIDC, SAML, CAS), or that names an identity provider,

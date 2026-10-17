@@ -986,6 +986,21 @@ enum ServiceMapCommand {
         after_help = "Requires the current active session UUID. Reads the endpoint's newest 200 retained rows: query string pairs, and form, top-level JSON or multipart body fields from each body's first 64 KiB, at most 32 MiB of retained rows per read. Lists each parameter's name, where it was sent, the rows that carried it and up to three values as captured, each cut to 80 characters. No target requests, inactive-session loading or automatic reads."
     )]
     Parameters(ServiceMapParametersArgs),
+    /// Describe one origin's API as an OpenAPI 3.1 document, from its retained rows.
+    #[command(
+        after_help = "Requires the current active session UUID. Reads every retained row of the origin: each method and path template (ID segments as {number}, {uuid} and {hex}), query and form, top-level JSON or multipart body field names from each operation's newest 20 rows with a type guessed from their values, response statuses with media types, and the credentials the rows showed as security schemes. No captured value is included. Operations that only answered with pages or static files, OPTIONS requests and methods OpenAPI cannot hold are left out; at most 500 operations are listed. No target requests, inactive-session loading or automatic reads."
+    )]
+    Openapi(ServiceMapOpenApiArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapOpenApiArgs {
+    /// Explicit current active session UUID; an inactive session is refused.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Exact canonical HTTP(S) origin to describe.
+    #[arg(long, value_parser = parse_service_map_origin)]
+    origin: String,
 }
 
 #[derive(Args, Debug)]
@@ -2734,6 +2749,7 @@ impl TargetCommand {
                     "target.service_map.socket_peer_matches.get"
                 }
                 Some(ServiceMapCommand::Parameters(_)) => "target.service_map.parameters.get",
+                Some(ServiceMapCommand::Openapi(_)) => "target.service_map.openapi.get",
                 None => "target.service_map.get",
             },
             TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
@@ -3817,6 +3833,26 @@ fn service_map_parameters_output_schema() -> Value {
     result
 }
 
+fn service_map_openapi_output_schema() -> Value {
+    use sniper::service_map_openapi::MAX_OPERATIONS;
+    json!({
+        "type":"object",
+        "description":"An OpenAPI 3.1 document of what one origin's retained rows showed (https://spec.openapis.org/oas/v3.1.0). Path templates mark ID segments as {number}, {uuid} and {hex}; parameter and body field types are guessed from captured values, which are not included. Each operation's x-sniper-requests counts the rows it stands for; security lists each credential the rows showed as an alternative, not what the server requires.",
+        "required":["openapi","info","servers","paths"],
+        "properties":{
+            "openapi":{"type":"string","enum":["3.1.0"]},
+            "info":{"type":"object","required":["title","version","description"],"properties":{
+                "title":{"type":"string","description":"The origin."},
+                "version":{"type":"string","enum":["observed"]},
+                "description":{"type":"string","description":"How many rows it was built from, and what was left out."}
+            }},
+            "servers":{"type":"array","minItems":1,"maxItems":1,"items":{"type":"object","required":["url"],"properties":{"url":{"type":"string"}}}},
+            "paths":{"type":"object","maxProperties":MAX_OPERATIONS,"propertyNames":{"pattern":"^/"}},
+            "components":{"type":"object","properties":{"securitySchemes":{"type":"object"}}}
+        }
+    })
+}
+
 fn service_map_html_generators_output_schema() -> Value {
     use sniper::service_map_html::{ACQUISITION_REASONS, PARSER_STOP_REASONS, TRUNCATION_REASONS};
     let span = service_map_object(json!({
@@ -4161,11 +4197,15 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             | "target.service_map.link_declarations.get"
             | "target.service_map.socket_peer_matches.get"
             | "target.service_map.parameters.get"
+            | "target.service_map.openapi.get"
     ) {
         return None;
     }
     if operation == "target.service_map.parameters.get" {
         return Some(service_map_parameters_output_schema());
+    }
+    if operation == "target.service_map.openapi.get" {
+        return Some(service_map_openapi_output_schema());
     }
     if operation == "target.service_map.socket_peer_matches.get" {
         return Some(service_map_socket_peer_matches_output_schema());
@@ -4537,6 +4577,13 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "path":{"type":"string","pattern":"^/[^?#]{0,4095}$","description":"The endpoint's exact path, without query or fragment."}
             }
         })),
+        "target.service_map.openapi.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","origin"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. An inactive session is refused; this read never loads or activates a session."),
+                "origin":{"type":"string","description":"Exact canonical HTTP(S) origin to describe, as a map card names it."}
+            }
+        })),
         "target.service_map.evidence.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
             "properties":{
@@ -4616,6 +4663,14 @@ fn service_map_parameters_path(args: &ServiceMapParametersArgs) -> String {
     )
 }
 
+fn service_map_openapi_path(args: &ServiceMapOpenApiArgs) -> String {
+    let query = encode_query(vec![("origin".into(), args.origin.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/openapi?{query}"),
+        Some(args.session_id),
+    )
+}
+
 fn service_map_html_generators_path(args: &ServiceMapHtmlGeneratorsArgs) -> String {
     let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
     session_query_path(
@@ -4672,6 +4727,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["session_id", "origin", "method", "path"],
             vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com","method":"GET","path":"/search"})],
+        ),
+        op(
+            "target.service_map.openapi.get",
+            "scope service-map openapi --session-id <uuid> --origin <origin>",
+            "Describe one origin's API as an OpenAPI 3.1 document built from all its retained rows: each method and path template with ID segments as {number}, {uuid} and {hex}, query and body field names with types guessed from their values, response statuses and media types, and the credentials the rows showed as security schemes. No captured value is included; operations that only served pages or static files are left out, and at most 500 are listed. Active session only; an inactive session is refused without loading or activation. No target requests or automatic reads.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "origin"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com"})],
         ),
         op(
             "target.service_map.html_generators.get",
@@ -5617,6 +5681,7 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         | "target.service_map.html_generators.get"
         | "target.service_map.link_declarations.get" => &["session_id", "evidence_id"],
         "target.service_map.parameters.get" => &["session_id", "origin", "method", "path"],
+        "target.service_map.openapi.get" => &["session_id", "origin"],
         "target.service_map.socket_peer_matches.get" => {
             &["session_id", "evidence_id", "in_scope_only", "max_records"]
         }
@@ -5820,6 +5885,9 @@ fn command_input_preview(command: &Command) -> Value {
                 Some(ServiceMapCommand::Parameters(args)) => json!({
                     "session_id":args.session_id,"origin":args.origin,
                     "method":args.method,"path":args.path,
+                }),
+                Some(ServiceMapCommand::Openapi(args)) => json!({
+                    "session_id":args.session_id,"origin":args.origin,
                 }),
                 None => {
                     let mut preview = json!({
@@ -6250,6 +6318,9 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 }
                 Some(ServiceMapCommand::Parameters(args)) => {
                     api_preview("GET", service_map_parameters_path(args), None)
+                }
+                Some(ServiceMapCommand::Openapi(args)) => {
+                    api_preview("GET", service_map_openapi_path(args), None)
                 }
                 Some(ServiceMapCommand::LinkDeclarations(args)) => {
                     api_preview("GET", service_map_link_declarations_path(args), None)
@@ -6754,8 +6825,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             | "target.service_map.link_declarations.get"
             | "target.service_map.socket_peer_matches.get"
             | "target.service_map.parameters.get"
+            | "target.service_map.openapi.get"
     ) {
-        if command.operation_name() == "target.service_map.parameters.get" {
+        if command.operation_name() == "target.service_map.openapi.get" {
+            notes.push("Explicit read of every retained row of one origin in an already active session. One GET after identity checks; no target requests, inactive-session loading, automatic reads, retries or fallback.");
+            notes.push("The document holds names, guessed types, statuses, media types and security schemes, never captured values. Parameters come from each operation's newest 20 rows, at most 32 MiB of retained rows per read; at most 500 operations are listed.");
+        } else if command.operation_name() == "target.service_map.parameters.get" {
             notes.push("Explicit read of one endpoint's newest 200 retained rows in an already active session. One GET after identity checks; no target requests, inactive-session loading, automatic reads, retries or fallback.");
             notes.push("Values are shown as captured, each cut to 80 characters, and may hold credentials or personal data. Request bodies are parsed from their first 64 KiB, at most 32 MiB of retained rows per read; unread_bodies counts the rest, whose query strings still count.");
         } else if command.operation_name() == "target.service_map.socket_peer_matches.get" {
@@ -7359,6 +7434,25 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                             evidence_id,
                         },
                     )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.openapi.get" => {
+            let origin: String = call_required(operation, input, "origin")?;
+            let args = ServiceMapOpenApiArgs {
+                session_id: call_required(operation, input, "session_id")?,
+                origin: parse_service_map_origin(&origin).map_err(|message| anyhow!(message))?,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::Openapi(args)),
                     session_id: None,
                     origin: None,
                     in_scope_only: false,
@@ -8699,6 +8793,7 @@ async fn run(cli: Cli) -> Result<()> {
                     | "target.service_map.link_declarations.get"
                     | "target.service_map.socket_peer_matches.get"
                     | "target.service_map.parameters.get"
+                    | "target.service_map.openapi.get"
                     | "capture.http.upstream_peer.get"
                     | "capture.http.upstream_peer.set"
             ) {
@@ -9604,6 +9699,24 @@ async fn service_map_get_with_catalog<T: DeserializeOwned>(
                 message: "The selected API does not support recorded socket peer matches; update the app to use this feature",
                 status: Some(404),
             }.into());
+        }
+        if path.starts_with("/api/target/service-map/openapi?") {
+            if status == StatusCode::NOT_FOUND {
+                return Err(ServiceMapCliError {
+                    code: "UNSUPPORTED_FEATURE",
+                    message: "The selected API does not describe origins in OpenAPI; update the app to use this feature",
+                    status: Some(404),
+                }
+                .into());
+            }
+            if status == StatusCode::CONFLICT {
+                return Err(ServiceMapCliError {
+                    code: "SESSION_INACTIVE",
+                    message: "OpenAPI reads the active session only; activate that session first",
+                    status: Some(409),
+                }
+                .into());
+            }
         }
         if status == StatusCode::NOT_FOUND
             && path.starts_with("/api/target/service-map/link-declarations?")
@@ -10849,6 +10962,50 @@ async fn read_service_map_parameters(
     Ok(result)
 }
 
+/// One origin's OpenAPI document, checked against the origin asked for and
+/// the server's own bounds before any of it is printed.
+fn validate_service_map_openapi_response(
+    document: &Value,
+    args: &ServiceMapOpenApiArgs,
+) -> Result<()> {
+    use sniper::service_map_openapi::{MAX_OPERATIONS, METHODS};
+    let paths = document["paths"].as_object();
+    let operations: usize = paths.map_or(0, |paths| {
+        paths
+            .values()
+            .map(|item| {
+                METHODS
+                    .iter()
+                    .filter(|method| item.get(**method).is_some())
+                    .count()
+            })
+            .sum()
+    });
+    let valid = document["openapi"] == "3.1.0"
+        && document["info"]["title"] == args.origin
+        && document["servers"] == json!([{ "url": args.origin }])
+        && paths.is_some_and(|paths| {
+            paths
+                .iter()
+                .all(|(path, item)| path.starts_with('/') && item.is_object())
+        })
+        && operations <= MAX_OPERATIONS;
+    if !valid {
+        return Err(service_map_error(
+            "INVALID_RESPONSE",
+            "The OpenAPI document does not match the requested origin or bounds",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_service_map_openapi(api: &ApiClient, args: &ServiceMapOpenApiArgs) -> Result<Value> {
+    let client = service_map_read_client()?;
+    let document: Value = service_map_get(api, &client, &service_map_openapi_path(args)).await?;
+    validate_service_map_openapi_response(&document, args)?;
+    Ok(document)
+}
+
 async fn read_service_map_html_generators(
     api: &ApiClient,
     args: &ServiceMapHtmlGeneratorsArgs,
@@ -10934,6 +11091,10 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             }
             Some(ServiceMapCommand::Parameters(args)) => {
                 let result = read_service_map_parameters(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::Openapi(args)) => {
+                let result = read_service_map_openapi(&api, args).await?;
                 print_session_read_json(&result, args.session_id)
             }
             Some(ServiceMapCommand::LinkDeclarations(args)) => {
@@ -19881,6 +20042,56 @@ mod tests {
             "inactive_session",
         );
         assert!(super::validate_service_map_parameters_response(&unavailable, &args).is_ok());
+    }
+
+    // An origin's OpenAPI document: an exact origin in, a document for that
+    // origin within the server's bounds out.
+    #[test]
+    fn service_map_openapi_reads_one_origin_and_checks_the_answer() {
+        let session = "00000000-0000-0000-0000-000000000001";
+        let input = json!({"session_id":session,"origin":"https://example.com"});
+        let command =
+            command_from_operation_input("target.service_map.openapi.get", &input).unwrap();
+        assert_eq!(command.operation_name(), "target.service_map.openapi.get");
+        let path = super::command_api_preview(&command).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            path.starts_with("/api/target/service-map/openapi?")
+                && path.contains("origin=https%3A%2F%2Fexample.com"),
+            "{path}"
+        );
+        for bad in [
+            json!({"session_id":session,"origin":"https://example.com/x"}),
+            json!({"session_id":session}),
+            json!({"session_id":session,"origin":"https://example.com","path":"/"}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.openapi.get", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let args = super::ServiceMapOpenApiArgs {
+            session_id: session.parse().unwrap(),
+            origin: "https://example.com".into(),
+        };
+        let document = json!({
+            "openapi":"3.1.0",
+            "info":{"title":"https://example.com","version":"observed","description":""},
+            "servers":[{"url":"https://example.com"}],
+            "paths":{"/v1/items":{"get":{"responses":{"200":{"description":"OK"}}}}},
+        });
+        assert!(super::validate_service_map_openapi_response(&document, &args).is_ok());
+        let mut other = document.clone();
+        other["servers"] = json!([{"url":"https://other.example.com"}]);
+        assert!(
+            super::validate_service_map_openapi_response(&other, &args).is_err(),
+            "another origin"
+        );
+        let mut relative = document.clone();
+        relative["paths"] = json!({"v1/items":{}});
+        assert!(super::validate_service_map_openapi_response(&relative, &args).is_err());
     }
 
     #[test]

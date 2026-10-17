@@ -36,6 +36,7 @@ mod service_map_html_parser;
 pub mod service_map_libraries;
 mod service_map_link_parser;
 pub mod service_map_links;
+pub mod service_map_openapi;
 pub mod service_map_parameters;
 pub mod service_map_peer_matches;
 pub mod service_map_servers;

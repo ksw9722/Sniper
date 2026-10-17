@@ -1055,7 +1055,9 @@ fn version_of<'a>(rule: &Regex, text: &'a str) -> Option<&'a str> {
 }
 
 /// What a response's headers say: vendor header names, values the header
-/// catalog does not name, and the names of the cookies it sets.
+/// catalog does not name, and the names of the cookies it sets. The map reads
+/// one header at a time (`detect_header`); the tests read several.
+#[cfg(test)]
 pub(crate) fn detect_headers<'a>(
     headers: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Vec<Detection> {

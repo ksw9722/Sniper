@@ -456,6 +456,32 @@ and `path` returns the same result, and so does the CLI:
 sniper-cli scope service-map parameters --session-id <active-session-uuid> --origin https://example.com --method GET --path /search
 ```
 
+## OpenAPI
+
+**Copy OpenAPI**, in the inspector of an origin that serves API data or signs
+users in, copies an OpenAPI 3.1 description of what its retained rows show, for
+Swagger UI, Postman, Burp or an agent, as Burp's API Exporter and
+mitmproxy2swagger build one from captured traffic. It lists each method and path
+template, with the ID segments as named path parameters (`{number}`, `{uuid}`,
+`{hex}`); the query, form, top-level JSON and multipart field names from each
+operation's newest 20 rows, with a type guessed from their values; each response
+status with the media types it came with; and the credentials the rows showed,
+as security schemes. Each scheme is one alternative: the rows show what was
+sent, not what the server requires. Every retained row of the origin counts,
+and each operation's `x-sniper-requests` says how many it stands for.
+
+No captured value is copied; a type is all that is kept of one. Operations that
+only answered with pages or static files are left out, and so are OPTIONS
+requests, nearly always CORS preflights, and methods OpenAPI cannot hold. At
+most 500 operations are listed, the most recently used, and `info.description`
+says what was left out. Like the parameters, it reads the active session only.
+`GET /api/target/service-map/openapi` with `session_id` and `origin` returns
+the document, and so does the CLI:
+
+```bash
+sniper-cli scope service-map openapi --session-id <active-session-uuid> --origin https://api.example.com > api.json
+```
+
 ## Server technologies and exposures
 
 The header catalog below reads three headers for a fixed list of product

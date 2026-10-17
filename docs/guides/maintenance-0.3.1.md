@@ -429,6 +429,13 @@ per-path cookies, the third-party services pages load (payments, maps,
 CAPTCHAs, chat, consent managers, analytics and ad tags) and library files
 named without a version, and reads bundles up to 8 MiB.
 
+An origin that serves API data can be copied as an OpenAPI 3.1 document
+(**Copy OpenAPI** in its inspector, `GET /api/target/service-map/openapi`, and
+`scope service-map openapi` in the CLI): its path templates, parameter and body
+field names with guessed types, response statuses and media types, and the
+credentials its rows showed, built from every retained row and holding no
+captured value.
+
 Cards are shorter (84px at the default text size) and a product found without a
 version shows its name alone; hovering `+N` lists the products it stands for.
 Every map toolbar control has the compact toolbar size, and the scope toggle is
