@@ -492,7 +492,8 @@ the map now reads four places for that, without sending anything:
   Server`, `Lotus-Domino`, Zope), Python's own servers (`TwistedWeb`,
   aiohttp, `WSGIServer`, `BaseHTTP`/`SimpleHTTP`), Mojolicious, H2O, Yaws,
   the servers embedded in routers and cameras (Mongoose, GoAhead, Boa,
-  thttpd, RomPager, Appweb), Wix's `Pepyaka`, CouchDB, MinIO, and
+  thttpd, RomPager, Appweb), Wix's `Pepyaka`, CouchDB, MinIO, Google Cloud
+  Storage's `UploadServer`, `tencent-cos`, `nghttpx`, Tencent's `Trpc httpd`, and
   `X-Powered-By: JSF` or `HHVM`.
 - **Names of the cookies a response sets:** `JSESSIONID` (Java servlet,
   also under a changed name such as `HH_JSESSIONID`), `PHPSESSID`,

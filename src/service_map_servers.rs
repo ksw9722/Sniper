@@ -77,6 +77,7 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("bytedance_tlb", "ByteDance TLB", GATEWAY),
     ("kong", "Kong", GATEWAY),
     ("trpc_gateway", "tRPC Gateway", GATEWAY),
+    ("nghttpx", "nghttpx", GATEWAY),
     ("ovhcloud", "OVHcloud Load Balancer", GATEWAY),
     ("varnish", "Varnish", GATEWAY),
     ("squid", "Squid", GATEWAY),
@@ -97,6 +98,7 @@ const PRODUCTS: &[(&str, &str, &str)] = &[
     ("kubernetes", "Kubernetes API server", PLATFORM),
     ("consul", "Consul", PLATFORM),
     ("minio", "MinIO", PLATFORM),
+    ("tencent_cos", "Tencent Cloud COS", PLATFORM),
     ("alibaba_cloud_oss", "Alibaba Cloud OSS", PLATFORM),
     ("vercel", "Vercel", PLATFORM),
     ("netlify", "Netlify", PLATFORM),
@@ -529,6 +531,11 @@ const HEADER_RULES: &[(&str, &str, &str)] = &[
     ("server", r"(?i)^Pepyaka(?:/§)?", "wix"),
     ("server", r"(?i)^CouchDB(?:/§)?", "couchdb"),
     ("server", r"(?i)^MinIO$", "minio"),
+    // Named from what the unnamed signals of a 667-site crawl showed.
+    ("server", r"^UploadServer$", "google_cloud_storage"),
+    ("server", r"(?i)^tencent-cos$", "tencent_cos"),
+    ("server", r"(?i)^nghttpx\b", "nghttpx"),
+    ("server", r"(?i)^Trpc httpd$", "trpc_gateway"),
     // A distribution's PHP build names it: 7.4.3-4ubuntu2.19, 7.4.33-1+deb11u4.
     ("x-powered-by", r"(?i)\bPHP/[0-9.]+-[^ ,;]*ubuntu", "ubuntu"),
     (
@@ -1546,6 +1553,10 @@ mod tests {
                 Some("3.3.2"),
             ),
             ("Server", "MinIO", "minio", None),
+            ("Server", "UploadServer", "google_cloud_storage", None),
+            ("Server", "tencent-cos", "tencent_cos", None),
+            ("Server", "nghttpx", "nghttpx", None),
+            ("Server", "Trpc httpd", "trpc_gateway", None),
             ("X-Powered-By", "PHP/7.4.3-4ubuntu2.19", "ubuntu", None),
             ("X-Powered-By", "PHP/7.4.33-1+deb11u4", "debian", None),
             ("X-Powered-By", "JSF/2.2", "jsf", Some("2.2")),
