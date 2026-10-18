@@ -1540,9 +1540,13 @@ fn bigip_address(set_cookie: &str) -> bool {
         return address.parse::<u32>().is_ok_and(|address| address != 0)
             && port.parse::<u16>().is_ok();
     }
+    // Bytes, not a str slice: a server-chosen value with a multi-byte character
+    // at the 32nd byte panicked the map and every capture scan of the row.
     value.starts_with("rd")
         && value.split_once('o').is_some_and(|(_, rest)| {
-            rest.len() >= 32 && rest[..32].bytes().all(|b| b.is_ascii_hexdigit())
+            rest.as_bytes()
+                .get(..32)
+                .is_some_and(|head| head.iter().all(u8::is_ascii_hexdigit))
         })
 }
 
@@ -2565,6 +2569,12 @@ mod tests {
             "BIGipServerpool_web=!Zb4R7m2k1/abcdEFGH; path=/",
         )]));
         assert_eq!(encrypted, [one("f5_big_ip", None)]);
+        // A multi-byte character where the route domain's 32 hex digits end.
+        let multibyte = format!("BIGipServerpool_rd=rdAo{}\u{e9}; path=/", "a".repeat(31));
+        assert_eq!(
+            found(detect_headers([("Set-Cookie", multibyte.as_str())])),
+            [one("f5_big_ip", None)]
+        );
     }
 
     // One body per rule, as each server writes it.
