@@ -230,6 +230,8 @@ impl AppState {
         Ok(state)
     }
 
+    /// Takes the map slot only if free: tests hold it to stage a running read.
+    #[cfg(test)]
     pub(crate) fn try_service_map_read(&self) -> Option<OwnedSemaphorePermit> {
         self.service_map_read_slot.clone().try_acquire_owned().ok()
     }
