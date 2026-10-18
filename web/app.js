@@ -9560,6 +9560,7 @@ function handleFindingEvent(event) {
 function clearFindingDetail() {
   findingsDetailGeneration += 1;
   selectedFindingId = null;
+  if (els.findingsBody) updateFindingsSelection(null);
   if (els.findingsDetailJump) {
     delete els.findingsDetailJump.dataset.recordId;
   }
