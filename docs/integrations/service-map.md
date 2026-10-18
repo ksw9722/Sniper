@@ -96,12 +96,17 @@ on the same origin remain distinguishable.
 
 ## Bounded ordinary-map refresh
 
-Ordinary map reads share one nonqueued application-wide worker slot. This slot
-never gates proxy forwarding or unrelated API operations. A second concurrent
-map read receives HTTP 429 with `x-sniper-service-map-error: busy`; canceling the
-first HTTP request does not free the slot while its queued or running worker is
-still projecting, aggregating or serializing. Admission is bounded, but Tokio's
-shared blocking pool does not provide a scheduling deadline.
+Ordinary map reads share one application-wide worker slot. This slot never
+gates proxy forwarding or unrelated API operations. Canceling an HTTP request
+does not free the slot while its queued or running worker is still projecting,
+aggregating or serializing, and a filter change, Reload or history invalidation
+cancels the read it replaces. A second map read therefore waits up to 20 seconds
+for the slot; a whole-history read of the same request then usually answers from
+the map the first one cached. Only a read still waiting after that receives HTTP
+429 with `x-sniper-service-map-error: busy`. The GUI takes a busy answer as
+"still running": it keeps the map and its inspections, and its next poll asks
+again; five busy answers in a row pause it like any other failure. Admission is
+bounded, but Tokio's shared blocking pool does not provide a scheduling deadline.
 
 The default 10,000 / maximum 50,000 considered-row window and 8 MiB metadata
 projection limit are unchanged. Metadata projection still takes one coherent

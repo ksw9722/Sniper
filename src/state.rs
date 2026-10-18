@@ -234,6 +234,22 @@ impl AppState {
         self.service_map_read_slot.clone().try_acquire_owned().ok()
     }
 
+    /// Waits a bounded time for the map read already running. A filter
+    /// change, Reload or history invalidation aborts the read it replaces, but
+    /// that read's worker keeps the slot until it finishes; refusing at once
+    /// failed the new read as busy. Once it finishes, an unchanged history
+    /// answers the same request from its cache.
+    pub(crate) async fn service_map_read(&self) -> Option<OwnedSemaphorePermit> {
+        #[cfg(not(test))]
+        const WAIT: Duration = Duration::from_secs(20);
+        #[cfg(test)]
+        const WAIT: Duration = Duration::from_millis(200);
+        tokio::time::timeout(WAIT, self.service_map_read_slot.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+
     pub fn set_proxy_online(&self, online: bool) {
         loop {
             let current = self.proxy_listener_status.load(Ordering::Acquire);

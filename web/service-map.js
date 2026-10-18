@@ -120,6 +120,9 @@
     } catch (_) { return ""; }
   }
   const MAP_ERROR_HEADER = "x-sniper-service-map-error";
+  // Busy answers in a row before refresh pauses; the server waits up to 20 s
+  // for the running read before each.
+  const MAX_BUSY_RETRIES = 5;
   const MAP_FAILURES = new Map([
     ["busy", { status: 429, message: "Service map is busy." }],
     ["scope_work_limit", { status: 422, message: "Scope matching exceeded the service map work limit. Simplify scope rules or use a smaller CLI --max-records window." }],
@@ -1418,7 +1421,7 @@
       bodyReferences: null, bodyReferencesLoading: false, bodyReferencesError: "", bodyReferencesRequestId: 0,
       bodyReferencesSource: null, relationLayers: Object.freeze([]), bodyOverlayNotice: "", apiDocs: null, apiDocsRequestId: 0,
       relationshipKind: "body", linkDeclarations: null, linkDeclarationsSource: null, linkDeclarationsError: "",
-      parameters: null, parametersKey: null, parametersLoading: false, parametersError: "", parametersRequestId: 0,
+      parameters: null, parametersKey: null, parametersLoading: false, parametersError: "", parametersRequestId: 0, busyRetries: 0,
       htmlGenerators: null, htmlGeneratorsLoading: false, htmlGeneratorsError: "", htmlGeneratorsRequestId: 0, htmlGeneratorsSource: null,
       inactiveSessionId: null, historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
     };
@@ -2225,6 +2228,7 @@
       const sessionId = getSessionId();
       if (state.sessionId !== sessionId) reset();
       if (!sessionId || state.refreshPaused && !retry || state.loading && !force) return false;
+      if (force || retry) state.busyRetries = 0;
       // The app polls every 1.2 seconds. A same-source background snapshot must
       // not erase an explicit inspection or continually abort its pending read.
       if (force) {
@@ -2273,6 +2277,7 @@
         if (state.htmlGeneratorsSource && !htmlGeneratorSourceIsRetained(state.htmlGeneratorsSource, snapshot)) cancelHtmlGenerators();
         state.snapshot = snapshot;
         state.refreshPaused = false;
+        state.busyRetries = 0;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
         // Another filter counts other rows, and other hidden request kinds draw
@@ -2316,6 +2321,15 @@
         return true;
       } catch (_) {
         if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
+        // Another read outlasted the server's wait for it. It is still running
+        // and finishes, so the next poll asks again and nothing shown is stale
+        // for it; only a long run of these pauses, as other failures do.
+        if (failure?.status === 429 && ++state.busyRetries <= MAX_BUSY_RETRIES) {
+          state.loading = false;
+          state.refreshPaused = false;
+          render();
+          return false;
+        }
         clearOverlay("Temporary body references cleared because the current refresh failed.");
         cancelBodyReferences();
         cancelHtmlGenerators();

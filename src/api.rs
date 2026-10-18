@@ -5562,9 +5562,10 @@ async fn get_target_service_map_impl(
         },
         None => None,
     };
-    // Reject rather than queue another expensive map read. The worker owns the
-    // permit through serialization, even when its HTTP awaiter is cancelled.
-    let Some(permit) = state.try_service_map_read() else {
+    // One map read at a time. The worker owns the permit through
+    // serialization, even when its HTTP awaiter is cancelled, so wait a
+    // bounded time for it instead of failing the read that replaced it.
+    let Some(permit) = state.service_map_read().await else {
         return ServiceMapReadError::Busy.into_response();
     };
     let implicit_session = query.session_id.is_none();
@@ -15554,6 +15555,28 @@ mod tests {
                 && !text.contains("origins")
                 && !text.contains("snapshot")
         );
+    }
+
+    // A read arriving while another runs waits for it, not fails: the read a
+    // filter change or Reload aborted still holds the slot until it finishes.
+    #[tokio::test]
+    async fn service_map_api_waits_for_the_running_read() {
+        let (state, dir) = test_state("sniper-map-wait");
+        let permit = state.try_service_map_read().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(permit);
+        });
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        release.await.unwrap();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

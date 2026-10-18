@@ -311,5 +311,7 @@ for (const failure of [{ status: 429, tag: 'busy' }, { status: 500, tag: 'build_
   f.requests.at(-1).resolve({ ok: false, status: failure.status, headers: { get: () => failure.tag } }); await pending;
   assert.equal(parametersRequest.options.signal.aborted, false); assert.equal(f.state.parametersLoading, true);
   await f.completeParameters(); assert.match(f.els.detail.innerHTML, /current-value/);
-  assert.equal(f.state.stale, true); assert.equal(f.state.refreshPaused, true);
+  // Busy only means another read is still running; the next poll asks again.
+  const pauses = failure.tag !== 'busy';
+  assert.equal(f.state.stale, pauses); assert.equal(f.state.refreshPaused, pauses);
 });

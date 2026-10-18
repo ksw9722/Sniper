@@ -2852,11 +2852,39 @@ function boundedMapError(status, marker, headers) {
   return { ok: false, status, headers: headers || { get(name) { assert.equal(name, 'x-sniper-service-map-error'); return marker; } },
     json() { assert.fail('Error JSON must never be read'); }, text() { assert.fail('Error text must never be read'); } };
 }
-async function rejectMap(f, status = 429, marker = 'busy', headers) {
+async function rejectMap(f, status = 500, marker = 'build_failed', headers) {
   const task = f.controller.refresh(); f.requests.at(-1).resolve(boundedMapError(status, marker, headers));
   assert.equal(await task, false);
 }
-for (const [status, marker, message] of boundedMapFailures) test(`ordinary map ${marker} keeps a stale map and pauses real polling until one manual Reload`, async () => {
+// Busy only means another read outlasted the server's wait for it.
+const pausingMapFailures = boundedMapFailures.filter(([, marker]) => marker !== 'busy');
+test('a busy map read keeps the map and its inspections, and the next poll asks again', async () => {
+  const f = await htmlGeneratorFixture(), previous = f.state.snapshot;
+  await resolveBodyReferences(f, bodyReferences({ session_id: technologySession, evidence_id: technologyToken(), source_sequence: '1' }));
+  assert.equal(f.controller.showBodyReferencesOnMap(), true);
+  await resolveHtmlGenerators(f);
+  await rejectMap(f, 429, 'busy');
+  assert.equal(f.state.snapshot, previous); assert.equal(f.state.refreshPaused, false); assert.equal(f.state.error, '');
+  assert.ok(f.state.bodyReferenceOverlay); assert.ok(f.state.htmlGenerators);
+  assert.doesNotMatch(f.els.status.textContent, /busy|paused/i);
+  const before = f.requests.length; pollRealTargetMap(f); assert.equal(f.requests.length, before + 1);
+  f.requests.at(-1).resolve(response(withCatalog(technologySnapshot()))); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.state.busyRetries, 0); assert.equal(f.state.refreshPaused, false);
+});
+test('busy answers in a row pause after five, and Reload starts the count again', async () => {
+  const f = fixture(); await f.load();
+  for (let i = 0; i < 5; i++) { await rejectMap(f, 429, 'busy'); assert.equal(f.state.refreshPaused, false, `answer ${i + 1}`); }
+  await rejectMap(f, 429, 'busy');
+  assert.equal(f.state.refreshPaused, true); assert.ok(f.state.error.startsWith('Service map is busy.'));
+  const reload = f.controller.refresh({ retry: true }); f.requests.at(-1).resolve(boundedMapError(429, 'busy')); await reload;
+  assert.equal(f.state.refreshPaused, false, 'Reload gets its own five');
+});
+test('an initial busy read keeps loading and the next poll asks again', async () => {
+  const f = fixture(); await rejectMap(f, 429, 'busy');
+  assert.equal(f.state.snapshot, null); assert.equal(f.state.refreshPaused, false); assert.equal(f.state.error, '');
+  await rejectMap(f, 429, 'busy'); assert.equal(f.requests.length, 2);
+});
+for (const [status, marker, message] of pausingMapFailures) test(`ordinary map ${marker} keeps a stale map and pauses real polling until one manual Reload`, async () => {
   const f = await htmlGeneratorFixture(), previous = f.state.snapshot, verified = f.state.evidence;
   await resolveBodyReferences(f, bodyReferences({ session_id: technologySession, evidence_id: technologyToken(), source_sequence: '1' }));
   assert.equal(f.controller.showBodyReferencesOnMap(), true);
@@ -2897,7 +2925,7 @@ test('native Headers joins duplicated markers and cannot satisfy the single-toke
   const f = fixture(); await f.load(); await rejectMap(f, 429, null, headers);
   assert.match(f.state.error, /^Reload failed\./);
 });
-for (const [status, marker, message] of boundedMapFailures) test(`initial ${marker} failure is explicit, empty, paused and manually retryable`, async () => {
+for (const [status, marker, message] of pausingMapFailures) test(`initial ${marker} failure is explicit, empty, paused and manually retryable`, async () => {
   const f = fixture(); await rejectMap(f, status, marker);
   assert.equal(f.state.snapshot, null); assert.equal(f.state.refreshPaused, true);
   assert.equal(f.els.status.textContent, `${message} Automatic refresh paused. Use Reload to retry.`);
