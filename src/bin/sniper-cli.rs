@@ -14568,13 +14568,17 @@ async fn open_replay_tab(
 // set here looks exactly like one typed into the tab strip and stays within the
 // server's 80-character limit instead of failing the whole workspace save.
 fn normalize_replay_tab_label(label: &str) -> String {
+    // Trim the end after the cut: it can stop on the joining space, which the
+    // server's own pass removes, and the saved label then never matched.
     label
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
         .take(80)
-        .collect()
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn next_replay_tab_sequence(replay: &ReplayWorkspaceState) -> Result<usize> {
@@ -17923,6 +17927,18 @@ fn parse_response_status_line(status_line: &str) -> Result<u16> {
         bail!("response status code out of range: {status}");
     }
     Ok(status)
+}
+
+#[cfg(test)]
+mod label_rule_tests {
+    // The server applies the rule again to what the CLI sends, and the CLI then
+    // compares the saved label with its own result.
+    #[test]
+    fn the_tab_label_rule_gives_the_same_label_when_applied_again() {
+        let label = super::normalize_replay_tab_label(&format!("{} tail", "a".repeat(79)));
+        assert_eq!(label, "a".repeat(79));
+        assert_eq!(super::normalize_replay_tab_label(&label), label);
+    }
 }
 
 #[cfg(test)]

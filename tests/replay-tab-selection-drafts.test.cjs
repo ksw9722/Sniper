@@ -408,7 +408,8 @@ const scalarLabelCases = [
   ['combining marks at limit', 'e\u0301'.repeat(40), 'e\u0301'.repeat(40)],
   ['combining mark beyond limit', 'a'.repeat(79) + 'e\u0301', 'a'.repeat(79) + 'e'],
   ['normalized whitespace', ' \t label\n 😀  ', 'label 😀'],
-  ['whitespace at truncated boundary', 'a'.repeat(79) + ' z', 'a'.repeat(79) + ' '],
+  // The server trims it too, so applying the rule again gives the same label.
+  ['whitespace at truncated boundary', 'a'.repeat(79) + ' z', 'a'.repeat(79)],
 ];
 for (const [name, input, expected] of scalarLabelCases) test(`saved label normalization preserves scalar characters: ${name}`, () => {
   const f = fixture(), actual = f.context.normalizeReplayTabCustomLabel(input);

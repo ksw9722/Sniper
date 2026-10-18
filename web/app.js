@@ -18838,7 +18838,8 @@ function commitReplayTabRename(id, value) {
 function normalizeReplayTabCustomLabel(value) {
   const normalized = String(value || "").replace(/\s+/g, " ").trim();
   // Match Rust's scalar limit without splitting a UTF-16 pair in saved metadata.
-  return Array.from(normalized).slice(0, 80).join("");
+  // The cut can end on a space; the server trims it, so trim it here too.
+  return Array.from(normalized).slice(0, 80).join("").trimEnd();
 }
 
 function persistReplayTabMetadataEdit(tab, field, previousValue) {

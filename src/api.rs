@@ -3172,6 +3172,8 @@ async fn set_saved_replay_tab_label(
     Json(payload): Json<SetSavedReplayTabLabelPayload>,
 ) -> Response {
     // Apply the same normalization as the tab strip without parsing any draft.
+    // The cut can end on the joining space; trim it, or applying the rule
+    // again (as the CLI's check does) gives a different label.
     let label = payload
         .label
         .split_whitespace()
@@ -3179,7 +3181,9 @@ async fn set_saved_replay_tab_label(
         .join(" ")
         .chars()
         .take(80)
-        .collect();
+        .collect::<String>()
+        .trim_end()
+        .to_string();
     mutate_saved_replay_tab(
         state,
         SavedHttpTabPayload {
