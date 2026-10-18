@@ -14402,7 +14402,7 @@ function renderReplayResponseView(text) {
     }
     _replayResponseCMView.setContent(text || "");
     // Apply search
-    const query = (state.replayMessageSearch?.response || "").trim();
+    const query = state.replayMessageSearch?.response || "";
     _replayResponseCMView.applySearch(query);
   } else if (els.replayResponseView) {
     // Fallback to legacy
@@ -23393,7 +23393,7 @@ function applyCodeSearch(viewElement, query) {
   // Remove any previous search highlights first
   clearSearchHighlights(viewElement);
 
-  const normalizedQuery = String(query || "").trim();
+  const normalizedQuery = String(query || "");
   if (!normalizedQuery) {
     return { count: 0, firstMatch: null };
   }
@@ -29351,8 +29351,8 @@ function updateCodePaneCM(key, container, text, options = {}) {
   }
   cv.setContent(text || "");
 
-  // Search highlights
-  const query = (options.search || "").trim();
+  // Preserve the same literal query used while typing, including whitespace.
+  const query = options.search || "";
   const searchResult = cv.applySearch(query, { classes: options.searchClasses });
 
   // Changed-line highlights (Modified view). Applied after setContent, which
