@@ -6602,12 +6602,23 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 session_query_path("/api/runtime", args.session_id),
                 None,
             ),
+            // The run replaces the whole list; null here read as "keep the
+            // current scope". A file or stdin is named, not read: a dry run
+            // stays offline and must not consume stdin.
             TargetCommand::SetScope(args) => api_preview(
                 "POST",
                 "/api/runtime",
                 Some(json!({
                     "session_id": args.session_id,
-                    "scope_patterns": if args.clear { Some(Vec::<String>::new()) } else { None },
+                    "scope_patterns": if args.clear {
+                        json!([])
+                    } else if let Some(file) = &args.file {
+                        json!({ "replaced_by_lines_of": file })
+                    } else if args.stdin {
+                        json!({ "replaced_by_lines_of": "stdin" })
+                    } else {
+                        json!(args.patterns)
+                    },
                 })),
             ),
         },
