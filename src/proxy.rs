@@ -493,8 +493,9 @@ pub async fn serve_proxy(listener: TcpListener, state: Arc<AppState>) -> Result<
         remember_proxy_connection(connection_id, abort);
         tokio::spawn(async move {
             let service = service_fn(move |request| {
+                // A dual-stack `[::]` listener sees IPv4 clients as `::ffff:a.b.c.d`.
                 CLIENT_ADDRESS.scope(
-                    peer_addr.ip(),
+                    peer_addr.ip().to_canonical(),
                     handle_request(request, state.clone(), peer_addr),
                 )
             });
