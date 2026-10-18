@@ -114,6 +114,13 @@ const cards = f => [...f.els.canvas.innerHTML.matchAll(/data-service-origin="([^
 const rows = element => [...element.innerHTML.matchAll(/data-service-endpoint="(\d+)"/g)].map(m => Number(m[1]));
 const plain = value => JSON.parse(JSON.stringify(value));
 
+test('an origin with more rows than the old 50,000 window still loads', () => {
+  const busy = origin(A, [observation('nginx', '1.26.2', 1, { row_count: 60000 })]);
+  busy.request_count = 75000;
+  const loaded = map.normalizeSnapshot(snapshot([busy]), SESSION).origins[0];
+  assert.equal(loaded.technology_observations[0].row_count, 60000);
+});
+
 test('missing, present-empty and reference-only are distinct from an unknown version observation', () => {
   const missing = origin(); delete missing.technology_observations;
   missing.technology_clues = [{ name: 'nginx/9.9', source: 'response_header', confidence: 'observed_header', evidence: [] }];

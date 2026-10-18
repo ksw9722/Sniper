@@ -259,7 +259,8 @@
       if (!exactFields(item, [...TECHNOLOGY_FIELDS, "row_count", "first_seen", "last_seen", "evidence"])) invalidTechnology();
       const base = technologyBase(item, catalogVersion), first = observationTime(item.first_seen), last = observationTime(item.last_seen);
       const originFirst = observationTime(origin.first_seen), originLast = observationTime(origin.last_seen);
-      if (!technologyInteger(origin.request_count, 50000) || !technologyInteger(item.row_count, origin.request_count) || !item.row_count
+      // The map covers every retained row, so an origin a fuzzer hit has far more than a window's 50,000.
+      if (!technologyInteger(origin.request_count, Number.MAX_SAFE_INTEGER) || !technologyInteger(item.row_count, origin.request_count) || !item.row_count
         || first === null || last === null || first > last
         || originFirst === null || originLast === null || first < originFirst || last > originLast
         || !Array.isArray(item.evidence) || !item.evidence.length || item.evidence.length > Math.min(3, item.row_count)
