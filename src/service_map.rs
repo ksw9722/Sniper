@@ -1140,7 +1140,8 @@ pub(crate) fn project_record_for_catalog(
             }
             _ => None,
         };
-        if let Some(signal) = unnamed {
+        // A header or cookie a row repeats is one signal, and one row of it.
+        if let Some(signal) = unnamed.filter(|signal| !row.unnamed.contains(signal)) {
             if row.unnamed.len() < MAX_UNNAMED_PER_ROW {
                 row.unnamed.push(signal);
             } else {
@@ -2886,6 +2887,25 @@ mod tests {
             .stopped_by
             .contains(&"unsupported_or_oversized_metadata".into()));
         assert!(result.origins[0].redirects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_map_a_repeated_unnamed_header_is_one_signal_and_one_row() {
+        let mut row = record("/unnamed");
+        row.response.as_mut().unwrap().headers = (0..MAX_UNNAMED_PER_ROW + 4)
+            .map(|_| HeaderRecord {
+                name: "x-synthetic-repeat".into(),
+                value: "fixture".into(),
+            })
+            .collect();
+        let projected = project_record(&row, "test".into()).unwrap();
+        assert_eq!(projected.unnamed.len(), 1);
+        assert!(projected.metadata_complete, "{:?}", projected.omitted);
+        let result = map(vec![row]).await;
+        assert!(result.snapshot.complete);
+        let signals = &result.origins[0].unnamed.headers;
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].row_count, 1);
     }
 
     #[tokio::test]
