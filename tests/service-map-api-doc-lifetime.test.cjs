@@ -84,8 +84,6 @@ async function prepareDocs(f, stage) {
 }
 const boundaries = [
   ['history invalidation', f => f.controller.invalidate()],
-  ['unknown history update', f => f.controller.markDirty()],
-  ['identified history update', f => f.controller.markDirty({ data: JSON.stringify({ id: oldRow }) })],
   ['scope rules', f => f.controller.scopeChanged({ scope_patterns: [] }, { scope_patterns: ['example.com'] })],
   ['row filter', f => f.controller.filterChanged()],
   ['scope filter', f => f.els.scope.dispatch('click')],
@@ -116,7 +114,19 @@ for (const [name, change] of boundaries) {
     clickDocs(f, { apiDocsReplay: newRow }); assert.deepEqual(f.replays, [newRow]); assertClosed(f);
   });
 }
-for (const boundary of ['invalidate', 'markDirty']) for (const stage of ['fetch', 'json']) {
+// Every captured row marks the map dirty; open docs and their pending read
+// stay, or the dialog would close while traffic flows.
+for (const event of [undefined, { data: JSON.stringify({ id: oldRow }) }]) for (const stage of ['loaded', 'fetch', 'json']) {
+  test(`a captured row leaves ${stage} API docs open${event ? ' (identified)' : ''}`, async () => {
+    const f = fixture(); await f.load(); const old = await prepareDocs(f, stage);
+    const id = f.state.apiDocsRequestId;
+    f.controller.markDirty(event); old.complete(); await tick();
+    assert.equal(f.state.apiDocsRequestId, id);
+    assert.equal(f.els.apiDocs.classList.contains('hidden'), false);
+    assert.equal(f.state.apiDocs.document.paths['/items'].get['x-sniper-newest-transaction'], oldRow);
+  });
+}
+for (const boundary of ['invalidate']) for (const stage of ['fetch', 'json']) {
   for (const outcome of ['success', 'error']) test(`old API-doc ${stage} ${outcome} cannot replace reopened docs after ${boundary}`, async () => {
     const f = fixture(); await f.load(); const old = await prepareDocs(f, stage);
     const start = f.requests.length; f.controller[boundary](); assertClosed(f); await f.finishBoundary(start);

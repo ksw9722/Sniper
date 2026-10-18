@@ -3506,9 +3506,9 @@
           (layer) => !recordId || layer.kind === "peer" || !validTechnologyEvidence(layer.source.evidenceId, layer.source.sessionId, layer.source.generation) || layer.source.evidenceId.split(".")[5].toLowerCase() === recordId);
         state.historyVersion += 1;
         state.stale = true;
-        // Docs include retained counts and a Replay row ID. Clear the visible
-        // document and fence late reads whenever those observations go stale.
-        closeApiDocs();
+        // Open API docs stay: this fires for every captured row, so closing
+        // them here would shut the dialog while traffic flows. A count one row
+        // behind is harmless, and Replay reports a row that is gone.
         cancelEvidence();
         render();
       },
