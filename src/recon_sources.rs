@@ -982,7 +982,7 @@ fn attributes(source: &str) -> HashMap<String, String> {
 
 /// A bounded literal tokenizer, not a browser DOM parser. It skips comments
 /// and raw-text elements so fake tags inside scripts cannot become crawl links.
-fn html_tags(body: &str) -> Vec<Tag> {
+fn html_tags(body: &str) -> (Vec<Tag>, bool) {
     let bytes = body.as_bytes();
     let lower_body = body.to_ascii_lowercase();
     let mut tags = Vec::new();
@@ -1066,7 +1066,10 @@ fn html_tags(body: &str) -> Vec<Tag> {
         }
         tags.push(tag);
     }
-    tags
+    // Do not scan past the token budget to prove that the remaining text is
+    // harmless. Retain the bounded prefix and conservatively report partial.
+    let truncated = tags.len() == MAX_STATIC_ITEMS && cursor < bytes.len();
+    (tags, truncated)
 }
 
 fn static_discovery(url: String, method: String, kind: &str, label: &str, base: &Url) -> Discovery {
@@ -1085,7 +1088,7 @@ fn js_candidates(
     body: &str,
     out: &mut Vec<Discovery>,
     seen: &mut HashSet<(String, String, String)>,
-) {
+) -> bool {
     // String-literal heuristics only. No interpolation, JS evaluation, guessed
     // variable contents, or inferred response/HTTP-method claims.
     static LITERALS: OnceLock<Regex> = OnceLock::new();
@@ -1093,7 +1096,14 @@ fn js_candidates(
         Regex::new(r#"(?s)"((?:\\.|[^"\\])+)"|'((?:\\.|[^'\\])+)'|`((?:\\.|[^`\\])+)`"#)
             .expect("JS literal pattern")
     });
-    for capture in regex.captures_iter(body).take(MAX_STATIC_ITEMS) {
+    for (index, capture) in regex
+        .captures_iter(body)
+        .take(MAX_STATIC_ITEMS + 1)
+        .enumerate()
+    {
+        if index == MAX_STATIC_ITEMS {
+            return true;
+        }
         let literal = capture
             .get(1)
             .or_else(|| capture.get(2))
@@ -1130,20 +1140,37 @@ fn js_candidates(
                 static_discovery(url, "GET".into(), "candidate", "javascript", base),
                 MAX_STATIC_ITEMS,
             ) {
-                break;
+                return true;
             }
         }
     }
+    false
+}
+
+/// Keep crawler dispatch and extraction in agreement, including extensionless
+/// ECMAScript responses. A declared non-script MIME type overrides the suffix.
+pub fn is_javascript_document(base: &Url, content_type: &str) -> bool {
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    content_type.contains("javascript")
+        || content_type.contains("ecmascript")
+        || (content_type.is_empty() && base.path().ends_with(".js"))
 }
 
 /// Extracts static evidence without executing scripts or submitting forms.
 /// Relative literals in external JavaScript are resolved against the script
 /// URL as a heuristic; the location label keeps them distinct from observations.
-pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Discovery> {
+/// The boolean reports when a byte, token, or discovery budget left a partial result.
+pub fn extract_document(base: &Url, content_type: &str, body: &str) -> (Vec<Discovery>, bool) {
     let mut end = body.len().min(MAX_RESPONSE_BYTES);
     while !body.is_char_boundary(end) {
         end -= 1;
     }
+    let mut truncated = end < body.len();
     let body = &body[..end];
     let content_type = content_type
         .split(';')
@@ -1153,15 +1180,16 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
         .to_ascii_lowercase();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    if content_type.contains("javascript")
-        || content_type.contains("ecmascript")
-        || (content_type.is_empty() && base.path().ends_with(".js"))
-    {
-        js_candidates(base, body, &mut out, &mut seen);
-        return out;
+    if is_javascript_document(base, &content_type) {
+        truncated |= js_candidates(base, body, &mut out, &mut seen);
+        return (out, truncated);
     }
     if base.path().ends_with("/robots.txt") {
-        for line in body.lines().take(MAX_STATIC_ITEMS) {
+        for (index, line) in body.lines().take(MAX_STATIC_ITEMS + 1).enumerate() {
+            if index == MAX_STATIC_ITEMS {
+                truncated = true;
+                break;
+            }
             let line = line.split('#').next().unwrap_or("").trim();
             let Some((key, value)) = line.split_once(':') else {
                 continue;
@@ -1187,11 +1215,12 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
                     static_discovery(url, "GET".into(), kind, label, base),
                     MAX_STATIC_ITEMS,
                 ) {
+                    truncated = true;
                     break;
                 }
             }
         }
-        return out;
+        return (out, truncated);
     }
     if content_type.contains("xml") || base.path().ends_with(".xml") {
         static LOC: OnceLock<Regex> = OnceLock::new();
@@ -1199,7 +1228,15 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
             Regex::new(r"(?is)<(?:[a-z0-9_-]+:)?loc\b[^>]*>(.*?)</(?:[a-z0-9_-]+:)?loc\s*>")
                 .expect("sitemap loc pattern")
         });
-        for capture in regex.captures_iter(body).take(MAX_STATIC_ITEMS) {
+        for (index, capture) in regex
+            .captures_iter(body)
+            .take(MAX_STATIC_ITEMS + 1)
+            .enumerate()
+        {
+            if index == MAX_STATIC_ITEMS {
+                truncated = true;
+                break;
+            }
             let literal = capture[1].trim();
             let literal = literal
                 .strip_prefix("<![CDATA[")
@@ -1212,21 +1249,23 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
                     static_discovery(url, "GET".into(), "observed", "sitemap", base),
                     MAX_STATIC_ITEMS,
                 ) {
+                    truncated = true;
                     break;
                 }
             }
         }
         if content_type != "application/xhtml+xml" {
-            return out;
+            return (out, truncated);
         }
     }
     if !matches!(
         content_type.as_str(),
         "text/html" | "application/xhtml+xml" | ""
     ) {
-        return out;
+        return (out, truncated);
     }
-    let tags = html_tags(body);
+    let (tags, clipped) = html_tags(body);
+    truncated |= clipped;
     let document_base = tags
         .iter()
         .filter(|tag| !tag.closing && tag.name == "base")
@@ -1252,16 +1291,17 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
             item.location
                 .push_str(&format!(" (field names: {})", names.join(", ")));
         }
-        push_discovery(out, seen, item, MAX_STATIC_ITEMS);
+        push_discovery(out, seen, item, MAX_STATIC_ITEMS)
     };
     for tag in tags {
         if out.len() >= MAX_STATIC_ITEMS {
+            truncated = true;
             break;
         }
         if tag.closing {
             if tag.name == "form" {
                 if let Some(form) = current_form.take() {
-                    flush_form(form, &mut out, &mut seen);
+                    truncated |= !flush_form(form, &mut out, &mut seen);
                 }
             }
             continue;
@@ -1271,7 +1311,7 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
         }
         if tag.name == "form" {
             if let Some(form) = current_form.take() {
-                flush_form(form, &mut out, &mut seen);
+                truncated |= !flush_form(form, &mut out, &mut seen);
             }
             let action = match tag
                 .attrs
@@ -1320,7 +1360,7 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
                     } else {
                         "resource"
                     };
-                    push_discovery(
+                    truncated |= !push_discovery(
                         &mut out,
                         &mut seen,
                         static_discovery(url, "GET".into(), "observed", label, base),
@@ -1339,7 +1379,7 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
                 .get("formmethod")
                 .map(String::as_str)
                 .or_else(|| current_form.as_ref().map(|(_, m, _)| m.as_str()));
-            push_discovery(
+            truncated |= !push_discovery(
                 &mut out,
                 &mut seen,
                 static_discovery(action, method(verb), "candidate", "form", base),
@@ -1348,14 +1388,14 @@ pub fn extract_document(base: &Url, content_type: &str, body: &str) -> Vec<Disco
         }
         if tag.name == "script" {
             if let Some((start, end)) = tag.body {
-                js_candidates(&document_base, &body[start..end], &mut out, &mut seen);
+                truncated |= js_candidates(&document_base, &body[start..end], &mut out, &mut seen);
             }
         }
     }
     if let Some(form) = current_form.take() {
-        flush_form(form, &mut out, &mut seen);
+        truncated |= !flush_form(form, &mut out, &mut seen);
     }
-    out
+    (out, truncated)
 }
 
 /// Candidates from forms, JavaScript, and robots rules remain passive evidence.
@@ -1544,7 +1584,7 @@ mod tests {
 
     #[test]
     fn html_resolves_base_attributes_and_entities_without_running_content() {
-        let found = extract_document(
+        let (found, _) = extract_document(
             &base(),
             "text/html; charset=utf-8",
             r##"
@@ -1583,7 +1623,7 @@ mod tests {
 
     #[test]
     fn html_forms_preserve_method_and_names_never_values_or_execution() {
-        let found = extract_document(
+        let (found, _) = extract_document(
             &base(),
             "text/html",
             r#"
@@ -1605,7 +1645,7 @@ mod tests {
 
     #[test]
     fn quoted_greater_than_and_raw_text_do_not_break_html_tokenization() {
-        let found = extract_document(&base(), "text/html", "<a title='x > y' href='/good'>link</a><textarea name='text'><a href='/bad'></textarea><a href='/after'>ok</a>");
+        let (found, _) = extract_document(&base(), "text/html", "<a title='x > y' href='/good'>link</a><textarea name='text'><a href='/bad'></textarea><a href='/after'>ok</a>");
         assert!(found.iter().any(|d| d.url.ends_with("/good")));
         assert!(found.iter().any(|d| d.url.ends_with("/after")));
         assert!(!found.iter().any(|d| d.url.ends_with("/bad")));
@@ -1613,7 +1653,7 @@ mod tests {
 
     #[test]
     fn javascript_literals_are_candidates_and_interpolations_are_skipped() {
-        let found = extract_document(
+        let (found, _) = extract_document(
             &Url::parse("https://example.com/assets/app.js").unwrap(),
             "application/javascript",
             r#"
@@ -1631,8 +1671,131 @@ mod tests {
     }
 
     #[test]
+    fn javascript_dispatch_uses_the_same_media_type_and_suffix_rules_as_extraction() {
+        for media_type in [
+            "application/javascript",
+            "text/javascript",
+            "application/ecmascript",
+            "text/ecmascript",
+            "APPLICATION/ECMASCRIPT; charset=UTF-8",
+            " application/x-javascript ; charset=utf-8",
+        ] {
+            let url = Url::parse("https://example.com/extensionless").unwrap();
+            assert!(is_javascript_document(&url, media_type), "{media_type}");
+            let (found, clipped) = extract_document(&url, media_type, "fetch('/candidate')");
+            assert_eq!(found.len(), 1, "{media_type}");
+            assert_eq!(found[0].kind, "candidate");
+            assert!(!clipped);
+        }
+        for (path, media_type, expected) in [
+            ("/bundle.js?version=1", "", true),
+            ("/bundle.JS", "", false),
+            ("/bundle.js", "text/plain; charset=javascript", false),
+            ("/bundle.js", "application/octet-stream", false),
+            ("/extensionless", "", false),
+        ] {
+            let url = Url::parse(&format!("https://example.com{path}")).unwrap();
+            assert_eq!(
+                is_javascript_document(&url, media_type),
+                expected,
+                "{path} {media_type}"
+            );
+            assert_eq!(
+                extract_document(&url, media_type, "fetch('/candidate')")
+                    .0
+                    .len(),
+                usize::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn html_token_limit_reports_unscanned_suffix_but_preserves_the_boundary_prefix() {
+        let prefix = "<span></span>".repeat(MAX_STATIC_ITEMS / 2);
+        let (found, clipped) = extract_document(&base(), "text/html", &prefix);
+        assert!(found.is_empty());
+        assert!(!clipped);
+        let (_, clipped) = extract_document(
+            &base(),
+            "text/html",
+            &format!("{prefix}<a href='/late'>late</a>"),
+        );
+        assert!(clipped);
+        // At the budget boundary, suffix bytes are deliberately not scanned,
+        // including whitespace or a comment which may conceal more markup.
+        assert!(extract_document(&base(), "text/html", &format!("{prefix}\n")).1);
+        let before = format!(
+            "{}<a href='/retained'>link</a>",
+            "<span></span>".repeat(MAX_STATIC_ITEMS / 2 - 1)
+        );
+        let (found, clipped) = extract_document(&base(), "text/html", &before);
+        assert!(!clipped);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].url.ends_with("/retained"));
+    }
+
+    #[test]
+    fn static_item_limits_report_clipping_even_when_the_prefix_has_no_urls() {
+        for (path, media_type, empty_item, final_item) in [
+            (
+                "/bundle.js",
+                "application/javascript",
+                "'not-a-url';",
+                "'/late'",
+            ),
+            ("/robots.txt", "text/plain", "# ignored\n", "Allow: /late\n"),
+            (
+                "/sitemap.xml",
+                "application/xml",
+                "<loc>#fragment</loc>",
+                "<loc>/late</loc>",
+            ),
+        ] {
+            let url = Url::parse(&format!("https://example.com{path}")).unwrap();
+            let body = empty_item.repeat(MAX_STATIC_ITEMS);
+            let (found, clipped) = extract_document(&url, media_type, &body);
+            assert!(found.is_empty(), "{path}");
+            assert!(!clipped, "{path}");
+            let (found, clipped) =
+                extract_document(&url, media_type, &format!("{body}{final_item}"));
+            assert!(found.is_empty(), "{path}");
+            assert!(clipped, "{path}");
+        }
+        let inline = format!(
+            "<script>{}'/late'</script>",
+            "'not-a-url';".repeat(MAX_STATIC_ITEMS)
+        );
+        assert!(extract_document(&base(), "text/html", &inline).1);
+    }
+
+    #[test]
+    fn discovery_output_limit_reports_partial_and_never_expands_the_result_cap() {
+        let body = (0..MAX_STATIC_ITEMS / 3 + 1)
+            .map(|index| {
+                format!("<object data='/data/{index}' src='/src/{index}' href='/link/{index}'>")
+            })
+            .collect::<String>();
+        let (found, clipped) = extract_document(&base(), "text/html", &body);
+        assert!(clipped);
+        assert_eq!(found.len(), MAX_STATIC_ITEMS);
+    }
+
+    #[test]
+    fn document_byte_limit_is_reported_and_preserves_utf8_boundaries() {
+        let body = " ".repeat(MAX_RESPONSE_BYTES);
+        assert!(!extract_document(&base(), "text/html", &body).1);
+        let body = format!(
+            "{}é<a href='/late'>late</a>",
+            " ".repeat(MAX_RESPONSE_BYTES - 1)
+        );
+        let (found, clipped) = extract_document(&base(), "text/html", &body);
+        assert!(found.is_empty());
+        assert!(clipped);
+    }
+
+    #[test]
     fn robots_and_sitemaps_are_static_evidence() {
-        let robots = extract_document(&Url::parse("https://example.com/robots.txt").unwrap(), "text/plain", "User-agent: *\nDisallow: /private\nAllow: /public\nDisallow: /*?token=\nSitemap: https://example.com/sitemap.xml\n");
+        let (robots, _) = extract_document(&Url::parse("https://example.com/robots.txt").unwrap(), "text/plain", "User-agent: *\nDisallow: /private\nAllow: /public\nDisallow: /*?token=\nSitemap: https://example.com/sitemap.xml\n");
         assert_eq!(robots.len(), 3);
         assert!(!is_followable(
             robots.iter().find(|d| d.url.ends_with("/private")).unwrap()
@@ -1640,7 +1803,7 @@ mod tests {
         assert!(is_followable(
             robots.iter().find(|d| d.url.ends_with(".xml")).unwrap()
         ));
-        let sitemap = extract_document(&base(), "application/xml", "<urlset><url><loc>https://example.com/p?a=1&amp;b=2</loc></url><url><loc><![CDATA[https://example.com/cdata]]></loc></url></urlset>");
+        let (sitemap, _) = extract_document(&base(), "application/xml", "<urlset><url><loc>https://example.com/p?a=1&amp;b=2</loc></url><url><loc><![CDATA[https://example.com/cdata]]></loc></url></urlset>");
         assert_eq!(sitemap.len(), 2);
         assert!(sitemap.iter().all(is_followable));
         assert_eq!(sitemap[0].url, "https://example.com/p?a=1&b=2");
@@ -1648,12 +1811,16 @@ mod tests {
 
     #[test]
     fn unsupported_media_and_long_multibyte_body_are_bounded() {
-        assert!(extract_document(&base(), "image/svg+xml", "<a href='/not-a-page'>").is_empty());
+        assert!(
+            extract_document(&base(), "image/svg+xml", "<a href='/not-a-page'>")
+                .0
+                .is_empty()
+        );
         let body = format!(
             "{}<a href='/past-limit'>",
             "😀".repeat(MAX_RESPONSE_BYTES / 4 + 1)
         );
-        assert!(extract_document(&base(), "text/html", &body).is_empty());
+        assert!(extract_document(&base(), "text/html", &body).0.is_empty());
     }
 
     #[test]
