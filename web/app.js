@@ -14178,7 +14178,7 @@ function renderReplay(options = {}) {
   const respMode = state.replayMessageViews.response;
   let responseText;
   if (respMode === "hex") {
-    responseText = toHexDump(rawResponseText);
+    responseText = buildMessageHexPresentation("response", tab.responseRecord, rawResponseText);
   } else if (respMode === "pretty") {
     responseText = prettyFormat(rawResponseText, tab.responseRecord.response);
   } else {
@@ -14456,7 +14456,7 @@ function renderReplayResponseOnly(tab) {
   const respMode = state.replayMessageViews.response;
   let responseText;
   if (respMode === "hex") {
-    responseText = toHexDump(rawResponseText);
+    responseText = buildMessageHexPresentation("response", tab.responseRecord, rawResponseText);
   } else if (respMode === "pretty") {
     responseText = prettyFormat(rawResponseText, tab.responseRecord.response);
   } else {
@@ -14541,7 +14541,7 @@ function renderReplayViewContent(target) {
     const rawText = buildRawResponse(tab.responseRecord);
     let displayText;
     if (mode === "hex") {
-      displayText = toHexDump(rawText);
+      displayText = buildMessageHexPresentation("response", tab.responseRecord, rawText);
     } else if (mode === "pretty") {
       displayText = prettyFormat(rawText, tab.responseRecord.response);
     } else {
