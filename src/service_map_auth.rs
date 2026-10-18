@@ -94,7 +94,9 @@ pub fn detect(record: &TransactionRecord) -> Vec<AuthSignal> {
                     found.extend(cookie(name.trim(), value));
                 }
             }
-            _ if api_key_header(&name) => found.push(AuthSignal {
+            // Reported by name, so bounded as a cookie's is: the CLI refuses a
+            // whole map that names `x~api-key` or a 65-byte `…-token`.
+            _ if api_key_header(&name) && reportable_name(&name) => found.push(AuthSignal {
                 kind: "api_key_header",
                 name: Some(name),
             }),
@@ -185,13 +187,16 @@ fn challenge(value: &str) -> Option<AuthSignal> {
 }
 
 /// A cookie that carries a JWT, or whose name says it holds a session.
-fn cookie(name: &str, value: &str) -> Option<AuthSignal> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name
+fn reportable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-    {
+}
+
+fn cookie(name: &str, value: &str) -> Option<AuthSignal> {
+    if !reportable_name(name) {
         return None;
     }
     let kind = if jwt(value) {
@@ -334,6 +339,17 @@ mod tests {
             .into_iter()
             .map(|item| (item.kind, item.name))
             .collect()
+    }
+
+    #[test]
+    fn a_key_header_name_the_cli_cannot_carry_is_left_out() {
+        let long = format!("x-{}-token", "a".repeat(60));
+        let found = kinds(detect(&record(
+            "/",
+            &[("x~api-key", "1"), (long.as_str(), "1"), ("x-api-key", "1")],
+            &[],
+        )));
+        assert_eq!(found, [("api_key_header", Some("x-api-key".into()))]);
     }
 
     #[test]
