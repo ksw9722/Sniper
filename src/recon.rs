@@ -533,7 +533,7 @@ pub async fn start(
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(15))
-                .user_agent("Sniper-Recon/0.3.1"),
+                .user_agent(concat!("Sniper-Recon/", env!("CARGO_PKG_VERSION"))),
         )
         .and_then(|builder| builder.build().map_err(Into::into))
         .map_err(|_| {
@@ -548,7 +548,7 @@ pub async fn start(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
-        .user_agent("Sniper-Recon/0.3.1")
+        .user_agent(concat!("Sniper-Recon/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|_| {
             api_error(
