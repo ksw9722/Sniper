@@ -6797,12 +6797,10 @@ fn fuzzer_api_preview(command: &FuzzerCommand) -> Value {
             session_query_path(&format!("/api/fuzzer/attacks/{}", args.id), args.session_id),
             None,
         ),
+        // The attack record carries its results; there is no `/results` route.
         FuzzerCommand::Results(args) => api_preview(
             "GET",
-            session_query_path(
-                &format!("/api/fuzzer/attacks/{}/results", args.id),
-                args.session_id,
-            ),
+            session_query_path(&format!("/api/fuzzer/attacks/{}", args.id), args.session_id),
             None,
         ),
         FuzzerCommand::List(args) => api_preview(
@@ -6945,10 +6943,18 @@ fn intercept_rule_api_preview(command: &InterceptRuleCommand) -> Value {
             session_query_path("/api/intercept-rules", args.session_id),
             None,
         ),
+        // The rule as it is sent; its id is minted when the command runs.
         InterceptRuleCommand::Create(args) => api_preview(
             "POST",
             session_query_path("/api/intercept-rules", args.session_id),
-            Some(json!({ "scope": args.scope, "all": args.all })),
+            Some(json!({
+                "id": "<new uuid>",
+                "enabled": args.enabled.unwrap_or(true),
+                "scope": args.scope,
+                "host_pattern": args.host_pattern.clone().unwrap_or_default(),
+                "path_pattern": args.path_pattern.clone().unwrap_or_default(),
+                "method_filter": args.method_filter,
+            })),
         ),
         InterceptRuleCommand::Update(args) => api_preview(
             "PATCH",
@@ -6989,15 +6995,19 @@ fn sequence_api_preview(command: &SequenceCommand) -> Value {
             session_query_path(&format!("/api/sequences/{}", args.id), args.session_id),
             None,
         ),
+        // Both send the session in the body, which is where the server reads it.
         SequenceCommand::Create(args) => api_preview(
             "POST",
-            session_query_path("/api/sequences", args.session_id),
-            Some(json!({ "note": "sequence definition from file/stdin" })),
+            "/api/sequences",
+            Some(json!({
+                "session_id": args.session_id,
+                "definition": "<sequence definition from file/stdin>",
+            })),
         ),
         SequenceCommand::Run(args) => api_preview(
             "POST",
-            session_query_path(&format!("/api/sequences/{}/run", args.id), args.session_id),
-            Some(json!({})),
+            &format!("/api/sequences/{}/run", args.id),
+            Some(json!({ "session_id": args.session_id })),
         ),
         SequenceCommand::RunGet(args) => api_preview(
             "GET",
