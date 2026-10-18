@@ -995,12 +995,18 @@ pub(crate) fn drop_library_source_map(found: &mut Vec<Detection>, url: &str) {
             Some(stem) if stem.len() >= 3 => stem.to_string(),
             _ => name,
         };
+        // Stop once the run is as long as the name: a run never shrinks, and
+        // a file name of thousands of tokens (the path is not bounded) made
+        // every start join all the rest.
         (0..tokens.len()).any(|start| {
             let mut joined = String::new();
-            tokens[start..].iter().any(|token| {
+            for token in &tokens[start..] {
                 joined.push_str(token);
-                joined == name
-            })
+                if joined.len() >= name.len() {
+                    return joined == name;
+                }
+            }
+            false
         })
     };
     let library = found
@@ -1792,6 +1798,9 @@ mod tests {
             "https://example.com/static/js/main.3f2a1b.js"
         ));
         assert!(mapped(map, "https://example.com/js/common.js"));
+        // Thousands of tokens in one file name are read in linear time.
+        let long = format!("https://example.com/x/{}js", "a.".repeat(32_000));
+        assert!(mapped(&jquery, &long));
         assert!(mapped(&d3, "https://example.com/js/main.d3a1f9.js"));
         assert!(mapped(
             map,
