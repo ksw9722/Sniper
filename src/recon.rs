@@ -1319,7 +1319,8 @@ mod tests {
                 session_id: first.id(),
             }),
         );
-        tokio::time::timeout(Duration::from_secs(5), stopping)
+        // Whether it was still running is a race; only finishing matters here.
+        let _ = tokio::time::timeout(Duration::from_secs(5), stopping)
             .await
             .unwrap()
             .unwrap();
