@@ -726,6 +726,20 @@ impl HistorySelectionArgs {
     }
 }
 
+const HISTORY_SORT_KEYS: [&str; 11] = [
+    "index",
+    "host",
+    "method",
+    "path",
+    "status",
+    "length",
+    "mime",
+    "notes",
+    "tls",
+    "edited",
+    "started_at",
+];
+
 #[derive(Args, Debug, Default)]
 struct HistoryListArgs {
     #[arg(long)]
@@ -762,8 +776,8 @@ struct HistoryListArgs {
     /// Filter by response MIME type (substring match), e.g. "json" or "text/html"
     #[arg(long)]
     mime: Option<String>,
-    /// Sort key for paged history output, e.g. index, host, method, path, status, length, mime, notes, tls, started_at.
-    #[arg(long, value_parser = ["index", "host", "method", "path", "status", "length", "mime", "notes", "tls", "edited", "started_at"])]
+    /// Sort key for paged history output, e.g. index, host, method, path, status, length, mime, notes, tls, edited, started_at.
+    #[arg(long, value_parser = HISTORY_SORT_KEYS)]
     sort_key: Option<String>,
     /// Sort direction for paged history output.
     #[arg(long, value_parser = ["asc", "desc"])]
@@ -1184,13 +1198,9 @@ struct ServiceMapParametersArgs {
 }
 
 fn parse_service_map_parameters_method(value: &str) -> Result<String, String> {
-    (!value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
-    .then(|| value.to_string())
-    .ok_or_else(|| "method must be an HTTP method token of at most 64 characters".to_string())
+    (value.len() <= 64 && is_http_method_token(value))
+        .then(|| value.to_string())
+        .ok_or_else(|| "method must be an HTTP method token of at most 64 characters".to_string())
 }
 
 fn parse_service_map_parameters_path(value: &str) -> Result<String, String> {
@@ -4785,7 +4795,7 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
             "properties":{
                 "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
                 "origin":{"type":"string","description":"Exact canonical HTTP(S) origin of the endpoint, as a map card names it."},
-                "method":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"The endpoint's exact method."},
+                "method":{"type":"string","minLength":1,"maxLength":64,"not":{"pattern":"[^A-Za-z0-9!#$%&'*+.^_`|~-]"},"description":"The endpoint's exact HTTP method token, preserving case and punctuation."},
                 "path":{"type":"string","pattern":"^/[^?#]{0,4095}$","description":"The endpoint's exact path, without query or fragment."}
             }
         })),
@@ -5649,6 +5659,14 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
                 "description": format!("CLI argument `{field}`"),
             }),
         );
+    }
+    if operation == "capture.http.list" {
+        let mut sort_keys: Vec<Value> = HISTORY_SORT_KEYS.into_iter().map(Value::from).collect();
+        sort_keys.push(Value::Null);
+        properties.insert("sort_key".into(), json!({
+            "type":["string","null"],"enum":sort_keys,
+            "description":"Sort key for paged history output. Omission or null uses the server's default order."
+        }));
     }
     if operation == "examples" {
         properties.insert("operation".into(), json!({
@@ -7447,18 +7465,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                             operation,
                             input,
                             "sort_key",
-                            &[
-                                "index",
-                                "host",
-                                "method",
-                                "path",
-                                "status",
-                                "length",
-                                "mime",
-                                "notes",
-                                "tls",
-                                "started_at",
-                            ],
+                            &HISTORY_SORT_KEYS,
                         )?,
                         sort_direction: call_optional_enum_string(
                             operation,
@@ -20240,6 +20247,39 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["sniper-cli", "scope", "service-map", "--all-rows"]).is_ok());
+    }
+
+    #[test]
+    fn service_map_method_input_schema_matches_http_tokens() {
+        let schema = super::service_map_input_schema("target.service_map.parameters.get").unwrap();
+        let schema = &schema["properties"]["method"];
+        assert_eq!(schema["type"], "string");
+        let forbidden = regex::Regex::new(schema["not"]["pattern"].as_str().unwrap()).unwrap();
+        let mut values: Vec<String> = (0..=127u8)
+            .map(|byte| format!("X{}Y", char::from(byte)))
+            .collect();
+        values.extend([
+            "".into(),
+            "X".repeat(64),
+            "X".repeat(65),
+            "GÉT".into(),
+            "GET\u{a0}".into(),
+            "GET\u{2028}".into(),
+            "GET\u{2029}".into(),
+        ]);
+        for value in values {
+            let valid = value.len() <= 64 && http::Method::from_bytes(value.as_bytes()).is_ok();
+            assert_eq!(
+                super::parse_service_map_parameters_method(&value).is_ok(),
+                valid,
+                "{value:?}"
+            );
+            let length = value.chars().count() as u64;
+            let schema_valid = length >= schema["minLength"].as_u64().unwrap()
+                && length <= schema["maxLength"].as_u64().unwrap()
+                && !forbidden.is_match(&value);
+            assert_eq!(schema_valid, valid, "schema: {value:?}");
+        }
     }
 
     // An endpoint's parameters: an exact endpoint in, the endpoint asked about
