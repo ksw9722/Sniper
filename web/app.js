@@ -14153,6 +14153,14 @@ function renderReplay(options = {}) {
     return;
   }
 
+  const previousOwner = getRenderedHttpReplayDraftOwner(tab);
+  const draftOwner = {
+    tab,
+    sessionId: currentSessionId(),
+    generation: workspaceStateGeneration,
+    // Keep the editor's history on redraw, while refreshing draft-capture state.
+    editorOwner: previousOwner?.editorOwner || {},
+  };
   syncReplayToolbar(tab, { force: options.forceToolbarSync });
   const reqMode = state.replayMessageViews.request;
   if (els.replayRequestCM) {
@@ -14165,9 +14173,9 @@ function renderReplay(options = {}) {
       }
       const hexText = toHexDumpFromBytes(tab.requestBytes);
       updateCodePaneCM("replayReq", els.replayRequestCM, hexText, {
-        mode: "hex", readOnly: true,
+        mode: "hex", readOnly: true, owner: draftOwner.editorOwner,
       });
-      updateReplaySearchPane("request", hexText);
+      updateReplaySearchPane("request", hexText, { scrollToFirst: !previousOwner });
     } else {
       // Pretty/Raw mode: editable
       if (tab.requestBytes) {
@@ -14176,10 +14184,10 @@ function renderReplay(options = {}) {
         tab.requestOriginalBytes = null;
       }
       updateCodePaneCM("replayReq", els.replayRequestCM, tab.requestText, {
-        mode: "http", readOnly: false,
+        mode: "http", readOnly: false, owner: draftOwner.editorOwner,
         onChange: syncReplayRequestTextFromEditor,
       });
-      updateReplaySearchPane("request", tab.requestText);
+      updateReplaySearchPane("request", tab.requestText, { scrollToFirst: !previousOwner });
     }
   } else if (reqMode === "hex") {
     if (els.replayRequestHighlight) els.replayRequestHighlight.removeAttribute("contenteditable");
@@ -14205,14 +14213,10 @@ function renderReplay(options = {}) {
     }
     if (els.replayRequestEditor) els.replayRequestEditor.value = tab.requestText;
     renderReplayRequestHighlight(tab.requestText);
-    updateReplaySearchPane("request", tab.requestText);
+    updateReplaySearchPane("request", tab.requestText, { scrollToFirst: !previousOwner });
   }
 
-  renderedHttpReplayDraftOwner = {
-    tab,
-    sessionId: currentSessionId(),
-    generation: workspaceStateGeneration,
-  };
+  renderedHttpReplayDraftOwner = draftOwner;
 
   if (!tab.responseRecord) {
     renderReplayEmptyResponse(tab);
@@ -14544,7 +14548,9 @@ function renderReplayViewContent(target) {
           tab.requestOriginalBytes = new Uint8Array(tab.requestBytes);
         }
         const hexText = toHexDumpFromBytes(tab.requestBytes);
-        updateCodePaneCM("replayReq", els.replayRequestCM, hexText, { mode: "hex", readOnly: true });
+        updateCodePaneCM("replayReq", els.replayRequestCM, hexText, {
+          mode: "hex", readOnly: true, owner: getRenderedHttpReplayDraftOwner(tab)?.editorOwner,
+        });
         updateReplaySearchPane("request", hexText);
       } else {
         if (tab.requestBytes) {
@@ -14555,6 +14561,7 @@ function renderReplayViewContent(target) {
         updateCodePaneCM("replayReq", els.replayRequestCM, tab.requestText, {
           mode: "http",
           readOnly: false,
+          owner: getRenderedHttpReplayDraftOwner(tab)?.editorOwner,
           onChange: syncReplayRequestTextFromEditor,
         });
         updateReplaySearchPane("request", tab.requestText);
@@ -29293,7 +29300,8 @@ class SniperCodeView {
     this._searchNavIndex = -1;
     this.view = new CM.EditorView({
       state: CM.EditorState.create({
-        doc: "",
+        // Initial content is a baseline, not an undoable edit from an empty pane.
+        doc: options.content || "",
         extensions: [...createBaseExtensions(options), searchDecoField, changedDecoField],
       }),
       parent: container,
@@ -29308,7 +29316,7 @@ class SniperCodeView {
   setContent(text) {
     const { view } = this;
     const nextText = text || "";
-    if (view.state.doc.toString() === nextText) {
+    if (view.state.doc.toString() === nextText.replace(/\r\n?/g, "\n")) {
       return;
     }
     cmProgrammaticViews.add(view);
@@ -29324,7 +29332,7 @@ class SniperCodeView {
   setContentPreservingSelection(text) {
     const { view } = this;
     const nextText = text || "";
-    if (view.state.doc.toString() === nextText) {
+    if (view.state.doc.toString() === nextText.replace(/\r\n?/g, "\n")) {
       return;
     }
     const selection = view.state.selection.main;
@@ -29399,13 +29407,18 @@ function initCMSearchNavigation(metaElement, cmKey) {
 function updateCodePaneCM(key, container, text, options = {}) {
   const mode = options.mode || "http"; // "http" | "hex" | "diff"
   const editable = options.readOnly === false;
-  // Recreate CM view if highlight mode or editable changed
-  if (_cmViews[key] && (_cmViews[key]._hlMode !== mode || !!_cmViews[key]._editable !== editable)) {
+  let restoreFocus = false;
+  // Undo history belongs to one document owner. Tab/session replacement must
+  // retire it even when the new document has the same text or persisted ID.
+  if (_cmViews[key] && (_cmViews[key]._hlMode !== mode || !!_cmViews[key]._editable !== editable
+    || _cmViews[key]._owner !== options.owner)) {
+    restoreFocus = _cmViews[key]._hlMode === mode && !!_cmViews[key]._editable === editable
+      && _cmViews[key].view.hasFocus;
     _cmViews[key].destroy();
     delete _cmViews[key];
   }
   if (!_cmViews[key]) {
-    const cmOpts = {};
+    const cmOpts = { content: text || "" };
     cmOpts.readOnly = !editable;
     if (mode === "http") cmOpts.httpHighlight = true;
     else if (mode === "hex") cmOpts.hexHighlight = true;
@@ -29415,6 +29428,7 @@ function updateCodePaneCM(key, container, text, options = {}) {
     _cmViews[key] = new SniperCodeView(container, cmOpts);
     _cmViews[key]._hlMode = mode;
     _cmViews[key]._editable = editable;
+    _cmViews[key]._owner = options.owner;
   }
   const cv = _cmViews[key];
   if (editable && options.onChange && !cv._onChangeWired) {
@@ -29430,6 +29444,9 @@ function updateCodePaneCM(key, container, text, options = {}) {
   // Changed-line highlights (Modified view). Applied after setContent, which
   // clears them, so this is the authoritative re-apply for the new text.
   cv.applyChangedLines(options.changedRanges);
+  // Keyboard tab cycling can leave focus inside the editor being replaced.
+  // Do not claim focus when a toolbar field or tab button owns it instead.
+  if (restoreFocus) cv.view.focus();
 
   const lineCount = cv.view.state.doc.lines;
   return {
