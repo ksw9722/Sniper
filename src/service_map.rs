@@ -710,7 +710,6 @@ pub fn canonical_origin(value: &str) -> Option<String> {
 pub(crate) fn request_target(record: &TransactionRecord) -> Option<(Url, String)> {
     if record.scheme.len() > 8
         || record.host.len() > MAX_HOST_BYTES
-        || record.path.len() > MAX_PATH_BYTES + MAX_HEADER_VALUE_BYTES
         || record.method.is_empty()
         || record.method.len() > MAX_METHOD_BYTES
         || !record
@@ -733,8 +732,11 @@ pub(crate) fn request_target(record: &TransactionRecord) -> Option<(Url, String)
     if base.host_str()?.len() > MAX_HOST_BYTES {
         return None;
     }
+    // The query is never read, and a path longer than an endpoint may hold
+    // still names its origin: a tracking pixel's 6 KiB query, a script's
+    // encoded path. The map leaves out only that endpoint.
     let path = record.path.split(['?', '#']).next().unwrap_or("");
-    if !path.starts_with('/') || path.len() > MAX_PATH_BYTES || path.chars().any(char::is_control) {
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
         return None;
     }
     Some((base, path.to_string()))
@@ -1540,7 +1542,11 @@ impl MapBuilder {
             }
         }
         let key = (row.origin.clone(), row.method.clone(), row.path.clone());
-        let endpoint_index = if let Some(index) = self.endpoint_indexes.get(&key) {
+        let endpoint_index = if row.path.len() > MAX_PATH_BYTES {
+            // The row still counts for its origin; only its endpoint is left out.
+            self.stopped_by.insert("path_limit".into());
+            None
+        } else if let Some(index) = self.endpoint_indexes.get(&key) {
             Some(*index)
         } else if self.endpoint_indexes.len() >= MAX_ENDPOINTS
             || origin.endpoints.len() >= MAX_ENDPOINTS_PER_ORIGIN
@@ -2872,9 +2878,13 @@ mod tests {
             name: "location".into(),
             value: "/next".into(),
         };
+        // A path past the endpoint cap, and a query past any header's, still
+        // count for their origin; only the long path's endpoint is left out.
+        let long_query = record(&format!("/pixel?d={}", "x".repeat(MAX_PATH_BYTES * 4)));
         let result = map(vec![
             row,
             record(&format!("/{}", "x".repeat(MAX_PATH_BYTES))),
+            long_query,
         ])
         .await;
         assert!(!result.snapshot.complete);
@@ -2882,10 +2892,20 @@ mod tests {
             .snapshot
             .stopped_by
             .contains(&"header_scan_limit".into()));
-        assert!(result
+        assert!(result.snapshot.stopped_by.contains(&"path_limit".into()));
+        assert!(!result
             .snapshot
             .stopped_by
             .contains(&"unsupported_or_oversized_metadata".into()));
+        assert_eq!(result.snapshot.omitted_rows, 0);
+        assert_eq!(result.origins[0].request_count, 3);
+        let paths: Vec<_> = result.origins[0]
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.path.as_str())
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.contains(&"/pixel"));
         assert!(result.origins[0].redirects.is_empty());
     }
 

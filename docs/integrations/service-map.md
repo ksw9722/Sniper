@@ -678,6 +678,11 @@ both because unread headers could contain duplicates. Before this, one
 long policy left the whole page unread: in the two crawls, 123 pages, 13
 redirects and 192 CORS answers.
 
+A request target's length no longer drops its row. The query is never read, so
+a tracking pixel's 6 KiB query counts like any other row, and a path longer than
+2,048 bytes counts for its origin (its rows, products, clients and links) while
+only its endpoint is left out, with `path_limit` in `snapshot.stopped_by`.
+
 Each finding gets a layer, outermost first: `edge` (CDN and WAF), `gateway`
 (load balancer, API gateway, proxy cache), `platform` (hosting and storage),
 `web_server`, `app_server`, `backend` (framework or application),
