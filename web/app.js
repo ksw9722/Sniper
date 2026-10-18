@@ -203,7 +203,7 @@ const FUZZER_RESULT_BUFFER_ROWS = 30;
 const FINDINGS_ROW_HEIGHT = 27;
 let measuredFindingsRowHeight = FINDINGS_ROW_HEIGHT;
 const FINDINGS_BUFFER_ROWS = 20;
-const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "fuzzer", "sequence", "replay", "recon", "tools", "logger"]);
+const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "map", "fuzzer", "sequence", "replay", "recon", "tools", "logger"]);
 const IMPLEMENTED_PROXY_TABS = new Set(["intercept", "http-history", "websockets-history", "replace", "findings", "oast", "proxy-settings"]);
 const DECODER_SCRIPT_SOURCES = [
   "/decoder/lib/jquery-1.7.2.min.js",
@@ -634,6 +634,7 @@ const els = {
   fuzzerShell: document.getElementById("fuzzerShell"),
   sequenceShell: document.getElementById("sequenceShell"),
   targetShell: document.getElementById("targetShell"),
+  mapShell: document.getElementById("mapShell"),
   loggerShell: document.getElementById("loggerShell"),
   filterBar: document.getElementById("filterBar"),
   trafficRegion: document.getElementById("trafficRegion"),
@@ -1203,10 +1204,8 @@ function bindEvents() {
       if (state.activeTool === "dashboard") {
         loadSessions({ reloadOnActiveChange: true }).catch(handleWorkspaceActionError);
       }
-      if (state.activeTool === "target") {
-        if (["service-map", "apis"].includes(state.activeTargetView)) targetServiceMapController?.refresh({ force: true });
-        else loadTargetSiteMap(true).catch((error) => console.error(error));
-      }
+      if (state.activeTool === "map") targetServiceMapController?.refresh({ force: true });
+      if (state.activeTool === "target") loadTargetSiteMap(true).catch((error) => console.error(error));
       if (state.activeTool === "logger") {
         loadEventLog().catch((error) => console.error(error));
       }
@@ -7613,9 +7612,9 @@ async function reloadTargetSiteMapFromButton() {
 async function loadTargetSiteMap(forceScopeSync = false, saveContext = null) {
   const sessionId = currentSessionId();
   const workspaceGeneration = workspaceStateGeneration;
-  // The legacy Paths projection is unbounded and carries raw paths. Never load
-  // it as a prerequisite of the bounded, query-free Service Map or APIs views.
-  const loadPaths = state.activeTool === "target" && state.activeTargetView === "paths";
+  // The legacy Paths projection is unbounded and carries raw paths. Load it only
+  // for Scope, where it is shown, never for the Service Map tool.
+  const loadPaths = state.activeTool === "target";
   const [runtimeResponse, siteMapResponse] = await Promise.all([
     fetch(sessionQueryPath("/api/runtime", sessionId)),
     loadPaths ? fetch(sessionQueryPath("/api/target/site-map", sessionId)) : null,
@@ -7638,7 +7637,7 @@ async function loadTargetSiteMap(forceScopeSync = false, saveContext = null) {
   if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
   state.runtime = runtime;
   if (siteMap) state.targetSiteMap = siteMap;
-  if (typeof targetServiceMapController !== "undefined" && state.activeTool === "target") {
+  if (typeof targetServiceMapController !== "undefined" && state.activeTool === "map") {
     targetServiceMapController?.refresh();
   }
   syncTargetScopeDraft(forceScopeSync);
@@ -7686,11 +7685,10 @@ async function pollAuxiliaryData() {
     tasks.push(loadEventLog());
   }
 
-  if (state.activeTool === "target") {
-    if (["service-map", "apis"].includes(state.activeTargetView) && typeof targetServiceMapController !== "undefined") {
-      tasks.push(targetServiceMapController?.refresh());
-    } else tasks.push(loadTargetSiteMap());
+  if (state.activeTool === "map" && typeof targetServiceMapController !== "undefined") {
+    tasks.push(targetServiceMapController?.refresh());
   }
+  if (state.activeTool === "target") tasks.push(loadTargetSiteMap());
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
     tasks.push(loadFindings());
@@ -8833,7 +8831,7 @@ let _searchActiveUntil = 0;
 
 function renderToolPanels() {
   if (typeof targetServiceMapController !== "undefined") {
-    targetServiceMapController?.setVisible(state.activeTool === "target" && ["service-map", "apis"].includes(state.activeTargetView), state.activeTargetView);
+    targetServiceMapController?.setVisible(state.activeTool === "map", state.activeTargetView);
   }
   state.activeTool = sanitizeActiveTool(state.activeTool);
 
@@ -8848,6 +8846,7 @@ function renderToolPanels() {
   const fuzzerVisible = state.activeTool === "fuzzer";
   const sequenceVisible = state.activeTool === "sequence";
   const targetVisible = state.activeTool === "target";
+  const mapVisible = state.activeTool === "map";
   const loggerVisible = state.activeTool === "logger";
   const reconVisible = state.activeTool === "recon";
   els.dashboardShell.classList.toggle("hidden", !dashboardVisible);
@@ -8857,6 +8856,7 @@ function renderToolPanels() {
   els.fuzzerShell.classList.toggle("hidden", !fuzzerVisible);
   els.sequenceShell.classList.toggle("hidden", !sequenceVisible);
   els.targetShell.classList.toggle("hidden", !targetVisible);
+  els.mapShell?.classList.toggle("hidden", !mapVisible);
   els.loggerShell.classList.toggle("hidden", !loggerVisible);
   els.reconShell?.classList.toggle("hidden", !reconVisible);
   if (typeof reconController !== "undefined") reconController?.setVisible(reconVisible);
@@ -8905,6 +8905,11 @@ function renderToolPanels() {
   if (targetVisible) {
     renderTarget();
     els.footerMode.textContent = "Scope active";
+    return;
+  }
+
+  if (mapVisible) {
+    els.footerMode.textContent = "Service Map active";
     return;
   }
 
@@ -14881,24 +14886,19 @@ function initializeTargetWorkspace() {
   setActiveTargetView(state.activeTargetView || "service-map");
 }
 
+// The Service Map tool's two views of one map: the graph and its APIs. Scope
+// shows its rules and paths together, with no views to switch.
 function setActiveTargetView(view, { refresh = true } = {}) {
-  state.activeTargetView = ["rules", "service-map", "apis", "paths"].includes(view) ? view : "service-map";
+  state.activeTargetView = ["service-map", "apis"].includes(view) ? view : "service-map";
   for (const tab of document.querySelectorAll("[data-target-view]")) {
     const selected = tab.dataset.targetView === state.activeTargetView;
     tab.classList.toggle("active", selected);
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
   }
-  document.getElementById("targetRulesPanel")?.classList.toggle("hidden", state.activeTargetView !== "rules");
-  document.getElementById("targetPathsPanel")?.classList.toggle("hidden", state.activeTargetView !== "paths");
-  const mapVisible = ["service-map", "apis"].includes(state.activeTargetView);
-  const mapPanel = document.getElementById("targetServiceMapPanel");
-  mapPanel?.classList.toggle("hidden", !mapVisible);
-  mapPanel?.setAttribute("aria-labelledby", state.activeTargetView === "apis" ? "targetApisTab" : "targetServiceMapTab");
-  targetServiceMapController?.setVisible(state.activeTool === "target" && mapVisible, state.activeTargetView);
-  if (state.activeTool === "target" && mapVisible) {
-    if (refresh) targetServiceMapController?.refresh();
-  } else if (state.activeTool === "target" && currentSessionId()) loadTargetSiteMap().catch((error) => console.error(error));
+  document.getElementById("targetServiceMapPanel")?.setAttribute("aria-labelledby", state.activeTargetView === "apis" ? "targetApisTab" : "targetServiceMapTab");
+  targetServiceMapController?.setVisible(state.activeTool === "map", state.activeTargetView);
+  if (state.activeTool === "map" && refresh) targetServiceMapController?.refresh();
 }
 
 function renderTarget() {

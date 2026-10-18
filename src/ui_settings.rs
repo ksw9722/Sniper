@@ -36,6 +36,7 @@ const ACTIVE_TOOL_OPTIONS: &[&str] = &[
     "dashboard",
     "target",
     "proxy",
+    "map",
     "fuzzer",
     "sequence",
     "recon",

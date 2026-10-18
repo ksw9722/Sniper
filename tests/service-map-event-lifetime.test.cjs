@@ -60,7 +60,7 @@ for (const previous of ['service-map', 'apis']) {
   test(`internal ${previous} to map navigation uses the loaded snapshot without another request`, () => {
     const calls = [];
     const context = loadFunctions(['setActiveTargetView'], {
-      state: { activeTool: 'target', activeTargetView: previous },
+      state: { activeTool: 'map', activeTargetView: previous },
       document: { querySelectorAll: () => [], getElementById: () => null },
       currentSessionId: () => 'session-one',
       targetServiceMapController: {

@@ -1,4 +1,5 @@
-// Scope navigation uses the same density rules as existing Capture tabs.
+// Scope shows its rules and paths together; the Service Map tool's view strip
+// uses the same density rules as existing Capture tabs.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -8,6 +9,7 @@ const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
 const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
 const app = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8');
 const header = html.match(/<header class="target-workspace-header">([^]*?)<\/header>/)?.[1];
+const scopeShell = html.match(/<section class="target-shell hidden" id="targetShell">([^]*?)\n        <\/section>\n/)?.[1];
 const rule = (selector, expectedDefinitions = 1) => {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const matches = [...css.matchAll(new RegExp(`${escaped}\\s*\\{([^}]+)\\}`, 'g'))];
@@ -15,32 +17,47 @@ const rule = (selector, expectedDefinitions = 1) => {
   return matches[0][1];
 };
 
-test('Scope tabs share existing sub-tab styling without Capture handlers', () => {
+test('Service Map tabs share existing sub-tab styling without Capture handlers', () => {
   assert.ok(header);
   const tabs = [...header.matchAll(/<button\b([^>]+)>/g)].map(match => match[1]);
-  assert.equal(tabs.length, 4);
+  assert.equal(tabs.length, 2);
   for (const tab of tabs) {
     assert.match(tab, /class="sub-tab target-tab(?: active)?"/);
-    assert.match(tab, /data-target-view="(?:rules|service-map|apis|paths)"/);
+    assert.match(tab, /data-target-view="(?:service-map|apis)"/);
     assert.match(tab, /role="tab"/);
     assert.doesNotMatch(tab, /data-proxy-tab/);
   }
   assert.match(app, /querySelectorAll\("\.sub-tab\[data-proxy-tab\]"\)/);
 });
 
-test('Target strip omits the duplicate title and keeps accessible navigation labels', () => {
-  assert.doesNotMatch(header, /<h[1-6]\b[^>]*>\s*(?:Scope|Target)\s*<\/h[1-6]>/);
-  assert.match(html, /<button class="main-tab" data-tool="target">Target<\/button>/);
-  assert.match(header, /role="tablist" aria-label="Target views"/);
-  // What was captured first, as Burp's Target lists its site map, then the
-  // scope rules that filter it.
+test('Scope and Service Map are main tools, the map right after Capture', () => {
+  const tools = [...html.matchAll(/<button class="main-tab(?: active)?" data-tool="([^"]+)">([^<]+)</g)].map(match => [match[1], match[2]]);
+  const at = (tool) => tools.findIndex(([id]) => id === tool);
+  assert.deepEqual(tools[at('target')], ['target', 'Scope']);
+  assert.deepEqual(tools[at('map')], ['map', 'Service Map']);
+  assert.equal(at('map'), at('proxy') + 1);
+  assert.match(app, /const IMPLEMENTED_TOOLS = new Set\(\[[^\]]*"map"/);
+});
+
+test('Scope shows its rules and paths side by side, with no views to switch', () => {
+  assert.ok(scopeShell);
+  assert.doesNotMatch(scopeShell, /role="tab(?:list|panel)?"|data-target-view|class="[^"]*\bhidden\b/);
+  assert.match(scopeShell, /<section class="split-panel split-panel-tight">/);
+  assert.match(scopeShell, /id="targetRulesPanel" aria-labelledby="targetRulesTitle"/);
+  assert.match(scopeShell, /id="targetPathsPanel" aria-labelledby="targetPathsTitle"/);
+  assert.ok(scopeShell.indexOf('id="targetRulesPanel"') < scopeShell.indexOf('id="targetPathsPanel"'));
+});
+
+test('Service Map strip omits the duplicate title and keeps accessible navigation labels', () => {
+  assert.doesNotMatch(header, /<h[1-6]\b[^>]*>\s*(?:Scope|Service Map)\s*<\/h[1-6]>/);
+  assert.match(header, /role="tablist" aria-label="Service Map views"/);
   assert.deepEqual([...header.matchAll(/data-target-view="([^"]+)"[^>]*>([^<]+)</g)].map(match => [match[1], match[2]]),
-    [['service-map', 'Service Map'], ['apis', 'APIs'], ['paths', 'Paths'], ['rules', 'Scope']]);
-  assert.match(html, /id="targetRulesPanel" role="tabpanel" aria-labelledby="targetRulesTab"/);
+    [['service-map', 'Map'], ['apis', 'APIs']]);
+  assert.match(html, /<section class="map-shell hidden" id="mapShell">\s*<header class="target-workspace-header">/);
   assert.match(html, /id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab"/);
 });
 
-test('Scope strip keeps compact height and adds no vertical padding', () => {
+test('Service Map strip keeps compact height and adds no vertical padding', () => {
   const strip = rule('.target-workspace-header');
   assert.match(strip, /padding:\s*0 8px;/);
   assert.match(strip, /min-height:\s*24px;/);
@@ -48,7 +65,7 @@ test('Scope strip keeps compact height and adds no vertical padding', () => {
   assert.doesNotMatch(css, /\.target-tab(?:\.active)?\s*\{/);
 });
 
-test('Scope keeps existing responsive sub-tab padding and active indicator', () => {
+test('Service Map keeps existing responsive sub-tab padding and active indicator', () => {
   assert.match(css, /@media \(max-height: 920px\)\s*\{[^]*?\.sub-tab\s*\{\s*padding:\s*4px 8px 3px;/);
   assert.match(css, /\.sub-tab\.active::after\s*\{/);
   assert.match(rule('.target-tabs'), /overflow-x:\s*auto;/);
@@ -56,6 +73,6 @@ test('Scope keeps existing responsive sub-tab padding and active indicator', () 
 });
 
 
-test('Scrollable Scope tabs keep the keyboard focus ring inside their bounds', () => {
+test('Scrollable Service Map tabs keep the keyboard focus ring inside their bounds', () => {
   assert.match(rule('.target-tab:focus-visible'), /outline-offset:\s*-2px;/);
 });

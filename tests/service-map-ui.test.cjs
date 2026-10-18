@@ -341,8 +341,9 @@ test('exact evidence includes source observations and any incomplete-metadata no
 });
 
 const { loadFunctions, appSource } = require('./frontend-test-helpers.cjs');
-for (const view of ['service-map', 'apis', 'rules', 'paths']) test(`${view} loader only requests legacy paths when Paths is explicitly visible`, async () => {
-  const requests = [], state = { activeTool: 'target', activeTargetView: view, targetScopeDraftVersion: 0, targetScopeSaveToken: 0, targetScopeDirty: false };
+// Scope shows its paths beside its rules; the Service Map tool never loads them.
+for (const tool of ['target', 'map']) test(`${tool} loader only requests legacy paths for Scope, which shows them`, async () => {
+  const requests = [], state = { activeTool: tool, activeTargetView: 'service-map', targetScopeDraftVersion: 0, targetScopeSaveToken: 0, targetScopeDirty: false };
   const ctx = loadFunctions(['loadTargetSiteMap'], {
     state, currentSessionId: () => 'session-one', workspaceStateGeneration: 0,
     sessionQueryPath: (path, id) => `${path}?session_id=${id}`,
@@ -350,13 +351,13 @@ for (const view of ['service-map', 'apis', 'rules', 'paths']) test(`${view} load
     requireOkResponse: async () => {}, jsonArray: value => value, syncTargetScopeDraft() {}, renderInterceptStatus() {}, renderProxySettings() {}, renderTarget() {},
   });
   await ctx.loadTargetSiteMap();
-  assert.equal(requests.some(url => url.startsWith('/api/target/site-map')), view === 'paths');
+  assert.equal(requests.some(url => url.startsWith('/api/target/site-map')), tool === 'target');
 });
 test('map/APIs polling bypasses legacy runtime/path reads entirely', async () => {
   for (const view of ['service-map', 'apis']) {
     let refreshes = 0;
     const ctx = loadFunctions(['pollAuxiliaryData'], {
-      state: { activeTool: 'target', activeTargetView: view },
+      state: { activeTool: 'map', activeTargetView: view },
       targetServiceMapController: { refresh: async () => { refreshes++; } },
       isWebsocketHistoryVisible: () => false, shouldPollFindingsBadge: () => false,
       loadTargetSiteMap() { assert.fail('Legacy path loader must not run in the bounded map'); },
@@ -1161,7 +1162,7 @@ test('canonical omitted references cannot exceed the inspected candidate budget'
 
 function pollRealTargetMap(f) {
   return loadFunctions(['pollAuxiliaryData'], {
-    state: { activeTool: 'target', activeTargetView: 'service-map' }, targetServiceMapController: f.controller,
+    state: { activeTool: 'map', activeTargetView: 'service-map' }, targetServiceMapController: f.controller,
     isWebsocketHistoryVisible: () => false, shouldPollFindingsBadge: () => false,
     loadTargetSiteMap() { assert.fail('No legacy map read'); },
   }).pollAuxiliaryData();

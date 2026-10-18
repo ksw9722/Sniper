@@ -456,10 +456,11 @@ its path templates, parameter and body field names with guessed types,
 response statuses and media types, and the credentials its rows showed, built
 from every retained row and holding no captured value. Each operation sends its
 newest row to Replay, and the document copies as JSON or opens in Swagger
-Editor (editor.swagger.io, to paste it into). The tool that holds the map is
-named **Target**, as in Burp, where it was Scope: Service Map, APIs and Paths
-show what was captured, and **Scope** beside them holds the rules that filter
-them. The CLI keeps `scope`, with `target` as its alias. An origin whose rows
+Editor (editor.swagger.io, to paste it into). The map has its own tool,
+**Service Map**, after Capture, with **Map** and **APIs** views; **Scope** again
+shows its rules beside the captured hosts and paths on one screen, as before the
+map was added. The CLI keeps `scope service-map`, with `target` as an alias of
+`scope`. An origin whose rows
 carried no typed response now stays off the map unless selected or searched
 for.
 
