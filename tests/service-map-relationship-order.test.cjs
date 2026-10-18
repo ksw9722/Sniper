@@ -394,8 +394,8 @@ function siteOrigins() {
 const press = (f, dataset) => f.els.panel.dispatch('click', { target: { closest: selector => selector === 'button' ? { dataset } : null } });
 
 test('site keys take the last two host labels, three under listed suffixes, and never an address', () => {
-  assert.deepEqual(['https://shop-phinf.pstatic.net', 'https://www.example.co.kr', 'https://example.com', 'http://127.0.0.1:8080', 'http://[::1]:80', 'http://localhost:3000'].map(map.siteKey),
-    ['pstatic.net', 'example.co.kr', 'example.com', null, null, null]);
+  assert.deepEqual(['https://shop-images.example.net', 'https://www.example.co.kr', 'https://example.com', 'http://127.0.0.1:8080', 'http://[::1]:80', 'http://localhost:3000'].map(map.siteKey),
+    ['example.net', 'example.co.kr', 'example.com', null, null, null]);
 });
 
 test('site keys ignore one DNS root dot before applying the existing suffix rules', () => {

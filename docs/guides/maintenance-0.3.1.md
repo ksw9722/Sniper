@@ -447,7 +447,7 @@ A response header over 4 KiB, such as a long Content-Security-Policy, no
 longer stops the map from reading the page: only that header is skipped, and
 the redirect and CORS answer still count unless it is the `Location` or
 `Access-Control-Allow-Origin` itself. It had left 123 crawled pages unread,
-monzo.com's Next.js among them.
+a Next.js site among them.
 
 An origin that serves API data opens as API docs, an OpenAPI 3.1 document laid
 out as Swagger UI lays one out (**API docs** in its inspector, `GET

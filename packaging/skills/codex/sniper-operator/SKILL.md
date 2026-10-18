@@ -299,8 +299,9 @@ The map is built for a model to read as well as a person. A workable order:
    tokens, and `named_alongside`: what the map named on the same origins
    (`--kind banners|headers|cookies`, `--limit`). Work down that list. Three
    clues, strongest first:
-   - The origins' own domain: a cookie set only on `rubiconproject.com` hosts
-     is Magnite's; one on `qq.com`, `gtimg.com` and `qpic.cn` is Tencent's.
+   - The origins' own domain: a cookie set only on one ad network's hosts is
+     that network's; one spread over a company's several domains is that
+     company's.
    - `named_alongside`: a header every carrying origin shares with one product
      (`cdn-pullzone` beside BunnyCDN) is likely that product's own.
    - The value: open an evidence row and read the header's value and the
