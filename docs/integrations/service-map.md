@@ -1,7 +1,7 @@
-# Passive retained-history Service Map (unreleased)
+# Passive retained-history Service Map
 
 Service Map's default inventory is a read-only view of metadata already retained
-by one Sniper session. It builds the same inventory for the Scope UI and CLI.
+by one Sniper session. It builds the same inventory for the Map tool and the CLI.
 Opening or refreshing it never probes an origin, starts a scan, replays a request,
 follows a redirect, crawls a page, or asks an agent to explore a target. It does not
 create a persistent graph or change the active session.
@@ -1682,7 +1682,7 @@ Compatibility works in both directions:
   Malformed, unsupported, or mismatched markers are rejected before validating
   observations. Neither clients nor servers silently retry with another catalog.
 
-The Scope UI requests revision 2 on both metadata reads. The CLI defaults to
+The Map tool requests revision 2 on both metadata reads. The CLI defaults to
 revision 2 for map and evidence; `--technology-catalog-version 1` or the numeric
 `technology_catalog_version: 1` call input explicitly requests revision 1. These
 CLI options become a local request header, not query parameters. CLI dry-run

@@ -1,11 +1,11 @@
-# CLI and saved-workspace maintenance (unreleased)
+# CLI and saved-workspace maintenance in 0.3.1
 
-This is an overview of maintenance work on `release/0.3.1`, not a release
-announcement. The package version is `0.3.1`, the version this branch releases.
+This is an overview of maintenance work released in 0.3.1, not a release
+announcement; see the release notes for that.
 
 ## Passive Service Map
 
-The Scope UI and read-only CLI share a bounded inventory built from retained
+The Map tool and read-only CLI share a bounded inventory built from retained
 capture metadata. Origins contain method-plus-exact-path endpoints, observed
 counts and safe exact-row evidence. Header clues and redirect instructions are
 labeled as observations; they do not establish infrastructure or a followed

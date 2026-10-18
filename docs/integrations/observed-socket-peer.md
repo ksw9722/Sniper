@@ -1,4 +1,4 @@
-# Observed socket peer capture (unreleased)
+# Observed socket peer capture
 
 Observed socket peer capture is an explicit, per-session option, **Off by
 default**. It records at most one bounded socket observation for an eligible

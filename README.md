@@ -43,13 +43,11 @@ since releases are not yet code-signed.
 
 Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or extract a Windows ZIP built by `packaging/windows/make-zip.ps1` and open `sniper-desktop.exe`. Building from source requires the MSVC Rust toolchain. See [Windows setup and packaging](packaging/windows/README.md) for WebView2/runtime prerequisites, HTTPS certificates, CLI usage, and isolated testing. Windows x64 is the first Windows target.
 
-### Linux: Debian 13 x86_64 on X11 (development branch)
+### Linux: Debian 13 x86_64 on X11
 
-**Debian 13 (trixie), x86_64, X11 is supported on the unreleased
-`release/0.3.1` development branch.** Build from that branch or use its exact-run
-CI candidate archive or `.deb`; there are **no published Linux release assets
-yet**. Candidate filenames use the crate version `0.3.1`, the version this branch
-will release.
+**Debian 13 (trixie), x86_64, X11 is supported from v0.3.1.** Build from the
+`v0.3.1` tag or use the CI candidate archive or `.deb` of that commit; there are
+**no published Linux release assets yet**.
 
 See [Linux source, CI artifacts and installation](packaging/linux/README.md)
 for the qualification boundary, system GTK 3/WebKitGTK 4.1 requirements,
@@ -227,9 +225,9 @@ chain, and writes them into the page; scripts still never run. Those requests
 go to the target and to any other host the page names, and are not recorded in
 HTTP history.
 
-## Passive Service Map (unreleased)
+## Passive Service Map
 
-Scope's Service Map summarizes origins and method-plus-exact-path endpoints from
+The Map tool's Service Map summarizes origins and method-plus-exact-path endpoints from
 retained capture metadata, with counts, bounded evidence, scope state, header
 clues, and redirect instructions. The UI and `sniper-cli scope service-map` share
 the same read model. No probing, scanning, replay, crawling, or redirect following
@@ -304,8 +302,8 @@ erase them. See [the observed socket peer contract](docs/integrations/observed-s
 
 ## CLI
 
-For the current development branch, see the
-[unreleased CLI and saved-workspace maintenance overview](docs/guides/maintenance-0.3.1.md).
+For what changed in 0.3.1, see the
+[CLI and saved-workspace maintenance overview](docs/guides/maintenance-0.3.1.md).
 
 `sniper-cli` is already bundled with the macOS app and Windows packages. The
 first desktop launch offers **Add to PATH** or **Later** when registration is

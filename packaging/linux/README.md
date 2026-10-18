@@ -1,9 +1,8 @@
 # Sniper on Debian 13: x86_64, X11
 
-**Debian 13 (trixie), x86_64, X11 is a supported development-branch target.**
-Use the unreleased `release/0.3.1` branch for source builds and CI candidates.
-There are **no published Linux release assets yet**. The crate and candidate
-filenames use version `0.3.1`, which is not released yet.
+**Debian 13 (trixie), x86_64, X11 is a supported target from v0.3.1.**
+Use the `v0.3.1` tag for source builds and the CI candidates of that commit.
+There are **no published Linux release assets yet**.
 Ubuntu, other Debian versions, other distributions, ARM, musl, native Wayland
 and XWayland are outside this qualification. These Linux checks make no new
 macOS qualification claim.
@@ -30,12 +29,12 @@ matching, provisioned Debian 13 machines; it is not a self-contained Linux app.
 The build manifest records actual ELF dependencies and GLIBC symbol versions.
 A glibc version match alone does not establish another distro's compatibility.
 
-## Get the development source or CI artifacts
+## Get the source or CI artifacts
 
 For a new source checkout:
 
 ```sh
-git clone --single-branch --branch release/0.3.1 https://github.com/sm1ee/Sniper.git
+git clone --single-branch --branch v0.3.1 https://github.com/sm1ee/Sniper.git
 cd Sniper
 git rev-parse HEAD
 ```
@@ -45,7 +44,7 @@ for prerequisites, tests, binaries and packages. Record the exact commit you use
 a branch can advance beyond the qualification baseline.
 
 For prebuilt candidates, open the repository's **Actions → Linux candidate**
-workflow and choose a successful run for the intended `release/0.3.1` commit.
+workflow and choose a successful run for the `v0.3.1` tag.
 Both `debian13-x86_64` and `runtime-debian13-x86_64` jobs must pass. Download
 `sniper-debian13-x86_64-candidate` and
 `sniper-debian13-x86_64-runtime-evidence` from that same run. Inspect the build
