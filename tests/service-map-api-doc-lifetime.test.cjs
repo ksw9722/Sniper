@@ -36,13 +36,13 @@ function node() {
 }
 function fixture() {
   let session = 'session-one';
-  const requests = [], copies = [], replays = [];
+  const requests = [], copies = [], replays = [], opened = [];
   const els = Object.fromEntries(['panel', 'apiDocs', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus'].map(name => [name, node()]));
   const controller = context.SniperServiceMap.createController({ elements: els, getSessionId: () => session,
-    document: { activeElement: null }, copyText: (...args) => copies.push(args), sendToReplay: id => replays.push(id),
+    document: { activeElement: null }, copyText: (...args) => copies.push(args), sendToReplay: id => replays.push(id), openUrl: url => opened.push(url),
     request(url, options) { const read = { url, options, ...deferred() }; requests.push(read); return read.promise; } });
   controller.setVisible(true);
-  return { controller, els, requests, copies, replays, state: controller.getState(), setSession(value) { session = value; },
+  return { controller, els, requests, copies, replays, opened, state: controller.getState(), setSession(value) { session = value; },
     async load(generation = 'generation-one') {
       const pending = controller.refresh();
       requests.at(-1).resolve(response(snapshot(session, generation))); await pending;
@@ -169,4 +169,20 @@ test('closing API docs does not cancel an independent endpoint parameter read', 
   assert.notEqual(parameters.options.signal?.aborted, true);
   parameters.resolve(response({ schema_version: 1, session_id: 'session-one', origin, method: 'GET', path: '/items', available: true, rows: 1, parameters: [{ name: 'query', location: 'query', rows: 1, examples: ['synthetic'] }] }));
   await tick(); assert.equal(f.state.parameters.items[0].name, 'query');
+});
+// Swagger Editor cannot read this app's API, so the click copies the document
+// to paste there, and sends nothing anywhere itself.
+test('Open in Swagger Editor copies the loaded document and opens the editor', async () => {
+  const f = fixture(); await f.load(); await prepareDocs(f, 'loaded');
+  assert.match(f.els.apiDocs.innerHTML, /data-api-docs-editor/);
+  const reads = f.requests.length;
+  clickDocs(f, { apiDocsEditor: '' });
+  assert.deepEqual(f.copies, [[JSON.stringify(apiDocument(), null, 2), 'Copied OpenAPI; paste it into Swagger Editor']]);
+  assert.deepEqual(f.opened, ['https://editor.swagger.io/']);
+  assert.equal(f.requests.length, reads);
+});
+test('Open in Swagger Editor waits for a loaded document', async () => {
+  const f = fixture(); await f.load(); await prepareDocs(f, 'fetch');
+  clickDocs(f, { apiDocsEditor: '' });
+  assert.deepEqual(f.opened, []); assert.deepEqual(f.copies, []);
 });

@@ -14856,6 +14856,8 @@ function initializeTargetWorkspace() {
         openTransactionRecordInReplay(record);
       })
       .catch((error) => showToast(error?.message || "Failed to open Replay", "error")),
+    // The desktop app hands an external page to the default browser.
+    openUrl: (url) => window.open(url, "_blank", "noopener,noreferrer"),
   });
   document.getElementById("serviceMapFilterButton")?.addEventListener("click", () => openFilterModal("serviceMap"));
   // Inspector-to-map navigation already owns a verified snapshot. Keep the

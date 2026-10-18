@@ -455,7 +455,8 @@ out as Swagger UI lays one out (**API docs** in its inspector, `GET
 its path templates, parameter and body field names with guessed types,
 response statuses and media types, and the credentials its rows showed, built
 from every retained row and holding no captured value. Each operation sends its
-newest row to Replay, and the document copies as JSON. An origin whose rows
+newest row to Replay, and the document copies as JSON or opens in Swagger
+Editor (editor.swagger.io, to paste it into). An origin whose rows
 carried no typed response now stays off the map unless selected or searched
 for.
 

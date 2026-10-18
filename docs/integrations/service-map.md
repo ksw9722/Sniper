@@ -526,7 +526,10 @@ body, responses and credentials, and **Send newest row to Replay** opens the
 newest row it stands for in Replay, as Burp's OpenAPI Parser sends an operation
 on to Repeater. **Copy OpenAPI JSON** copies the document for Swagger UI,
 Postman, Burp or an agent, as Burp's API Exporter and mitmproxy2swagger build
-one from captured traffic. There is no Try it out: a request goes through
+one from captured traffic. **Open in Swagger Editor** copies it the same way
+and opens editor.swagger.io, in the default browser from the desktop app, to
+paste it into; the editor cannot read the document from Sniper, and nothing is
+sent to it until it is pasted. There is no Try it out: a request goes through
 Replay, and so through the proxy. The document lists each method and path
 template, with the ID segments as named path parameters (`{number}`, `{uuid}`,
 `{hex}`). If ID kinds differ in the same path position, one `{id}` path

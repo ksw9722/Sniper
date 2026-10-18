@@ -120,6 +120,7 @@
     } catch (_) { return ""; }
   }
   const MAP_ERROR_HEADER = "x-sniper-service-map-error";
+  const SWAGGER_EDITOR_URL = "https://editor.swagger.io/";
   // Busy answers in a row before refresh pauses; the server waits up to 20 s
   // for the running read before each.
   const MAX_BUSY_RETRIES = 5;
@@ -1389,7 +1390,7 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, sendToReplay = null, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, sendToReplay = null, openUrl = null, document: doc = root.document }) {
     // Request kinds whose links are not drawn. The app keeps them in UI
     // settings; without it they live for this controller only.
     let localHiddenLinkKinds = [...DEFAULT_HIDDEN_LINK_KINDS];
@@ -2160,7 +2161,7 @@
     function apiDocsMarkup({ origin, document, error }) {
       const body = error ? `<p class="service-map-filter-notice" role="status">${escape(error)}</p>`
         : document ? apiDocsBodyMarkup(document) : '<p class="service-map-muted" role="status">Reading retained rows…</p>';
-      return `<div class="modal-card modal-card-wide service-map-api-docs" role="dialog" aria-modal="true" aria-labelledby="serviceMapApiDocsTitle"><header class="modal-header"><div><p class="placeholder-kicker">API docs · OpenAPI 3.1</p><h2 id="serviceMapApiDocsTitle" title="${escape(origin)}">${escape(origin)}</h2></div></header><div class="modal-body">${body}</div><footer class="modal-footer"><button class="secondary-action" type="button" data-api-docs-copy ${document ? "" : "disabled"}>Copy OpenAPI JSON</button><button class="secondary-action" type="button" data-api-docs-close>Close</button></footer></div>`;
+      return `<div class="modal-card modal-card-wide service-map-api-docs" role="dialog" aria-modal="true" aria-labelledby="serviceMapApiDocsTitle"><header class="modal-header"><div><p class="placeholder-kicker">API docs · OpenAPI 3.1</p><h2 id="serviceMapApiDocsTitle" title="${escape(origin)}">${escape(origin)}</h2></div></header><div class="modal-body">${body}</div><footer class="modal-footer"><button class="secondary-action" type="button" data-api-docs-copy ${document ? "" : "disabled"}>Copy OpenAPI JSON</button><button class="secondary-action" type="button" data-api-docs-editor title="Copies the document and opens editor.swagger.io, where you paste it" ${document ? "" : "disabled"}>Open in Swagger Editor</button><button class="secondary-action" type="button" data-api-docs-close>Close</button></footer></div>`;
     }
     function apiDocsBodyMarkup(document) {
       const schemes = document.components?.securitySchemes || {};
@@ -3432,6 +3433,12 @@
       if (data.apiDocsClose !== undefined) closeApiDocs();
       // The text is already read, so the copy runs within the click.
       else if (data.apiDocsCopy !== undefined && state.apiDocs?.document) copyText?.(JSON.stringify(state.apiDocs.document, null, 2), "Copied OpenAPI");
+      // Swagger Editor cannot fetch the document from this app, so the click
+      // copies it to paste there. Nothing is sent to the site.
+      else if (data.apiDocsEditor !== undefined && state.apiDocs?.document) {
+        copyText?.(JSON.stringify(state.apiDocs.document, null, 2), "Copied OpenAPI; paste it into Swagger Editor");
+        openUrl?.(SWAGGER_EDITOR_URL);
+      }
       else if (data.apiDocsReplay) { closeApiDocs(); sendToReplay?.(data.apiDocsReplay); }
     });
     els.apiDocs?.addEventListener("keydown", (event) => {
