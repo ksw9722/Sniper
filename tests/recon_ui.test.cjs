@@ -160,7 +160,12 @@ function controllerFixture() {
   const fetcher = async (path, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : null;
     const method = options.method || "GET";
-    fixture.calls.push({ path, body, method });
+    fixture.calls.push({ path, body, method, signal: options.signal });
+    if (fixture.respondNext) {
+      const respond = fixture.respondNext;
+      fixture.respondNext = null;
+      return respond();
+    }
     if (fixture.failNext === method) { fixture.failNext = null; return { ok: false, status: 503, text: async () => '{"error":"Temporary failure"}' }; }
     const sid = body?.session_id || new URL(path, "http://localhost").searchParams.get("session_id");
     const snapshot = snapshots[sid];
@@ -182,13 +187,258 @@ function controllerFixture() {
     return response(snapshot);
   };
   fixture.controller = recon.createController({ root, getSessionId: () => fixture.session, getSessionGeneration: () => fixture.generation, fetch: fetcher,
-    setTimeout(callback) { fixture.timers.set(++fixture.nextTimer, callback); return fixture.nextTimer; }, clearTimeout(id) { fixture.timers.delete(id); } });
+    setTimeout(callback, delay) { fixture.timers.set(++fixture.nextTimer, { callback, delay }); return fixture.nextTimer; }, clearTimeout(id) { fixture.timers.delete(id); } });
   fixture.switchTo = session => { fixture.controller.reset(); fixture.session = session; fixture.generation += 1; fixture.controller.syncSession(); };
   fixture.controller.setVisible(true);
   return fixture;
 }
 async function settled() { for (let i = 0; i < 10; i += 1) await new Promise(resolve => setImmediate(resolve)); }
 function descendants(node) { return node.childNodes.flatMap(child => [child, ...descendants(child)]); }
+
+function deferredResponse(fixture, phase) {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  fixture.respondNext = () => phase === "fetch" ? promise : {
+    ok: phase === "json", status: 503, json: () => promise, text: () => promise,
+  };
+  return {
+    succeed(payload) { resolve(phase === "fetch" ? { ok: true, json: async () => payload } : phase === "json" ? payload : '{"error":"Old HTTP error"}'); },
+    fail() { reject(new Error("Old transport error")); },
+  };
+}
+
+function controllerState(f) {
+  return {
+    jobs: f.node("Jobs").textContent, endpoints: f.node("Endpoints").textContent,
+    detail: f.node("Detail").textContent, inventory: f.node("InventoryMeta").textContent,
+    load: f.node("LoadStatus").textContent, action: f.node("ActionStatus").textContent,
+    target: f.node("Target").value, search: f.node("Search").value, kind: f.node("Kind").value,
+    startDisabled: f.node("Start").disabled, refreshDisabled: f.node("Refresh").disabled,
+    timers: [...f.timers.keys()], calls: f.calls.length,
+  };
+}
+
+function runRefreshTimer(f) {
+  assert.equal(f.timers.size, 1);
+  const [id, { callback }] = [...f.timers.entries()][0];
+  f.timers.delete(id);
+  callback();
+}
+
+for (const phase of ["fetch", "json", "error body"]) {
+  for (const outcome of ["success", "failure"]) {
+    for (const completion of ["hidden", "new read pending", "new read complete"]) {
+      test(`hide releases ${phase} read; late ${outcome} while ${completion} cannot repaint or release newer work`, async () => {
+        const f = controllerFixture(); await settled();
+        const old = deferredResponse(f, phase);
+        const pending = f.controller.refresh(); await settled();
+        const oldRequest = f.calls.at(-1);
+        assert.equal(f.node("Refresh").disabled, true);
+        f.controller.setVisible(false);
+        assert.equal(oldRequest.signal.aborted, true);
+        assert.equal(f.node("Refresh").disabled, false);
+        assert.equal(f.timers.size, 0);
+        await f.controller.refresh();
+        assert.equal(f.calls.length, 2, "hidden refresh cannot acquire a read");
+
+        let fresh;
+        const latest = { session_id: "a", jobs: [], endpoints: [f.snapshots.a.endpoints[110]] };
+        if (completion !== "hidden") {
+          fresh = deferredResponse(f, "fetch");
+          f.controller.setVisible(true); await settled();
+          assert.equal(f.calls.length, 3, "reopening starts a fresh read before the old read settles");
+          assert.equal(f.node("Refresh").disabled, true);
+          f.controller.setVisible(true);
+          assert.equal(f.calls.length, 3, "same-visible render does not duplicate the read");
+          if (completion === "new read complete") { fresh.succeed(latest); await settled(); }
+        }
+        const before = controllerState(f);
+        if (outcome === "success") old.succeed({ session_id: "a", jobs: [], endpoints: [] });
+        else old.fail();
+        await pending; await settled();
+        assert.deepEqual(controllerState(f), before, "old success, catch and finally must all be inert");
+
+        if (completion === "hidden") {
+          f.snapshots.a = latest;
+          f.controller.setVisible(true); await settled();
+        } else if (completion === "new read pending") {
+          assert.equal(f.calls.at(-1).signal.aborted, false);
+          fresh.succeed(latest); await settled();
+        }
+        assert.match(f.node("Endpoints").textContent, /api\/110/);
+        assert.equal(f.node("Endpoints").childNodes.length, 1);
+        assert.equal(f.node("LoadStatus").textContent, "");
+        assert.equal(f.node("Refresh").disabled, false);
+        assert.equal(f.timers.size, 1);
+        assert.equal([...f.timers.values()][0].delay, 10000);
+        f.snapshots.a = latest;
+        runRefreshTimer(f); await settled();
+        assert.equal(f.calls.length, 4, "reopened polling continues");
+        assert.equal(f.timers.size, 1);
+        f.controller.dispose();
+      });
+    }
+  }
+}
+
+test("same-visible renders preserve read ownership and the existing poll timer", async () => {
+  const f = controllerFixture(); await settled();
+  const originalTimer = [...f.timers.keys()];
+  f.controller.setVisible(true); f.controller.setVisible(true);
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual([...f.timers.keys()], originalTimer);
+  const pending = deferredResponse(f, "json");
+  const refreshing = f.controller.refresh(); await settled();
+  const signal = f.calls.at(-1).signal;
+  f.controller.setVisible(true); f.controller.setVisible(true);
+  assert.equal(signal.aborted, false);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.node("Refresh").disabled, true);
+  assert.equal(f.timers.size, 0);
+  pending.succeed(f.snapshots.a); await refreshing;
+  assert.equal(f.node("Refresh").disabled, false);
+  assert.equal(f.timers.size, 1);
+  f.controller.dispose();
+});
+
+for (const type of ["start", "stop"]) {
+  for (const phase of ["fetch", "json", "error body"]) {
+    for (const outcome of ["success", "failure"]) {
+      for (const completion of ["hidden", "reopened"]) {
+        test(`hide preserves ${type} ownership through ${phase} ${outcome} completed ${completion}`, async () => {
+          const f = controllerFixture(); await settled();
+          f.node("Target").value = "https://example.com/";
+          const job = { id: "owned-job", status: "running", target_url: "https://example.com/", sources: [] };
+          if (type === "stop") { f.snapshots.a.jobs = [job]; await f.controller.refresh(); }
+          const pending = deferredResponse(f, phase);
+          const stop = descendants(f.node("Jobs")).find(item => item.dataset.stopJob);
+          if (type === "start") f.node("Form").emit("submit");
+          else f.node("Jobs").emit("click", { target: stop });
+          await settled();
+          const mutationRequest = f.calls.at(-1);
+          const callsBefore = f.calls.length;
+          f.controller.setVisible(false); f.controller.setVisible(false);
+          assert.equal(mutationRequest.signal.aborted, false, "hiding must not abort the POST");
+          assert.equal(f.node("Start").disabled, true);
+          assert.equal(f.node("Refresh").disabled, true);
+          assert.equal(f.timers.size, 0);
+          if (completion === "reopened") { f.controller.setVisible(true); await settled(); }
+          f.node("Form").emit("submit");
+          if (stop) f.node("Jobs").emit("click", { target: stop });
+          await f.controller.refresh();
+          assert.equal(f.calls.length, callsBefore, "pending mutation owns the controls across hide/reopen");
+          assert.equal(mutationRequest.signal.aborted, false);
+          assert.equal(f.node("Target").value, "https://example.com/");
+
+          const succeeded = outcome === "success" && phase !== "error body";
+          if (succeeded) f.snapshots.a.jobs = [{ ...job, status: type === "start" ? "running" : "cancelled" }];
+          if (outcome === "success") pending.succeed(type === "start" ? job : { stopped: true, session_id: "a" });
+          else pending.fail();
+          await settled();
+          assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
+          assert.match(f.node("ActionStatus").textContent, succeeded ? type === "start" ? /Discovery started/ : /Stop requested/ : /Refresh jobs to confirm/);
+          if (completion === "hidden") {
+            assert.equal(f.calls.length, callsBefore, "hidden mutation completion must not launch a GET");
+            assert.equal(f.timers.size, 0);
+            assert.equal(f.node("Refresh").disabled, false);
+            f.controller.setVisible(true); await settled();
+          }
+          assert.equal(f.calls.length, callsBefore + 1, "exactly one read reconciles the visible inventory");
+          assert.equal(f.node("Refresh").disabled, false);
+          assert.equal(f.node("Start").disabled, type === "start" ? succeeded : !succeeded);
+          assert.equal(f.timers.size, 1);
+          assert.equal([...f.timers.values()][0].delay, (type === "start" ? succeeded : !succeeded) ? 2000 : 10000);
+          runRefreshTimer(f); await settled();
+          assert.equal(f.calls.length, callsBefore + 2);
+          assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
+          f.controller.dispose();
+        });
+      }
+    }
+  }
+}
+
+test("reopening recovers immediately even if the previous inventory fetch never settles", async () => {
+  const f = controllerFixture(); await settled();
+  deferredResponse(f, "fetch");
+  void f.controller.refresh(); await settled();
+  f.controller.setVisible(false);
+  f.controller.setVisible(true); await settled();
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.node("Refresh").disabled, false);
+  assert.equal(f.timers.size, 1);
+  f.controller.dispose();
+});
+
+test("repeated hide/reopen cancels each read without cancelling its successor", async () => {
+  const f = controllerFixture(); await settled();
+  const first = deferredResponse(f, "json");
+  const firstRead = f.controller.refresh(); await settled();
+  const firstSignal = f.calls.at(-1).signal;
+  f.controller.setVisible(false);
+  const second = deferredResponse(f, "error body");
+  f.controller.setVisible(true); await settled();
+  const secondSignal = f.calls.at(-1).signal;
+  f.controller.setVisible(false);
+  const third = deferredResponse(f, "fetch");
+  f.controller.setVisible(true); await settled();
+  const thirdSignal = f.calls.at(-1).signal;
+  const before = controllerState(f);
+  second.succeed(); await settled();
+  first.succeed({ session_id: "a", jobs: [], endpoints: [] }); await firstRead;
+  assert.deepEqual(controllerState(f), before);
+  assert.equal(firstSignal.aborted, true);
+  assert.equal(secondSignal.aborted, true);
+  assert.equal(thirdSignal.aborted, false);
+  third.succeed(f.snapshots.a); await settled();
+  assert.equal(f.node("Refresh").disabled, false);
+  assert.equal(f.timers.size, 1);
+  f.controller.dispose();
+});
+
+for (const operation of ["read", "start", "stop"]) {
+  for (const transition of ["session ABA", "dispose"]) {
+    for (const outcome of ["success", "failure"]) {
+      test(`hidden ${operation} late JSON ${outcome} is inert after ${transition}`, async () => {
+        const f = controllerFixture(); await settled();
+        f.node("Target").value = "https://example.com/";
+        if (operation === "stop") {
+          f.snapshots.a.jobs = [{ id: "old-job", status: "running", target_url: "https://example.com/", sources: [] }];
+          await f.controller.refresh();
+        }
+        const pending = deferredResponse(f, "json");
+        if (operation === "read") void f.controller.refresh();
+        else if (operation === "start") f.node("Form").emit("submit");
+        else f.node("Jobs").emit("click", { target: descendants(f.node("Jobs")).find(item => item.dataset.stopJob) });
+        await settled();
+        const request = f.calls.at(-1);
+        f.controller.setVisible(false);
+        assert.equal(request.signal.aborted, operation === "read");
+        if (transition === "dispose") f.controller.dispose();
+        else {
+          f.session = "b"; f.generation += 1; f.controller.syncSession();
+          f.session = "a"; f.generation += 1; f.controller.syncSession();
+          f.snapshots.a.jobs = [];
+          f.snapshots.a.endpoints = [f.snapshots.a.endpoints[110]];
+          f.controller.setVisible(true); await settled();
+        }
+        assert.equal(request.signal.aborted, true, "session reset and disposal still cancel mutations");
+        const before = controllerState(f);
+        if (outcome === "failure") pending.fail();
+        else pending.succeed(operation === "read" ? { session_id: "a", jobs: [], endpoints: [] }
+          : operation === "start" ? { id: "old-start", status: "running" } : { stopped: true, session_id: "a" });
+        await settled();
+        assert.deepEqual(controllerState(f), before);
+        if (transition === "session ABA") {
+          assert.match(f.node("Endpoints").textContent, /api\/110/);
+          assert.equal(f.node("Start").disabled, false);
+          assert.equal(f.timers.size, 1);
+        } else assert.equal(f.timers.size, 0);
+        f.controller.dispose();
+      });
+    }
+  }
+}
 
 test("controller renders bounded pages, search and text-only provenance", async () => {
   const f = controllerFixture(); await settled();

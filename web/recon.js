@@ -287,7 +287,7 @@
       return response.json();
     }
     async function refresh() {
-      if (!sessionId || disposed || read || mutation) return;
+      if (!visible || !sessionId || disposed || read || mutation) return;
       clearTimer();
       const token = guard.capture();
       if (!canUse(token)) return;
@@ -401,8 +401,12 @@
       const changed = visible !== !!next;
       visible = !!next;
       syncSession();
-      if (!visible) clearTimer();
-      else if (changed && !read) void refresh();
+      if (!visible) {
+        clearTimer();
+        // Reads belong to this view; pending start/stop requests still own their result.
+        if (read) { read.controller.abort(); read = null; }
+        renderControls();
+      } else if (changed && !read) void refresh();
     }
 
     on(els.Form, "submit", (event) => { event.preventDefault(); void mutate("start"); });
