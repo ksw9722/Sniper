@@ -22112,19 +22112,13 @@ function validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths = [
 
 function splitRawHttpMessage(text) {
   const raw = String(text ?? "");
-  const crlfBoundary = raw.indexOf("\r\n\r\n");
-  if (crlfBoundary !== -1) {
+  // The editor can use LF headers around a CRLF body (for example imported
+  // multipart data). Only the first blank line separates headers from body.
+  const boundary = /\r?\n\r?\n/.exec(raw);
+  if (boundary) {
     return {
-      head: raw.slice(0, crlfBoundary).replace(/\r\n/g, "\n"),
-      body: raw.slice(crlfBoundary + 4),
-    };
-  }
-
-  const lfBoundary = raw.indexOf("\n\n");
-  if (lfBoundary !== -1) {
-    return {
-      head: raw.slice(0, lfBoundary).replace(/\r\n/g, "\n"),
-      body: raw.slice(lfBoundary + 2),
+      head: raw.slice(0, boundary.index).replace(/\r\n/g, "\n"),
+      body: raw.slice(boundary.index + boundary[0].length),
     };
   }
 
@@ -27425,8 +27419,10 @@ function shellQuote(value) {
 }
 
 function parseRequestForExport(rawText, scheme, host, port) {
-  const lines = String(rawText || "").replace(/\r\n/g, "\n").split("\n");
-  const [startLine = "GET / HTTP/1.1", ...rest] = lines;
+  // Normalize header lines only: multipart and signed text bodies need their
+  // original CRLF bytes, even when the editor uses LF for the request head.
+  const lines = String(rawText || "").split("\n");
+  const [startLine = "GET / HTTP/1.1", ...rest] = lines.map((line) => line.replace(/\r$/, ""));
   const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)(?:\s+(HTTP\/[0-9.]+))?$/);
   if (!match) return null;
   const method = match[1];
@@ -27441,7 +27437,7 @@ function parseRequestForExport(rawText, scheme, host, port) {
     }
   }
   const headerLines = bodyIdx === -1 ? rest : rest.slice(0, bodyIdx);
-  const body = bodyIdx === -1 ? "" : (rest[bodyIdx] === "" ? rest.slice(bodyIdx + 1) : rest.slice(bodyIdx)).join("\n");
+  const body = bodyIdx === -1 ? "" : lines.slice(bodyIdx + (rest[bodyIdx] === "" ? 2 : 1)).join("\n");
   const bodyProvided = bodyIdx !== -1;
   const headers = headerLines.map((h) => parseHeaderLineForExport(h)).filter(Boolean);
   const authority = exportHeaderValue(headers, ":authority");
@@ -27477,7 +27473,7 @@ function isHttpPseudoHeaderName(name) {
 }
 
 function requestToPython(parsed) {
-  if (!parsed) return "";
+  if (!parsed || requestFormatExportBlockedReason(parsed, "python")) return "";
   const py = (s) => JSON.stringify(String(s));
   const lines = [`import requests`, ""];
   const hasBody = parsed.bodyProvided || parsed.body.length > 0;
@@ -27535,7 +27531,7 @@ function hostHeaderDiffersFromUrl(hostHeader, url) {
 function requestToFetch(parsed) {
   if (!parsed) return "";
   const js = (s) => JSON.stringify(String(s));
-  if (fetchExportBlockedReason(parsed)) {
+  if (requestFormatExportBlockedReason(parsed, "fetch")) {
     return "";
   }
   const headerObj = exportableHeadersForUrl(parsed.headers, parsed.url);
@@ -27565,8 +27561,29 @@ function fetchExportBlockedReason(parsed) {
   return "";
 }
 
-function requestToPowerShell(parsed) {
+function requestFormatExportBlockedReason(parsed, format) {
   if (!parsed) return "";
+  if (format === "fetch") {
+    const blocked = fetchExportBlockedReason(parsed);
+    if (blocked) return blocked;
+  }
+  const label = { python: "Python", fetch: "Fetch", powershell: "PowerShell" }[format];
+  if (!label) return "";
+  // These APIs use header maps or combine field values. Neither can preserve
+  // arbitrary repeated fields, and comma-joining changes some header semantics.
+  const names = new Set();
+  for (const header of exportableHeadersForUrl(parsed.headers, parsed.url)) {
+    const name = header.name.toLowerCase();
+    if (names.has(name)) {
+      return `${label} cannot preserve repeated headers safely. Use cURL export instead.`;
+    }
+    names.add(name);
+  }
+  return "";
+}
+
+function requestToPowerShell(parsed) {
+  if (!parsed || requestFormatExportBlockedReason(parsed, "powershell")) return "";
   const esc = (s) => s.replace(/'/g, "''");
   const parts = [`Invoke-WebRequest -Uri '${esc(parsed.url)}'`];
   if (parsed.method !== "GET") parts.push(`-Method ${parsed.method}`);
@@ -27623,12 +27640,10 @@ function replayRequestToFormat(format, tab = getActiveReplayTab()) {
     target.host || "",
     target.port || "",
   );
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
+  const formatBlocked = requestFormatExportBlockedReason(parsed, format);
+  if (formatBlocked) {
+    showToast(formatBlocked, "error");
+    return "";
   }
   if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
@@ -27691,19 +27706,28 @@ function recordToFormat(record, format) {
     showToast(blocked, "error");
     return "";
   }
-  const rawText = buildRawRequest(record);
+  const request = record.request || {};
+  // Captured previews can be decoded while their display headers still describe
+  // the wire bytes. Match the backend's decoded-body resend contract on a copy.
+  const exportRecord = request.content_decoded ? {
+    ...record,
+    request: {
+      ...request,
+      headers: normalizedHeaders(request.headers).filter((header) =>
+        !headerNameEquals(header, "content-encoding") && !headerNameEquals(header, "content-length")),
+    },
+  } : record;
+  const rawText = buildRawRequest(exportRecord);
   const scheme = record.scheme || "https";
   const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
   const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
   const host = record.host || hostHeader?.value || authorityHeader?.value || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
+  const formatBlocked = requestFormatExportBlockedReason(parsed, format);
+  if (formatBlocked) {
+    showToast(formatBlocked, "error");
+    return "";
   }
   if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
@@ -27719,30 +27743,7 @@ async function historyRequestToFormat(transactionId, format) {
   if (!response.ok) return "";
   const record = await response.json();
   if (currentSessionId() !== sessionId) return "";
-  const blocked = historyRequestExportBlockedReason(record);
-  if (blocked) {
-    showToast(blocked, "error");
-    return "";
-  }
-  const rawText = buildRawRequest(record);
-  const scheme = record.scheme || "https";
-  const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
-  const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
-  const host = record.host || hostHeader?.value || authorityHeader?.value || "";
-  const parsed = parseRequestForExport(rawText, scheme, host, "");
-  if (!parsed) return "";
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
-  }
-  if (format === "curl") return requestToCurl(parsed);
-  if (format === "python") return requestToPython(parsed);
-  if (format === "fetch") return requestToFetch(parsed);
-  if (format === "powershell") return requestToPowerShell(parsed);
-  return "";
+  return recordToFormat(record, format);
 }
 
 function copyTransactionUrl(transactionId) {
@@ -27766,8 +27767,8 @@ function copyReplayUrl(tab = getActiveReplayTab()) {
 }
 
 function parseCurlCommand(text) {
-  const normalized = text.replace(/\\\s*\n/g, " ").trim();
-  const shellWords = splitShellWords(normalized);
+  const shellWords = splitShellWords(text);
+  if (shellWords.error) return shellWords;
   if (!shellWords.length || shellWords[0].toLowerCase() !== "curl") return null;
   const tokens = shellWords.slice(1);
   let method = "GET";
@@ -27814,12 +27815,12 @@ function parseCurlCommand(text) {
     "--unix-socket",
   ]);
   const curlShortOptionsWithValue = new Set(["-E", "-m", "-o", "-x", "-y", "-Y"]);
-  const requireOptionValue = (flag) => {
+  const requireOptionValue = (flag, allowEmpty = false) => {
     if (t + 1 >= tokens.length) {
       return { error: `cURL ${flag} requires a value.` };
     }
     const value = tokens[t + 1];
-    if (value === undefined || value === "") {
+    if (value === undefined || (!allowEmpty && value === "")) {
       return { error: `cURL ${flag} requires a value.` };
     }
     t += 1;
@@ -27839,7 +27840,7 @@ function parseCurlCommand(text) {
     if (flag === "--data-urlencode") {
       const encoded = encodeCurlDataUrlencode(value);
       if (encoded.error) return encoded.error;
-      bodyParts.push(encoded.value);
+      bodyParts.push({ value: encoded.value, separator: "&" });
       bodyProvided = true;
       if (options.defaultContentType !== false) needsDefaultFormContentType = true;
       if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
@@ -27851,7 +27852,7 @@ function parseCurlCommand(text) {
     if (flag !== "--data-raw" && value.startsWith("@")) {
       return "cURL @file body imports are not supported. Use --data-raw for literal @ bodies.";
     }
-    bodyParts.push(value);
+    bodyParts.push({ value, separator: flag === "--json" ? "" : "&" });
     bodyProvided = true;
     if (options.defaultContentType !== false) needsDefaultFormContentType = true;
     if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
@@ -27867,7 +27868,7 @@ function parseCurlCommand(text) {
     if (raw.startsWith("@")) {
       return "cURL --json @file imports are not supported.";
     }
-    const error = addBodyPart("--data-raw", raw, { defaultContentType: false });
+    const error = addBodyPart("--json", raw, { defaultContentType: false });
     if (error) return error;
     ensureHeader("Content-Type", "application/json");
     ensureHeader("Accept", "application/json");
@@ -27924,13 +27925,13 @@ function parseCurlCommand(text) {
       if (error) return { error };
     }
     else if (tok === "-d" || tok === "--data" || tok === "--data-raw" || tok === "--data-binary" || tok === "--data-urlencode") {
-      const value = requireOptionValue(tok);
+      const value = requireOptionValue(tok, true);
       if (value.error) return value;
       const error = addBodyPart(tok, value.value);
       if (error) return { error };
     }
     else if (tok === "--json") {
-      const value = requireOptionValue(tok);
+      const value = requireOptionValue(tok, true);
       if (value.error) return value;
       const error = addJsonBody(value.value);
       if (error) return { error };
@@ -28028,7 +28029,9 @@ function parseCurlCommand(text) {
   if (!HTTP_METHOD_TOKEN_RE.test(method)) {
     return { error: "Invalid HTTP method in cURL command." };
   }
-  let body = bodyParts.join("&");
+  // curl chooses the separator from the option being appended, and only
+  // inserts it when previous fragments have produced a nonempty body.
+  let body = bodyParts.reduce((value, part) => value + (value ? part.separator : "") + part.value, "");
   if (getMode && body) {
     url = appendCurlGetQuery(url, body);
     body = "";
@@ -28111,10 +28114,45 @@ function rawPathFromUrlString(url) {
 }
 
 function splitShellWords(input) {
+  if (/[\uD800-\uDFFF]/u.test(input)) {
+    return { error: "cURL commands must contain valid Unicode text." };
+  }
+  if (input.includes("\0")) {
+    return { error: "cURL commands containing NUL bytes cannot be imported." };
+  }
   const tokens = [];
   let token = "";
   let quote = null;
   let active = false;
+  let byteChunks = [];
+  const appendTextBytes = () => {
+    if (!token) return;
+    byteChunks.push(new TextEncoder().encode(token));
+    token = "";
+  };
+  const finishToken = () => {
+    if (byteChunks.length) {
+      appendTextBytes();
+      const bytes = new Uint8Array(byteChunks.reduce((length, chunk) => length + chunk.length, 0));
+      let offset = 0;
+      for (const chunk of byteChunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.length;
+      }
+      try {
+        // Byte escapes can span adjacent quoted segments. Decode the whole
+        // word once, retaining a literal BOM and refusing lossy replacement.
+        token = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+      } catch (_) {
+        return "cURL ANSI-C byte escapes must form valid UTF-8 text. Binary byte imports are not supported.";
+      }
+    }
+    tokens.push(token);
+    token = "";
+    byteChunks = [];
+    active = false;
+    return "";
+  };
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i];
@@ -28127,8 +28165,17 @@ function splitShellWords(input) {
       if (ch === '"') {
         quote = null;
       } else if (ch === "\\" && i + 1 < input.length) {
-        token += input[++i];
-        active = true;
+        // In double quotes, backslashes only escape shell-special characters.
+        // Paths such as C:\temp\file keep their literal backslashes.
+        const next = input[i + 1];
+        if (next === "\n") {
+          i += 1;
+        } else if (next === "$" || next === "`" || next === '"' || next === "\\") {
+          token += next;
+          i += 1;
+        } else {
+          token += ch;
+        }
       } else {
         token += ch;
         active = true;
@@ -28140,7 +28187,13 @@ function splitShellWords(input) {
         quote = null;
       } else if (ch === "\\" && i + 1 < input.length) {
         const decoded = decodeAnsiCStringEscape(input, i + 1);
-        token += decoded.value;
+        if (decoded.error) return decoded;
+        if (decoded.byte !== undefined) {
+          appendTextBytes();
+          byteChunks.push(Uint8Array.of(decoded.byte));
+        } else {
+          token += decoded.value;
+        }
         i = decoded.index;
         active = true;
       } else {
@@ -28151,9 +28204,10 @@ function splitShellWords(input) {
     }
 
     if (/\s/.test(ch)) {
-      if (active || token.length) tokens.push(token);
-      token = "";
-      active = false;
+      if (active || token.length) {
+        const error = finishToken();
+        if (error) return { error };
+      }
       continue;
     }
     if (ch === "$" && input[i + 1] === "'") {
@@ -28168,6 +28222,12 @@ function splitShellWords(input) {
       continue;
     }
     if (ch === "\\" && i + 1 < input.length) {
+      // A continuation removes the newline, without splitting the current word.
+      // Single-quoted and ANSI-C quoted text are handled above and stay literal.
+      if (input[i + 1] === "\n") {
+        i += 1;
+        continue;
+      }
       token += input[++i];
       active = true;
       continue;
@@ -28177,7 +28237,10 @@ function splitShellWords(input) {
   }
 
   if (quote) return [];
-  if (active || token.length) tokens.push(token);
+  if (active || token.length) {
+    const error = finishToken();
+    if (error) return { error };
+  }
   return tokens;
 }
 
@@ -28201,32 +28264,29 @@ function decodeAnsiCStringEscape(input, index) {
   if (Object.prototype.hasOwnProperty.call(simple, ch)) {
     return { value: simple[ch], index };
   }
+  const byteEscape = (value, end) => value === 0
+    ? { error: "cURL ANSI-C NUL escapes cannot be imported as text." }
+    : { byte: value, index: end };
   if (ch === "x") {
     const hex = input.slice(index + 1).match(/^[0-9a-fA-F]{1,2}/)?.[0] || "";
+    if (hex) return byteEscape(parseInt(hex, 16), index + hex.length);
+  }
+  if (ch === "u" || ch === "U") {
+    const width = ch === "u" ? 4 : 8;
+    const hex = input.slice(index + 1, index + 1 + width).match(/^[0-9a-fA-F]+/)?.[0] || "";
     if (hex) {
-      return { value: String.fromCharCode(parseInt(hex, 16)), index: index + hex.length };
-    }
-  }
-  if (ch === "u") {
-    const hex = input.slice(index + 1, index + 5);
-    if (/^[0-9a-fA-F]{4}$/.test(hex)) {
-      return { value: String.fromCharCode(parseInt(hex, 16)), index: index + 4 };
-    }
-  }
-  if (ch === "U") {
-    const hex = input.slice(index + 1, index + 9);
-    if (/^[0-9a-fA-F]{8}$/.test(hex)) {
       const codePoint = parseInt(hex, 16);
-      if (codePoint <= 0x10ffff) {
-        return { value: String.fromCodePoint(codePoint), index: index + 8 };
+      if (codePoint === 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+        return { error: "cURL ANSI-C Unicode escapes must contain valid non-NUL Unicode characters." };
       }
+      return { value: String.fromCodePoint(codePoint), index: index + hex.length };
     }
   }
   if (/^[0-7]$/.test(ch)) {
     const octal = input.slice(index, index + 3).match(/^[0-7]{1,3}/)?.[0] || ch;
-    return { value: String.fromCharCode(parseInt(octal, 8)), index: index + octal.length - 1 };
+    return byteEscape(parseInt(octal, 8) & 0xff, index + octal.length - 1);
   }
-  return { value: ch, index };
+  return { value: `\\${ch}`, index };
 }
 
 function openCurlImportModal() {
