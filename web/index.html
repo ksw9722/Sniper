@@ -8,13 +8,15 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="toast-container" id="toastContainer"></div>
+    <div class="toast-container" id="toastContainer" role="status" aria-atomic="false" aria-relevant="additions text"></div>
     <div class="app-shell">
       <header class="top-strip">
         <nav class="main-tabs" aria-label="Main tools">
           <button class="main-tab" data-tool="dashboard">Session</button>
           <button class="main-tab" data-tool="target">Scope</button>
           <button class="main-tab active" data-tool="proxy">Capture</button>
+          <button class="main-tab" data-tool="map">Map</button>
+          <button class="main-tab" data-tool="recon">Recon</button>
           <button class="main-tab" data-tool="replay">Replay</button>
           <button class="main-tab" data-tool="fuzzer">Fuzzer</button>
           <button class="main-tab" data-tool="sequence">Sequence</button>
@@ -757,6 +759,39 @@
           </section>
 
           <section class="proxy-panel hidden" id="proxySettingsPanel">
+            <section class="panel-card upstream-peer-card" id="upstreamPeerSection" aria-labelledby="upstreamPeerHeading">
+              <header class="panel-toolbar">
+                <div><h2 id="upstreamPeerHeading">Upstream socket peer</h2><p>Current session: <strong id="upstreamPeerSession">Loading…</strong></p></div>
+              </header>
+              <div class="settings-form">
+                <label class="settings-toggle"><input id="upstreamPeerEnabled" type="checkbox" aria-describedby="upstreamPeerDisclosure upstreamPeerTiming" disabled /><span>Record upstream socket peer (default: Off)</span></label>
+                <p id="upstreamPeerDisclosure">Stores the observed upstream IP address and port with future captured HTTP(S) exchanges. This may be an internal or proxy address and may identify a proxy rather than the origin. Stored peers are included in session exports and full-record JSON. Turning this off does not remove previously stored peers.</p>
+                <p id="upstreamPeerTiming">Changes apply to new exchanges. Eligible exchanges already in flight may finish using the previous setting.</p>
+                <p id="upstreamPeerError" class="upstream-peer-error" role="alert"></p>
+                <p id="upstreamPeerStatus" role="status" aria-live="polite">Loading saved setting…</p>
+                <div class="toolbar-actions"><button class="primary-action" id="upstreamPeerSave" type="button" disabled>Save</button><button class="secondary-action" id="upstreamPeerCancel" type="button" disabled>Cancel</button><button class="secondary-action hidden" id="upstreamPeerRefresh" type="button">Check status</button></div>
+              </div>
+            </section>
+            <section class="panel-card history-retention-card" id="historyRetentionSection" aria-labelledby="historyRetentionHeading">
+              <header class="panel-toolbar">
+                <div><h2 id="historyRetentionHeading">HTTP History automatic cleanup</h2><p>Current session: <strong id="historyRetentionSession">Loading…</strong></p></div>
+              </header>
+              <div class="settings-form">
+                <fieldset class="history-retention-fields" aria-describedby="historyRetentionWarning historyRetentionProtection">
+                  <legend>Saved HTTP History limit</legend>
+                  <label class="settings-toggle"><input id="historyRetentionEnabled" type="checkbox" disabled /><span>Enable automatic cleanup (default: Off)</span></label>
+                  <label class="settings-field" for="historyRetentionPreset"><span>Keep newest total entries</span>
+                    <select id="historyRetentionPreset" disabled><option value="10000">10,000</option><option value="50000">50,000</option><option value="100000">100,000</option><option value="250000">250,000</option><option value="custom">Custom</option></select>
+                  </label>
+                  <label class="settings-field hidden" id="historyRetentionCustomField" for="historyRetentionCustom"><span>Custom total entry limit</span><input id="historyRetentionCustom" type="text" inputmode="numeric" pattern="[0-9]+" aria-describedby="historyRetentionCustomHelp historyRetentionError" disabled /><small id="historyRetentionCustomHelp">Whole number from 1 to 4,294,967,295.</small></label>
+                </fieldset>
+                <p id="historyRetentionWarning" class="history-retention-warning">Saving an enabled policy permanently deletes the oldest unprotected entries above the total target, now and as history grows. Deleted requests, responses and notes cannot be restored. Turning cleanup off does not restore deleted entries.</p>
+                <p id="historyRetentionProtection">Original records referenced by durably saved HTTP tabs and in-progress stored records are protected. Protected entries count toward the total; if they exceed the target, the limit is soft. Unsaved tabs and note edits do not protect records.</p>
+                <p id="historyRetentionError" class="history-retention-error" role="alert"></p>
+                <p id="historyRetentionStatus" role="status" aria-live="polite">Loading saved policy…</p>
+                <div class="toolbar-actions"><button class="primary-action" id="historyRetentionSave" type="button" disabled>Save cleanup policy</button><button class="secondary-action" id="historyRetentionCancel" type="button" disabled>Cancel</button><button class="secondary-action" id="historyRetentionRefresh" type="button">Check status</button></div>
+              </div>
+            </section>
             <div class="split-panel split-panel-tight">
               <section class="panel-card">
                 <header class="panel-toolbar">
@@ -887,7 +922,7 @@
                   <dd id="proxySettingsNextProxyAddr">Loading...</dd>
                   <dt>UI listener</dt>
                   <dd id="proxySettingsUiAddr">Loading...</dd>
-                  <dt>Capture cap</dt>
+                  <dt>Body preview cap</dt>
                   <dd id="proxySettingsCaptureCap">Loading...</dd>
                   <dt>Bootstrap host</dt>
                   <dd id="proxySettingsBootstrap">Loading...</dd>
@@ -1005,7 +1040,7 @@
             <div class="ws-replay-left">
               <div class="ws-connection-section">
                 <div class="ws-connection-bar">
-                  <select id="wsSchemeSelect" class="compact-field-inline">
+                  <select id="wsSchemeSelect" class="compact-field-inline" aria-label="WebSocket scheme">
                     <option value="wss">WSS</option>
                     <option value="ws">WS</option>
                   </select>
@@ -1027,14 +1062,14 @@
                 </div>
               </div>
               <div class="ws-editor-section">
-                <label class="ws-editor-label">MESSAGE</label>
+                <label id="wsMessageLabel" class="ws-editor-label">MESSAGE</label>
                 <div class="ws-message-highlight-shell">
                   <textarea id="wsMessageEditor" class="ws-message-editor-hidden" rows="6" spellcheck="false"></textarea>
-                  <pre id="wsMessageHighlight" class="ws-message-highlight" contenteditable="plaintext-only" spellcheck="false" data-placeholder="Type a message..."></pre>
+                  <pre id="wsMessageHighlight" class="ws-message-highlight" contenteditable="plaintext-only" role="textbox" aria-multiline="true" aria-labelledby="wsMessageLabel" spellcheck="false" data-placeholder="Type a message..."></pre>
                 </div>
                 <div class="ws-editor-actions">
                   <button class="primary-action ws-send-button" id="wsSendButton" type="button" disabled>Send</button>
-                  <select id="wsMessageType" class="compact-field-inline ws-type-field">
+                  <select id="wsMessageType" class="compact-field-inline ws-type-field" aria-label="WebSocket message type">
                     <option value="text">Text</option>
                     <option value="binary">Binary</option>
                     <option value="ping">Ping</option>
@@ -1083,6 +1118,7 @@
                 <div class="panel-toolbar">
                   <div>
                     <h2>Tools</h2>
+                    <p class="settings-inline-status error hidden" id="toolsLoadError" role="status" aria-live="polite" aria-atomic="true">Tools could not finish loading. Preserve any unsaved work, then reload the app to try again.</p>
                   </div>
                 </div>
                 <div class="tools-tool-strip">
@@ -1333,12 +1369,9 @@
 
         <section class="target-shell hidden" id="targetShell">
           <section class="split-panel split-panel-tight">
-            <section class="panel-card target-scope-card">
+            <section class="panel-card target-scope-card" id="targetRulesPanel" aria-labelledby="targetRulesTitle">
               <header class="panel-toolbar">
-                <div>
-                  <p class="placeholder-kicker">Target</p>
-                  <h2>Scope</h2>
-                </div>
+                <div><p class="placeholder-kicker">Scope rules</p><h2 id="targetRulesTitle">Included and excluded hosts</h2></div>
                 <div class="toolbar-actions">
                   <button class="secondary-action" id="reloadTargetButton" type="button">Reload</button>
                   <button class="primary-action" id="saveTargetScopeButton" type="button">Save</button>
@@ -1357,16 +1390,123 @@
                 </label>
               </div>
             </section>
-
-            <section class="panel-card">
-              <header class="panel-toolbar">
-                <div>
-                  <p class="placeholder-kicker">Site map</p>
-                  <h2>Captured hosts and paths</h2>
-                </div>
-              </header>
+            <section class="panel-card" id="targetPathsPanel" aria-labelledby="targetPathsTitle">
+              <header class="panel-toolbar"><div><p class="placeholder-kicker">Site map</p><h2 id="targetPathsTitle">Captured hosts and paths</h2></div></header>
               <div class="target-tree" id="targetTree"></div>
             </section>
+          </section>
+        </section>
+
+        <section class="map-shell hidden" id="mapShell">
+          <header class="target-workspace-header">
+            <div class="target-tabs" role="tablist" aria-label="Map views">
+              <button class="sub-tab target-tab active" id="targetServiceMapTab" type="button" data-target-view="service-map" role="tab" aria-selected="true" aria-controls="targetServiceMapPanel">Service Map</button>
+              <button class="sub-tab target-tab" id="targetApisTab" type="button" data-target-view="apis" role="tab" aria-selected="false" aria-controls="targetServiceMapPanel">APIs</button>
+            </div>
+            <span class="target-passive-label">Retained history · read only</span>
+          </header>
+          <section class="service-map-workspace" id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab">
+            <div class="service-map-toolbar">
+              <div class="service-map-view-controls" id="serviceMapViewControls" role="group" aria-label="Service map view">
+                <button class="service-map-mode" id="serviceMapAllOrigins" type="button" aria-pressed="true">All origins</button>
+                <button class="service-map-mode" id="serviceMapDirectRelations" type="button" aria-pressed="false" title="Pin the selected origin and show its direct retained relations">Direct relations</button>
+                <button class="secondary-action hidden" id="serviceMapFocusSelection" type="button">Focus selection</button>
+              </div>
+              <div class="service-map-zoom-controls" id="serviceMapZoomControls" role="group" aria-label="Map zoom">
+                <button class="secondary-action" id="serviceMapZoomOut" type="button" aria-label="Zoom out">−</button>
+                <button class="secondary-action service-map-zoom-reset" id="serviceMapZoomReset" type="button" aria-label="Zoom 100%. Fit the map, or back to 100% once fitted" title="Fit the map; fitted, back to 100%">100%</button>
+                <button class="secondary-action" id="serviceMapZoomIn" type="button" aria-label="Zoom in">+</button>
+              </div>
+              <input class="service-map-search" id="serviceMapSearch" type="search" placeholder="Find an origin" aria-label="Filter origins and references" />
+              <button class="scope-pill" id="serviceMapScopeOnly" type="button" aria-pressed="false" title="Show only in-scope origins">In scope</button>
+              <button class="secondary-action service-map-filter" id="serviceMapFilterButton" type="button" aria-haspopup="dialog" aria-describedby="serviceMapFilterSummary">Filter</button>
+              <span class="service-map-filter-summary" id="serviceMapFilterSummary"></span>
+              <details class="service-map-product-filters"><summary>Products / versions</summary><div id="serviceMapProductFilters" class="service-map-product-filter-panel"></div></details>
+              <button class="secondary-action service-map-reload" id="serviceMapRefresh" type="button" title="Reload retained HTTP metadata. This view updates automatically while open.">Reload</button>
+            </div>
+            <div class="service-map-alert hidden" id="serviceMapAlert" role="status" aria-live="polite"></div>
+            <div class="service-map-content" id="serviceMapContent">
+              <section class="service-map-graph" aria-label="Captured service origins">
+                <div class="service-map-body-overlay hidden" id="serviceMapBodyOverlay" aria-label="Shown retained inspections" aria-live="polite"></div>
+                <div class="service-map-viewport" id="serviceMapViewport" tabindex="0" aria-label="Service map. Plus or minus to zoom, zero to reset, F to fit."><div class="service-map-canvas" id="serviceMapCanvas"></div></div>
+                <div class="service-map-legend"><span class="service-map-line" aria-hidden="true"></span>Redirect <span class="service-map-line dashed" aria-hidden="true"></span>Origin / Referer <span class="service-map-line dotted" aria-hidden="true"></span>Body URL <span class="service-map-line link-declaration" aria-hidden="true"></span>Link header <span class="service-map-line preconnect-hint" aria-hidden="true"></span>Preconnect <span class="service-map-line peer-observation" aria-hidden="true"></span>Same address <span class="service-map-line client-request" aria-hidden="true"></span>Direct request<span id="serviceMapLinkKinds" class="service-map-kinds" role="group" aria-label="Origin and Referer links by request kind"></span><span id="serviceMapSiteControls" class="service-map-kinds" role="group" aria-label="Site grouping and origins hidden from the map"></span><details class="service-map-bounds-details hidden" id="serviceMapBoundsDetails"><summary id="serviceMapDetailsSummary">Details</summary><p class="service-map-status" id="serviceMapStatus"></p><p id="serviceMapGraphBounds"></p><p id="serviceMapGraphDiagnostics"></p></details></div>
+              </section>
+              <div class="pane-resizer service-map-resizer" id="serviceMapResizer" role="separator" aria-orientation="vertical" aria-label="Resize the map and the inspector" tabindex="0" title="Drag to resize; double-click to reset"></div>
+              <aside class="service-map-detail" id="serviceMapDetail" aria-label="Selected origin details"></aside>
+            </div>
+            <section class="service-map-api-catalog hidden" id="serviceMapApiCatalog" aria-label="Observed API paths"></section>
+          </section>
+        </section>
+
+        <section class="recon-shell hidden" id="reconShell" aria-labelledby="reconTitle">
+          <section class="panel-card recon-setup">
+            <header class="panel-toolbar">
+              <div><p class="placeholder-kicker">Endpoint discovery</p><h2 id="reconTitle">Recon</h2></div>
+              <button class="secondary-action" id="reconRefresh" type="button">Refresh</button>
+            </header>
+            <form id="reconForm" class="recon-form">
+              <div class="recon-target-row">
+                <label class="recon-field recon-target-field" for="reconTarget">Target URL
+                  <input id="reconTarget" type="url" placeholder="https://example.com/" required autocomplete="off" spellcheck="false" />
+                </label>
+                <button class="primary-action" id="reconStart" type="submit" disabled>Start discovery</button>
+              </div>
+              <label class="recon-check"><input id="reconSubdomains" type="checkbox" /> Include subdomains (same effective port)</label>
+              <p class="recon-help" id="reconScope">Enter an explicit HTTP or HTTPS URL. Discovery is limited to that hostname and effective port.</p>
+              <fieldset class="recon-sources">
+                <legend>Sources</legend>
+                <label class="recon-check"><input id="reconCrawler" type="checkbox" checked /> Static HTML / JavaScript crawler</label>
+                <label class="recon-check"><input id="reconUrlscan" type="checkbox" /> urlscan.io historical search</label>
+                <label class="recon-check"><input id="reconWayback" type="checkbox" /> Wayback Machine history</label>
+                <label class="recon-check"><input id="reconUrlscanSubmit" type="checkbox" /> Submit a new urlscan.io browser scan</label>
+              </fieldset>
+              <p class="recon-help">The crawler sends bounded GET requests and reads static HTML and JavaScript. It does not run a browser or submit forms. Historical results and extracted candidates do not prove an endpoint is live. Only test targets you are authorized to access.</p>
+              <label class="recon-check recon-history-consent hidden" id="reconHistoryConsentRow"><input id="reconHistoryConsent" type="checkbox" /><span id="reconHistoryConsentText">Allow sending the target domain to the selected history services.</span></label>
+              <div id="reconScanOptions" class="recon-scan-options hidden">
+                <label class="recon-field" for="reconScanVisibility">New scan visibility<select id="reconScanVisibility"><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select></label>
+                <p class="recon-help">A new scan sends the full target URL to urlscan.io; remove query strings and fragments first. Its remote browser may contact third-party resources outside Sniper's scope. Public results are visible to everyone; unlisted results are not private. urlscan.io plan and retention limits apply. The API key is configured only on the backend.</p>
+                <label class="recon-check"><input id="reconScanConsent" type="checkbox" /><span id="reconScanConsentText">Allow a new urlscan.io scan of this URL with the selected visibility.</span></label>
+              </div>
+              <details class="recon-limits">
+                <summary>Discovery limits</summary>
+                <div class="recon-limit-fields">
+                  <label class="recon-field" for="reconMaxRequests">Crawler requests<input id="reconMaxRequests" type="number" min="1" max="1000" value="100" required /></label>
+                  <label class="recon-field" for="reconMaxDepth">Crawl depth<input id="reconMaxDepth" type="number" min="0" max="10" value="3" required /></label>
+                  <label class="recon-field" for="reconMaxEndpoints">Endpoints<input id="reconMaxEndpoints" type="number" min="1" max="5000" value="5000" required /></label>
+                  <label class="recon-field" for="reconMaxPages">History pages per source<input id="reconMaxPages" type="number" min="1" max="20" value="5" required /></label>
+                </div>
+              </details>
+              <p class="recon-notice hidden" id="reconActionStatus" role="status" aria-live="polite"></p>
+            </form>
+          </section>
+          <section class="panel-card recon-jobs-panel" aria-labelledby="reconJobsTitle">
+            <header class="panel-toolbar"><h2 id="reconJobsTitle">Jobs</h2><span id="reconJobsMeta" class="recon-help"></span></header>
+            <div id="reconJobs" class="recon-jobs"><p class="recon-empty">No discovery jobs in this session.</p></div>
+          </section>
+          <section class="panel-card recon-inventory" aria-labelledby="reconInventoryTitle">
+            <header class="panel-toolbar recon-inventory-toolbar">
+              <div><h2 id="reconInventoryTitle">Endpoint inventory</h2><p id="reconInventoryMeta" class="recon-help" role="status" aria-live="polite">Open Recon to load this session.</p></div>
+              <div class="recon-search-controls">
+                <label class="recon-sr-only" for="reconSearch">Search endpoints and evidence</label>
+                <input id="reconSearch" type="search" placeholder="Search URL, method, source or evidence" autocomplete="off" />
+                <label class="recon-sr-only" for="reconKind">Evidence type</label>
+                <select id="reconKind"><option value="">All evidence</option><option value="live">Live</option><option value="observed">Observed</option><option value="history">Historical</option><option value="candidate">Candidate</option></select>
+              </div>
+            </header>
+            <p id="reconLoadStatus" class="recon-notice hidden" role="status" aria-live="polite"></p>
+            <div class="recon-results">
+              <div class="recon-table-scroll">
+                <table class="mini-table recon-table">
+                  <thead><tr><th>Method</th><th>URL</th><th>Evidence</th><th>Sources</th></tr></thead>
+                  <tbody id="reconEndpoints"></tbody>
+                </table>
+              </div>
+              <aside class="recon-detail" id="reconDetail" aria-labelledby="reconDetailTitle"><h3 id="reconDetailTitle">Endpoint details</h3><p class="recon-help">Select an endpoint to inspect its raw URLs and provenance.</p></aside>
+            </div>
+            <footer class="recon-pagination">
+              <span id="reconPageMeta">0 endpoints</span>
+              <div class="toolbar-actions"><button class="secondary-action" id="reconPrevious" type="button" disabled>Previous</button><button class="secondary-action" id="reconNext" type="button" disabled>Next</button></div>
+            </footer>
           </section>
         </section>
 
@@ -1586,6 +1726,9 @@
                 <small>Lower numbers make the whole workbench denser. The default is 12 px.</small>
               </label>
 
+              <p class="modal-copy" id="displaySettingsLoadStatus" role="status" aria-live="polite">Loading saved display settings. You can edit while they load.</p>
+              <button class="secondary-action" id="retryDisplaySettingsButton" type="button" disabled>Retry</button>
+
             </section>
 
             <section class="filter-group">
@@ -1633,7 +1776,7 @@
 
         <div class="modal-actions">
           <button class="secondary-action" id="resetDisplaySettingsButton" type="button">Reset</button>
-          <button class="primary-action" id="applyDisplaySettingsButton" type="button">Apply</button>
+          <button class="primary-action" id="applyDisplaySettingsButton" type="button" aria-describedby="displaySettingsLoadStatus" disabled>Apply</button>
         </div>
       </div>
     </div>
@@ -1658,6 +1801,8 @@
         </footer>
       </div>
     </div>
+
+    <div class="modal-backdrop hidden" id="serviceMapApiDocs"></div>
 
     <div class="modal-backdrop hidden" id="curlImportModal">
       <div class="modal-card">
@@ -1785,7 +1930,16 @@
       </div>
     </div>
 
+    <details class="history-recovered-notes hidden" id="historyRecoveredNotes">
+      <summary id="historyRecoveredNotesSummary">Recovered unsaved notes</summary>
+      <p role="status">The original record is no longer available. This unsaved text is only kept in this window, across tabs and sessions. Select and copy anything you need before discarding it or reloading. It will not be saved back to HTTP History.</p>
+      <div id="historyRecoveredNotesList"></div>
+    </details>
+
     <script src="/codemirror.js" defer></script>
+    <script src="/product-icons.js" defer></script>
+    <script src="/service-map.js" defer></script>
+    <script src="/recon.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>

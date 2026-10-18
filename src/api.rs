@@ -55,7 +55,7 @@ use crate::{
     websocket::WebSocketListFilters,
     workspace::{
         can_replace_snapshot, validate_workspace_serialized_size, FuzzerWorkspaceState,
-        ReplayTabState, SavedHttpTabOperation, WorkspaceReplaceError, WorkspaceStateSnapshot,
+        ReplayTabState, SavedReplayTabOperation, WorkspaceReplaceError, WorkspaceStateSnapshot,
         WorkspaceTransformError, MAX_WORKSPACE_SERIALIZED_BYTES,
     },
 };
@@ -361,6 +361,12 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/decoder/", get(decoder_index))
         .route("/decoder/*path", get(decoder_asset))
         .route("/app.js", get(app_js))
+        .route("/recon.js", get(recon_js))
+        .route("/api/recon", get(crate::recon::list))
+        .route("/api/recon/jobs", post(crate::recon::start))
+        .route("/api/recon/jobs/:id/stop", post(crate::recon::stop))
+        .route("/service-map.js", get(service_map_js))
+        .route("/product-icons.js", get(product_icons_js))
         .route("/codemirror.js", get(codemirror_js))
         .route("/styles.css", get(styles_css))
         .route("/favicon.svg", get(favicon_svg))
@@ -388,8 +394,16 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             "/api/workspace-state/keepalive",
             post(update_workspace_state_keepalive),
         )
+        .route(
+            "/api/replay/tabs/set-label",
+            post(set_saved_replay_tab_label),
+        )
         .route("/api/replay/tabs/close", post(close_saved_http_tab))
         .route("/api/replay/tabs/duplicate", post(duplicate_saved_http_tab))
+        .route(
+            "/api/replay/tabs/set-pinned",
+            post(set_saved_http_tab_pinned),
+        )
         .route(
             "/api/startup-settings",
             get(get_startup_settings).post(update_startup_settings),
@@ -423,6 +437,14 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/clear", post(clear_findings))
         .route(
+            "/api/transactions/upstream-peer-settings",
+            get(get_upstream_peer_settings).post(update_upstream_peer_settings),
+        )
+        .route(
+            "/api/transactions/retention",
+            get(get_history_retention).post(update_history_retention),
+        )
+        .route(
             "/api/scanner-config",
             get(get_scanner_config).post(update_scanner_config),
         )
@@ -432,6 +454,39 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/oast/generate", post(generate_oast_payload))
         .route("/api/oast/status", get(oast_status))
         .route("/api/target/site-map", get(get_target_site_map))
+        .route("/api/target/service-map", get(get_target_service_map))
+        .route(
+            "/api/target/service-map/evidence",
+            get(get_target_service_map_evidence),
+        )
+        .route(
+            "/api/target/service-map/body-references",
+            get(get_target_service_map_body_references),
+        )
+        .route(
+            "/api/target/service-map/html-generators",
+            get(get_target_service_map_html_generators),
+        )
+        .route(
+            "/api/target/service-map/link-declarations",
+            get(get_target_service_map_link_declarations),
+        )
+        .route(
+            "/api/target/service-map/socket-peer-matches",
+            get(get_target_service_map_socket_peer_matches),
+        )
+        .route(
+            "/api/target/service-map/parameters",
+            get(get_target_service_map_parameters),
+        )
+        .route(
+            "/api/target/service-map/openapi",
+            get(get_target_service_map_openapi),
+        )
+        .route(
+            "/api/target/service-map/favicon",
+            get(get_target_service_map_favicon),
+        )
         .route(
             "/api/transactions",
             get(list_transactions).delete(clear_transactions),
@@ -458,7 +513,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             "/api/intercept-rules",
             get(list_intercept_rules).post(upsert_intercept_rule),
         )
-        .route("/api/intercept-rules/:id", delete(delete_intercept_rule))
+        .route(
+            "/api/intercept-rules/:id",
+            delete(delete_intercept_rule).patch(update_intercept_rule),
+        )
         .route("/api/response-intercepts", get(list_response_intercepts))
         .route(
             "/api/response-intercepts/forward-all",
@@ -620,11 +678,21 @@ async fn local_api_write_guard(request: Request, next: Next) -> Response {
             )
                 .into_response();
         }
-        if !matches!(
+        let read = matches!(
             *request.method(),
             Method::GET | Method::HEAD | Method::OPTIONS
-        ) && !is_allowed_browser_write(request.headers(), request.uri())
-        {
+        );
+        // Another site's page cannot see the answer, but each read still costs
+        // a history search or a whole map build, and a page could send them
+        // without end while the map's single slot refused the UI.
+        if read && request_has_cross_site_fetch_metadata(request.headers()) {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-site reads of the local Sniper API are blocked",
+            )
+                .into_response();
+        }
+        if !read && !is_allowed_browser_write(request.headers(), request.uri()) {
             return (
                 StatusCode::FORBIDDEN,
                 "cross-origin writes to the local Sniper API are blocked",
@@ -942,6 +1010,26 @@ fn websocket_list_filters(
     }
 }
 
+/// A search regex the store could not compile would match every row (or none,
+/// negated) instead of failing, so refuse it before it is used.
+fn validate_advanced_regex(
+    search: Option<&str>,
+    regex: bool,
+    case_sensitive: bool,
+) -> std::result::Result<(), String> {
+    let Some(term) = search
+        .map(str::trim)
+        .filter(|term| regex && !term.is_empty())
+    else {
+        return Ok(());
+    };
+    RegexBuilder::new(term)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("invalid advanced_search regex: {error}"))
+}
+
 fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(), String> {
     validate_optional_limit(query.limit)?;
     validate_sort_direction(query.sort_direction.as_deref())?;
@@ -960,16 +1048,11 @@ fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(
         validate_since(value).ok_or_else(|| format!("invalid since filter: {value}"))?;
     }
 
-    if query.advanced_regex.unwrap_or(false) {
-        if let Some(term) = query.advanced_search.as_deref().map(str::trim) {
-            if !term.is_empty() {
-                RegexBuilder::new(term)
-                    .case_insensitive(!query.advanced_case_sensitive.unwrap_or(false))
-                    .build()
-                    .map_err(|error| format!("invalid advanced_search regex: {error}"))?;
-            }
-        }
-    }
+    validate_advanced_regex(
+        query.advanced_search.as_deref(),
+        query.advanced_regex.unwrap_or(false),
+        query.advanced_case_sensitive.unwrap_or(false),
+    )?;
 
     Ok(())
 }
@@ -2683,6 +2766,60 @@ impl From<crate::intercept::InterceptRule> for InterceptRulePayload {
     }
 }
 
+// Supplied patch fields must have their actual type; null is not a clearing value.
+fn deserialize_intercept_rule_patch_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterceptRuleUpdatePayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    scope: Option<crate::intercept::InterceptScope>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    host_pattern: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    path_pattern: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_intercept_rule_patch_field")]
+    method_filter: Option<Vec<String>>,
+}
+
+impl InterceptRuleUpdatePayload {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.scope.is_none()
+            && self.host_pattern.is_none()
+            && self.path_pattern.is_none()
+            && self.method_filter.is_none()
+    }
+
+    fn apply(self, rule: &mut crate::intercept::InterceptRule) {
+        if let Some(enabled) = self.enabled {
+            rule.enabled = enabled;
+        }
+        if let Some(scope) = self.scope {
+            rule.scope = scope;
+        }
+        if let Some(host_pattern) = self.host_pattern {
+            rule.host_pattern = host_pattern;
+        }
+        if let Some(path_pattern) = self.path_pattern {
+            rule.path_pattern = path_pattern;
+        }
+        if let Some(method_filter) = self.method_filter {
+            rule.method_filter = method_filter;
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct InterceptForwardPayload {
     #[serde(default)]
@@ -3010,28 +3147,95 @@ struct SavedHttpTabPayload {
     expected_active_session_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSavedHttpTabPinnedPayload {
+    session_id: Uuid,
+    tab_id: String,
+    expected_workspace_revision: u64,
+    expected_active_session_id: Option<Uuid>,
+    pinned: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSavedReplayTabLabelPayload {
+    session_id: Uuid,
+    tab_id: String,
+    expected_workspace_revision: u64,
+    expected_active_session_id: Option<Uuid>,
+    label: String,
+}
+
+async fn set_saved_replay_tab_label(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SetSavedReplayTabLabelPayload>,
+) -> Response {
+    // Apply the same normalization as the tab strip without parsing any draft.
+    // The cut can end on the joining space; trim it, or applying the rule
+    // again (as the CLI's check does) gives a different label.
+    let label = payload
+        .label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    mutate_saved_replay_tab(
+        state,
+        SavedHttpTabPayload {
+            session_id: payload.session_id,
+            tab_id: payload.tab_id,
+            expected_workspace_revision: payload.expected_workspace_revision,
+            expected_active_session_id: payload.expected_active_session_id,
+        },
+        SavedReplayTabOperation::SetLabel(label),
+    )
+    .await
+}
+
+async fn set_saved_http_tab_pinned(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SetSavedHttpTabPinnedPayload>,
+) -> Response {
+    mutate_saved_replay_tab(
+        state,
+        SavedHttpTabPayload {
+            session_id: payload.session_id,
+            tab_id: payload.tab_id,
+            expected_workspace_revision: payload.expected_workspace_revision,
+            expected_active_session_id: payload.expected_active_session_id,
+        },
+        SavedReplayTabOperation::SetPinned(payload.pinned),
+    )
+    .await
+}
+
 async fn close_saved_http_tab(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SavedHttpTabPayload>,
 ) -> Response {
-    mutate_saved_http_tab(state, payload, SavedHttpTabOperation::Close).await
+    mutate_saved_replay_tab(state, payload, SavedReplayTabOperation::Close).await
 }
 
 async fn duplicate_saved_http_tab(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SavedHttpTabPayload>,
 ) -> Response {
-    mutate_saved_http_tab(state, payload, SavedHttpTabOperation::Duplicate).await
+    mutate_saved_replay_tab(state, payload, SavedReplayTabOperation::Duplicate).await
 }
 
-async fn mutate_saved_http_tab(
+async fn mutate_saved_replay_tab(
     state: Arc<AppState>,
     payload: SavedHttpTabPayload,
-    operation: SavedHttpTabOperation,
+    operation: SavedReplayTabOperation,
 ) -> Response {
     // Keep the operation/persistence locks alive through disk commit and memory
     // publication even when the requester disconnects during spawn_blocking.
-    tokio::spawn(mutate_saved_http_tab_inner(state, payload, operation))
+    tokio::spawn(mutate_saved_replay_tab_inner(state, payload, operation))
         .await
         .unwrap_or_else(|_| saved_http_tab_uncertain_response())
 }
@@ -3044,10 +3248,10 @@ fn saved_http_tab_uncertain_response() -> Response {
         .into_response()
 }
 
-async fn mutate_saved_http_tab_inner(
+async fn mutate_saved_replay_tab_inner(
     state: Arc<AppState>,
     payload: SavedHttpTabPayload,
-    operation: SavedHttpTabOperation,
+    operation: SavedReplayTabOperation,
 ) -> Response {
     if payload.tab_id.trim().is_empty() || payload.tab_id.len() > MAX_WORKSPACE_REPLAY_TAB_ID_BYTES
     {
@@ -3092,22 +3296,42 @@ async fn mutate_saved_http_tab_inner(
     // This narrow operation writes only workspace.json. A cached read-only
     // inactive context is sufficient; promotion could repair unrelated files.
     match session
-        .mutate_saved_http_tab_and_persist(
+        .mutate_saved_replay_tab_and_persist(
             &payload.tab_id,
             payload.expected_workspace_revision,
-            operation,
+            operation.clone(),
         )
         .await
     {
         Ok(snapshot) => {
+            state.mark_workspace_retention_durability(&session, true);
             let mut result = serde_json::json!({
                 "session_id": session.id(),
                 "revision": snapshot.revision,
                 "active_tab_id": snapshot.replay.active_tab_id,
             });
             match operation {
-                SavedHttpTabOperation::Close => result["closed_tab_id"] = payload.tab_id.into(),
-                SavedHttpTabOperation::Duplicate => {
+                SavedReplayTabOperation::SetLabel(_) => {
+                    // Preserve replay.update's full-tab result without accepting tab payloads.
+                    let tab = snapshot
+                        .replay
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == payload.tab_id)
+                        .unwrap();
+                    return Json(serde_json::json!({
+                        "session_id": session.id(),
+                        "revision": snapshot.revision,
+                        "tab": tab,
+                    }))
+                    .into_response();
+                }
+                SavedReplayTabOperation::Close => result["closed_tab_id"] = payload.tab_id.into(),
+                SavedReplayTabOperation::SetPinned(pinned) => {
+                    result["tab_id"] = payload.tab_id.into();
+                    result["pinned"] = pinned.into();
+                }
+                SavedReplayTabOperation::Duplicate => {
                     result["source_tab_id"] = payload.tab_id.into();
                     result["new_tab_id"] = snapshot.replay.tabs.last().unwrap().id.clone().into();
                 }
@@ -3135,10 +3359,22 @@ async fn mutate_saved_http_tab_inner(
                 .into_response()
         }
         Err(WorkspaceTransformError::CommittedButUncertain(error)) => {
+            state.mark_workspace_retention_durability(&session, false);
             tracing::warn!(%error, "saved Replay tab update committed with uncertain durability");
             saved_http_tab_uncertain_response()
         }
     }
+}
+
+fn workspace_commit_uncertain_response() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "code": "WORKSPACE_COMMIT_UNCERTAIN",
+            "error": "Workspace was saved, but durability could not be confirmed. Reload the selected session before retrying.",
+        })),
+    )
+        .into_response()
 }
 
 async fn update_workspace_state(
@@ -3233,6 +3469,10 @@ async fn update_workspace_state(
             tracing::warn!(%error, "failed to persist workspace state update");
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
+        Err(WorkspaceReplaceError::CommittedButUncertain(error)) => {
+            tracing::warn!(%error, "workspace state update committed with uncertain durability");
+            workspace_commit_uncertain_response()
+        }
     }
 }
 
@@ -3317,6 +3557,10 @@ async fn update_workspace_state_keepalive(
         Err(WorkspaceReplaceError::Persist(error)) => {
             tracing::warn!(%error, "failed to persist workspace keepalive update");
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(WorkspaceReplaceError::CommittedButUncertain(error)) => {
+            tracing::warn!(%error, "workspace keepalive update committed with uncertain durability");
+            workspace_commit_uncertain_response()
         }
     }
 }
@@ -4471,6 +4715,383 @@ async fn clear_findings(
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamPeerSettingsQuery {
+    session_id: Option<Uuid>,
+    expected_active_session_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamPeerSettingsPayload {
+    enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_upstream_peer_config_token")]
+    expected_config_token: Option<String>,
+}
+
+fn deserialize_upstream_peer_config_token<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    // An omitted precondition is 428; an explicit null or wrong type is 400.
+    String::deserialize(deserializer).map(Some)
+}
+
+fn upstream_peer_settings_error(status: StatusCode, code: &str, error: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"code": code, "error": error})),
+    )
+        .into_response()
+}
+
+fn upstream_peer_settings_session_conflict() -> Response {
+    upstream_peer_settings_error(StatusCode::CONFLICT, "UPSTREAM_PEER_SESSION_CHANGED",
+        "Observed socket peer settings require the current active session; reload before continuing.")
+}
+
+async fn pin_upstream_peer_settings_session(
+    state: &Arc<AppState>,
+    query: &UpstreamPeerSettingsQuery,
+) -> std::result::Result<Arc<SessionContext>, Response> {
+    // Never resolve an inactive saved context: even a Check must be bounded and
+    // must not hydrate retained history or activate background work.
+    let session = state.active_session_for_read().await;
+    if query.session_id.is_some_and(|id| id != session.id())
+        || query
+            .expected_active_session_id
+            .is_some_and(|id| id != session.id())
+        || state.sessions.active_session_id() != session.id()
+        || !state.sessions.contains_session(session.id())
+    {
+        return Err(upstream_peer_settings_session_conflict());
+    }
+    Ok(session)
+}
+
+async fn upstream_peer_settings_context_is_current(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    query: &UpstreamPeerSettingsQuery,
+) -> bool {
+    let current = state.active_session_for_read().await;
+    Arc::ptr_eq(&current, session)
+        && state.sessions.active_session_id() == session.id()
+        && state.sessions.contains_session(session.id())
+        && query
+            .expected_active_session_id
+            .is_none_or(|id| id == session.id())
+}
+
+async fn get_upstream_peer_settings(
+    State(state): State<Arc<AppState>>,
+    query: std::result::Result<
+        Query<UpstreamPeerSettingsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return upstream_peer_settings_error(
+            StatusCode::BAD_REQUEST,
+            "UPSTREAM_PEER_INVALID_QUERY",
+            "Invalid observed socket peer settings query.",
+        );
+    };
+    let session = match pin_upstream_peer_settings_session(&state, &query).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = state
+        .session_operation_lock(session.id())
+        .await
+        .lock_owned()
+        .await;
+    if !upstream_peer_settings_context_is_current(&state, &session, &query).await {
+        return upstream_peer_settings_session_conflict();
+    }
+    let _mutation_guard = session.mutation_guard().await;
+    Json(crate::upstream_peer_settings::snapshot(&session, None).await).into_response()
+}
+
+async fn update_upstream_peer_settings(
+    State(state): State<Arc<AppState>>,
+    query: std::result::Result<
+        Query<UpstreamPeerSettingsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+    payload: std::result::Result<
+        Json<UpstreamPeerSettingsPayload>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let (Ok(Query(query)), Ok(Json(payload))) = (query, payload) else {
+        // Extractor errors can echo supplied input. Keep this endpoint's errors
+        // content-free, including malformed credential-looking input.
+        return upstream_peer_settings_error(
+            StatusCode::BAD_REQUEST,
+            "UPSTREAM_PEER_INVALID_REQUEST",
+            "Invalid observed socket peer settings request.",
+        );
+    };
+    let session = match pin_upstream_peer_settings_session(&state, &query).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    // Once dispatched, finish the state-only transaction even if the caller
+    // disconnects. A writer panic leaves the independent eligibility gate set.
+    tokio::spawn(update_upstream_peer_settings_inner(state, session, query, payload))
+        .await.unwrap_or_else(|_| upstream_peer_settings_error(StatusCode::INTERNAL_SERVER_ERROR,
+            "UPSTREAM_PEER_COMMIT_UNCERTAIN", "Observed socket peer settings outcome is unknown; Check and explicitly Save again to confirm durability."))
+}
+
+async fn update_upstream_peer_settings_inner(
+    state: Arc<AppState>,
+    session: Arc<SessionContext>,
+    query: UpstreamPeerSettingsQuery,
+    payload: UpstreamPeerSettingsPayload,
+) -> Response {
+    use crate::upstream_peer_settings::{config_token, SettingsWriteError};
+    let _operation_guard = state
+        .session_operation_lock(session.id())
+        .await
+        .lock_owned()
+        .await;
+    if !upstream_peer_settings_context_is_current(&state, &session, &query).await {
+        return upstream_peer_settings_session_conflict();
+    }
+    let Some(expected) = payload.expected_config_token.as_deref() else {
+        return upstream_peer_settings_error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "UPSTREAM_PEER_TOKEN_REQUIRED",
+            "Use expected_config_token from a fresh Check of observed socket peer settings.",
+        );
+    };
+    if !crate::upstream_peer_settings::valid_config_token(expected) {
+        return upstream_peer_settings_error(
+            StatusCode::BAD_REQUEST,
+            "UPSTREAM_PEER_INVALID_TOKEN",
+            "Invalid observed socket peer settings token.",
+        );
+    }
+    let _mutation_guard = session.mutation_guard().await;
+    let previous = session.runtime.snapshot().await;
+    if expected
+        != config_token(
+            session.id(),
+            previous.upstream_peer_capture_enabled,
+            previous.upstream_peer_capture_revision,
+        )
+    {
+        return upstream_peer_settings_error(
+            StatusCode::CONFLICT,
+            "UPSTREAM_PEER_SETTINGS_CHANGED",
+            "Observed socket peer settings changed; Check and review before saving.",
+        );
+    }
+    let changed = previous.upstream_peer_capture_enabled != payload.enabled;
+    let revision = if changed {
+        match previous.upstream_peer_capture_revision.and_then(|value| value.checked_add(1)) {
+            Some(next) => Some(next),
+            None => return upstream_peer_settings_error(StatusCode::CONFLICT, "UPSTREAM_PEER_REVISION_EXHAUSTED", "Observed socket peer settings revision is invalid or exhausted; settings were not changed."),
+        }
+    } else {
+        previous.upstream_peer_capture_revision
+    };
+    if let Err(error) = session
+        .persist_upstream_peer_settings(payload.enabled, revision)
+        .await
+    {
+        // Never log addresses, credentials, filesystem paths, or raw I/O errors.
+        tracing::warn!(?error, session_id = %session.id(), "observed socket peer settings persistence not confirmed");
+        let (code, message) = match error {
+            SettingsWriteError::NotCommitted => ("UPSTREAM_PEER_NOT_COMMITTED", "Observed socket peer settings were not committed. Previous settings remain; new observations are paused until an explicit successful Save."),
+            SettingsWriteError::CommittedButUncertain => ("UPSTREAM_PEER_COMMIT_UNCERTAIN", "Observed socket peer settings were replaced but durability is uncertain. New observations are paused; Check and explicitly Save again."),
+            SettingsWriteError::OutcomeUnknown => ("UPSTREAM_PEER_COMMIT_UNCERTAIN", "Observed socket peer settings write outcome is unknown. Last attempted settings are shown; new observations are paused. Check and explicitly Save again."),
+        };
+        let settings = crate::upstream_peer_settings::snapshot(&session, None).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"code":code,"error":message,"settings":settings})),
+        )
+            .into_response();
+    }
+    Json(crate::upstream_peer_settings::snapshot(&session, Some(changed)).await).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryRetentionPayload {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    expected_config_token: Option<String>,
+    policy: crate::history_retention::HistoryRetentionPolicy,
+}
+
+async fn get_history_retention(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionScopedQuery>,
+) -> Response {
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = state
+        .session_operation_lock(session.id())
+        .await
+        .lock_owned()
+        .await;
+    if !state.is_current_session_context(&session).await {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history settings context changed; reload before reading.",
+        )
+            .into_response();
+    }
+    let _mutation_guard = session.mutation_guard().await;
+    Json(
+        crate::history_retention::snapshot(
+            &session,
+            state.workspace_retention_is_uncertain(session.id()),
+            state.retention_persistence_is_uncertain(session.id()),
+            None,
+        )
+        .await,
+    )
+    .into_response()
+}
+
+async fn update_history_retention(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionWriteQuery>,
+    Json(payload): Json<HistoryRetentionPayload>,
+) -> Response {
+    tokio::spawn(update_history_retention_inner(state, query, payload)).await.unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "HTTP history retention update outcome is unknown; reload this session before retrying.").into_response()
+    })
+}
+
+async fn update_history_retention_inner(
+    state: Arc<AppState>,
+    query: SessionWriteQuery,
+    payload: HistoryRetentionPayload,
+) -> Response {
+    use crate::history_retention::history_retention_config_token;
+    let (target_session_id, explicit) =
+        match reconcile_write_session_id(query.session_id, payload.session_id) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        target_session_id,
+    ) {
+        return response;
+    }
+    let session = match resolve_read_session_for_optional_id(&state, target_session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let _operation_guard = match guard_session_write_operation(
+        &state,
+        &session,
+        !explicit || query.expected_active_session_id.is_some(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        Some(session.id()),
+    ) {
+        return response;
+    }
+    if !state.is_current_session_context(&session).await {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history settings context changed; reload before saving.",
+        )
+            .into_response();
+    }
+    let Some(expected) = payload.expected_config_token.as_deref() else {
+        return (StatusCode::PRECONDITION_REQUIRED, "HTTP history retention requires expected_config_token from a fresh GET /api/transactions/retention.").into_response();
+    };
+    let read_guard = session.mutation_guard().await;
+    let (read_policy, read_revision) = session.runtime.history_retention_config().await;
+    if expected != history_retention_config_token(session.id(), &read_policy, read_revision) {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history retention changed; reload and review before saving.",
+        )
+            .into_response();
+    }
+    drop(read_guard);
+    let session = if state.sessions.active_session_id() == session.id() {
+        session
+    } else {
+        match state
+            .session_context_for_id_operation_locked(session.id())
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => return session_load_failure_response(session.id(), error),
+        }
+    };
+    let _mutation_guard = session.mutation_guard().await;
+    let (previous, revision) = session.runtime.history_retention_config().await;
+    if expected != history_retention_config_token(session.id(), &previous, revision) {
+        return (
+            StatusCode::CONFLICT,
+            "HTTP history retention changed; reload before saving.",
+        )
+            .into_response();
+    }
+    let changed = previous != payload.policy;
+    let next_revision = if changed {
+        match revision.checked_add(1) {
+            Some(next) => next,
+            None => return (StatusCode::CONFLICT, Json(serde_json::json!({"code":"RETENTION_REVISION_EXHAUSTED","error":"HTTP history retention settings revision is exhausted; settings were not changed."}))).into_response(),
+        }
+    } else {
+        revision
+    };
+    // A policy-only save cannot compact or remove traffic. The independent
+    // worker cannot acquire these locks until this durable write has finished.
+    if let Err(error) = session
+        .persist_history_retention_policy(payload.policy, next_revision)
+        .await
+    {
+        state.mark_retention_policy_durability(&session, false);
+        tracing::warn!(?error, session_id = %session.id(), "failed to persist HTTP history retention policy");
+        let (code, message) = match error {
+            crate::history_retention::PolicyWriteError::NotCommitted => ("RETENTION_NOT_COMMITTED", "HTTP history retention could not be saved. Previous settings remain; cleanup is paused until a successful settings save."),
+            _ => ("RETENTION_COMMIT_UNCERTAIN", "HTTP history retention write outcome is uncertain. Cleanup is paused; reload settings and save again to confirm durability."),
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"code":code,"error":message})),
+        )
+            .into_response();
+    }
+    state.mark_retention_policy_durability(&session, true);
+    state.start_history_retention_worker(&session);
+    session.store.notify_retention_work();
+    Json(
+        crate::history_retention::snapshot(
+            &session,
+            state.workspace_retention_is_uncertain(session.id()),
+            state.retention_persistence_is_uncertain(session.id()),
+            Some(changed),
+        )
+        .await,
+    )
+    .into_response()
+}
+
 async fn get_scanner_config(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SessionScopedQuery>,
@@ -4779,6 +5400,767 @@ async fn update_match_replace_rules(
         return response;
     }
     Json(rules).into_response()
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapQuery {
+    session_id: Option<Uuid>,
+    /// Read every retained row, as the UI does, instead of the newest
+    /// `max_records`; such a read is cached per filter, scope and catalog.
+    #[serde(default)]
+    all_rows: bool,
+    /// Rebuild a whole-history map now rather than serve a recent one.
+    #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
+    in_scope_only: bool,
+    max_records: Option<usize>,
+    origin: Option<String>,
+    // The Service Map display filter: the HTTP history filter's row conditions,
+    // under the same names as `/api/transactions`.
+    #[serde(default)]
+    hide_without_responses: bool,
+    #[serde(default)]
+    only_parameterized: bool,
+    #[serde(default)]
+    only_notes: bool,
+    status_classes: Option<String>,
+    mime_types: Option<String>,
+    hidden_extensions: Option<String>,
+    port: Option<String>,
+    color_tags: Option<String>,
+    advanced_search: Option<String>,
+    #[serde(default)]
+    advanced_regex: bool,
+    #[serde(default)]
+    advanced_case_sensitive: bool,
+    #[serde(default)]
+    advanced_negative: bool,
+}
+
+/// Builds the map's display filter as `transaction_list_filters` would, so a
+/// condition hides exactly the rows it hides in HTTP history.
+fn service_map_row_filters(query: &ServiceMapQuery) -> ListFilters {
+    ListFilters {
+        hide_without_responses: query.hide_without_responses,
+        only_parameterized: query.only_parameterized,
+        only_notes: query.only_notes,
+        status_classes: optional_csv_param(query.status_classes.clone()),
+        mime_types: optional_csv_param(query.mime_types.clone()),
+        hidden_extensions: csv_param(query.hidden_extensions.clone()),
+        port: query.port.clone().filter(|port| !port.trim().is_empty()),
+        color_tags: csv_param(query.color_tags.clone()),
+        advanced_search: query.advanced_search.clone(),
+        advanced_regex: query.advanced_regex,
+        advanced_case_sensitive: query.advanced_case_sensitive,
+        advanced_negative: query.advanced_negative,
+        // History's search always reads headers; a term only a header holds
+        // hid the row on the map while History listed it.
+        search_headers: true,
+        ..ListFilters::default()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapEvidenceQuery {
+    session_id: Uuid,
+    evidence_id: String,
+    #[serde(default)]
+    include_socket_peer: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapBodyEvidenceQuery {
+    session_id: Uuid,
+    evidence_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceMapSocketPeerMatchesQuery {
+    session_id: Uuid,
+    evidence_id: String,
+    #[serde(default)]
+    in_scope_only: bool,
+    max_records: Option<usize>,
+}
+
+const TECHNOLOGY_CATALOG_HEADER: &str = "x-sniper-technology-catalog-version";
+const INVALID_TECHNOLOGY_CATALOG: &str = "invalid technology catalog version header";
+
+fn service_map_catalog(
+    headers: &HeaderMap,
+) -> Result<(crate::service_map_technology::CatalogVersion, Option<u32>), &'static str> {
+    use crate::service_map_technology::CatalogVersion;
+    let mut values = headers.get_all(TECHNOLOGY_CATALOG_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok((CatalogVersion::V1, None));
+    };
+    if values.next().is_some() {
+        return Err(INVALID_TECHNOLOGY_CATALOG);
+    }
+    let catalog = match value.as_bytes() {
+        b"1" => CatalogVersion::V1,
+        b"2" => CatalogVersion::V2,
+        _ => return Err(INVALID_TECHNOLOGY_CATALOG),
+    };
+    Ok((catalog, Some(catalog.number())))
+}
+
+const SERVICE_MAP_ERROR_HEADER: &str = "x-sniper-service-map-error";
+
+#[derive(Clone, Copy, Debug)]
+enum ServiceMapReadError {
+    Busy,
+    ScopeWorkLimit,
+    SessionChanged,
+    ScopeChanged,
+    HistoryChanged,
+    BuildFailed,
+}
+
+impl IntoResponse for ServiceMapReadError {
+    fn into_response(self) -> Response {
+        let (status, marker, message) = match self {
+            Self::Busy => (StatusCode::TOO_MANY_REQUESTS, "busy", "A Service Map read is already running; use Refresh to retry"),
+            Self::ScopeWorkLimit => (StatusCode::UNPROCESSABLE_ENTITY, "scope_work_limit", "The scope work limit was reached; narrow the scope rules or lower max_records, then retry"),
+            Self::SessionChanged => (StatusCode::CONFLICT, "session_changed", "The session source changed; refresh the Service Map"),
+            Self::ScopeChanged => (StatusCode::CONFLICT, "scope_changed", "The scope rules changed; refresh the Service Map"),
+            Self::HistoryChanged => (StatusCode::CONFLICT, "history_changed", "Retained history changed; refresh the Service Map"),
+            Self::BuildFailed => (StatusCode::INTERNAL_SERVER_ERROR, "build_failed", "The Service Map read could not complete; use Refresh to retry"),
+        };
+        (status, [(SERVICE_MAP_ERROR_HEADER, marker)], message).into_response()
+    }
+}
+
+async fn get_target_service_map(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceMapQuery>,
+) -> Response {
+    get_target_service_map_impl(
+        State(state),
+        headers,
+        Query(query),
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_impl(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceMapQuery>,
+    #[cfg(test)] worker_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> Response {
+    let (catalog, catalog_marker) = match service_map_catalog(&headers) {
+        Ok(selection) => selection,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    if let Err(message) = validate_advanced_regex(
+        query.advanced_search.as_deref(),
+        query.advanced_regex,
+        query.advanced_case_sensitive,
+    ) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let row_filters = service_map_row_filters(&query);
+    let (all_rows, fresh) = (query.all_rows, query.fresh);
+    let cache_query = ServiceMapQuery {
+        fresh: false,
+        session_id: None,
+        ..query.clone()
+    };
+    let max_records = query
+        .max_records
+        .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
+    if !(1..=crate::service_map::MAX_RECORDS).contains(&max_records) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "max_records must be between 1 and 50000",
+        )
+            .into_response();
+    }
+    let origin = match query.origin {
+        Some(origin) => match crate::service_map::canonical_origin(&origin) {
+            Some(canonical) if canonical == origin => Some(canonical),
+            _ => return (StatusCode::BAD_REQUEST, "origin must be a canonical HTTP(S) origin without credentials, path, query, or fragment").into_response(),
+        },
+        None => None,
+    };
+    // One map read at a time. The worker owns the permit through
+    // serialization, even when its HTTP awaiter is cancelled, so wait a
+    // bounded time for it instead of failing the read that replaced it.
+    let Some(permit) = state.service_map_read().await else {
+        return ServiceMapReadError::Busy.into_response();
+    };
+    let implicit_session = query.session_id.is_none();
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let (include, exclude) = session.runtime.scope_lists().await;
+    let cache_key =
+        format!("{catalog:?}|{catalog_marker:?}|{cache_query:?}|{include:?}|{exclude:?}");
+    let worker_include = include.clone();
+    let worker_exclude = exclude.clone();
+    let worker_session = session.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((paused, resume)) = worker_hook {
+            let _ = paused.send(());
+            resume
+                .recv_timeout(Duration::from_secs(10))
+                .expect("map worker test hook resumed");
+        }
+        if all_rows {
+            let store = &worker_session.store;
+            if let Some(bytes) = store.cached_service_map(&cache_key, fresh) {
+                return Ok((bytes, None, permit));
+            }
+            let started = std::time::Instant::now();
+            let token = store.service_map_history_token();
+            let (mut map, complete) = store
+                .service_map_all_rows_blocking(
+                    worker_session.id(),
+                    catalog,
+                    &row_filters,
+                    query.in_scope_only,
+                    origin,
+                    &worker_include,
+                    &worker_exclude,
+                )
+                .map_err(|error| match error {
+                    crate::store::ServiceMapStreamError::HistoryChanged => {
+                        ServiceMapReadError::HistoryChanged
+                    }
+                    crate::store::ServiceMapStreamError::ScopeWorkLimit => {
+                        ServiceMapReadError::ScopeWorkLimit
+                    }
+                })?;
+            map.technology_catalog_version = catalog_marker;
+            let bytes = bytes::Bytes::from(
+                serde_json::to_vec(&map).map_err(|_| ServiceMapReadError::BuildFailed)?,
+            );
+            store.store_service_map(cache_key, token, started.elapsed(), complete, bytes.clone());
+            return Ok((bytes, None, permit));
+        }
+        let (snapshot, epoch) = worker_session
+            .store
+            .service_map_snapshot_blocking_for_catalog(
+                worker_session.id(),
+                max_records,
+                catalog,
+                &row_filters,
+            );
+        let mut map = crate::service_map::build_bounded(
+            worker_session.id(),
+            snapshot,
+            max_records,
+            query.in_scope_only,
+            origin,
+            &worker_include,
+            &worker_exclude,
+        )
+        .map_err(|_| ServiceMapReadError::ScopeWorkLimit)?;
+        map.technology_catalog_version = catalog_marker;
+        let bytes = serde_json::to_vec(&map).map_err(|_| ServiceMapReadError::BuildFailed)?;
+        Ok::<_, ServiceMapReadError>((bytes::Bytes::from(bytes), Some(epoch), permit))
+    })
+    .await;
+    let (bytes, epoch, _permit) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return error.into_response(),
+        Err(_) => return ServiceMapReadError::BuildFailed.into_response(),
+    };
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    // These are post-work publication checkpoints, not an atomic transaction
+    // across runtime, session registry and history. Pure appends may coexist
+    // with the captured window; destructive/full-record changes invalidate it.
+    if !state.sessions.contains_session(session.id())
+        || !state.is_current_session_context(&session).await
+        || implicit_session && !Arc::ptr_eq(&state.active_session_for_read().await, &session)
+    {
+        return ServiceMapReadError::SessionChanged.into_response();
+    }
+    if session.runtime.scope_lists().await != (include, exclude) {
+        return ServiceMapReadError::ScopeChanged.into_response();
+    }
+    // A whole-history read has no window to invalidate: it already continued
+    // past removals, and shows the history as it read it until the next map.
+    if let Some(epoch) = epoch {
+        if !session
+            .store
+            .service_map_metadata_epoch_matches(epoch)
+            .await
+        {
+            return ServiceMapReadError::HistoryChanged.into_response();
+        }
+    }
+    ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+}
+
+async fn get_target_service_map_evidence(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceMapEvidenceQuery>,
+) -> Response {
+    let (catalog, catalog_marker) = match service_map_catalog(&headers) {
+        Ok(selection) => selection,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    let session = match resolve_read_session_for_optional_id(&state, Some(query.session_id)).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let mut evidence = session
+        .store
+        .service_map_evidence_for_catalog(
+            session.id(),
+            &query.evidence_id,
+            query.include_socket_peer,
+            catalog,
+        )
+        .await;
+    if !state.sessions.contains_session(session.id())
+        || !state.is_current_session_context(&session).await
+    {
+        evidence = crate::service_map::ServiceMapEvidence::missing(
+            query.session_id,
+            query.evidence_id,
+            "session_source_changed",
+        );
+    }
+    evidence.technology_catalog_version = catalog_marker;
+    Json(evidence).into_response()
+}
+
+async fn get_target_service_map_body_references(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+) -> Response {
+    use crate::service_map_body::ServiceMapBodyReferences;
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    // Unlike metadata reads, this opt-in operation never opens an inactive
+    // saved context: its legacy loader can hydrate unbounded retained bodies.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(ServiceMapBodyReferences::missing(
+            query.session_id,
+            query.evidence_id,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    let result = session
+        .store
+        .service_map_body_references(session.id(), &query.evidence_id)
+        .await;
+    // The reader fences its row and file generations. Recheck source identity
+    // across its asynchronous work as well, without starting a session worker.
+    if let Some(reason) =
+        service_map_body_source_changed(&state, &session, &query.evidence_id).await
+    {
+        return Json(ServiceMapBodyReferences::missing(
+            query.session_id,
+            query.evidence_id,
+            &reason,
+        ))
+        .into_response();
+    }
+    Json(result).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceMapParametersQuery {
+    session_id: Uuid,
+    origin: String,
+    method: String,
+    path: String,
+}
+
+// One endpoint's parameters, read on request. It reads retained request
+// bodies, so like a body inspection it serves the active session only.
+async fn get_target_service_map_parameters(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapParametersQuery>,
+) -> Response {
+    use crate::service_map_parameters::EndpointParameters;
+    if crate::service_map::canonical_origin(&query.origin).as_deref() != Some(query.origin.as_str())
+        || query.method.is_empty()
+        || query.method.len() > 64
+        || !query.path.starts_with('/')
+        || query.path.len() > 4096
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "origin, method and path must name one endpoint",
+        )
+            .into_response();
+    }
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(EndpointParameters::unavailable(
+            query.session_id,
+            query.origin,
+            query.method,
+            query.path,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    Json(
+        session
+            .store
+            .service_map_parameters(session.id(), &query.origin, &query.method, &query.path)
+            .await,
+    )
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceMapOpenApiQuery {
+    session_id: Uuid,
+    origin: String,
+}
+
+// One origin's API as an OpenAPI 3.1 document, built from its retained rows.
+// Its parameters come from retained request bodies, so like the parameters of
+// one endpoint it serves the active session only.
+async fn get_target_service_map_openapi(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapOpenApiQuery>,
+) -> Response {
+    if crate::service_map::canonical_origin(&query.origin).as_deref() != Some(query.origin.as_str())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "origin must be a canonical HTTP(S) origin without credentials, path, query, or fragment",
+        )
+            .into_response();
+    }
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return (
+            StatusCode::CONFLICT,
+            "Only the active session's rows can be read; open that session first",
+        )
+            .into_response();
+    }
+    match session
+        .store
+        .service_map_openapi(session.id(), &query.origin)
+        .await
+    {
+        Some(document) => Json(document).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The OpenAPI description could not be built",
+        )
+            .into_response(),
+    }
+}
+
+// An origin's icon from retained history, for its map card. It reads a
+// retained body, so like the other body reads it serves the active session
+// only. Only raster images whose own bytes say so are served, never SVG, and a
+// sandbox policy keeps a page opened at this address from running anything.
+async fn get_target_service_map_favicon(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+) -> Response {
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match session
+        .store
+        .service_map_favicon(session.id(), &query.evidence_id)
+        .await
+    {
+        Some((content_type, bytes)) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src 'none'; sandbox",
+                ),
+                // The evidence names one revision of one row, so its bytes
+                // never change.
+                (header::CACHE_CONTROL, "private, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn get_target_service_map_html_generators(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+) -> Response {
+    get_target_service_map_html_generators_impl(
+        State(state),
+        Query(query),
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_html_generators_impl(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> Response {
+    use crate::service_map_html::ServiceMapHtmlGenerators;
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    // Unlike metadata reads, this opt-in operation never opens an inactive
+    // saved context: its legacy loader can hydrate unbounded retained bodies.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(ServiceMapHtmlGenerators::missing(
+            query.session_id,
+            query.evidence_id,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    let result = session
+        .store
+        .service_map_html_generators(session.id(), &query.evidence_id)
+        .await;
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    // The reader fences its row and file generations. Recheck source identity
+    // across its asynchronous work as well, without starting a session worker.
+    if let Some(reason) =
+        service_map_body_source_changed(&state, &session, &query.evidence_id).await
+    {
+        return Json(ServiceMapHtmlGenerators::missing(
+            query.session_id,
+            query.evidence_id,
+            &reason,
+        ))
+        .into_response();
+    }
+    Json(result).into_response()
+}
+
+async fn get_target_service_map_link_declarations(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<ServiceMapBodyEvidenceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid link-declarations query").into_response()
+        }
+    };
+    get_target_service_map_link_declarations_impl(
+        State(state),
+        Query(query),
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_link_declarations_impl(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapBodyEvidenceQuery>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> Response {
+    use crate::service_map_links::ServiceMapLinkDeclarations;
+    if crate::service_map::EvidenceKey::parse(&query.evidence_id).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    // This supplementary read never activates or loads a saved session, creates
+    // a session worker, or persists anything, including for inactive requests.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return Json(ServiceMapLinkDeclarations::missing(
+            query.session_id,
+            query.evidence_id,
+            "inactive_session",
+        ))
+        .into_response();
+    }
+    let result = session
+        .store
+        .service_map_link_declarations(session.id(), &query.evidence_id)
+        .await;
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    let row_status = session
+        .store
+        .service_map_link_source_status(session.id(), &query.evidence_id)
+        .await;
+    let active = state.active_session_for_read().await;
+    let reason =
+        if !Arc::ptr_eq(&active, &session) || !state.sessions.contains_session(session.id()) {
+            Some("session_source_changed")
+        } else {
+            row_status.err()
+        };
+    if let Some(reason) = reason {
+        return Json(ServiceMapLinkDeclarations::missing(
+            query.session_id,
+            query.evidence_id,
+            reason,
+        ))
+        .into_response();
+    }
+    Json(result).into_response()
+}
+
+async fn get_target_service_map_socket_peer_matches(
+    State(state): State<Arc<AppState>>,
+    query: Result<
+        Query<ServiceMapSocketPeerMatchesQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid socket-peer-matches query").into_response()
+        }
+    };
+    get_target_service_map_socket_peer_matches_impl(
+        State(state),
+        Query(query),
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn get_target_service_map_socket_peer_matches_impl(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ServiceMapSocketPeerMatchesQuery>,
+    #[cfg(test)] publication_hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> Response {
+    use crate::service_map_peer_matches::ServiceMapSocketPeerMatches;
+    if !crate::service_map_peer_matches::is_canonical_evidence_id(&query.evidence_id) {
+        return (StatusCode::BAD_REQUEST, "invalid evidence_id").into_response();
+    }
+    let max_records = query
+        .max_records
+        .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
+    if !(1..=crate::service_map::MAX_RECORDS).contains(&max_records) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "max_records must be between 1 and 50000",
+        )
+            .into_response();
+    }
+    let missing = |reason| {
+        Json(ServiceMapSocketPeerMatches::missing(
+            query.session_id,
+            query.evidence_id.clone(),
+            query.in_scope_only,
+            max_records,
+            reason,
+        ))
+        .into_response()
+    };
+    // Active-only: no saved-context load, activation, worker, or persistence.
+    let session = state.active_session_for_read().await;
+    if session.id() != query.session_id {
+        return missing("inactive_session");
+    }
+    let (include, exclude) = session.runtime.scope_lists().await;
+    let result = session
+        .store
+        .service_map_socket_peer_matches(
+            session.id(),
+            &query.evidence_id,
+            query.in_scope_only,
+            max_records,
+            &include,
+            &exclude,
+        )
+        .await;
+    #[cfg(test)]
+    if let Some((paused, resume)) = publication_hook {
+        let _ = paused.send(());
+        let _ = resume.await;
+    }
+    // Same narrow revision check used by metadata-only Link inspection. Body
+    // storage availability must never invalidate already-retained peer evidence.
+    let row_status = session
+        .store
+        .service_map_link_source_status(session.id(), &query.evidence_id)
+        .await;
+    let active = state.active_session_for_read().await;
+    if !Arc::ptr_eq(&active, &session) || !state.sessions.contains_session(session.id()) {
+        return missing("session_source_changed");
+    }
+    if let Err(reason) = row_status {
+        return missing(reason);
+    }
+    Json(result).into_response()
+}
+
+async fn service_map_body_source_changed(
+    state: &AppState,
+    session: &Arc<crate::session::SessionContext>,
+    evidence_id: &str,
+) -> Option<String> {
+    let evidence = session
+        .store
+        .service_map_evidence(session.id(), evidence_id)
+        .await;
+    let active = state.active_session_for_read().await;
+    if !Arc::ptr_eq(&active, session) || !state.sessions.contains_session(session.id()) {
+        Some("session_source_changed".into())
+    } else if !evidence.available {
+        Some(evidence.reason.unwrap_or_else(|| "record_changed".into()))
+    } else {
+        None
+    }
 }
 
 async fn get_target_site_map(
@@ -5690,6 +7072,108 @@ async fn upsert_intercept_rule(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn update_intercept_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<SessionWriteQuery>,
+    Json(payload): Json<InterceptRuleUpdatePayload>,
+) -> Response {
+    if payload.is_empty() {
+        return (StatusCode::BAD_REQUEST, "provide at least one rule field").into_response();
+    }
+    // Keep persistence and rollback inside the owned transaction if the caller disconnects.
+    tokio::spawn(async move {
+        let (target_session_id, session_id_is_explicit) =
+            match reconcile_write_session_id(query.session_id, payload.session_id) {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+            };
+        if let Some(response) = expected_active_session_conflict_response(
+            &state,
+            query.expected_active_session_id,
+            target_session_id,
+        ) {
+            return response;
+        }
+        let session = match resolve_read_session_for_optional_id(&state, target_session_id).await {
+            Ok(session) => session,
+            Err(response) => return response,
+        };
+        let _operation_guard = match guard_session_write_operation(
+            &state,
+            &session,
+            !session_id_is_explicit || query.expected_active_session_id.is_some(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        if let Some(response) = expected_active_session_conflict_response(
+            &state,
+            query.expected_active_session_id,
+            Some(session.id()),
+        ) {
+            return response;
+        }
+        if !state.is_current_session_context(&session).await {
+            return (
+                StatusCode::CONFLICT,
+                "Intercept rule context changed; reload before saving.",
+            )
+                .into_response();
+        }
+        let read_guard = session.mutation_guard().await;
+        if !session
+            .intercept_rules
+            .snapshot()
+            .await
+            .iter()
+            .any(|rule| rule.id == id)
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        drop(read_guard);
+        // Do not repair inactive session files for a missing-ID request.
+        let session = if state.sessions.active_session_id() == session.id() {
+            session
+        } else {
+            match state
+                .session_context_for_id_operation_locked(session.id())
+                .await
+            {
+                Ok(session) => session,
+                Err(error) => return session_load_failure_response(session.id(), error),
+            }
+        };
+        let _mutation_guard = session.mutation_guard().await;
+        let previous = session.intercept_rules.snapshot().await;
+        let Some(mut rule) = previous.iter().find(|rule| rule.id == id).cloned() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        // Merge on the server under the mutation lock, never from a stale CLI snapshot.
+        payload.apply(&mut rule);
+        session.intercept_rules.upsert(rule.clone()).await;
+        if persist_session_mutation_locked_or_status(&state, &session)
+            .await
+            .is_err()
+        {
+            session.intercept_rules.replace_all(previous).await;
+            persist_rolled_back_session_snapshot(&state, &session, "intercept rule update").await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Json(rule).into_response()
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rule update outcome unavailable; inspect current state before retrying",
+        )
+            .into_response()
+    })
 }
 
 async fn delete_intercept_rule(
@@ -7047,6 +8531,7 @@ async fn events(
     let mut websocket_retention_receiver = session.websockets.subscribe_retention();
     let mut workspace_receiver = session.workspace.subscribe();
     let latest_sequence = session.store.latest_event_sequence();
+    let mut retention_event_boundary = 0;
     let event_stream_started_for_active_session = state.sessions.active_session_id() == session_id;
 
     let stream = stream! {
@@ -7077,6 +8562,7 @@ async fn events(
                 result = transaction_receiver.recv() => {
                     match result {
                         Ok(event) => {
+                            if event.event_sequence <= retention_event_boundary { continue; }
                             let summary = event.summary;
                             if let Ok(payload) = serde_json::to_string(&summary) {
                                 yield Ok(Event::default()
@@ -7096,10 +8582,16 @@ async fn events(
                 }
                 result = transaction_retention_receiver.recv() => {
                     match result {
-                        Ok(()) => {
-                            yield Ok(Event::default()
-                                .event("transactions_gap")
-                                .data("retention"));
+                        Ok(crate::store::TransactionRetentionEvent::Gap) => {
+                            yield Ok(Event::default().event("transactions_gap").data("retention"));
+                        }
+                        Ok(crate::store::TransactionRetentionEvent::Deleted { ids, generation, event_sequence }) => {
+                            retention_event_boundary = retention_event_boundary.max(event_sequence);
+                            let payload = serde_json::json!({ "session_id": session_id, "ids": ids, "generation": generation, "event_sequence": event_sequence });
+                            yield Ok(Event::default().event("retention_deleted").id(event_sequence.to_string()).data(payload.to_string()));
+                            // Queued pre-deletion summaries may be skipped above;
+                            // refetch fills in unrelated changes without reviving IDs.
+                            yield Ok(Event::default().event("transactions_gap").data("retention"));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             yield Ok(Event::default()
@@ -7273,6 +8765,27 @@ async fn app_js() -> Response {
     asset_response(
         "application/javascript; charset=utf-8",
         include_str!("../web/app.js"),
+    )
+}
+
+async fn recon_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/recon.js"),
+    )
+}
+
+async fn service_map_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/service-map.js"),
+    )
+}
+
+async fn product_icons_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/product-icons.js"),
     )
 }
 
@@ -7645,6 +9158,7 @@ mod tests {
     use axum::{
         extract::{Path, Query, State},
         http::{HeaderMap, HeaderValue, Request, StatusCode, Uri},
+        response::IntoResponse,
         Json,
     };
     use chrono::Utc;
@@ -7842,6 +9356,83 @@ mod tests {
             max_transaction_entries: 100,
             body_preview_bytes: 4096,
             data_dir: std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4())),
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_handlers_preserve_loaded_zero_revision_baselines() {
+        for explicit_zero in [false, true] {
+            let config = test_app_config("sniper-ui-settings-loaded-baseline");
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            let path = config.data_dir.join("ui-settings.json");
+            let mut legacy = serde_json::json!({
+                "display_settings": { "theme": "paper", "size_px": 16 },
+                "http_query": "saved query", "workbench_height": 777,
+                "http_filter_settings": { "only_notes": true },
+                "browser": { "preferred": "chrome" }
+            });
+            if explicit_zero {
+                legacy["server_revision"] = serde_json::json!(0);
+            }
+            let original = serde_json::to_vec_pretty(&legacy).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let state = Arc::new(AppState::new(config.clone()).unwrap());
+            let response = super::get_ui_settings(State(state.clone()))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let baseline: serde_json::Value = response_json(response).await;
+            assert_eq!(baseline["server_revision"], 1);
+            assert_eq!(baseline["display_settings"]["theme"], "paper");
+            assert_eq!(baseline["http_query"], "saved query");
+            assert_eq!(baseline["http_filter_settings"]["only_notes"], true);
+            assert_eq!(baseline["workbench_height"], 777);
+            assert_eq!(baseline["browser"]["preferred"], "chrome");
+            assert!(baseline.get("client_id").is_none());
+            assert!(baseline.get("client_version").is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            // Both an uninitialized current page and a revision-unaware anonymous
+            // client must receive the saved winner rather than overwrite it.
+            for client_id in ["fresh-page", ""] {
+                let incoming = super::AppUiSettingsSnapshot {
+                    client_id: client_id.to_string(),
+                    client_version: 1,
+                    ..Default::default()
+                };
+                let response =
+                    super::update_ui_settings(State(state.clone()), Json(incoming)).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let winner: serde_json::Value = response_json(response).await;
+                assert_eq!(winner, baseline);
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+
+            let mut edit = baseline.clone();
+            edit["client_id"] = serde_json::json!("loaded-page");
+            edit["client_version"] = serde_json::json!(1);
+            edit["display_settings"]["size_px"] = serde_json::json!(18);
+            let response = super::update_ui_settings(
+                State(state.clone()),
+                Json(serde_json::from_value(edit.clone()).unwrap()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let saved: serde_json::Value = response_json(response).await;
+            edit["server_revision"] = serde_json::json!(2);
+            assert_eq!(saved, edit);
+            drop(state);
+
+            let restarted = Arc::new(AppState::new(config.clone()).unwrap());
+            let restored: serde_json::Value = response_json(
+                super::get_ui_settings(State(restarted.clone()))
+                    .await
+                    .into_response(),
+            )
+            .await;
+            assert_eq!(restored, saved);
+            drop(restarted);
+            std::fs::remove_dir_all(config.data_dir).unwrap();
         }
     }
 
@@ -8838,6 +10429,34 @@ mod tests {
             );
         }
 
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    // A read costs work even when the page cannot see the answer: a whole map
+    // build, a history search. Another site's page gets neither.
+    #[tokio::test]
+    async fn another_sites_page_cannot_read_the_api() {
+        let (_state, data_dir, addr, server) = serve_for_test("sniper-api-cross-site-read").await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let read = |site: &'static str| {
+            client
+                .get(format!("http://{addr}/api/runtime"))
+                .header("sec-fetch-site", site)
+                .send()
+        };
+        assert_eq!(
+            read("cross-site").await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            read("same-origin").await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            read("none").await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
         server.abort();
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -9996,6 +11615,367 @@ mod tests {
             serde_json::to_value(saved).unwrap(),
             serde_json::to_value(reloaded.workspace.snapshot().await).unwrap()
         );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn saved_rule_patch_and_label_payloads_reject_null_and_unknown_fields() {
+        for value in [
+            serde_json::json!({"enabled":null}),
+            serde_json::json!({"enabled":"false"}),
+            serde_json::json!({"scope":"unknown"}),
+            serde_json::json!({"host_pattern":null}),
+            serde_json::json!({"path_pattern":false}),
+            serde_json::json!({"method_filter":null}),
+            serde_json::json!({"method_filter":[1]}),
+            serde_json::json!({"id":Uuid::new_v4(),"enabled":false}),
+            serde_json::json!({"unknown":true}),
+        ] {
+            assert!(serde_json::from_value::<super::InterceptRuleUpdatePayload>(value).is_err());
+        }
+        let payload: super::InterceptRuleUpdatePayload =
+            serde_json::from_value(serde_json::json!({
+                "enabled":false,"host_pattern":"","path_pattern":"","method_filter":[]
+            }))
+            .unwrap();
+        assert!(!payload.is_empty());
+        assert!(super::InterceptRuleUpdatePayload::default().is_empty());
+        let good = serde_json::json!({
+            "session_id":Uuid::new_v4(),"tab_id":"saved","expected_workspace_revision":0,"label":""
+        });
+        assert!(
+            serde_json::from_value::<super::SetSavedReplayTabLabelPayload>(good.clone()).is_ok()
+        );
+        for (field, value) in [
+            ("label", serde_json::Value::Null),
+            ("request_text", serde_json::json!("draft")),
+            ("ws_editor_text", serde_json::json!("draft")),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            assert!(serde_json::from_value::<super::SetSavedReplayTabLabelPayload>(bad).is_err());
+        }
+    }
+
+    async fn patch_saved_rule_fixture(
+        state: Arc<AppState>,
+        session_id: Uuid,
+        id: Uuid,
+        value: serde_json::Value,
+    ) -> axum::response::Response {
+        super::update_intercept_rule(
+            State(state),
+            Path(id),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session_id),
+                expected_active_session_id: None,
+            }),
+            Json(serde_json::from_value(value).unwrap()),
+        )
+        .await
+    }
+
+    fn saved_rule_fixture() -> InterceptRule {
+        InterceptRule {
+            id: Uuid::new_v4(),
+            enabled: true,
+            scope: InterceptScope::Both,
+            host_pattern: "example.com".into(),
+            path_pattern: "/saved".into(),
+            method_filter: vec!["GET".into(), "POST".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_merges_concurrent_fields_preserves_identity_and_reloads() {
+        let (state, path) = test_state("sniper-saved-rule-patch");
+        let session = state.session().await;
+        let original = saved_rule_fixture();
+        let untouched = saved_rule_fixture();
+        session
+            .intercept_rules
+            .replace_all(vec![original.clone(), untouched.clone()])
+            .await;
+        session.persist().await.unwrap();
+        let (host, disabled) = tokio::join!(
+            patch_saved_rule_fixture(
+                state.clone(),
+                session.id(),
+                original.id,
+                serde_json::json!({"host_pattern":""})
+            ),
+            patch_saved_rule_fixture(
+                state.clone(),
+                session.id(),
+                original.id,
+                serde_json::json!({"enabled":false})
+            ),
+        );
+        assert_eq!(host.status(), StatusCode::OK);
+        assert_eq!(disabled.status(), StatusCode::OK);
+        for _ in 0..2 {
+            assert_eq!(
+                patch_saved_rule_fixture(
+                    state.clone(),
+                    session.id(),
+                    original.id,
+                    serde_json::json!({"enabled":false})
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        let current = session.intercept_rules.list().await;
+        let mut expected = original.clone();
+        expected.enabled = false;
+        expected.host_pattern.clear();
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::to_value(vec![expected.clone(), untouched.clone()]).unwrap()
+        );
+        let (status, body) = api_route_response(
+            state.clone(),
+            reqwest::Method::PATCH,
+            &format!(
+                "/api/intercept-rules/{}?session_id={}",
+                original.id,
+                session.id()
+            ),
+            Some(serde_json::json!({"scope":"response","path_pattern":"","method_filter":[]})),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        expected.scope = InterceptScope::Response;
+        expected.path_pattern.clear();
+        expected.method_filter.clear();
+        let returned: InterceptRule = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![expected, untouched]).unwrap()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_rejects_empty_missing_and_stale_session_without_mutation() {
+        let (state, path) = test_state("sniper-saved-rule-rejection");
+        let session = state.session().await;
+        let rule = saved_rule_fixture();
+        session.intercept_rules.upsert(rule.clone()).await;
+        session.persist().await.unwrap();
+        for (id, patch, expected) in [
+            (rule.id, serde_json::json!({}), StatusCode::BAD_REQUEST),
+            (
+                Uuid::new_v4(),
+                serde_json::json!({"enabled":false}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            assert_eq!(
+                patch_saved_rule_fixture(state.clone(), session.id(), id, patch)
+                    .await
+                    .status(),
+                expected
+            );
+        }
+        let next = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let response = super::update_intercept_rule(
+            State(state.clone()),
+            Path(rule.id),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session.id()),
+                expected_active_session_id: Some(next.id),
+            }),
+            Json(serde_json::from_value(serde_json::json!({"enabled":false})).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::to_value(session.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![rule]).unwrap()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_missing_inactive_id_does_not_repair_storage() {
+        let (state, path) = test_state("sniper-saved-rule-inactive-missing");
+        let active_id = state.session().await.id();
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let storage = state.sessions.session_storage_path(inactive.id).unwrap();
+        std::fs::write(storage.join("snapshot.json"), b"{not-json").unwrap();
+        std::fs::write(storage.join("transactions.journal"), b"{not-json}\n").unwrap();
+        let files = || {
+            std::fs::read_dir(&storage)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (path.clone(), std::fs::read(path).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = files();
+        assert_eq!(
+            patch_saved_rule_fixture(
+                state.clone(),
+                inactive.id,
+                Uuid::new_v4(),
+                serde_json::json!({"enabled":false})
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(files(), before);
+        assert_eq!(state.sessions.active_session_id(), active_id);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_updates_inactive_session_without_switching_active() {
+        let (state, path) = test_state("sniper-saved-rule-inactive");
+        let active = state.session().await;
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let context = state.sessions.load_context(inactive.id).unwrap();
+        let mut rule = saved_rule_fixture();
+        context.intercept_rules.upsert(rule.clone()).await;
+        context.persist().await.unwrap();
+        drop(context);
+        let response = patch_saved_rule_fixture(
+            state.clone(),
+            inactive.id,
+            rule.id,
+            serde_json::json!({"enabled":false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        rule.enabled = false;
+        assert_eq!(state.sessions.active_session_id(), active.id());
+        assert!(active.intercept_rules.list().await.is_empty());
+        let reloaded = state.sessions.load_context_read_only(inactive.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![rule]).unwrap()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_rule_patch_rolls_back_when_persistence_fails() {
+        let (state, path) = test_state("sniper-saved-rule-rollback");
+        let session = state.session().await;
+        let rule = saved_rule_fixture();
+        session.intercept_rules.upsert(rule.clone()).await;
+        session.persist().await.unwrap();
+        let storage = session.storage_dir().to_path_buf();
+        std::fs::remove_dir_all(&storage).unwrap();
+        std::fs::write(&storage, b"not a directory").unwrap();
+        let response = patch_saved_rule_fixture(
+            state,
+            session.id(),
+            rule.id,
+            serde_json::json!({"enabled":false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            serde_json::to_value(session.intercept_rules.list().await).unwrap(),
+            serde_json::to_value(vec![rule]).unwrap()
+        );
+        std::fs::remove_file(storage).unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_replay_label_only_route_preserves_state_with_cas_and_restart() {
+        let (state, path) = test_state("sniper-saved-replay-label");
+        let session = state.session().await;
+        let ws_id = Uuid::new_v4();
+        let mut workspace: WorkspaceStateSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id":session.id(), "replay":{"active_tab_id":ws_id, "tab_sequence":8,
+                "tabs":[{"id":ws_id,"type":"websocket","sequence":8,"pinned":true,
+                    "custom_label":"old","ws_host":"example.com","ws_scheme":"wss","ws_port":"443","ws_path":"/saved",
+                    "ws_headers":[{"name":"X-Synthetic","value":"saved"}],"ws_handshake_text":"unfinished saved draft",
+                    "ws_handshake_edited":true,"ws_editor_text":"AAEC","ws_message_type":"binary","ws_editor_body_encoded":true,
+                    "ws_setup_notice":"saved notice","ws_setup_queue":[{"kind":"binary","body":"AAEC","body_encoded":true}],
+                    "ws_frames":[{"index":4,"captured_at":"2026-01-01T00:00:00Z","direction":"server_to_client","kind":"binary","body":"AAEC","body_encoding":"base64","body_size":99,"preview_truncated":true}],
+                    "ws_frames_truncated":true,"ws_selected_frame_index":4,"ws_frame_window_start":4},
+                    {"id":"http","type":"http","request_text":"unfinished http draft"}]},
+            "fuzzer":{"request_text":"other saved draft","payloads_text":"unchanged"}
+        })).unwrap();
+        super::validate_workspace_state(&workspace).unwrap();
+        workspace = state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        let payload = serde_json::json!({"session_id":session.id(),"tab_id":ws_id,"expected_workspace_revision":workspace.revision,"label":"  Saved\n conversation  "});
+        let (status, body) = api_route_response(
+            state.clone(),
+            reqwest::Method::POST,
+            "/api/replay/tabs/set-label",
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["tab"]["custom_label"], "Saved conversation");
+        let actual = session.workspace.snapshot().await;
+        let mut expected = workspace.clone();
+        expected.revision += 1;
+        expected.client_id = None;
+        expected.client_version = 0;
+        expected.expected_active_session_id = None;
+        expected.replay.tabs[0].custom_label = "Saved conversation".into();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            api_route_response(
+                state.clone(),
+                reqwest::Method::POST,
+                "/api/replay/tabs/set-label",
+                Some(payload)
+            )
+            .await
+            .0,
+            reqwest::StatusCode::CONFLICT
+        );
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.workspace.snapshot().await).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let clear = serde_json::json!({"session_id":session.id(),"tab_id":ws_id,"expected_workspace_revision":actual.revision,"label":""});
+        assert_eq!(
+            api_route_response(
+                state.clone(),
+                reqwest::Method::POST,
+                "/api/replay/tabs/set-label",
+                Some(clear)
+            )
+            .await
+            .0,
+            reqwest::StatusCode::OK
+        );
+        assert!(session.workspace.snapshot().await.replay.tabs[0]
+            .custom_label
+            .is_empty());
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -13537,6 +15517,1841 @@ mod tests {
         assert!(error.contains("replay tab tab-a sequence is too large"));
     }
 
+    #[test]
+    fn service_map_catalog_header_requires_one_exact_supported_value() {
+        use crate::service_map_technology::CatalogVersion;
+        assert_eq!(
+            super::service_map_catalog(&HeaderMap::new()),
+            Ok((CatalogVersion::V1, None))
+        );
+        for (value, catalog) in [("1", CatalogVersion::V1), ("2", CatalogVersion::V2)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                super::TECHNOLOGY_CATALOG_HEADER,
+                HeaderValue::from_static(value),
+            );
+            assert_eq!(
+                super::service_map_catalog(&headers),
+                Ok((catalog, Some(catalog.number())))
+            );
+        }
+        for value in [
+            b"".as_slice(),
+            b" ",
+            b" 2",
+            b"2 ",
+            b"01",
+            b"0",
+            b"3",
+            b"2,2",
+            b"1, 2",
+            b"SECRET_SENTINEL",
+            b"\xff",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                super::TECHNOLOGY_CATALOG_HEADER,
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+            assert_eq!(
+                super::service_map_catalog(&headers),
+                Err(super::INVALID_TECHNOLOGY_CATALOG)
+            );
+        }
+        for first in ["1", "2"] {
+            for second in ["1", "2"] {
+                let mut headers = HeaderMap::new();
+                headers.append(
+                    super::TECHNOLOGY_CATALOG_HEADER,
+                    HeaderValue::from_static(first),
+                );
+                headers.append(
+                    super::TECHNOLOGY_CATALOG_HEADER,
+                    HeaderValue::from_static(second),
+                );
+                assert_eq!(
+                    super::service_map_catalog(&headers),
+                    Err(super::INVALID_TECHNOLOGY_CATALOG)
+                );
+            }
+        }
+        assert!(serde_json::from_value::<super::ServiceMapQuery>(
+            serde_json::json!({"technology_catalog_version":2})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<super::ServiceMapEvidenceQuery>(serde_json::json!({"session_id":Uuid::new_v4(), "evidence_id":"test", "technology_catalog_version":2})).is_err());
+    }
+
+    fn bounded_map_query(session_id: Option<Uuid>) -> super::ServiceMapQuery {
+        super::ServiceMapQuery {
+            session_id,
+            in_scope_only: false,
+            max_records: Some(100),
+            origin: None,
+            ..Default::default()
+        }
+    }
+
+    async fn bounded_map_assert_error(
+        response: axum::response::Response,
+        status: StatusCode,
+        marker: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get(super::SERVICE_MAP_ERROR_HEADER)
+                .unwrap(),
+            marker
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(super::SERVICE_MAP_ERROR_HEADER)
+                .iter()
+                .count(),
+            1
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !text.contains("SECRET_SENTINEL")
+                && !text.contains("origins")
+                && !text.contains("snapshot")
+        );
+    }
+
+    // A read arriving while another runs waits for it, not fails: the read a
+    // filter change or Reload aborted still holds the slot until it finishes.
+    #[tokio::test]
+    async fn service_map_api_waits_for_the_running_read() {
+        let (state, dir) = test_state("sniper-map-wait");
+        let permit = state.try_service_map_read().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(permit);
+        });
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(None)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        release.await.unwrap();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_errors_are_fixed_and_admission_precedes_session_load() {
+        let (state, dir) = test_state("sniper-map-admission");
+        let permit = state.try_service_map_read().unwrap();
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(Some(Uuid::new_v4()))),
+        )
+        .await;
+        bounded_map_assert_error(response, StatusCode::TOO_MANY_REQUESTS, "busy").await;
+        // A normal API read remains available while the map-only slot is held.
+        let response = super::get_runtime_settings(
+            State(state.clone()),
+            Query(super::RuntimeQuery { session_id: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Cheap invalid queries remain 400 rather than consuming admission.
+        let mut invalid = bounded_map_query(None);
+        invalid.max_records = Some(0);
+        assert_eq!(
+            super::get_target_service_map(State(state.clone()), HeaderMap::new(), Query(invalid))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        drop(permit);
+        for (error, status, marker) in [
+            (
+                super::ServiceMapReadError::ScopeWorkLimit,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "scope_work_limit",
+            ),
+            (
+                super::ServiceMapReadError::SessionChanged,
+                StatusCode::CONFLICT,
+                "session_changed",
+            ),
+            (
+                super::ServiceMapReadError::ScopeChanged,
+                StatusCode::CONFLICT,
+                "scope_changed",
+            ),
+            (
+                super::ServiceMapReadError::HistoryChanged,
+                StatusCode::CONFLICT,
+                "history_changed",
+            ),
+            (
+                super::ServiceMapReadError::BuildFailed,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "build_failed",
+            ),
+        ] {
+            bounded_map_assert_error(error.into_response(), status, marker).await;
+        }
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_cancelled_worker_holds_slot_and_executor_stays_available() {
+        let (state, dir) = test_state("sniper-map-cancel-worker");
+        let (paused, ready) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let read_state = state.clone();
+        let reading = tokio::spawn(async move {
+            super::get_target_service_map_impl(
+                State(read_state),
+                HeaderMap::new(),
+                Query(bounded_map_query(None)),
+                Some((paused, resumed)),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        // This current-thread runtime can still execute unrelated work while
+        // the real blocking worker is deliberately occupied.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::get_runtime_settings(
+                State(state.clone()),
+                Query(super::RuntimeQuery { session_id: None }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        reading.abort();
+        assert!(reading.await.unwrap_err().is_cancelled());
+        bounded_map_assert_error(
+            super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(bounded_map_query(None)),
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy",
+        )
+        .await;
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(permit) = state.try_service_map_read() {
+                    drop(permit);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(bounded_map_query(None))
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn service_map_api_bounded_cancelled_queued_job_still_owns_admission() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, dir) = test_state("sniper-map-cancel-queued");
+            let (occupied, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                occupied.send(()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let read_state = state.clone();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map(
+                    State(read_state),
+                    HeaderMap::new(),
+                    Query(bounded_map_query(None)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match state.try_service_map_read() {
+                        Some(permit) => drop(permit),
+                        None => break,
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            reading.abort();
+            assert!(reading.await.unwrap_err().is_cancelled());
+            assert!(
+                state.try_service_map_read().is_none(),
+                "cancelled queued job retains its permit"
+            );
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(permit) = state.try_service_map_read() {
+                        drop(permit);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_worker_panic_is_fixed_and_releases_admission() {
+        let (state, dir) = test_state("sniper-map-worker-failure");
+        let (paused, _) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        drop(resume);
+        let response = super::get_target_service_map_impl(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(None)),
+            Some((paused, resumed)),
+            None,
+        )
+        .await;
+        bounded_map_assert_error(response, StatusCode::INTERNAL_SERVER_ERROR, "build_failed").await;
+        assert!(state.try_service_map_read().is_some());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "local synthetic measurement; explicitly select this test"]
+    async fn service_map_api_bounded_executor_measurement() {
+        let mut config = test_app_config("sniper-map-executor-measurement");
+        config.max_transaction_entries = crate::service_map::MAX_RECORDS;
+        let dir = config.data_dir.clone();
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.active_session_for_read().await;
+        let mut template = test_replay_response_record("/items/1", 200);
+        template.host = "api.example.com".into();
+        template.started_at = chrono::DateTime::from_timestamp(1_760_000_000, 0).unwrap();
+        template.response = Some(MessageRecord::from_headers_and_body(
+            &HeaderMap::new(),
+            &[],
+            0,
+        ));
+        session
+            .store
+            .replace_all(
+                (1..=crate::service_map::MAX_RECORDS as u64)
+                    .rev()
+                    .map(|sequence| {
+                        let mut row = template.clone();
+                        row.id = Uuid::from_u128(sequence as u128 + 1);
+                        row.sequence = sequence;
+                        row
+                    })
+                    .collect(),
+            )
+            .await;
+        for scoped in [false, true] {
+            session
+                .runtime
+                .update(crate::runtime::RuntimeSettingsUpdate {
+                    scope_patterns: Some(if scoped {
+                        vec!["*.example.com".into()]
+                    } else {
+                        vec![]
+                    }),
+                    excluded_scope_patterns: Some(if scoped {
+                        vec!["*.blocked.example.com".into()]
+                    } else {
+                        vec![]
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            for max_records in [
+                crate::service_map::DEFAULT_MAX_RECORDS,
+                crate::service_map::MAX_RECORDS,
+            ] {
+                for repetition in 1..=2 {
+                    let mut query = bounded_map_query(Some(session.id()));
+                    query.max_records = Some(max_records);
+                    let read = super::get_target_service_map(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Query(query),
+                    );
+                    tokio::pin!(read);
+                    let mut timer = tokio::time::interval(std::time::Duration::from_millis(1));
+                    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let start = std::time::Instant::now();
+                    let mut ticks = 0usize;
+                    let mut max_lateness = std::time::Duration::ZERO;
+                    let response = loop {
+                        tokio::select! {
+                            result = &mut read => break result,
+                            scheduled = timer.tick() => { ticks += 1; max_lateness = max_lateness.max(tokio::time::Instant::now().saturating_duration_since(scheduled)); }
+                        }
+                    };
+                    let elapsed = start.elapsed();
+                    assert_eq!(
+                        response.headers().get(super::header::CONTENT_TYPE).unwrap(),
+                        "application/json"
+                    );
+                    let map: crate::service_map::ServiceMap = response_json(response).await;
+                    println!(
+                        "MAP_EXECUTOR_MEASUREMENT {}",
+                        serde_json::json!({
+                            "scope": if scoped { "common" } else { "empty" }, "requested_rows": max_records,
+                            "projected_rows": map.snapshot.projected_rows, "repetition": repetition,
+                            "handler_seconds": elapsed.as_secs_f64(), "timer_ticks": ticks,
+                            "max_one_ms_timer_lateness_seconds": max_lateness.as_secs_f64(),
+                            "claim": "local synthetic current-thread runtime observation; no latency threshold or native guarantee"
+                        })
+                    );
+                }
+            }
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_pinned_session_deletion_and_context_replacement() {
+        for activate in [false, true] {
+            let (state, dir) = test_state("sniper-map-pinned-publication");
+            let inactive = state
+                .sessions
+                .create_session(Some("Read-only map fixture".into()))
+                .unwrap();
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let id = inactive.id;
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_impl(
+                    State(read_state),
+                    HeaderMap::new(),
+                    Query(bounded_map_query(Some(id))),
+                    None,
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            if activate {
+                state.activate_session(id).await.unwrap();
+            } else {
+                state.delete_session(id).await.unwrap();
+            }
+            resume.send(()).unwrap();
+            bounded_map_assert_error(
+                reading.await.unwrap(),
+                StatusCode::CONFLICT,
+                "session_changed",
+            )
+            .await;
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_work_exhaustion_returns_no_partial_map() {
+        let (state, dir) = test_state("sniper-map-scope-budget");
+        let session = state.active_session_for_read().await;
+        let patterns = (0..500)
+            .map(|i| format!("{}z{i:03}*", "*a".repeat(230)))
+            .collect();
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                excluded_scope_patterns: Some(patterns),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for index in 0..30 {
+            let mut record = test_replay_response_record("/retained?token=SECRET_SENTINEL", 200);
+            record.host = format!(
+                "{}.{}.{}.{}.{index:02}.example.com",
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(40)
+            );
+            session.store.insert(record).await;
+        }
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(bounded_map_query(Some(session.id()))),
+        )
+        .await;
+        bounded_map_assert_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "scope_work_limit",
+        )
+        .await;
+        // Failure releases only this map slot, without changing configured scope.
+        assert!(state.try_service_map_read().is_some());
+        assert_eq!(session.runtime.scope_lists().await.1.len(), 500);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_bounded_publication_checks_changes_and_allows_append_annotations() {
+        for change in [
+            "scope_include",
+            "scope_exclude",
+            "scope_aba",
+            "update",
+            "delete",
+            "duplicate",
+            "replace",
+            "append",
+            "annotation",
+            "implicit_session",
+        ] {
+            let (state, dir) = test_state("sniper-map-publication");
+            let session = state.active_session_for_read().await;
+            let mut record = test_replay_response_record("/retained?token=SECRET_SENTINEL", 200);
+            record.host = "example.com".into();
+            let id = record.id;
+            session.store.insert(record.clone()).await;
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = session.id();
+            let query_id = if change == "implicit_session" {
+                None
+            } else {
+                Some(session_id)
+            };
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_impl(
+                    State(read_state),
+                    HeaderMap::new(),
+                    Query(bounded_map_query(query_id)),
+                    None,
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                state.try_service_map_read().is_none(),
+                "permit survives serialization and publication checks"
+            );
+            let marker = match change {
+                "scope_include" | "scope_exclude" | "scope_aba" => {
+                    let mut update = crate::runtime::RuntimeSettingsUpdate::default();
+                    if change == "scope_exclude" {
+                        update.excluded_scope_patterns = Some(vec!["example.com".into()]);
+                    } else {
+                        update.scope_patterns = Some(vec!["other.example.com".into()]);
+                    }
+                    session.runtime.update(update).await.unwrap();
+                    if change == "scope_aba" {
+                        session
+                            .runtime
+                            .update(crate::runtime::RuntimeSettingsUpdate {
+                                scope_patterns: Some(vec![]),
+                                ..Default::default()
+                            })
+                            .await
+                            .unwrap();
+                        None
+                    } else {
+                        Some("scope_changed")
+                    }
+                }
+                "update" => {
+                    session
+                        .store
+                        .update_record(id, |r| r.path = "/changed".into())
+                        .await
+                        .unwrap();
+                    Some("history_changed")
+                }
+                "delete" => {
+                    session.store.delete_ids(&[id]).await.unwrap();
+                    Some("history_changed")
+                }
+                "duplicate" => {
+                    session.store.insert(record.clone()).await;
+                    Some("history_changed")
+                }
+                "replace" => {
+                    session.store.replace_all(vec![record.clone()]).await;
+                    Some("history_changed")
+                }
+                "append" => {
+                    record.id = Uuid::new_v4();
+                    record.path = "/appended".into();
+                    session.store.insert(record).await;
+                    None
+                }
+                "annotation" => {
+                    session
+                        .store
+                        .update_annotations(id, None, Some(Some("synthetic note".into())))
+                        .await
+                        .unwrap();
+                    None
+                }
+                "implicit_session" => {
+                    state
+                        .create_session(Some("Map replacement fixture".into()))
+                        .await
+                        .unwrap();
+                    Some("session_changed")
+                }
+                _ => unreachable!(),
+            };
+            resume.send(()).unwrap();
+            let response = reading.await.unwrap();
+            if let Some(marker) = marker {
+                bounded_map_assert_error(response, StatusCode::CONFLICT, marker).await;
+            } else {
+                let map: crate::service_map::ServiceMap = response_json(response).await;
+                assert_eq!(
+                    map.snapshot.retained_rows, 1,
+                    "snapshot window stays coherent for {change}"
+                );
+                assert_eq!(map.origins[0].endpoints[0].path, "/retained");
+            }
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_api_reads_pinned_inactive_without_writes_or_workers() {
+        let (state, data_dir) = test_state("sniper-service-map-inactive");
+        let active_id = state.session().await.id();
+        let metadata = state
+            .sessions
+            .create_session(Some("Map fixture".into()))
+            .unwrap();
+        let inactive = state.sessions.load_context(metadata.id).unwrap();
+        let mut record = test_replay_response_record("/retained?token=SECRET_SENTINEL", 200);
+        record.host = "example.com".into();
+        inactive.store.insert(record).await;
+        inactive.persist().await.unwrap();
+        let dir = inactive.storage_dir().to_path_buf();
+        drop(inactive);
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let map: crate::service_map::ServiceMap = response_json(
+            super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(super::ServiceMapQuery {
+                    session_id: Some(metadata.id),
+                    in_scope_only: false,
+                    max_records: None,
+                    origin: None,
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(map.session_id, metadata.id);
+        assert_eq!(map.snapshot.retained_rows, 1);
+        assert_eq!(map.origins[0].endpoints[0].path, "/retained");
+        let token = map.origins[0].endpoints[0].evidence[0].clone();
+        let evidence: crate::service_map::ServiceMapEvidence = response_json(
+            super::get_target_service_map_evidence(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(super::ServiceMapEvidenceQuery {
+                    session_id: metadata.id,
+                    evidence_id: token,
+                    include_socket_peer: false,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(evidence.available);
+        let readonly = state
+            .read_session_context_for_id(metadata.id)
+            .await
+            .unwrap();
+        assert!(!readonly.retention_writable());
+        assert_eq!(state.session().await.id(), active_id);
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "read-only service map changed saved files");
+        drop(readonly);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_api_rejects_unsafe_filters_and_stale_evidence_is_explicit() {
+        let (state, data_dir) = test_state("sniper-service-map-api-validation");
+        for origin in [
+            "https://example.com/path",
+            "https://example.com?token=SECRET_SENTINEL",
+            "https://user:password@example.com",
+            "ftp://example.com",
+        ] {
+            let response = super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(super::ServiceMapQuery {
+                    session_id: None,
+                    in_scope_only: false,
+                    max_records: None,
+                    origin: Some(origin.into()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        for limit in [0, crate::service_map::MAX_RECORDS + 1] {
+            let response = super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(super::ServiceMapQuery {
+                    session_id: None,
+                    in_scope_only: false,
+                    max_records: Some(limit),
+                    origin: None,
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let session = state.session().await;
+        let mut record = test_replay_response_record("/old", 200);
+        record.host = "example.com".into();
+        let id = record.id;
+        session.store.insert(record).await;
+        let map: crate::service_map::ServiceMap = response_json(
+            super::get_target_service_map(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(super::ServiceMapQuery {
+                    session_id: Some(session.id()),
+                    in_scope_only: false,
+                    max_records: None,
+                    origin: None,
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        let token = map.origins[0].endpoints[0].evidence[0].clone();
+        session
+            .store
+            .update_record(id, |record| record.path = "/new".into())
+            .await;
+        let evidence: crate::service_map::ServiceMapEvidence = response_json(
+            super::get_target_service_map_evidence(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(super::ServiceMapEvidenceQuery {
+                    session_id: session.id(),
+                    evidence_id: token,
+                    include_socket_peer: false,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(!evidence.available);
+        assert!(evidence.row.is_none());
+        assert_eq!(evidence.reason.as_deref(), Some("record_changed"));
+        let response = super::get_target_service_map_evidence(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(super::ServiceMapEvidenceQuery {
+                session_id: session.id(),
+                evidence_id: "bad".into(),
+                include_socket_peer: false,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_body_api_rejects_inactive_without_loading_saved_data() {
+        let (state, data_dir) = test_state("sniper-service-map-body-inactive");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive body fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        // If this endpoint accidentally starts resolving saved contexts, the
+        // intentionally invalid saved snapshot cannot be loaded successfully.
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let response: serde_json::Value = response_json(
+            super::get_target_service_map_body_references(
+                State(state.clone()),
+                Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["available"], false);
+        assert_eq!(response["reasons"], serde_json::json!(["inactive_session"]));
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "inactive body read changed saved files");
+        let invalid = super::get_target_service_map_body_references(
+            State(state.clone()),
+            Query(super::ServiceMapBodyEvidenceQuery {
+                session_id: active.id(),
+                evidence_id: "invalid".into(),
+            }),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    // A card's icon: raster bytes only, with headers that keep a browser from
+    // sniffing or running them, and nothing for a session that is not active.
+    #[tokio::test]
+    async fn service_map_favicon_serves_raster_icons_of_the_active_session_only() {
+        let (state, data_dir) = test_state("sniper-service-map-favicon");
+        let active = state.active_session_for_read().await;
+        use axum::http::header;
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nIHDR";
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+        let mut record = test_replay_response_record("/favicon.ico", 200);
+        record.host = "example.com".into();
+        record.response = Some(MessageRecord::from_headers_and_body(&headers, png, 1024));
+        active.store.insert(record).await;
+        let token = active
+            .store
+            .service_map_snapshot(active.id(), 1)
+            .await
+            .favicons
+            .remove("https://example.com")
+            .unwrap();
+        let read = |session_id, evidence_id| {
+            super::get_target_service_map_favicon(
+                State(state.clone()),
+                Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id,
+                    evidence_id,
+                }),
+            )
+        };
+        let response = read(active.id(), token.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; sandbox"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], png);
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive favicon fixture".into()))
+            .unwrap();
+        assert_eq!(
+            read(inactive.id, token).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            read(active.id(), "invalid".into()).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_rejects_inactive_without_loading_saved_data() {
+        let (state, data_dir) = test_state("sniper-service-map-html-inactive");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive body fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        // If this endpoint accidentally starts resolving saved contexts, the
+        // intentionally invalid saved snapshot cannot be loaded successfully.
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let response: serde_json::Value = response_json(
+            super::get_target_service_map_html_generators(
+                State(state.clone()),
+                Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["available"], false);
+        assert_eq!(response["reasons"], serde_json::json!(["inactive_session"]));
+        assert!(response["observations"].as_array().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "inactive body read changed saved files");
+        let invalid = super::get_target_service_map_html_generators(
+            State(state.clone()),
+            Query(super::ServiceMapBodyEvidenceQuery {
+                session_id: active.id(),
+                evidence_id: "invalid".into(),
+            }),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_requires_both_exact_selection_fields() {
+        let (state, data_dir) = test_state("sniper-service-map-html-query");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        let body = "<html><head><meta name='generator' content='WordPress 6.8.1'></head>";
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            body.as_bytes(),
+            body.len(),
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        for query in [
+            String::new(),
+            format!("?session_id={}", active.id()),
+            format!("?evidence_id={token}"),
+            format!("?session_id={}&evidence_id=invalid", active.id()),
+            format!(
+                "?session_id={}&evidence_id={token}&url=https://example.com",
+                active.id()
+            ),
+        ] {
+            let (status, _) = api_route_response(
+                state.clone(),
+                reqwest::Method::GET,
+                &format!("/api/target/service-map/html-generators{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{query}");
+        }
+        let (status, text) = api_route_response(
+            state.clone(),
+            reqwest::Method::GET,
+            &format!(
+                "/api/target/service-map/html-generators?session_id={}&evidence_id={token}",
+                active.id()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let result: crate::service_map_html::ServiceMapHtmlGenerators =
+            serde_json::from_str(&text).unwrap();
+        assert!(result.available && result.complete && result.head_closed);
+        assert_eq!(result.evidence_id, token);
+        assert_eq!(result.session_id, active.id());
+        assert_eq!(result.observations[0].product_id, "wordpress");
+        assert_eq!(
+            result.observations[0].reported_version.as_deref(),
+            Some("6.8.1")
+        );
+        assert!(!text.contains("<meta"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_reports_unsupported_without_a_body_read() {
+        let (state, data_dir) = test_state("sniper-service-map-html-unsupported");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/xhtml+xml".parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            b"SYNTHETIC_PRIVATE_BODY",
+            100,
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let result: serde_json::Value = response_json(
+            super::get_target_service_map_html_generators(
+                State(state.clone()),
+                Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: active.id(),
+                    evidence_id: token,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result["status"], "unsupported");
+        assert_eq!(result["available"], false);
+        assert_eq!(
+            result["reasons"],
+            serde_json::json!(["unsupported_content_type"])
+        );
+        assert_eq!(result["retained_preview_bytes"], serde_json::Value::Null);
+        assert_eq!(result["source_origin"], serde_json::Value::Null);
+        assert_eq!(result["scan_prefix_bytes"], 0);
+        assert_eq!(result["observations"], serde_json::json!([]));
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_BODY"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_html_api_discards_scanned_result_after_session_or_source_change() {
+        for change in ["session", "mutation", "deletion"] {
+            let (state, data_dir) = test_state("sniper-service-map-html-publication");
+            let active = state.active_session_for_read().await;
+            let mut record = test_replay_response_record("/html", 200);
+            record.host = "example.com".into();
+            let body = "<html><head><meta name='generator' content='Drupal 11'></head>";
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "text/html".parse().unwrap());
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                body.as_bytes(),
+                body.len(),
+            ));
+            let id = record.id;
+            active.store.insert(record).await;
+            let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+                .evidence_id
+                .clone();
+            // Establish that the exact input is a successful nonempty scan.
+            let before = active
+                .store
+                .service_map_html_generators(active.id(), &token)
+                .await;
+            assert!(before.complete);
+            assert_eq!(before.observations.len(), 1);
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = active.id();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_html_generators_impl(
+                    State(read_state),
+                    Query(super::ServiceMapBodyEvidenceQuery {
+                        session_id,
+                        evidence_id: token,
+                    }),
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match change {
+                "session" => {
+                    state
+                        .create_session(Some("New HTML fixture".into()))
+                        .await
+                        .unwrap();
+                    "session_source_changed"
+                }
+                "mutation" => {
+                    active
+                        .store
+                        .update_record(id, |row| row.path = "/changed".into())
+                        .await
+                        .unwrap();
+                    "record_changed"
+                }
+                _ => {
+                    assert_eq!(active.store.delete_ids(&[id]).await.unwrap(), 1);
+                    "record_missing"
+                }
+            };
+            resume.send(()).unwrap();
+            let result: crate::service_map_html::ServiceMapHtmlGenerators =
+                response_json(reading.await.unwrap()).await;
+            assert!(
+                !result.available && !result.complete && !result.head_closed,
+                "{change}"
+            );
+            assert_eq!(result.reasons, [expected], "{change}");
+            assert!(result.observations.is_empty());
+            assert!(result.source_origin.is_none());
+            assert!(result.source_sequence.is_none());
+            assert!(result.source_started_at.is_none());
+            assert!(result.retained_preview_bytes.is_none());
+            assert!(result.parser_stop.is_none());
+            assert_eq!(result.scan_prefix_bytes, 0);
+            assert_eq!(result.tag_candidates_inspected, 0);
+            drop(active);
+            drop(state);
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_rejects_inactive_without_loading_saved_data() {
+        let (state, data_dir) = test_state("sniper-service-map-link-inactive");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive body fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        // If this endpoint accidentally starts resolving saved contexts, the
+        // intentionally invalid saved snapshot cannot be loaded successfully.
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let response: serde_json::Value = response_json(
+            super::get_target_service_map_link_declarations(
+                State(state.clone()),
+                Ok(Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["available"], false);
+        assert_eq!(response["reasons"], serde_json::json!(["inactive_session"]));
+        assert!(response["observations"].as_array().unwrap().is_empty());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "inactive body read changed saved files");
+        let invalid = super::get_target_service_map_link_declarations(
+            State(state.clone()),
+            Ok(Query(super::ServiceMapBodyEvidenceQuery {
+                session_id: active.id(),
+                evidence_id: "invalid".into(),
+            })),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_requires_both_exact_selection_fields() {
+        let (state, data_dir) = test_state("sniper-service-map-link-query");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        let body = "<html><head><meta name='generator' content='WordPress 6.8.1'></head>";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "link",
+            "<https://docs.example.com/private?token=HIDDEN>; rel=service-doc"
+                .parse()
+                .unwrap(),
+        );
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            body.as_bytes(),
+            body.len(),
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        for query in [
+            String::new(),
+            format!("?session_id={}", active.id()),
+            format!("?evidence_id={token}"),
+            format!("?session_id=SYNTHETIC_PRIVATE_QUERY&evidence_id={token}"),
+            format!(
+                "?session_id={}&evidence_id={token}&SYNTHETIC_PRIVATE_QUERY=1",
+                active.id()
+            ),
+            format!("?session_id={}&evidence_id=invalid", active.id()),
+            format!(
+                "?session_id={}&evidence_id={token}&url=https://example.com",
+                active.id()
+            ),
+        ] {
+            let (status, response_text) = api_route_response(
+                state.clone(),
+                reqwest::Method::GET,
+                &format!("/api/target/service-map/link-declarations{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{query}");
+            assert!(!response_text.contains("SYNTHETIC_PRIVATE_QUERY"));
+        }
+        let (status, text) = api_route_response(
+            state.clone(),
+            reqwest::Method::GET,
+            &format!(
+                "/api/target/service-map/link-declarations?session_id={}&evidence_id={token}",
+                active.id()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let result: crate::service_map_links::ServiceMapLinkDeclarations =
+            serde_json::from_str(&text).unwrap();
+        assert!(result.available && result.complete);
+        assert_eq!(result.evidence_id, token);
+        assert_eq!(result.session_id, active.id());
+        assert_eq!(result.observations[0].relation, "service-doc");
+        assert_eq!(
+            result.observations[0].target_origin,
+            "https://docs.example.com"
+        );
+        assert_eq!(result.source_status, Some(200));
+        assert!(!text.contains("HIDDEN"));
+        assert!(!text.contains("<meta"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_reports_unsupported_without_a_body_read() {
+        let (state, data_dir) = test_state("sniper-service-map-link-unsupported");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/html", 200);
+        record.host = "example.com".into();
+        record.method = "POST".into();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/xhtml+xml".parse().unwrap());
+        record.response = Some(MessageRecord::from_headers_and_body(
+            &headers,
+            b"SYNTHETIC_PRIVATE_BODY",
+            100,
+        ));
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let result: serde_json::Value = response_json(
+            super::get_target_service_map_link_declarations(
+                State(state.clone()),
+                Ok(Query(super::ServiceMapBodyEvidenceQuery {
+                    session_id: active.id(),
+                    evidence_id: token,
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result["status"], "unsupported");
+        assert_eq!(result["available"], false);
+        assert_eq!(
+            result["reasons"],
+            serde_json::json!(["unsupported_source_context"])
+        );
+        assert_eq!(result["retained_header_count"], serde_json::Value::Null);
+        assert_eq!(result["source_origin"], serde_json::Value::Null);
+        assert_eq!(
+            result["counts"],
+            serde_json::to_value(crate::service_map_links::ServiceMapLinkCounts::default())
+                .unwrap()
+        );
+        assert_eq!(result["observations"], serde_json::json!([]));
+        assert!(!result.to_string().contains("SYNTHETIC_PRIVATE_BODY"));
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn service_map_link_api_discards_scanned_result_after_session_or_source_change() {
+        for change in ["session", "mutation", "deletion"] {
+            let (state, data_dir) = test_state("sniper-service-map-link-publication");
+            let active = state.active_session_for_read().await;
+            let mut record = test_replay_response_record("/html", 200);
+            record.host = "example.com".into();
+            let body = "<html><head><meta name='generator' content='Drupal 11'></head>";
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "link",
+                "<https://docs.example.com/private?token=HIDDEN>; rel=service-doc"
+                    .parse()
+                    .unwrap(),
+            );
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                body.as_bytes(),
+                body.len(),
+            ));
+            let id = record.id;
+            active.store.insert(record).await;
+            let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+                .evidence_id
+                .clone();
+            // Establish that the exact input is a successful nonempty scan.
+            let before = active
+                .store
+                .service_map_link_declarations(active.id(), &token)
+                .await;
+            assert!(before.complete);
+            assert_eq!(before.observations.len(), 1);
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = active.id();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_link_declarations_impl(
+                    State(read_state),
+                    Query(super::ServiceMapBodyEvidenceQuery {
+                        session_id,
+                        evidence_id: token,
+                    }),
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match change {
+                "session" => {
+                    state
+                        .create_session(Some("New HTML fixture".into()))
+                        .await
+                        .unwrap();
+                    "session_source_changed"
+                }
+                "mutation" => {
+                    active
+                        .store
+                        .update_record(id, |row| row.path = "/changed".into())
+                        .await
+                        .unwrap();
+                    "record_changed"
+                }
+                _ => {
+                    assert_eq!(active.store.delete_ids(&[id]).await.unwrap(), 1);
+                    "record_missing"
+                }
+            };
+            resume.send(()).unwrap();
+            let result: crate::service_map_links::ServiceMapLinkDeclarations =
+                response_json(reading.await.unwrap()).await;
+            assert!(!result.available && !result.complete, "{change}");
+            assert_eq!(result.reasons, [expected], "{change}");
+            assert!(result.observations.is_empty());
+            assert!(result.source_origin.is_none());
+            assert!(result.source_sequence.is_none());
+            assert!(result.source_started_at.is_none());
+            assert!(result.retained_header_count.is_none());
+            assert!(result.source_method.is_none() && result.source_status.is_none());
+            assert_eq!(
+                result.counts,
+                crate::service_map_links::ServiceMapLinkCounts::default()
+            );
+            drop(active);
+            drop(state);
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_body_publication_revalidates_row_and_active_context() {
+        let (state, data_dir) = test_state("sniper-service-map-body-publication");
+        let active = state.active_session_for_read().await;
+        let mut record = test_replay_response_record("/body", 200);
+        record.host = "example.com".into();
+        let id = record.id;
+        active.store.insert(record).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        assert_eq!(
+            super::service_map_body_source_changed(&state, &active, &token).await,
+            None
+        );
+        active
+            .store
+            .update_record(id, |record| record.path = "/changed".into())
+            .await;
+        assert_eq!(
+            super::service_map_body_source_changed(&state, &active, &token)
+                .await
+                .as_deref(),
+            Some("record_changed")
+        );
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        state
+            .create_session(Some("New active fixture".into()))
+            .await
+            .unwrap();
+        // This is the exact final guard used after asynchronous body work. A
+        // formerly active context can still exist in cache, but cannot publish.
+        assert_eq!(
+            super::service_map_body_source_changed(&state, &active, &token)
+                .await
+                .as_deref(),
+            Some("session_source_changed")
+        );
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    fn test_socket_peer_record() -> TransactionRecord {
+        let mut record = test_replay_response_record("/PRIVATE_PATH?token=PRIVATE_QUERY", 200);
+        record.host = "example.com".into();
+        record.observed_socket_peer = Some(crate::model::ObservedSocketPeer::from_remote_addr(
+            record.started_at,
+            crate::model::ObservedSocketPeerRoute::Direct,
+            Some("198.51.100.7:443".parse().unwrap()),
+        ));
+        record
+    }
+
+    #[tokio::test]
+    async fn peer_matches_api_strict_query_and_default_peer_privacy() {
+        let (state, data_dir) = test_state("sniper-peer-matches-query");
+        let active = state.active_session_for_read().await;
+        active.store.insert(test_socket_peer_record()).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let base = format!("?session_id={}&evidence_id={token}", active.id());
+        for query in [
+            String::new(),
+            format!("?session_id={}", active.id()),
+            format!("?evidence_id={token}"),
+            format!("{base}&max_records=0"),
+            format!("{base}&max_records=50001"),
+            format!("{base}&max_records=null"),
+            format!("{base}&in_scope_only=null"),
+            format!("{base}&in_scope_only=1"),
+            format!("{base}&address=PRIVATE_QUERY"),
+            format!("{base}&session_id={}", active.id()),
+            format!("?session_id={}&evidence_id=PRIVATE_QUERY", active.id()),
+            format!(
+                "?session_id={}&evidence_id={}",
+                active.id(),
+                token.replace('-', "")
+            ),
+        ] {
+            let (status, text) = api_route_response(
+                state.clone(),
+                reqwest::Method::GET,
+                &format!("/api/target/service-map/socket-peer-matches{query}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            assert!(!text.contains("PRIVATE_QUERY"));
+        }
+        let (status, text) = api_route_response(
+            state.clone(),
+            reqwest::Method::GET,
+            &format!("/api/target/service-map/socket-peer-matches{base}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let result: crate::service_map_peer_matches::ServiceMapSocketPeerMatches =
+            serde_json::from_str(&text).unwrap();
+        assert!(result.available && result.complete);
+        assert_eq!(result.status, "no_matches");
+        assert!(result.validate_response(active.id(), &token, false, 10_000));
+        assert!(!text.contains("PRIVATE_PATH") && !text.contains("PRIVATE_QUERY"));
+        for url in [
+            format!("/api/target/service-map?session_id={}", active.id()),
+            format!("/api/target/service-map/evidence{base}"),
+        ] {
+            let (status, text) =
+                api_route_response(state.clone(), reqwest::Method::GET, &url, None).await;
+            assert_eq!(status, reqwest::StatusCode::OK);
+            assert!(!text.contains("198.51.100.7") && !text.contains("socket_peer"));
+        }
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn peer_matches_api_inactive_is_read_only_without_saved_context_loading() {
+        let (state, data_dir) = test_state("sniper-peer-matches-inactive");
+        let active = state.active_session_for_read().await;
+        active.store.insert(test_socket_peer_record()).await;
+        let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+            .evidence_id
+            .clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Inactive peer fixture".into()))
+            .unwrap();
+        let path = state.session_storage_path(inactive.id).unwrap();
+        std::fs::write(path.join("snapshot.json"), b"SYNTHETIC_UNREADABLE").unwrap();
+        let before: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                (
+                    p.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&p).unwrap(),
+                        std::fs::metadata(&p).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let result: crate::service_map_peer_matches::ServiceMapSocketPeerMatches = response_json(
+            super::get_target_service_map_socket_peer_matches(
+                State(state.clone()),
+                Ok(Query(super::ServiceMapSocketPeerMatchesQuery {
+                    session_id: inactive.id,
+                    evidence_id: token,
+                    in_scope_only: false,
+                    max_records: None,
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result.reasons, ["inactive_session"]);
+        assert!(result.peer.is_none() && result.snapshot.is_none());
+        assert!(Arc::ptr_eq(&active, &state.active_session_for_read().await));
+        let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                (
+                    p.file_name().unwrap().to_owned(),
+                    (
+                        std::fs::read(&p).unwrap(),
+                        std::fs::metadata(&p).unwrap().modified().unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(before, after);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn peer_matches_api_revalidates_source_and_active_session_before_publication() {
+        for change in ["session", "mutation", "deletion"] {
+            let (state, data_dir) = test_state("sniper-peer-matches-publication");
+            let active = state.active_session_for_read().await;
+            let record = test_socket_peer_record();
+            let id = record.id;
+            active.store.insert(record).await;
+            let token = active.store.service_map_snapshot(active.id(), 1).await.rows[0]
+                .evidence_id
+                .clone();
+            let (paused, ready) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let read_state = state.clone();
+            let session_id = active.id();
+            let reading = tokio::spawn(async move {
+                super::get_target_service_map_socket_peer_matches_impl(
+                    State(read_state),
+                    Query(super::ServiceMapSocketPeerMatchesQuery {
+                        session_id,
+                        evidence_id: token,
+                        in_scope_only: false,
+                        max_records: Some(10),
+                    }),
+                    Some((paused, resumed)),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = match change {
+                "session" => {
+                    state
+                        .create_session(Some("New peer fixture".into()))
+                        .await
+                        .unwrap();
+                    "session_source_changed"
+                }
+                "mutation" => {
+                    active
+                        .store
+                        .update_record(id, |r| r.observed_socket_peer = None)
+                        .await
+                        .unwrap();
+                    "record_changed"
+                }
+                _ => {
+                    active.store.delete_ids(&[id]).await.unwrap();
+                    "record_missing"
+                }
+            };
+            resume.send(()).unwrap();
+            let result: crate::service_map_peer_matches::ServiceMapSocketPeerMatches =
+                response_json(reading.await.unwrap()).await;
+            assert_eq!(result.reasons, [expected]);
+            assert!(!result.available && !result.complete);
+            assert!(
+                result.peer.is_none()
+                    && result.source.is_none()
+                    && result.snapshot.is_none()
+                    && result.origins.is_empty()
+            );
+            assert_eq!(result.counts, Default::default());
+            drop(active);
+            drop(state);
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn service_map_api_deleted_pinned_session_cannot_reappear_from_cache() {
+        let (state, data_dir) = test_state("sniper-service-map-deleted-session");
+        let metadata = state
+            .sessions
+            .create_session(Some("Delete fixture".into()))
+            .unwrap();
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(super::ServiceMapQuery {
+                session_id: Some(metadata.id),
+                in_scope_only: false,
+                max_records: None,
+                origin: None,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        state.delete_session(metadata.id).await.unwrap();
+        let response = super::get_target_service_map(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(super::ServiceMapQuery {
+                session_id: Some(metadata.id),
+                in_scope_only: false,
+                max_records: None,
+                origin: None,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     #[tokio::test]
     async fn target_site_map_counts_notes_once_per_record() {
         let config = AppConfig {
@@ -14980,6 +18795,322 @@ mod tests {
         assert_eq!(durable.user_note.as_deref(), Some("durable snapshot"));
 
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    async fn workspace_commit_test_fixture(
+        name: &str,
+    ) -> (
+        Arc<AppState>,
+        PathBuf,
+        Arc<crate::session::SessionContext>,
+        WorkspaceStateSnapshot,
+    ) {
+        let (state, data_dir) = test_state(name);
+        let session = state.session().await;
+        let initial: WorkspaceStateSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id": session.id(),
+            "replay": {"tab_sequence": 1, "active_tab_id": "synthetic-tab", "tabs": [{
+                "id": "synthetic-tab", "type": "http", "sequence": 1,
+                "custom_label": "old label", "request_text": "old saved draft"
+            }]}
+        }))
+        .unwrap();
+        let initial = state
+            .replace_workspace_state_and_persist(&session, initial)
+            .await
+            .unwrap();
+        (state, data_dir, session, initial)
+    }
+
+    async fn submit_workspace_commit_test_update(
+        state: Arc<AppState>,
+        snapshot: WorkspaceStateSnapshot,
+        keepalive: bool,
+    ) -> axum::response::Response {
+        if keepalive {
+            super::update_workspace_state_keepalive(
+                State(state),
+                Json(super::WorkspaceKeepaliveUpdate {
+                    snapshot,
+                    keepalive: super::WorkspaceKeepaliveMetadata {
+                        replay_tabs_complete: true,
+                        fuzzer_complete: true,
+                        ..super::WorkspaceKeepaliveMetadata::default()
+                    },
+                }),
+            )
+            .await
+        } else {
+            super::update_workspace_state(State(state), Json(snapshot)).await
+        }
+    }
+
+    async fn assert_workspace_commit_failure_recovery(keepalive: bool, committed: bool) {
+        use crate::session::WorkspaceWriteFault;
+
+        let (state, data_dir, session, initial) =
+            workspace_commit_test_fixture("sniper-workspace-commit-recovery").await;
+        let config = state.config.clone();
+        let disk_path = session.storage_dir().join("workspace.json");
+        let initial_bytes = std::fs::read(&disk_path).unwrap();
+        let snapshot_path = session.storage_dir().join("snapshot.json");
+        let session_snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+        let mut events = session.workspace.subscribe();
+        let mut candidate = initial.clone();
+        candidate.replay.tabs[0].request_text = "new unrelated saved draft".into();
+        session.fail_next_workspace_write(if committed {
+            WorkspaceWriteFault::AfterReplacement
+        } else {
+            WorkspaceWriteFault::BeforeReplacement
+        });
+        let mut payload = serde_json::to_value(candidate).unwrap();
+        let endpoint = if keepalive {
+            payload["keepalive"] = serde_json::json!({
+                "replay_tabs_complete": true,
+                "fuzzer_complete": true,
+            });
+            "/api/workspace-state/keepalive"
+        } else {
+            "/api/workspace-state"
+        };
+        let (status, body) =
+            api_route_json(state.clone(), reqwest::Method::POST, endpoint, payload).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body.into_bytes();
+        let memory = session.workspace.snapshot().await;
+        let saved_bytes = std::fs::read(&disk_path).unwrap();
+        let durable: WorkspaceStateSnapshot = serde_json::from_slice(&saved_bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&snapshot_path).unwrap(),
+            session_snapshot_bytes
+        );
+        let expected = if committed {
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["code"], "WORKSPACE_COMMIT_UNCERTAIN");
+            assert!(error["error"]
+                .as_str()
+                .unwrap()
+                .contains("Reload the selected session before retrying"));
+            assert_ne!(saved_bytes, initial_bytes);
+            assert_eq!(memory.revision, initial.revision + 1);
+            assert_eq!(
+                memory.replay.tabs[0].request_text,
+                "new unrelated saved draft"
+            );
+            assert_eq!(events.try_recv().unwrap().revision, memory.revision);
+            assert!(events.try_recv().is_err());
+
+            // A stale label CAS must not reuse the committed revision or erase
+            // the unrelated draft that became visible despite the error.
+            let stale = super::set_saved_replay_tab_label(
+                State(state.clone()),
+                Json(super::SetSavedReplayTabLabelPayload {
+                    session_id: session.id(),
+                    tab_id: "synthetic-tab".into(),
+                    expected_workspace_revision: initial.revision,
+                    expected_active_session_id: None,
+                    label: "new label".into(),
+                }),
+            )
+            .await;
+            assert_eq!(stale.status(), StatusCode::CONFLICT);
+            let conflict: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(stale.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(conflict["revision"], memory.revision);
+            assert_eq!(std::fs::read(&disk_path).unwrap(), saved_bytes);
+            assert!(events.try_recv().is_err());
+
+            let refreshed: WorkspaceStateSnapshot = response_json(
+                super::get_workspace_state(
+                    State(state.clone()),
+                    Query(super::WorkspaceStateQuery {
+                        session_id: Some(session.id()),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(refreshed.revision, memory.revision);
+            let response = super::set_saved_replay_tab_label(
+                State(state.clone()),
+                Json(super::SetSavedReplayTabLabelPayload {
+                    session_id: session.id(),
+                    tab_id: "synthetic-tab".into(),
+                    expected_workspace_revision: refreshed.revision,
+                    expected_active_session_id: None,
+                    label: "new label".into(),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let updated: serde_json::Value = response_json(response).await;
+            assert_eq!(updated["revision"], initial.revision + 2);
+            assert_eq!(updated["tab"]["custom_label"], "new label");
+            assert_eq!(updated["tab"]["request_text"], "new unrelated saved draft");
+            assert_eq!(events.try_recv().unwrap().revision, initial.revision + 2);
+            assert!(events.try_recv().is_err());
+            session.workspace.snapshot().await
+        } else {
+            let error = std::str::from_utf8(&body).unwrap();
+            assert!(error.contains("before replacement"));
+            assert!(!error.contains("WORKSPACE_COMMIT_UNCERTAIN"));
+            assert_eq!(saved_bytes, initial_bytes);
+            assert_eq!(
+                serde_json::to_value(&memory).unwrap(),
+                serde_json::to_value(&initial).unwrap()
+            );
+            assert!(events.try_recv().is_err());
+            initial
+        };
+        drop(session);
+        drop(state);
+        let restarted = AppState::new(config).unwrap();
+        let reloaded = restarted.session().await.workspace.snapshot().await;
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_ordinary_precommit_failure_preserves_state() {
+        assert_workspace_commit_failure_recovery(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_keepalive_precommit_failure_preserves_state() {
+        assert_workspace_commit_failure_recovery(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_ordinary_uncertainty_rejects_stale_label_and_preserves_draft() {
+        assert_workspace_commit_failure_recovery(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_keepalive_uncertainty_rejects_stale_label_and_preserves_draft() {
+        assert_workspace_commit_failure_recovery(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_commit_cancellation_before_write_preserves_state() {
+        for keepalive in [false, true] {
+            let (state, data_dir, session, initial) =
+                workspace_commit_test_fixture("sniper-workspace-precommit-cancel").await;
+            let config = state.config.clone();
+            let path = session.storage_dir().join("workspace.json");
+            let before = std::fs::read(&path).unwrap();
+            let mut events = session.workspace.subscribe();
+            let guard = session.mutation_guard().await;
+            let mut candidate = initial.clone();
+            candidate.replay.tabs[0].request_text = "cancelled draft".into();
+            let mut request = tokio::spawn(submit_workspace_commit_test_update(
+                state.clone(),
+                candidate,
+                keepalive,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut request)
+                    .await
+                    .is_err()
+            );
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            drop(guard);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(session.workspace.snapshot().await).unwrap(),
+                serde_json::to_value(&initial).unwrap()
+            );
+            assert!(events.try_recv().is_err());
+            drop(session);
+            drop(state);
+            let restarted = AppState::new(config).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.session().await.workspace.snapshot().await).unwrap(),
+                serde_json::to_value(&initial).unwrap()
+            );
+            drop(restarted);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_commit_cancellation_after_replacement_publishes_state() {
+        for keepalive in [false, true] {
+            for uncertain in [false, true] {
+                let (state, data_dir, session, initial) =
+                    workspace_commit_test_fixture("sniper-workspace-postcommit-cancel").await;
+                let config = state.config.clone();
+                let path = session.storage_dir().join("workspace.json");
+                let mut events = session.workspace.subscribe();
+                let mut candidate = initial;
+                candidate.replay.tabs[0].request_text = "committed before cancellation".into();
+                if uncertain {
+                    session.fail_next_workspace_write(
+                        crate::session::WorkspaceWriteFault::AfterReplacement,
+                    );
+                }
+                let (entered, release) = session.pause_next_workspace_commit();
+                let request = tokio::spawn(submit_workspace_commit_test_update(
+                    state.clone(),
+                    candidate,
+                    keepalive,
+                ));
+                tokio::time::timeout(Duration::from_secs(2), entered)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let committed: WorkspaceStateSnapshot =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                request.abort();
+                release.send(()).unwrap();
+                match tokio::time::timeout(Duration::from_secs(2), request)
+                    .await
+                    .unwrap()
+                {
+                    Ok(response) => assert_eq!(
+                        response.status(),
+                        if uncertain {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::OK
+                        }
+                    ),
+                    Err(error) => assert!(error.is_cancelled()),
+                }
+                assert_eq!(
+                    serde_json::to_value(session.workspace.snapshot().await).unwrap(),
+                    serde_json::to_value(&committed).unwrap()
+                );
+                assert_eq!(
+                    committed.replay.tabs[0].request_text,
+                    "committed before cancellation"
+                );
+                assert_eq!(events.try_recv().unwrap().revision, committed.revision);
+                assert!(events.try_recv().is_err());
+                drop(session);
+                drop(state);
+                let restarted = AppState::new(config).unwrap();
+                assert_eq!(
+                    serde_json::to_value(restarted.session().await.workspace.snapshot().await)
+                        .unwrap(),
+                    serde_json::to_value(&committed).unwrap()
+                );
+                drop(restarted);
+                std::fs::remove_dir_all(data_dir).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -19579,6 +23710,1713 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         assert!(session.store.get(id).await.is_none());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+    async fn peer_settings_request(
+        state: Arc<AppState>,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> axum::response::Response {
+        use hyper::service::Service;
+        let service = hyper_util::service::TowerToHyperService::new(super::router(state));
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.unwrap_or("").to_owned()))
+            .unwrap();
+        service.call(request).await.unwrap()
+    }
+
+    async fn peer_settings_get(
+        state: &Arc<AppState>,
+        session: &Arc<crate::session::SessionContext>,
+    ) -> crate::upstream_peer_settings::UpstreamPeerSettingsSnapshot {
+        let response = peer_settings_request(state.clone(), "GET", &format!("/api/transactions/upstream-peer-settings?session_id={}&expected_active_session_id={}", session.id(), session.id()), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    async fn peer_settings_save(
+        state: &Arc<AppState>,
+        session: &Arc<crate::session::SessionContext>,
+        enabled: bool,
+    ) -> axum::response::Response {
+        let current = peer_settings_get(state, session).await;
+        peer_settings_request(state.clone(), "POST", &format!("/api/transactions/upstream-peer-settings?session_id={}&expected_active_session_id={}", session.id(), session.id()), Some(&serde_json::json!({"enabled":enabled,"expected_config_token":current.config_token}).to_string())).await
+    }
+
+    #[tokio::test]
+    async fn peer_settings_check_is_default_off_and_read_only() {
+        let (state, path) = test_state("peer-settings-read-only");
+        let session = state.active_session_for_read().await;
+        session.persist().await.unwrap();
+        let state_path = session.storage_dir().join("state.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let events = session.event_log.snapshot(None).await.len();
+        let current = peer_settings_get(&state, &session).await;
+        assert!(!current.enabled);
+        assert!(!current.status.effective_enabled);
+        assert_eq!(current.status.blocked_reason, None);
+        assert_eq!(current.config_revision, "0");
+        assert_eq!(current.changed, None);
+        assert!(!session.upstream_peer_capture_eligible().await);
+        assert_eq!(std::fs::read(state_path).unwrap(), before);
+        assert_eq!(session.event_log.snapshot(None).await.len(), events);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_router_rejects_malformed_unknown_and_missing_fields() {
+        let (state, path) = test_state("peer-settings-strict-router");
+        let session = state.active_session_for_read().await;
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        for body in [
+            r#"{"enabled":true"#,
+            r#"{}"#,
+            r#"{"enabled":"true"}"#,
+            r#"{"enabled":null}"#,
+            r#"{"enabled":1}"#,
+            r#"{"enabled":false,"expected_config_token":null}"#,
+            r#"{"enabled":false,"expected_config_token":42}"#,
+            r#"{"enabled":false,"expected_config_token":"secret@example.com"}"#,
+            r#"{"enabled":false,"session_id":"unexpected"}"#,
+            r#"{"enabled":false,"upstream_proxy":{"url":"secret@example.com"}}"#,
+            r#"{"enabled":false,"enabled":true}"#,
+        ] {
+            let response = peer_settings_request(state.clone(), "POST", &uri, Some(body)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error = response_body_json(response).await;
+            assert!(!error.to_string().contains("secret@example.com"));
+        }
+        assert_eq!(
+            peer_settings_request(state.clone(), "POST", &uri, Some(r#"{"enabled":true}"#))
+                .await
+                .status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(
+            peer_settings_request(state.clone(), "GET", &format!("{uri}&unknown=true"), None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            peer_settings_request(
+                state.clone(),
+                "GET",
+                "/api/transactions/upstream-peer-settings?session_id=invalid",
+                None
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!peer_settings_get(&state, &session).await.enabled);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_rejects_inactive_without_loading_or_touching_files() {
+        let (state, path) = test_state("peer-settings-inactive");
+        let active = state.active_session_for_read().await;
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let saved = path.join("sessions").join(inactive.id.to_string());
+        let file = saved.join("state.json");
+        std::fs::write(&file, b"deliberately invalid synthetic saved state").unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let token = crate::upstream_peer_settings::config_token(inactive.id, false, Some(0));
+        let body = serde_json::json!({"enabled":true,"expected_config_token":token}).to_string();
+        for method in ["GET", "POST"] {
+            let response = peer_settings_request(
+                state.clone(),
+                method,
+                &format!(
+                    "/api/transactions/upstream-peer-settings?session_id={}",
+                    inactive.id
+                ),
+                Some(&body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(std::fs::read(&file).unwrap(), before);
+        }
+        let mismatch = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}&expected_active_session_id={}",
+            active.id(),
+            inactive.id
+        );
+        assert_eq!(
+            peer_settings_request(state.clone(), "GET", &mismatch, None)
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            peer_settings_request(state.clone(), "POST", &mismatch, Some(&body))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(!active.upstream_peer_capture_eligible().await);
+        drop(active);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_cas_prevents_aba_and_foreign_tokens_and_survives_restart() {
+        use crate::upstream_peer_settings::UpstreamPeerSettingsSnapshot;
+        let (state, path) = test_state("peer-settings-cas-restart");
+        let config = state.config.clone();
+        let session = state.active_session_for_read().await;
+        let initial = peer_settings_get(&state, &session).await;
+        let on: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, true).await).await;
+        assert_eq!(on.config_revision, "1");
+        assert_eq!(on.changed, Some(true));
+        assert!(on.status.effective_enabled);
+        let off: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, false).await).await;
+        assert_eq!(off.config_revision, "2");
+        assert_ne!(off.config_token, initial.config_token);
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        for token in [
+            initial.config_token,
+            crate::upstream_peer_settings::config_token(Uuid::new_v4(), false, Some(2)),
+            crate::history_retention::history_retention_config_token(
+                session.id(),
+                &Default::default(),
+                2,
+            ),
+        ] {
+            let body =
+                serde_json::json!({"enabled":true,"expected_config_token":token}).to_string();
+            assert_eq!(
+                peer_settings_request(state.clone(), "POST", &uri, Some(&body))
+                    .await
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        let noop: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, false).await).await;
+        assert_eq!(noop.changed, Some(false));
+        assert_eq!(noop.config_token, off.config_token);
+        assert_eq!(noop.config_revision, "2");
+        let enabled: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, true).await).await;
+        let id = session.id();
+        drop(session);
+        drop(state);
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state.active_session_for_read().await;
+        assert_eq!(session.id(), id);
+        let restored = peer_settings_get(&state, &session).await;
+        assert!(restored.enabled);
+        assert!(restored.status.effective_enabled);
+        assert_eq!(restored.config_token, enabled.config_token);
+        assert_eq!(restored.config_revision, "3");
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_saves_are_state_only_and_competing_cas_has_one_winner() {
+        let (state, path) = test_state("peer-settings-state-only-cas");
+        let session = state.active_session_for_read().await;
+        let ids = history_retention_records(&session, 2).await;
+        let before: Vec<_> = [
+            "snapshot.json",
+            "workspace.json",
+            "transactions.ndjson",
+            "transactions.meta.ndjson",
+            "transactions.journal",
+            "websockets.journal",
+        ]
+        .into_iter()
+        .map(|name| (name, std::fs::read(session.storage_dir().join(name)).ok()))
+        .collect();
+        let current = peer_settings_get(&state, &session).await;
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        let body = serde_json::json!({"enabled":true,"expected_config_token":current.config_token})
+            .to_string();
+        let (first, second) = tokio::join!(
+            peer_settings_request(state.clone(), "POST", &uri, Some(&body)),
+            peer_settings_request(state.clone(), "POST", &uri, Some(&body))
+        );
+        let statuses = [first.status(), second.status()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            peer_settings_get(&state, &session).await.config_revision,
+            "1"
+        );
+        for (name, bytes) in before {
+            assert_eq!(
+                std::fs::read(session.storage_dir().join(name)).ok(),
+                bytes,
+                "{name} must not be rewritten by peer settings"
+            );
+        }
+        for (index, id) in ids.into_iter().enumerate() {
+            let record = session.store.get(id).await.unwrap();
+            assert_eq!(
+                record.request.body_preview,
+                format!("synthetic history body {index}")
+            );
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_http_pause_and_other_runtime_updates_do_not_change_opt_in() {
+        use crate::upstream_peer_settings::UpstreamPeerBlockedReason;
+        let (state, path) = test_state("peer-settings-http-pause");
+        let session = state.active_session_for_read().await;
+        assert_eq!(
+            peer_settings_save(&state, &session, true).await.status(),
+            StatusCode::OK
+        );
+        let before = peer_settings_get(&state, &session).await;
+        let broad = serde_json::from_value(serde_json::json!({"http_capture_enabled":false,"upstream_peer_capture_enabled":false,"upstream_peer_capture_revision":42,"upstream_insecure":false})).unwrap();
+        session.runtime.update(broad).await.unwrap();
+        session.persist_state_only().await.unwrap();
+        let paused = peer_settings_get(&state, &session).await;
+        assert!(paused.enabled);
+        assert!(!paused.status.effective_enabled);
+        assert_eq!(
+            paused.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::HttpCapturePaused)
+        );
+        assert_eq!(paused.config_token, before.config_token);
+        assert!(!session.upstream_peer_capture_eligible().await);
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(session.upstream_peer_capture_eligible().await);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_failures_gate_new_exchanges_until_explicit_noop_save() {
+        use crate::upstream_peer_settings::{
+            SettingsWriteFault, UpstreamPeerBlockedReason, UpstreamPeerSettingsSnapshot,
+        };
+        for fault in [
+            SettingsWriteFault::BeforeReplacement,
+            SettingsWriteFault::AfterReplacement,
+            SettingsWriteFault::OutcomeUnknown,
+        ] {
+            let (state, path) = test_state("peer-settings-save-fault");
+            let session = state.active_session_for_read().await;
+            assert_eq!(
+                peer_settings_save(&state, &session, true).await.status(),
+                StatusCode::OK
+            );
+            let eligible_before_disable = session.upstream_peer_capture_eligible().await;
+            assert!(eligible_before_disable);
+            let old_config = peer_settings_get(&state, &session).await;
+            session.fail_next_upstream_peer_write(fault);
+            let response = peer_settings_save(&state, &session, false).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let error = response_body_json(response).await;
+            let current = peer_settings_get(&state, &session).await;
+            if matches!(fault, SettingsWriteFault::BeforeReplacement) {
+                assert!(current.enabled);
+                assert_eq!(current.config_revision, "1");
+                assert_eq!(error["code"], "UPSTREAM_PEER_NOT_COMMITTED");
+            }
+            if matches!(
+                fault,
+                SettingsWriteFault::AfterReplacement | SettingsWriteFault::OutcomeUnknown
+            ) {
+                assert!(!current.enabled);
+                assert_eq!(current.config_revision, "2");
+                assert_ne!(current.config_token, old_config.config_token);
+                let stale_body = serde_json::json!({"enabled":false,"expected_config_token":old_config.config_token}).to_string();
+                let uri = format!(
+                    "/api/transactions/upstream-peer-settings?session_id={}",
+                    session.id()
+                );
+                assert_eq!(
+                    peer_settings_request(state.clone(), "POST", &uri, Some(&stale_body))
+                        .await
+                        .status(),
+                    StatusCode::CONFLICT
+                );
+            }
+            assert_eq!(
+                current.status.blocked_reason,
+                Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+            );
+            assert!(!current.status.effective_enabled);
+            assert!(!session.upstream_peer_capture_eligible().await);
+            // Completion retains a prior eligibility decision; it never re-reads
+            // live settings to fabricate eligibility or erase valid evidence.
+            assert!(eligible_before_disable);
+            session
+                .runtime
+                .update(crate::runtime::RuntimeSettingsUpdate {
+                    upstream_insecure: Some(false),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            session.persist_state_only().await.unwrap();
+            session.persist().await.unwrap();
+            assert!(!session.upstream_peer_capture_eligible().await);
+            assert_eq!(
+                peer_settings_get(&state, &session)
+                    .await
+                    .status
+                    .blocked_reason,
+                Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+            );
+            let confirmed: UpstreamPeerSettingsSnapshot =
+                response_json(peer_settings_save(&state, &session, current.enabled).await).await;
+            assert_eq!(confirmed.changed, Some(false));
+            assert_eq!(confirmed.config_token, current.config_token);
+            assert_eq!(confirmed.status.blocked_reason, None);
+            assert_eq!(confirmed.status.effective_enabled, current.enabled);
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_settings_pending_save_is_gated_and_finishes_after_request_cancellation() {
+        let (state, path) = test_state("peer-settings-cancel");
+        let session = state.active_session_for_read().await;
+        let current = peer_settings_get(&state, &session).await;
+        let persist_guard = session.owned_persist_guard().await;
+        let request_state = state.clone();
+        let uri = format!(
+            "/api/transactions/upstream-peer-settings?session_id={}",
+            session.id()
+        );
+        let body = serde_json::json!({"enabled":true,"expected_config_token":current.config_token})
+            .to_string();
+        let request = tokio::spawn(async move {
+            peer_settings_request(request_state, "POST", &uri, Some(&body)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !session.upstream_peer_settings.uncertain() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !session
+                .runtime
+                .snapshot()
+                .await
+                .upstream_peer_capture_enabled
+        );
+        assert!(!session.upstream_peer_capture_eligible().await);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(persist_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.upstream_peer_settings.uncertain() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(session.upstream_peer_capture_eligible().await);
+        let loaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert!(
+            loaded
+                .runtime
+                .snapshot()
+                .await
+                .upstream_peer_capture_enabled
+        );
+        drop(loaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_invalid_and_exhausted_revisions_never_revive_old_cas() {
+        use crate::upstream_peer_settings::{
+            config_token, UpstreamPeerBlockedReason, UpstreamPeerSettingsSnapshot,
+        };
+        let (state, path) = test_state("peer-settings-exhausted");
+        let session = state.active_session_for_read().await;
+        for revision in [Some(u64::MAX), None] {
+            session
+                .runtime
+                .set_upstream_peer_capture_config(false, revision)
+                .await;
+            let current = peer_settings_get(&state, &session).await;
+            assert_eq!(current.config_revision, u64::MAX.to_string());
+            assert_ne!(
+                current.config_token,
+                config_token(session.id(), false, Some(0))
+            );
+            assert_eq!(
+                peer_settings_save(&state, &session, true).await.status(),
+                StatusCode::CONFLICT
+            );
+            let confirmed: UpstreamPeerSettingsSnapshot =
+                response_json(peer_settings_save(&state, &session, false).await).await;
+            assert_eq!(confirmed.config_token, current.config_token);
+            assert_eq!(
+                session
+                    .runtime
+                    .snapshot()
+                    .await
+                    .upstream_peer_capture_revision,
+                revision
+            );
+            assert_eq!(
+                confirmed.status.blocked_reason,
+                Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+            );
+            if revision.is_none() {
+                assert_ne!(
+                    confirmed.config_token,
+                    config_token(session.id(), false, Some(u64::MAX))
+                );
+            }
+            assert!(!session.upstream_peer_capture_eligible().await);
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_exhausted_on_is_effectively_off_before_and_after_restart() {
+        use crate::upstream_peer_settings::{
+            config_token, UpstreamPeerBlockedReason, UpstreamPeerSettingsSnapshot,
+        };
+        let (state, path) = test_state("peer-settings-exhausted-on");
+        let config = state.config.clone();
+        let session = state.active_session_for_read().await;
+        session
+            .runtime
+            .set_upstream_peer_capture_config(true, Some(u64::MAX))
+            .await;
+        session.persist_state_only().await.unwrap();
+        let current = peer_settings_get(&state, &session).await;
+        assert!(current.enabled);
+        assert!(!current.status.effective_enabled);
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+        );
+        assert!(!session.upstream_peer_capture_eligible().await);
+        assert_eq!(current.config_revision, u64::MAX.to_string());
+        assert_eq!(
+            current.config_token,
+            config_token(session.id(), true, Some(u64::MAX))
+        );
+        assert_ne!(
+            current.config_token,
+            config_token(session.id(), false, None)
+        );
+        assert_ne!(
+            current.config_token,
+            config_token(session.id(), false, Some(u64::MAX))
+        );
+        // Exhaustion never resets the revision, and a no-op durability Save
+        // cannot bypass the independent fail-closed eligibility check.
+        assert_eq!(
+            peer_settings_save(&state, &session, false).await.status(),
+            StatusCode::CONFLICT
+        );
+        let confirmed: UpstreamPeerSettingsSnapshot =
+            response_json(peer_settings_save(&state, &session, true).await).await;
+        assert_eq!(confirmed.config_token, current.config_token);
+        assert_eq!(confirmed.changed, Some(false));
+        assert!(!confirmed.status.effective_enabled);
+        assert!(!session.upstream_peer_capture_eligible().await);
+        drop(session);
+        drop(state);
+        let restarted = Arc::new(AppState::new(config).unwrap());
+        let session = restarted.active_session_for_read().await;
+        let restored = peer_settings_get(&restarted, &session).await;
+        assert_eq!(restored.config_token, current.config_token);
+        assert_eq!(restored.config_revision, u64::MAX.to_string());
+        assert!(restored.enabled);
+        assert!(!restored.status.effective_enabled);
+        assert_eq!(
+            restored.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::InvalidConfiguration)
+        );
+        assert!(!session.upstream_peer_capture_eligible().await);
+        drop(session);
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn peer_settings_session_switch_isolated_and_pinned_old_context_rejected() {
+        use crate::upstream_peer_settings::{SettingsWriteFault, UpstreamPeerBlockedReason};
+        let (state, path) = test_state("peer-settings-session-switch");
+        let first = state.active_session_for_read().await;
+        assert_eq!(
+            peer_settings_save(&state, &first, true).await.status(),
+            StatusCode::OK
+        );
+        first.fail_next_upstream_peer_write(SettingsWriteFault::BeforeReplacement);
+        assert_eq!(
+            peer_settings_save(&state, &first, false).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let before = crate::upstream_peer_settings::snapshot(&first, None).await;
+        let second = state
+            .sessions
+            .create_session(Some("Synthetic second".into()))
+            .unwrap();
+        state.activate_session(second.id).await.unwrap();
+        let active = state.active_session_for_read().await;
+        assert!(!peer_settings_get(&state, &active).await.enabled);
+        let response = super::update_upstream_peer_settings_inner(
+            state.clone(),
+            first.clone(),
+            super::UpstreamPeerSettingsQuery {
+                session_id: Some(first.id()),
+                expected_active_session_id: Some(first.id()),
+            },
+            super::UpstreamPeerSettingsPayload {
+                enabled: false,
+                expected_config_token: Some(before.config_token.clone()),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        state.activate_session(first.id()).await.unwrap();
+        let restored = state.active_session_for_read().await;
+        let current = peer_settings_get(&state, &restored).await;
+        assert_eq!(current.config_token, before.config_token);
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(UpstreamPeerBlockedReason::PersistenceUncertain)
+        );
+        assert!(!restored.upstream_peer_capture_eligible().await);
+        drop(restored);
+        drop(active);
+        drop(first);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn history_retention_policy(target: u32) -> crate::history_retention::HistoryRetentionPolicy {
+        crate::history_retention::HistoryRetentionPolicy::KeepNewest {
+            max_entries: std::num::NonZeroU32::new(target).unwrap(),
+        }
+    }
+
+    async fn history_retention_save(
+        state: &Arc<AppState>,
+        session: &Arc<crate::session::SessionContext>,
+        policy: crate::history_retention::HistoryRetentionPolicy,
+    ) -> axum::response::Response {
+        let (policy_before, revision) = session.runtime.history_retention_config().await;
+        let token = crate::history_retention::history_retention_config_token(
+            session.id(),
+            &policy_before,
+            revision,
+        );
+        super::update_history_retention(
+            State(state.clone()),
+            Query(super::SessionWriteQuery {
+                session_id: Some(session.id()),
+                expected_active_session_id: None,
+            }),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some(token),
+                policy,
+            }),
+        )
+        .await
+    }
+
+    async fn history_retention_records(
+        session: &Arc<crate::session::SessionContext>,
+        count: usize,
+    ) -> Vec<Uuid> {
+        // Persist this opt-out with the fixture so journal recovery cannot run
+        // optional scanner rules when a retention test reloads its synthetic rows.
+        let mut scanner_config = session.scanner.get_config().await;
+        scanner_config.enabled = false;
+        session.scanner.update_config(scanner_config).await;
+        let mut ids = Vec::new();
+        for index in 0..count {
+            let body = format!("synthetic history body {index}");
+            let record = TransactionRecord::http(
+                chrono::Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "example.com".into(),
+                format!("/{index}"),
+                Some(200),
+                1,
+                MessageRecord::from_headers_and_body(&HeaderMap::new(), body.as_bytes(), 4096),
+                None,
+                vec![],
+                None,
+                None,
+            );
+            ids.push(record.id);
+            session.store.insert(record).await;
+        }
+        // Leave no insert journal for restart tests; scanner remains disabled
+        // in stored state even if a later operation appends another journal entry.
+        session.persist().await.unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(session.storage_dir().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["scanner_config"]["enabled"], false);
+        ids
+    }
+
+    async fn history_retention_raw_request(
+        state: Arc<AppState>,
+        uri: &str,
+        body: &str,
+    ) -> axum::response::Response {
+        use hyper::service::Service;
+
+        // Drive the actual router and extractors without a listener or client.
+        let service = hyper_util::service::TowerToHyperService::new(super::router(state));
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap();
+        service.call(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_malformed_json_with_400() {
+        let (state, path) = test_state("history-retention-router-syntax");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [r#"{"policy":{"mode":"off"}"#, r#"{"policy":]}"#] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_semantic_policy_errors_with_422() {
+        let (state, path) = test_state("history-retention-router-policy");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [
+            r#"{"policy":{"mode":"keep_newest","max_entries":0}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":4294967296}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":-1}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1.5}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1e3}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":null}}"#,
+            r#"{"policy":{"mode":"keep_newest"}}"#,
+            r#"{"policy":{"mode":"unknown"}}"#,
+            r#"{"policy":null}"#,
+        ] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_unknown_fields_with_422() {
+        let (state, path) = test_state("history-retention-router-unknown-field");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [
+            r#"{"policy":{"mode":"off"},"config_token":"unexpected"}"#,
+            r#"{"policy":{"mode":"off","max_entries":1}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1,"extra":true}}"#,
+        ] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_missing_token_with_428() {
+        let (state, path) = test_state("history-retention-router-missing-token");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        for body in [
+            r#"{"policy":{"mode":"off"}}"#,
+            r#"{"policy":{"mode":"keep_newest","max_entries":1}}"#,
+        ] {
+            let response = history_retention_raw_request(state.clone(), &uri, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::PRECONDITION_REQUIRED,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_router_rejects_conflicting_session_ids_with_400() {
+        let (state, path) = test_state("history-retention-router-conflicting-session");
+        let session = state.session().await;
+        let uri = format!("/api/transactions/retention?session_id={}", session.id());
+        let current = crate::history_retention::snapshot(&session, false, false, None).await;
+        let body = serde_json::json!({
+            "session_id": Uuid::new_v4(),
+            "expected_config_token": current.config_token,
+            "policy": {"mode": "keep_newest", "max_entries": 1}
+        });
+        let response = history_retention_raw_request(state.clone(), &uri, &body.to_string()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            b"query session_id conflicts with JSON session_id"
+        );
+        assert_eq!(
+            session.runtime.history_retention_config().await,
+            (crate::history_retention::HistoryRetentionPolicy::Off, 0)
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    async fn history_retention_wait_count(
+        session: &Arc<crate::session::SessionContext>,
+        expected: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.store.len().await != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn history_retention_input_is_strict_and_persisted_invalid_policy_is_off() {
+        use crate::history_retention::HistoryRetentionPolicy;
+        for invalid in [
+            serde_json::json!({"mode":"keep_newest","max_entries":0}),
+            serde_json::json!({"mode":"keep_newest","max_entries":4294967296u64}),
+            serde_json::json!({"mode":"off","max_entries":1}),
+            serde_json::json!({"mode":"unknown"}),
+            serde_json::Value::Null,
+        ] {
+            assert!(serde_json::from_value::<HistoryRetentionPolicy>(invalid.clone()).is_err());
+            let settings: crate::runtime::RuntimeSettingsSnapshot = serde_json::from_value(serde_json::json!({"http_history_retention":invalid,"http_capture_enabled":false,"scope_patterns":["example.com"]})).unwrap();
+            assert_eq!(settings.http_history_retention, HistoryRetentionPolicy::Off);
+            assert!(!settings.http_capture_enabled);
+            assert_eq!(settings.scope_patterns, ["example.com"]);
+        }
+        assert_eq!(
+            serde_json::from_str::<crate::runtime::RuntimeSettingsSnapshot>("{}")
+                .unwrap()
+                .http_history_retention,
+            HistoryRetentionPolicy::Off
+        );
+        assert!(serde_json::from_value::<super::HistoryRetentionPayload>(serde_json::json!({"policy":{"mode":"off"},"expected_config_token":"x","config_token":"other"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn history_retention_default_off_does_not_persist_or_delete_and_worker_drops() {
+        let (state, path) = test_state("history-retention-off");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 4).await;
+        let files = ["state.json", "snapshot.json", "transactions.ndjson"];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(session.storage_dir().join(name)).unwrap())
+            .collect();
+        for _ in 0..8 {
+            session.store.notify_retention_work();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(session.store.len().await, ids.len());
+        for (name, bytes) in files.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(session.storage_dir().join(name)).unwrap(),
+                bytes
+            );
+        }
+        let weak = Arc::downgrade(&session);
+        drop(session);
+        drop(state);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_retention_token_is_count_independent_and_session_bound() {
+        let (state, path) = test_state("history-retention-token");
+        let session = state.session().await;
+        let policy = session.runtime.history_retention_policy().await;
+        let token =
+            crate::history_retention::history_retention_config_token(session.id(), &policy, 0);
+        history_retention_records(&session, 2).await;
+        let snapshot = crate::history_retention::snapshot(&session, false, false, None).await;
+        assert_eq!(token, snapshot.config_token);
+        assert_ne!(
+            token,
+            crate::history_retention::history_retention_config_token(Uuid::new_v4(), &policy, 0)
+        );
+        let query = super::SessionWriteQuery {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+        };
+        let response = super::update_history_retention(
+            State(state.clone()),
+            Query(query.clone()),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some("stale".into()),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = super::update_history_retention(
+            State(state.clone()),
+            Query(query),
+            Json(super::HistoryRetentionPayload {
+                session_id: Some(Uuid::new_v4()),
+                expected_config_token: Some(token),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(session.store.len().await, 2);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_failed_policy_write_never_deletes_and_uncertain_commit_is_explicit()
+    {
+        for fault in [
+            crate::session::WorkspaceWriteFault::BeforeReplacement,
+            crate::session::WorkspaceWriteFault::AfterReplacement,
+        ] {
+            let (state, path) = test_state("history-retention-policy-failure");
+            let session = state.session().await;
+            history_retention_records(&session, 3).await;
+            session.fail_next_history_retention_write(fault);
+            let response =
+                history_retention_save(&state, &session, history_retention_policy(1)).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = response_body_json(response).await;
+            assert_eq!(
+                body["code"],
+                match fault {
+                    crate::session::WorkspaceWriteFault::BeforeReplacement =>
+                        "RETENTION_NOT_COMMITTED",
+                    _ => "RETENTION_COMMIT_UNCERTAIN",
+                }
+            );
+            for _ in 0..20 {
+                session.store.notify_retention_work();
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(session.store.len().await, 3);
+            assert_eq!(
+                crate::history_retention::snapshot(&session, false, false, None)
+                    .await
+                    .status
+                    .blocked_reason,
+                Some(crate::history_retention::HistoryRetentionBlockedReason::PersistenceError)
+            );
+            let persisted: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(session.storage_dir().join("state.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                persisted["runtime"]["http_history_retention"]["mode"],
+                match fault {
+                    crate::session::WorkspaceWriteFault::BeforeReplacement => "off",
+                    _ => "keep_newest",
+                }
+            );
+            let retry = history_retention_save(&state, &session, history_retention_policy(1)).await;
+            assert_eq!(retry.status(), StatusCode::OK);
+            history_retention_wait_count(&session, 1).await;
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_retention_durable_replay_sources_protected_and_removed_tab_wakes_worker() {
+        let (state, path) = test_state("history-retention-protected");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 3).await;
+        let mut workspace = session.workspace.snapshot().await;
+        workspace.replay.tabs = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| crate::workspace::ReplayTabState {
+                id: format!("tab-{index}"),
+                source_transaction_id: Some(*id),
+                ..Default::default()
+            })
+            .collect();
+        workspace.replay.active_tab_id = Some("tab-0".into());
+        state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let status = crate::history_retention::snapshot(&session, false, false, None)
+            .await
+            .status;
+        assert_eq!((status.total_count, status.protected_count), (3, 3));
+        assert_eq!(
+            status.blocked_reason,
+            Some(crate::history_retention::HistoryRetentionBlockedReason::ProtectedRecords)
+        );
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let operation_guard = operation_lock.lock().await;
+        let mut workspace = session.workspace.snapshot().await;
+        workspace.replay.tabs.truncate(1);
+        state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        drop(operation_guard);
+        history_retention_wait_count(&session, 1).await;
+        assert!(session.store.get(ids[0]).await.is_some());
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_late_workspace_save_keeps_deleted_source_absent() {
+        let (state, path) = test_state("history-retention-late-workspace-save");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 3).await;
+        let deleted_source = ids[0];
+        let survivor = ids[2];
+        let draft = "GET /late-save HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut unsaved = session.workspace.snapshot().await;
+        unsaved.session_id = Some(session.id());
+        unsaved.replay.tabs.push(crate::workspace::ReplayTabState {
+            id: "saved-after-source-deletion".into(),
+            tab_type: "http".into(),
+            source_transaction_id: Some(deleted_source),
+            request_text: draft.into(),
+            ..Default::default()
+        });
+        unsaved.replay.active_tab_id = Some("saved-after-source-deletion".into());
+
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        history_retention_wait_count(&session, 1).await;
+        assert!(session.store.get(deleted_source).await.is_none());
+        assert!(session.store.get(survivor).await.is_some());
+
+        // Use the ordinary save handler, including its shared operation lock and
+        // mutation-safe persistence. Saving a reference does not recreate a row.
+        let response = super::update_workspace_state(State(state.clone()), Json(unsaved)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: crate::workspace::WorkspaceStateSnapshot = response_json(response).await;
+        assert_eq!(saved.replay.tabs.len(), 1);
+        assert_eq!(saved.replay.tabs[0].request_text, draft);
+        assert_eq!(
+            saved.replay.tabs[0].source_transaction_id,
+            Some(deleted_source)
+        );
+        assert_eq!(session.store.len().await, 1);
+        assert!(session.store.get(deleted_source).await.is_none());
+
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let operation_guard = operation_lock.lock().await;
+        let status = crate::history_retention::snapshot(&session, false, false, None).await;
+        assert_eq!(status.status.protected_count, 0);
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert!(!reloaded.scanner.get_config().await.enabled);
+        let restored = reloaded.workspace.snapshot().await;
+        assert_eq!(restored.replay.tabs.len(), 1);
+        assert_eq!(restored.replay.tabs[0].request_text, draft);
+        assert_eq!(
+            restored.replay.tabs[0].source_transaction_id,
+            Some(deleted_source)
+        );
+        assert_eq!(reloaded.store.len().await, 1);
+        assert!(reloaded.store.get(deleted_source).await.is_none());
+        assert!(reloaded.store.get(survivor).await.is_some());
+        drop(reloaded);
+        drop(operation_guard);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_disable_and_raise_are_rechecked_between_chunks() {
+        for disable in [true, false] {
+            let (state, path) = test_state("history-retention-chunks");
+            let session = state.session().await;
+            history_retention_records(&session, 300).await;
+            let (entered, resume) = session.history_retention.pause_after_next_chunk();
+            assert_eq!(
+                history_retention_save(&state, &session, history_retention_policy(1))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.store.len().await, 44);
+            let policy = if disable {
+                crate::history_retention::HistoryRetentionPolicy::Off
+            } else {
+                history_retention_policy(100)
+            };
+            assert_eq!(
+                history_retention_save(&state, &session, policy)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            resume.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while session.store.retention_compaction_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(session.store.len().await, 44);
+            drop(session);
+            drop(state);
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_retention_uncertain_read_only_workspace_survives_promotion() {
+        let (state, path) = test_state("history-retention-promotion");
+        let config = state.config.clone();
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let session = state.session_context_for_id(inactive.id).await.unwrap();
+        history_retention_records(&session, 3).await;
+        drop(session);
+        drop(state);
+        let state = Arc::new(AppState::new(config).unwrap());
+        let session = state
+            .read_session_context_for_id(inactive.id)
+            .await
+            .unwrap();
+        assert!(!session.retention_writable());
+        session.fail_next_workspace_write(crate::session::WorkspaceWriteFault::AfterReplacement);
+        let operation_lock = state.session_operation_lock(inactive.id).await;
+        let guard = operation_lock.lock().await;
+        let workspace = session.workspace.snapshot().await;
+        assert!(matches!(
+            state
+                .replace_workspace_state_and_persist(&session, workspace)
+                .await,
+            Err(crate::workspace::WorkspaceReplaceError::CommittedButUncertain(_))
+        ));
+        assert!(state.workspace_retention_is_uncertain(inactive.id));
+        drop(guard);
+        let read = state
+            .read_session_context_for_id(inactive.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            history_retention_save(&state, &read, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let promoted = state.session_context_for_id(inactive.id).await.unwrap();
+        assert!(promoted.retention_writable());
+        for _ in 0..15 {
+            promoted.store.notify_retention_work();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(promoted.store.len().await, 3);
+        assert_eq!(crate::history_retention::snapshot(&promoted, true, false, None).await.status.blocked_reason, Some(crate::history_retention::HistoryRetentionBlockedReason::WorkspaceDurabilityUncertain));
+        // A GET is not proof of fsync and must not lift the session-ID gate.
+        let response = super::get_history_retention(
+            State(state.clone()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(inactive.id),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.workspace_retention_is_uncertain(inactive.id));
+        let guard = operation_lock.lock().await;
+        state
+            .replace_workspace_state_and_persist(&promoted, promoted.workspace.snapshot().await)
+            .await
+            .unwrap();
+        drop(guard);
+        history_retention_wait_count(&promoted, 1).await;
+        assert_eq!(state.session().await.store.len().await, 0);
+        drop(promoted);
+        drop(read);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn history_retention_uncertain_policy_survives_canonical_context_replacement() {
+        let (state, path) = test_state("history-retention-policy-context");
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let session = state.session_context_for_id(inactive.id).await.unwrap();
+        history_retention_records(&session, 3).await;
+        session.fail_next_history_retention_write(
+            crate::session::WorkspaceWriteFault::AfterReplacement,
+        );
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(state.retention_persistence_is_uncertain(inactive.id));
+        let reloaded = state.sessions.load_context_read_only(inactive.id).unwrap();
+        let operation_lock = state.session_operation_lock(inactive.id).await;
+        let guard = operation_lock.lock().await;
+        state
+            .replace_workspace_state_and_persist(&reloaded, reloaded.workspace.snapshot().await)
+            .await
+            .unwrap();
+        drop(guard);
+        let replacement = state.session_context_for_id(inactive.id).await.unwrap();
+        assert!(!Arc::ptr_eq(&session, &replacement));
+        for _ in 0..15 {
+            replacement.store.notify_retention_work();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(replacement.store.len().await, 3);
+        let response = super::get_history_retention(
+            State(state.clone()),
+            Query(super::SessionScopedQuery {
+                session_id: Some(inactive.id),
+            }),
+        )
+        .await;
+        let current: crate::history_retention::HistoryRetentionSnapshot =
+            response_json(response).await;
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(crate::history_retention::HistoryRetentionBlockedReason::PersistenceError)
+        );
+        assert_eq!(
+            history_retention_save(&state, &replacement, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        history_retention_wait_count(&replacement, 1).await;
+        drop(replacement);
+        drop(reloaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_new_durable_replay_reference_wins_between_chunks() {
+        let (state, path) = test_state("history-retention-replay-race");
+        let session = state.session().await;
+        let ids = history_retention_records(&session, 300).await;
+        let (entered, resume) = session.history_retention.pause_after_next_chunk();
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let protected = ids[256];
+        let operation_lock = state.session_operation_lock(session.id()).await;
+        let guard = operation_lock.lock().await;
+        let mut workspace = session.workspace.snapshot().await;
+        workspace
+            .replay
+            .tabs
+            .push(crate::workspace::ReplayTabState {
+                id: "saved-between-chunks".into(),
+                tab_type: "http".into(),
+                source_transaction_id: Some(protected),
+                ..Default::default()
+            });
+        workspace.replay.active_tab_id = Some("saved-between-chunks".into());
+        state
+            .replace_workspace_state_and_persist(&session, workspace)
+            .await
+            .unwrap();
+        drop(guard);
+        resume.send(()).unwrap();
+        history_retention_wait_count(&session, 1).await;
+        assert!(session.store.get(protected).await.is_some());
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_malformed_persisted_policy_preserves_unrelated_state() {
+        let (state, path) = test_state("history-retention-malformed-policy");
+        let session = state.session().await;
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(false),
+                scope_patterns: Some(vec!["example.com".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        session.persist().await.unwrap();
+        let file = session.storage_dir().join("state.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        value["runtime"]["http_history_retention"] =
+            serde_json::json!({"mode":"future_unsupported","max_entries":-1});
+        std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+        let read = state.sessions.load_context_read_only(session.id()).unwrap();
+        let runtime = read.runtime.snapshot().await;
+        assert_eq!(
+            runtime.http_history_retention,
+            crate::history_retention::HistoryRetentionPolicy::Off
+        );
+        assert!(!runtime.http_capture_enabled);
+        assert_eq!(runtime.scope_patterns, ["example.com"]);
+        assert!(file.is_file());
+        drop(read);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_runtime_update_cannot_bypass_policy_cas() {
+        let (state, path) = test_state("history-retention-runtime-bypass");
+        let session = state.session().await;
+        let update:crate::runtime::RuntimeSettingsUpdate=serde_json::from_value(serde_json::json!({"http_capture_enabled":false,"http_history_retention":{"mode":"keep_newest","max_entries":1}})).unwrap();
+        session.runtime.update(update).await.unwrap();
+        assert_eq!(
+            session.runtime.history_retention_policy().await,
+            crate::history_retention::HistoryRetentionPolicy::Off
+        );
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_revision_prevents_aba_survives_restart_and_noop_is_stable() {
+        use crate::history_retention::{
+            history_retention_config_token, HistoryRetentionPolicy, HistoryRetentionSnapshot,
+        };
+        let (state, path) = test_state("history-retention-revision");
+        let session = state.session().await;
+        let initial = crate::history_retention::snapshot(&session, false, false, None).await;
+        assert_eq!(initial.config_revision, "0");
+        let enabled: HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, history_retention_policy(10)).await,
+        )
+        .await;
+        assert_eq!(enabled.config_revision, "1");
+        assert_eq!(enabled.changed, Some(true));
+        let disabled: HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, HistoryRetentionPolicy::Off).await,
+        )
+        .await;
+        assert_eq!(disabled.config_revision, "2");
+        assert_ne!(initial.config_token, disabled.config_token);
+        let query = super::SessionWriteQuery {
+            session_id: Some(session.id()),
+            expected_active_session_id: None,
+        };
+        let stale = super::update_history_retention(
+            State(state.clone()),
+            Query(query.clone()),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some(initial.config_token),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let foreign = super::update_history_retention(
+            State(state.clone()),
+            Query(query),
+            Json(super::HistoryRetentionPayload {
+                session_id: None,
+                expected_config_token: Some(history_retention_config_token(
+                    Uuid::new_v4(),
+                    &HistoryRetentionPolicy::Off,
+                    2,
+                )),
+                policy: history_retention_policy(1),
+            }),
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::CONFLICT);
+        let noop: HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, HistoryRetentionPolicy::Off).await,
+        )
+        .await;
+        assert_eq!(noop.changed, Some(false));
+        assert_eq!(noop.config_token, disabled.config_token);
+        assert_eq!(noop.config_revision, "2");
+        let reloaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        let (policy, revision) = reloaded.runtime.history_retention_config().await;
+        assert_eq!(revision, 2);
+        assert_eq!(
+            history_retention_config_token(session.id(), &policy, revision),
+            noop.config_token
+        );
+        drop(reloaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_revision_unknown_ack_is_visible_and_retry_keeps_revision() {
+        let (state, path) = test_state("history-retention-revision-uncertain");
+        let session = state.session().await;
+        session.fail_next_history_retention_write(
+            crate::session::WorkspaceWriteFault::AfterReplacement,
+        );
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(10))
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let current: crate::history_retention::HistoryRetentionSnapshot = response_json(
+            super::get_history_retention(
+                State(state.clone()),
+                Query(super::SessionScopedQuery {
+                    session_id: Some(session.id()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(current.config_revision, "1");
+        assert_eq!(
+            current.status.blocked_reason,
+            Some(crate::history_retention::HistoryRetentionBlockedReason::PersistenceError)
+        );
+        let confirmed: crate::history_retention::HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, history_retention_policy(10)).await,
+        )
+        .await;
+        assert_eq!(confirmed.config_revision, "1");
+        assert_eq!(confirmed.config_token, current.config_token);
+        assert_eq!(confirmed.changed, Some(false));
+        assert_eq!(confirmed.status.blocked_reason, None);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_revision_exhaustion_rejects_changes_but_preserves_noop() {
+        let (state, path) = test_state("history-retention-revision-max");
+        let session = state.session().await;
+        session
+            .runtime
+            .set_history_retention_policy(history_retention_policy(10), u64::MAX)
+            .await;
+        let response = history_retention_save(
+            &state,
+            &session,
+            crate::history_retention::HistoryRetentionPolicy::Off,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value = response_body_json(response).await;
+        assert_eq!(value["code"], "RETENTION_REVISION_EXHAUSTED");
+        let current: crate::history_retention::HistoryRetentionSnapshot = response_json(
+            history_retention_save(&state, &session, history_retention_policy(10)).await,
+        )
+        .await;
+        assert_eq!(current.config_revision, u64::MAX.to_string());
+        assert_eq!(current.changed, Some(false));
+        let loaded = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert_eq!(
+            loaded.runtime.history_retention_config().await,
+            (history_retention_policy(10), u64::MAX)
+        );
+        drop(loaded);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn history_retention_invalid_revision_fails_off_without_discarding_other_state() {
+        let (state, path) = test_state("history-retention-invalid-revision");
+        let session = state.session().await;
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                http_capture_enabled: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        session.persist().await.unwrap();
+        let file = session.storage_dir().join("state.json");
+        for invalid in [
+            serde_json::json!("bad"),
+            serde_json::Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            value["runtime"]["http_history_retention"] =
+                serde_json::json!({"mode":"keep_newest","max_entries":1});
+            value["runtime"]["http_history_retention_revision"] = invalid;
+            std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+            let loaded = state.sessions.load_context_read_only(session.id()).unwrap();
+            assert_eq!(
+                loaded.runtime.history_retention_config().await,
+                (
+                    crate::history_retention::HistoryRetentionPolicy::Off,
+                    u64::MAX
+                )
+            );
+            assert!(!loaded.runtime.http_capture_enabled().await);
+        }
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn history_retention_many_later_inserts_do_not_rewrite_each_time() {
+        let (state, path) = test_state("history-retention-coalesced");
+        let session = state.session().await;
+        history_retention_records(&session, 3).await;
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        history_retention_wait_count(&session, 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.store.retention_compaction_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .history_retention
+                .compactions_started
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        for index in 0..20 {
+            let record = TransactionRecord::http(
+                chrono::Utc::now(),
+                "GET".into(),
+                "https".into(),
+                "example.com".into(),
+                format!("/later-{index}"),
+                Some(200),
+                1,
+                MessageRecord::from_headers_and_body(&HeaderMap::new(), b"fixture", 4096),
+                None,
+                vec![],
+                None,
+                None,
+            );
+            session.store.insert(record).await;
+            history_retention_wait_count(&session, 1).await;
+        }
+        assert!(session.store.retention_compaction_pending());
+        assert_eq!(
+            session
+                .history_retention
+                .compactions_started
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[tokio::test]
+    async fn history_retention_read_only_restart_reports_uncompacted_tombstones() {
+        let (state, path) = test_state("history-retention-restart-status");
+        let inactive = state
+            .sessions
+            .create_session(Some("Synthetic inactive".into()))
+            .unwrap();
+        let session = state.session_context_for_id(inactive.id).await.unwrap();
+        let ids = history_retention_records(&session, 3).await;
+        let operation_lock = state.session_operation_lock(inactive.id).await;
+        let guard = operation_lock.lock().await;
+        // Direct primitive creates only a deletion journal after the full fixture
+        // snapshot, so read-only recovery never runs a scanner or inserts traffic.
+        let outcome = session
+            .store
+            .trim_retention(1, &std::collections::HashSet::new(), 256)
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_ids.len(), 2);
+        let read = state.sessions.load_context_read_only(inactive.id).unwrap();
+        assert_eq!(read.store.len().await, 1);
+        assert!(read.store.retention_compaction_pending());
+        let status = crate::history_retention::snapshot(&read, false, false, None).await;
+        assert!(status.status.disk_cleanup_pending);
+        assert!(status.status.pending);
+        assert!(read.store.get(ids[2]).await.is_some());
+        let reloaded = state.sessions.load_context(inactive.id).unwrap();
+        assert_eq!(reloaded.store.len().await, 1);
+        assert!(!reloaded.store.retention_compaction_pending());
+        assert_eq!(
+            reloaded
+                .store
+                .get(ids[2])
+                .await
+                .unwrap()
+                .request
+                .body_preview,
+            "synthetic history body 2"
+        );
+        drop(reloaded);
+        drop(read);
+        drop(guard);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 

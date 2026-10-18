@@ -1,0 +1,18 @@
+{
+  "fixture": "Loaded endpoint filters and exact API pagination",
+  "production_controller": "web/service-map.js",
+  "production_styles": "web/styles.css",
+  "production_dom": "targetServiceMapPanel extracted from web/index.html",
+  "app_bootstrap": false,
+  "networking": "CSP connect-src none and closed synthetic request adapter",
+  "sha256": {
+    "web/service-map.js": "8e24c5ebfd2a10c4e56ee7752eb03982d9a121f4e7598256b228cb7524248d4b",
+    "web/styles.css": "d975c30e67d8510251e6331ae7046595656e574681ebdcb364b576c47a447fa2",
+    "web/index.html": "25e128c32dab1376dbde6898b81b2c886c4b40439a99de1633cb1b10d609b73f",
+    "tests/fixtures/loaded-endpoints-browser.html": "466b73be12792e9256ff1a4aaf2628945a5cac6f36fe4eb632f59aaddea1eb84",
+    "tests/fixtures/loaded-endpoints-browser.js": "fa8409e0b907cf4e511ae3a3d876d9e4bc27e6cd846833cd291d295cbe0f5f0b",
+    "tests/fixtures/loaded-endpoints-browser.css": "f4d1de6aec95c5554d51863ff0f2c9765a5da62ed22d9e743c102eded851967d",
+    "tests/fixtures/loaded-endpoints-browser.README.md": "932908670c2ce887b06ad2d82a79712647a7a0d45da9f194f43ebbe4d97c867e",
+    "tests/fixtures/loaded-endpoints-browser-manifest.py": "fef578721c9240e720ab9e13b826c656c64c5b6516d5cbc8c20fcea128d89b24"
+  }
+}

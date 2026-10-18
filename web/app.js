@@ -203,7 +203,7 @@ const FUZZER_RESULT_BUFFER_ROWS = 30;
 const FINDINGS_ROW_HEIGHT = 27;
 let measuredFindingsRowHeight = FINDINGS_ROW_HEIGHT;
 const FINDINGS_BUFFER_ROWS = 20;
-const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "fuzzer", "sequence", "replay", "tools", "logger"]);
+const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "map", "fuzzer", "sequence", "replay", "recon", "tools", "logger"]);
 const IMPLEMENTED_PROXY_TABS = new Set(["intercept", "http-history", "websockets-history", "replace", "findings", "oast", "proxy-settings"]);
 const DECODER_SCRIPT_SOURCES = [
   "/decoder/lib/jquery-1.7.2.min.js",
@@ -429,6 +429,7 @@ const state = {
   sessions: [],
   activeSession: null,
   selectedSessionId: null,
+  dashboardStorageSessionId: null,
   sessionSortKey: "created_at",
   sessionSortDir: "desc",
   activeTool: "proxy",
@@ -465,11 +466,20 @@ const state = {
   historyColumnOrder: [...DEFAULT_HISTORY_COLUMN_ORDER],
   wsColumnWidths: createDefaultWsColumnWidths(),
   filterSettings: createDefaultFilterSettings(),
+  // Service Map's own display filter, as Burp keeps one for its site map.
+  serviceMapFilterSettings: createDefaultFilterSettings(),
+  // Request kinds whose links the map does not draw: frames and resource loads by default.
+  serviceMapHiddenLinkKinds: ["frame", "script", "static"],
+  // How the map groups sites and what it hides, in every session.
+  serviceMapSiteDisplay: { groupSites: true, expandedSites: [], hidden: [] },
   targetScopeDraft: "",
   targetScopeExcludeDraft: "",
   targetScopeDirty: false,
+  targetScopeDraftVersion: 0,
+  targetScopeSaveToken: 0,
   targetScopeEditorSessionId: null,
   targetExpandedHosts: new Set(),
+  activeTargetView: "service-map",
   intercepts: [],
   responseIntercepts: [],
   interceptRules: [],
@@ -506,6 +516,8 @@ const state = {
   matchReplaceRules: [],
   selectedMatchReplaceRuleId: null,
   matchReplaceDirty: false,
+  matchReplaceDraftVersion: 0,
+  matchReplaceSaveToken: 0,
   matchReplaceEditorSessionId: null,
   targetSiteMap: [],
   oastCallbacks: [],
@@ -544,6 +556,7 @@ const state = {
   workbenchHeight: null,
   workbenchPaneWidths: null,
   websocketPaneWidth: null,
+  serviceMapDetailWidth: null,
   wsReplayLeftWidth: null,
   wsReplayFrameDetailHeight: null,
 };
@@ -581,6 +594,7 @@ let _interceptToggleRequestSeq = 0;
 let _interceptToggleInFlight = false;
 
 const els = {
+  reconShell: document.getElementById("reconShell"),
   dashboardShell: document.getElementById("dashboardShell"),
   dashboardCurrentSessionName: document.getElementById("dashboardCurrentSessionName"),
   dashboardCurrentSessionStatus: document.getElementById("dashboardCurrentSessionStatus"),
@@ -613,12 +627,14 @@ const els = {
   proxyShell: document.getElementById("proxyShell"),
   replayShell: document.getElementById("replayShell"),
   toolsShell: document.getElementById("toolsShell"),
+  toolsLoadError: document.getElementById("toolsLoadError"),
   toolsActiveToolTitle: document.getElementById("toolsActiveToolTitle"),
   replayTabStrip: document.getElementById("replayTabStrip"),
   newReplayTabButton: document.getElementById("newReplayTabButton"),
   fuzzerShell: document.getElementById("fuzzerShell"),
   sequenceShell: document.getElementById("sequenceShell"),
   targetShell: document.getElementById("targetShell"),
+  mapShell: document.getElementById("mapShell"),
   loggerShell: document.getElementById("loggerShell"),
   filterBar: document.getElementById("filterBar"),
   trafficRegion: document.getElementById("trafficRegion"),
@@ -681,6 +697,28 @@ const els = {
   oastDetailTitle: document.getElementById("oastDetailTitle"),
   oastDetailView: document.getElementById("oastDetailView"),
   proxySettingsPanel: document.getElementById("proxySettingsPanel"),
+  upstreamPeerSection: document.getElementById("upstreamPeerSection"),
+  upstreamPeerSession: document.getElementById("upstreamPeerSession"),
+  upstreamPeerEnabled: document.getElementById("upstreamPeerEnabled"),
+  upstreamPeerError: document.getElementById("upstreamPeerError"),
+  upstreamPeerStatus: document.getElementById("upstreamPeerStatus"),
+  upstreamPeerSave: document.getElementById("upstreamPeerSave"),
+  upstreamPeerCancel: document.getElementById("upstreamPeerCancel"),
+  upstreamPeerRefresh: document.getElementById("upstreamPeerRefresh"),
+  historyRetentionSection: document.getElementById("historyRetentionSection"),
+  historyRecoveredNotes: document.getElementById("historyRecoveredNotes"),
+  historyRecoveredNotesSummary: document.getElementById("historyRecoveredNotesSummary"),
+  historyRecoveredNotesList: document.getElementById("historyRecoveredNotesList"),
+  historyRetentionSession: document.getElementById("historyRetentionSession"),
+  historyRetentionEnabled: document.getElementById("historyRetentionEnabled"),
+  historyRetentionPreset: document.getElementById("historyRetentionPreset"),
+  historyRetentionCustom: document.getElementById("historyRetentionCustom"),
+  historyRetentionCustomField: document.getElementById("historyRetentionCustomField"),
+  historyRetentionError: document.getElementById("historyRetentionError"),
+  historyRetentionStatus: document.getElementById("historyRetentionStatus"),
+  historyRetentionSave: document.getElementById("historyRetentionSave"),
+  historyRetentionCancel: document.getElementById("historyRetentionCancel"),
+  historyRetentionRefresh: document.getElementById("historyRetentionRefresh"),
   requestView: document.getElementById("requestView"),
   requestLines: document.getElementById("requestLines"),
   responseView: document.getElementById("responseView"),
@@ -718,6 +756,8 @@ const els = {
   closeDisplaySettingsButton: document.getElementById("closeDisplaySettingsButton"),
   applyDisplaySettingsButton: document.getElementById("applyDisplaySettingsButton"),
   resetDisplaySettingsButton: document.getElementById("resetDisplaySettingsButton"),
+  displaySettingsLoadStatus: document.getElementById("displaySettingsLoadStatus"),
+  retryDisplaySettingsButton: document.getElementById("retryDisplaySettingsButton"),
   displayThemeSelect: document.getElementById("displayThemeSelect"),
   displaySizeInput: document.getElementById("displaySizeInput"),
   displayUiFontSelect: document.getElementById("displayUiFontSelect"),
@@ -926,6 +966,9 @@ const sectionToggles = Array.from(document.querySelectorAll(".section-toggle"));
 let sortHeaders = Array.from(document.querySelectorAll(".sort-header"));
 let historyColumnHandles = Array.from(document.querySelectorAll(".column-resize-handle"));
 
+let reconController = null;
+let targetServiceMapController = null;
+let targetServiceMapEventStreamReady = () => false;
 let refreshTimer = null;
 let auxTimer = null;
 let eventSource = null;
@@ -946,6 +989,9 @@ const workspaceClientId = createWorkspaceClientId();
 let workspaceSaveLoopPromise = null;
 let workspaceSaveConflictPending = false;
 let workspaceStateGeneration = 0;
+let renderedHttpReplayDraftOwner = null;
+const workspacePendingReplayCloses = new Map();
+const workspaceReplayMetadataEdits = new WeakMap();
 let workspaceExternalLoadGeneration = 0;
 let workspaceExternalAppliedGeneration = 0;
 // Highest replay-tab count a workspace may hold; must match
@@ -967,6 +1013,13 @@ let uiSettingsSaveTimer = null;
 let uiSettingsDirty = false;
 let uiSettingsInFlight = false;
 let uiSettingsSavePromise = null;
+let uiSettingsLoadPromise = null;
+let uiSettingsLoadState = "loading";
+let uiSettingsInitialPostGeneration = 0;
+let uiSettingsInitialPostRevision = 0;
+let displaySettingsReady = false;
+let pendingDisplaySettingsApply = null;
+const displaySettingsEditedControls = new Set();
 let lastUiSettingsPayload = null;
 let proxySettingsSaveInFlight = false;
 let proxySettingsSavePromise = null;
@@ -1077,6 +1130,8 @@ async function init() {
   // Ensure Settings tab data loads on startup if it's the active tab
   if (state.activeProxyTab === "proxy-settings") {
     loadRuntimeSettings().catch((error) => console.error(error));
+    loadHistoryRetentionSettings();
+    loadUpstreamPeerSettings();
   }
   renderIntercepts();
   renderWebsocketSessions();
@@ -1125,6 +1180,14 @@ function setActiveProxyTab(tab, options = {}) {
 }
 
 function bindEvents() {
+  initializeTargetWorkspace();
+  if (window.SniperRecon && els.reconShell) {
+    reconController = window.SniperRecon.createController({
+      root: els.reconShell,
+      getSessionId: currentSessionId,
+      getSessionGeneration: () => workspaceStateGeneration,
+    });
+  }
   window.addEventListener("resize", resetLayoutTextareas);
   document.addEventListener("visibilitychange", flushWorkspaceStateBeforeHidden);
   window.addEventListener("pagehide", flushWorkspaceStateOnUnload);
@@ -1141,9 +1204,8 @@ function bindEvents() {
       if (state.activeTool === "dashboard") {
         loadSessions({ reloadOnActiveChange: true }).catch(handleWorkspaceActionError);
       }
-      if (state.activeTool === "target") {
-        loadTargetSiteMap(true).catch((error) => console.error(error));
-      }
+      if (state.activeTool === "map") targetServiceMapController?.refresh({ force: true });
+      if (state.activeTool === "target") loadTargetSiteMap(true).catch((error) => console.error(error));
       if (state.activeTool === "logger") {
         loadEventLog().catch((error) => console.error(error));
       }
@@ -1173,6 +1235,8 @@ function bindEvents() {
       }
       if (state.activeProxyTab === "proxy-settings") {
         loadRuntimeSettings().catch((error) => console.error(error));
+        loadHistoryRetentionSettings();
+        loadUpstreamPeerSettings();
       }
       if (state.activeProxyTab === "replace") {
         flushMatchReplaceDraft()
@@ -1468,6 +1532,7 @@ function bindEvents() {
       await requireOkResponse(response, "Failed to change capture.");
       const runtime = await response.json();
       if (sessionId !== currentSessionId()) return;
+      if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
       state.runtime = runtime;
       syncHttpCapturePill();
     } catch (error) {
@@ -1493,6 +1558,7 @@ function bindEvents() {
           await requireOkResponse(response, "Failed to clear the history.");
           const result = await response.json();
           if (sessionId !== currentSessionId()) return;
+          targetServiceMapController?.invalidate();
           clearHttpHistorySelectionPreview();
           state.selectedId = null;
           state.selectedRecord = null;
@@ -1530,6 +1596,7 @@ function bindEvents() {
       if (sessionId !== currentSessionId()) {
         return;
       }
+      if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
       state.runtime = runtime;
       const savedScopeOnly = state.runtime?.intercept_scope_only ?? nextScopeOnly;
       state.interceptInScopeOnly = savedScopeOnly;
@@ -1595,6 +1662,14 @@ function bindEvents() {
   });
   els.applyFilterSettingsButton.addEventListener("click", applyFilterSettings);
   els.resetFilterSettingsButton.addEventListener("click", () => {
+    if (state.filterModalTarget === "serviceMap") {
+      state.serviceMapFilterSettings = createDefaultFilterSettings();
+      hydrateFilterForm();
+      filterSettingsEditedControls.clear();
+      els.filterModal.querySelectorAll("input").forEach((control) => filterSettingsEditedControls.add(control));
+      serviceMapFilterApplied();
+      return;
+    }
     state.filterSettings = createDefaultFilterSettings();
     hydrateFilterForm();
     filterSettingsEditedControls.clear();
@@ -1623,6 +1698,12 @@ function bindEvents() {
   });
 
   els.applyDisplaySettingsButton.addEventListener("click", saveDisplaySettingsFromForm);
+  els.retryDisplaySettingsButton.addEventListener("click", loadUiSettings);
+  displaySettingsFormControls().forEach((control) => {
+    const markEdited = () => displaySettingsEditedControls.add(control);
+    control.addEventListener("input", markEdited);
+    control.addEventListener("change", markEdited);
+  });
   els.resetDisplaySettingsButton.addEventListener("click", () => {
     const defaults = createDefaultDisplaySettings();
     els.displayThemeSelect.value = defaults.theme;
@@ -1630,6 +1711,7 @@ function bindEvents() {
     els.displayUiFontSelect.value = defaults.uiFont;
     els.displayMonoFontSelect.value = defaults.monoFont;
     els.displayRenderResourcesInput.checked = defaults.renderResources;
+    displaySettingsFormControls().forEach((control) => displaySettingsEditedControls.add(control));
     previewDisplaySettingsFromForm();
   });
   [els.displayThemeSelect, els.displayUiFontSelect, els.displayMonoFontSelect].forEach((element) => {
@@ -1651,7 +1733,7 @@ function bindEvents() {
   onClickWithProgress(els.dashboardCreateSessionButton, () =>
     createSession().catch(handleWorkspaceActionError));
   onClickWithProgress(els.dashboardOpenStorageBtn, () => {
-    const sessionId = state.selectedSessionId || state.activeSession?.id || state.sessions.find((s) => s.active)?.id;
+    const sessionId = state.dashboardStorageSessionId;
     if (!sessionId) return undefined;
     return revealSessionFolder(sessionId).catch((error) => {
       console.error(error);
@@ -1787,6 +1869,16 @@ function bindEvents() {
     loadSettings()
       .then(renderProxySettings)
       .catch((error) => console.error(error)));
+  els.upstreamPeerEnabled?.addEventListener("change", editUpstreamPeerSettings);
+  els.upstreamPeerSave?.addEventListener("click", saveUpstreamPeerSettings);
+  els.upstreamPeerCancel?.addEventListener("click", cancelUpstreamPeerSettings);
+  els.upstreamPeerRefresh?.addEventListener("click", loadUpstreamPeerSettings);
+  els.historyRetentionEnabled?.addEventListener("change", editHistoryRetentionSettings);
+  els.historyRetentionPreset?.addEventListener("change", editHistoryRetentionSettings);
+  els.historyRetentionCustom?.addEventListener("input", editHistoryRetentionSettings);
+  els.historyRetentionSave?.addEventListener("click", saveHistoryRetentionSettings);
+  els.historyRetentionCancel?.addEventListener("click", cancelHistoryRetentionSettings);
+  els.historyRetentionRefresh?.addEventListener("click", loadHistoryRetentionSettings);
   document.getElementById("proxySettingAutoContentLength")?.addEventListener("change", (e) => {
     localStorage.setItem("sniper_auto_content_length", e.target.checked);
   });
@@ -1892,7 +1984,7 @@ function bindEvents() {
     }
     syncMatchReplaceEditor();
     return saveMatchReplaceRules()
-      .then(() => showToast("Rule saved"))
+      .then((saved) => { if (saved !== false) showToast("Rule saved"); })
       .catch((error) => { console.error(error); showToast("Failed to save rule", "error"); });
   });
   els.addMatchReplaceRuleButton.addEventListener("click", () => {
@@ -1921,14 +2013,20 @@ function bindEvents() {
   });
   onClickWithProgress(els.saveTargetScopeButton, () =>
     saveTargetScope()
-      .then(() => showToast("Scope saved"))
+      .then((saved) => { if (saved !== false) showToast("Scope saved"); })
       .catch((error) => { console.error(error); showToast(error?.message || "Failed to save scope", "error"); }));
   els.targetScopeEditor.addEventListener("input", () => {
+    if (state.targetScopeDraft !== els.targetScopeEditor.value) {
+      state.targetScopeDraftVersion = (state.targetScopeDraftVersion || 0) + 1;
+    }
     state.targetScopeDraft = els.targetScopeEditor.value;
     state.targetScopeDirty = true;
     state.targetScopeEditorSessionId = currentSessionId();
   });
   els.targetScopeExcludeEditor?.addEventListener("input", () => {
+    if (state.targetScopeExcludeDraft !== els.targetScopeExcludeEditor.value) {
+      state.targetScopeDraftVersion = (state.targetScopeDraftVersion || 0) + 1;
+    }
     state.targetScopeExcludeDraft = els.targetScopeExcludeEditor.value;
     state.targetScopeDirty = true;
     state.targetScopeEditorSessionId = currentSessionId();
@@ -2064,6 +2162,7 @@ function bindEvents() {
       els.replayRequestEditor.value = restored;
       const tab = getActiveReplayTab();
       if (tab) {
+        if (renderedHttpReplayDraftOwner?.tab === tab) renderedHttpReplayDraftOwner.preservedVersionDraft = null;
         tab.requestText = restored;
         clearReplayResponseForDraftChange(tab);
       }
@@ -2159,6 +2258,7 @@ function bindEvents() {
     const ver = e.target.value;
     const tab = getActiveReplayTab();
     if (!tab || tab.type === "websocket") return;
+    if (renderedHttpReplayDraftOwner?.tab === tab) renderedHttpReplayDraftOwner.preservedVersionDraft = null;
     tab.httpVersionMode = ver || "";
     const cv = getCMView("replayReq");
     const text = tab.requestBytes
@@ -2264,6 +2364,8 @@ function bindEvents() {
         return;
       }
       if (event.key === "Escape") {
+        // Let the IME cancel composition without discarding the dialog's draft.
+        if (event.isComposing) return;
         event.preventDefault();
         activeModalAction.close();
         return;
@@ -2398,6 +2500,7 @@ function bindEvents() {
     }
 
     if (
+      !event.defaultPrevented &&
       !event.metaKey &&
       !event.ctrlKey &&
       !event.altKey &&
@@ -2451,6 +2554,7 @@ function bindEvents() {
 
     // Arrow keys in Dashboard: navigate session rows
     if (
+      !event.defaultPrevented &&
       !event.metaKey &&
       !event.ctrlKey &&
       !event.altKey &&
@@ -2472,6 +2576,7 @@ function bindEvents() {
 
     // Arrow keys in WS Replay: navigate frames
     if (
+      !event.defaultPrevented &&
       (event.key === "ArrowUp" || event.key === "ArrowDown") &&
       !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey &&
       state.activeTool === "replay" &&
@@ -2522,9 +2627,10 @@ function bindEvents() {
       const idx = visualOrder.findIndex((t) => t.id === state.activeReplayTabId);
       const len = visualOrder.length;
       const next = event.shiftKey ? (idx - 1 + len) % len : (idx + 1) % len;
+      if (!preserveActiveHttpReplayDraftBeforeNavigation(getActiveReplayTab(), "switching tabs")) return;
       state.activeReplayTabId = visualOrder[next].id;
       scheduleWorkspaceStateSave();
-      renderReplay();
+      renderReplay({ forceToolbarSync: true });
       return;
     }
 
@@ -2682,6 +2788,7 @@ function bindEvents() {
   bindWorkbenchStackResizer(els.historyWorkbenchResizer);
   bindWebsocketPaneResizer(els.websocketSplitResizer);
   bindWebsocketStackResizer(els.websocketStackResizer);
+  bindServiceMapResizer(document.getElementById("serviceMapResizer"));
   applyWsColumnWidths();
   bindWsColumnResizers();
 
@@ -2753,9 +2860,11 @@ async function loadSettings(retries = 5) {
 
 async function _applySettings(response) {
   state.settings = await response.json();
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, state.settings.runtime);
   state.runtime = state.settings.runtime;
   syncHttpCapturePill();
   state.activeSession = state.settings.active_session;
+  if (typeof reconController !== "undefined") reconController?.syncSession();
   state.oastTokenClearPending = false;
   // Sync intercept scope pill with server state
   const interceptScopePill = document.getElementById("interceptInScopeToggle");
@@ -2767,7 +2876,7 @@ async function _applySettings(response) {
 
   els.proxyAddr.textContent = state.settings.proxy_addr;
   els.uiAddr.textContent = state.settings.ui_addr;
-  els.captureMode.textContent = `${formatSize(state.settings.body_preview_bytes)} preview cap / ${configuredTransactionEntryLimit()} HTTP entries`;
+  els.captureMode.textContent = `${formatSize(state.settings.body_preview_bytes)} body preview cap`;
   els.settingsSpecialHostHttp.textContent = state.settings.certificate.special_host_http;
 
   updateProxyStatusIndicator(state.settings.proxy_online);
@@ -2821,17 +2930,18 @@ const UPDATE_STEPS = new Set([
   "Restarting...",
 ]);
 
-// A filled disc with a ring in it: the ring's arc grows with the download, and
-// spins for the steps with nothing to measure. No text; the percentage is the
-// tooltip. The button keeps the size it had.
+// A bare ring: its arc grows with the download, and spins for the steps with
+// nothing to measure. A filled disc behind it was the loudest thing in the top
+// bar. No text; the percentage is the tooltip. The button keeps the size it had.
 const UPDATE_RING_MARKUP = `
   <span class="update-ring">
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <circle class="update-ring-disc" cx="12" cy="12" r="12"></circle>
-      <circle class="update-ring-track" cx="12" cy="12" r="6.5"></circle>
-      <circle class="update-ring-arc" cx="12" cy="12" r="6.5" pathLength="100"></circle>
+      <circle class="update-ring-track" cx="12" cy="12" r="8"></circle>
+      <circle class="update-ring-arc" cx="12" cy="12" r="8" pathLength="100"></circle>
     </svg>
   </span>`;
+
+let pendingSelfUpdateFailureReset = null;
 
 async function performSelfUpdate() {
   if (state.appVersion?.self_update_supported === false) {
@@ -2842,6 +2952,8 @@ async function performSelfUpdate() {
   // aria-disabled and not `disabled`: a disabled button may show no tooltip, and the
   // tooltip is where the percentage is.
   if (button.getAttribute("aria-disabled") === "true") return;
+  // Retire the previous failure before a retry captures its clean idle state.
+  pendingSelfUpdateFailureReset?.();
   button.setAttribute("aria-disabled", "true");
   const idleTitle = button.title;
   // Pinned before the content changes, so turning "Update" into a ring moves nothing.
@@ -2860,7 +2972,12 @@ async function performSelfUpdate() {
     button.title = measured ? `${percent}%` : "";
     button.setAttribute("aria-label", measured ? `Updating, ${percent} percent` : "Updating");
   };
+  let resetTimer = null;
   const reset = () => {
+    if (pendingSelfUpdateFailureReset !== reset) return;
+    pendingSelfUpdateFailureReset = null;
+    clearTimeout(resetTimer);
+    resetTimer = null;
     button.classList.remove("is-updating", "is-busy", "is-failed");
     button.removeAttribute("aria-busy");
     button.removeAttribute("aria-disabled");
@@ -2873,10 +2990,12 @@ async function performSelfUpdate() {
     button.classList.remove("is-busy");
     button.classList.add("is-failed");
     button.removeAttribute("aria-busy");
+    button.removeAttribute("aria-label");
     button.textContent = "Failed";
     button.title = reason;
     button.removeAttribute("aria-disabled");
-    setTimeout(reset, 4000);
+    pendingSelfUpdateFailureReset = reset;
+    resetTimer = setTimeout(reset, 4000);
   };
 
   const handleProgress = (data) => {
@@ -2948,8 +3067,10 @@ async function performSelfUpdate() {
 let sessionsLoadGeneration = 0;
 let sessionsAppliedLoadGeneration = 0;
 
-async function loadSessions({ reloadOnActiveChange = false } = {}) {
+async function loadSessions({ reloadOnActiveChange = false, preserveWorkspaceOwner = false } = {}) {
   const generation = ++sessionsLoadGeneration;
+  const workspaceGeneration = preserveWorkspaceOwner ? workspaceStateGeneration : null;
+  const workspaceSessionId = preserveWorkspaceOwner ? currentSessionId() : null;
   let sessions;
   try {
     const response = await fetch("/api/sessions");
@@ -2968,7 +3089,16 @@ async function loadSessions({ reloadOnActiveChange = false } = {}) {
   // Awaited startup/workspace reads still supply data while a refresh is pending.
   // Only an already accepted newer list can supersede this read.
   if (generation < sessionsAppliedLoadGeneration) return;
+  // Error reconciliation refreshes rows only. A later workspace load owns its
+  // own session list, and must not be relabelled by this older action's read.
+  if (preserveWorkspaceOwner && (workspaceGeneration !== workspaceStateGeneration
+    || workspaceSessionId !== currentSessionId())) return;
   sessionsAppliedLoadGeneration = generation;
+  if (preserveWorkspaceOwner) {
+    state.sessions = sessions;
+    renderDashboard();
+    return;
+  }
   const previousActiveSessionId = currentSessionId();
   const nextActiveSession = sessions.find((session) => session.active) || sessions[0] || null;
   if (
@@ -2984,7 +3114,68 @@ async function loadSessions({ reloadOnActiveChange = false } = {}) {
   }
   state.sessions = sessions;
   state.activeSession = nextActiveSession;
+  if (typeof reconController !== "undefined") reconController?.syncSession();
   renderDashboard();
+}
+
+async function reconcileSessionsAfterActionError(sessionId, workspaceGeneration) {
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
+  let readFailed = false;
+  try {
+    // An error can follow a committed registry write. Do not retry it or bind
+    // the existing workspace's drafts to the session reported by this read.
+    await loadSessions({ preserveWorkspaceOwner: true });
+  } catch (error) {
+    readFailed = true;
+    console.warn("Failed to refresh sessions after a session action:", error);
+  }
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
+  const listedActiveSession = state.sessions.find((session) => session.active);
+  const activeSessionChanged = listedActiveSession && listedActiveSession.id !== currentSessionId();
+  showToast(
+    readFailed
+      ? "The session action may have completed, but the session list could not be refreshed. Keep a copy of unsaved edits, then use Reload sessions before trying again."
+      : activeSessionChanged
+        ? "The active session changed. Your existing workspace is still open. Keep a copy of unsaved edits, then use Reload sessions to reconcile."
+        : "The session action may have completed. Check the session list before trying again.",
+    "error",
+    7000,
+  );
+}
+
+async function reconcileSessionsAfterCompletedAction() {
+  const sessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  let readFailed = false;
+  try {
+    await loadSessions({ preserveWorkspaceOwner: true });
+  } catch (error) {
+    readFailed = true;
+    console.warn("Failed to refresh sessions after a completed session action:", error);
+  }
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
+  const listedActiveSession = state.sessions.find((session) => session.active);
+  const activeSessionChanged = listedActiveSession && listedActiveSession.id !== sessionId;
+  showToast(
+    readFailed
+      ? "The session action completed, but the session list could not be refreshed. Your current workspace is still open. Keep a copy of unsaved edits, then use Reload sessions to reconcile."
+      : activeSessionChanged
+        ? "The session action completed and the active session changed. Your current workspace is still open. Keep a copy of unsaved edits, then use Reload sessions to reconcile."
+        : "The session action completed. Your current workspace is still open. Check the session list before continuing.",
+    "error",
+    7000,
+  );
+}
+
+function canReloadWorkspaceAfterSessionAction(sessionId, workspaceGeneration, saveVersion, scopeDraftVersion, matchReplaceDraftVersion, sequenceDraftVersion) {
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
+  // Input stays available while the action awaits its response. Capture supported
+  // DOM-only changes, and leave newer work with its owner instead of resetting it.
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("reloading this workspace")) return false;
+  return saveVersion === workspaceSaveVersion
+    && scopeDraftVersion === (state.targetScopeDraftVersion || 0)
+    && matchReplaceDraftVersion === (state.matchReplaceDraftVersion || 0)
+    && sequenceDraftVersion === (state.sequenceDraftVersion || 0);
 }
 
 async function loadWorkspaceState() {
@@ -3128,7 +3319,9 @@ async function adoptExternalReplayTabs() {
     const existing = local.get(tab.id);
     if (!existing) {
       // A baseline tab absent locally was closed here, not opened remotely.
-      if (baselineById.has(tab.id)) continue;
+      const pendingClose = workspacePendingReplayCloses.get(tab.id);
+      if (baselineById.has(tab.id) || (pendingClose
+        && pendingClose.generation === stateGeneration && pendingClose.sessionId === sessionId)) continue;
       const hydrated = hydrateReplayTab(tab);
       if (hydrated) {
         added.push(hydrated);
@@ -3137,6 +3330,20 @@ async function adoptExternalReplayTabs() {
         ));
       }
       continue;
+    }
+    // Pin state is independent of request/rename drafts. Merge this field even
+    // while its editor is dirty, without rerendering the editor or adopting the
+    // remote array order. A local-only toggle stays local; matching toggles
+    // converge and advance the baseline so the next remote toggle can follow.
+    const baseline = baselineById.get(tab.id);
+    if (baseline && baseline.type !== "websocket"
+      && existing.type !== "websocket" && tab.type !== "websocket") {
+      const nextPinned = !!tab.pinned;
+      if (!!existing.pinned === !!baseline.pinned || !!existing.pinned === nextPinned) {
+        if (!!existing.pinned !== nextPinned) updated = true;
+        existing.pinned = nextPinned;
+        baseline.pinned = nextPinned;
+      }
     }
     if (replayTabHasUncommittedEditorState(existing)) continue;
     if (adoptExternalReplayResult(existing, tab)) {
@@ -3245,10 +3452,14 @@ function adoptExternalReplayLabel(existing, incoming) {
   const baseline = workspaceReplayTabsById(workspaceSaveCommittedSnapshot).get(existing.id);
   if (!baseline) return false;
   const committed = normalizeReplayTabCustomLabel(baseline.custom_label);
+  const local = normalizeReplayTabCustomLabel(existing.customLabel);
   const next = normalizeReplayTabCustomLabel(incoming.custom_label);
-  if (normalizeReplayTabCustomLabel(existing.customLabel) !== committed || next === committed) return false;
-  existing.customLabel = next;
+  if (local !== committed && local !== next) return false;
+  // Matching renames converge without a render, but must move the baseline so
+  // a later remote rename is not mistaken for an unsaved local change.
   baseline.custom_label = next;
+  if (local === next) return false;
+  existing.customLabel = next;
   return true;
 }
 
@@ -3718,28 +3929,39 @@ async function flushQueuedWorkspaceStateSave(options = {}) {
   if (workspaceSaveConflictPending && !clearBypassableWorkspaceConflict(options)) {
     return;
   }
+  const stateGeneration = workspaceStateGeneration;
+  const sessionId = currentSessionId();
   if (workspaceSaveLoopPromise) {
-    return workspaceSaveLoopPromise;
+    await workspaceSaveLoopPromise;
+    if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
+    // A new session can join an older session's still-pending save. Its action
+    // must wait for its own save too; another waiter may already have started it.
+    if (!workspaceSaveConflictPending && (workspaceSaveDirty || workspaceSaveLoopPromise)) {
+      return flushQueuedWorkspaceStateSave(options);
+    }
+    return;
   }
 
-  const stateGeneration = workspaceStateGeneration;
-  workspaceSaveLoopPromise = runQueuedWorkspaceStateSaves(options)
+  const saveLoopPromise = runQueuedWorkspaceStateSaves(options)
     .finally(() => {
+      if (workspaceSaveLoopPromise !== saveLoopPromise) return;
       workspaceSaveLoopPromise = null;
       // A new session's timer may have joined this old save while it was still
       // awaiting its response. Give that session its own save loop afterwards.
-      if (stateGeneration !== workspaceStateGeneration && workspaceLoaded
+      if ((stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) && workspaceLoaded
         && workspaceSaveDirty && !workspaceSaveConflictPending) {
         scheduleWorkspaceStateSave();
       }
     });
-  return workspaceSaveLoopPromise;
+  workspaceSaveLoopPromise = saveLoopPromise;
+  return saveLoopPromise;
 }
 
 async function runQueuedWorkspaceStateSaves(options = {}) {
   const stateGeneration = workspaceStateGeneration;
+  const sessionId = currentSessionId();
   while (state.activeSession && workspaceSaveDirty && !workspaceSaveConflictPending
-    && stateGeneration === workspaceStateGeneration) {
+    && stateGeneration === workspaceStateGeneration && sessionId === currentSessionId()) {
     workspaceSaveDirty = false;
     const version = workspaceSaveVersion;
     const snapshot = snapshotWorkspaceState(options);
@@ -3748,7 +3970,8 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
     try {
       await saveWorkspaceState(snapshot, options);
     } catch (error) {
-      if (stateGeneration !== workspaceStateGeneration || workspaceSaveConflictPending) return;
+      if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()
+        || workspaceSaveConflictPending) return;
       if (isTooManyReplayTabsError(error)) {
         // The server rejects every save while over the limit. Re-sending the
         // same over-limit snapshot on a 1s timer just spams toasts and never
@@ -3783,8 +4006,15 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
       workspaceSaveDirty = true;
       window.clearTimeout(workspaceSaveTimer);
       workspaceSaveTimer = null;
+      if (error.commitUncertain) {
+        window.clearTimeout(wsTranscriptSaveTimer);
+        wsTranscriptSaveTimer = null;
+        wsTranscriptFirstDirtyAt = 0;
+        workspaceSaveLastSnapshot = null;
+      }
       showToast(
-        "Workspace changed elsewhere; local workspace edits were not saved. Reload the workspace to reconcile.",
+        error.commitUncertain ? error.message
+          : "Workspace changed elsewhere; local workspace edits were not saved. Reload the workspace to reconcile.",
         "error",
         6000,
       );
@@ -3792,7 +4022,8 @@ async function runQueuedWorkspaceStateSaves(options = {}) {
     } finally {
       workspaceSaveInFlight = false;
     }
-    if (stateGeneration !== workspaceStateGeneration || workspaceSaveConflictPending) return;
+    if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()
+      || workspaceSaveConflictPending) return;
     if (workspaceSaveVersion !== version) {
       workspaceSaveDirty = true;
     }
@@ -3886,6 +4117,7 @@ async function saveWorkspaceState(snapshot = null, options = {}) {
   }
   if (workspaceSaveConflictPending) throw new WorkspaceStateConflictError(workspaceSaveConflictLatest);
   const stateGeneration = workspaceStateGeneration;
+  const sessionId = currentSessionId();
   if (!snapshot) {
     snapshot = snapshotWorkspaceState(options);
   }
@@ -3899,22 +4131,33 @@ async function saveWorkspaceState(snapshot = null, options = {}) {
     body: JSON.stringify(snapshot),
   });
 
-  if (stateGeneration !== workspaceStateGeneration) return;
+  if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
   if (!response.ok) {
     if (response.status === 409) {
       const latest = await response.json().catch(() => null);
-      if (stateGeneration !== workspaceStateGeneration) return;
+      if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
       throw new WorkspaceStateConflictError(latest);
     }
-    throw new Error(await response.text());
+    const message = await response.text();
+    if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
+    if (response.status === 500) {
+      let latest = null;
+      try { latest = JSON.parse(message); } catch (_error) {}
+      // The file may already be replaced. Retrying this stale revision could
+      // overwrite a visible commit, so require the existing reload barrier.
+      if (latest?.code === "WORKSPACE_COMMIT_UNCERTAIN") {
+        throw new WorkspaceStateConflictError(latest);
+      }
+    }
+    throw new Error(message);
   }
   const saved = await response.json();
-  const currentSessionId = state.activeSession?.id || null;
+  const activeSessionId = currentSessionId();
   if (
-    stateGeneration !== workspaceStateGeneration || workspaceSaveConflictPending
+    stateGeneration !== workspaceStateGeneration || sessionId !== activeSessionId || workspaceSaveConflictPending
     || (Number.isFinite(saved?.revision) && saved.revision <= state.workspaceRevision)
-    || (snapshot?.session_id && snapshot.session_id !== currentSessionId)
-    || (saved?.session_id && saved.session_id !== currentSessionId)
+    || (snapshot?.session_id && snapshot.session_id !== activeSessionId)
+    || (saved?.session_id && saved.session_id !== activeSessionId)
   ) {
     return;
   }
@@ -3926,9 +4169,13 @@ async function saveWorkspaceState(snapshot = null, options = {}) {
 
 class WorkspaceStateConflictError extends Error {
   constructor(latest) {
-    super("Workspace state revision conflict");
+    const commitUncertain = latest?.code === "WORKSPACE_COMMIT_UNCERTAIN";
+    super(commitUncertain
+      ? "Workspace save could not be confirmed. Keep a copy of newer edits, then reload the app before retrying."
+      : "Workspace state revision conflict");
     this.name = "WorkspaceStateConflictError";
     this.latest = latest;
+    this.commitUncertain = commitUncertain;
   }
 }
 
@@ -3936,7 +4183,8 @@ function handleWorkspaceActionError(error) {
   console.error(error);
   if (error instanceof WorkspaceStateConflictError) {
     showToast(
-      "Workspace changed elsewhere. Reload the workspace before switching sessions.",
+      error.commitUncertain ? error.message
+        : "Workspace changed elsewhere. Reload the workspace before switching sessions.",
       "error",
       7000,
     );
@@ -3946,6 +4194,8 @@ function handleWorkspaceActionError(error) {
 }
 
 async function flushWorkspaceState(options = {}) {
+  const stateGeneration = workspaceStateGeneration;
+  const sessionId = currentSessionId();
   const hasQueuedChanges = !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer);
   const hasInFlightSave = !!(workspaceSaveInFlight || workspaceSaveLoopPromise);
   const hasPendingConflict = !!workspaceSaveConflictPending;
@@ -3958,20 +4208,23 @@ async function flushWorkspaceState(options = {}) {
     return;
   }
   if (hasPendingConflict && !clearBypassableWorkspaceConflict(options)) {
-    throw new WorkspaceStateConflictError(null);
+    throw new WorkspaceStateConflictError(workspaceSaveConflictLatest);
   }
   if (hasQueuedChanges) {
     workspaceSaveDirty = true;
     workspaceSaveVersion += 1;
   }
   await flushQueuedWorkspaceStateSave(options);
+  // Old-session options must never clear or retry a newer workspace's conflict.
+  if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
   if (workspaceSaveConflictPending) {
     if (clearBypassableWorkspaceConflict(options)) {
       await flushQueuedWorkspaceStateSave(options);
+      if (stateGeneration !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
     }
   }
   if (workspaceSaveConflictPending) {
-    throw new WorkspaceStateConflictError(null);
+    throw new WorkspaceStateConflictError(workspaceSaveConflictLatest);
   }
 }
 
@@ -4034,6 +4287,21 @@ async function flushBeforeNativeClose() {
   uiSettingsSaveTimer = null;
   if (uiSettingsDirty || uiSettingsInFlight) {
     await persistUiSettings();
+  }
+  if (state.historyRecoveredNotes?.size) {
+    throw new Error("Copy and discard recovered unsaved notes before closing again. They are only stored in this window.");
+  }
+  // A live editor may still own text that its debounce has not queued yet.
+  // Inspect it without interrupting composition or forcing another save.
+  for (const input of document.querySelectorAll("input.note-inline-input")) {
+    if (input.hasPendingNoteEdit?.()) {
+      throw new Error("Finish or cancel the note edit before closing again.");
+    }
+  }
+  // A note can be queued after the first drain while a later save is pending.
+  // Keep the window and that edit alive; the next close can retry the drain.
+  if (state._pendingAnnotations?.size || state._annotationInFlight?.size) {
+    throw new Error("Annotations are still unsaved. Close again to retry saving them.");
   }
 }
 
@@ -4219,8 +4487,17 @@ function syncActiveHttpReplayDraftFromDom() {
       ? cv.getContent()
       : (els.replayRequestEditor?.value ?? els.replayRequestHighlight?.innerText ?? null);
     if (typeof requestText === "string" && !replayRequestTextsEquivalent(requestText, tab.requestText)) {
-      syncReplayRequestTextFromEditor(requestText);
-      changed = true;
+      // The hidden legacy mirror can differ from the visible editor. Only skip
+      // this passive read when both still show the exact captured source.
+      const visibleText = cv ? requestText : (els.replayRequestCM ? null
+        : (els.replayRequestHighlight?.innerText ?? els.replayRequestEditor?.value ?? null));
+      const editorIdentity = cv || (els.replayRequestCM ? els.replayRequestCM : els.replayRequestHighlight || els.replayRequestEditor);
+      const versionControl = document.getElementById("replayHttpVersionSelect");
+      if (!isPreservedHttpReplayVersionSource(tab, visibleText, editorIdentity, versionControl)
+        || requestText !== visibleText) {
+        syncReplayRequestTextFromEditor(requestText);
+        changed = true;
+      }
     }
   }
   if (els.replayHostInput && els.replayPortInput) {
@@ -4691,8 +4968,26 @@ function hasPendingWorkspaceStateSave() {
   return !!(workspaceSaveDirty || workspaceSaveTimer || wsTranscriptSaveTimer || workspaceSaveInFlight || workspaceSaveLoopPromise);
 }
 
+function canLeaveSessionAfterDraftPreflight({ externalSessionChanged = false } = {}) {
+  // An editor whose save already finished can become dirty while a later phase
+  // waits. Only outstanding work blocks the transition; edits acknowledged by a
+  // later save are safe, even when their draft versions changed during preflight.
+  if (!state.targetScopeDirty && !state.matchReplaceDirty
+    && !(state.sequenceDirty && state.editingSequence)
+    && !hasPendingWorkspaceStateSave() && !workspaceSaveConflictPending
+    && !state._pendingAnnotations?.size && !state._annotationInFlight?.size) return true;
+  showToast(
+    `${externalSessionChanged ? "The active session changed. " : ""}Unsaved drafts arrived while preparing the session change. Your current workspace is still open. Save or discard the drafts before trying again.`,
+    "error",
+    7000,
+  );
+  return false;
+}
+
 async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
   const sessionId = options.sessionId || null;
+  const workspaceSessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
   const tabs = (state.replayTabs || []).filter((tab) => (
     tab
     && tab.type === "websocket"
@@ -4706,6 +5001,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
     guardWorkspaceRevision: false,
     sessionId,
   })));
+  if (workspaceSessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return;
   for (const result of results) {
     if (result.status === "rejected") {
       console.warn("Failed to clean up WebSocket replay tab before session reset:", result.reason);
@@ -4718,6 +5014,14 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
 
 function resetSessionScopedUiState() {
   workspaceStateGeneration += 1;
+  if (typeof reconController !== "undefined") reconController?.reset();
+  state.historyRetentionSettings = null;
+  state.upstreamPeerSettings = null;
+  state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
+  state._historyRetentionEvents = null;
+  state._historyDeletedIds = new Set();
+  state._historyRetentionClearedSelection = false;
+  state._historyRetentionReconcile = false;
   workspaceLoaded = false;
   clearReplaySendInFlight();
   closeContextMenu();
@@ -4799,6 +5103,7 @@ function resetSessionScopedUiState() {
   state.matchReplaceDirty = false;
   state.matchReplaceEditorSessionId = null;
   state.targetSiteMap = [];
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.reset();
   resetOastUiState();
   state.targetScopeDraft = "";
   state.targetScopeExcludeDraft = "";
@@ -4845,6 +5150,7 @@ function resetSessionScopedUiState() {
 }
 
 function renderReplayClearedState() {
+  renderedHttpReplayDraftOwner = null;
   if (els.replayTabStrip) {
     els.replayTabStrip.innerHTML = "";
   }
@@ -4907,13 +5213,22 @@ async function reloadSessionWorkspace({ cleanupBeforeReset = true } = {}) {
 
 async function handleExternalSessionChanged(previousSessionId = currentSessionId()) {
   const targetSessionId = previousSessionId || currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWorkspace = () => targetSessionId === currentSessionId()
+    && workspaceGeneration === workspaceStateGeneration;
+  // Bypassing the active-session guard is safe only for this original workspace.
+  // Another reload can finish while any of the draft preflights is awaiting I/O.
+  if (!ownsWorkspace()) return;
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("reloading this workspace after the active session changed")) return;
   const staleSessionWriteOptions = {
     bypassExpectedActiveSessionGuard: true,
     sessionId: targetSessionId,
   };
   let shouldReload = false;
   try {
-    if (!(await flushSequenceDraftBeforeExternalSessionReload(staleSessionWriteOptions))) {
+    const sequenceSaved = await flushSequenceDraftBeforeExternalSessionReload(staleSessionWriteOptions);
+    if (!ownsWorkspace()) return;
+    if (!sequenceSaved) {
       showToast(
         "Session changed before the Sequence draft finished saving. Save or discard the draft before reloading sessions.",
         "error",
@@ -4922,101 +5237,191 @@ async function handleExternalSessionChanged(previousSessionId = currentSessionId
       return;
     }
   } catch (error) {
+    if (!ownsWorkspace()) return;
     handleSequenceActionError(error);
     return;
   }
   if (!(await flushTargetScopeDraft(staleSessionWriteOptions))) {
     return;
   }
+  if (!ownsWorkspace()) return;
   if (!(await flushMatchReplaceDraft(staleSessionWriteOptions))) {
     return;
   }
+  if (!ownsWorkspace()) return;
   try {
     await flushAllPendingAnnotations(staleSessionWriteOptions);
   } catch (error) {
+    if (!ownsWorkspace()) return;
     handleWorkspaceActionError(error);
     return;
   }
+  if (!ownsWorkspace()) return;
   if (hasPendingWorkspaceStateSave()) {
     try {
       await flushWorkspaceState(staleSessionWriteOptions);
     } catch (error) {
+      if (!ownsWorkspace()) return;
       handleWorkspaceActionError(error);
       return;
     }
+    if (!ownsWorkspace()) return;
   }
   try {
     await cleanupWsReplayTabsBeforeStateReset(staleSessionWriteOptions);
+    if (!ownsWorkspace()) return;
     shouldReload = true;
   } catch (error) {
+    if (!ownsWorkspace()) return;
     handleWorkspaceActionError(error);
     return;
   }
   if (shouldReload) {
+    if (!preserveActiveHttpReplayDraftBeforeSessionChange("reloading this workspace after the active session changed")
+      || !canLeaveSessionAfterDraftPreflight({ externalSessionChanged: true })) return;
     await reloadSessionWorkspace({ cleanupBeforeReset: false });
   }
 }
 
 async function createSession() {
-  if (!(await flushTargetScopeDraft())) {
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("creating a session")) return;
+  const entrySessionId = currentSessionId();
+  const entryWorkspaceGeneration = workspaceStateGeneration;
+  const canContinuePreflight = () => {
+    if (entrySessionId === currentSessionId() && entryWorkspaceGeneration === workspaceStateGeneration) return true;
+    showToast(
+      "Session action stopped before its request was sent because the workspace changed. Review the current workspace before trying again.",
+      "error",
+      7000,
+    );
+    return false;
+  };
+  // Another action may reload the workspace while these draft saves settle.
+  // Stop before the next phase can consume that workspace's inputs or drafts.
+  try {
+    const scopeSaved = await flushTargetScopeDraft();
+    if (!canContinuePreflight() || !scopeSaved) return;
+    const matchReplaceSaved = await flushMatchReplaceDraft();
+    if (!canContinuePreflight() || !matchReplaceSaved) return;
+    const sequenceSaved = await flushSequenceDraft();
+    if (!canContinuePreflight() || !sequenceSaved) return;
+    await flushAllPendingAnnotations();
+    if (!canContinuePreflight()) return;
+    await flushWorkspaceState();
+    if (!canContinuePreflight()) return;
+    await cleanupWsReplayTabsBeforeStateReset();
+    if (!canContinuePreflight()) return;
+  } catch (error) {
+    if (!canContinuePreflight()) return;
+    throw error;
+  }
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("creating a session")
+    || !canLeaveSessionAfterDraftPreflight()) return;
+  const submittedName = els.dashboardCreateSessionName.value;
+  const name = submittedName.trim();
+  const actionSessionId = currentSessionId();
+  const actionWorkspaceGeneration = workspaceStateGeneration;
+  const actionWorkspaceSaveVersion = workspaceSaveVersion;
+  const actionScopeDraftVersion = state.targetScopeDraftVersion || 0;
+  const actionMatchReplaceDraftVersion = state.matchReplaceDraftVersion || 0;
+  const actionSequenceDraftVersion = state.sequenceDraftVersion || 0;
+  try {
+    const response = await fetch("/api/sessions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ name: name || null }),
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+  } catch (error) {
+    await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
+    throw error;
+  }
+  if (!canReloadWorkspaceAfterSessionAction(
+    actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion,
+    actionScopeDraftVersion, actionMatchReplaceDraftVersion, actionSequenceDraftVersion,
+  )) {
+    await reconcileSessionsAfterCompletedAction();
     return;
   }
-  if (!(await flushMatchReplaceDraft())) {
-    return;
-  }
-  if (!(await flushSequenceDraft())) {
-    return;
-  }
-  await flushAllPendingAnnotations();
-  await flushWorkspaceState();
-  await cleanupWsReplayTabsBeforeStateReset();
-  const name = els.dashboardCreateSessionName.value.trim();
-  const response = await fetch("/api/sessions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ name: name || null }),
-  });
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  els.dashboardCreateSessionName.value = "";
+  if (els.dashboardCreateSessionName.value === submittedName) els.dashboardCreateSessionName.value = "";
   await reloadSessionWorkspace({ cleanupBeforeReset: false });
 }
 
 async function activateSessionById(id, { force = false } = {}) {
-  if (!(await flushTargetScopeDraft())) {
-    return;
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("switching sessions")) return;
+  const entrySessionId = currentSessionId();
+  const entryWorkspaceGeneration = workspaceStateGeneration;
+  const canContinuePreflight = () => {
+    if (entrySessionId === currentSessionId() && entryWorkspaceGeneration === workspaceStateGeneration) return true;
+    showToast(
+      "Session action stopped before its request was sent because the workspace changed. Review the current workspace before trying again.",
+      "error",
+      7000,
+    );
+    return false;
+  };
+  // Another action may reload the workspace while these draft saves settle.
+  // Stop before the next phase can consume that workspace's inputs or drafts.
+  try {
+    const scopeSaved = await flushTargetScopeDraft();
+    if (!canContinuePreflight() || !scopeSaved) return;
+    const matchReplaceSaved = await flushMatchReplaceDraft();
+    if (!canContinuePreflight() || !matchReplaceSaved) return;
+    const sequenceSaved = await flushSequenceDraft();
+    if (!canContinuePreflight() || !sequenceSaved) return;
+    await flushAllPendingAnnotations();
+    if (!canContinuePreflight()) return;
+    await flushWorkspaceState();
+    if (!canContinuePreflight()) return;
+    await cleanupWsReplayTabsBeforeStateReset();
+    if (!canContinuePreflight()) return;
+  } catch (error) {
+    if (!canContinuePreflight()) return;
+    throw error;
   }
-  if (!(await flushMatchReplaceDraft())) {
-    return;
-  }
-  if (!(await flushSequenceDraft())) {
-    return;
-  }
-  await flushAllPendingAnnotations();
-  await flushWorkspaceState();
-  await cleanupWsReplayTabsBeforeStateReset();
-  const response = await fetch(`/api/sessions/${id}/activate${force ? "?force=true" : ""}`, {
-    method: "POST",
-  });
-  if (!response.ok) {
-    const message = await response.text();
-    // The server already waited for work that was about to finish. What is left is
-    // a stream that does not end on its own — a server-sent event stream, a long
-    // poll — so offer to cut it rather than leaving the user stuck.
-    if (response.status === 409 && !force && message.includes("proxy activity is still running")) {
-      showConfirmDialog(
-        `${message}.\n\nSwitch anyway? Anything still in flight is cut and will not be recorded.`,
-        () => {
-          activateSessionById(id, { force: true }).catch(handleWorkspaceActionError);
-        },
-        { title: "Proxy is busy", confirmLabel: "Switch anyway" },
-      );
-      return;
+  if (!preserveActiveHttpReplayDraftBeforeSessionChange("switching sessions")
+    || !canLeaveSessionAfterDraftPreflight()) return;
+  const actionSessionId = currentSessionId();
+  const actionWorkspaceGeneration = workspaceStateGeneration;
+  const actionWorkspaceSaveVersion = workspaceSaveVersion;
+  const actionScopeDraftVersion = state.targetScopeDraftVersion || 0;
+  const actionMatchReplaceDraftVersion = state.matchReplaceDraftVersion || 0;
+  const actionSequenceDraftVersion = state.sequenceDraftVersion || 0;
+  try {
+    const response = await fetch(`/api/sessions/${id}/activate${force ? "?force=true" : ""}`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      const message = await response.text();
+      // The server already waited for work that was about to finish. What is left is
+      // a stream that does not end on its own — a server-sent event stream, a long
+      // poll — so offer to cut it rather than leaving the user stuck.
+      if (response.status === 409 && !force && message.includes("proxy activity is still running")) {
+        showConfirmDialog(
+          `${message}.\n\nSwitch anyway? Anything still in flight is cut and will not be recorded.`,
+          () => {
+            activateSessionById(id, { force: true }).catch(handleWorkspaceActionError);
+          },
+          { title: "Proxy is busy", confirmLabel: "Switch anyway" },
+        );
+        return;
+      }
+      throw new Error(message);
     }
-    throw new Error(message);
+  } catch (error) {
+    await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
+    throw error;
+  }
+  if (!canReloadWorkspaceAfterSessionAction(
+    actionSessionId, actionWorkspaceGeneration, actionWorkspaceSaveVersion,
+    actionScopeDraftVersion, actionMatchReplaceDraftVersion, actionSequenceDraftVersion,
+  )) {
+    await reconcileSessionsAfterCompletedAction();
+    return;
   }
   state.selectedSessionId = id;
   await reloadSessionWorkspace({ cleanupBeforeReset: false });
@@ -5030,6 +5435,7 @@ async function loadRuntimeSettings() {
   if (sessionId !== currentSessionId()) {
     return;
   }
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
   state.runtime = runtime;
   renderInterceptStatus();
   renderProxySettings();
@@ -5164,6 +5570,7 @@ function selectedMimeTypes(filters) {
 }
 
 async function fetchTransactionPage(offsetOrOptions = 0) {
+  const retentionEpoch = state._historyRetentionEpoch || 0;
   const options = typeof offsetOrOptions === "object"
     ? offsetOrOptions
     : { offset: offsetOrOptions };
@@ -5177,7 +5584,7 @@ async function fetchTransactionPage(offsetOrOptions = 0) {
   }));
   if (!response.ok) {
     const message = await response.text();
-    if (!isCurrentHistoryQuerySignature(querySignature)) {
+    if (retentionEpoch !== (state._historyRetentionEpoch || 0) || !isCurrentHistoryQuerySignature(querySignature)) {
       return null;
     }
     if (els.historyMeta) els.historyMeta.textContent = `HTTP History filter error: ${message}`;
@@ -5188,7 +5595,7 @@ async function fetchTransactionPage(offsetOrOptions = 0) {
     throw new Error(message);
   }
   const page = await response.json();
-  if (!isCurrentHistoryQuerySignature(querySignature)) {
+  if (retentionEpoch !== (state._historyRetentionEpoch || 0) || !isCurrentHistoryQuerySignature(querySignature)) {
     return null;
   }
   return page;
@@ -5268,6 +5675,11 @@ async function loadTransactions(preserveSelection = true, options = {}) {
     state.historyPaging.loading = true;
     state.historyListError = "";
     const generation = state.historyPaging.generation;
+    const retentionEpoch = state._historyRetentionEpoch || 0;
+    const finishReconciliation = () => {
+      if (retentionEpoch === (state._historyRetentionEpoch || 0)
+        && state.historyPaging.generation === generation) state._historyRetentionReconcile = false;
+    };
     if (options.resetScroll || queryChanged) {
       clearHttpHistoryLoadedRowsForPendingQuery();
     }
@@ -5298,7 +5710,11 @@ async function loadTransactions(preserveSelection = true, options = {}) {
         state.historyPaging.hasMore = false;
         state.historyPaging.fullyLoaded = true;
         state.historyListError = error?.message || "Failed to load HTTP History.";
-        clearHttpHistoryLoadedRowsForPendingQuery();
+        if (typeof document !== "undefined" && document.querySelectorAll?.("input.note-inline-input").length) {
+          renderHistory({ preserveNoteEditor: true });
+        } else {
+          clearHttpHistoryLoadedRowsForPendingQuery();
+        }
       }
       throw error;
     }
@@ -5326,19 +5742,26 @@ async function loadTransactions(preserveSelection = true, options = {}) {
     }
 
     const visibleEntries = getVisibleEntries();
-    if (!preserveSelection || !visibleEntries.some((entry) => entry.item.id === state.selectedId)) {
+    const hasLiveNotes = typeof document !== "undefined" && document.querySelectorAll?.("input.note-inline-input").length > 0;
+    const reconcileRetention = state._historyRetentionReconcile || hasLiveNotes;
+    const preserveMissingSelection = reconcileRetention && preserveSelection && !queryChanged && !options.resetScroll && state.selectedId;
+    if (!state._historyRetentionClearedSelection && !preserveMissingSelection
+      && (!preserveSelection || !visibleEntries.some((entry) => entry.item.id === state.selectedId))) {
       state.selectedId = visibleEntries[0]?.item.id ?? null;
     }
 
-    renderHistory();
+    if (reconcileRetention) reconcileMissingHistoryNoteEditors();
+    renderHistory({ preserveNoteEditor: !!reconcileRetention });
     if (state.selectedId) {
       if (preserveSelection && canReuseSelectedHistoryRecord(state.selectedId)) {
+        finishReconciliation();
         return;
       }
       await selectHistoryTransaction(state.selectedId);
     } else {
       renderEmptyDetail();
     }
+    finishReconciliation();
   } finally {
     _historyFullLoadInFlight = Math.max(0, _historyFullLoadInFlight - 1);
     if (!_historyFullLoadInFlight && _pendingTransactionSummaries.length) {
@@ -5350,44 +5773,63 @@ async function loadTransactions(preserveSelection = true, options = {}) {
 async function loadTransactionDetail(id) {
   const generation = ++_historyDetailGeneration;
   const sessionId = currentSessionId();
-  const response = await fetch(transactionPath(id, sessionId));
-  if (generation !== _historyDetailGeneration || sessionId !== currentSessionId()) {
-    return null;
-  }
-  if (!response.ok) {
-    if (response.status === 404) {
-      const index = state.items.findIndex((item) => item.id === id);
-      let nextSelectedId = null;
-      if (index >= 0) {
-        state.items.splice(index, 1);
-        nextSelectedId = state.items[Math.min(index, state.items.length - 1)]?.id ?? null;
-        state._itemsVersion += 1;
-        adjustHistoryPagingAfterLocalRemoval(1);
-        precomputeItemIndexes();
-        invalidateVisibleEntriesCache();
-        refreshHistoryPagingCursorFromItems();
-        renderHistory();
-      }
-      if (state.selectedId === id) {
-        await selectHistoryTransaction(nextSelectedId, { scroll: true });
-      }
-    } else if (state.selectedId === id) {
-      state.selectedId = null;
-      updateHistorySelection(null);
-      renderEmptyDetail();
+  const reconcileRetention = state._historyRetentionReconcile === true;
+  while (true) {
+    const annotationGeneration = state._historyDetailAnnotationGeneration || 0;
+    const response = await fetch(transactionPath(id, sessionId));
+    if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
+      return null;
     }
-    return null;
-  }
+    if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
+    if (!response.ok) {
+      if (response.status === 404) {
+        if (reconcileRetention) {
+          applyConfirmedHistoryRemoval([id], sessionId);
+          return null;
+        }
+        const index = state.items.findIndex((item) => item.id === id);
+        let nextSelectedId = null;
+        if (index >= 0) {
+          state.items.splice(index, 1);
+          nextSelectedId = state.items[Math.min(index, state.items.length - 1)]?.id ?? null;
+          state._itemsVersion += 1;
+          adjustHistoryPagingAfterLocalRemoval(1);
+          precomputeItemIndexes();
+          invalidateVisibleEntriesCache();
+          refreshHistoryPagingCursorFromItems();
+          renderHistory();
+        }
+        if (state.selectedId === id) {
+          await selectHistoryTransaction(nextSelectedId, { scroll: true });
+        }
+      } else if (state.selectedId === id) {
+        state.selectedId = null;
+        updateHistorySelection(null);
+        renderEmptyDetail();
+      }
+      return null;
+    }
 
-  const record = await response.json();
-  if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
-    return null;
+    const record = await response.json();
+    if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
+      return null;
+    }
+    // A successful save can finish after this read captured its annotations. The
+    // pending overlay is gone by then, and a summary only has a truncated note.
+    // Read again under the same selection owner rather than display stale text.
+    if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
+    const pending = state._pendingAnnotations?.get(id);
+    if (pending?.sessionId === sessionId) {
+      for (const key of ["user_note", "color_tag"]) {
+        if (pending.payload?.[key] !== undefined) record[key] = pending.payload[key];
+      }
+    }
+    state.loadingDetailId = null;
+    observeAnnotationRevision(record);
+    state.selectedRecord = record;
+    renderDetail(state.selectedRecord);
+    return record;
   }
-  state.loadingDetailId = null;
-  observeAnnotationRevision(record);
-  state.selectedRecord = record;
-  renderDetail(state.selectedRecord);
-  return record;
 }
 
 function historyRecordSummarySignature(source) {
@@ -5432,6 +5874,7 @@ function canReuseSelectedHistoryRecord(id) {
 async function selectHistoryTransaction(id, options = {}) {
   state._historySelectionGeneration = (state._historySelectionGeneration || 0) + 1;
   const nextId = id ?? null;
+  if (nextId) state._historyRetentionClearedSelection = false;
   if (nextId && state.selectedId === nextId && canReuseSelectedHistoryRecord(nextId)) {
     updateHistorySelection(nextId);
     if (options.scroll) {
@@ -5879,7 +6322,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
     };
     state.websocketSessions = append
       ? mergeWebsocketAppendPage(pageItems, state.websocketSessions, summaryMutationGeneration)
-      : (summaryMutationGeneration === _websocketSummaryMutationGeneration
+      : (_websocketSummaryMutationById.size === 0 && summaryMutationGeneration === _websocketSummaryMutationGeneration
         ? pageItems
         : mergeWebsocketPageWithCurrentSummaries(
           pageItems,
@@ -5887,16 +6330,30 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
           summaryMutationGeneration,
           responsePaging,
         ));
+    for (const mutation of _websocketSummaryMutationById.values()) {
+      if (mutation.generation <= summaryMutationGeneration) mutation.counted = true;
+    }
+    for (const item of pageItems) {
+      const mutation = _websocketSummaryMutationById.get(item?.id);
+      if (mutation) mutation.counted = true;
+    }
     pruneWebsocketSummaryMutationCache();
+    const summariesChanged = summaryMutationGeneration !== _websocketSummaryMutationGeneration
+      || (_websocketSummaryMutationById.size > 0
+        && pageItems.some((item) => isWebsocketSummaryFresher(_websocketSummaryMutationById.get(item?.id)?.summary, item)));
     const loadedLimit = Math.min(
       WEBSOCKET_MAX_LOADED_SESSIONS,
-      Math.max(loadedOffset, state.websocketSessions.length),
+      summariesChanged ? state.websocketSessions.length : Math.max(loadedOffset, state.websocketSessions.length),
     );
     const capReached = serverHasMore && loadedLimit >= WEBSOCKET_MAX_LOADED_SESSIONS;
     state.websocketPaging = {
       querySignature,
-      total: Math.max(Number(page.total || 0), state.websocketSessions.length),
-      filteredTotal: page.filteredTotal,
+      total: Math.max(Number(page.total || 0), state.websocketSessions.length,
+        summariesChanged ? Number(state.websocketPaging?.total || 0) : 0),
+      // A partial page cannot establish the exact count after concurrent events.
+      filteredTotal: summariesChanged
+        ? (serverHasMore ? null : state.websocketSessions.length)
+        : page.filteredTotal,
       limit: loadedLimit,
       loadedOffset: loadedLimit,
       offset: pageOffset,
@@ -5904,7 +6361,7 @@ async function loadWebsockets(preserveSelection = true, options = {}) {
       hasMore: serverHasMore && !capReached,
       capReached,
       loading: false,
-      summaryMutationGeneration: _websocketSummaryMutationGeneration,
+      summaryMutationGeneration,
     };
     state.websocketListError = "";
     state.websocketHistoryDirty = false;
@@ -5984,7 +6441,7 @@ async function loadMoreWebsockets() {
   return Math.max(0, (state.websocketSessions || []).length - previousCount);
 }
 
-function adjustWebsocketPagingAfterLocalRemoval(removedCount = 1) {
+function adjustWebsocketPagingAfterLocalRemoval(removedCount = 1, options = {}) {
   const count = Math.max(0, Number(removedCount) || 0);
   if (!count) return;
   const paging = state.websocketPaging || createWebsocketPagingState();
@@ -5996,11 +6453,10 @@ function adjustWebsocketPagingAfterLocalRemoval(removedCount = 1) {
     : paging.filteredTotal;
   state.websocketPaging = {
     ...paging,
-    total: Math.max(state.websocketSessions.length, previousTotal - count),
+    total: Math.max(state.websocketSessions.length, previousTotal - (options.decrementTotal === false ? 0 : count)),
     filteredTotal,
     limit: Math.max(0, previousLimit - count),
     loadedOffset: Math.max(0, previousLoadedOffset - count),
-    loading: false,
   };
 }
 
@@ -6237,18 +6693,17 @@ function mergeWebsocketPageWithCurrentSummaries(
   const preserved = [];
   for (const item of pageItems || []) {
     if (!item?.id || seen.has(item.id)) continue;
-    const current = currentById.get(item.id);
-    const currentMutatedDuringRequest = (_websocketSummaryMutationById.get(item.id) || 0) > mutationGenerationAtRequest;
-    merged.push(
-      currentMutatedDuringRequest && isWebsocketSummaryFresher(current, item)
-        ? current
-        : item,
-    );
+    const mutation = _websocketSummaryMutationById.get(item.id);
+    const visible = currentById.get(item.id);
+    const current = isWebsocketSummaryFresher(mutation?.summary, visible) ? mutation.summary : visible;
+    const next = isWebsocketSummaryFresher(current, item) ? current : item;
+    if (mutation && isWebsocketSummaryFresher(next, mutation.summary)) mutation.summary = next;
     seen.add(item.id);
+    if (websocketSummaryMatchesCurrentQuery(next)) merged.push(next);
   }
   for (const item of currentItems || []) {
     if (!item?.id || seen.has(item.id)) continue;
-    if ((_websocketSummaryMutationById.get(item.id) || 0) <= mutationGenerationAtRequest) continue;
+    if ((_websocketSummaryMutationById.get(item.id)?.generation || 0) <= mutationGenerationAtRequest) continue;
     if (!websocketServerOrderCanAcceptSummaryEvents()) continue;
     if (!shouldInsertUnknownWebsocketSummary(item, pageItems, paging)) continue;
     preserved.push(item);
@@ -6276,23 +6731,25 @@ function mergeWebsocketAppendPage(pageItems, currentItems, mutationGenerationAtR
   }
   for (const item of pageItems || []) {
     if (!item?.id) continue;
-    const current = currentById.get(item.id);
-    const currentMutatedDuringRequest = (_websocketSummaryMutationById.get(item.id) || 0) > mutationGenerationAtRequest;
-    if (current) {
-      if (currentMutatedDuringRequest && isWebsocketSummaryFresher(current, item)) continue;
+    const mutation = _websocketSummaryMutationById.get(item.id);
+    const visible = currentById.get(item.id);
+    const current = isWebsocketSummaryFresher(mutation?.summary, visible) ? mutation.summary : visible;
+    const next = isWebsocketSummaryFresher(current, item) ? current : item;
+    if (mutation && isWebsocketSummaryFresher(next, mutation.summary)) mutation.summary = next;
+    if (seen.has(item.id)) {
       const index = indexById.get(item.id);
-      if (index >= 0) merged[index] = item;
+      if (index >= 0) merged[index] = next;
       continue;
     }
-    if (seen.has(item.id)) continue;
     indexById.set(item.id, merged.length);
-    merged.push(item);
+    merged.push(next);
     seen.add(item.id);
   }
-  if (merged.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
-    merged.length = WEBSOCKET_MAX_LOADED_SESSIONS;
+  const matching = merged.filter(websocketSummaryMatchesCurrentQuery);
+  if (matching.length > WEBSOCKET_MAX_LOADED_SESSIONS) {
+    matching.length = WEBSOCKET_MAX_LOADED_SESSIONS;
   }
-  return merged;
+  return matching;
 }
 
 function normalizeWebsocketFrameIndex(value) {
@@ -6602,10 +7059,17 @@ function websocketSummarySignature(summary) {
   ].join("|");
 }
 
-function noteWebsocketSummaryMutation(id) {
+function noteWebsocketSummaryMutation(summary) {
   _websocketSummaryMutationGeneration += 1;
-  if (id) {
-    _websocketSummaryMutationById.set(id, _websocketSummaryMutationGeneration);
+  if (summary?.id) {
+    const counted = _websocketSummaryMutationById.get(summary.id)?.counted
+      || (state.websocketSessions || []).some((item) => item.id === summary.id);
+    _websocketSummaryMutationById.delete(summary.id);
+    _websocketSummaryMutationById.set(summary.id, {
+      generation: _websocketSummaryMutationGeneration,
+      summary,
+      counted,
+    });
   }
   pruneWebsocketSummaryMutationCache();
 }
@@ -6648,9 +7112,16 @@ function queueWebsocketSummaryEvent(event) {
 
 function applyWebsocketSummary(summary) {
   if (!summary?.id) return;
+  const sessions = Array.isArray(state.websocketSessions) ? state.websocketSessions : [];
+  const existingIndex = sessions.findIndex((item) => item.id === summary.id);
+  const cached = _websocketSummaryMutationById.get(summary.id)?.summary;
+  const visible = existingIndex >= 0 ? sessions[existingIndex] : null;
+  const previous = isWebsocketSummaryFresher(cached, visible) ? cached : visible;
+  if (websocketSummarySignature(previous) === websocketSummarySignature(summary)
+    || isWebsocketSummaryFresher(previous, summary)) return;
+  noteWebsocketSummaryMutation(summary);
   if (!websocketServerOrderCanAcceptSummaryEvents()) {
     const selectedChanged = applySelectedWebsocketSummary(summary);
-    noteWebsocketSummaryMutation(summary.id);
     if (selectedChanged && isWebsocketHistoryVisible()) {
       scheduleVisibleWebsocketSelectionSync({ deferStaleDetail: true });
     }
@@ -6659,12 +7130,6 @@ function applyWebsocketSummary(summary) {
   }
 
   const filtersActive = websocketFilterIsActive();
-  const sessions = Array.isArray(state.websocketSessions) ? state.websocketSessions : [];
-  const existingIndex = sessions.findIndex((item) => item.id === summary.id);
-  const previous = existingIndex >= 0 ? sessions[existingIndex] : null;
-  if (websocketSummarySignature(previous) === websocketSummarySignature(summary)) {
-    return;
-  }
   const summaryMatches = websocketSummaryMatchesCurrentQuery(summary);
 
   if (filtersActive && existingIndex < 0 && !summaryMatches) {
@@ -6694,7 +7159,6 @@ function applyWebsocketSummary(summary) {
         limit: Number(paging.limit ?? paging.loadedOffset ?? 0) || 0,
         loadedOffset: Number(paging.loadedOffset ?? paging.limit ?? 0) || 0,
         capReached: Boolean(paging.capReached),
-        loading: false,
       };
       if (selectedChanged && isWebsocketHistoryVisible()) {
         scheduleVisibleWebsocketSelectionSync({ deferStaleDetail: true });
@@ -6707,7 +7171,9 @@ function applyWebsocketSummary(summary) {
     }
     const knownTotal = Number(paging.total || 0);
     const hasMore = Boolean(paging.hasMore);
-    const nextTotal = Math.max(knownTotal + 1, nextSessions.length);
+    const mutation = _websocketSummaryMutationById.get(summary.id);
+    const nextTotal = Math.max(knownTotal + (mutation?.counted ? 0 : 1), nextSessions.length);
+    if (mutation) mutation.counted = true;
     const capReached = Boolean(paging.capReached)
       || (nextSessions.length >= WEBSOCKET_MAX_LOADED_SESSIONS && nextTotal > nextSessions.length);
     const nextLoadedOffset = Math.min(
@@ -6720,18 +7186,17 @@ function applyWebsocketSummary(summary) {
     state.websocketPaging = {
       ...paging,
       total: nextTotal,
+      filteredTotal: isKnownCount(paging.filteredTotal) ? Number(paging.filteredTotal) + 1 : null,
       limit: nextLoadedOffset,
       loadedOffset: nextLoadedOffset,
       hasMore: hasMore && nextSessions.length < WEBSOCKET_MAX_LOADED_SESSIONS,
       capReached,
-      loading: false,
     };
   }
   state.websocketSessions = nextSessions;
   if (removedVisibleCount) {
-    adjustWebsocketPagingAfterLocalRemoval(removedVisibleCount);
+    adjustWebsocketPagingAfterLocalRemoval(removedVisibleCount, { decrementTotal: false });
   }
-  noteWebsocketSummaryMutation(summary.id);
 
   const selectedChanged = applySelectedWebsocketSummary(summary);
 
@@ -6879,14 +7344,16 @@ function applySelectedWebsocketSummary(summary) {
 }
 
 function pruneWebsocketSummaryMutationCache() {
-  if (!_websocketSummaryMutationById.size) {
-    return;
+  // A filtered-out session still owns newer state than an overlapping page.
+  // Keep that evidence bounded, and invalidate reads before evicting any of it.
+  if (_websocketSummaryMutationById.size <= WEBSOCKET_MAX_LOADED_SESSIONS) return;
+  if (state.websocketPaging?.loading) {
+    _websocketLoadGeneration += 1;
+    state.websocketPaging.loading = false;
+    scheduleWebsocketPageRefresh();
   }
-  const visibleIds = new Set((state.websocketSessions || []).map((item) => item?.id).filter(Boolean));
-  for (const id of _websocketSummaryMutationById.keys()) {
-    if (!visibleIds.has(id)) {
-      _websocketSummaryMutationById.delete(id);
-    }
+  while (_websocketSummaryMutationById.size > WEBSOCKET_MAX_LOADED_SESSIONS) {
+    _websocketSummaryMutationById.delete(_websocketSummaryMutationById.keys().next().value);
   }
 }
 
@@ -7056,21 +7523,27 @@ async function saveMatchReplaceRules(options = {}) {
   ) {
     throw new Error("Match/Replace editor changed sessions. Review the rule and save again.");
   }
+  const workspaceGeneration = workspaceStateGeneration;
+  const draftVersion = state.matchReplaceDraftVersion || 0;
+  const saveToken = state.matchReplaceSaveToken = (state.matchReplaceSaveToken || 0) + 1;
+  const submittedRules = JSON.stringify(state.matchReplaceRules);
   const response = await fetch(sessionWritePath("/api/match-replace", sessionId, options), {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({ session_id: sessionId, rules: state.matchReplaceRules }),
+    body: JSON.stringify({ session_id: sessionId, rules: JSON.parse(submittedRules) }),
   });
   await requireOkResponse(response, "Failed to save match-replace rules.");
   const rules = jsonArray(await response.json());
-  if (sessionId !== currentSessionId()) {
-    if (state.matchReplaceEditorSessionId === sessionId) {
-      state.matchReplaceDirty = false;
-      state.matchReplaceEditorSessionId = null;
-    }
-    return;
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
+  // An acknowledgement belongs to its dispatched draft, not to edits made
+  // while it was pending (including edit/revert and a newer save attempt).
+  if (draftVersion !== (state.matchReplaceDraftVersion || 0)
+    || saveToken !== state.matchReplaceSaveToken
+    || submittedRules !== JSON.stringify(state.matchReplaceRules)) {
+    showToast("An earlier save completed. Your current draft is unchanged; review it before continuing.", "error", 7000);
+    return false;
   }
   state.matchReplaceRules = rules;
   if (!state.matchReplaceRules.some((rule) => rule.id === state.selectedMatchReplaceRuleId)) {
@@ -7079,6 +7552,7 @@ async function saveMatchReplaceRules(options = {}) {
   state.matchReplaceDirty = false;
   state.matchReplaceEditorSessionId = sessionId;
   renderMatchReplaceRules();
+  return true;
 }
 
 async function flushMatchReplaceDraft(options = {}) {
@@ -7086,8 +7560,7 @@ async function flushMatchReplaceDraft(options = {}) {
     return true;
   }
   try {
-    await saveMatchReplaceRules(options);
-    return true;
+    return (await saveMatchReplaceRules(options)) !== false;
   } catch (error) {
     console.error(error);
     showToast(error?.message || "Failed to save match-replace rule", "error");
@@ -7118,11 +7591,10 @@ async function flushTargetScopeDraft(options = {}) {
     return true;
   }
   try {
-    await saveTargetScope({
+    return (await saveTargetScope({
       ...options,
       skipReload: true,
-    });
-    return true;
+    })) !== false;
   } catch (error) {
     console.error(error);
     showToast(error?.message || "Failed to save scope", "error");
@@ -7137,21 +7609,37 @@ async function reloadTargetSiteMapFromButton() {
   await loadTargetSiteMap(true);
 }
 
-async function loadTargetSiteMap(forceScopeSync = false) {
+async function loadTargetSiteMap(forceScopeSync = false, saveContext = null) {
   const sessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  // The legacy Paths projection is unbounded and carries raw paths. Load it only
+  // for Scope, where it is shown, never for the Map tool.
+  const loadPaths = state.activeTool === "target";
   const [runtimeResponse, siteMapResponse] = await Promise.all([
     fetch(sessionQueryPath("/api/runtime", sessionId)),
-    fetch(sessionQueryPath("/api/target/site-map", sessionId)),
+    loadPaths ? fetch(sessionQueryPath("/api/target/site-map", sessionId)) : null,
   ]);
   await requireOkResponse(runtimeResponse, "Failed to load runtime settings.");
-  await requireOkResponse(siteMapResponse, "Failed to load target site map.");
+  if (siteMapResponse) await requireOkResponse(siteMapResponse, "Failed to load target site map.");
   const runtime = await runtimeResponse.json();
-  const siteMap = jsonArray(await siteMapResponse.json());
-  if (sessionId !== currentSessionId()) {
-    return;
-  }
+  const siteMap = siteMapResponse ? jsonArray(await siteMapResponse.json()) : null;
+  if (sessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
+  // A save's follow-up read must not overwrite a newer editor before the
+  // waiting save caller gets its chance to check ownership again.
+  if (saveContext && (saveContext.sessionId !== sessionId
+    || saveContext.workspaceGeneration !== workspaceGeneration
+    || saveContext.draftVersion !== (state.targetScopeDraftVersion || 0)
+    || saveContext.saveToken !== state.targetScopeSaveToken
+    || saveContext.scopeDraft !== state.targetScopeDraft
+    || saveContext.excludeDraft !== state.targetScopeExcludeDraft
+    || saveContext.scopeText !== els.targetScopeEditor.value
+    || saveContext.excludeText !== els.targetScopeExcludeEditor?.value)) return false;
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
   state.runtime = runtime;
-  state.targetSiteMap = siteMap;
+  if (siteMap) state.targetSiteMap = siteMap;
+  if (typeof targetServiceMapController !== "undefined" && state.activeTool === "map") {
+    targetServiceMapController?.refresh();
+  }
   syncTargetScopeDraft(forceScopeSync);
   renderInterceptStatus();
   renderProxySettings();
@@ -7181,13 +7669,26 @@ async function pollAuxiliaryData() {
     }
   }
 
+  if (state.activeTool === "proxy" && state.activeProxyTab === "proxy-settings"
+    && !state.historyRetentionSettings?.loading && !state.historyRetentionSettings?.saving) {
+    tasks.push(loadHistoryRetentionSettings());
+  }
+
+  if (state.activeTool === "proxy" && state.activeProxyTab === "proxy-settings"
+    && !state.upstreamPeerSettings?.loading && !state.upstreamPeerSettings?.saving
+    && !state.upstreamPeerSettings?.uncertain && !state.upstreamPeerSettings?.writeConflict
+    && !state.upstreamPeerSettings?.readFailed) {
+    tasks.push(loadUpstreamPeerSettings());
+  }
+
   if (state.activeTool === "logger") {
     tasks.push(loadEventLog());
   }
 
-  if (state.activeTool === "target") {
-    tasks.push(loadTargetSiteMap());
+  if (state.activeTool === "map" && typeof targetServiceMapController !== "undefined") {
+    tasks.push(targetServiceMapController?.refresh());
   }
+  if (state.activeTool === "target") tasks.push(loadTargetSiteMap());
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
     tasks.push(loadFindings());
@@ -7206,15 +7707,205 @@ async function pollAuxiliaryData() {
   await Promise.allSettled(tasks);
 }
 
+function preserveDeletedHistoryNote(transactionId, sessionId, text) {
+  if (!state.historyRecoveredNotes) state.historyRecoveredNotes = new Map();
+  const key = `${sessionId}:${transactionId}`;
+  const existing = state.historyRecoveredNotes.get(key);
+  if (existing?.text === text) return;
+  state.historyRecoveredNotes.set(key, {
+    transactionId, sessionId, text,
+    sessionName: state.activeSession?.id === sessionId ? state.activeSession.name : sessionId,
+  });
+  renderRecoveredHistoryNotes();
+  if (els.historyRecoveredNotes) els.historyRecoveredNotes.open = true;
+}
+
+function discardRecoveredHistoryNote(key) {
+  const note = state.historyRecoveredNotes?.get(key);
+  if (!note) return;
+  showConfirmDialog("Discard this recovered text? It is only stored in this window and cannot be restored after discarding.", () => {
+    // A second deletion notification can update the recovery while confirmation
+    // is open. That newer text was not the text the operator chose to discard.
+    if (state.historyRecoveredNotes?.get(key) !== note) return;
+    state.historyRecoveredNotes.delete(key);
+    renderRecoveredHistoryNotes();
+  }, { title: "Discard recovered text", confirmLabel: "Discard recovered text" });
+}
+
+function renderRecoveredHistoryNotes() {
+  if (!els.historyRecoveredNotes) return;
+  const notes = state.historyRecoveredNotes || new Map();
+  els.historyRecoveredNotes.classList.toggle("hidden", !notes.size);
+  els.historyRecoveredNotesSummary.textContent = `Recovered unsaved notes (${notes.size})`;
+  els.historyRecoveredNotesList.replaceChildren();
+  for (const [key, note] of notes) {
+    const entry = document.createElement("div");
+    entry.className = "history-recovered-note";
+    const label = document.createElement("label");
+    label.className = "settings-field";
+    const title = document.createElement("span");
+    title.textContent = `Session: ${note.sessionName || note.sessionId} · Record: ${note.transactionId}`;
+    const input = document.createElement("textarea");
+    input.readOnly = true;
+    input.rows = 3;
+    input.value = note.text;
+    input.setAttribute("aria-label", `Recovered unsaved note for ${note.transactionId}, session ${note.sessionName || note.sessionId}`);
+    label.append(title, input);
+    const discard = document.createElement("button");
+    discard.type = "button";
+    discard.className = "secondary-action";
+    discard.textContent = "Discard recovered text";
+    discard.addEventListener("click", () => discardRecoveredHistoryNote(key));
+    entry.append(label, discard);
+    els.historyRecoveredNotesList.appendChild(entry);
+  }
+}
+
+function applyHistoryRetentionDeletedEvent(event, sessionId = currentSessionId()) {
+  if (sessionId !== currentSessionId()) return true;
+  let payload;
+  try { payload = JSON.parse(event.data); } catch (_) { return false; }
+  const sequence = /^(0|[1-9][0-9]{0,19})$/.test(event.lastEventId || "")
+    ? event.lastEventId : Number.isSafeInteger(payload?.event_sequence) && payload.event_sequence >= 0 ? String(payload.event_sequence) : null;
+  if (!payload || payload.session_id !== sessionId || typeof payload.generation !== "string"
+    || !payload.generation || sequence === null || BigInt(sequence) > 18446744073709551615n
+    || typeof payload.event_sequence !== "number" || Number(sequence) !== payload.event_sequence
+    || !Array.isArray(payload.ids) || !payload.ids.every((id) => typeof id === "string" && id)) return false;
+  const previous = state._historyRetentionEvents;
+  if (previous?.generation === payload.generation && BigInt(previous.sequence) >= BigInt(sequence)) return true;
+  state._historyRetentionEvents = { generation: payload.generation, sequence };
+  applyConfirmedHistoryRemoval(payload.ids, sessionId, "automatic_cleanup");
+  return true;
+}
+
+function applyConfirmedHistoryRemoval(ids, sessionId = currentSessionId(), cause = "unavailable") {
+  if (sessionId !== currentSessionId()) return false;
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.invalidate();
+  state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
+  state._historyRetentionReconcile = true;
+  // Only this batch is needed: old requests carry an epoch, and the server/SSE
+  // sequence rejects summaries from before deletion without an unbounded ID set.
+  const deleted = new Set(ids);
+  state._historyDeletedIds = deleted;
+  const recovered = new Set();
+  for (const input of document.querySelectorAll("input.note-inline-input")) {
+    const editor = input.historyRetentionNote;
+    if (!editor || editor.sessionId !== sessionId || !deleted.has(editor.transactionId)) continue;
+    const pending = state._pendingAnnotations?.get(editor.transactionId);
+    const result = editor.cancel();
+    if (result.dirty || (pending?.sessionId === sessionId && pending.payload?.user_note !== undefined)) {
+      preserveDeletedHistoryNote(editor.transactionId, sessionId, result.text);
+      recovered.add(editor.transactionId);
+    }
+    input.closest?.("tr.history-row")?.remove();
+  }
+  for (const [id, entry] of state._pendingAnnotations || []) {
+    if (entry.sessionId !== sessionId || !deleted.has(id)) continue;
+    entry.retentionDeleted = true;
+    const noteInput = entry.noteEdit?.input;
+    const result = noteInput?.historyRetentionNote?.cancel();
+    if (!recovered.has(id) && entry.payload?.user_note !== undefined) {
+      preserveDeletedHistoryNote(id, sessionId, result ? result.text : (entry.payload.user_note ?? ""));
+    }
+    if (entry.noteEdit?.removed) {
+      entry.noteEdit.removed.window.editors.delete(entry.noteEdit);
+      entry.noteEdit.removed = null;
+    }
+    state._pendingAnnotations.delete(id);
+  }
+  for (const row of els.historyTableBody?.querySelectorAll(".history-row") || []) {
+    if (deleted.has(row.dataset.id)) row.remove();
+  }
+  pendingHistoryNoteRead?.cancel();
+  if (deleted.has(contextMenuTargetId)) closeContextMenu();
+  _pendingTransactionSummaries.length = 0;
+  clearHistoryBackfill();
+  state.historyPaging.generation = ++_historyPagingGeneration;
+  state.historyPaging.loading = false;
+  _historyDetailGeneration += 1;
+  cancelHistoryDetailLoading();
+  state.items = state.items.filter((item) => !deleted.has(item.id));
+  state._itemsVersion += 1;
+  precomputeItemIndexes();
+  invalidateVisibleEntriesCache();
+  refreshHistoryPagingCursorFromItems();
+  if (deleted.has(state.selectedId)) {
+    state._historyRetentionClearedSelection = true;
+    state._selectionPastEndId = null;
+    clearHttpHistorySelectionPreview();
+    showToast(cause === "automatic_cleanup"
+      ? "The selected HTTP History entry was permanently removed by automatic cleanup."
+      : "The selected HTTP History entry is no longer available.", "info", 6000);
+  } else if (deleted.has(state.selectedRecord?.id)) {
+    // A newer selection can coexist with an older preview. Remove that preview
+    // without discarding the surviving selection; the refetch loads its detail.
+    state.selectedRecord = null;
+    state.loadingDetailId = null;
+    renderEmptyDetail();
+  }
+  renderHistory({ preserveNoteEditor: true });
+  scheduleRefresh();
+  if (els.historyRetentionSection && state.activeTool === "proxy" && state.activeProxyTab === "proxy-settings"
+    && !state.historyRetentionSettings?.loading && !state.historyRetentionSettings?.saving) loadHistoryRetentionSettings();
+  return true;
+}
+
+function invalidateHistoryAfterEventGap() {
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.invalidate();
+  state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
+  state._historyRetentionReconcile = true;
+  _pendingTransactionSummaries.length = 0;
+  state.historyPaging.generation = ++_historyPagingGeneration;
+  state.historyPaging.loading = false;
+  _historyDetailGeneration += 1;
+  scheduleRefresh();
+}
+
+function reconcileMissingHistoryNoteEditors() {
+  const sessionId = currentSessionId();
+  const epoch = state._historyRetentionEpoch || 0;
+  if (!state._historyNoteAvailabilityReads) state._historyNoteAvailabilityReads = new Set();
+  const reads = state._historyNoteAvailabilityReads;
+  for (const input of document.querySelectorAll("input.note-inline-input")) {
+    const editor = input.historyRetentionNote;
+    if (!editor || editor.sessionId !== sessionId || getHistoryItem(editor.transactionId)) continue;
+    state._historyRetentionReconcile = true;
+    const key = `${sessionId}:${epoch}:${editor.transactionId}`;
+    if (reads.has(key)) continue;
+    reads.add(key);
+    fetch(transactionPath(editor.transactionId, sessionId)).then((response) => {
+      if (response.status !== 404 || sessionId !== currentSessionId()
+        || epoch !== (state._historyRetentionEpoch || 0)) return;
+      applyConfirmedHistoryRemoval([editor.transactionId], sessionId);
+    }).catch(() => {
+      // An unreadable record is not proof of deletion. Keep the live editor and
+      // its existing close guard; the next refresh can verify availability.
+    }).finally(() => reads.delete(key));
+  }
+}
+
 function connectEvents() {
   if (eventSource) {
     eventSource.close();
   }
   const eventSessionId = currentSessionId();
   eventSource = new EventSource(sessionQueryPath("/api/events", eventSessionId));
+  const eventStreamOwner = eventSource;
+  const eventWorkspaceGeneration = workspaceStateGeneration;
+  const ownsHistoryEvents = () => eventSource === eventStreamOwner
+    && eventWorkspaceGeneration === workspaceStateGeneration && eventSessionId === currentSessionId();
+  targetServiceMapEventStreamReady = () => ownsHistoryEvents() && eventStreamOwner.readyState === 1;
   let openedOnce = false;
 
   eventSource.onopen = () => {
+    if (!ownsHistoryEvents()) return;
+    // A fresh subscription has no older queued events. A restarted store may
+    // reuse low sequence values, so retire the previous stream's boundary.
+    state._historyRetentionEvents = null;
+    state._historyDeletedIds = new Set();
+    // A deletion may fall between the initial page and subscription, or while
+    // disconnected. Reconcile even if the server cannot replay deleted IDs.
+    invalidateHistoryAfterEventGap();
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");
     if (!openedOnce) {
@@ -7233,9 +7924,10 @@ function connectEvents() {
   };
 
   eventSource.addEventListener("transaction", (event) => {
-    if (eventSessionId !== currentSessionId()) {
+    if (!ownsHistoryEvents()) {
       return;
     }
+    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.markDirty(event);
     _lastHttpHistoryFallbackPoll = Date.now();
     els.liveStatus.textContent = "Proxy live";
     els.liveStatus.classList.add("online");
@@ -7244,11 +7936,16 @@ function connectEvents() {
     }
   });
 
+  eventSource.addEventListener("retention_deleted", (event) => {
+    if (!ownsHistoryEvents()) return;
+    if (!applyHistoryRetentionDeletedEvent(event, eventSessionId)) scheduleRefresh();
+  });
+
   eventSource.addEventListener("transactions_gap", () => {
-    if (eventSessionId !== currentSessionId()) {
+    if (!ownsHistoryEvents()) {
       return;
     }
-    scheduleRefresh();
+    invalidateHistoryAfterEventGap();
   });
 
   eventSource.addEventListener("event_log", (event) => {
@@ -7328,6 +8025,10 @@ function connectEvents() {
   });
 
   eventSource.onerror = () => {
+    if (!ownsHistoryEvents()) return;
+    // A disconnected event stream cannot prove that a retained evidence source
+    // stayed unchanged. Drop temporary body-reference state without re-reading.
+    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.disconnect();
     els.liveStatus.textContent = "Retrying";
     els.liveStatus.classList.remove("online");
   };
@@ -7727,6 +8428,9 @@ function applyTransactionDeltaEvent(event, sessionId = currentSessionId()) {
   }
 
   try {
+    if (state._historyRetentionEvents
+      && (!/^[0-9]+$/.test(event.lastEventId || "")
+        || BigInt(event.lastEventId) <= BigInt(state._historyRetentionEvents.sequence))) return true;
     const summary = JSON.parse(event.data || "null");
     if (!summary || !summary.id) return false;
     _pendingTransactionSummaries.push({ sessionId, summary });
@@ -7773,16 +8477,19 @@ function flushTransactionDeltas() {
   // it starts and changes when its body finishes, often within one flush.
   const latest = new Map();
   for (const { summary } of pending) {
-    if (summary?.id) latest.set(summary.id, summary);
+    if (summary?.id && !state._historyDeletedIds?.has(summary.id)) latest.set(summary.id, summary);
   }
   const fresh = [];
   let totalAdded = 0;
   let hiddenConnectAdded = 0;
   let updated = 0;
+  let noteWindow = state._historyNoteEditWindow ? currentHistoryNoteEditWindow() : null;
+  const removed = [];
   for (const summary of latest.values()) {
     const existing = getHistoryItem(summary.id);
     if (existing) {
       applyLiveSummaryUpdate(existing, summary);
+      if (!summaryMatchesActiveHistoryFilters(existing)) removed.push(existing);
       updated += 1;
       continue;
     }
@@ -7797,7 +8504,35 @@ function flushTransactionDeltas() {
 
   if (fresh.length && state.historyPaging?.trimmedHeadCount > 0 && canUseSequenceCursorForHistoryPaging()) {
     scheduleIncrementalRefresh();
-    return;
+    fresh.length = 0;
+    totalAdded = 0;
+    hiddenConnectAdded = 0;
+  }
+
+  if (removed.length) {
+    const inputs = typeof document === "undefined" ? [] : document.querySelectorAll("input.note-inline-input");
+    for (const item of removed) {
+      const input = Array.from(inputs).find((input) => input.historyRetentionNote?.transactionId === item.id
+        && input.historyRetentionNote.sessionId === activeSessionId);
+      const pendingEdit = state._pendingAnnotations?.get(item.id);
+      const editor = input?.historyRetentionNote?.editor
+        || (pendingEdit?.sessionId === activeSessionId ? pendingEdit.noteEdit : null);
+      noteWindow = retainFilteredHistoryNote(editor, item, noteWindow);
+    }
+    const removedIds = new Set(removed.map((item) => item.id));
+    for (let index = state.items.length - 1; index >= 0; index -= 1) {
+      if (removedIds.has(state.items[index].id)) state.items.splice(index, 1);
+    }
+    // Filter membership changed, but the records are still retained. This also
+    // invalidates overlapping pages so they cannot resurrect the old matches.
+    adjustHistoryPagingAfterLocalRemoval(removed.length, { decrementTotal: false });
+    rebuildHistoryItemIndex();
+    refreshHistoryPagingCursorFromItems();
+    if (removedIds.has(state.selectedId)) {
+      state.loadingDetailId = null;
+      state._selectionPastEndId = null;
+      clearHttpHistorySelectionPreview();
+    }
   }
 
   fresh.sort((a, b) => Number(b.sequence ?? 0) - Number(a.sequence ?? 0));
@@ -7824,7 +8559,8 @@ function flushTransactionDeltas() {
   }
   if (totalAdded || added || updated) {
     state.historyDirty = false;
-    renderHistory();
+    if (noteWindow) syncHistoryNoteEditWindow(noteWindow);
+    renderHistory({ preserveNoteEditor: true });
   }
 }
 
@@ -8014,9 +8750,11 @@ function scheduleIncrementalRefresh() {
         return;
       }
       const refreshSessionId = state.activeSession?.id || null;
+      const retentionEpoch = state._historyRetentionEpoch || 0;
       const resp = await fetch(buildTransactionsPageUrl({ limit: 50, offset: 0, queryState: refreshQueryState }));
       if (
-        refreshSessionId !== (state.activeSession?.id || null)
+        retentionEpoch !== (state._historyRetentionEpoch || 0)
+        || refreshSessionId !== (state.activeSession?.id || null)
         || !isCurrentHistoryQuerySignature(refreshQuerySignature)
       ) {
         return;
@@ -8035,7 +8773,8 @@ function scheduleIncrementalRefresh() {
       }
       const page = await resp.json();
       if (
-        refreshSessionId !== (state.activeSession?.id || null)
+        retentionEpoch !== (state._historyRetentionEpoch || 0)
+        || refreshSessionId !== (state.activeSession?.id || null)
         || !isCurrentHistoryQuerySignature(refreshQuerySignature)
         || state.historyPaging?.querySignature !== refreshQuerySignature
       ) {
@@ -8091,6 +8830,9 @@ function scheduleIncrementalRefresh() {
 let _searchActiveUntil = 0;
 
 function renderToolPanels() {
+  if (typeof targetServiceMapController !== "undefined") {
+    targetServiceMapController?.setVisible(state.activeTool === "map", state.activeTargetView);
+  }
   state.activeTool = sanitizeActiveTool(state.activeTool);
 
   mainTabs.forEach((tab) => {
@@ -8104,7 +8846,9 @@ function renderToolPanels() {
   const fuzzerVisible = state.activeTool === "fuzzer";
   const sequenceVisible = state.activeTool === "sequence";
   const targetVisible = state.activeTool === "target";
+  const mapVisible = state.activeTool === "map";
   const loggerVisible = state.activeTool === "logger";
+  const reconVisible = state.activeTool === "recon";
   els.dashboardShell.classList.toggle("hidden", !dashboardVisible);
   els.proxyShell.classList.toggle("hidden", !proxyVisible);
   els.replayShell.classList.toggle("hidden", !replayVisible);
@@ -8112,7 +8856,10 @@ function renderToolPanels() {
   els.fuzzerShell.classList.toggle("hidden", !fuzzerVisible);
   els.sequenceShell.classList.toggle("hidden", !sequenceVisible);
   els.targetShell.classList.toggle("hidden", !targetVisible);
+  els.mapShell?.classList.toggle("hidden", !mapVisible);
   els.loggerShell.classList.toggle("hidden", !loggerVisible);
+  els.reconShell?.classList.toggle("hidden", !reconVisible);
+  if (typeof reconController !== "undefined") reconController?.setVisible(reconVisible);
 
   if (dashboardVisible) {
     renderDashboard();
@@ -8134,7 +8881,10 @@ function renderToolPanels() {
   if (decoderVisible) {
     ensureDecoderWorkbench().catch((error) => {
       console.error(error);
-      // Tools load failed
+      // Keep late failures on this panel and avoid re-announcing a cached failure.
+      if (state.activeTool === "tools" && els.toolsLoadError.classList.contains("hidden")) {
+        els.toolsLoadError.classList.remove("hidden");
+      }
     });
     els.footerMode.textContent = "Tools active";
     return;
@@ -8155,6 +8905,16 @@ function renderToolPanels() {
   if (targetVisible) {
     renderTarget();
     els.footerMode.textContent = "Scope active";
+    return;
+  }
+
+  if (mapVisible) {
+    els.footerMode.textContent = "Map active";
+    return;
+  }
+
+  if (reconVisible) {
+    els.footerMode.textContent = "Recon active";
     return;
   }
 
@@ -8310,13 +9070,16 @@ function renderDashboard() {
     state.selectedSessionId = activeSession.id;
   }
   const current = state.sessions.find((s) => s.id === state.selectedSessionId) || activeSession;
+  // Activation changes selection before its reload finishes. Keep folder opens
+  // bound to the path still on screen if that reload is delayed or fails.
+  state.dashboardStorageSessionId = current?.id || null;
   els.dashboardCurrentSessionName.textContent = current?.name || "No active session";
   const isActive = Boolean(current && (current.active || current.id === activeSession?.id));
   els.dashboardCurrentSessionStatus.textContent = current ? (isActive ? "Active" : "Stored") : "No session";
   els.dashboardCurrentSessionStatus.className = `detail-chip ${isActive ? "active-badge" : "none"}`;
   els.dashboardCurrentSessionPath.textContent = current?.storage_path || "No storage path";
   els.dashboardCurrentSessionRequests.textContent =
-    formatCappedCount(current?.request_count ?? 0, retainedTransactionsCap());
+    formatCappedCount(current?.request_count ?? 0);
   els.dashboardCurrentSessionWebsockets.textContent =
     formatCappedCount(current?.websocket_count ?? 0, retainedEntriesCap());
   els.dashboardCurrentSessionEvents.textContent =
@@ -8349,7 +9112,7 @@ function renderDashboard() {
         .map((session) => `
           <tr class="history-row ${session.id === state.selectedSessionId ? "selected" : ""}" data-id="${session.id}">
             <td>${escapeHtml(session.name)}</td>
-            <td>${formatCappedCount(session.request_count, retainedTransactionsCap())}</td>
+            <td>${formatCappedCount(session.request_count)}</td>
             <td>${formatCappedCount(session.websocket_count, retainedEntriesCap())}</td>
             <td>${formatCappedCount(session.event_count, retainedEntriesCap())}</td>
             <td>${session.rule_count}</td>
@@ -8466,7 +9229,11 @@ async function revealSessionFolder(sessionId) {
   });
   await requireOkResponse(response, "Failed to open session folder.");
   const result = await response.json().catch(() => null);
-  showToast(result?.path ? `Opened ${result.path}` : "Session folder opened.");
+  if (!result || typeof result !== "object" || Array.isArray(result)
+    || result.ok !== true || typeof result.path !== "string" || !result.path.trim()) {
+    throw new Error("Could not confirm the session folder opened. Reload sessions before trying again.");
+  }
+  showToast(`Opened ${result.path}`);
 }
 
 function closeSessionContextMenu() {
@@ -8516,6 +9283,8 @@ async function deleteSessionById(id) {
   const session = state.sessions.find((s) => s.id === id);
   const name = session ? session.name : id;
   showConfirmDialog(`Delete session "${name}"?\nThis will permanently remove all session data.`, async () => {
+    const actionSessionId = currentSessionId();
+    const actionWorkspaceGeneration = workspaceStateGeneration;
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!res.ok) throw new Error(await res.text());
@@ -8523,6 +9292,7 @@ async function deleteSessionById(id) {
       if (state.selectedSessionId === id) state.selectedSessionId = null;
       renderDashboard();
     } catch (error) {
+      await reconcileSessionsAfterActionError(actionSessionId, actionWorkspaceGeneration);
       console.error("Failed to delete session:", error);
       showToast(error?.message || "Failed to delete session.", "error");
     }
@@ -8577,6 +9347,9 @@ let findingsLoadPromise = null;
 let findingsLoadSessionId = null;
 let findingsStateGeneration = 0;
 let findingsLoadGeneration = 0;
+let findingsCountReadGeneration = 0;
+let findingsCountAcceptedGeneration = 0;
+let findingsEventEpoch = 0;
 let findingsBadgeRefreshTimer = 0;
 let findingsListRefreshTimer = 0;
 let lastFindingsBadgePollAt = 0;
@@ -8609,6 +9382,7 @@ const BUILTIN_RULE_LABELS = {
 const BUILTIN_FINDING_CATEGORIES = new Set(Object.keys(BUILTIN_RULE_LABELS));
 
 let selectedFindingId = null;
+let findingsDetailGeneration = 0;
 
 async function loadFindings() {
   const sessionId = currentSessionId();
@@ -8617,6 +9391,12 @@ async function loadFindings() {
   }
   const stateGeneration = findingsStateGeneration;
   const loadGeneration = ++findingsLoadGeneration;
+  const countRead = {
+    sessionId,
+    stateGeneration,
+    generation: ++findingsCountReadGeneration,
+    eventEpoch: findingsEventEpoch,
+  };
   findingsLoadSessionId = sessionId;
   let loadPromise;
   loadPromise = (async () => {
@@ -8634,9 +9414,12 @@ async function loadFindings() {
         return;
       }
       findingsData = findings;
-      findingsBadgeCount = fullCount == null ? findings.length : Math.max(fullCount, findings.length);
+      const badgeAccepted = commitFindingsBadgeCount(
+        fullCount == null ? findings.length : Math.max(fullCount, findings.length),
+        countRead,
+      );
       renderFindings();
-      updateFindingsBadge();
+      if (badgeAccepted) updateFindingsBadge();
     } catch (error) {
       console.error("Failed to load findings:", error);
     } finally {
@@ -8656,14 +9439,33 @@ async function loadFindings() {
 
 async function updateFindingsBadgeOnly() {
   const sessionId = currentSessionId();
-  const stateGeneration = findingsStateGeneration;
+  const countRead = {
+    sessionId,
+    stateGeneration: findingsStateGeneration,
+    generation: ++findingsCountReadGeneration,
+    eventEpoch: findingsEventEpoch,
+  };
   try {
     const count = await fetchFindingsCount(sessionId);
-    if (sessionId !== currentSessionId() || stateGeneration !== findingsStateGeneration) return;
-    if (count == null) return;
-    findingsBadgeCount = count;
-    updateFindingsBadge();
+    if (commitFindingsBadgeCount(count, countRead)) updateFindingsBadge();
   } catch (e) { /* silent */ }
+}
+
+function commitFindingsBadgeCount(count, read) {
+  // Pending or failed newer reads must not suppress a usable count. Events
+  // invalidate earlier snapshots without blocking authoritative decreases.
+  if (
+    count == null
+    || read.sessionId !== currentSessionId()
+    || read.stateGeneration !== findingsStateGeneration
+    || read.eventEpoch !== findingsEventEpoch
+    || read.generation < findingsCountAcceptedGeneration
+  ) {
+    return false;
+  }
+  findingsCountAcceptedGeneration = read.generation;
+  findingsBadgeCount = count;
+  return true;
 }
 
 async function fetchFindingsCount(sessionId) {
@@ -8674,16 +9476,12 @@ async function fetchFindingsCount(sessionId) {
   return Number.isFinite(count) && count >= 0 ? count : 0;
 }
 
-// The stores evict past their retention cap, so a count that reaches it has
-// stopped being a total. Show "N+" rather than implying capture stopped growing.
+// Bounded non-HTTP stores evict past their cap. For those stores, "N+"
+// avoids implying capture stopped growing. HTTP counts have no global cap.
 function formatCappedCount(count, cap) {
   const value = Number.isFinite(Number(count)) ? Number(count) : 0;
   const limit = Number(cap);
   return Number.isFinite(limit) && limit > 0 && value >= limit ? `${value}+` : String(value);
-}
-
-function retainedTransactionsCap() {
-  return state.settings?.max_transaction_entries ?? null;
 }
 
 function retainedEntriesCap() {
@@ -8733,6 +9531,7 @@ function handleFindingEvent(event) {
   try {
     const summary = JSON.parse(event.data || "null");
     if (summary?.id) {
+      findingsEventEpoch += 1;
       findingsBadgeCount += 1;
       updateFindingsBadge();
     }
@@ -8747,6 +9546,7 @@ function handleFindingEvent(event) {
 }
 
 function clearFindingDetail() {
+  findingsDetailGeneration += 1;
   selectedFindingId = null;
   if (els.findingsDetailJump) {
     delete els.findingsDetailJump.dataset.recordId;
@@ -8982,7 +9782,10 @@ function renderFindings() {
   }
 
   if (!state._findingsEntries.length) {
-    els.findingsBody.innerHTML = `<tr class="empty-row"><td colspan="6">No findings yet. Browse with the proxy to start scanning.</td></tr>`;
+    const message = findingsData.length
+      ? "No findings match your filters."
+      : "No findings yet. Browse with the proxy to start scanning.";
+    els.findingsBody.innerHTML = `<tr class="empty-row"><td colspan="6">${message}</td></tr>`;
     return;
   }
 
@@ -9062,34 +9865,41 @@ function renderFindingsVirtual() {
 
 async function loadFindingDetail(id) {
   const sessionId = currentSessionId();
+  const generation = ++findingsDetailGeneration;
+  // Returning to the same finding or session must not revive an earlier read.
+  const isCurrent = () => generation === findingsDetailGeneration
+    && sessionId === currentSessionId()
+    && selectedFindingId === id;
   if (selectedFindingId === id && els.findingsDetailJump) {
     delete els.findingsDetailJump.dataset.recordId;
     renderFindingDetailLoading();
   }
   try {
     const res = await fetch(sessionQueryPath(`/api/findings/${encodeURIComponent(id)}`, sessionId));
-    if (currentSessionId() !== sessionId || selectedFindingId !== id) return;
+    if (!isCurrent()) return;
     if (!res.ok) {
       clearFindingDetail();
       return;
     }
     const finding = await res.json();
-    if (currentSessionId() !== sessionId) return;
-    if (selectedFindingId !== id) return;
+    if (!isCurrent()) return;
     // Also fetch the transaction record for request/response
     let record = null;
     try {
       const tRes = await fetch(transactionPath(finding.record_id, sessionId));
-      if (tRes.ok) record = await tRes.json();
-    } catch (_) { /* silent */ }
-    if (currentSessionId() !== sessionId) return;
-    if (selectedFindingId !== id) return;
+      if (!isCurrent()) return;
+      if (tRes.ok) {
+        record = await tRes.json();
+        if (!isCurrent()) return;
+      }
+    } catch (_) {
+      if (!isCurrent()) return;
+    }
     showFindingDetail(finding, record);
   } catch (error) {
+    if (!isCurrent()) return;
     console.error("Failed to load finding detail:", error);
-    if (selectedFindingId === id && sessionId === currentSessionId()) {
-      clearFindingDetail();
-    }
+    clearFindingDetail();
   }
 }
 
@@ -10263,9 +11073,12 @@ function bindFindingsEvents() {
       if (e.key === "Enter" && !e.target.matches("input, textarea, select")) { e.preventDefault(); saveScannerSettingsFromModal(); }
       return;
     }
-    // Only handle when findings tab is active and not focused on input
+    // Only handle when findings tab is active and owns unmodified arrow keys
     if (state.activeTool !== "proxy" || state.activeProxyTab !== "findings") return;
-    if (e.target.matches("input, textarea, select")) return;
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    if (e.defaultPrevented || getActiveModalAction()) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+    if (isEditableTarget(e.target)) return;
     if (e.key === "ArrowDown") { e.preventDefault(); findingsArrowNav(1); }
     if (e.key === "ArrowUp") { e.preventDefault(); findingsArrowNav(-1); }
   });
@@ -11269,11 +12082,13 @@ async function copyTextToClipboard(text) {
   textarea.style.opacity = "0";
   textarea.style.pointerEvents = "none";
   document.body.appendChild(textarea);
-  textarea.select();
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  if (!copied) {
-    throw new Error("Clipboard copy failed");
+  try {
+    textarea.select();
+    if (!document.execCommand("copy")) {
+      throw new Error("Clipboard copy failed");
+    }
+  } finally {
+    textarea.remove();
   }
 }
 
@@ -12036,21 +12851,17 @@ function renderIntercepts() {
 
   els.interceptDetailPath.textContent = `${state.selectedInterceptRecord.request.scheme.toUpperCase()} / ${state.selectedInterceptRecord.peer_addr}`;
   els.interceptDetailTitle.textContent = `${state.selectedInterceptRecord.request.method} ${state.selectedInterceptRecord.request.host}`;
+  // Polling refreshes the held record, but the editor owns its draft until the
+  // selection changes. Losing focus (including to search) must not re-seed it.
   if (els.interceptRequestCM) {
-    const cv = getCMView("interceptReq");
-    const isFocused = cv && cv.view.hasFocus;
-    const rawText = buildEditableRawRequest(state.selectedInterceptRecord.request);
-    // Re-seeding rewrites the document, which resets search highlights and the
-    // match-cycling position, so skip it when the text is already identical.
-    const contentDiffers = !cv || cv.getContent() !== rawText;
-    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id || (!isFocused && contentDiffers)) {
-      setInterceptPaneContent("interceptReq", els.interceptRequestCM, rawText, {
+    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id) {
+      setInterceptPaneContent("interceptReq", els.interceptRequestCM, buildEditableRawRequest(state.selectedInterceptRecord.request), {
         mode: "http", readOnly: false,
       });
       state.interceptEditorSeedId = state.selectedInterceptRecord.id;
     }
   } else {
-    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id || document.activeElement !== els.interceptRequestEditor) {
+    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id) {
       els.interceptRequestEditor.value = buildEditableRawRequest(state.selectedInterceptRecord.request);
       state.interceptEditorSeedId = state.selectedInterceptRecord.id;
     }
@@ -12679,7 +13490,478 @@ function websocketLoadedWindowCanHideSelection() {
     || (Number.isFinite(total) && loadedCount < total);
 }
 
+function upstreamPeerSettingsState() {
+  const sessionId = currentSessionId();
+  let settings = state.upstreamPeerSettings;
+  if (!settings || settings.sessionId !== sessionId || settings.workspaceGeneration !== workspaceStateGeneration) {
+    settings = { sessionId, workspaceGeneration: workspaceStateGeneration, saved: null, baselineToken: null,
+      draft: false, draftVersion: 0, readOwner: 0, readFailed: false, saving: false, loading: false,
+      dirty: false, conflict: false, writeConflict: false, uncertain: null, error: "", message: "" };
+    state.upstreamPeerSettings = settings;
+  }
+  return settings;
+}
+
+function validateUpstreamPeerSnapshot(payload, sessionId) {
+  const status = payload?.status;
+  if (payload?.session_id !== sessionId || typeof payload.enabled !== "boolean"
+    || typeof payload.config_token !== "string" || !/^[a-f0-9]{64}$/.test(payload.config_token)
+    || typeof payload.config_revision !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(payload.config_revision)
+    || BigInt(payload.config_revision) > 18446744073709551615n
+    || !status || typeof status.effective_enabled !== "boolean"
+    || ![null, "persistence_uncertain", "invalid_configuration", "http_capture_paused"].includes(status.blocked_reason)
+    || (status.effective_enabled && (!payload.enabled || status.blocked_reason !== null))
+    || (status.blocked_reason === null && status.effective_enabled !== payload.enabled)
+    || (status.blocked_reason === "http_capture_paused" && !payload.enabled)) {
+    throw new Error("Could not verify the upstream socket peer setting. Check status before saving.");
+  }
+  return { session_id: sessionId, enabled: payload.enabled, config_token: payload.config_token,
+    config_revision: payload.config_revision, status: { effective_enabled: status.effective_enabled, blocked_reason: status.blocked_reason },
+    ...(Object.prototype.hasOwnProperty.call(payload, "changed") ? { changed: payload.changed } : {}) };
+}
+
+function validateUpstreamPeerAcknowledgement(snapshot, baseline, enabled) {
+  const changed = baseline.enabled !== enabled;
+  if (typeof snapshot.changed !== "boolean" || snapshot.changed !== changed || snapshot.enabled !== enabled
+    || BigInt(snapshot.config_revision) !== BigInt(baseline.config_revision) + (changed ? 1n : 0n)
+    || (changed ? snapshot.config_token === baseline.config_token : snapshot.config_token !== baseline.config_token)
+    || snapshot.status.blocked_reason === "persistence_uncertain") {
+    throw new Error("The save acknowledgement could not be verified. Check status before saving again.");
+  }
+  return snapshot;
+}
+
+function adoptUpstreamPeerSnapshot(settings, snapshot, { replaceDraft = false, preserveDraft = false } = {}) {
+  settings.saved = snapshot;
+  if (replaceDraft) settings.writeConflict = false;
+  if (replaceDraft || (!preserveDraft && !settings.dirty)) {
+    settings.draft = snapshot.enabled;
+    settings.baselineToken = snapshot.config_token;
+    settings.dirty = false;
+  }
+  settings.conflict = settings.writeConflict || settings.baselineToken !== snapshot.config_token;
+}
+
+async function loadUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  if (!settings.sessionId || settings.saving) return false;
+  const readOwner = ++settings.readOwner;
+  const ownsRead = () => settings === state.upstreamPeerSettings && readOwner === settings.readOwner
+    && settings.sessionId === currentSessionId() && settings.workspaceGeneration === workspaceStateGeneration;
+  settings.loading = true;
+  renderUpstreamPeerSettings();
+  try {
+    const response = await fetch(sessionQueryPath("/api/transactions/upstream-peer-settings", settings.sessionId));
+    if (response.status === 409 && ownsRead()) {
+      settings.conflict = true;
+      settings.writeConflict = true;
+    }
+    await requireOkResponse(response, "Failed to check the upstream socket peer setting.");
+    const snapshot = validateUpstreamPeerSnapshot(await response.json(), settings.sessionId);
+    if (!ownsRead()) return false;
+    settings.readFailed = false;
+    const uncertain = settings.uncertain;
+    if (uncertain) {
+      const matched = snapshot.enabled === uncertain.enabled;
+      settings.baselineToken = snapshot.config_token;
+      adoptUpstreamPeerSnapshot(settings, snapshot, { replaceDraft: settings.draftVersion === uncertain.draftVersion && matched,
+        preserveDraft: settings.draftVersion !== uncertain.draftVersion });
+      settings.dirty = settings.draft !== snapshot.enabled;
+      settings.conflict = false;
+      settings.uncertain = null;
+      settings.message = snapshot.status.blocked_reason === "persistence_uncertain"
+        ? "Status checked. Storage is still unconfirmed; use Save to retry explicitly."
+        : "Current saved setting checked. The earlier save acknowledgement was unavailable.";
+    } else {
+      adoptUpstreamPeerSnapshot(settings, snapshot);
+    }
+    settings.error = settings.conflict
+      ? "This setting changed or the active session moved. Cancel to review the saved setting before saving again."
+      : "";
+    return true;
+  } catch (error) {
+    if (ownsRead()) {
+      settings.readFailed = true;
+      settings.error = error?.message || "Failed to check the upstream socket peer setting.";
+    }
+    return false;
+  } finally {
+    if (ownsRead()) { settings.loading = false; renderUpstreamPeerSettings(); }
+  }
+}
+
+function editUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  settings.draft = els.upstreamPeerEnabled.checked;
+  settings.draftVersion += 1;
+  settings.dirty = !!settings.saved && settings.draft !== settings.saved.enabled;
+  settings.message = "";
+  if (!settings.conflict && !settings.uncertain) settings.error = "";
+  renderUpstreamPeerSettings();
+}
+
+function cancelUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  settings.draftVersion += 1;
+  if (settings.saved) adoptUpstreamPeerSnapshot(settings, settings.saved, { replaceDraft: true });
+  settings.error = "";
+  settings.message = settings.uncertain ? "Save outcome is still unknown. Check status before saving again."
+    : settings.readFailed ? "Changes cancelled. Check status before saving again." : "Changes cancelled.";
+  renderUpstreamPeerSettings();
+}
+
+async function saveUpstreamPeerSettings() {
+  const settings = upstreamPeerSettingsState();
+  const retryDurability = settings.saved?.status.blocked_reason === "persistence_uncertain";
+  if (!settings.saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading
+    || settings.readFailed || settings.conflict || settings.uncertain || settings.saved.status.blocked_reason === "invalid_configuration") return false;
+  const enabled = settings.draft;
+  const draftVersion = settings.draftVersion;
+  const baseline = settings.saved;
+  const ownsWrite = () => settings === state.upstreamPeerSettings && settings.sessionId === currentSessionId()
+    && settings.workspaceGeneration === workspaceStateGeneration;
+  settings.saving = true;
+  settings.readOwner += 1;
+  settings.error = "";
+  settings.message = "Saving setting…";
+  renderUpstreamPeerSettings();
+  let rejected = false;
+  try {
+    const response = await fetch(sessionWritePath("/api/transactions/upstream-peer-settings", settings.sessionId), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, expected_config_token: settings.baselineToken }),
+    });
+    if (!ownsWrite()) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        settings.readFailed = true;
+        settings.conflict = true;
+        settings.writeConflict = true;
+        settings.error = "This setting changed or the active session moved. Check status, then Cancel to review the saved setting.";
+        settings.message = "Setting was not saved.";
+        return false;
+      }
+      if (response.status >= 500) throw new Error("The save outcome is unknown. Check status before saving again.");
+      rejected = true;
+      await requireOkResponse(response, "Failed to save the upstream socket peer setting.");
+    }
+    const snapshot = validateUpstreamPeerAcknowledgement(
+      validateUpstreamPeerSnapshot(await response.json(), settings.sessionId), baseline, enabled,
+    );
+    if (!ownsWrite()) return false;
+    settings.baselineToken = snapshot.config_token;
+    adoptUpstreamPeerSnapshot(settings, snapshot, { replaceDraft: draftVersion === settings.draftVersion,
+      preserveDraft: draftVersion !== settings.draftVersion });
+    settings.dirty = settings.draft !== snapshot.enabled;
+    settings.conflict = false;
+    settings.message = "Setting saved. Changes apply to new exchanges.";
+    return true;
+  } catch (error) {
+    if (ownsWrite()) {
+      if (!rejected) settings.uncertain = { enabled, draftVersion };
+      settings.error = error?.message || "The save outcome is unknown. Check status before saving again.";
+      settings.message = rejected ? "Setting was not saved." : "The save will not be retried automatically.";
+    }
+    return false;
+  } finally {
+    if (ownsWrite()) { settings.saving = false; renderUpstreamPeerSettings(); }
+  }
+}
+
+function renderUpstreamPeerSettings() {
+  if (!els.upstreamPeerSection) return;
+  const settings = upstreamPeerSettingsState();
+  const saved = settings.saved;
+  const blocked = saved?.status.blocked_reason;
+  const retryDurability = blocked === "persistence_uncertain" && !settings.dirty;
+  els.upstreamPeerSession.textContent = state.activeSession?.name || settings.sessionId || "No active session";
+  els.upstreamPeerEnabled.checked = settings.draft;
+  els.upstreamPeerEnabled.disabled = !saved || blocked === "invalid_configuration";
+  els.upstreamPeerError.textContent = settings.error;
+  els.upstreamPeerSave.disabled = !saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading
+    || settings.readFailed || settings.conflict || !!settings.uncertain || blocked === "invalid_configuration";
+  els.upstreamPeerSave.textContent = settings.saving ? "Saving…" : retryDurability ? "Retry save" : "Save";
+  els.upstreamPeerCancel.disabled = !saved || (!settings.dirty && !settings.conflict);
+  els.upstreamPeerRefresh.classList.toggle("hidden", !(settings.error || settings.uncertain || settings.conflict || settings.readFailed));
+  els.upstreamPeerRefresh.disabled = settings.loading || settings.saving;
+  const parts = [];
+  if (!saved) parts.push(settings.loading ? "Loading saved setting…" : "Load the saved setting before making changes.");
+  if (saved) {
+    parts.push(`${blocked === "persistence_uncertain" ? "Current setting" : "Saved setting"}: ${saved.enabled ? "On" : "Off"}.`);
+    if (blocked === "persistence_uncertain") parts.push("Storage is unconfirmed. Peer recording is paused until a save succeeds.");
+    else if (blocked === "invalid_configuration") parts.push("The saved configuration is invalid or exhausted. Peer recording is off and this setting cannot be changed here.");
+    else if (blocked === "http_capture_paused") parts.push("HTTP capture is paused, so no new socket peers are being recorded.");
+    else if (saved.status.effective_enabled) parts.push("Recording peers for new captured HTTP(S) exchanges.");
+    if (settings.dirty) parts.push("Unsaved changes.");
+  }
+  if (settings.readFailed && !settings.message.includes("Check status before saving")) parts.push("Check status before saving.");
+  if (settings.message) parts.push(settings.message);
+  els.upstreamPeerStatus.textContent = parts.join(" ");
+}
+
+function historyRetentionSettingsState() {
+  const sessionId = currentSessionId();
+  let settings = state.historyRetentionSettings;
+  if (!settings || settings.sessionId !== sessionId) {
+    settings = {
+      sessionId, saved: null, baselineToken: null,
+      draft: { mode: "off", preset: "10000", custom: "" },
+      draftVersion: 0, readOwner: 0, saving: false, loading: false,
+      dirty: false, conflict: false, writeConflict: false, uncertain: null, error: "", message: "",
+    };
+    state.historyRetentionSettings = settings;
+  }
+  return settings;
+}
+
+function historyRetentionDraftFromPolicy(policy) {
+  const value = String(policy.max_entries || 10000);
+  const preset = ["10000", "50000", "100000", "250000"].includes(value) ? value : "custom";
+  return { mode: policy.mode, preset, custom: preset === "custom" ? value : "" };
+}
+
+function historyRetentionPolicyFromDraft(draft) {
+  if (draft.mode === "off") return { mode: "off" };
+  const raw = draft.preset === "custom" ? draft.custom : draft.preset;
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(Number(raw))
+    || Number(raw) < 1 || Number(raw) > 4294967295) {
+    throw new Error("Enter a whole number from 1 to 4,294,967,295.");
+  }
+  return { mode: "keep_newest", max_entries: Number(raw) };
+}
+
+function validateHistoryRetentionSnapshot(payload, sessionId) {
+  const policy = payload?.policy;
+  const status = payload?.status;
+  if (payload?.session_id !== sessionId || typeof payload.config_token !== "string" || !/^[a-f0-9]{64}$/.test(payload.config_token)
+    || typeof payload.config_revision !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(payload.config_revision)
+    || BigInt(payload.config_revision) > 18446744073709551615n
+    || !policy || !["off", "keep_newest"].includes(policy.mode)
+    || (policy.mode === "off" && Object.prototype.hasOwnProperty.call(policy, "max_entries"))
+    || (policy.mode === "keep_newest" && (!Number.isInteger(policy.max_entries)
+      || policy.max_entries < 1 || policy.max_entries > 4294967295))
+    || !status || !Number.isSafeInteger(status.total_count) || status.total_count < 0
+    || !Number.isSafeInteger(status.protected_count) || status.protected_count < 0
+    || status.protected_count > status.total_count
+    || typeof status.pending !== "boolean" || typeof status.disk_cleanup_pending !== "boolean"
+    || ![null, "protected_records", "workspace_durability_uncertain", "persistence_error", "record_identity_conflict"].includes(status.blocked_reason)) {
+    throw new Error("Invalid automatic cleanup response. Reload its status before saving.");
+  }
+  return { ...payload, policy: policy.mode === "off"
+    ? { mode: "off" } : { mode: "keep_newest", max_entries: policy.max_entries } };
+}
+
+function validateHistoryRetentionAcknowledgement(snapshot, baseline, submittedPolicy) {
+  const changed = JSON.stringify(baseline.policy) !== JSON.stringify(submittedPolicy);
+  if (typeof snapshot.changed !== "boolean" || snapshot.changed !== changed
+    || JSON.stringify(snapshot.policy) !== JSON.stringify(submittedPolicy)
+    || BigInt(snapshot.config_revision) !== BigInt(baseline.config_revision) + (changed ? 1n : 0n)
+    || (changed ? snapshot.config_token === baseline.config_token : snapshot.config_token !== baseline.config_token)) {
+    throw new Error("Invalid save acknowledgement. Checking saved status; the save will not be retried automatically.");
+  }
+  return snapshot;
+}
+
+function historyRetentionDraftIsDirty(settings) {
+  if (!settings.saved) return false;
+  try {
+    return JSON.stringify(historyRetentionPolicyFromDraft(settings.draft)) !== JSON.stringify(settings.saved.policy);
+  } catch (_) {
+    return true;
+  }
+}
+
+function adoptHistoryRetentionSnapshot(settings, snapshot, { replaceDraft = false, preserveDraft = false } = {}) {
+  settings.saved = snapshot;
+  if (replaceDraft) settings.writeConflict = false;
+  if (replaceDraft || (!preserveDraft && !settings.dirty)) {
+    settings.draft = historyRetentionDraftFromPolicy(snapshot.policy);
+    settings.baselineToken = snapshot.config_token;
+    settings.dirty = false;
+  }
+  settings.conflict = settings.writeConflict || settings.baselineToken !== snapshot.config_token;
+}
+
+async function loadHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  if (!settings.sessionId || settings.saving) return false;
+  const readOwner = ++settings.readOwner;
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsRead = () => settings === state.historyRetentionSettings && readOwner === settings.readOwner
+    && settings.sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
+  settings.loading = true;
+  renderHistoryRetentionSettings();
+  try {
+    const response = await fetch(sessionQueryPath("/api/transactions/retention", settings.sessionId));
+    await requireOkResponse(response, "Failed to load automatic cleanup settings.");
+    const snapshot = validateHistoryRetentionSnapshot(await response.json(), settings.sessionId);
+    if (!ownsRead()) return false;
+    const uncertain = settings.uncertain;
+    if (uncertain) {
+      const matched = JSON.stringify(snapshot.policy) === JSON.stringify(uncertain.policy);
+      settings.baselineToken = snapshot.config_token;
+      adoptHistoryRetentionSnapshot(settings, snapshot, { replaceDraft: settings.draftVersion === uncertain.draftVersion && matched, preserveDraft: settings.draftVersion !== uncertain.draftVersion });
+      settings.dirty = historyRetentionDraftIsDirty(settings);
+      settings.conflict = false;
+      settings.uncertain = null;
+      settings.message = matched
+        ? "Saved policy verified. Cleanup runs in the background."
+        : "Saved policy checked. The earlier save could not be confirmed; review your draft before saving again.";
+    } else {
+      adoptHistoryRetentionSnapshot(settings, snapshot);
+    }
+    settings.error = settings.conflict
+      ? "This policy changed or the active session moved. Cancel to review the saved policy, then check the current session before saving."
+      : "";
+    return true;
+  } catch (error) {
+    if (ownsRead()) settings.error = error?.message || "Failed to load automatic cleanup settings.";
+    return false;
+  } finally {
+    if (ownsRead()) {
+      settings.loading = false;
+      renderHistoryRetentionSettings();
+    }
+  }
+}
+
+function editHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  settings.draft = {
+    mode: els.historyRetentionEnabled.checked ? "keep_newest" : "off",
+    preset: els.historyRetentionPreset.value,
+    custom: els.historyRetentionCustom.value,
+  };
+  settings.draftVersion += 1;
+  settings.dirty = historyRetentionDraftIsDirty(settings);
+  settings.message = "";
+  if (!settings.conflict && !settings.uncertain) settings.error = "";
+  renderHistoryRetentionSettings();
+}
+
+function cancelHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  settings.draftVersion += 1;
+  if (settings.saved) adoptHistoryRetentionSnapshot(settings, settings.saved, { replaceDraft: true });
+  settings.error = "";
+  settings.message = settings.uncertain ? "Save outcome is still unknown. Check status before saving again." : "Changes cancelled.";
+  renderHistoryRetentionSettings();
+}
+
+async function saveHistoryRetentionSettings() {
+  const settings = historyRetentionSettingsState();
+  const retryDurability = settings.saved?.status.blocked_reason === "persistence_error";
+  if (!settings.saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading || settings.conflict || settings.uncertain) return false;
+  let policy;
+  try {
+    policy = historyRetentionPolicyFromDraft(settings.draft);
+  } catch (error) {
+    settings.error = error.message;
+    renderHistoryRetentionSettings();
+    els.historyRetentionCustom.focus();
+    return false;
+  }
+  const draftVersion = settings.draftVersion;
+  const submittedBaseline = settings.saved;
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWrite = () => settings === state.historyRetentionSettings
+    && settings.sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
+  settings.saving = true;
+  settings.readOwner += 1;
+  settings.error = "";
+  settings.message = "Saving policy…";
+  renderHistoryRetentionSettings();
+  let verify = false;
+  let rejected = false;
+  try {
+    const response = await fetch(sessionWritePath("/api/transactions/retention", settings.sessionId), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_config_token: settings.baselineToken, policy }),
+    });
+    if (!ownsWrite()) return false;
+    if (!response.ok) {
+      if (response.status === 409) {
+        settings.conflict = true;
+        settings.writeConflict = true;
+        settings.error = "This policy changed or the active session moved. Check status, then cancel to load the saved policy.";
+        settings.message = "Policy was not saved.";
+        verify = true;
+        return false;
+      }
+      if (response.status >= 500) throw new Error("The save outcome is unknown. Checking saved status; it will not be retried automatically.");
+      rejected = true;
+      await requireOkResponse(response, "Failed to save automatic cleanup settings.");
+    }
+    const snapshot = validateHistoryRetentionAcknowledgement(
+      validateHistoryRetentionSnapshot(await response.json(), settings.sessionId), submittedBaseline, policy,
+    );
+    if (!ownsWrite()) return false;
+    settings.baselineToken = snapshot.config_token;
+    adoptHistoryRetentionSnapshot(settings, snapshot, { replaceDraft: draftVersion === settings.draftVersion, preserveDraft: draftVersion !== settings.draftVersion });
+    settings.dirty = historyRetentionDraftIsDirty(settings);
+    settings.conflict = false;
+    settings.message = "Policy saved. Cleanup runs in the background.";
+    return true;
+  } catch (error) {
+    if (ownsWrite()) {
+      if (!rejected) settings.uncertain = { policy, draftVersion };
+      settings.error = error?.message || "The save outcome is unknown. Check status before saving again.";
+      settings.message = rejected ? "Policy was not saved." : "The save will not be retried automatically.";
+      verify = !rejected;
+    }
+    return false;
+  } finally {
+    if (ownsWrite()) {
+      settings.saving = false;
+      renderHistoryRetentionSettings();
+      if (verify) await loadHistoryRetentionSettings();
+    }
+  }
+}
+
+function renderHistoryRetentionSettings() {
+  if (!els.historyRetentionSection) return;
+  const settings = historyRetentionSettingsState();
+  const { draft, saved } = settings;
+  els.historyRetentionSession.textContent = state.activeSession?.name || settings.sessionId || "No active session";
+  els.historyRetentionEnabled.checked = draft.mode === "keep_newest";
+  els.historyRetentionEnabled.disabled = !saved;
+  els.historyRetentionPreset.value = draft.preset;
+  els.historyRetentionPreset.disabled = !saved || draft.mode === "off";
+  els.historyRetentionCustom.value = draft.custom;
+  els.historyRetentionCustom.disabled = !saved || draft.mode === "off" || draft.preset !== "custom";
+  els.historyRetentionCustomField.classList.toggle("hidden", draft.preset !== "custom");
+  let invalid = false;
+  try { historyRetentionPolicyFromDraft(draft); } catch (_) { invalid = true; }
+  els.historyRetentionCustom.setAttribute("aria-invalid", String(invalid));
+  els.historyRetentionError.textContent = settings.error || (invalid ? "Enter a whole number from 1 to 4,294,967,295." : "");
+  const retryDurability = saved?.status.blocked_reason === "persistence_error" && !settings.dirty;
+  els.historyRetentionSave.disabled = !saved || (!settings.dirty && !retryDurability) || settings.saving || settings.loading || settings.conflict || !!settings.uncertain || invalid;
+  els.historyRetentionCancel.disabled = !saved || (!settings.dirty && !settings.conflict);
+  els.historyRetentionRefresh.disabled = settings.loading || settings.saving;
+  els.historyRetentionSave.textContent = settings.saving ? "Saving…" : retryDurability ? "Retry policy save" : "Save cleanup policy";
+  const parts = [];
+  if (!saved) parts.push(settings.loading ? "Loading saved policy…" : "Load the saved policy before making changes.");
+  if (saved) {
+    const status = saved.status;
+    parts.push(`Saved policy: ${saved.policy.mode === "off" ? "Off" : `keep newest ${saved.policy.max_entries.toLocaleString()} total entries`}.`);
+    parts.push(`${status.total_count.toLocaleString()} stored; ${status.protected_count.toLocaleString()} protected.`);
+    if (status.pending) parts.push("Cleanup pending.");
+    if (status.blocked_reason === "protected_records") parts.push("Protected records prevent reaching the target. The limit is soft.");
+    if (status.blocked_reason === "record_identity_conflict") parts.push("Duplicate record IDs prevent further automatic cleanup.");
+    if (status.blocked_reason === "workspace_durability_uncertain") parts.push("Cleanup paused until saved HTTP tab protection is durable.");
+    if (status.blocked_reason === "persistence_error") parts.push("Cleanup paused after a storage error. Retry policy save to confirm durability; cleanup may still be blocked.");
+    if (status.disk_cleanup_pending) parts.push("Deleted records are hidden; disk space reclamation is pending.");
+    if (settings.dirty) parts.push("Unsaved changes.");
+  }
+  if (settings.message) parts.push(settings.message);
+  els.historyRetentionStatus.textContent = parts.join(" ");
+}
+
 function renderProxySettings() {
+  if (els.upstreamPeerSection) renderUpstreamPeerSettings();
+  if (els.historyRetentionSection) renderHistoryRetentionSettings();
   if (!state.settings || !state.runtime) {
     // Data not ready — schedule a background load to self-heal
     if (!state._settingsLoadPending) {
@@ -12719,7 +14001,7 @@ function renderProxySettings() {
   els.proxySettingsProxyAddr.textContent = state.settings.proxy_addr;
   els.proxySettingsNextProxyAddr.textContent = startup?.proxy_addr || state.settings.proxy_addr;
   els.proxySettingsUiAddr.textContent = state.settings.ui_addr;
-  els.proxySettingsCaptureCap.textContent = `${formatSize(state.settings.body_preview_bytes)} preview / ${configuredTransactionEntryLimit()} HTTP entries`;
+  els.proxySettingsCaptureCap.textContent = `${formatSize(state.settings.body_preview_bytes)} body preview cap`;
   els.proxySettingsBootstrap.textContent = state.settings.certificate.special_host_https;
   // Auto Content-Length (local UI setting, not server-side)
   const aclEl = document.getElementById("proxySettingAutoContentLength");
@@ -12812,11 +14094,13 @@ function renderReplay(options = {}) {
   if (els.wsReplayPanel) els.wsReplayPanel.classList.toggle("hidden", !isWsTab);
 
   if (isWsTab) {
+    renderedHttpReplayDraftOwner = null;
     renderWsReplay();
     return;
   }
 
   if (!tab) {
+    renderedHttpReplayDraftOwner = null;
     if (els.replayRequestCM) {
       updateCodePaneCM("replayReq", els.replayRequestCM, "", {
         mode: "http", readOnly: false,
@@ -12842,7 +14126,7 @@ function renderReplay(options = {}) {
     return;
   }
 
-  syncReplayToolbar(tab);
+  syncReplayToolbar(tab, { force: options.forceToolbarSync });
   const reqMode = state.replayMessageViews.request;
   if (els.replayRequestCM) {
     // CM path for all modes
@@ -12897,6 +14181,12 @@ function renderReplay(options = {}) {
     updateReplaySearchPane("request", tab.requestText);
   }
 
+  renderedHttpReplayDraftOwner = {
+    tab,
+    sessionId: currentSessionId(),
+    generation: workspaceStateGeneration,
+  };
+
   if (!tab.responseRecord) {
     renderReplayEmptyResponse(tab);
     return;
@@ -12917,7 +14207,7 @@ function renderReplay(options = {}) {
   const respMode = state.replayMessageViews.response;
   let responseText;
   if (respMode === "hex") {
-    responseText = toHexDump(rawResponseText);
+    responseText = buildMessageHexPresentation("response", tab.responseRecord, rawResponseText);
   } else if (respMode === "pretty") {
     responseText = prettyFormat(rawResponseText, tab.responseRecord.response);
   } else {
@@ -13023,6 +14313,8 @@ function syncReplayRequestTextFromEditor(newText) {
   if (!activeTab || activeTab.type === "websocket") {
     return;
   }
+  // Input synchronization invalidates an earlier capture even after edit-and-revert.
+  if (renderedHttpReplayDraftOwner?.tab === activeTab) renderedHttpReplayDraftOwner.preservedVersionDraft = null;
   const previousText = activeTab.requestText;
   let nextText = newText;
   let parsed = null;
@@ -13139,7 +14431,7 @@ function renderReplayResponseView(text) {
     }
     _replayResponseCMView.setContent(text || "");
     // Apply search
-    const query = (state.replayMessageSearch?.response || "").trim();
+    const query = state.replayMessageSearch?.response || "";
     _replayResponseCMView.applySearch(query);
   } else if (els.replayResponseView) {
     // Fallback to legacy
@@ -13193,7 +14485,7 @@ function renderReplayResponseOnly(tab) {
   const respMode = state.replayMessageViews.response;
   let responseText;
   if (respMode === "hex") {
-    responseText = toHexDump(rawResponseText);
+    responseText = buildMessageHexPresentation("response", tab.responseRecord, rawResponseText);
   } else if (respMode === "pretty") {
     responseText = prettyFormat(rawResponseText, tab.responseRecord.response);
   } else {
@@ -13278,7 +14570,7 @@ function renderReplayViewContent(target) {
     const rawText = buildRawResponse(tab.responseRecord);
     let displayText;
     if (mode === "hex") {
-      displayText = toHexDump(rawText);
+      displayText = buildMessageHexPresentation("response", tab.responseRecord, rawText);
     } else if (mode === "pretty") {
       displayText = prettyFormat(rawText, tab.responseRecord.response);
     } else {
@@ -13328,16 +14620,17 @@ function updateReplaySearchPane(target, text, options = {}) {
   meta.innerHTML = buildSearchMeta(countLines(text), mode, searchResult.count);
 }
 
-function syncReplayToolbar(tab) {
+function syncReplayToolbar(tab, { force = false } = {}) {
   const request = deriveRepeaterRequest(tab);
   const target = getRepeaterTargetConfig(tab, request);
-  if (document.activeElement !== els.replayHostInput && els.replayHostInput.value !== target.host) {
+  // A successful tab switch must replace the old tab's controls even when focus stays here.
+  if ((force || document.activeElement !== els.replayHostInput) && els.replayHostInput.value !== target.host) {
     els.replayHostInput.value = target.host;
   }
-  if (document.activeElement !== els.replayPortInput && els.replayPortInput.value !== target.port) {
+  if ((force || document.activeElement !== els.replayPortInput) && els.replayPortInput.value !== target.port) {
     els.replayPortInput.value = target.port;
   }
-  if (document.activeElement !== els.replaySchemeSelect && els.replaySchemeSelect.value !== target.scheme) {
+  if ((force || document.activeElement !== els.replaySchemeSelect) && els.replaySchemeSelect.value !== target.scheme) {
     els.replaySchemeSelect.value = target.scheme;
   }
   setReplayTargetInputValidity(validateManualRepeaterTargetInput(
@@ -13345,7 +14638,7 @@ function syncReplayToolbar(tab) {
     els.replayPortInput.value,
   ));
   const versionSelect = document.getElementById("replayHttpVersionSelect");
-  if (versionSelect && document.activeElement !== versionSelect) {
+  if (versionSelect && (force || document.activeElement !== versionSelect)) {
     versionSelect.value = normalizeReplayHttpVersion(tab.httpVersionMode || "");
   }
   const sending = isReplayTabSending(tab.id);
@@ -13471,6 +14764,9 @@ function renderMatchReplaceRules() {
       event.stopPropagation();
       const rule = state.matchReplaceRules.find((r) => r.id === toggle.dataset.ruleToggle);
       if (rule) {
+        if (rule.enabled !== toggle.checked) {
+          state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
+        }
         rule.enabled = toggle.checked;
         saveMatchReplaceRules().catch((error) => {
           console.error(error);
@@ -13507,8 +14803,118 @@ function renderMatchReplaceRules() {
   els.saveMatchReplaceRuleButton.textContent = "Save";
 }
 
+function initializeTargetWorkspace() {
+  const panel = document.getElementById("targetServiceMapPanel");
+  if (!panel || !window.SniperServiceMap) return;
+  targetServiceMapController = window.SniperServiceMap.createController({
+    elements: {
+      panel,
+      status: document.getElementById("serviceMapStatus"),
+      filterSummary: document.getElementById("serviceMapFilterSummary"),
+      refresh: document.getElementById("serviceMapRefresh"),
+      search: document.getElementById("serviceMapSearch"),
+      scope: document.getElementById("serviceMapScopeOnly"),
+      mapControls: document.getElementById("serviceMapViewControls"),
+      allOrigins: document.getElementById("serviceMapAllOrigins"),
+      directRelations: document.getElementById("serviceMapDirectRelations"),
+      focusSelection: document.getElementById("serviceMapFocusSelection"),
+      canvas: document.getElementById("serviceMapCanvas"),
+      viewport: document.getElementById("serviceMapViewport"),
+      zoomControls: document.getElementById("serviceMapZoomControls"),
+      zoomOut: document.getElementById("serviceMapZoomOut"),
+      zoomReset: document.getElementById("serviceMapZoomReset"),
+      zoomIn: document.getElementById("serviceMapZoomIn"),
+      graphBounds: document.getElementById("serviceMapGraphBounds"),
+      linkKinds: document.getElementById("serviceMapLinkKinds"),
+      siteControls: document.getElementById("serviceMapSiteControls"),
+      alert: document.getElementById("serviceMapAlert"),
+      detailsSummary: document.getElementById("serviceMapDetailsSummary"),
+      boundsDetails: document.getElementById("serviceMapBoundsDetails"),
+      graphDiagnostics: document.getElementById("serviceMapGraphDiagnostics"),
+      overlayStatus: document.getElementById("serviceMapBodyOverlay"),
+      detail: document.getElementById("serviceMapDetail"),
+      content: document.getElementById("serviceMapContent"),
+      catalog: document.getElementById("serviceMapApiCatalog"),
+      apiDocs: document.getElementById("serviceMapApiDocs"),
+    },
+    getSessionId: currentSessionId,
+    getEventStreamReady: () => targetServiceMapEventStreamReady(),
+    getFilterQuery: () => serviceMapFilterQuery(),
+    getFilterSummary: () => serviceMapFilterSummary(),
+    getHiddenLinkKinds: () => state.serviceMapHiddenLinkKinds,
+    setHiddenLinkKinds: (kinds) => {
+      state.serviceMapHiddenLinkKinds = kinds;
+      scheduleUiSettingsSave();
+    },
+    getSiteDisplay: () => state.serviceMapSiteDisplay,
+    setSiteDisplay: (display) => {
+      state.serviceMapSiteDisplay = display;
+      scheduleUiSettingsSave();
+    },
+    request: (path, options) => fetch(path, options),
+    copyText: (text, label) => copyTextToClipboard(text)
+      .then(() => showToast(label))
+      .catch(() => showToast("Failed to copy", "error")),
+    sendToReplay: (id) => loadTransactionRecordById(id)
+      .then((record) => {
+        if (!record) throw new Error("The row could not be loaded.");
+        openTransactionRecordInReplay(record);
+      })
+      .catch((error) => showToast(error?.message || "Failed to open Replay", "error")),
+    // The desktop app hands an external page to the default browser.
+    openUrl: (url) => window.open(url, "_blank", "noopener,noreferrer"),
+  });
+  document.getElementById("serviceMapFilterButton")?.addEventListener("click", () => openFilterModal("serviceMap"));
+  // Inspector-to-map navigation already owns a verified snapshot. Keep the
+  // explicit temporary-reference action local instead of issuing another read.
+  targetServiceMapController.setViewChange((view) => setActiveTargetView(view, { refresh: false }));
+  const tabs = Array.from(document.querySelectorAll("[data-target-view]"));
+  tabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => setActiveTargetView(tab.dataset.targetView));
+    tab.addEventListener("keydown", (event) => {
+      let next = index;
+      if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+      else if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      tabs[next].focus();
+      setActiveTargetView(tabs[next].dataset.targetView);
+    });
+  });
+  setActiveTargetView(state.activeTargetView || "service-map");
+}
+
+// The Map tool's two views of one map: the graph and its APIs. Scope
+// shows its rules and paths together, with no views to switch.
+function setActiveTargetView(view, { refresh = true } = {}) {
+  state.activeTargetView = ["service-map", "apis"].includes(view) ? view : "service-map";
+  for (const tab of document.querySelectorAll("[data-target-view]")) {
+    const selected = tab.dataset.targetView === state.activeTargetView;
+    tab.classList.toggle("active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  document.getElementById("targetServiceMapPanel")?.setAttribute("aria-labelledby", state.activeTargetView === "apis" ? "targetApisTab" : "targetServiceMapTab");
+  targetServiceMapController?.setVisible(state.activeTool === "map", state.activeTargetView);
+  if (state.activeTool === "map" && refresh) targetServiceMapController?.refresh();
+}
+
 function renderTarget() {
   const sessionId = currentSessionId();
+  const targetTree = els.targetTree;
+  const focusedElement = document.activeElement;
+  const focusedButton = focusedElement?.closest(".target-host-toggle");
+  const canRestoreHostFocus = () => sessionId && currentSessionId() === sessionId
+    && els.targetTree === targetTree && targetTree.isConnected
+    && state.activeTool === "target" && !els.targetShell.classList.contains("hidden")
+    && targetTree.getClientRects().length && window.getComputedStyle(targetTree).visibility !== "hidden"
+    && !document.querySelector(".modal-backdrop:not(.hidden), dialog[open]");
+  // Scope-draft sync can reset the editor owner without changing this tree.
+  const focusedHost = focusedButton && targetTree.contains(focusedButton)
+    && targetTree.dataset.renderedSessionId === sessionId && canRestoreHostFocus()
+    ? focusedButton.dataset.targetHost : null;
   if (!state.targetScopeDirty) {
     state.targetScopeDraft = formatScopePatternsText(state.runtime?.scope_patterns);
     state.targetScopeExcludeDraft = formatScopePatternsText(
@@ -13540,7 +14946,7 @@ function renderTarget() {
     Array.from(state.targetExpandedHosts).filter((host) => liveHosts.has(host)),
   );
 
-  els.targetTree.innerHTML = siteMap.length
+  targetTree.innerHTML = siteMap.length
     ? siteMap
         .map((host) => {
           const hostName = String(host.host || "");
@@ -13585,7 +14991,8 @@ function renderTarget() {
         .join("")
     : "<p class=\"empty-copy\">No captured targets yet. Send traffic through the proxy to build a site map.</p>";
 
-  Array.from(els.targetTree.querySelectorAll(".target-host-toggle")).forEach((button) => {
+  const hostButtons = Array.from(targetTree.querySelectorAll(".target-host-toggle"));
+  hostButtons.forEach((button) => {
     button.addEventListener("click", () => {
       const host = button.dataset.targetHost;
       if (!host) {
@@ -13601,6 +15008,19 @@ function renderTarget() {
       renderTarget();
     });
   });
+  targetTree.dataset.renderedSessionId = sessionId || "";
+
+  // Replacing the buttons drops focus to body. A newer focus owner always wins.
+  const activeElement = document.activeElement;
+  if (focusedHost !== null && canRestoreHostFocus()
+    && (!activeElement || activeElement === document.body
+      || (activeElement === focusedElement && !focusedElement.isConnected))) {
+    const button = hostButtons.find((candidate) => candidate.dataset.targetHost === focusedHost);
+    if (button?.isConnected && !button.disabled && button.tabIndex >= 0
+      && button.getClientRects().length && window.getComputedStyle(button).visibility !== "hidden") {
+      button.focus({ preventScroll: true });
+    }
+  }
 }
 
 function renderFuzzer() {
@@ -14021,6 +15441,7 @@ function createNewMatchReplaceRule() {
     case_sensitive: false,
   };
   state.matchReplaceRules = [rule, ...state.matchReplaceRules];
+  state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
   state.selectedMatchReplaceRuleId = rule.id;
   renderMatchReplaceRules();
 }
@@ -14053,6 +15474,7 @@ function syncMatchReplaceEditor() {
     || Boolean(rule.case_sensitive) !== next.case_sensitive;
   Object.assign(rule, next);
   if (changed) {
+    state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
     state.matchReplaceDirty = true;
     state.matchReplaceEditorSessionId = currentSessionId();
   }
@@ -14064,10 +15486,11 @@ async function deleteSelectedMatchReplaceRule() {
   }
 
   state.matchReplaceRules = state.matchReplaceRules.filter((rule) => rule.id !== state.selectedMatchReplaceRuleId);
+  state.matchReplaceDraftVersion = (state.matchReplaceDraftVersion || 0) + 1;
   state.selectedMatchReplaceRuleId = state.matchReplaceRules[0]?.id ?? null;
   renderMatchReplaceRules();
-  await saveMatchReplaceRules();
-  showToast("Rule deleted");
+  const saved = await saveMatchReplaceRules();
+  if (saved !== false) showToast("Rule deleted");
 }
 
 async function saveTargetScope(options = {}) {
@@ -14085,6 +15508,21 @@ async function saveTargetScope(options = {}) {
   const excludeText = state.targetScopeEditorSessionId === sessionId
     ? els.targetScopeExcludeEditor?.value
     : state.targetScopeExcludeDraft;
+  const workspaceGeneration = workspaceStateGeneration;
+  const draftVersion = state.targetScopeDraftVersion || 0;
+  const saveToken = state.targetScopeSaveToken = (state.targetScopeSaveToken || 0) + 1;
+  const submittedDraft = state.targetScopeDraft;
+  const submittedExcludeDraft = state.targetScopeExcludeDraft;
+  const ownsWorkspace = () => sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
+  const ownsDraft = () => ownsWorkspace()
+    && draftVersion === (state.targetScopeDraftVersion || 0)
+    && saveToken === state.targetScopeSaveToken;
+  const superseded = () => {
+    if (ownsWorkspace()) {
+      showToast("An earlier save completed. Your current draft is unchanged; review it before continuing.", "error", 7000);
+    }
+    return false;
+  };
   const toPatterns = (text) => String(text || "")
     .split("\n")
     .map((line) => line.trim())
@@ -14107,15 +15545,16 @@ async function saveTargetScope(options = {}) {
     throw new Error(`saveTargetScope failed: ${response.status}`);
   }
   const runtime = await response.json();
-  if (sessionId !== currentSessionId()) {
-    if (state.targetScopeEditorSessionId === sessionId) {
-      state.targetScopeDraft = formatScopePatternsText(runtime?.scope_patterns);
-      state.targetScopeExcludeDraft = formatScopePatternsText(runtime?.excluded_scope_patterns);
-      state.targetScopeDirty = false;
-      state.targetScopeEditorSessionId = null;
-    }
-    return;
+  // Even a save superseded by a newer editor changed server-side scope. Fence
+  // map reads from before that acknowledgement without touching the newer draft.
+  if (ownsWorkspace() && typeof targetServiceMapController !== "undefined") {
+    targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
   }
+  if (!ownsDraft()
+    || submittedDraft !== state.targetScopeDraft
+    || submittedExcludeDraft !== state.targetScopeExcludeDraft
+    || scopeText !== (state.targetScopeEditorSessionId === sessionId ? els.targetScopeEditor.value : state.targetScopeDraft)
+    || excludeText !== (state.targetScopeEditorSessionId === sessionId ? els.targetScopeExcludeEditor?.value : state.targetScopeExcludeDraft)) return superseded();
   state.runtime = runtime;
   state.targetScopeDraft = formatScopePatternsText(state.runtime?.scope_patterns);
   state.targetScopeExcludeDraft = formatScopePatternsText(
@@ -14135,10 +15574,20 @@ async function saveTargetScope(options = {}) {
   renderInterceptStatus();
   renderProxySettings();
   if (!options.skipReload) {
-    await loadTargetSiteMap();
+    const loaded = await loadTargetSiteMap(false, {
+      sessionId, workspaceGeneration, draftVersion, saveToken,
+      // Compare against the canonical response now shown, not the raw text
+      // that was legitimately normalized by this successful save.
+      scopeText: els.targetScopeEditor.value,
+      excludeText: els.targetScopeExcludeEditor?.value,
+      scopeDraft: state.targetScopeDraft,
+      excludeDraft: state.targetScopeExcludeDraft,
+    });
+    if (loaded === false || !ownsDraft()) return superseded();
   }
   invalidateVisibleEntriesCache();
   scheduleRefresh();
+  return true;
 }
 
 async function openFuzzerFromReplay() {
@@ -14847,6 +16296,8 @@ async function saveCurrentSequence({
   skipPostSaveStateSync = false,
 } = {}) {
   if (!state.editingSequence) return false;
+  const workspaceSessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
   syncSequenceStepFromDom({ allowInvalidRequests: true });
   const sessionId = targetSessionId || currentSequenceSessionId();
   const savedId = state.editingSequence.id;
@@ -14870,6 +16321,7 @@ async function saveCurrentSequence({
     return false;
   }
   if (skipPostSaveStateSync) {
+    if (workspaceSessionId !== currentSessionId() || workspaceGeneration !== workspaceStateGeneration) return false;
     if ((state.sequenceDraftVersion || 0) !== draftVersion) {
       state.sequenceDirty = true;
       return false;
@@ -14906,9 +16358,16 @@ async function flushSequenceDraft(options = {}) {
 }
 
 async function flushSequenceDraftBeforeExternalSessionReload(options = {}) {
+  const sessionId = options.sessionId || currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWorkspace = () => sessionId === currentSessionId()
+    && workspaceGeneration === workspaceStateGeneration;
+  if (!ownsWorkspace()) return false;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     if (!state.sequenceDirty || !state.editingSequence) return true;
-    if (await flushSequenceDraft({ ...options, skipPostSaveStateSync: true })) {
+    const saved = await flushSequenceDraft({ ...options, skipPostSaveStateSync: true });
+    if (!ownsWorkspace()) return false;
+    if (saved) {
       return true;
     }
   }
@@ -15192,6 +16651,7 @@ async function toggleIntercept() {
     if (requestSeq !== _interceptToggleRequestSeq || sessionId !== currentSessionId()) {
       return;
     }
+    if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
     state.runtime = runtime;
     renderInterceptStatus();
 
@@ -15365,6 +16825,7 @@ async function saveProxySettings() {
   if (sessionId !== currentSessionId()) {
     return startupResult;
   }
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtimeResult);
   state.runtime = runtimeResult;
   state.oastTokenClearPending = false;
   if (startupResult) {
@@ -15981,21 +17442,16 @@ function renderResponseIntercepts() {
   if (state.interceptQueueTab === "response") {
     els.interceptDetailPath.textContent = `${rec.scheme.toUpperCase()} / ${rec.method} ${rec.host}${rec.path}`;
     els.interceptDetailTitle.textContent = `${rec.status} Response`;
+    // As with requests, preserve this record's draft and search state on polls.
     if (els.interceptResponseCM) {
-      const cv = getCMView("interceptRes");
-      const isFocused = cv && cv.view.hasFocus;
-      const rawText = buildEditableRawResponse(rec.response);
-      // See the request pane above: avoid a no-op re-seed that would clear the
-      // active search highlights and match position.
-      const contentDiffers = !cv || cv.getContent() !== rawText;
-      if (state.responseInterceptEditorSeedId !== rec.id || (!isFocused && contentDiffers)) {
-        setInterceptPaneContent("interceptRes", els.interceptResponseCM, rawText, {
+      if (state.responseInterceptEditorSeedId !== rec.id) {
+        setInterceptPaneContent("interceptRes", els.interceptResponseCM, buildEditableRawResponse(rec.response), {
           mode: "http", readOnly: false,
         });
         state.responseInterceptEditorSeedId = rec.id;
       }
     } else {
-      if (state.responseInterceptEditorSeedId !== rec.id || document.activeElement !== els.interceptResponseEditor) {
+      if (state.responseInterceptEditorSeedId !== rec.id) {
         els.interceptResponseEditor.value = buildEditableRawResponse(rec.response);
         state.responseInterceptEditorSeedId = rec.id;
       }
@@ -16239,11 +17695,13 @@ function clearReplaySendInFlight() {
   setReplaySending(false);
 }
 
-function isReplayTabStillCurrent(tab, tabId, sessionId) {
+function isReplayTabStillCurrent(tab, tabId, sessionId, controller) {
   return Boolean(
     tab
     && state.replayTabs.includes(tab)
     && tab.id === tabId
+    && _replaySendControllers.get(tabId) === controller
+    && !controller.signal.aborted
     && (state.activeSession?.id || null) === sessionId
   );
 }
@@ -16302,159 +17760,149 @@ async function sendReplay() {
   _replaySendControllers.set(sendingTabId, replayController);
   setReplaySending(true);
 
-  let expectedWorkspaceRevision;
+  // Keep ownership until the body is decoded and applied, not just until
+  // fetch resolves headers. Cancel/close may retire it at any await.
   try {
-    expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
-  } catch (error) {
-    if (_replaySendControllers.get(sendingTabId) !== replayController || replayController.signal.aborted) {
+    let expectedWorkspaceRevision;
+    try {
+      expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
+    } catch (error) {
+      if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+      if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+      }
+      handleWorkspaceActionError(error);
       return;
     }
-    _replaySendControllers.delete(sendingTabId);
-    setReplaySending(false);
-    if (error instanceof WorkspaceStateConflictError) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
+    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+
+    // Enter sending state after validation so only a valid send clears the response pane.
+    tab.responseRecord = null;
+    tab.notice = "";
+    if (state.activeReplayTabId === sendingTabId) {
+      els.replayFollowRedirectButton?.classList.add("hidden");
+      els.replayResponseMeta.textContent = "";
+      renderReplayResponseView("");
     }
-    handleWorkspaceActionError(error);
-    return;
-  }
-  if (_replaySendControllers.get(sendingTabId) !== replayController || replayController.signal.aborted) {
-    return;
-  }
-  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-    _replaySendControllers.delete(sendingTabId);
-    setReplaySending(false);
-    return;
-  }
 
-  // Enter sending state after validation so only a valid send clears the response pane.
-  tab.responseRecord = null;
-  tab.notice = "";
-  els.replayFollowRedirectButton?.classList.add("hidden");
-  els.replayResponseMeta.textContent = "";
-  renderReplayResponseView("");
-
-  let response;
-  try {
-    const targetPayload = replayTargetOverridePayload(tab, request, target);
-    response = await fetch("/api/replay/send", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        session_id: sendingSessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(sendingSessionId),
-        expected_workspace_revision: expectedWorkspaceRevision,
+    let response, responseRecord, errorPayload;
+    try {
+      const targetPayload = replayTargetOverridePayload(tab, request, target);
+      response = await fetch("/api/replay/send", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          session_id: sendingSessionId,
+          expected_active_session_id: expectedActiveSessionIdForWrite(sendingSessionId),
+          expected_workspace_revision: expectedWorkspaceRevision,
+          request,
+          target: targetPayload,
+          source_transaction_id: tab.sourceTransactionId,
+          http_version: httpVersion,
+        }),
+        signal: replayController.signal,
+      });
+      if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+      if (response.ok) {
+        responseRecord = await response.json();
+      } else {
+        errorPayload = await readReplaySendError(response);
+      }
+    } catch (e) {
+      if (e.name === "AbortError") return; // cancelled
+      if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+      const notice = e?.message || "Failed to send replay.";
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = null;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+      }
+      recordRepeaterHistory(tab, {
         request,
-        target: targetPayload,
-        source_transaction_id: tab.sourceTransactionId,
-        http_version: httpVersion,
-      }),
-      signal: replayController.signal,
-    });
-  } catch (e) {
-    if (e.name === "AbortError") return; // cancelled
-    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) return;
-    const notice = e?.message || "Failed to send replay.";
+        requestText,
+        responseRecord: null,
+        notice,
+        target,
+      });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      showToast(notice, "error");
+      return;
+    }
+
+    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) {
+      return;
+    }
+
+    if (!response.ok) {
+      if (errorPayload.workspaceConflict) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+        handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
+        return;
+      }
+      const notice = errorPayload.notice;
+      const responseRecord = errorPayload.responseRecord;
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = responseRecord;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+      }
+      recordRepeaterHistory(tab, {
+        request,
+        requestText,
+        responseRecord,
+        notice,
+        target,
+      });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      showToast(notice, "error");
+      if (responseRecord) {
+        scheduleRefresh();
+      }
+      return;
+    }
+
     const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
     if (draftUnchanged) {
-      tab.responseRecord = null;
-      tab.notice = notice;
       applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+      tab.notice = "";
+      tab.responseRecord = responseRecord;
     }
     recordRepeaterHistory(tab, {
       request,
       requestText,
-      responseRecord: null,
-      notice,
+      responseRecord,
+      notice: "",
       target,
     });
     scheduleWorkspaceStateSave();
+    // Only update response side — don't re-render request to preserve cursor/scroll
     if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
       renderReplayResponseOnly(tab);
       syncReplayToolbar(tab);
+      renderReplayViewTabs();
+    } else if (!draftUnchanged && state.activeReplayTabId === sendingTabId) {
+      syncReplayToolbar(tab);
+      showToast("Replay response was saved to history; current request changed while sending.", "info", 4000);
     }
-    showToast(notice, "error");
-    return;
+    scheduleRefresh();
   } finally {
     if (_replaySendControllers.get(sendingTabId) === replayController) {
       _replaySendControllers.delete(sendingTabId);
       setReplaySending(false);
     }
   }
-
-  if (!state.replayTabs.some((item) => item.id === sendingTabId)) {
-    return;
-  }
-  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-    return;
-  }
-
-  if (!response.ok) {
-    const errorPayload = await readReplaySendError(response);
-    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-      return;
-    }
-    if (errorPayload.workspaceConflict) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
-      handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
-      return;
-    }
-    const notice = errorPayload.notice;
-    const responseRecord = errorPayload.responseRecord;
-    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-    if (draftUnchanged) {
-      tab.responseRecord = responseRecord;
-      tab.notice = notice;
-      applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
-    }
-    recordRepeaterHistory(tab, {
-      request,
-      requestText,
-      responseRecord,
-      notice,
-      target,
-    });
-    scheduleWorkspaceStateSave();
-    if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
-      renderReplayResponseOnly(tab);
-      syncReplayToolbar(tab);
-    }
-    showToast(notice, "error");
-    if (responseRecord) {
-      scheduleRefresh();
-    }
-    return;
-  }
-
-  const responseRecord = await response.json();
-  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-    return;
-  }
-  const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-  if (draftUnchanged) {
-    applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
-    tab.notice = "";
-    tab.responseRecord = responseRecord;
-  }
-  recordRepeaterHistory(tab, {
-    request,
-    requestText,
-    responseRecord,
-    notice: "",
-    target,
-  });
-  scheduleWorkspaceStateSave();
-  // Only update response side — don't re-render request to preserve cursor/scroll
-  if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
-    renderReplayResponseOnly(tab);
-    syncReplayToolbar(tab);
-    renderReplayViewTabs();
-  } else if (!draftUnchanged && state.activeReplayTabId === sendingTabId) {
-    syncReplayToolbar(tab);
-    showToast("Replay response was saved to history; current request changed while sending.", "info", 4000);
-  }
-  scheduleRefresh();
 }
 
 function isWorkspaceRevisionConflictPayload(payload) {
@@ -16701,7 +18149,8 @@ async function followRedirect() {
 
   // Add updated host
   const newHostPort = isDefaultPortForScheme(newScheme, newPort) ? "" : newPort;
-  newHeaders.unshift({ name: "host", value: joinAuthority(newHost, newHostPort) });
+  const newAuthority = joinAuthority(newHost, newHostPort);
+  newHeaders.unshift({ name: "host", value: newAuthority });
 
   // Add merged cookies
   if (cookieMap.size > 0) {
@@ -16710,7 +18159,7 @@ async function followRedirect() {
 
   const newRequest = {
     scheme: newScheme,
-    host: newHost,
+    host: newAuthority,
     method: newMethod,
     path: newPath,
     headers: newHeaders,
@@ -16743,117 +18192,128 @@ async function followRedirect() {
     renderReplayViewTabs();
   }
 
-  let expectedWorkspaceRevision;
-  try {
-    expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
-  } catch (error) {
-    if (error instanceof WorkspaceStateConflictError) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
-    }
-    handleWorkspaceActionError(error);
-    return;
-  }
-
-  // Send the follow request
-  const target = { scheme: newScheme, host: newHost, port: newPort };
   const followingTabId = tab.id;
   const followingSessionId = state.activeSession?.id || null;
   const replayController = new AbortController();
   _replaySendControllers.set(followingTabId, replayController);
   setReplaySending(true);
-  let response;
+
+  // Keep ownership until the body is decoded and applied, not just until
+  // fetch resolves headers. Cancel/close may retire it at any await.
   try {
-    response = await fetch("/api/replay/send", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        session_id: followingSessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
-        expected_workspace_revision: expectedWorkspaceRevision,
-        request: newRequest,
-        target,
-        source_transaction_id: null,
-        http_version: httpVersion,
-      }),
-      signal: replayController.signal,
-    });
-  } catch (e) {
-    if (e.name === "AbortError") return;
-    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-    const notice = e?.message || "Failed to follow redirect.";
+    let expectedWorkspaceRevision;
+    try {
+      expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
+    } catch (error) {
+      if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+      if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+      }
+      handleWorkspaceActionError(error);
+      return;
+    }
+
+    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+
+    // Send the follow request
+    const target = { scheme: newScheme, host: newHost, port: newPort };
+    let response, responseRecord, errorPayload;
+    try {
+      response = await fetch("/api/replay/send", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: followingSessionId,
+          expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
+          expected_workspace_revision: expectedWorkspaceRevision,
+          request: newRequest,
+          target: replayTargetOverridePayload(tab, newRequest, target),
+          source_transaction_id: null,
+          http_version: httpVersion,
+        }),
+        signal: replayController.signal,
+      });
+      if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+      if (response.ok) {
+        responseRecord = await response.json();
+      } else {
+        errorPayload = await readReplaySendError(response);
+      }
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+      const notice = e?.message || "Failed to follow redirect.";
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = null;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+      }
+      recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord: null, notice, target });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === followingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      showToast(notice, "error");
+      return;
+    }
+
+    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+
+    if (!response.ok) {
+      if (errorPayload.workspaceConflict) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+        handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
+        return;
+      }
+      const notice = errorPayload.notice;
+      const responseRecord = errorPayload.responseRecord;
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = responseRecord;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+      }
+      recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice, target });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === followingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      if (responseRecord) {
+        scheduleRefresh();
+      }
+      return;
+    }
+
     const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
     if (draftUnchanged) {
-      tab.responseRecord = null;
-      tab.notice = notice;
       applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+      tab.notice = "";
+      tab.responseRecord = responseRecord;
     }
-    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord: null, notice, target });
+    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice: "", target });
     scheduleWorkspaceStateSave();
     if (draftUnchanged && state.activeReplayTabId === followingTabId) {
       renderReplayResponseOnly(tab);
       syncReplayToolbar(tab);
+      renderReplayViewTabs();
+    } else if (!draftUnchanged && state.activeReplayTabId === followingTabId) {
+      syncReplayToolbar(tab);
+      showToast("Redirect response was saved to history; current request changed while sending.", "info", 4000);
     }
-    showToast(notice, "error");
-    return;
+    scheduleRefresh();
   } finally {
     if (_replaySendControllers.get(followingTabId) === replayController) {
       _replaySendControllers.delete(followingTabId);
       setReplaySending(false);
     }
   }
-
-  if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-
-  if (!response.ok) {
-    const errorPayload = await readReplaySendError(response);
-    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-    if (errorPayload.workspaceConflict) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
-      handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
-      return;
-    }
-    const notice = errorPayload.notice;
-    const responseRecord = errorPayload.responseRecord;
-    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-    if (draftUnchanged) {
-      tab.responseRecord = responseRecord;
-      tab.notice = notice;
-      applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
-    }
-    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice, target });
-    scheduleWorkspaceStateSave();
-    if (draftUnchanged && state.activeReplayTabId === followingTabId) {
-      renderReplayResponseOnly(tab);
-      syncReplayToolbar(tab);
-    }
-    if (responseRecord) {
-      scheduleRefresh();
-    }
-    return;
-  }
-
-  const responseRecord = await response.json();
-  if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-  const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-  if (draftUnchanged) {
-    applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
-    tab.notice = "";
-    tab.responseRecord = responseRecord;
-  }
-  recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice: "", target });
-  scheduleWorkspaceStateSave();
-  if (draftUnchanged && state.activeReplayTabId === followingTabId) {
-    renderReplayResponseOnly(tab);
-    syncReplayToolbar(tab);
-    renderReplayViewTabs();
-  } else if (!draftUnchanged && state.activeReplayTabId === followingTabId) {
-    syncReplayToolbar(tab);
-    showToast("Redirect response was saved to history; current request changed while sending.", "info", 4000);
-  }
-  scheduleRefresh();
 }
 
 function openBlankReplayTab() {
+  if (!preserveActiveHttpReplayDraftBeforeNavigation(getActiveReplayTab(), "opening a new tab")) return;
   const tab = createReplayTab();
   state.replayTabs.push(tab);
   state.activeReplayTabId = tab.id;
@@ -16904,8 +18364,9 @@ function duplicateActiveReplayTab() {
     return;
   }
 
+  if (!preserveActiveHttpReplayDraftBeforeNavigation(tab, "duplicating this tab")) return;
   const fallback = tab.baseRequest || createDefaultEditableRequest();
-  const requestText = tab.requestText || buildEditableRawRequest(fallback);
+  const requestText = tab.requestText ?? buildEditableRawRequest(fallback);
   let request = cloneEditableRequest(fallback);
   try {
     request = parseEditableRawRequest(requestText, fallback);
@@ -17170,6 +18631,21 @@ function wireReplayTabDragReorder(tabElement, id) {
 function renderReplayTabs(options = {}) {
   const preserveScrollLeft = options.keepScroll ? els.replayTabStrip.scrollLeft : null;
   const sortedTabs = getReplayTabVisualOrder();
+  const renamingTab = sortedTabs.find((tab) => tab.id === state.replayRenamingTabId);
+  const renameInput = renamingTab && els.replayTabStrip.querySelector(
+    `.replay-tab[data-replay-tab-id="${CSS.escape(renamingTab.id)}"] .replay-tab-name-input`,
+  );
+  const renameOwner = renameInput?._replayRenameOwner;
+  if (renameOwner && renameOwner.tab === renamingTab
+    && renameOwner.sessionId === currentSessionId()
+    && renameOwner.generation === workspaceStateGeneration
+    && renameOwner.activeTabId === state.activeReplayTabId) {
+    // Status callbacks can redraw the strip while its only copy of a name draft
+    // is in this input. Keep the node (and IME/selection) alive until commit or
+    // cancel; the final render will also pick up deferred tab additions/order.
+    for (const tab of sortedTabs) refreshReplayTabLabel(tab.id);
+    return;
+  }
 
   els.replayTabStrip.innerHTML = sortedTabs
     .map((tab) => {
@@ -17224,21 +18700,43 @@ function renderReplayTabs(options = {}) {
       );
       event.preventDefault();
       event.stopPropagation();
-      commitReplayTabRename(editingId, editingInput?.value || "");
       if (closeButton) {
-        closeRepeaterTab(actionTabId).catch(handleWorkspaceActionError);
-      } else if (pinButton) {
+        closeRepeaterTab(actionTabId, { id: editingId, value: editingInput?.value || "" })
+          .catch(handleWorkspaceActionError);
+        return;
+      }
+      if (tabButton && state.activeReplayTabId !== actionTabId
+        && !preserveActiveHttpReplayDraftBeforeNavigation(getActiveReplayTab(), "switching tabs")) return;
+      commitReplayTabRename(editingId, editingInput?.value || "");
+      if (pinButton) {
         toggleReplayTabPin(actionTabId);
       } else if (tabButton && state.activeReplayTabId !== actionTabId) {
         state.activeReplayTabId = actionTabId;
         state.replayRenamingTabId = null;
         scheduleWorkspaceStateSave();
-        renderReplay();
+        renderReplay({ forceToolbarSync: true });
       }
     }, { capture: true });
     if (nameInput) {
+      const owner = nameInput._replayRenameOwner = {
+        tab: state.replayTabs.find((tab) => tab.id === id),
+        sessionId: currentSessionId(),
+        generation: workspaceStateGeneration,
+        activeTabId: state.activeReplayTabId,
+      };
+      const ownsRename = () => state.replayRenamingTabId === id
+        && owner.sessionId === currentSessionId()
+        && owner.generation === workspaceStateGeneration
+        && owner.activeTabId === state.activeReplayTabId
+        && state.replayTabs.includes(owner.tab)
+        && els.replayTabStrip.querySelector(
+          `.replay-tab[data-replay-tab-id="${CSS.escape(id)}"] .replay-tab-name-input`,
+        ) === nameInput;
       nameInput.addEventListener("click", (event) => event.stopPropagation());
       nameInput.addEventListener("keydown", (event) => {
+        if (!ownsRename()) return;
+        // Composition keys edit the label, rather than commit or cancel it.
+        if (event.isComposing) return;
         if (event.key === "Enter") {
           event.preventDefault();
           commitReplayTabRename(id, nameInput.value);
@@ -17249,10 +18747,10 @@ function renderReplayTabs(options = {}) {
         }
       });
       nameInput.addEventListener("blur", () => {
-        commitReplayTabRename(id, nameInput.value);
+        if (ownsRename()) commitReplayTabRename(id, nameInput.value);
       });
       requestAnimationFrame(() => {
-        if (state.replayRenamingTabId === id) {
+        if (ownsRename()) {
           nameInput.focus();
           nameInput.select();
         }
@@ -17263,10 +18761,11 @@ function renderReplayTabs(options = {}) {
         beginReplayTabRename(id);
         return;
       }
+      if (!preserveActiveHttpReplayDraftBeforeNavigation(getActiveReplayTab(), "switching tabs")) return;
       state.activeReplayTabId = id;
       state.replayRenamingTabId = null;
       scheduleWorkspaceStateSave();
-      renderReplay();
+      renderReplay({ forceToolbarSync: true });
     });
     tabElement.querySelector(".replay-tab-pin-btn")?.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -17331,21 +18830,50 @@ function commitReplayTabRename(id, value) {
   }
   const previousLabel = tab.customLabel || "";
   tab.customLabel = normalizeReplayTabCustomLabel(value);
-  const attemptedLabel = tab.customLabel;
   state.replayRenamingTabId = null;
-  scheduleWorkspaceStateSave();
-  flushWorkspaceState().catch((error) => {
-    if (tab.customLabel === attemptedLabel) {
-      tab.customLabel = previousLabel;
-    }
-    handleWorkspaceActionError(error);
-    renderReplayTabs();
-  });
+  persistReplayTabMetadataEdit(tab, "customLabel", previousLabel);
   renderReplayTabs();
 }
 
 function normalizeReplayTabCustomLabel(value) {
-  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  // Match Rust's scalar limit without splitting a UTF-16 pair in saved metadata.
+  // The cut can end on a space; the server trims it, so trim it here too.
+  return Array.from(normalized).slice(0, 80).join("").trimEnd();
+}
+
+function persistReplayTabMetadataEdit(tab, field, previousValue) {
+  const generation = workspaceStateGeneration;
+  const sessionId = currentSessionId();
+  const revision = state.workspaceRevision;
+  const attemptedValue = tab[field];
+  const committedValue = () => {
+    const baseline = workspaceReplayTabsById(workspaceSaveCommittedSnapshot).get(tab.id);
+    return baseline ? (field === "pinned" ? !!baseline.pinned
+      : normalizeReplayTabCustomLabel(baseline.custom_label)) : null;
+  };
+  const baselineValue = committedValue();
+  const owners = workspaceReplayMetadataEdits.get(tab) || {};
+  const owner = {};
+  owners[field] = owner;
+  workspaceReplayMetadataEdits.set(tab, owners);
+  scheduleWorkspaceStateSave();
+  flushWorkspaceState().catch((error) => {
+    if (generation !== workspaceStateGeneration || sessionId !== currentSessionId()
+      || !state.replayTabs.includes(tab)) return;
+    // A later snapshot may have confirmed this value while the old POST was
+    // still awaiting its response. Rolling it back would let the retry overwrite
+    // that committed metadata. Tokens also distinguish repeated/ABA local edits.
+    // A typed postcommit failure cannot prove the previous value is correct either.
+    if (!error.commitUncertain && owners[field] === owner && tab[field] === attemptedValue
+      && state.workspaceRevision === revision && committedValue() === baselineValue) {
+      tab[field] = previousValue;
+      if (!state.replayRenamingTabId) renderReplayTabs();
+    }
+    handleWorkspaceActionError(error);
+  }).finally(() => {
+    if (owners[field] === owner) delete owners[field];
+  });
 }
 
 function toggleReplayTabPin(id) {
@@ -17353,16 +18881,8 @@ function toggleReplayTabPin(id) {
   if (!tab) return;
   const previousPinned = !!tab.pinned;
   tab.pinned = !tab.pinned;
-  const attemptedPinned = tab.pinned;
   // Flush immediately so pin state survives quick app quit
-  scheduleWorkspaceStateSave();
-  flushWorkspaceState().catch((error) => {
-    if (tab.pinned === attemptedPinned) {
-      tab.pinned = previousPinned;
-    }
-    handleWorkspaceActionError(error);
-    renderReplayTabs();
-  });
+  persistReplayTabMetadataEdit(tab, "pinned", previousPinned);
   renderReplayTabs();
 }
 
@@ -17374,20 +18894,158 @@ function scrollActiveReplayTabIntoView() {
   }
 }
 
-async function closeRepeaterTab(id) {
+function getRenderedHttpReplayDraftOwner(tab) {
+  const owner = renderedHttpReplayDraftOwner;
+  // Dashboard navigation hides a real editor, but a session reload leaves it
+  // cleared. Only read controls that were rendered for this exact workspace.
+  if (!workspaceLoaded || !owner || owner.tab !== tab
+    || owner.sessionId !== currentSessionId() || owner.generation !== workspaceStateGeneration) {
+    if (owner) owner.preservedVersionDraft = null;
+    return null;
+  }
+  return owner;
+}
+
+function preserveActiveHttpReplayDraftBeforeSessionChange(action) {
+  const tab = getActiveReplayTab();
+  if (!getRenderedHttpReplayDraftOwner(tab)) return true;
+  return preserveActiveHttpReplayDraftBeforeNavigation(tab, action);
+}
+
+function isPreservedHttpReplayVersionSource(tab, sourceText, editorIdentity, versionControl) {
+  const owner = getRenderedHttpReplayDraftOwner(tab);
+  const preserved = owner?.preservedVersionDraft;
+  if (!preserved) return false;
+  const version = versionControl?.value ?? normalizeReplayHttpVersionMode(tab.httpVersionMode);
+  // A capture can normalize only the model's request line. Its untouched source
+  // is not another edit, but only for the exact rendered owner and this tuple.
+  // Observed input invalidates the capture even when it later returns to A.
+  if (preserved.sourceText === sourceText && preserved.modelText === tab.requestText
+    && preserved.version === version && preserved.version === tab.httpVersionMode
+    && preserved.view === state.replayMessageViews.request && preserved.editor === editorIdentity
+    && preserved.versionControl === versionControl && !tab.requestBytes) return true;
+  owner.preservedVersionDraft = null;
+  return false;
+}
+
+function preserveActiveHttpReplayDraftBeforeNavigation(tab, action) {
+  if (!tab || tab.type === "websocket" || tab.id !== state.activeReplayTabId) return true;
+  const draftOwner = getRenderedHttpReplayDraftOwner(tab);
+
+  // Read every control before touching the model: normal editor synchronization
+  // also refreshes the toolbar and can erase a different, still-invalid draft.
+  const editor = getCMView("replayReq");
+  const hexMode = state.replayMessageViews.request === "hex";
+  const legacyText = els.replayRequestCM ? null
+    : (els.replayRequestHighlight?.innerText ?? els.replayRequestEditor?.value ?? null);
+  const visibleText = hexMode ? null : (editor ? editor.getContent()
+    : legacyText);
+  let textChanged = typeof visibleText === "string"
+    && !replayRequestTextsEquivalent(visibleText, tab.requestText);
+  let requestText = textChanged ? visibleText : (tab.requestText || "");
+  const target = getRepeaterTargetConfig(tab);
+  const host = els.replayHostInput?.value ?? target.host;
+  const port = els.replayPortInput?.value ?? target.port;
+  const scheme = els.replaySchemeSelect?.value ?? target.scheme;
+  const targetChanged = host !== target.host || port !== target.port || scheme !== target.scheme;
+  const versionSelect = document.getElementById("replayHttpVersionSelect");
+  const version = versionSelect?.value ?? normalizeReplayHttpVersionMode(tab.httpVersionMode);
+  const versionChanged = version !== normalizeReplayHttpVersionMode(tab.httpVersionMode);
+  const editorIdentity = editor || (els.replayRequestCM ? els.replayRequestCM : els.replayRequestHighlight || els.replayRequestEditor);
+  if (isPreservedHttpReplayVersionSource(tab, visibleText, editorIdentity, versionSelect)) {
+    textChanged = false;
+    requestText = tab.requestText;
+  }
+  const hexInput = hexMode && !editor && !els.replayRequestCM
+    ? els.replayRequestHighlight?.querySelector?.(".hex-byte-input") : null;
+
+  if (targetChanged && !validateManualRepeaterTargetInput(host, port).valid) {
+    showToast(`Finish or correct the target fields before ${action}; your draft is still here.`, "error", 6000);
+    return false;
+  }
+  if (hexInput) {
+    const index = Number(hexInput.closest(".hex-byte")?.dataset.idx);
+    const value = hexInput.value.trim();
+    if (!Number.isSafeInteger(index) || index < 0 || !tab.requestBytes
+      || index >= tab.requestBytes.length || !/^[0-9a-f]{1,2}$/i.test(value)
+      || parseInt(value, 16) !== tab.requestBytes[index]) {
+      // Its delayed blur commit belongs to the current DOM. Navigating first would
+      // destroy that input before the byte reaches the retained tab object.
+      showToast(`Finish the byte edit before ${action}; your draft is still here.`, "error", 6000);
+      return false;
+    }
+  }
+  if (versionChanged && (tab.requestBytes || version !== normalizeReplayHttpVersionMode(version))) {
+    showToast(`Apply the HTTP version change before ${action}; your draft is still here.`, "error", 6000);
+    return false;
+  }
+
+  if (versionChanged) {
+    requestText = requestText.replace(/^[^\r\n]*/, (line) => {
+      let nextLine = version
+        ? line.replace(/\s+HTTP\/[0-9.]+\s*$/i, ` ${version}`)
+        : line.replace(/\s+HTTP\/[0-9.]+\s*$/i, "");
+      if (version && !/HTTP\//i.test(nextLine)) nextLine += ` ${version}`;
+      return nextLine;
+    });
+    textChanged = !replayRequestTextsEquivalent(requestText, tab.requestText);
+  }
+  const nextTarget = targetChanged ? normalizeRepeaterTargetInput(host, port, scheme) : target;
+  const targetModelChanged = targetChanged && (nextTarget.host !== target.host
+    || nextTarget.port !== target.port || nextTarget.scheme !== target.scheme);
+
+  // Preserve supported edits before the shared editor displays another tab,
+  // without re-rendering or parsing partially typed text into a different draft.
+  if (textChanged) {
+    tab.requestText = requestText;
+    tab.httpVersionMode = replayHttpVersionState(null, requestText, tab.httpVersionMode);
+    tab.requestBytes = null;
+    tab.requestOriginalBytes = null;
+  }
+  if (versionChanged) tab.httpVersionMode = version;
+  if (targetModelChanged) {
+    tab.targetScheme = nextTarget.scheme;
+    tab.targetHost = nextTarget.host;
+    tab.targetPort = nextTarget.port;
+    tab.targetManuallyEdited = true;
+  }
+  if (textChanged || versionChanged || targetModelChanged) {
+    tab.responseRecord = null;
+    tab.notice = "";
+    scheduleWorkspaceStateSave();
+  }
+  if (draftOwner && versionChanged && typeof visibleText === "string" && visibleText !== tab.requestText) {
+    draftOwner.preservedVersionDraft = {
+      sourceText: visibleText, modelText: tab.requestText, version,
+      view: state.replayMessageViews.request, editor: editorIdentity, versionControl: versionSelect,
+    };
+  }
+  return true;
+}
+
+async function closeRepeaterTab(id, pendingRename = null) {
   const index = state.replayTabs.findIndex((tab) => tab.id === id);
   if (index === -1) {
     return;
   }
+  const closingTab = state.replayTabs[index];
+  if (!preserveActiveHttpReplayDraftBeforeNavigation(closingTab, "closing this tab")) return;
+  // The strip can finish a rename with the same click; a refused close must
+  // leave that input and its pending save untouched as well.
+  if (pendingRename) commitReplayTabRename(pendingRename.id, pendingRename.value);
 
-  const closeSnapshot = snapshotReplayTabsState();
+  const generation = workspaceStateGeneration;
+  const sessionId = currentSessionId();
+  const closeOwner = { generation, sessionId };
+  const originalIds = state.replayTabs.map((tab) => tab.id);
+  const previousActiveId = state.activeReplayTabId;
   const visualOrderBeforeClose = getReplayTabVisualOrder().map((tab) => tab.id);
   const visualIndex = visualOrderBeforeClose.indexOf(id);
-  const closingTab = state.replayTabs[index];
   const currentIndex = state.replayTabs.findIndex((tab) => tab.id === id);
   if (currentIndex === -1) {
     return;
   }
+  workspacePendingReplayCloses.set(id, closeOwner);
   const controller = _replaySendControllers.get(id);
   if (controller) {
     _replaySendControllers.delete(id);
@@ -17413,22 +19071,58 @@ async function closeRepeaterTab(id) {
     state.activeReplayTabId = remainingVisualIds[replacementIndex] || state.replayTabs[Math.max(0, currentIndex - 1)].id;
   }
   scheduleWorkspaceStateSave();
-  renderReplay();
+  if (state.activeReplayTabId !== previousActiveId) {
+    renderReplay({ preserveTabStrip: !!state.replayRenamingTabId });
+  } else if (!state.replayRenamingTabId) {
+    renderReplayTabs();
+  }
   try {
     await flushWorkspaceState();
   } catch (error) {
+    if (generation !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
     if (isTooManyReplayTabsError(error)) {
-      // Keep the close: it is progress back under the limit. Restoring the tab
-      // here is exactly what left the workspace stuck — every delete reappeared.
-      renderReplay();
+      // Keep the close: it is progress back under the limit.
       return;
     }
-    restoreReplayTabsState(closeSnapshot);
-    handleWorkspaceActionError(error);
-    renderReplay();
+    // A failed POST may already have reached disk. Preserve newer local/remote
+    // work, but stop all retries until the user explicitly reconciles it.
+    workspaceSaveConflictPending = true;
+    workspaceSaveConflictLatest = error.latest || workspaceSaveConflictLatest;
+    workspaceSaveDirty = true;
+    window.clearTimeout(workspaceSaveTimer);
+    workspaceSaveTimer = null;
+    window.clearTimeout(wsTranscriptSaveTimer);
+    wsTranscriptSaveTimer = null;
+    wsTranscriptFirstDirtyAt = 0;
+    workspaceSaveLastSnapshot = null;
+    if (!state.replayTabs.some((tab) => tab.id === id)) {
+      // Restore only this close, beside the nearest surviving original neighbour.
+      // Never replay an old array, revision, selection or tab sequence.
+      const before = originalIds.slice(0, index).reverse()
+        .find((tabId) => state.replayTabs.some((tab) => tab.id === tabId));
+      const after = originalIds.slice(index + 1)
+        .find((tabId) => state.replayTabs.some((tab) => tab.id === tabId));
+      const insertion = before ? state.replayTabs.findIndex((tab) => tab.id === before) + 1
+        : after ? state.replayTabs.findIndex((tab) => tab.id === after) : state.replayTabs.length;
+      state.replayTabs.splice(insertion, 0, closingTab);
+    }
+    if (!state.replayTabs.some((tab) => tab.id === state.activeReplayTabId)) {
+      state.activeReplayTabId = id;
+      renderReplay({ preserveTabStrip: !!state.replayRenamingTabId });
+    } else if (!state.replayRenamingTabId) {
+      renderReplayTabs();
+    }
+    showToast(
+      "Replay tab close could not be confirmed. The tab is restored locally; changes are unsaved. Copy local edits before reloading the workspace to reconcile.",
+      "error", 7000,
+    );
     return;
+  } finally {
+    // An older session's callback must not clear a newer close of the same ID.
+    if (workspacePendingReplayCloses.get(id) === closeOwner) workspacePendingReplayCloses.delete(id);
   }
 
+  if (generation !== workspaceStateGeneration || sessionId !== currentSessionId()) return;
   if (closingTab.type === "websocket") {
     try {
       await cleanupWsReplayTab(closingTab, {
@@ -18494,6 +20188,9 @@ function cliPathDescription() {
   if (cliPathState.status?.platform === "windows") {
     return "Optionally add this app's bundled sniper-cli to your user PATH. This changes only your account's PATH. Open a new terminal afterwards; you may need to restart your terminal app.";
   }
+  if (cliPathState.status?.platform === "linux") {
+    return "CLI availability is checked against the running app's PATH, which may differ from your terminal's. Use the Debian package or the portable archive's bin/sniper-cli. Sniper does not edit shell profiles on Linux.";
+  }
   return "Make this app's bundled sniper-cli available in a terminal. PATH setup is optional; availability depends on the platform and app package.";
 }
 
@@ -18548,7 +20245,7 @@ function renderCliPathUi() {
 }
 
 function validCliPathStatus(status) {
-  return status && ["macos", "windows", "unsupported"].includes(status.platform)
+  return status && ["macos", "windows", "linux", "unsupported"].includes(status.platform)
     && ["supported", "registered", "can_install", "should_prompt"].every((key) => typeof status[key] === "boolean")
     && (status.directory === null || typeof status.directory === "string")
     && typeof status.message === "string";
@@ -18614,18 +20311,24 @@ async function installCliPath() {
   try {
     const response = await fetch("/api/cli-path", { method: "POST", signal: controller.signal });
     await requireOkResponse(response, "Could not add sniper-cli to PATH.");
-    const result = await response.json();
+    const result = await response.json().catch(() => {
+      // JSON parser errors can include raw response text.
+      throw new Error("Invalid PATH setup response.");
+    });
     if (!current()) return;
-    if (![result?.updated, result?.unchanged, result?.warnings].every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))) {
+    // Successful backend results always name an updated or unchanged target.
+    // Validate the acknowledgement before hiding retry or displaying its message.
+    if (![result?.updated, result?.unchanged, result?.warnings].every((items) =>
+      Array.isArray(items) && items.every((item) => typeof item === "string" && item.trim()))
+      || !(result.updated.length || result.unchanged.length)
+      || typeof result.message !== "string" || !result.message.trim()) {
       throw new Error("Invalid PATH setup response.");
     }
     cliPathState.status.should_prompt = false;
     cliPathState.status.registered = result.warnings.length === 0;
     cliPathState.error = result.warnings.length > 0;
-    const message = typeof result.message === "string" && result.message.trim()
-      ? result.message : "PATH setup finished. Open a new terminal and run sniper-cli.";
     cliPathState.message = result.warnings.length
-      ? `${message} ${result.warnings.join(" ")} You can retry from Settings → Runtime.` : message;
+      ? `${result.message} ${result.warnings.join(" ")} You can retry from Settings → Runtime.` : result.message;
   } catch (error) {
     if (!current()) return;
     cliPathState.error = true;
@@ -18702,13 +20405,24 @@ function closeDisplaySettingsModal() {
   }
   els.displaySettingsModal.classList.add("hidden");
   if (wasVisible) {
+    displaySettingsEditedControls.clear();
     restoreModalFocus(displaySettingsReturnFocus, els.openDisplaySettingsButton);
     displaySettingsReturnFocus = null;
   }
 }
 
-function openFilterModal() {
+// One dialog edits either HTTP history's filter or the Service Map's own one;
+// state.filterModalTarget says which.
+function openFilterModal(target) {
   if (isModalVisible(els.filterModal)) return;
+  state.filterModalTarget = target === "serviceMap" ? "serviceMap" : "history";
+  const forMap = state.filterModalTarget === "serviceMap";
+  const title = document.getElementById?.("filterModalTitle");
+  if (title) title.textContent = forMap ? "Service Map filter" : "Filter settings";
+  const kicker = els.filterModal.querySelector?.(".modal-header .placeholder-kicker");
+  if (kicker) kicker.textContent = forMap ? "Scope" : "HTTP";
+  // The map keeps scope on its own In scope only toggle.
+  els.filterInScopeOnly?.closest?.("label")?.classList.toggle("hidden", forMap);
   filterSettingsReturnFocus = document.activeElement;
   filterSettingsEditedControls.clear();
   hydrateFilterForm();
@@ -18882,8 +20596,8 @@ function sanitizeHttpFilterSettings(candidate) {
   };
 }
 
-function serializeHttpFilterSettings() {
-  const filters = sanitizeHttpFilterSettings(state.filterSettings);
+function serializeHttpFilterSettings(source = state.filterSettings) {
+  const filters = sanitizeHttpFilterSettings(source);
   return {
     in_scope_only: filters.inScopeOnly,
     hide_without_responses: filters.hideWithoutResponses,
@@ -19151,12 +20865,37 @@ function persistWorkbenchLayout(height) {
   scheduleUiSettingsSave();
 }
 
-function hydrateDisplaySettingsForm() {
-  els.displayThemeSelect.value = state.displaySettings.theme;
-  els.displaySizeInput.value = String(state.displaySettings.sizePx);
-  els.displayUiFontSelect.value = state.displaySettings.uiFont;
-  els.displayMonoFontSelect.value = state.displaySettings.monoFont;
-  els.displayRenderResourcesInput.checked = state.displaySettings.renderResources;
+function displaySettingsFormControls() {
+  return [els.displayThemeSelect, els.displaySizeInput, els.displayUiFontSelect,
+    els.displayMonoFontSelect, els.displayRenderResourcesInput];
+}
+
+function hydrateDisplaySettingsForm({ preserveDraft = false } = {}) {
+  const values = [state.displaySettings.theme, String(state.displaySettings.sizePx),
+    state.displaySettings.uiFont, state.displaySettings.monoFont, state.displaySettings.renderResources];
+  displaySettingsFormControls().forEach((control, index) => {
+    if (preserveDraft && displaySettingsEditedControls.has(control)) return;
+    if (control === els.displayRenderResourcesInput) control.checked = values[index];
+    else control.value = values[index];
+  });
+}
+
+function updateDisplaySettingsReadiness() {
+  // An earlier save may still return a conflicting snapshot after the GET.
+  // Wait for that whole loop, but keep normal repeated Apply behavior once ready.
+  if (uiSettingsLoadState === "loaded" && !uiSettingsSavePromise && !uiSettingsInFlight) {
+    displaySettingsReady = true;
+  }
+  els.applyDisplaySettingsButton.disabled = !displaySettingsReady;
+  const message = displaySettingsReady ? "" : uiSettingsLoadState === "failed"
+    ? "Could not load saved display settings. Your draft is kept. Retry before applying."
+    : uiSettingsLoadState === "waiting" ? "Finishing an earlier settings save. You can keep editing."
+      : "Loading saved display settings. You can edit while they load.";
+  if (els.displaySettingsLoadStatus.textContent !== message) {
+    els.displaySettingsLoadStatus.textContent = message;
+  }
+  els.retryDisplaySettingsButton.disabled = uiSettingsLoadState !== "failed";
+  els.retryDisplaySettingsButton.classList.toggle("hidden", uiSettingsLoadState === "loaded");
 }
 
 function collectDisplaySettingsFormValues() {
@@ -19182,8 +20921,10 @@ function previewDisplaySettingsFromForm() {
 }
 
 function saveDisplaySettingsFromForm() {
+  if (!displaySettingsReady) return;
   const renderResourcesBefore = state.displaySettings.renderResources;
   state.displaySettings = collectDisplaySettingsFormValues();
+  pendingDisplaySettingsApply = { ...state.displaySettings };
   applyDisplaySettingsState();
   if (state.displaySettings.renderResources !== renderResourcesBefore) {
     redrawResponsePreviews();
@@ -19201,17 +20942,68 @@ function applyDisplaySettingsState(settings = state.displaySettings) {
   document.body.dataset.theme = settings.theme;
   document.body.dataset.uiFont = settings.uiFont;
   document.body.dataset.monoFont = settings.monoFont;
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.displayChanged?.();
+}
+
+function isUiSettingsLoadSnapshot(snapshot) {
+  // Legacy/default files are expanded by Rust before GET serialization. Zero
+  // metadata may be omitted, but the Display object itself is always present.
+  return snapshot !== null && typeof snapshot === "object" && !Array.isArray(snapshot)
+    && snapshot.display_settings !== null && typeof snapshot.display_settings === "object"
+    && !Array.isArray(snapshot.display_settings)
+    && (snapshot.server_revision === undefined
+      || (Number.isSafeInteger(snapshot.server_revision) && snapshot.server_revision >= 0))
+    && (snapshot.client_id === undefined || typeof snapshot.client_id === "string")
+    && (snapshot.client_version === undefined
+      || (Number.isSafeInteger(snapshot.client_version) && snapshot.client_version >= 0));
 }
 
 async function loadUiSettings() {
-  try {
-    const response = await fetch("/api/ui-settings");
-    if (!response.ok) {
-      throw new Error(await response.text());
+  if (uiSettingsLoadPromise) return uiSettingsLoadPromise;
+  if (uiSettingsLoadState === "loaded") return;
+  const postGeneration = uiSettingsInitialPostGeneration;
+  uiSettingsLoadState = "loading";
+  updateDisplaySettingsReadiness();
+  const loadPromise = (async () => {
+    try {
+      const response = await fetch("/api/ui-settings");
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const snapshot = await response.json();
+      if (!isUiSettingsLoadSnapshot(snapshot)) {
+        throw new Error("Invalid UI settings response. Please try again.");
+      }
+      if (uiSettingsSavePromise) {
+        uiSettingsLoadState = "waiting";
+        updateDisplaySettingsReadiness();
+        while (uiSettingsSavePromise) {
+          // Persistence keeps its own failure/retry policy. A failed response
+          // can still follow a server commit, so it also invalidates this read.
+          await uiSettingsSavePromise.catch(() => {});
+        }
+      }
+      // A concurrent POST may have superseded this GET, including at the same
+      // revision. Do not choose a partial acknowledgement as a new baseline or
+      // relabel old values with its revision; require a fresh read instead.
+      if (postGeneration !== uiSettingsInitialPostGeneration
+        || (snapshot.server_revision ?? 0) < uiSettingsInitialPostRevision) {
+        throw new Error("Saved settings changed while loading. Please retry.");
+      }
+      applyUiSettingsSnapshot(snapshot, { mergeFilterDraft: true });
+      uiSettingsLoadState = "loaded";
+      updateDisplaySettingsReadiness();
+    } catch (error) {
+      uiSettingsLoadState = "failed";
+      console.error(error);
     }
-    applyUiSettingsSnapshot(await response.json(), { mergeFilterDraft: true });
-  } catch (error) {
-    console.error(error);
+  })();
+  uiSettingsLoadPromise = loadPromise;
+  try {
+    return await loadPromise;
+  } finally {
+    uiSettingsLoadPromise = null;
+    updateDisplaySettingsReadiness();
   }
 }
 
@@ -19240,6 +21032,18 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   state.sortKey = sanitizeHttpSortKey(snapshot?.http_sort_key);
   state.sortDirection = sanitizeHttpSortDirection(snapshot?.http_sort_direction);
   state.filterSettings = sanitizeHttpFilterSettings(snapshot?.http_filter_settings);
+  // The map reads its filter on every refresh and re-ranks when it changed.
+  state.serviceMapFilterSettings = sanitizeHttpFilterSettings(snapshot?.service_map_filter_settings);
+  // Settings saved before the list existed hide frames and resource loads, as the server does.
+  state.serviceMapHiddenLinkKinds = Array.isArray(snapshot?.service_map_hidden_link_kinds)
+    ? ["api", "navigation", "frame", "script", "static", "other"].filter((kind) => snapshot.service_map_hidden_link_kinds.includes(kind))
+    : ["frame", "script", "static"];
+  // Sites group unless switched off; lists saved before they existed are empty.
+  state.serviceMapSiteDisplay = {
+    groupSites: snapshot?.service_map_group_sites !== false,
+    expandedSites: Array.isArray(snapshot?.service_map_expanded_sites) ? snapshot.service_map_expanded_sites.filter((item) => typeof item === "string") : [],
+    hidden: Array.isArray(snapshot?.service_map_hidden) ? snapshot.service_map_hidden.filter((item) => typeof item === "string") : [],
+  };
   if (snapshot?.ws_column_widths && typeof snapshot.ws_column_widths === "object") {
     Object.entries(snapshot.ws_column_widths).forEach(([k, v]) => {
       if (WS_COLUMN_RULES[k] && WS_COLUMN_RULES[k].max > 0 && typeof v === "number") {
@@ -19250,6 +21054,8 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   state.workbenchHeight = sanitizeWorkbenchHeight(snapshot?.workbench_height);
   state.workbenchPaneWidths = sanitizeWorkbenchPaneWidths(snapshot?.workbench_pane_widths);
   state.websocketPaneWidth = sanitizeWebsocketPaneWidth(snapshot?.websocket_pane_width);
+  state.serviceMapDetailWidth = sanitizeServiceMapDetailWidth(snapshot?.service_map_detail_width);
+  applyServiceMapDetailWidth();
   state.websocketQuery = sanitizeWebsocketQuery(snapshot?.websocket_query);
   state.websocketSortKey = sanitizeWebsocketSortKey(snapshot?.websocket_sort_key);
   state.websocketSortDirection = sanitizeWebsocketSortDirection(snapshot?.websocket_sort_direction);
@@ -19278,7 +21084,11 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
   syncHttpCapturePill();
   document.getElementById("wsInScopeOnly")?.classList.toggle("active", state.websocketInScopeOnly);
   document.getElementById("wsHideClosed")?.classList.toggle("active", state.websocketLiveOnly);
-  if (isModalVisible(els.displaySettingsModal) && displaySettingsPreviewActive) {
+  const displayOpen = isModalVisible(els.displaySettingsModal);
+  if (!displayOpen || !displaySettingsReady) {
+    hydrateDisplaySettingsForm({ preserveDraft: displayOpen });
+  }
+  if (displayOpen && displaySettingsPreviewActive) {
     previewDisplaySettingsFromForm();
   } else {
     applyDisplaySettingsState();
@@ -19321,9 +21131,15 @@ function snapshotUiSettings() {
     http_sort_key: sanitizeHttpSortKey(state.sortKey),
     http_sort_direction: sanitizeHttpSortDirection(state.sortDirection),
     http_filter_settings: serializeHttpFilterSettings(),
+    service_map_filter_settings: serializeHttpFilterSettings(state.serviceMapFilterSettings),
+    service_map_hidden_link_kinds: Array.isArray(state.serviceMapHiddenLinkKinds) ? [...state.serviceMapHiddenLinkKinds] : ["frame", "script", "static"],
+    service_map_group_sites: state.serviceMapSiteDisplay?.groupSites !== false,
+    service_map_expanded_sites: Array.isArray(state.serviceMapSiteDisplay?.expandedSites) ? [...state.serviceMapSiteDisplay.expandedSites] : [],
+    service_map_hidden: Array.isArray(state.serviceMapSiteDisplay?.hidden) ? [...state.serviceMapSiteDisplay.hidden] : [],
     workbench_height: state.workbenchHeight > 0 ? state.workbenchHeight : null,
     workbench_pane_widths: serializeWorkbenchPaneWidths(),
     websocket_pane_width: state.websocketPaneWidth > 0 ? state.websocketPaneWidth : null,
+    service_map_detail_width: state.serviceMapDetailWidth > 0 ? state.serviceMapDetailWidth : null,
     websocket_query: sanitizeWebsocketQuery(state.websocketQuery),
     websocket_sort_key: sanitizeWebsocketSortKey(state.websocketSortKey),
     websocket_sort_direction: sanitizeWebsocketSortDirection(state.websocketSortDirection),
@@ -19373,6 +21189,7 @@ async function persistUiSettings() {
       while (uiSettingsDirty) {
         uiSettingsDirty = false;
         const payloadSnapshot = nextUiSettingsSnapshot();
+        const displaySettingsSnapshot = { ...state.displaySettings };
         const payload = JSON.stringify(payloadSnapshot);
         lastUiSettingsPayload = payload;
         let savedSnapshot;
@@ -19400,14 +21217,30 @@ async function persistUiSettings() {
           // Wait for the response body too, so a slow failure cannot consume the
           // retry timer while this attempt still owns the in-flight promise.
           scheduleUiSettingsRetry();
+          if (pendingDisplaySettingsApply) {
+            pendingDisplaySettingsApply = null;
+            showToast("Could not confirm saving display settings. Automatic retries will continue.", "warning", 6000);
+          }
           throw error;
+        } finally {
+          if (!displaySettingsReady) uiSettingsInitialPostGeneration += 1;
         }
         if (savedSnapshot && typeof savedSnapshot === "object") {
+          if (!displaySettingsReady && Number.isSafeInteger(savedSnapshot.server_revision)) {
+            uiSettingsInitialPostRevision = Math.max(uiSettingsInitialPostRevision, savedSnapshot.server_revision);
+          }
           updateUiSettingsServerRevision(savedSnapshot);
           const savedClientId = String(savedSnapshot.client_id || "");
           const savedClientVersion = Math.max(0, Number(savedSnapshot.client_version || 0) || 0);
           if (savedClientId !== payloadSnapshot.client_id || savedClientVersion !== payloadSnapshot.client_version) {
+            // The server winner also replaces any pending local appearance.
+            pendingDisplaySettingsApply = null;
             applyUiSettingsSnapshot(savedSnapshot);
+          } else if (pendingDisplaySettingsApply && Object.entries(pendingDisplaySettingsApply)
+            .every(([key, value]) => displaySettingsSnapshot[key] === value)) {
+            // Confirm the Display values here: a later unrelated save in this
+            // same loop may fail, while a newer Apply may still be pending.
+            pendingDisplaySettingsApply = null;
           }
         }
       }
@@ -19422,6 +21255,7 @@ async function persistUiSettings() {
     if (uiSettingsSavePromise === savePromise) {
       uiSettingsSavePromise = null;
     }
+    updateDisplaySettingsReadiness();
   }
 }
 
@@ -19480,6 +21314,63 @@ function sanitizeWebsocketPaneWidth(candidate) {
     : null;
 }
 
+const SERVICE_MAP_DETAIL_MIN_WIDTH = 260;
+// The map's minimum, its resizer and the gaps beside it.
+const SERVICE_MAP_GRAPH_MIN_WIDTH = 372;
+
+function sanitizeServiceMapDetailWidth(candidate) {
+  const parsed = Number(candidate);
+  return Number.isFinite(parsed) && parsed > 0 ? clamp(Math.round(parsed), SERVICE_MAP_DETAIL_MIN_WIDTH, 4096) : null;
+}
+
+// The inspector beside the Service Map keeps the width it was dragged to; the
+// stylesheet still leaves the map its minimum on a narrow window.
+function applyServiceMapDetailWidth() {
+  const content = document.getElementById("serviceMapContent");
+  if (!content) return;
+  if (state.serviceMapDetailWidth > 0) content.style.setProperty("--service-map-detail-width", `${state.serviceMapDetailWidth}px`);
+  else content.style.removeProperty("--service-map-detail-width");
+}
+
+function bindServiceMapResizer(handle) {
+  if (!handle) return;
+  const content = document.getElementById("serviceMapContent");
+  const detail = document.getElementById("serviceMapDetail");
+  const setWidth = (width) => {
+    const room = (content?.getBoundingClientRect().width || 0) - SERVICE_MAP_GRAPH_MIN_WIDTH;
+    state.serviceMapDetailWidth = clamp(Math.round(width), SERVICE_MAP_DETAIL_MIN_WIDTH, Math.max(SERVICE_MAP_DETAIL_MIN_WIDTH, room));
+    applyServiceMapDetailWidth();
+  };
+  handle.addEventListener("dblclick", () => {
+    state.serviceMapDetailWidth = null;
+    applyServiceMapDetailWidth();
+    scheduleUiSettingsSave();
+  });
+  handle.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    setWidth((detail?.getBoundingClientRect().width || SERVICE_MAP_DETAIL_MIN_WIDTH) + (event.key === "ArrowLeft" ? 24 : -24));
+    scheduleUiSettingsSave();
+  });
+  handle.addEventListener("mousedown", (event) => {
+    if (!detail || window.matchMedia("(max-width: 720px)").matches) return;
+    event.preventDefault();
+    const startX = event.clientX, startWidth = detail.getBoundingClientRect().width;
+    document.body.classList.add("pane-resizing-x");
+    handle.classList.add("active");
+    const onMove = (moveEvent) => setWidth(startWidth - (moveEvent.clientX - startX));
+    const onUp = () => {
+      document.body.classList.remove("pane-resizing-x");
+      handle.classList.remove("active");
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      scheduleUiSettingsSave();
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
 function serializeWorkbenchPaneWidths() {
   if (!state.workbenchPaneWidths) {
     return {};
@@ -19511,7 +21402,7 @@ function syncHttpCapturePill() {
 }
 
 function hydrateFilterForm({ preserveDraft = false } = {}) {
-  const filters = state.filterSettings;
+  const filters = state.filterModalTarget === "serviceMap" ? state.serviceMapFilterSettings : state.filterSettings;
   const update = (control, value) => {
     if (!preserveDraft || !filterSettingsEditedControls.has(control)) {
       control[control.type === "checkbox" ? "checked" : "value"] = value;
@@ -19573,12 +21464,12 @@ function applyFilterSettings() {
       new RegExp(searchTerm, els.filterCaseSensitive.checked ? "" : "i");
     } catch (error) {
       const message = `Invalid regex: ${error.message}`;
-      if (els.historyMeta) els.historyMeta.textContent = message;
+      if (els.historyMeta && state.filterModalTarget !== "serviceMap") els.historyMeta.textContent = message;
       showToast(message, "error");
       return;
     }
   }
-  state.filterSettings = {
+  const next = {
     inScopeOnly: els.filterInScopeOnly.checked,
     hideWithoutResponses: els.filterHideWithoutResponses.checked,
     onlyParameterized: els.filterOnlyParameterized.checked,
@@ -19591,14 +21482,70 @@ function applyFilterSettings() {
     status: nextStatus,
     hiddenExtensions: els.filterHiddenExtensions.value.trim(),
     port: els.filterPort.value.trim(),
-    colorTags: state.filterSettings.colorTags,
   };
+  if (state.filterModalTarget === "serviceMap") {
+    // Scope and colour tags stay with the map toggle and History's colour dots.
+    state.serviceMapFilterSettings = { ...next, inScopeOnly: false, colorTags: new Set() };
+    closeFilterModal();
+    serviceMapFilterApplied();
+    return;
+  }
+  state.filterSettings = { ...next, colorTags: state.filterSettings.colorTags };
   closeFilterModal();
   syncHttpInScopePill();
   syncHttpCapturePill();
   scheduleUiSettingsSave();
   clearHttpHistorySelectionPreview();
   scheduleRefresh({ resetScroll: true });
+}
+
+const SERVICE_MAP_FILTER_MIME_LABELS = { html: "HTML", script: "script", json: "JSON", css: "CSS", image: "images", websocket: "WebSocket", other: "other types" };
+const SERVICE_MAP_FILTER_STATUS_LABELS = { success: "2xx", redirect: "3xx", clientError: "4xx", serverError: "5xx", other: "other status" };
+
+function serviceMapFilterApplied() {
+  scheduleUiSettingsSave();
+  targetServiceMapController?.filterChanged?.();
+}
+
+// Conditions for the Service Map read, under HTTP history's parameter names.
+// A group with every option selected hides nothing, so it is not sent.
+function serviceMapFilterQuery(filters = sanitizeHttpFilterSettings(state.serviceMapFilterSettings)) {
+  const query = {};
+  const mime = selectedMimeTypes(filters);
+  const status = selectedStatusClasses(filters);
+  if (mime.length < Object.keys(SERVICE_MAP_FILTER_MIME_LABELS).length) query.mime_types = mime.join(",");
+  if (status.length < Object.keys(SERVICE_MAP_FILTER_STATUS_LABELS).length) query.status_classes = status.join(",");
+  if (filters.hiddenExtensions) query.hidden_extensions = filters.hiddenExtensions;
+  if (filters.port) query.port = filters.port;
+  if (filters.hideWithoutResponses) query.hide_without_responses = "true";
+  if (filters.onlyParameterized) query.only_parameterized = "true";
+  if (filters.onlyNotes) query.only_notes = "true";
+  if (filters.searchTerm) {
+    query.advanced_search = filters.searchTerm;
+    if (filters.regex) query.advanced_regex = "true";
+    if (filters.caseSensitive) query.advanced_case_sensitive = "true";
+    if (filters.negativeSearch) query.advanced_negative = "true";
+  }
+  return query;
+}
+
+// What the Service Map filter hides, for the map toolbar.
+function serviceMapFilterSummary() {
+  const filters = sanitizeHttpFilterSettings(state.serviceMapFilterSettings);
+  const parts = [];
+  const extensions = filters.hiddenExtensions.split(",").map((value) => value.trim()).filter(Boolean);
+  if (extensions.length) parts.push(`hiding ${extensions.slice(0, 3).join(", ")}${extensions.length > 3 ? ` +${extensions.length - 3}` : ""}`);
+  const mimeOff = Object.entries(SERVICE_MAP_FILTER_MIME_LABELS).filter(([key]) => (key === "websocket" ? filters.mime.websocket === false : !filters.mime[key])).map(([, label]) => label);
+  if (mimeOff.length) parts.push(`no ${mimeOff.join(", ")}`);
+  const statusOff = Object.entries(SERVICE_MAP_FILTER_STATUS_LABELS).filter(([key]) => !filters.status[key]).map(([, label]) => label);
+  if (statusOff.length) parts.push(`no ${statusOff.join(", ")}`);
+  if (filters.hideWithoutResponses) parts.push("responses only");
+  if (filters.onlyParameterized) parts.push("parameterized only");
+  if (filters.onlyNotes) parts.push("notes only");
+  if (filters.port) parts.push(`port ${filters.port}`);
+  if (filters.searchTerm) parts.push(`${filters.negativeSearch ? "without" : "with"} "${filters.searchTerm}"`);
+  const text = parts.length ? parts.join(" · ") : "showing every row";
+  return { text, detail: `Service Map filter: ${text}${extensions.length > 3 ? ` (extensions ${extensions.join(", ")})` : ""}` };
 }
 
 async function openCertificateFolder() {
@@ -20098,16 +22045,23 @@ function parseEditableRawRequest(text, fallback) {
 
   if (/^https?:\/\//i.test(target)) {
     const absolute = new URL(target);
-    if (absolute.username || absolute.password) {
+    if (absolute.username || absolute.password || /^https?:\/\/[^/?#]*@/i.test(target)) {
       throw new Error("Absolute request target must not include credentials");
     }
-    if (absolute.hash) {
+    if (target.includes("#")) {
       throw new Error("Absolute request target must not include a fragment");
+    }
+    // URL validates the authority, but its path serialization removes dot
+    // segments and an empty query delimiter. Replay must retain the raw target.
+    const rawTarget = target.match(/^https?:\/\/[^/?#\\]+([/?][^#]*)?$/i);
+    if (!rawTarget || /[\u0000-\u0020\u007f]/.test(target)) {
+      throw new Error("Invalid absolute request target");
     }
     scheme = absolute.protocol.replace(":", "");
     host = absolute.host;
     absoluteAuthority = absolute.host;
-    path = `${absolute.pathname || "/"}${absolute.search || ""}`;
+    path = rawTarget[1] || "/";
+    if (path.startsWith("?")) path = `/${path}`;
   }
 
   const hostHeader = headerValue(headers, "host");
@@ -20225,19 +22179,13 @@ function validateRawHttpBodyFraming(headers, bodyLength, acceptedBodyLengths = [
 
 function splitRawHttpMessage(text) {
   const raw = String(text ?? "");
-  const crlfBoundary = raw.indexOf("\r\n\r\n");
-  if (crlfBoundary !== -1) {
+  // The editor can use LF headers around a CRLF body (for example imported
+  // multipart data). Only the first blank line separates headers from body.
+  const boundary = /\r?\n\r?\n/.exec(raw);
+  if (boundary) {
     return {
-      head: raw.slice(0, crlfBoundary).replace(/\r\n/g, "\n"),
-      body: raw.slice(crlfBoundary + 4),
-    };
-  }
-
-  const lfBoundary = raw.indexOf("\n\n");
-  if (lfBoundary !== -1) {
-    return {
-      head: raw.slice(0, lfBoundary).replace(/\r\n/g, "\n"),
-      body: raw.slice(lfBoundary + 2),
+      head: raw.slice(0, boundary.index).replace(/\r\n/g, "\n"),
+      body: raw.slice(boundary.index + boundary[0].length),
     };
   }
 
@@ -20527,7 +22475,7 @@ function startHexByteEdit(span, tab, container) {
   input.addEventListener("blur", () => {
     // Delay to allow click on another byte
     setTimeout(() => {
-      if (!container.querySelector(".hex-byte-input")) return;
+      if (container.querySelector(".hex-byte-input") !== input) return;
       commit();
     }, 100);
   });
@@ -21472,7 +23420,7 @@ function applyCodeSearch(viewElement, query) {
   // Remove any previous search highlights first
   clearSearchHighlights(viewElement);
 
-  const normalizedQuery = String(query || "").trim();
+  const normalizedQuery = String(query || "");
   if (!normalizedQuery) {
     return { count: 0, firstMatch: null };
   }
@@ -22241,21 +24189,39 @@ function syncColorTagFilterUI() {
   });
 }
 
+// The client's copy of src/scope.rs, which decides what the server lists as in
+// scope. It must agree: History drops a row whose update this calls out of
+// scope, and the old copy, without globs, excludes or the root dot, dropped
+// in-scope rows as soon as they were tagged or noted.
 function isInScopeHost(host) {
-  const patterns = state.runtime?.scope_patterns || [];
-  if (!patterns.length) {
-    return true;
-  }
-
   const hostname = normalizeHostForMatching(host);
-  return patterns.some((pattern) => {
-    const normalized = normalizeHostForMatching(pattern);
-    if (normalized.startsWith("*.")) {
-      const suffix = normalized.slice(2);
-      return hostname === suffix || hostname.endsWith(`.${suffix}`);
-    }
-    return hostname === normalized;
-  });
+  const matches = (pattern) => hostMatchesScopePattern(hostname, pattern);
+  const include = state.runtime?.scope_patterns || [];
+  const exclude = state.runtime?.excluded_scope_patterns || [];
+  return (!include.length || include.some(matches)) && !exclude.some(matches);
+}
+
+// `*.example.com` is the domain and anything under it; any other `*` stands for
+// any run of characters; anything else is one exact host.
+function hostMatchesScopePattern(hostname, pattern) {
+  const normalized = normalizeHostForMatching(pattern);
+  if (normalized.startsWith("*.") && !normalized.slice(2).includes("*")) {
+    const suffix = normalized.slice(2);
+    return hostname === suffix || hostname.endsWith(`.${suffix}`);
+  }
+  if (!normalized.includes("*")) return hostname === normalized;
+  const parts = normalized.split("*");
+  const first = parts.shift();
+  const last = parts.pop();
+  if (!hostname.startsWith(first) || !hostname.endsWith(last) || first.length + last.length > hostname.length) return false;
+  let rest = hostname.slice(first.length, hostname.length - last.length);
+  for (const middle of parts) {
+    if (!middle) continue;
+    const at = rest.indexOf(middle);
+    if (at < 0) return false;
+    rest = rest.slice(at + middle.length);
+  }
+  return true;
 }
 
 function normalizeHostForMatching(host) {
@@ -22267,7 +24233,7 @@ function normalizeHostForMatching(host) {
     value = value.slice(2);
   }
   const hostOnly = value.split(/[/?#]/, 1)[0].trim();
-  return hostWithoutPort(hostOnly).toLowerCase();
+  return hostWithoutPort(hostOnly).toLowerCase().replace(/\.$/, "");
 }
 
 function hostWithoutPort(host) {
@@ -22458,10 +24424,6 @@ function formatSize(bytes) {
     index += 1;
   }
   return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
-function configuredTransactionEntryLimit() {
-  return state.settings?.max_transaction_entries ?? state.settings?.max_entries ?? 0;
 }
 
 function titleCase(value) {
@@ -22895,6 +24857,7 @@ function truncateSetupLabel(body, kind = "text") {
 async function wsConnect() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
+  if (tab.wsStatus === "connecting" || tab.wsStatus === "connected") return;
   const sessionId = state.activeSession?.id || null;
 
   // Sync fields from UI
@@ -22938,30 +24901,38 @@ async function wsConnect() {
   renderWsSetupQueue();
   renderWsFrameList();
 
+  const isCurrentConnection = () => isWsReplayTabAlive(tab, lifecycleToken)
+    && (state.activeSession?.id || null) === sessionId;
   try {
+    // The shared editor may belong to another tab by the time persistence
+    // finishes. Capture the complete connection while this tab owns the UI.
+    const connection = {
+      session_id: sessionId,
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+      id: tab.id,
+      scheme: tab.wsScheme,
+      host: tab.wsHost,
+      port: Number(wsPort),
+      path: wsPath,
+      headers: parseWsHandshakeHeaders(tab),
+    };
     const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
-    const headers = parseWsHandshakeHeaders(tab);
+    if (!isCurrentConnection()) return;
     const resp = await fetch("/api/replay/ws-connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        session_id: sessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+        ...connection,
         expected_workspace_revision: expectedWorkspaceRevision,
-        id: tab.id,
-        scheme: tab.wsScheme,
-        host: tab.wsHost,
-        port: Number(wsPort),
-        path: wsPath,
-        headers,
       }),
     });
-    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+    if (!isCurrentConnection()) {
       await disconnectWsReplayBackend(tab.id, { remove: true, sessionId });
       return;
     }
     if (!resp.ok) {
       const workspaceConflict = await readWorkspaceRevisionConflictPayload(resp);
+      if (!isCurrentConnection()) return;
       if (workspaceConflict) {
         restoreReplayTabConflictState(tab, conflictSnapshot);
         handleReplayWorkspaceRevisionConflict(workspaceConflict);
@@ -22983,11 +24954,11 @@ async function wsConnect() {
     // Auto-send setup queue after connection
     await runSetupQueue(tab, lifecycleToken);
   } catch (e) {
-    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+    if (!isCurrentConnection()) {
       return;
     }
     if (e instanceof WorkspaceStateConflictError) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
+      if (!e.commitUncertain) restoreReplayTabConflictState(tab, conflictSnapshot);
       handleWorkspaceActionError(e);
       return;
     }
@@ -24634,6 +26605,8 @@ function contextMenuSessionIsCurrent() {
 // Editing a note happens in the cell itself: double-click it, type, Enter or
 // click away to save, Escape to abandon. It used to live in the right-click
 // menu, which meant aiming at a menu to write one word.
+let pendingHistoryNoteRead = null;
+
 async function beginNoteEdit(cell, transactionId) {
   if (!cell || cell.dataset.noteLoading === "true" || cell.querySelector("input.note-inline-input")) return;
   if (cell.dataset.noteFilteredOut === "true") {
@@ -24641,9 +26614,49 @@ async function beginNoteEdit(cell, transactionId) {
     delete cell.dataset.noteFilteredOut;
   }
   const sessionId = currentSessionId();
+  const focusOwner = document.activeElement;
+  const retentionEpoch = state._historyRetentionEpoch || 0;
+  const canEdit = () => retentionEpoch === (state._historyRetentionEpoch || 0)
+    && currentSessionId() === sessionId && cell.isConnected
+    && isHttpHistoryVisible() && document.activeElement === focusOwner
+    && document.visibilityState !== "hidden"
+    && !isModalVisible(els.displaySettingsModal) && !isModalVisible(els.filterModal);
+  if (!canEdit()) return;
   closeContextMenu();
 
   let current = "";
+  let mayOpen = false;
+  // Only the latest uninterrupted intent may create an editor. Record focus
+  // changes as they happen: closing a modal can restore the original focus
+  // owner before the read finishes, but must not revive the abandoned edit.
+  pendingHistoryNoteRead?.cancel();
+  const cleanup = () => {
+    document.removeEventListener("pointerdown", onPointerDown, true);
+    document.removeEventListener("contextmenu", cleanup, true);
+    document.removeEventListener("focusin", onFocusIn, true);
+    document.removeEventListener("keydown", cleanup, true);
+    document.removeEventListener("visibilitychange", onVisibilityChange, true);
+    window.removeEventListener("blur", cleanup);
+    // A cancelled read can finish after the same cell starts a new read.
+    if (pendingHistoryNoteRead === pendingRead) {
+      pendingHistoryNoteRead = null;
+      delete cell.dataset.noteLoading;
+    }
+  };
+  const onPointerDown = (event) => {
+    if (event.button !== 0 || !cell.contains(event.target)) cleanup();
+  };
+  const onFocusIn = (event) => { if (event.target !== focusOwner) cleanup(); };
+  const onVisibilityChange = () => { if (document.visibilityState === "hidden") cleanup(); };
+  const pendingRead = { cancel: cleanup };
+  const isCurrent = () => pendingHistoryNoteRead === pendingRead && canEdit();
+  pendingHistoryNoteRead = pendingRead;
+  document.addEventListener("pointerdown", onPointerDown, true);
+  document.addEventListener("contextmenu", cleanup, true);
+  document.addEventListener("focusin", onFocusIn, true);
+  document.addEventListener("keydown", cleanup, true);
+  document.addEventListener("visibilitychange", onVisibilityChange, true);
+  window.addEventListener("blur", cleanup);
   // Repeated opens must not let a late read replace a draft already being typed.
   cell.dataset.noteLoading = "true";
   try {
@@ -24655,16 +26668,17 @@ async function beginNoteEdit(cell, transactionId) {
       throw new Error("Failed to load note: invalid response.");
     }
     current = record.user_note || "";
+    mayOpen = isCurrent();
   } catch (error) {
     // A failed read is not an empty note: editing it could overwrite saved text.
-    if (currentSessionId() === sessionId && cell.isConnected) {
+    if (isCurrent()) {
       showToast(error?.message || "Failed to load note.", "error");
     }
     return;
   } finally {
-    delete cell.dataset.noteLoading;
+    cleanup();
   }
-  if (currentSessionId() !== sessionId || !cell.isConnected) return;
+  if (!mayOpen) return;
   // Its last pending save may have released this cell while the read was pending.
   if (cell.dataset.noteFilteredOut === "true") {
     if (getHistoryItemIndex(transactionId) === -1) return;
@@ -24687,11 +26701,28 @@ async function beginNoteEdit(cell, transactionId) {
   let composing = false;
   let compositionFinishing = false;
   let commitAfterComposition = false;
-  // Compared against what was last written, not against what the note said when
-  // the edit began: typing saves after a pause, so clearing the field back to
-  // empty is still a change the server has to be told about.
-  let lastSaved = current.trim();
-  const noteEdit = { cell, sessionId, closed: false, removed: null };
+  // Start from the input's sanitized value: text inputs strip CR/LF, but opening
+  // and closing an unchanged saved note must not overwrite its original text.
+  // Then compare against each queued save, so reverting after autosave still
+  // writes the changed value (including clearing the field back to empty).
+  let lastSaved = input.value.trim();
+  input.hasPendingNoteEdit = () => !settled && (composing || compositionFinishing
+    || truncateUtf8(input.value, MAX_ANNOTATION_NOTE_BYTES).trim() !== lastSaved);
+  const noteEdit = { cell, input, sessionId, closed: false, removed: null };
+  input.historyRetentionNote = {
+    transactionId, sessionId, editor: noteEdit,
+    cancel: () => {
+      const result = { text: input.value, dirty: input.hasPendingNoteEdit() };
+      window.clearTimeout(debounce);
+      settled = true;
+      noteEdit.closed = true;
+      if (noteEdit.removed) {
+        noteEdit.removed.window.editors.delete(noteEdit);
+        noteEdit.removed = null;
+      }
+      return result;
+    },
+  };
   inheritPendingHistoryNoteEdit(transactionId, noteEdit);
   const save = (value) => {
     if (value === lastSaved) return;
@@ -24791,12 +26822,20 @@ async function beginNoteEdit(cell, transactionId) {
 
 async function loadUserNote(transactionId) {
   const sessionId = currentSessionId();
+  const target = contextMenuRecordTarget;
+  const menu = els.contextMenu;
+  // Each open creates a new target, so returning to the same row/session must
+  // not revive a read from a closed or superseded menu.
+  const isCurrent = () => target === contextMenuRecordTarget
+    && contextMenuTargetId === transactionId && contextMenuSessionId === sessionId
+    && currentSessionId() === sessionId && menu === els.contextMenu
+    && menu.isConnected && !menu.classList.contains("hidden");
   try {
     const response = await fetch(transactionPath(transactionId, sessionId));
-    if (currentSessionId() !== sessionId) return;
+    if (!isCurrent()) return;
     if (response.ok) {
       const record = await response.json();
-      if (currentSessionId() === sessionId && contextMenuTargetId === transactionId) {
+      if (isCurrent()) {
         renderContextMenuNotes(record.notes);
         positionContextMenu();
       }
@@ -24893,6 +26932,7 @@ function inheritPendingHistoryNoteEdit(transactionId, editor) {
 }
 
 async function updateAnnotations(transactionId, payload, sessionId = currentSessionId(), noteEdit = null) {
+  if (sessionId === currentSessionId() && state._historyDeletedIds?.has(transactionId)) return;
   if (!state._pendingAnnotations) state._pendingAnnotations = new Map();
   if (!state._annotationInFlight) state._annotationInFlight = new Set();
   const pending = state._pendingAnnotations;
@@ -24920,7 +26960,7 @@ function flushAnnotationsOnUnload() {
     return;
   }
   for (const [transactionId, entry] of state._pendingAnnotations.entries()) {
-    if (!entry?.sessionId || !entry.payload) continue;
+    if (!entry?.sessionId || !entry.payload || entry.retentionDeleted) continue;
     const body = JSON.stringify(entry.payload);
     if (utf8ByteLength(body) > WORKSPACE_UNLOAD_KEEPALIVE_MAX_BYTES) continue;
     fetch(sessionWritePath(`/api/transactions/${encodeURIComponent(transactionId)}/annotations`, entry.sessionId), {
@@ -24933,7 +26973,12 @@ function flushAnnotationsOnUnload() {
 }
 
 async function flushAllPendingAnnotations(options = {}) {
+  const sessionId = options.sessionId || currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  const ownsWorkspace = () => sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration;
   for (let attempt = 0; attempt < 40; attempt += 1) {
+    // A drain must not carry an old external-change bypass into newer notes.
+    if (!ownsWorkspace()) return;
     const pendingIds = state._pendingAnnotations ? Array.from(state._pendingAnnotations.keys()) : [];
     const inFlight = state._annotationInFlight || new Set();
     if (!pendingIds.length && !inFlight.size) {
@@ -24941,15 +26986,22 @@ async function flushAllPendingAnnotations(options = {}) {
     }
     const idleIds = pendingIds.filter((id) => !inFlight.has(id));
     if (idleIds.length) {
-      await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, {
-        ...options,
-        throwOnError: true,
-      })));
+      try {
+        await Promise.all(idleIds.map((id) => flushPendingAnnotations(id, {
+          ...options,
+          throwOnError: true,
+        })));
+      } catch (error) {
+        if (!ownsWorkspace()) return;
+        throw error;
+      }
     }
+    if (!ownsWorkspace()) return;
     if ((!state._pendingAnnotations || state._pendingAnnotations.size === 0) && (!state._annotationInFlight || state._annotationInFlight.size === 0)) {
       return;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 50));
+    if (!ownsWorkspace()) return;
   }
   throw new Error("Timed out saving pending annotations.");
 }
@@ -24962,6 +27014,7 @@ async function flushPendingAnnotations(transactionId, options = {}) {
   const entry = pending.get(transactionId);
   if (!entry) return false;
   const { sessionId, payload } = entry;
+  const retentionEpoch = state._historyRetentionEpoch || 0;
 
   state._annotationInFlight.add(transactionId);
   let failureMessage = "";
@@ -24976,14 +27029,28 @@ async function flushPendingAnnotations(transactionId, options = {}) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (entry.retentionDeleted) return false;
+    if (response.status === 404 && currentSessionId() === sessionId) {
+      applyConfirmedHistoryRemoval([transactionId], sessionId);
+      return false;
+    }
     if (!response.ok) {
       failureMessage = await response.text().catch(() => "Failed to save annotation");
       throw new Error(failureMessage || "Failed to save annotation");
     }
     const summary = await response.json();
+    if (entry.retentionDeleted) return false;
     observeAnnotationRevision(summary);
     saved = true;
-    if (currentSessionId() !== sessionId) {
+    if (currentSessionId() !== sessionId) return saved;
+    if (state.selectedId === transactionId) {
+      state._historyDetailAnnotationGeneration = (state._historyDetailAnnotationGeneration || 0) + 1;
+    }
+    if (retentionEpoch !== (state._historyRetentionEpoch || 0)) {
+      // An unrelated deletion can overlap this successful annotation. Its first
+      // refetch may have preceded the save; reconcile again without merging the
+      // old acknowledgement into a newer window.
+      scheduleRefresh();
       return saved;
     }
     state.historyPaging.annotationMutationGeneration = (state.historyPaging.annotationMutationGeneration || 0) + 1;
@@ -25058,6 +27125,7 @@ async function flushPendingAnnotations(transactionId, options = {}) {
       }
     }
   } catch (error) {
+    if (entry.retentionDeleted) return false;
     console.error("Failed to update annotations:", error);
     if (currentSessionId() === sessionId) {
       showToast(failureMessage || error.message || "Failed to save annotation", "error");
@@ -25448,8 +27516,10 @@ function shellQuote(value) {
 }
 
 function parseRequestForExport(rawText, scheme, host, port) {
-  const lines = String(rawText || "").replace(/\r\n/g, "\n").split("\n");
-  const [startLine = "GET / HTTP/1.1", ...rest] = lines;
+  // Normalize header lines only: multipart and signed text bodies need their
+  // original CRLF bytes, even when the editor uses LF for the request head.
+  const lines = String(rawText || "").split("\n");
+  const [startLine = "GET / HTTP/1.1", ...rest] = lines.map((line) => line.replace(/\r$/, ""));
   const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)(?:\s+(HTTP\/[0-9.]+))?$/);
   if (!match) return null;
   const method = match[1];
@@ -25464,7 +27534,7 @@ function parseRequestForExport(rawText, scheme, host, port) {
     }
   }
   const headerLines = bodyIdx === -1 ? rest : rest.slice(0, bodyIdx);
-  const body = bodyIdx === -1 ? "" : (rest[bodyIdx] === "" ? rest.slice(bodyIdx + 1) : rest.slice(bodyIdx)).join("\n");
+  const body = bodyIdx === -1 ? "" : lines.slice(bodyIdx + (rest[bodyIdx] === "" ? 2 : 1)).join("\n");
   const bodyProvided = bodyIdx !== -1;
   const headers = headerLines.map((h) => parseHeaderLineForExport(h)).filter(Boolean);
   const authority = exportHeaderValue(headers, ":authority");
@@ -25500,7 +27570,7 @@ function isHttpPseudoHeaderName(name) {
 }
 
 function requestToPython(parsed) {
-  if (!parsed) return "";
+  if (!parsed || requestFormatExportBlockedReason(parsed, "python")) return "";
   const py = (s) => JSON.stringify(String(s));
   const lines = [`import requests`, ""];
   const hasBody = parsed.bodyProvided || parsed.body.length > 0;
@@ -25558,7 +27628,7 @@ function hostHeaderDiffersFromUrl(hostHeader, url) {
 function requestToFetch(parsed) {
   if (!parsed) return "";
   const js = (s) => JSON.stringify(String(s));
-  if (fetchExportBlockedReason(parsed)) {
+  if (requestFormatExportBlockedReason(parsed, "fetch")) {
     return "";
   }
   const headerObj = exportableHeadersForUrl(parsed.headers, parsed.url);
@@ -25588,8 +27658,29 @@ function fetchExportBlockedReason(parsed) {
   return "";
 }
 
-function requestToPowerShell(parsed) {
+function requestFormatExportBlockedReason(parsed, format) {
   if (!parsed) return "";
+  if (format === "fetch") {
+    const blocked = fetchExportBlockedReason(parsed);
+    if (blocked) return blocked;
+  }
+  const label = { python: "Python", fetch: "Fetch", powershell: "PowerShell" }[format];
+  if (!label) return "";
+  // These APIs use header maps or combine field values. Neither can preserve
+  // arbitrary repeated fields, and comma-joining changes some header semantics.
+  const names = new Set();
+  for (const header of exportableHeadersForUrl(parsed.headers, parsed.url)) {
+    const name = header.name.toLowerCase();
+    if (names.has(name)) {
+      return `${label} cannot preserve repeated headers safely. Use cURL export instead.`;
+    }
+    names.add(name);
+  }
+  return "";
+}
+
+function requestToPowerShell(parsed) {
+  if (!parsed || requestFormatExportBlockedReason(parsed, "powershell")) return "";
   const esc = (s) => s.replace(/'/g, "''");
   const parts = [`Invoke-WebRequest -Uri '${esc(parsed.url)}'`];
   if (parsed.method !== "GET") parts.push(`-Method ${parsed.method}`);
@@ -25646,12 +27737,10 @@ function replayRequestToFormat(format, tab = getActiveReplayTab()) {
     target.host || "",
     target.port || "",
   );
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
+  const formatBlocked = requestFormatExportBlockedReason(parsed, format);
+  if (formatBlocked) {
+    showToast(formatBlocked, "error");
+    return "";
   }
   if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
@@ -25714,19 +27803,28 @@ function recordToFormat(record, format) {
     showToast(blocked, "error");
     return "";
   }
-  const rawText = buildRawRequest(record);
+  const request = record.request || {};
+  // Captured previews can be decoded while their display headers still describe
+  // the wire bytes. Match the backend's decoded-body resend contract on a copy.
+  const exportRecord = request.content_decoded ? {
+    ...record,
+    request: {
+      ...request,
+      headers: normalizedHeaders(request.headers).filter((header) =>
+        !headerNameEquals(header, "content-encoding") && !headerNameEquals(header, "content-length")),
+    },
+  } : record;
+  const rawText = buildRawRequest(exportRecord);
   const scheme = record.scheme || "https";
   const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
   const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
   const host = record.host || hostHeader?.value || authorityHeader?.value || "";
   const parsed = parseRequestForExport(rawText, scheme, host, "");
   if (!parsed) return "";
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
+  const formatBlocked = requestFormatExportBlockedReason(parsed, format);
+  if (formatBlocked) {
+    showToast(formatBlocked, "error");
+    return "";
   }
   if (format === "curl") return requestToCurl(parsed);
   if (format === "python") return requestToPython(parsed);
@@ -25742,30 +27840,7 @@ async function historyRequestToFormat(transactionId, format) {
   if (!response.ok) return "";
   const record = await response.json();
   if (currentSessionId() !== sessionId) return "";
-  const blocked = historyRequestExportBlockedReason(record);
-  if (blocked) {
-    showToast(blocked, "error");
-    return "";
-  }
-  const rawText = buildRawRequest(record);
-  const scheme = record.scheme || "https";
-  const hostHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, "host"));
-  const authorityHeader = normalizedHeaders(record.request?.headers).find((h) => headerNameEquals(h, ":authority"));
-  const host = record.host || hostHeader?.value || authorityHeader?.value || "";
-  const parsed = parseRequestForExport(rawText, scheme, host, "");
-  if (!parsed) return "";
-  if (format === "fetch") {
-    const fetchBlocked = fetchExportBlockedReason(parsed);
-    if (fetchBlocked) {
-      showToast(fetchBlocked, "error");
-      return "";
-    }
-  }
-  if (format === "curl") return requestToCurl(parsed);
-  if (format === "python") return requestToPython(parsed);
-  if (format === "fetch") return requestToFetch(parsed);
-  if (format === "powershell") return requestToPowerShell(parsed);
-  return "";
+  return recordToFormat(record, format);
 }
 
 function copyTransactionUrl(transactionId) {
@@ -25789,8 +27864,8 @@ function copyReplayUrl(tab = getActiveReplayTab()) {
 }
 
 function parseCurlCommand(text) {
-  const normalized = text.replace(/\\\s*\n/g, " ").trim();
-  const shellWords = splitShellWords(normalized);
+  const shellWords = splitShellWords(text);
+  if (shellWords.error) return shellWords;
   if (!shellWords.length || shellWords[0].toLowerCase() !== "curl") return null;
   const tokens = shellWords.slice(1);
   let method = "GET";
@@ -25837,12 +27912,12 @@ function parseCurlCommand(text) {
     "--unix-socket",
   ]);
   const curlShortOptionsWithValue = new Set(["-E", "-m", "-o", "-x", "-y", "-Y"]);
-  const requireOptionValue = (flag) => {
+  const requireOptionValue = (flag, allowEmpty = false) => {
     if (t + 1 >= tokens.length) {
       return { error: `cURL ${flag} requires a value.` };
     }
     const value = tokens[t + 1];
-    if (value === undefined || value === "") {
+    if (value === undefined || (!allowEmpty && value === "")) {
       return { error: `cURL ${flag} requires a value.` };
     }
     t += 1;
@@ -25862,7 +27937,7 @@ function parseCurlCommand(text) {
     if (flag === "--data-urlencode") {
       const encoded = encodeCurlDataUrlencode(value);
       if (encoded.error) return encoded.error;
-      bodyParts.push(encoded.value);
+      bodyParts.push({ value: encoded.value, separator: "&" });
       bodyProvided = true;
       if (options.defaultContentType !== false) needsDefaultFormContentType = true;
       if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
@@ -25874,7 +27949,7 @@ function parseCurlCommand(text) {
     if (flag !== "--data-raw" && value.startsWith("@")) {
       return "cURL @file body imports are not supported. Use --data-raw for literal @ bodies.";
     }
-    bodyParts.push(value);
+    bodyParts.push({ value, separator: flag === "--json" ? "" : "&" });
     bodyProvided = true;
     if (options.defaultContentType !== false) needsDefaultFormContentType = true;
     if (!getMode && !methodExplicit && (!method || method === "GET")) method = "POST";
@@ -25890,7 +27965,7 @@ function parseCurlCommand(text) {
     if (raw.startsWith("@")) {
       return "cURL --json @file imports are not supported.";
     }
-    const error = addBodyPart("--data-raw", raw, { defaultContentType: false });
+    const error = addBodyPart("--json", raw, { defaultContentType: false });
     if (error) return error;
     ensureHeader("Content-Type", "application/json");
     ensureHeader("Accept", "application/json");
@@ -25947,13 +28022,13 @@ function parseCurlCommand(text) {
       if (error) return { error };
     }
     else if (tok === "-d" || tok === "--data" || tok === "--data-raw" || tok === "--data-binary" || tok === "--data-urlencode") {
-      const value = requireOptionValue(tok);
+      const value = requireOptionValue(tok, true);
       if (value.error) return value;
       const error = addBodyPart(tok, value.value);
       if (error) return { error };
     }
     else if (tok === "--json") {
-      const value = requireOptionValue(tok);
+      const value = requireOptionValue(tok, true);
       if (value.error) return value;
       const error = addJsonBody(value.value);
       if (error) return { error };
@@ -26051,7 +28126,9 @@ function parseCurlCommand(text) {
   if (!HTTP_METHOD_TOKEN_RE.test(method)) {
     return { error: "Invalid HTTP method in cURL command." };
   }
-  let body = bodyParts.join("&");
+  // curl chooses the separator from the option being appended, and only
+  // inserts it when previous fragments have produced a nonempty body.
+  let body = bodyParts.reduce((value, part) => value + (value ? part.separator : "") + part.value, "");
   if (getMode && body) {
     url = appendCurlGetQuery(url, body);
     body = "";
@@ -26134,10 +28211,45 @@ function rawPathFromUrlString(url) {
 }
 
 function splitShellWords(input) {
+  if (/[\uD800-\uDFFF]/u.test(input)) {
+    return { error: "cURL commands must contain valid Unicode text." };
+  }
+  if (input.includes("\0")) {
+    return { error: "cURL commands containing NUL bytes cannot be imported." };
+  }
   const tokens = [];
   let token = "";
   let quote = null;
   let active = false;
+  let byteChunks = [];
+  const appendTextBytes = () => {
+    if (!token) return;
+    byteChunks.push(new TextEncoder().encode(token));
+    token = "";
+  };
+  const finishToken = () => {
+    if (byteChunks.length) {
+      appendTextBytes();
+      const bytes = new Uint8Array(byteChunks.reduce((length, chunk) => length + chunk.length, 0));
+      let offset = 0;
+      for (const chunk of byteChunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.length;
+      }
+      try {
+        // Byte escapes can span adjacent quoted segments. Decode the whole
+        // word once, retaining a literal BOM and refusing lossy replacement.
+        token = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+      } catch (_) {
+        return "cURL ANSI-C byte escapes must form valid UTF-8 text. Binary byte imports are not supported.";
+      }
+    }
+    tokens.push(token);
+    token = "";
+    byteChunks = [];
+    active = false;
+    return "";
+  };
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i];
@@ -26150,8 +28262,17 @@ function splitShellWords(input) {
       if (ch === '"') {
         quote = null;
       } else if (ch === "\\" && i + 1 < input.length) {
-        token += input[++i];
-        active = true;
+        // In double quotes, backslashes only escape shell-special characters.
+        // Paths such as C:\temp\file keep their literal backslashes.
+        const next = input[i + 1];
+        if (next === "\n") {
+          i += 1;
+        } else if (next === "$" || next === "`" || next === '"' || next === "\\") {
+          token += next;
+          i += 1;
+        } else {
+          token += ch;
+        }
       } else {
         token += ch;
         active = true;
@@ -26163,7 +28284,13 @@ function splitShellWords(input) {
         quote = null;
       } else if (ch === "\\" && i + 1 < input.length) {
         const decoded = decodeAnsiCStringEscape(input, i + 1);
-        token += decoded.value;
+        if (decoded.error) return decoded;
+        if (decoded.byte !== undefined) {
+          appendTextBytes();
+          byteChunks.push(Uint8Array.of(decoded.byte));
+        } else {
+          token += decoded.value;
+        }
         i = decoded.index;
         active = true;
       } else {
@@ -26174,9 +28301,10 @@ function splitShellWords(input) {
     }
 
     if (/\s/.test(ch)) {
-      if (active || token.length) tokens.push(token);
-      token = "";
-      active = false;
+      if (active || token.length) {
+        const error = finishToken();
+        if (error) return { error };
+      }
       continue;
     }
     if (ch === "$" && input[i + 1] === "'") {
@@ -26191,6 +28319,12 @@ function splitShellWords(input) {
       continue;
     }
     if (ch === "\\" && i + 1 < input.length) {
+      // A continuation removes the newline, without splitting the current word.
+      // Single-quoted and ANSI-C quoted text are handled above and stay literal.
+      if (input[i + 1] === "\n") {
+        i += 1;
+        continue;
+      }
       token += input[++i];
       active = true;
       continue;
@@ -26200,7 +28334,10 @@ function splitShellWords(input) {
   }
 
   if (quote) return [];
-  if (active || token.length) tokens.push(token);
+  if (active || token.length) {
+    const error = finishToken();
+    if (error) return { error };
+  }
   return tokens;
 }
 
@@ -26224,32 +28361,29 @@ function decodeAnsiCStringEscape(input, index) {
   if (Object.prototype.hasOwnProperty.call(simple, ch)) {
     return { value: simple[ch], index };
   }
+  const byteEscape = (value, end) => value === 0
+    ? { error: "cURL ANSI-C NUL escapes cannot be imported as text." }
+    : { byte: value, index: end };
   if (ch === "x") {
     const hex = input.slice(index + 1).match(/^[0-9a-fA-F]{1,2}/)?.[0] || "";
+    if (hex) return byteEscape(parseInt(hex, 16), index + hex.length);
+  }
+  if (ch === "u" || ch === "U") {
+    const width = ch === "u" ? 4 : 8;
+    const hex = input.slice(index + 1, index + 1 + width).match(/^[0-9a-fA-F]+/)?.[0] || "";
     if (hex) {
-      return { value: String.fromCharCode(parseInt(hex, 16)), index: index + hex.length };
-    }
-  }
-  if (ch === "u") {
-    const hex = input.slice(index + 1, index + 5);
-    if (/^[0-9a-fA-F]{4}$/.test(hex)) {
-      return { value: String.fromCharCode(parseInt(hex, 16)), index: index + 4 };
-    }
-  }
-  if (ch === "U") {
-    const hex = input.slice(index + 1, index + 9);
-    if (/^[0-9a-fA-F]{8}$/.test(hex)) {
       const codePoint = parseInt(hex, 16);
-      if (codePoint <= 0x10ffff) {
-        return { value: String.fromCodePoint(codePoint), index: index + 8 };
+      if (codePoint === 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+        return { error: "cURL ANSI-C Unicode escapes must contain valid non-NUL Unicode characters." };
       }
+      return { value: String.fromCodePoint(codePoint), index: index + hex.length };
     }
   }
   if (/^[0-7]$/.test(ch)) {
     const octal = input.slice(index, index + 3).match(/^[0-7]{1,3}/)?.[0] || ch;
-    return { value: String.fromCharCode(parseInt(octal, 8)), index: index + octal.length - 1 };
+    return byteEscape(parseInt(octal, 8) & 0xff, index + octal.length - 1);
   }
-  return { value: ch, index };
+  return { value: `\\${ch}`, index };
 }
 
 function openCurlImportModal() {
@@ -27262,8 +29396,8 @@ function updateCodePaneCM(key, container, text, options = {}) {
   }
   cv.setContent(text || "");
 
-  // Search highlights
-  const query = (options.search || "").trim();
+  // Preserve the same literal query used while typing, including whitespace.
+  const query = options.search || "";
   const searchResult = cv.applySearch(query, { classes: options.searchClasses });
 
   // Changed-line highlights (Modified view). Applied after setContent, which

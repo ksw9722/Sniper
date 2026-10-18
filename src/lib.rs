@@ -7,6 +7,7 @@ pub mod cli_path;
 pub mod config;
 pub mod event_log;
 pub mod fuzzer;
+pub mod history_retention;
 pub mod history_selection;
 pub mod intercept;
 pub mod match_replace;
@@ -14,6 +15,8 @@ pub mod model;
 pub mod oast;
 pub mod platform;
 pub mod proxy;
+pub mod recon;
+pub mod recon_sources;
 pub mod runtime;
 pub mod runtime_state;
 pub mod saved_contract;
@@ -24,13 +27,32 @@ pub mod saved_operations;
 pub mod scanner;
 pub mod scope;
 pub mod sequence;
+pub mod service_map;
+pub mod service_map_auth;
+pub mod service_map_body;
+pub mod service_map_clients;
+pub mod service_map_html;
+mod service_map_html_parser;
+pub mod service_map_libraries;
+mod service_map_link_parser;
+pub mod service_map_links;
+pub mod service_map_openapi;
+pub mod service_map_parameters;
+pub mod service_map_peer_matches;
+pub mod service_map_servers;
+pub mod service_map_technology;
 pub mod session;
+pub mod skill_activation;
+pub mod skill_auto_update;
+pub mod skill_managed;
+pub mod skill_status;
 pub mod skills;
 pub mod special_host;
 pub mod state;
 pub mod store;
 pub mod target;
 pub mod ui_settings;
+pub mod upstream_peer_settings;
 pub mod upstream_proxy;
 pub mod websocket;
 pub mod workspace;
@@ -195,6 +217,7 @@ async fn shutdown_headless_runtime(
     state: &AppState,
     oast_task: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
+    state.stop_recon_jobs().await?;
     oast_task.abort();
     if let Err(error) = oast_task.await {
         if !error.is_cancelled() {

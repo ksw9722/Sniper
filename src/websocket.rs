@@ -338,7 +338,12 @@ impl WebSocketStore {
                     .map(|summary| (index, summary))
             })
             .filter(|(_, summary)| {
-                websocket_summary_matches_filters(summary, filters, normalized_query.as_deref())
+                Some(summary.id) == filters.after_id
+                    || websocket_summary_matches_filters(
+                        summary,
+                        filters,
+                        normalized_query.as_deref(),
+                    )
             })
             .collect();
         sort_websocket_summaries(
@@ -346,8 +351,22 @@ impl WebSocketStore {
             filters.sort_key.as_deref(),
             filters.sort_direction.as_deref(),
         );
+        let cursor_offset = sorted_summary_offset_after_id(&matched, filters.after_id);
+        // A closed or otherwise filtered-out cursor still fixes the next page's
+        // position. Keep it through sorting, then remove it before counts and rows.
+        let filtered_cursor_offset = cursor_offset.filter(|&offset| {
+            !websocket_summary_matches_filters(
+                &matched[offset - 1].1,
+                filters,
+                normalized_query.as_deref(),
+            )
+        });
+        if let Some(offset) = filtered_cursor_offset {
+            matched.remove(offset - 1);
+        }
         let filtered_total = matched.len();
-        let offset = sorted_summary_offset_after_id(&matched, filters.after_id)
+        let offset = cursor_offset
+            .map(|offset| offset - usize::from(filtered_cursor_offset.is_some()))
             .unwrap_or_else(|| filters.offset.unwrap_or(0))
             .min(filtered_total);
         let summaries = matched.into_iter().skip(offset).map(|(_, summary)| summary);
@@ -1426,6 +1445,203 @@ mod tests {
             .iter()
             .all(|summary| !first_page_ids.contains(&summary.id)));
         assert!(!second_page.has_more);
+    }
+
+    #[tokio::test]
+    async fn sorted_cursor_survives_a_closed_anchor_outside_storage_order() {
+        let base = fixed_time("2026-01-01T12:00:00Z");
+        for direction in ["asc", "desc"] {
+            for offset in [None, Some(2)] {
+                for limit in [0, 1, 2] {
+                    let records: Vec<_> = [4, 2, 3, 1]
+                        .into_iter()
+                        .map(|rank| {
+                            let mut record = session(Vec::new());
+                            record.started_at = base + chrono::Duration::seconds(rank);
+                            record.path = format!("/{rank}");
+                            record
+                        })
+                        .collect();
+                    let store = WebSocketStore::from_sessions(10, 10, records);
+                    let filters = WebSocketListFilters {
+                        limit: Some(2),
+                        live_only: true,
+                        sort_key: Some("started_at".into()),
+                        sort_direction: Some(direction.into()),
+                        ..Default::default()
+                    };
+                    let first_page = store.list_page_filtered(&filters).await;
+                    let anchor = first_page.items[1].id;
+                    assert!(store.close(anchor, base, 123, None).await);
+                    let page = store
+                        .list_page_filtered(&WebSocketListFilters {
+                            after_id: Some(anchor),
+                            offset,
+                            limit: Some(limit),
+                            ..filters
+                        })
+                        .await;
+                    let remaining = if direction == "desc" {
+                        ["/2", "/1"]
+                    } else {
+                        ["/3", "/4"]
+                    };
+                    let expected = if limit == 1 {
+                        &remaining[..1]
+                    } else {
+                        &remaining[..]
+                    };
+                    assert_eq!(
+                        page.items
+                            .iter()
+                            .map(|row| row.path.as_str())
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "direction={direction}, offset={offset:?}, limit={limit}"
+                    );
+                    assert_eq!(page.total, 4);
+                    assert_eq!(page.filtered_total, Some(3));
+                    assert_eq!(page.offset, 1);
+                    assert_eq!(page.has_more, limit == 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sorted_cursor_keeps_ties_and_filter_exclusions_out_of_results() {
+        for direction in ["asc", "desc"] {
+            for filter in ["live", "query", "scope"] {
+                let records: Vec<_> = (0..4)
+                    .map(|index| {
+                        let mut record = session(Vec::new());
+                        record.path = format!("/{index}");
+                        record.host = if index == 1 {
+                            "anchor.example.com"
+                        } else {
+                            "keep.example.com"
+                        }
+                        .into();
+                        record
+                    })
+                    .collect();
+                let anchor = records[1].id;
+                let store = WebSocketStore::from_sessions(10, 10, records);
+                let mut filters = WebSocketListFilters {
+                    limit: Some(2),
+                    sort_key: Some("status".into()),
+                    sort_direction: Some(direction.into()),
+                    after_id: Some(anchor),
+                    offset: Some(2),
+                    ..Default::default()
+                };
+                match filter {
+                    "live" => {
+                        filters.live_only = true;
+                        assert!(store.close(anchor, Utc::now(), 123, None).await);
+                    }
+                    "query" => filters.query = Some("keep.example.com".into()),
+                    "scope" => {
+                        filters.in_scope_only = true;
+                        filters.scope_patterns = vec!["*.example.com".into()];
+                        filters.excluded_scope_patterns = vec!["anchor.example.com".into()];
+                    }
+                    _ => unreachable!(),
+                }
+                let page = store.list_page_filtered(&filters).await;
+                assert_eq!(
+                    page.items
+                        .iter()
+                        .map(|row| row.path.as_str())
+                        .collect::<Vec<_>>(),
+                    ["/2", "/3"],
+                    "direction={direction}, filter={filter}"
+                );
+                assert_eq!(page.filtered_total, Some(3));
+                assert_eq!(page.offset, 1);
+                assert!(!page.has_more);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sorted_cursor_exclusion_at_first_and_last_positions() {
+        for anchor_index in [0, 3] {
+            let records: Vec<_> = (0..4)
+                .map(|index| {
+                    let mut record = session(Vec::new());
+                    record.path = format!("/{index}");
+                    record
+                })
+                .collect();
+            let anchor = records[anchor_index].id;
+            let store = WebSocketStore::from_sessions(10, 10, records);
+            assert!(store.close(anchor, Utc::now(), 123, None).await);
+            let page = store
+                .list_page_filtered(&WebSocketListFilters {
+                    after_id: Some(anchor),
+                    limit: Some(2),
+                    live_only: true,
+                    sort_key: Some("status".into()),
+                    ..Default::default()
+                })
+                .await;
+            let expected: Vec<_> = (anchor_index + 1..4)
+                .take(2)
+                .map(|index| format!("/{index}"))
+                .collect();
+            assert_eq!(
+                page.items
+                    .iter()
+                    .map(|row| row.path.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(page.total, 4);
+            assert_eq!(page.filtered_total, Some(3));
+            assert_eq!(page.offset, anchor_index);
+            assert_eq!(page.has_more, anchor_index == 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sorted_cursor_missing_from_storage_uses_requested_offset() {
+        let records: Vec<_> = (0..4)
+            .map(|index| {
+                let mut record = session(Vec::new());
+                record.path = format!("/{index}");
+                record
+            })
+            .collect();
+        let anchor = records[1].id;
+        let store = WebSocketStore::from_sessions(10, 10, records);
+        remove_ordered_session(&mut *store.inner.write().await, anchor);
+        for direction in ["asc", "desc"] {
+            for offset in [0, 2, 10] {
+                let page = store
+                    .list_page_filtered(&WebSocketListFilters {
+                        after_id: Some(anchor),
+                        offset: Some(offset),
+                        limit: Some(2),
+                        sort_key: Some("status".into()),
+                        sort_direction: Some(direction.into()),
+                        ..Default::default()
+                    })
+                    .await;
+                let all = ["/0", "/2", "/3"];
+                assert_eq!(
+                    page.items
+                        .iter()
+                        .map(|row| row.path.as_str())
+                        .collect::<Vec<_>>(),
+                    all.iter().copied().skip(offset).take(2).collect::<Vec<_>>()
+                );
+                assert_eq!(page.total, 3);
+                assert_eq!(page.filtered_total, Some(3));
+                assert_eq!(page.offset, offset.min(3));
+                assert_eq!(page.has_more, offset == 0);
+            }
+        }
     }
 
     #[tokio::test]

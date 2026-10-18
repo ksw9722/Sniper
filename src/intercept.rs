@@ -41,16 +41,12 @@ impl InterceptRule {
             return false;
         }
 
-        if !self.host_pattern.is_empty() {
-            let host = normalize_host_for_matching(&request.host);
-            let pattern = normalize_host_for_matching(&self.host_pattern);
-            if let Some(suffix) = pattern.strip_prefix("*.") {
-                if host != suffix && !host.ends_with(&format!(".{suffix}")) {
-                    return false;
-                }
-            } else if host != pattern {
-                return false;
-            }
+        // Scope's matcher, as everywhere else: this copy knew only `*.x` and
+        // exact hosts, so a rule for `*` or `api-*.example.com` held nothing.
+        if !self.host_pattern.is_empty()
+            && !crate::scope::host_matches_pattern(&request.host, &self.host_pattern)
+        {
+            return false;
         }
 
         if !self.path_pattern.is_empty() && !request.path.contains(&self.path_pattern) {
@@ -511,27 +507,6 @@ fn trim_pending_response_intercepts(
     evicted
 }
 
-fn host_without_port(host: &str) -> &str {
-    let trimmed = host.trim();
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            return &rest[..end];
-        }
-    }
-    if trimmed.matches(':').count() == 1 {
-        return trimmed
-            .split_once(':')
-            .map(|(value, _)| value)
-            .unwrap_or(trimmed);
-    }
-    trimmed
-}
-
-fn normalize_host_for_matching(host: &str) -> String {
-    let host = host_without_port(host);
-    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -635,6 +610,29 @@ mod tests {
 
         request.host = "example.com.".to_string();
         assert!(rule.matches(&request));
+    }
+
+    #[test]
+    fn intercept_rule_host_patterns_match_as_scope_patterns_do() {
+        let matches = |pattern: &str, host: &str| {
+            let mut request = request();
+            request.host = host.to_string();
+            InterceptRule {
+                id: Uuid::new_v4(),
+                enabled: true,
+                scope: InterceptScope::Request,
+                host_pattern: pattern.to_string(),
+                path_pattern: String::new(),
+                method_filter: Vec::new(),
+            }
+            .matches(&request)
+        };
+
+        assert!(matches("*", "anything.example.com"));
+        assert!(matches("api-*.example.com", "api-v2.example.com:8443"));
+        assert!(!matches("api-*.example.com", "web.example.com"));
+        assert!(matches("example.com", "EXAMPLE.com:443"));
+        assert!(!matches("example.com", "api.example.com"));
     }
 
     #[tokio::test]

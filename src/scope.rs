@@ -19,22 +19,162 @@
 ///
 /// Matching ignores case, a port, and a trailing DNS root dot.
 pub fn host_matches_pattern(host: &str, pattern: &str) -> bool {
-    let hostname = normalize_host_for_matching(host);
-    let normalized = normalize_host_for_matching(pattern);
+    PreparedPattern::new(pattern).matches(&normalize_host_for_matching(host))
+}
 
-    if let Some(suffix) = normalized.strip_prefix("*.") {
-        // Kept distinct from the glob below: a plain glob would not match the bare
-        // domain, and `*.example.com` has always included `example.com`.
-        if !suffix.contains('*') {
-            return hostname == suffix || hostname.ends_with(&format!(".{suffix}"));
+#[derive(Clone, Copy)]
+enum PatternKind {
+    Exact,
+    DomainSuffix,
+    Glob,
+}
+
+struct PreparedPattern {
+    normalized: String,
+    kind: PatternKind,
+}
+
+impl PreparedPattern {
+    fn new(pattern: &str) -> Self {
+        let normalized = normalize_host_for_matching(pattern);
+        let kind = if normalized
+            .strip_prefix("*.")
+            .is_some_and(|suffix| !suffix.contains('*'))
+        {
+            PatternKind::DomainSuffix
+        } else if normalized.contains('*') {
+            PatternKind::Glob
+        } else {
+            PatternKind::Exact
+        };
+        Self { normalized, kind }
+    }
+
+    fn matches(&self, hostname: &str) -> bool {
+        match self.kind {
+            PatternKind::Exact => hostname == self.normalized,
+            PatternKind::DomainSuffix => {
+                let suffix = &self.normalized[2..];
+                hostname == suffix
+                    || hostname
+                        .strip_suffix(suffix)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            }
+            PatternKind::Glob => glob_matches(hostname, &self.normalized),
+        }
+    }
+}
+
+/// A bounded caller-owned scope snapshot for repeated metadata comparisons.
+/// Prepare before acquiring a store lock. The same matcher backs one-off calls;
+/// this only reuses normalization and avoids per-pattern work allocations.
+pub(crate) struct PreparedScope {
+    include: PreparedPatterns,
+    exclude: PreparedPatterns,
+}
+
+struct PreparedPatterns {
+    exact: std::collections::BTreeSet<String>,
+    patterned: Vec<PreparedPattern>,
+}
+
+impl PreparedPatterns {
+    fn new(patterns: &[String]) -> Self {
+        let mut prepared = Self {
+            exact: Default::default(),
+            patterned: Vec::new(),
+        };
+        for pattern in patterns {
+            let pattern = PreparedPattern::new(pattern);
+            if matches!(pattern.kind, PatternKind::Exact) {
+                prepared.exact.insert(pattern.normalized);
+            } else {
+                prepared.patterned.push(pattern);
+            }
+        }
+        prepared
+    }
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.patterned.is_empty()
+    }
+    fn contains_bounded(
+        &self,
+        hostname: &str,
+        remaining: &mut usize,
+    ) -> Result<bool, ScopeWorkLimit> {
+        if self.exact.contains(hostname) {
+            return Ok(true);
+        }
+        for pattern in &self.patterned {
+            // Charge before suffix/glob work. These byte-based logical units
+            // bound repeated middle searches without a timing-dependent cutoff.
+            let charge = hostname
+                .len()
+                .saturating_add(pattern.normalized.len())
+                .saturating_add(16);
+            *remaining = remaining.checked_sub(charge).ok_or(ScopeWorkLimit)?;
+            if pattern.matches(hostname) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ScopeWorkLimit;
+
+impl PreparedScope {
+    pub(crate) fn within_limits(
+        include: &[String],
+        exclude: &[String],
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> bool {
+        include.len() <= max_entries
+            && exclude.len() <= max_entries
+            && include
+                .iter()
+                .chain(exclude)
+                .all(|pattern| pattern.len() <= max_bytes)
+    }
+
+    pub(crate) fn try_new(
+        include: &[String],
+        exclude: &[String],
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Option<Self> {
+        Self::within_limits(include, exclude, max_entries, max_bytes)
+            .then(|| Self::new(include, exclude))
+    }
+    pub(crate) fn new(include: &[String], exclude: &[String]) -> Self {
+        Self {
+            include: PreparedPatterns::new(include),
+            exclude: PreparedPatterns::new(exclude),
         }
     }
 
-    if normalized.contains('*') {
-        return glob_matches(&hostname, &normalized);
+    pub(crate) fn contains_bounded(
+        &self,
+        host: &str,
+        remaining: &mut usize,
+    ) -> Result<bool, ScopeWorkLimit> {
+        if self.include.is_empty() && self.exclude.is_empty() {
+            return Ok(true);
+        }
+        let hostname = normalize_host_for_matching(host);
+        let included =
+            self.include.is_empty() || self.include.contains_bounded(&hostname, remaining)?;
+        Ok(included && !self.exclude.contains_bounded(&hostname, remaining)?)
     }
 
-    hostname == normalized
+    #[cfg(test)]
+    pub(crate) fn contains(&self, host: &str) -> bool {
+        let mut remaining = usize::MAX;
+        self.contains_bounded(host, &mut remaining)
+            .expect("unbounded synthetic scope comparison")
+    }
 }
 
 pub fn host_matches_any(host: &str, patterns: &[String]) -> bool {
@@ -55,13 +195,11 @@ pub fn is_host_in_scope(host: &str, include: &[String], exclude: &[String]) -> b
 /// `*` matches any run of characters, including dots. Anchored at both ends, so
 /// `log-*.example.com` does not match `x-log-y.example.com`.
 fn glob_matches(value: &str, pattern: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return value == pattern;
-    }
-
-    let first = parts[0];
-    let last = parts[parts.len() - 1];
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    let Some(last) = parts.next_back() else {
+        return value == first;
+    };
     if !value.starts_with(first) || !value.ends_with(last) {
         return false;
     }
@@ -72,7 +210,7 @@ fn glob_matches(value: &str, pattern: &str) -> bool {
     }
 
     let mut rest = &value[first.len()..value.len() - last.len()];
-    for middle in &parts[1..parts.len() - 1] {
+    for middle in parts {
         if middle.is_empty() {
             continue;
         }
@@ -118,6 +256,164 @@ pub fn host_without_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn original_matches(host: &str, pattern: &str) -> bool {
+        let hostname = normalize_host_for_matching(host);
+        let normalized = normalize_host_for_matching(pattern);
+        if let Some(suffix) = normalized.strip_prefix("*.") {
+            if !suffix.contains('*') {
+                return hostname == suffix || hostname.ends_with(&format!(".{suffix}"));
+            }
+        }
+        if normalized.contains('*') {
+            let parts: Vec<&str> = normalized.split('*').collect();
+            let first = parts[0];
+            let last = parts[parts.len() - 1];
+            if !hostname.starts_with(first)
+                || !hostname.ends_with(last)
+                || first.len() + last.len() > hostname.len()
+            {
+                return false;
+            }
+            let mut rest = &hostname[first.len()..hostname.len() - last.len()];
+            for middle in &parts[1..parts.len() - 1] {
+                if middle.is_empty() {
+                    continue;
+                }
+                let Some(at) = rest.find(middle) else {
+                    return false;
+                };
+                rest = &rest[at + middle.len()..];
+            }
+            return true;
+        }
+        hostname == normalized
+    }
+
+    #[test]
+    fn prepared_scope_preserves_raw_host_and_pattern_normalization() {
+        let values = [
+            "",
+            " ",
+            "*",
+            "*.",
+            "**",
+            "*.*",
+            "a*b",
+            "ab",
+            "a..",
+            "*.EXAMPLE.com.",
+            "https://API.Example.com:443/path?secret#fragment",
+            "//api.example.com",
+            "API.Example.com.:8443",
+            "[2001:db8::1]:443",
+            "[::1]ignored",
+            "a:invalid",
+            "\u{2003}API.example.com\u{2003}",
+            "2001:db8::1",
+            "[::1",
+            "[::1]",
+            "127.0.0.1:443",
+            "127.1",
+            "Ä.Example.com",
+            "ä.example.com",
+            "example.com@other.example.com",
+            "a*b*c",
+            "a**b",
+            "a*b*",
+            "*a*b",
+        ];
+        for host in values {
+            for pattern in values {
+                let expected = original_matches(host, pattern);
+                assert_eq!(
+                    host_matches_pattern(host, pattern),
+                    expected,
+                    "host={host:?}, pattern={pattern:?}"
+                );
+                let prepared = PreparedScope::new(&[pattern.into()], &[]);
+                assert_eq!(prepared.contains(host), expected);
+                let mut remaining = usize::MAX;
+                assert_eq!(
+                    prepared.contains_bounded(host, &mut remaining),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    PreparedScope::new(&[], &[pattern.into()]).contains(host),
+                    !expected
+                );
+            }
+        }
+        assert!(PreparedScope::new(&[], &[]).contains(""));
+    }
+
+    #[test]
+    fn prepared_scope_budget_is_exact_and_never_treats_exhaustion_as_out_of_scope() {
+        let host = "api.example.com";
+        let patterns = vec!["*.example.com".to_owned()];
+        let scope = PreparedScope::try_new(&patterns, &[], 500, 512).unwrap();
+        let charge = host.len() + patterns[0].len() + 16;
+        let mut exact = charge;
+        assert_eq!(scope.contains_bounded(host, &mut exact), Ok(true));
+        assert_eq!(exact, 0);
+        let mut short = charge - 1;
+        assert_eq!(
+            scope.contains_bounded(host, &mut short),
+            Err(ScopeWorkLimit)
+        );
+        assert_eq!(short, charge - 1);
+        let mut empty = 0;
+        assert_eq!(
+            scope.contains_bounded(host, &mut empty),
+            Err(ScopeWorkLimit)
+        );
+        let exact_scope = PreparedScope::try_new(&[host.into()], &[], 500, 512).unwrap();
+        assert_eq!(exact_scope.contains_bounded(host, &mut empty), Ok(true));
+        assert!(PreparedScope::try_new(&vec!["*".into(); 501], &[], 500, 512).is_none());
+        assert!(PreparedScope::try_new(&[], &["x".repeat(513)], 500, 512).is_none());
+    }
+
+    #[test]
+    fn prepared_scope_generated_globs_match_original_engine() {
+        fn strings(alphabet: &[char], max: usize) -> Vec<String> {
+            let mut all = vec![String::new()];
+            let mut previous = all.clone();
+            for _ in 0..max {
+                let next: Vec<_> = previous
+                    .iter()
+                    .flat_map(|prefix| alphabet.iter().map(move |ch| format!("{prefix}{ch}")))
+                    .collect();
+                all.extend(next.iter().cloned());
+                previous = next;
+            }
+            all
+        }
+        let patterns = strings(&['a', 'b', '*', '.'], 4);
+        let hosts = strings(&['a', 'b', '.'], 4);
+        for pattern in &patterns {
+            let matcher = PreparedScope::new(&[pattern.clone()], &[]);
+            for host in &hosts {
+                let expected = original_matches(host, pattern);
+                assert_eq!(
+                    matcher.contains(host),
+                    expected,
+                    "host={host:?}, pattern={pattern:?}"
+                );
+                assert_eq!(host_matches_pattern(host, pattern), expected);
+            }
+        }
+        for index in 0..patterns.len() {
+            let include = vec![patterns[index].clone(), "*.example.com".into()];
+            let exclude = vec![patterns[(index * 17 + 3) % patterns.len()].clone()];
+            let matcher = PreparedScope::new(&include, &exclude);
+            for host in &hosts {
+                let expected = include.iter().any(|p| original_matches(host, p))
+                    && !exclude.iter().any(|p| original_matches(host, p));
+                assert_eq!(matcher.contains(host), expected);
+                assert_eq!(is_host_in_scope(host, &include, &exclude), expected);
+            }
+        }
+    }
 
     fn list(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()

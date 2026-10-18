@@ -201,12 +201,21 @@ pub struct WorkspaceStateEvent {
 pub enum WorkspaceReplaceError<E> {
     Conflict(Box<WorkspaceStateSnapshot>),
     Persist(E),
+    CommittedButUncertain(E),
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum SavedHttpTabOperation {
+#[derive(Debug)]
+pub struct WorkspacePersistCommit<T, E> {
+    pub value: T,
+    pub finalization_error: Option<E>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SavedReplayTabOperation {
     Close,
     Duplicate,
+    SetPinned(bool),
+    SetLabel(String),
 }
 
 #[derive(Debug)]
@@ -219,10 +228,10 @@ pub(crate) enum WorkspaceTransformError<E> {
 
 /// Transform saved state only: draft text, embedded bodies and transaction
 /// references must never pass through the request parser or body hydrator here.
-pub(crate) fn transform_saved_http_tab(
+pub(crate) fn transform_saved_replay_tab(
     current: &WorkspaceStateSnapshot,
     tab_id: &str,
-    operation: SavedHttpTabOperation,
+    operation: SavedReplayTabOperation,
 ) -> Result<WorkspaceStateSnapshot, String> {
     let index = current
         .replay
@@ -231,12 +240,27 @@ pub(crate) fn transform_saved_http_tab(
         .position(|tab| tab.id == tab_id)
         .ok_or_else(|| "saved Replay tab was not found".to_string())?;
     let source = &current.replay.tabs[index];
-    if !matches!(source.tab_type.as_str(), "" | "http") {
-        return Err("saved Replay tab must be an HTTP tab".to_string());
+    let label_only = matches!(&operation, SavedReplayTabOperation::SetLabel(_));
+    if !matches!(source.tab_type.as_str(), "" | "http")
+        && !(label_only && source.tab_type == "websocket")
+    {
+        return Err(if label_only {
+            "saved Replay tab must be an HTTP or WebSocket tab"
+        } else {
+            "saved Replay tab must be an HTTP tab"
+        }
+        .to_string());
     }
     let mut next = current.clone();
     match operation {
-        SavedHttpTabOperation::Close => {
+        SavedReplayTabOperation::SetLabel(label) => {
+            next.replay.tabs[index].custom_label = label;
+        }
+        SavedReplayTabOperation::SetPinned(pinned) => {
+            // This is desired-state assignment, never a toggle or reorder.
+            next.replay.tabs[index].pinned = pinned;
+        }
+        SavedReplayTabOperation::Close => {
             // Legacy counters can lag the saved tabs. Closing the last/highest
             // tab must not make its sequence available for reuse.
             next.replay.tab_sequence = current
@@ -260,7 +284,7 @@ pub(crate) fn transform_saved_http_tab(
                 next.replay.active_tab_id = None;
             }
         }
-        SavedHttpTabOperation::Duplicate => {
+        SavedReplayTabOperation::Duplicate => {
             if current.replay.tabs.len() >= MAX_WORKSPACE_REPLAY_TABS {
                 return Err("workspace has reached the saved Replay tab limit".to_string());
             }
@@ -315,6 +339,19 @@ impl WorkspaceStateStore {
         });
     }
 
+    /// Retention reads references without cloning request/response bodies.
+    pub async fn http_replay_source_ids(&self) -> std::collections::HashSet<Uuid> {
+        self.inner
+            .read()
+            .await
+            .replay
+            .tabs
+            .iter()
+            .filter(|tab| tab.tab_type.is_empty() || tab.tab_type == "http")
+            .filter_map(|tab| tab.source_transaction_id)
+            .collect()
+    }
+
     pub async fn snapshot(&self) -> WorkspaceStateSnapshot {
         self.inner.read().await.clone()
     }
@@ -357,7 +394,7 @@ impl WorkspaceStateStore {
     ) -> Result<(WorkspaceStateSnapshot, T), WorkspaceReplaceError<E>>
     where
         F: FnOnce(WorkspaceStateSnapshot) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        Fut: Future<Output = Result<WorkspacePersistCommit<T, E>, E>>,
     {
         let mut current = self.inner.write().await;
         if !can_replace_snapshot(&snapshot, &current) {
@@ -373,7 +410,12 @@ impl WorkspaceStateStore {
         *current = next.clone();
         drop(current);
         self.announce(&next);
-        Ok((next, persist_result))
+        if let Some(error) = persist_result.finalization_error {
+            // Replacement already made this revision visible on disk. Keep
+            // memory and subscribers current even when durability is uncertain.
+            return Err(WorkspaceReplaceError::CommittedButUncertain(error));
+        }
+        Ok((next, persist_result.value))
     }
 
     pub(crate) async fn transform_snapshot_checked_persisting<F, P, Fut, E>(
@@ -658,6 +700,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(current.revision, 1);
+        let mut events = store.subscribe();
 
         let result = store
             .replace_snapshot_checked_persisting(
@@ -671,7 +714,9 @@ mod tests {
                     },
                     ..WorkspaceStateSnapshot::default()
                 },
-                |_candidate| async { Err::<(), _>("disk failed") },
+                |_candidate| async {
+                    Err::<super::WorkspacePersistCommit<(), _>, _>("disk failed")
+                },
             )
             .await;
 
@@ -683,6 +728,41 @@ mod tests {
         assert_eq!(after.revision, 1);
         assert_eq!(after.client_version, 1);
         assert!(after.replay.active_tab_id.is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_replace_persisting_publishes_committed_uncertainty() {
+        let store = WorkspaceStateStore::new();
+        let mut events = store.subscribe();
+        let result = store
+            .replace_snapshot_checked_persisting(
+                WorkspaceStateSnapshot {
+                    client_id: Some("client-a".to_string()),
+                    client_version: 1,
+                    ..WorkspaceStateSnapshot::default()
+                },
+                |candidate| async move {
+                    assert_eq!(candidate.revision, 1);
+                    Ok::<_, &str>(super::WorkspacePersistCommit {
+                        value: (),
+                        finalization_error: Some("directory sync failed"),
+                    })
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::WorkspaceReplaceError::CommittedButUncertain(
+                "directory sync failed"
+            ))
+        ));
+        let current = store.snapshot().await;
+        assert_eq!(current.revision, 1);
+        assert_eq!(current.client_id.as_deref(), Some("client-a"));
+        assert_eq!(current.client_version, 1);
+        assert_eq!(events.try_recv().unwrap().revision, 1);
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -709,7 +789,12 @@ mod tests {
                     },
                     ..WorkspaceStateSnapshot::default()
                 },
-                |candidate| async move { Ok::<_, ()>(candidate.revision) },
+                |candidate| async move {
+                    Ok::<_, ()>(super::WorkspacePersistCommit {
+                        value: candidate.revision,
+                        finalization_error: None,
+                    })
+                },
             )
             .await
             .unwrap();
@@ -804,11 +889,27 @@ mod saved_http_tab_tests {
         serde_json::to_value(snapshot).unwrap()
     }
 
+    const COMPLETENESS_FIELDS: [&str; 4] = [
+        "response_record_complete",
+        "history_entries_complete",
+        "ws_setup_queue_complete",
+        "ws_frames_complete",
+    ];
+
+    fn completeness_flags(tab: &ReplayTabState) -> [Option<bool>; 4] {
+        [
+            tab.response_record_complete,
+            tab.history_entries_complete,
+            tab.ws_setup_queue_complete,
+            tab.ws_frames_complete,
+        ]
+    }
+
     #[test]
     fn saved_http_close_uses_stable_visual_order_and_retains_monotonic_sequence() {
         let current = fixture();
         let next =
-            transform_saved_http_tab(&current, "middle", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&current, "middle", SavedReplayTabOperation::Close).unwrap();
         assert_eq!(next.replay.active_tab_id.as_deref(), Some("pinned"));
         assert_eq!(next.replay.tab_sequence, 20);
         assert_eq!(
@@ -823,13 +924,16 @@ mod saved_http_tab_tests {
         for (selected, expected) in [("first", "pinned"), ("last", "first"), ("pinned", "middle")] {
             let mut selected_state = current.clone();
             selected_state.replay.active_tab_id = Some(selected.into());
-            let closed =
-                transform_saved_http_tab(&selected_state, selected, SavedHttpTabOperation::Close)
-                    .unwrap();
+            let closed = transform_saved_replay_tab(
+                &selected_state,
+                selected,
+                SavedReplayTabOperation::Close,
+            )
+            .unwrap();
             assert_eq!(closed.replay.active_tab_id.as_deref(), Some(expected));
         }
         let nonselected =
-            transform_saved_http_tab(&current, "last", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&current, "last", SavedReplayTabOperation::Close).unwrap();
         assert_eq!(
             nonselected.replay.active_tab_id,
             current.replay.active_tab_id
@@ -837,13 +941,13 @@ mod saved_http_tab_tests {
         let mut single = current.clone();
         single.replay.tabs.retain(|tab| tab.id == "middle");
         let empty =
-            transform_saved_http_tab(&single, "middle", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&single, "middle", SavedReplayTabOperation::Close).unwrap();
         assert!(empty.replay.tabs.is_empty());
         assert!(empty.replay.active_tab_id.is_none());
         assert_eq!(empty.replay.tab_sequence, 20);
         single.replay.tab_sequence = 0;
         let empty =
-            transform_saved_http_tab(&single, "middle", SavedHttpTabOperation::Close).unwrap();
+            transform_saved_replay_tab(&single, "middle", SavedReplayTabOperation::Close).unwrap();
         assert_eq!(empty.replay.tab_sequence, 5);
     }
 
@@ -851,7 +955,8 @@ mod saved_http_tab_tests {
     fn saved_http_duplicate_keeps_raw_saved_state_and_focus_with_fresh_unpinned_identity() {
         let current = fixture();
         let next =
-            transform_saved_http_tab(&current, "middle", SavedHttpTabOperation::Duplicate).unwrap();
+            transform_saved_replay_tab(&current, "middle", SavedReplayTabOperation::Duplicate)
+                .unwrap();
         assert_eq!(next.replay.active_tab_id, current.replay.active_tab_id);
         assert_eq!(next.replay.tab_sequence, 21);
         let mut duplicate = next.replay.tabs.last().unwrap().clone();
@@ -877,7 +982,7 @@ mod saved_http_tab_tests {
         let mut behind = current.clone();
         behind.replay.tab_sequence = 0;
         assert_eq!(
-            transform_saved_http_tab(&behind, "middle", SavedHttpTabOperation::Duplicate)
+            transform_saved_replay_tab(&behind, "middle", SavedReplayTabOperation::Duplicate)
                 .unwrap()
                 .replay
                 .tab_sequence,
@@ -886,17 +991,190 @@ mod saved_http_tab_tests {
     }
 
     #[test]
+    fn saved_metadata_transforms_preserve_durable_state_and_all_completeness_combinations() {
+        let mut source = value(&fixture());
+        let tab = &mut source["replay"]["tabs"][1];
+        tab["base_request"] = json!({
+            "scheme":"https", "host":"example.com", "method":"GET", "path":"/saved",
+            "headers":[{"name":"X-Synthetic", "value":"exact whitespace  "}]
+        });
+        tab["response_record"] = json!({
+            "id":"22222222-2222-4222-8222-222222222222", "started_at":"2026-01-01T00:00:00Z",
+            "method":"GET", "scheme":"https", "host":"example.com", "path":"/saved",
+            "status":204, "request":{}, "response":{"body_preview":"saved response"},
+            "user_note":"保存", "annotation_revision":4
+        });
+        tab["history_entries"][0]["request"] = tab["base_request"].clone();
+        tab["history_entries"][0]["response_record"] = tab["response_record"].clone();
+        tab["ws_editor_text"] = json!("AAEC");
+        tab["ws_editor_body_encoded"] = json!(true);
+        tab["ws_setup_queue"] = json!([{
+            "kind":"binary", "body":"AAEC", "bodyEncoded":true,
+            "extra_saved_metadata":{"label":"retained"}
+        }]);
+        tab["ws_frames"] = json!([{
+            "index":7, "captured_at":"2026-01-01T00:00:00Z", "direction":"server_to_client",
+            "kind":"binary", "body":"", "body_encoding":"base64", "body_size":8,
+            "preview_truncated":true
+        }]);
+        tab["ws_frames_truncated"] = json!(true);
+        tab["ws_selected_frame_index"] = json!(7);
+        tab["ws_frame_window_start"] = json!(7);
+        source["replay"]["tabs"][0]["history_entries_complete"] = json!(false);
+
+        for kind in ["", "http", "websocket"] {
+            // Base three covers independent None/false/true values, including
+            // mixed completeness, rather than only all-clear or all-complete.
+            for combination in 0..3usize.pow(COMPLETENESS_FIELDS.len() as u32) {
+                let mut input = source.clone();
+                input["replay"]["tabs"][1]["type"] = json!(kind);
+                let mut digits = combination;
+                let flags = std::array::from_fn::<_, 4, _>(|_| {
+                    let flag = [None, Some(false), Some(true)][digits % 3];
+                    digits /= 3;
+                    flag
+                });
+                for (field, flag) in COMPLETENESS_FIELDS.iter().zip(flags) {
+                    input["replay"]["tabs"][1][*field] = json!(flag);
+                }
+                let current: WorkspaceStateSnapshot = serde_json::from_value(input).unwrap();
+                assert_eq!(completeness_flags(&current.replay.tabs[1]), flags);
+                let durable = value(&current);
+                let reloaded: WorkspaceStateSnapshot =
+                    serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+                assert_eq!(value(&reloaded), durable, "kind={kind:?}, flags={flags:?}");
+                for (index, tab) in reloaded.replay.tabs.iter().enumerate() {
+                    // Completeness belongs to an incoming update, not the saved
+                    // projection. A reload must not resurrect those hints.
+                    assert_eq!(completeness_flags(tab), [None; 4]);
+                    for field in COMPLETENESS_FIELDS {
+                        assert!(durable["replay"]["tabs"][index].get(field).is_none());
+                    }
+                }
+                for operation in [
+                    SavedReplayTabOperation::SetLabel("Saved é".into()),
+                    SavedReplayTabOperation::SetLabel(String::new()),
+                    SavedReplayTabOperation::SetPinned(false),
+                    SavedReplayTabOperation::SetPinned(true),
+                ] {
+                    let mut expected = durable.clone();
+                    match &operation {
+                        SavedReplayTabOperation::SetLabel(label) => {
+                            expected["replay"]["tabs"][1]["custom_label"] = json!(label);
+                        }
+                        SavedReplayTabOperation::SetPinned(pinned) if kind != "websocket" => {
+                            expected["replay"]["tabs"][1]["pinned"] = json!(pinned);
+                        }
+                        _ => continue,
+                    }
+                    let next =
+                        transform_saved_replay_tab(&current, "middle", operation.clone()).unwrap();
+                    let repeated =
+                        transform_saved_replay_tab(&next, "middle", operation.clone()).unwrap();
+                    for transformed in [&next, &repeated] {
+                        assert_eq!(
+                            value(transformed),
+                            expected,
+                            "kind={kind:?}, flags={flags:?}, operation={operation:?}"
+                        );
+                        for (actual, original) in
+                            transformed.replay.tabs.iter().zip(&current.replay.tabs)
+                        {
+                            assert_eq!(completeness_flags(actual), completeness_flags(original));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_workspace_legacy_aliases_and_null_optionals_keep_the_canonical_projection() {
+        let omitted = json!({
+            "repeater": {"tabs":[{"id":"legacy", "history_entries":[{"request_text":"draft"}]}]},
+            "intruder": {"request_text":"unrelated draft"}
+        });
+        let mut explicit_null = omitted.clone();
+        for field in ["session_id", "expected_active_session_id", "client_id"] {
+            explicit_null[field] = Value::Null;
+        }
+        explicit_null["repeater"]["active_tab_id"] = Value::Null;
+        for field in [
+            "base_request",
+            "source_transaction_id",
+            "response_record",
+            "history_index",
+            "ws_port",
+            "ws_selected_frame_index",
+            "ws_frame_window_start",
+        ]
+        .into_iter()
+        .chain(COMPLETENESS_FIELDS)
+        {
+            explicit_null["repeater"]["tabs"][0][field] = Value::Null;
+        }
+        for field in ["request", "response_record"] {
+            explicit_null["repeater"]["tabs"][0]["history_entries"][0][field] = Value::Null;
+        }
+        for field in [
+            "base_request",
+            "source_transaction_id",
+            "target",
+            "target_request_authority",
+            "attack_record_id",
+            "attack_record",
+        ] {
+            explicit_null["intruder"][field] = Value::Null;
+        }
+        let omitted: WorkspaceStateSnapshot = serde_json::from_value(omitted).unwrap();
+        let explicit_null: WorkspaceStateSnapshot = serde_json::from_value(explicit_null).unwrap();
+        let canonical = value(&omitted);
+        assert_eq!(value(&explicit_null), canonical);
+        assert!(canonical.get("repeater").is_none());
+        assert!(canonical.get("intruder").is_none());
+        assert_eq!(canonical["replay"]["tabs"][0]["id"], "legacy");
+        assert_eq!(canonical["replay"]["tabs"][0]["type"], "");
+        assert_eq!(canonical["fuzzer"]["request_text"], "unrelated draft");
+        assert!(canonical["replay"]["tabs"][0]["history_entries"][0]
+            .get("request")
+            .is_none());
+        assert_eq!(completeness_flags(&explicit_null.replay.tabs[0]), [None; 4]);
+        let reloaded: WorkspaceStateSnapshot = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(value(&reloaded), canonical);
+    }
+
+    #[test]
+    fn saved_label_transform_rejects_missing_or_unknown_tabs() {
+        let mut current = fixture();
+        current.replay.tabs[1].tab_type = "unknown".into();
+        assert!(transform_saved_replay_tab(
+            &current,
+            "middle",
+            SavedReplayTabOperation::SetLabel("name".into())
+        )
+        .is_err());
+        assert!(transform_saved_replay_tab(
+            &current,
+            "missing",
+            SavedReplayTabOperation::SetLabel("name".into())
+        )
+        .is_err());
+    }
+
+    #[test]
     fn saved_http_transform_rejects_missing_wrong_kind_cap_and_sequence_overflow() {
         let current = fixture();
         for operation in [
-            SavedHttpTabOperation::Close,
-            SavedHttpTabOperation::Duplicate,
+            SavedReplayTabOperation::Close,
+            SavedReplayTabOperation::Duplicate,
+            SavedReplayTabOperation::SetPinned(true),
+            SavedReplayTabOperation::SetPinned(false),
         ] {
-            assert!(transform_saved_http_tab(&current, " middle ", operation).is_err());
+            assert!(transform_saved_replay_tab(&current, " middle ", operation.clone()).is_err());
             for kind in ["websocket", "unknown", "HTTP"] {
                 let mut wrong = current.clone();
                 wrong.replay.tabs[1].tab_type = kind.into();
-                assert!(transform_saved_http_tab(&wrong, "middle", operation).is_err());
+                assert!(transform_saved_replay_tab(&wrong, "middle", operation.clone()).is_err());
             }
         }
         let mut full = current.clone();
@@ -904,23 +1182,24 @@ mod saved_http_tab_tests {
             .tabs
             .resize(MAX_WORKSPACE_REPLAY_TABS, current.replay.tabs[0].clone());
         assert!(
-            transform_saved_http_tab(&full, "middle", SavedHttpTabOperation::Duplicate).is_err()
+            transform_saved_replay_tab(&full, "middle", SavedReplayTabOperation::Duplicate)
+                .is_err()
         );
         for sequence in [usize::MAX, usize::MAX - 1] {
             let mut exhausted = current.clone();
             exhausted.replay.tab_sequence = sequence;
-            assert!(transform_saved_http_tab(
+            assert!(transform_saved_replay_tab(
                 &exhausted,
                 "middle",
-                SavedHttpTabOperation::Duplicate
+                SavedReplayTabOperation::Duplicate
             )
             .is_err());
             exhausted.replay.tab_sequence = 0;
             exhausted.replay.tabs[0].sequence = sequence;
-            assert!(transform_saved_http_tab(
+            assert!(transform_saved_replay_tab(
                 &exhausted,
                 "middle",
-                SavedHttpTabOperation::Duplicate
+                SavedReplayTabOperation::Duplicate
             )
             .is_err());
         }
@@ -934,7 +1213,9 @@ mod saved_http_tab_tests {
         let committed = store
             .transform_snapshot_checked_persisting(
                 8,
-                |current| transform_saved_http_tab(current, "middle", SavedHttpTabOperation::Close),
+                |current| {
+                    transform_saved_replay_tab(current, "middle", SavedReplayTabOperation::Close)
+                },
                 |_| async { Ok::<_, String>(None) },
             )
             .await
@@ -966,33 +1247,46 @@ mod saved_http_tab_tests {
 
     #[tokio::test]
     async fn saved_http_failed_persistence_is_not_published_but_postrename_uncertainty_is() {
-        let current = fixture();
-        let store = WorkspaceStateStore::from_snapshot(current.clone());
-        let mut events = store.subscribe();
-        let failure = store
-            .transform_snapshot_checked_persisting(
-                8,
-                |current| transform_saved_http_tab(current, "middle", SavedHttpTabOperation::Close),
-                |_| async { Err::<Option<String>, _>("before rename".into()) },
-            )
-            .await;
-        assert!(matches!(failure, Err(WorkspaceTransformError::Persist(_))));
-        assert_eq!(value(&store.snapshot().await), value(&current));
-        assert!(events.try_recv().is_err());
-        let uncertainty = store
-            .transform_snapshot_checked_persisting(
-                8,
-                |current| transform_saved_http_tab(current, "middle", SavedHttpTabOperation::Close),
-                |_| async { Ok::<_, String>(Some("directory sync failed after rename".into())) },
-            )
-            .await;
-        assert!(matches!(
-            uncertainty,
-            Err(WorkspaceTransformError::CommittedButUncertain(_))
-        ));
-        assert_eq!(store.snapshot().await.revision, 9);
-        assert!(store.snapshot().await.client_id.is_none());
-        assert_eq!(events.try_recv().unwrap().revision, 9);
+        for operation in [
+            SavedReplayTabOperation::Close,
+            SavedReplayTabOperation::SetPinned(false),
+            SavedReplayTabOperation::SetLabel("saved name".into()),
+        ] {
+            let current = fixture();
+            let store = WorkspaceStateStore::from_snapshot(current.clone());
+            let mut events = store.subscribe();
+            let failure = store
+                .transform_snapshot_checked_persisting(
+                    8,
+                    |current| transform_saved_replay_tab(current, "middle", operation.clone()),
+                    |_| async { Err::<Option<String>, _>("before rename".into()) },
+                )
+                .await;
+            assert!(matches!(failure, Err(WorkspaceTransformError::Persist(_))));
+            assert_eq!(value(&store.snapshot().await), value(&current));
+            assert!(events.try_recv().is_err());
+            let uncertainty = store
+                .transform_snapshot_checked_persisting(
+                    8,
+                    |current| transform_saved_replay_tab(current, "middle", operation.clone()),
+                    |_| async {
+                        Ok::<_, String>(Some("directory sync failed after rename".into()))
+                    },
+                )
+                .await;
+            assert!(matches!(
+                uncertainty,
+                Err(WorkspaceTransformError::CommittedButUncertain(_))
+            ));
+            let mut expected = transform_saved_replay_tab(&current, "middle", operation).unwrap();
+            expected.revision = 9;
+            expected.client_id = None;
+            expected.client_version = 0;
+            assert_eq!(value(&store.snapshot().await), value(&expected));
+            assert_eq!(store.snapshot().await.revision, 9);
+            assert!(store.snapshot().await.client_id.is_none());
+            assert_eq!(events.try_recv().unwrap().revision, 9);
+        }
     }
 
     #[tokio::test]

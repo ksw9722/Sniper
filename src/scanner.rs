@@ -332,7 +332,7 @@ impl ScannerStore {
         }
     }
 
-    /// Push a finding, deduplicating by transaction+host+path+category+title.
+    /// Push a finding unless the same issue is already listed (see `finding_scope`).
     pub async fn push(&self, finding: ScannerFinding) -> bool {
         self.push_inner(finding, None).await
     }
@@ -395,7 +395,10 @@ impl ScannerStore {
         let mut seen = self.seen.write().await;
         entries.clear();
         seen.clear();
-        for finding in findings.into_iter().take(self.max_entries) {
+        for finding in distinct_findings(findings)
+            .into_iter()
+            .take(self.max_entries)
+        {
             seen.insert(finding_dedup_key(&finding));
             entries.push_back(finding);
         }
@@ -428,7 +431,10 @@ impl ScannerStore {
         config: ScannerConfig,
     ) -> Self {
         let (events, _) = broadcast::channel(max_entries.clamp(64, MAX_SCANNER_BROADCAST_CAPACITY));
-        let findings: Vec<_> = findings.into_iter().take(max_entries).collect();
+        let findings: Vec<_> = distinct_findings(findings)
+            .into_iter()
+            .take(max_entries)
+            .collect();
         let seen = findings.iter().map(finding_dedup_key).collect();
         Self {
             max_entries,
@@ -453,23 +459,76 @@ impl ScannerStore {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FindingDedupKey {
-    record_id: Uuid,
     host: String,
-    path: String,
     rule_id: String,
     category: String,
     title: String,
+    scope: String,
 }
 
 fn finding_dedup_key(finding: &ScannerFinding) -> FindingDedupKey {
     FindingDedupKey {
-        record_id: finding.record_id,
-        host: finding.host.clone(),
-        path: finding.path.clone(),
+        host: finding.host.to_ascii_lowercase(),
         rule_id: finding.rule_id.clone(),
         category: finding.category.clone(),
         title: finding.title.clone(),
+        scope: finding_scope(finding),
     }
+}
+
+/// One finding per issue, not per request. A missing header or a cookie's
+/// flags belong to the host; an open redirect, an error page, an exposed
+/// document or endpoint, or a caching policy to one endpoint, with ID segments
+/// grouped as the map groups them; a secret, a token, an address, a version
+/// banner, a CORS policy or a comment to its own value. Each request used to
+/// add a finding, on every path the host served.
+fn finding_scope(finding: &ScannerFinding) -> String {
+    let endpoint = || {
+        let path = finding.path.split(['?', '#']).next().unwrap_or("");
+        crate::service_map::path_group(path).unwrap_or_else(|| path.to_string())
+    };
+    if !finding.rule_id.is_empty() {
+        return finding.evidence.clone();
+    }
+    match (finding.category.as_str(), finding.title.as_str()) {
+        ("disclosure" | "jwt", _) | ("info", "Email address in response") => {
+            finding.evidence.clone()
+        }
+        // A host may run more than one stack, one behind each path; a CORS
+        // policy may trust more than one origin, and a site may leave more
+        // than one comment.
+        ("server", title) if title.ends_with("version disclosure") => finding.evidence.clone(),
+        ("cors", _) => finding.evidence.clone(),
+        ("info", title) if title.starts_with("HTML comment") => finding.evidence.clone(),
+        // A SQL error or a stack trace on `/search` and on `/login` are two leads.
+        ("error", _) => endpoint(),
+        ("auth", "Possible open redirect") => endpoint(),
+        ("misconfig", title) if title.contains("Cache-Control") => endpoint(),
+        ("info", title) if ENDPOINT_INFO_TITLES.contains(&title) => endpoint(),
+        // A page the map names as exposed carries no evidence; one named from
+        // a header or a cookie is on every answer of the host.
+        ("info", title) if title.ends_with(" exposed") && finding.evidence.is_empty() => endpoint(),
+        _ => String::new(),
+    }
+}
+
+/// Information findings an endpoint gives away by answering, not the host.
+const ENDPOINT_INFO_TITLES: &[&str] = &[
+    "Directory listing enabled",
+    "Git commit metadata exposed",
+    "GraphQL introspection enabled",
+    "Swagger/OpenAPI spec exposed",
+    "WSDL service definition exposed",
+];
+
+/// Keeps the first of each issue, newest first, as a store built before
+/// findings were grouped by issue may hold one per request.
+fn distinct_findings(findings: Vec<ScannerFinding>) -> Vec<ScannerFinding> {
+    let mut seen = HashSet::new();
+    findings
+        .into_iter()
+        .filter(|finding| seen.insert(finding_dedup_key(finding)))
+        .collect()
 }
 
 // ── Scanner engine ──
@@ -544,6 +603,7 @@ pub fn scan_transaction(record: &TransactionRecord, config: &ScannerConfig) -> V
     }
     if config.is_rule_enabled("info") {
         check_info_disclosure(record, &mut findings);
+        check_exposures(record, &mut findings);
     }
     if config.is_rule_enabled("auth") {
         check_auth_issues(record, &mut findings);
@@ -993,11 +1053,14 @@ fn looks_like_jwt(value: &str) -> bool {
     if parts.len() != 3 {
         return false;
     }
-    // Each part should be valid base64url
+    // Each part should be valid base64url, and the first a JOSE header: any
+    // three dotted words passed before, so a BIG-IP cookie
+    // (`1677787402.20480.0000`) read as a session token.
     parts[0..2].iter().all(|part| is_non_empty_base64url(part))
         && parts[2]
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=')
+        && decode_jwt_part(parts[0]).is_some_and(|header| jwt_alg_from_header(&header).is_some())
 }
 
 fn normalize_jwt_token_candidate(value: &str) -> String {
@@ -1141,7 +1204,24 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
             .map(|h| h.value.as_str())
     };
 
-    if should_check_hsts(record)
+    // Only documents a browser navigates to or frames: browsers act on these
+    // headers there, not on the scripts, images, API answers and fragments a
+    // page loads. Checking every HTTPS answer for HSTS listed every CDN, API
+    // and tracker host the pages used.
+    let document = match crate::service_map::request_kind(record) {
+        "navigation" | "frame" => true,
+        // Neither Sec-Fetch-Dest nor a type to go by.
+        "other" => is_html_page_response(response),
+        _ => false,
+    };
+    if !document {
+        return;
+    }
+
+    // Redirects too: an apex that only redirects to `www` still needs HSTS, or
+    // the first visit to it can be downgraded.
+    if record.scheme.eq_ignore_ascii_case("https")
+        && matches!(record.status, Some(200..=399))
         && !header_value("strict-transport-security").is_some_and(valid_hsts_header_value)
     {
         findings.push(make_finding(
@@ -1154,8 +1234,7 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
         ));
     }
 
-    // Only check successful HTML document responses. Error pages and fallback
-    // HTML snippets create noisy checklist findings in passive capture.
+    // Error pages and fallback HTML snippets create noisy checklist findings.
     if !is_success_html_page_response(record, response) {
         return;
     }
@@ -1254,10 +1333,6 @@ fn is_success_html_page_response(
     matches!(record.status, Some(200..=299)) && is_html_page_response(response)
 }
 
-fn should_check_hsts(record: &TransactionRecord) -> bool {
-    record.scheme.eq_ignore_ascii_case("https") && matches!(record.status, Some(200..=399))
-}
-
 // ── Rule 3: Cookie Flags ──
 
 fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -1279,6 +1354,15 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
             continue;
         };
         if !cookie_requires_security_flags(cookie_name, cookie_value) {
+            continue;
+        }
+        // An ad or analytics service's own cookie, named by the map's cookie
+        // rules (`everest_session_v2` is Adobe Advertising's), is read by its
+        // script on purpose; it is not the target's session.
+        if crate::service_map_servers::detect_header("set-cookie", &header.value)
+            .iter()
+            .any(|detection| detection.category == crate::service_map_libraries::ANALYTICS)
+        {
             continue;
         }
         let attributes = cookie_attribute_names(&header.value);
@@ -1394,6 +1478,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
     if body.is_empty() {
         return;
     }
+    let script = javascript_or_css_response(record, response);
 
     static PATTERNS: &[(&str, &str, Severity)] = &[
         // ── Cloud provider secrets ──
@@ -1526,8 +1611,10 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
             "API Key/Secret pattern",
             Severity::Medium,
         ),
+        // Only with key material after the header, as the map reads it: a PEM
+        // parser in a script carries the bare header as a constant.
         (
-            r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+            r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----(?:\\[rn]|\s)*[A-Za-z0-9+/]{40}",
             "Private Key",
             Severity::High,
         ),
@@ -1679,7 +1766,7 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                     continue;
                 };
                 if label == "Password in response"
-                    && !password_candidate_looks_like_secret(&captures)
+                    && !password_candidate_looks_like_secret(&captures, script)
                 {
                     continue;
                 }
@@ -1688,15 +1775,27 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                 {
                     continue;
                 }
+                // A script's sixteen digits are an ID or a test number.
                 if is_card_number_label(label)
-                    && (!luhn_valid(m.as_str())
+                    && (script
+                        || !luhn_valid(m.as_str())
                         || card_number_is_known_test(m.as_str())
-                        || !card_number_match_has_payment_context(body, &m))
+                        || !card_number_match_has_payment_context(body, &m)
+                        // The head of a UUID: `41234567-1234-1234-…`.
+                        || body[m.end()..].starts_with('-')
+                        || body[..m.start()].ends_with('-'))
                 {
                     continue;
                 }
                 if is_database_connection_label(label)
                     && !database_connection_string_has_credentials(m.as_str())
+                {
+                    continue;
+                }
+                // A real token mixes cases and digits; a run of letters after
+                // `EAA` is a minified identifier or part of a blob.
+                if label == "Facebook Page Access Token"
+                    && !token_mixes_cases_and_digits(m.as_str())
                 {
                     continue;
                 }
@@ -1844,11 +1943,55 @@ fn captured_secret_value<'a>(captures: &regex::Captures<'a>) -> Option<&'a str> 
         .find(|value| !value.is_empty())
 }
 
-fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>) -> bool {
+fn token_mixes_cases_and_digits(token: &str) -> bool {
+    let body = token.get(4..).unwrap_or("");
+    body.bytes().filter(u8::is_ascii_digit).count() >= 4
+        && body.bytes().any(|byte| byte.is_ascii_uppercase())
+        && body.bytes().any(|byte| byte.is_ascii_lowercase())
+}
+
+fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>, script: bool) -> bool {
     let Some(value) = captured_secret_value(captures) else {
         return false;
     };
     if value.len() < 8 {
+        return false;
+    }
+    // Code, not a value: in a script anything unquoted (`e.password,text:…`);
+    // anywhere an unquoted flag, comparison or call (`!0`, `==e.type`, `f(x)`),
+    // or a quote closing a string before a concatenation (`"pw: "+e.pw`).
+    let quoted = captures.get(1).or(captures.get(2)).is_some();
+    if value.starts_with('+')
+        || (!quoted && (script || value.starts_with(['!', '=']) || value.contains('(')))
+    {
+        return false;
+    }
+    // A label shown to users: words with spaces, or another script's letters
+    // ("비밀번호"); a template variable (`%pass%`, `{{pass}}`, `${pass}`), a
+    // selector (`[name=pw]`), a regex, a path or a URL; and a value naming the
+    // field (`user_password`, the autocomplete token `new-password`).
+    let lower = value.to_ascii_lowercase();
+    let wrapped = |open: &str, close: &str| value.starts_with(open) && value.ends_with(close);
+    if value.contains(char::is_whitespace)
+        || value.chars().any(|ch| ch.is_alphabetic() && !ch.is_ascii())
+        || wrapped("%", "%")
+        || wrapped("{{", "}}")
+        || wrapped("${", "}")
+        || wrapped("<", ">")
+        || wrapped("[", "]")
+        || value.starts_with('/')
+        || value.contains("://")
+        || lower.contains("password")
+        || lower.contains("passwd")
+    {
+        return false;
+    }
+    // A script's word is an identifier or a message key, not a password.
+    if script
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '-')
+    {
         return false;
     }
 
@@ -2200,18 +2343,20 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
                 "ACAO: null, ACAC: true",
             ));
         } else if acac.is_some_and(|v| v.eq_ignore_ascii_case("true")) {
-            // Reflect origin with credentials — potentially dangerous
             let req_origin = record.request.header_value("origin").unwrap_or("").trim();
             if !req_origin.is_empty()
                 && origin == req_origin
-                && !origin_matches_request_origin(origin, &record.scheme, &record.host)
+                && !origin_is_same_site(origin, &record.scheme, &record.host)
             {
+                // One answer cannot show reflection: an allowlist answers its
+                // own origins the same way. A site trusting its own hosts is
+                // the usual setup and is left out above.
                 findings.push(make_finding(
                     record,
-                    Severity::Medium,
+                    Severity::Low,
                     "cors",
-                    "CORS: reflected origin with credentials",
-                    format!("Server reflects the request Origin ({origin}) with credentials allowed. If there is no whitelist, any site can read authenticated responses."),
+                    "CORS: another site allowed with credentials",
+                    format!("The response let {origin}, another site, read it with credentials. One answer cannot tell an allowlist from a server that reflects any origin: replay the request with an Origin the server cannot expect, and the finding stands if that origin comes back with credentials allowed."),
                     format!("ACAO: {origin}, ACAC: true"),
                 ));
             }
@@ -2219,22 +2364,73 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
     }
 }
 
-fn origin_matches_request_origin(origin: &str, request_scheme: &str, request_host: &str) -> bool {
-    let Ok(base) = url::Url::parse(&format!("{request_scheme}://{request_host}")) else {
+/// Whether an origin is on the same site as the request, as browsers judge
+/// it for cookies: the same scheme and registrable domain. `www.example.com`
+/// and `api.example.com` are one site; an `http:` page on it is not, since
+/// anyone on the network can write into it.
+fn origin_is_same_site(origin: &str, request_scheme: &str, request_host: &str) -> bool {
+    let parse = |url: &str| {
+        let url = url::Url::parse(url).ok()?;
+        Some((
+            url.scheme().to_string(),
+            url.host_str()?.to_ascii_lowercase(),
+        ))
+    };
+    let (Some((origin_scheme, origin_host)), Some((scheme, host))) = (
+        parse(origin),
+        parse(&format!("{request_scheme}://{request_host}")),
+    ) else {
         return false;
     };
-    let Ok(origin) = url::Url::parse(origin) else {
-        return false;
+    origin_scheme == scheme && site_of(&origin_host) == site_of(&host)
+}
+
+/// A host's registrable domain: its last two labels, or three under a suffix
+/// whose names belong to different owners, a ccTLD's own second level
+/// (`co.kr`, `com.mx`, `co.za`) or an app host that gives each customer a
+/// subdomain (`herokuapp.com`). An address or a single label is its own site.
+// ponytail: a heuristic and a short list, not the public suffix list; a
+// missing shared host reads as one site and hides that host's CORS findings.
+fn site_of(host: &str) -> &str {
+    const COUNTRY_SECOND_LEVELS: &[&str] = &[
+        "com", "net", "org", "edu", "gov", "mil", "co", "ac", "or", "ne", "go", "re", "pe", "gob",
+    ];
+    const SHARED_HOSTS: &[&str] = &[
+        "herokuapp.com",
+        "vercel.app",
+        "netlify.app",
+        "github.io",
+        "gitlab.io",
+        "pages.dev",
+        "workers.dev",
+        "web.app",
+        "firebaseapp.com",
+        "appspot.com",
+        "azurewebsites.net",
+        "cloudfront.net",
+        "onrender.com",
+        "fly.dev",
+        "myshopify.com",
+        "blogspot.com",
+    ];
+    let host = host.trim_end_matches('.');
+    if host.starts_with('[') || host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return host;
+    }
+    // Where the last two labels start, then the last three.
+    let mut starts = host.rmatch_indices('.').map(|(dot, _)| dot + 1).skip(1);
+    let Some(two) = starts.next() else {
+        return host;
     };
-    let Some(base_host) = base.host_str() else {
-        return false;
-    };
-    let Some(origin_host) = origin.host_str() else {
-        return false;
-    };
-    base.scheme().eq_ignore_ascii_case(origin.scheme())
-        && base_host.eq_ignore_ascii_case(origin_host)
-        && base.port_or_known_default() == origin.port_or_known_default()
+    let suffix = &host[two..];
+    let shared = SHARED_HOSTS.contains(&suffix)
+        || suffix
+            .split_once('.')
+            .is_some_and(|(second, top)| top.len() == 2 && COUNTRY_SECOND_LEVELS.contains(&second));
+    if shared {
+        return starts.next().map_or(host, |three| &host[three..]);
+    }
+    suffix
 }
 
 // ── Rule 6: Server / Version Disclosure ──
@@ -2251,8 +2447,7 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
         ("x-aspnet-version", "X-AspNet-Version"),
     ] {
         if let Some(value) = response.header_value(header_name) {
-            // Only flag if it contains version-like info
-            if server_header_value_reveals_stack(value) {
+            if header_discloses_stack_version(header_name, value) {
                 findings.push(make_finding(
                     record,
                     Severity::Info,
@@ -2297,14 +2492,20 @@ fn check_server_disclosure(record: &TransactionRecord, findings: &mut Vec<Scanne
     }
 }
 
-fn server_header_value_reveals_stack(value: &str) -> bool {
-    if value.chars().any(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    value
-        .to_ascii_lowercase()
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|token| matches!(token, "php" | "asp" | "aspnet"))
+/// A dotted version of the target's own stack: `nginx/1.25.3`, `PHP/8.2.12`,
+/// `4.0.30319`. Any digit used to count, so a CDN node (`BunnyCDN-KR1-1192`),
+/// a build hash (`Fly/42494bfe9c`) or `AmazonS3` read as a version, and a bare
+/// `PHP` as one. A banner the map names as an edge, a gateway or a host is
+/// theirs, not the target's stack.
+fn header_discloses_stack_version(header_name: &str, value: &str) -> bool {
+    use crate::service_map_servers::{EDGE, GATEWAY, PLATFORM};
+    let dotted = value.as_bytes().windows(3).any(|window| {
+        window[0].is_ascii_digit() && window[1] == b'.' && window[2].is_ascii_digit()
+    });
+    dotted
+        && !crate::service_map_servers::detect_header(header_name, value)
+            .iter()
+            .any(|detection| [EDGE, GATEWAY, PLATFORM].contains(&detection.category))
 }
 
 // ── Rule 7: Error Messages ──
@@ -2764,8 +2965,13 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
         }
     }
 
-    // Cache-Control missing on authenticated responses
-    let has_auth = has_authenticated_cache_context(record, response);
+    // Cache-Control missing on authenticated responses. Browsers send cookies
+    // with every image, style and script too, whose public caching is right.
+    let has_auth = has_authenticated_cache_context(record, response)
+        && !matches!(
+            crate::service_map::request_kind(record),
+            "script" | "static"
+        );
     if has_auth && !has_header("cache-control") {
         findings.push(make_finding(
             record,
@@ -3355,6 +3561,98 @@ fn sensitive_html_comment_keyword(comment_lower: &str) -> Option<&'static str> {
         })
 }
 
+// ── Exposures the Service Map names ──
+
+/// What the map names as exposed (`service_map_servers`) that no rule above
+/// reads: a management or debug endpoint answering, a configuration file
+/// served, a backend address in a load balancer's cookie or in a header. Error
+/// pages, stack traces, SQL errors, source maps and secrets are the rules above.
+fn check_exposures(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
+    let Some(response) = &record.response else {
+        return;
+    };
+    let mut push = |detection: &crate::service_map_libraries::Detection, evidence: String| {
+        let Some(severity) = map_exposure_severity(&detection.product_id) else {
+            return;
+        };
+        let title = if detection.product_id == "backend_address" {
+            detection.name.clone()
+        } else {
+            format!("{} exposed", detection.name)
+        };
+        if findings.iter().any(|finding| finding.title == title) {
+            return;
+        }
+        let detail = if evidence.is_empty() {
+            format!("Found {} at this path. It shows how the server is run or configured, and should not be reachable from outside.", detection.name)
+        } else {
+            format!("{evidence} gives away the name or address of a server behind the one that answered.")
+        };
+        findings.push(make_finding(
+            record, severity, "info", title, detail, evidence,
+        ));
+    };
+    // A management page or a configuration file is text, never a script.
+    if !response.body_preview.is_empty()
+        && !is_binary_body(response)
+        && !javascript_or_css_response(record, response)
+    {
+        let html = is_html_page_response(response);
+        // These pages say what they are at the top, and this runs on every
+        // captured response: the rules' long bounded gaps cost time on
+        // megabytes of text.
+        let body = &response.body_preview;
+        let head = &body[..previous_char_boundary(body, body.len().min(EXPOSURE_BODY_BYTES))];
+        for detection in crate::service_map_servers::detect_body(head) {
+            // A page about a project quotes these files in its code blocks; the
+            // files themselves are served as text.
+            if html && matches!(detection.product_id.as_str(), "git_config" | "dotenv") {
+                continue;
+            }
+            push(&detection, String::new());
+        }
+    }
+    for header in &response.headers {
+        let name = header.name.to_ascii_lowercase();
+        // The server rule reports this header with its value.
+        if name == "x-backend-server" {
+            continue;
+        }
+        for detection in crate::service_map_servers::detect_header(&name, &header.value) {
+            // Only the cookie's or the header's name: the map never reports the
+            // address or the host either.
+            let evidence = match name.as_str() {
+                "set-cookie" => format!(
+                    "Set-Cookie: {}",
+                    header.value.split(['=', ';']).next().unwrap_or("").trim()
+                ),
+                _ => header.name.clone(),
+            };
+            push(&detection, evidence);
+        }
+    }
+}
+
+const EXPOSURE_BODY_BYTES: usize = 64 * 1024;
+
+/// The map's exposures this rule reports, by how much each gives away.
+fn map_exposure_severity(product_id: &str) -> Option<Severity> {
+    Some(match product_id {
+        "git_config" | "dotenv" | "h2_console" | "jolokia" => Severity::High,
+        "spring_actuator"
+        | "phpinfo"
+        | "go_pprof"
+        | "go_expvar"
+        | "apache_server_status"
+        | "apache_server_info"
+        | "elasticsearch_root"
+        | "backend_address"
+        | "backend_host_header" => Severity::Medium,
+        "nginx_status" | "prometheus_metrics" | "graphql_ide" => Severity::Low,
+        _ => return None,
+    })
+}
+
 // ── Rule 10: Authentication Issues ──
 
 fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
@@ -3608,6 +3906,11 @@ fn session_token_value_looks_sensitive(name: &str, value: &str) -> bool {
     if name == "api_key" && session_api_key_value_is_public_identifier(trimmed) {
         return false;
     }
+    // A short number is a timestamp or a counter: analytics beacons send their
+    // session start as `sid=1760000000`.
+    if trimmed.len() < 16 && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
     !trimmed.is_empty()
         && !secret_candidate_is_masked(trimmed)
         && !secret_candidate_is_placeholder(trimmed)
@@ -3836,35 +4139,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scanner_store_deduplicates_by_path_too() {
+    async fn scanner_store_lists_a_host_issue_once_across_paths_and_records() {
         let store = ScannerStore::new(10);
         let mut first = finding("Missing CSP");
         first.path = "/login".to_string();
         let mut second = finding("Missing CSP");
         second.path = "/admin".to_string();
+        let mut other_host = finding("Missing CSP");
+        other_host.host = "api.example.com".to_string();
 
-        store.push(first).await;
-        store.push(second).await;
+        assert!(store.push(first).await);
+        assert!(!store.push(second).await);
+        assert!(store.push(other_host).await);
 
         let findings = store.list(None).await;
         assert_eq!(findings.len(), 2);
-        assert!(findings.iter().any(|finding| finding.path == "/login"));
-        assert!(findings.iter().any(|finding| finding.path == "/admin"));
     }
 
     #[tokio::test]
-    async fn scanner_store_keeps_same_path_findings_for_distinct_records() {
+    async fn scanner_store_lists_endpoint_issues_per_path_group_and_values_per_value() {
         let store = ScannerStore::new(10);
-        let first = finding("Missing CSP");
-        let mut second = first.clone();
-        second.id = Uuid::new_v4();
-        second.record_id = Uuid::new_v4();
+        let redirect = |path: &str| {
+            let mut finding = finding("Possible open redirect");
+            finding.category = "auth".to_string();
+            finding.path = path.to_string();
+            finding
+        };
+        let secret = |path: &str, evidence: &str| {
+            let mut finding = finding("AWS Access Key ID");
+            finding.category = "disclosure".to_string();
+            finding.path = path.to_string();
+            finding.evidence = evidence.to_string();
+            finding
+        };
 
-        store.push(first).await;
-        store.push(second).await;
+        assert!(store.push(redirect("/users/1/go?to=a")).await);
+        assert!(!store.push(redirect("/users/2/go?to=b")).await);
+        assert!(store.push(redirect("/login")).await);
+        assert!(store.push(secret("/a.js", "AKIA-one")).await);
+        assert!(!store.push(secret("/b.js", "AKIA-one")).await);
+        assert!(store.push(secret("/a.js", "AKIA-two")).await);
 
+        let error = |path: &str| {
+            let mut finding = finding("SQL error in error response");
+            finding.category = "error".to_string();
+            finding.path = path.to_string();
+            finding
+        };
+        assert!(store.push(error("/search?q='")).await);
+        assert!(!store.push(error("/search?q=%27")).await);
+        assert!(store.push(error("/login")).await);
+        let cors = |origin: &str| {
+            let mut finding = finding("CORS: another site allowed with credentials");
+            finding.category = "cors".to_string();
+            finding.evidence = format!("ACAO: {origin}, ACAC: true");
+            finding
+        };
+        assert!(store.push(cors("https://partner.example")).await);
+        assert!(store.push(cors("https://evil.example")).await);
+
+        assert_eq!(store.list(None).await.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn scanner_store_collapses_findings_restored_one_per_request() {
+        let newest = finding("Missing CSP");
+        let mut older = finding("Missing CSP");
+        older.path = "/other".to_string();
+
+        let store = ScannerStore::from_findings_with_config(
+            10,
+            vec![newest.clone(), older.clone()],
+            Default::default(),
+        );
         let findings = store.list(None).await;
-        assert_eq!(findings.len(), 2);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, newest.id);
+
+        store.replace_all(vec![older.clone(), newest]).await;
+        let findings = store.list(None).await;
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, older.id);
     }
 
     #[tokio::test]
@@ -5058,23 +5413,23 @@ mod tests {
     }
 
     #[test]
-    fn hsts_check_runs_for_non_html_https_redirects() {
-        let mut record = make_record(
-            vec![],
-            vec![("location", "https://example.com/login")],
+    fn hsts_is_checked_on_navigations_and_their_redirects_only() {
+        let mut redirect = make_record(
+            vec![("sec-fetch-dest", "document")],
+            vec![("location", "https://www.example.com/")],
             "",
-            302,
+            301,
         );
-        if let Some(response) = &mut record.response {
+        if let Some(response) = &mut redirect.response {
             response.content_type = None;
         }
-        let findings = scan_transaction(&record, &ScannerConfig::default());
+        let findings = scan_transaction(&redirect, &ScannerConfig::default());
 
         assert!(
             findings
                 .iter()
                 .any(|finding| finding.title == "Missing Strict-Transport-Security"),
-            "HSTS is a host-level HTTPS policy and should be checked on redirects"
+            "an apex that only redirects still needs HSTS"
         );
         assert!(
             !findings
@@ -5082,6 +5437,25 @@ mod tests {
                 .any(|finding| finding.title == "Missing Content-Security-Policy"),
             "page-only header checks should still skip non-HTML redirects"
         );
+
+        let mut script = make_record(vec![("sec-fetch-dest", "script")], vec![], "let a;", 200);
+        if let Some(response) = &mut script.response {
+            response.content_type = Some("application/javascript".into());
+        }
+        let fragment = make_record(
+            vec![("sec-fetch-dest", "empty")],
+            vec![],
+            "<div>row</div>",
+            200,
+        );
+        for record in [script, fragment] {
+            assert!(
+                !scan_transaction(&record, &ScannerConfig::default())
+                    .iter()
+                    .any(|finding| finding.category == "header"),
+                "a script or a fragment a page loads is not a document"
+            );
+        }
     }
 
     #[test]
@@ -5683,43 +6057,51 @@ mod tests {
             .any(|finding| finding.title == "CORS: null origin with credentials"));
     }
 
-    #[test]
-    fn cors_reflected_same_origin_with_credentials_is_ignored() {
+    fn credentialed_cors_finding(origin: &str) -> Option<ScannerFinding> {
         let record = make_record(
-            vec![("origin", "https://example.com")],
+            vec![("origin", origin)],
             vec![
-                ("access-control-allow-origin", "https://example.com"),
+                ("access-control-allow-origin", origin),
                 ("access-control-allow-credentials", "true"),
             ],
             "",
             200,
         );
-        let findings = scan_transaction(&record, &ScannerConfig::default());
-
-        assert!(
-            !findings
-                .iter()
-                .any(|finding| finding.title == "CORS: reflected origin with credentials"),
-            "same-origin reflection should not be reported as arbitrary reflected CORS"
-        );
+        scan_transaction(&record, &ScannerConfig::default())
+            .into_iter()
+            .find(|finding| finding.title == "CORS: another site allowed with credentials")
     }
 
     #[test]
-    fn cors_reflected_cross_origin_with_credentials_is_reported() {
-        let record = make_record(
-            vec![("origin", "https://evil.example")],
-            vec![
-                ("access-control-allow-origin", "https://evil.example"),
-                ("access-control-allow-credentials", "true"),
-            ],
-            "",
-            200,
-        );
-        let findings = scan_transaction(&record, &ScannerConfig::default());
+    fn cors_credentials_for_the_same_site_are_ignored() {
+        for origin in ["https://example.com", "https://app.example.com"] {
+            assert!(
+                credentialed_cors_finding(origin).is_none(),
+                "a site trusting its own hosts is the usual setup: {origin}"
+            );
+        }
+    }
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.title == "CORS: reflected origin with credentials"));
+    #[test]
+    fn cors_credentials_for_another_site_or_an_http_page_are_reported() {
+        for origin in ["https://evil.example", "http://app.example.com"] {
+            let finding = credentialed_cors_finding(origin).expect(origin);
+            assert_eq!(finding.severity, Severity::Low);
+        }
+    }
+
+    #[test]
+    fn site_of_keeps_two_level_suffixes_and_addresses_whole() {
+        assert_eq!(site_of("victim.herokuapp.com"), "victim.herokuapp.com");
+        assert_eq!(site_of("shop.example.com.mx"), "example.com.mx");
+        assert_eq!(site_of("a.example.co.za"), "example.co.za");
+        assert_eq!(site_of("www.example.com"), "example.com");
+        assert_eq!(site_of("example.com."), "example.com");
+        assert_eq!(site_of("a.b.example.co.uk"), "example.co.uk");
+        assert_eq!(site_of("example.co.kr"), "example.co.kr");
+        assert_eq!(site_of("127.0.0.1"), "127.0.0.1");
+        assert_eq!(site_of("[::1]"), "[::1]");
+        assert_eq!(site_of("localhost"), "localhost");
     }
 
     #[test]
@@ -5781,15 +6163,21 @@ mod tests {
     }
 
     #[test]
-    fn server_disclosure_still_reports_php_token_without_version() {
-        let record = make_record(vec![], vec![("x-powered-by", "PHP")], "", 200);
-        let findings = scan_transaction(&record, &ScannerConfig::default());
-
-        assert!(
-            findings
+    fn server_disclosure_needs_a_dotted_version_of_the_targets_own_stack() {
+        let disclosed = |name: &str, value: &str| {
+            let record = make_record(vec![], vec![(name, value)], "", 200);
+            scan_transaction(&record, &ScannerConfig::default())
                 .iter()
-                .any(|finding| finding.title == "X-Powered-By version disclosure"),
-            "explicit PHP stack tokens should still be reported even without a version number"
+                .any(|finding| finding.title.ends_with("version disclosure"))
+        };
+
+        assert!(disclosed("x-powered-by", "PHP/8.2.12"));
+        assert!(disclosed("server", "nginx/1.25.3"));
+        assert!(!disclosed("x-powered-by", "PHP"), "a name is no version");
+        assert!(!disclosed("server", "BunnyCDN-KR1-1192"), "a CDN node id");
+        assert!(
+            !disclosed("server", "awselb/2.0"),
+            "the load balancer's, not the target's"
         );
     }
 
@@ -7034,6 +7422,207 @@ mod tests {
                 .iter()
                 .any(|f| f.title == "Email address in response"),
             "example domains should not create email Findings"
+        );
+    }
+
+    fn titles_for(path: &str, content_type: &str, body: &str) -> Vec<String> {
+        let mut record = make_record(vec![], vec![], body, 200);
+        record.path = path.to_string();
+        if let Some(response) = &mut record.response {
+            response.content_type = Some(content_type.into());
+        }
+        scan_transaction(&record, &ScannerConfig::default())
+            .into_iter()
+            .map(|finding| finding.title)
+            .collect()
+    }
+
+    #[test]
+    fn password_rule_ignores_code_labels_templates_and_field_names() {
+        let password = "Password in response detected in response".to_string();
+        let json = |body: &str| titles_for("/api/user", "application/json", body);
+        let script = |body: &str| titles_for("/static/app.js", "application/javascript", body);
+
+        assert!(json(r#"{"password":"CorrectHorseBattery99"}"#).contains(&password));
+        assert!(script(r#"cfg={password:"Xk29pLm7Qw"}"#).contains(&password));
+        for body in [
+            r#"{"password":"{{user_pw}}"}"#,
+            r#"{"password":"%PW_VALUE%"}"#,
+            r#"{"password":"${DB_PASS}"}"#,
+            r#"{"pwd":"[name=pw1234]"}"#,
+            r#"{"password":"/account/reset"}"#,
+            r#"{"pwd":"https://example.com/reset"}"#,
+            r#"{"password":"Type it here"}"#,
+            r#"{"password":"비밀번호를입력"}"#,
+            r#"{"pwd":"user_password"}"#,
+            r#"{"password":"new-password"}"#,
+        ] {
+            assert!(!json(body).contains(&password), "{body}");
+        }
+        for body in [
+            "a={password:e.password,text:t}",
+            "if(password=!0){}",
+            r#"t.password="ConfirmMsg""#,
+            r#"m="Your password: "+user.pin+"!""#,
+        ] {
+            assert!(!script(body).contains(&password), "{body}");
+        }
+        let page = titles_for(
+            "/",
+            "text/html",
+            r#"<script>if("password"===e.type||x)</script>"#,
+        );
+        assert!(!page.contains(&password), "a comparison in a page's script");
+    }
+
+    #[test]
+    fn card_rule_ignores_uuid_heads_and_scripts() {
+        let visa = |path: &str, content_type: &str, body: &str| {
+            titles_for(path, content_type, body)
+                .iter()
+                .any(|title| title.contains("Possible Visa card number"))
+        };
+
+        assert!(visa(
+            "/pay",
+            "application/json",
+            r#"{"card_number":"4929123456789015"}"#
+        ));
+        assert!(!visa(
+            "/pay",
+            "application/json",
+            r#"{"card_id":"49291234-5678-9015-1234-123456789abc"}"#
+        ));
+        assert!(!visa(
+            "/checkout.js",
+            "application/javascript",
+            r#"var card_number="4929123456789015";"#
+        ));
+    }
+
+    #[test]
+    fn facebook_token_rule_needs_mixed_cases_and_digits() {
+        let token = |tail: &str| {
+            let body = format!(r#"{{"token":"EAAC{}"}}"#, tail.repeat(13));
+            titles_for("/api", "application/json", &body)
+                .iter()
+                .any(|title| title.contains("Facebook Page Access Token"))
+        };
+
+        assert!(token("Ab1cD2eF"));
+        assert!(!token("abcdEFGH"), "a run of letters is a minified name");
+    }
+
+    #[test]
+    fn private_key_rule_needs_key_material_after_the_header() {
+        let header = concat!("-----BEGIN RSA ", "PRIVATE KEY-----");
+        let key = |body: String| {
+            titles_for("/static/app.js", "application/javascript", &body)
+                .iter()
+                .any(|title| title.starts_with("Private Key"))
+        };
+
+        assert!(key(format!("{header}\n{}", "MIIEowIBAAKCAQEA".repeat(4))));
+        assert!(
+            !key(format!(r#"const H="{header}";"#)),
+            "a PEM parser's constant"
+        );
+    }
+
+    #[test]
+    fn session_token_rule_ignores_short_numbers() {
+        let reported = |path: &str| {
+            let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+            record.path = path.to_string();
+            scan_transaction(&record, &ScannerConfig::default())
+                .iter()
+                .any(|finding| finding.title.starts_with("Session/token parameter"))
+        };
+
+        assert!(!reported("/collect?sid=1760000000"), "a session start time");
+        assert!(reported("/collect?sid=Zm9vYmFyYmF6cXV4MTIz"));
+    }
+
+    #[test]
+    fn cache_control_check_skips_what_a_page_loads_with_its_cookies() {
+        let missing = |dest: &str, content_type: &str| {
+            let mut record = make_record(
+                vec![("cookie", "session=abc123"), ("sec-fetch-dest", dest)],
+                vec![],
+                "x",
+                200,
+            );
+            if let Some(response) = &mut record.response {
+                response.content_type = Some(content_type.into());
+            }
+            scan_transaction(&record, &ScannerConfig::default())
+                .iter()
+                .any(|finding| finding.title == "Missing Cache-Control on authenticated response")
+        };
+
+        assert!(missing("empty", "application/json"));
+        assert!(!missing("image", "image/png"));
+        assert!(!missing("script", "application/javascript"));
+    }
+
+    #[test]
+    fn cookie_flags_ignore_an_analytics_service_cookie() {
+        let record = make_record(
+            vec![],
+            vec![("set-cookie", "everest_session_v2=abc123; Path=/")],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+
+        assert!(
+            !findings.iter().any(|finding| finding.category == "cookie"),
+            "the map names this cookie as Adobe Advertising's"
+        );
+    }
+
+    #[test]
+    fn exposures_the_map_names_are_findings() {
+        let git = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n";
+        let found = titles_for("/.git/config", "text/plain", git);
+        assert!(found.contains(&"Git repository config exposed".to_string()));
+        assert!(
+            !titles_for("/docs/setup", "text/html", &format!("<pre>{git}</pre>"))
+                .iter()
+                .any(|title| title == "Git repository config exposed"),
+            "a page quoting the file is not the file"
+        );
+
+        let record = make_record(
+            vec![],
+            vec![
+                ("x-upstream", "app-07.internal"),
+                (
+                    "set-cookie",
+                    "BIGipServerpool_web=1677787402.20480.0000; Path=/",
+                ),
+            ],
+            "",
+            200,
+        );
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+        let finding = |title: &str| {
+            findings
+                .iter()
+                .find(|finding| finding.title == title)
+                .unwrap_or_else(|| panic!("{title}"))
+        };
+        assert_eq!(
+            finding("Backend host header exposed").evidence,
+            "x-upstream"
+        );
+        assert_eq!(
+            finding("Backend address in a BIG-IP cookie").evidence,
+            "Set-Cookie: BIGipServerpool_web"
+        );
+        assert!(
+            !findings.iter().any(|finding| finding.category == "cookie"),
+            "a load balancer's cookie is not a session token"
         );
     }
 }

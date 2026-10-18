@@ -465,7 +465,8 @@ Once decrypted, HTTPS requests appear in history like any other, alongside the
 ## Filtering by scope
 
 Scope is the list of hosts you care about. In the UI it is the **Scope** tab,
-an include list and an exclude list; the **In scope** pill above the HTTP
+an include list and an exclude list beside the captured hosts and paths; the
+**In scope** pill above the HTTP
 history filters the table to it. From the CLI:
 
 ```bash
@@ -540,6 +541,11 @@ invalid replay target: Replay target override is not supported when the request 
 
 An override therefore needs a capture whose `Host:` header is a name.
 
+A request read with `--request-file` or `--stdin` names no scheme of its own, so
+`--scheme` (or the scheme of a URL given to `--host`) becomes its scheme rather
+than an override. Sending such a request to `127.0.0.1` over plain HTTP works as
+long as `--host` and `--port` match its `Host:` header.
+
 `--label` on `replay open` and `replay update` names the tab, the same as
 renaming it in the tab strip. An agent firing several requests can mark what
 each tab tests, and an empty `--label ""` clears the name:
@@ -548,6 +554,12 @@ each tab tests, and an empty `--label ""` clears the name:
 ./target/release/sniper-cli --api http://127.0.0.1:18901 --output compact \
   replay update --tab-id <tab-id> --label "closed orders" --yes
 ```
+
+A label-only `replay update` also works on a saved WebSocket tab. It updates
+only saved label metadata through a revision-checked server transform, preserving
+frames, queued drafts, targets and other tools. Labels collapse whitespace and
+are limited to 80 characters. Combining `--label` with request or target inputs
+still requires an HTTP tab. No request is sent by a label update.
 
 ## Where sessions live on disk
 
@@ -615,7 +627,10 @@ when more than one is running.
 - `sniper-cli` covers the operations in `sniper-cli manifest`. The in-scope
   history toggle, the site map and the Tools tab are not among them.
 - Findings come from a passive scan of traffic that already flowed. Nothing
-  crawls or probes a target on its own.
+  crawls or probes a target on its own. Each issue is listed once — a missing
+  header, a CORS policy or a cookie's flags per host, an exposed endpoint or an
+  open redirect per endpoint, a leaked value per value — and links to the first
+  request that showed it, not to every request that repeats it.
 
 When you are done with the throwaway instance, stop it and delete its directory:
 its capture, its root CA and its session files are all under `SNIPER_DATA_DIR`.

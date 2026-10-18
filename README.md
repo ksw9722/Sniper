@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="web/screenshot.png" width="800" alt="Sniper proxy UI — HTTP capture, replay, fuzzer" />
+  <img src="web/screenshot.png" width="800" alt="Sniper's HTTP history with synthetic example.com traffic: a tagged POST /v1/cart request and its request and response" />
 </p>
 
 <p align="center">
@@ -41,7 +41,18 @@ If you've used an intercepting proxy before, the workflow will be familiar. Snip
 Each installer ships with a `.sha256` beside it; check it with `Get-FileHash` before running,
 since releases are not yet code-signed.
 
-Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or extract a Windows ZIP built by `packaging/windows/make-zip.ps1` and open `sniper-desktop.exe`. Building from source requires the MSVC Rust toolchain. See [Windows setup and packaging](packaging/windows/README.md) for WebView2/runtime prerequisites, HTTPS certificates, CLI usage, and isolated testing. Windows x64 is the first port; Linux validation is still pending.
+Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or extract a Windows ZIP built by `packaging/windows/make-zip.ps1` and open `sniper-desktop.exe`. Building from source requires the MSVC Rust toolchain. See [Windows setup and packaging](packaging/windows/README.md) for WebView2/runtime prerequisites, HTTPS certificates, CLI usage, and isolated testing. Windows x64 is the first Windows target.
+
+### Linux: Debian 13 x86_64 on X11
+
+**Debian 13 (trixie), x86_64, X11 is supported from v0.3.1.** Build from the
+`v0.3.1` tag or use the CI candidate archive or `.deb` of that commit; there are
+**no published Linux release assets yet**.
+
+See [Linux source, CI artifacts and installation](packaging/linux/README.md)
+for the qualification boundary, system GTK 3/WebKitGTK 4.1 requirements,
+checksums and installation instructions. Ubuntu, other distributions or Debian
+versions, ARM, native Wayland and XWayland are outside this support claim.
 
 ### macOS
 
@@ -73,7 +84,8 @@ cargo run --bin sniper-desktop
 | **Fuzzer** | Payload-based request testing with markers |
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
 | **Sessions** | Isolated workspaces — each with its own records, scope, and state |
-| **Scope** | Host and wildcard filtering with site map visualization |
+| **Scope** | Host and wildcard filtering beside the captured hosts and paths |
+| **Map** | A passive retained-history Service Map of the captured origins and their relations, and the APIs they serve |
 | **Themes** | 12 themes — 7 dark + 5 light, gold-accent design language |
 | **CLI** | `sniper-cli` — JSON-first automation for scripting |
 | **AI Skills** | Built-in Claude & Codex skill templates using `sniper-cli` |
@@ -157,9 +169,10 @@ Session → Scope → Capture → Replay → Fuzz
 ```
 
 - **Session** — isolated workspaces with their own records and state
-- **Scope** — define target domains/paths, auto-filter traffic
+- **Scope** — define target domains/paths, auto-filter traffic, and see the captured hosts and paths beside them
+- **Map** — the Service Map of the captured origins, how they relate, and the APIs they serve, from retained history
 - **Capture** — inspect HTTP, render HTML and image responses in a sandbox, intercept & modify, WebSocket frames, auto-replace
-- **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses
+- **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses, and the management endpoints and backend addresses the Service Map names; each issue is listed once per host, endpoint or value
 - **Replay** — resend with modifications, override host/port, render the response
 - **Fuzzer** — insert markers, run payload lists
 - **Tools** — decode/encode/hash/JWT in one place
@@ -212,7 +225,89 @@ chain, and writes them into the page; scripts still never run. Those requests
 go to the target and to any other host the page names, and are not recorded in
 HTTP history.
 
+## Passive Service Map
+
+<p align="center">
+  <img src="web/screenshot-map.png" width="800" alt="The Map tool: the clients, the origins they reached with the servers and libraries each one names, and an API origin's endpoints and bearer JWT in the inspector" />
+</p>
+
+The Map tool's Service Map summarizes origins and method-plus-exact-path endpoints from
+retained capture metadata, with counts, bounded evidence, scope state, header
+clues, and redirect instructions. The UI and `sniper-cli scope service-map` share
+the same read model. No probing, scanning, replay, crawling, or redirect following
+is performed. Always inspect the reported completeness and unavailable fields;
+this is an observed inventory, not a verified infrastructure topology. See the
+[Service Map contract and examples](docs/integrations/service-map.md).
+
+The map has its own display filter, as Burp's site map does: the HTTP history
+filter's conditions (MIME type, status class, hidden extensions and the rest),
+kept apart from History's. By default it hides images, styles and fonts, so a
+page's static CDN and its arrows drop out. `sniper-cli scope service-map` takes
+the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`,
+`--hide-without-responses` and `--only-parameterized`.
+
+Each row's User-Agent names the client that sent it (a browser, an app's
+WebView, an app, a tool, a library or a crawler), and the map's first column
+shows the clients, each with an arrow to the origins where the map starts;
+selecting one draws an arrow to each origin it went to itself. An origin whose
+rows carried no typed response stays off the map unless selected or searched for.
+How requests authenticate (a bearer JWT, Basic, session cookies, API key headers,
+OAuth, OpenID Connect or SAML) is named from headers and URLs, never their values.
+An origin that serves API data opens as API docs from its inspector, laid out
+as Swagger UI lays them out and sent on to Replay a row at a time, and
+`sniper-cli scope service-map openapi` reads the same OpenAPI 3.1 document: path
+templates, parameter and body field names with guessed types, statuses and
+media types, and the credentials sent, never their values. What no rule names
+(a `Server` value, a vendor header or cookie name) is kept for a person or an
+agent to judge; `sniper-cli scope service-map unnamed` lists it across the
+whole map, most widespread first, with the origins, evidence and the products
+named beside each signal.
+
+Origin and Referer links are sorted by request kind (API call, page navigation,
+frame, script, static file), read from `Sec-Fetch-Dest`. The legend toggles each
+kind; frames, scripts and static files draw no arrows by default, and an arrow
+grows heavier with its rows. Each link also counts the responses that let its
+source read them through CORS, with or without credentials. Origins of one site
+share a card by default, and any origin or site can be hidden from the map.
+
+A separate, explicit `sniper-cli target service-map body-references --session-id
+<active-session-uuid> --evidence-id <returned-token>` read can inspect one retained
+UTF-8 HTML/JavaScript response preview. It returns canonical origins and preview
+byte offsets, with truncation and limits; literal references do not prove calls
+or ownership. The session must already be active. Default map/evidence reads
+remain metadata-only apart from scripts and pages, read for the front-end
+frameworks, CMSs and libraries they name and the keys, source maps and private
+addresses they give away, and error and debug responses, read for the servers
+behind an origin and what they expose; they send no target requests. The UI's map
+covers every retained row; the CLI reads the newest `--max-records` rows, or every
+row with `--all-rows`. An endpoint's parameters (query, form and JSON fields, with
+a few values) are read when it is opened.
+
+In the GUI, explicitly inspected body references, Response Link declarations and
+recorded socket-peer groups can coexist in a session-local map collection, with
+up to eight exact-source entries. Typed reference arrows and undirected recorded
+address spokes retain separate provenance and coverage; they do not prove calls
+or common ownership. Show, filters, selection and per-entry removal make no extra
+reads. The collection is never persisted and shares the existing 24-card/40-edge
+limits. Unrelated record events preserve verified body/Link entries; peer groups
+still clear when history changes because unsampled membership cannot be proved
+unchanged. See the
+[collection behavior and lifetime limits](docs/integrations/service-map.md#session-local-retained-relationship-collection-gui-only).
+
+An optional **Upstream socket peer** Capture Settings card records one bounded
+socket observation for eligible future ordinary captured HTTP(S) responses. It
+is Off by default, uses explicit Save/Cancel, and never backfills or probes.
+`capture http upstream-peer get/set --session-id <active-session-uuid>` exposes
+the same active-session settings; set requires `--enabled true|false --yes`.
+An exact evidence read adds it only with `--include-socket-peer`. A socket peer
+may be a proxy, CDN or shared endpoint and does not establish origin ownership.
+Observations persist in session files, exports and full-record JSON; Off does not
+erase them. See [the observed socket peer contract](docs/integrations/observed-socket-peer.md).
+
 ## CLI
+
+For what changed in 0.3.1, see the
+[CLI and saved-workspace maintenance overview](docs/guides/maintenance-0.3.1.md).
 
 `sniper-cli` is already bundled with the macOS app and Windows packages. The
 first desktop launch offers **Add to PATH** or **Later** when registration is
@@ -296,39 +391,87 @@ can also be sensitive. These reads do not add redaction: review the output befor
 sharing it with an agent or saving it to a transcript. No scanner execution,
 configuration, or clear operation is exposed by these commands.
 
+### Existing rule settings and saved tab labels
+
+```bash
+sniper-cli capture intercept-rule update --id <rule-uuid> --path-pattern /saved --dry-run
+sniper-cli capture intercept-rule update --id <rule-uuid> --clear-methods --yes
+sniper-cli capture intercept-rule set-enabled --id <rule-uuid> --enabled false --yes
+sniper-cli call capture.intercept_rule.update --input '{"id":"<rule-uuid>","host_pattern":"","method_filter":[]}' --dry-run
+sniper-cli replay update --tab-id '11111111-1111-4111-8111-111111111111' --label "Saved conversation" --yes
+```
+
+Rule updates patch only supplied fields of an existing rule. Omission preserves
+current values; empty host/path strings and an empty method list clear those
+matchers. `set-enabled` assigns an explicit boolean and never toggles or creates
+a rule. Label-only `replay.update` supports saved HTTP and WebSocket tabs and
+preserves every other saved tab field. Request and target edits remain HTTP-only.
+These writes require `--yes`; `--dry-run` is offline. Prefer an explicit
+`--session-id` to select an inactive session without changing the active session.
+See [saved configuration edits](docs/integrations/saved-configuration-edits.md)
+for partial-update, session, concurrency and failure semantics.
+
 ### Saved HTTP Replay tab housekeeping
 
 ```bash
 sniper-cli replay close --tab-id 'exact-tab-id' --dry-run
 sniper-cli replay close --tab-id 'exact-tab-id' --yes
 sniper-cli replay duplicate --tab-id 'exact-tab-id' --session-id <session-uuid> --yes
+sniper-cli replay set-pinned --tab-id 'exact-tab-id' --pinned true --yes
 sniper-cli call replay.duplicate --input '{"tab_id":"exact-tab-id"}' --dry-run
 sniper-cli schema output replay.close
 ```
 
-`replay.close` and `replay.duplicate` accept only an exact `tab_id` and optional
-`session_id`. IDs are never trimmed or matched by label; blank IDs and IDs over
-128 UTF-8 bytes are rejected. Only saved HTTP tabs (including legacy empty tab
-types) are supported. Both require `--yes`; `--dry-run` is entirely offline and
+`replay.close`, `replay.duplicate`, and `replay.set_pinned` accept an exact
+`tab_id` and optional `session_id`. Set-pinned also requires an explicit boolean
+(`--pinned true` or `--pinned false`; JSON `pinned` for `call`). IDs are never
+trimmed or matched by label; blank IDs and IDs over 128 UTF-8 bytes are rejected. Only saved HTTP tabs (including legacy empty tab
+types) are supported. All require `--yes`; `--dry-run` is entirely offline and
 cannot check whether the tab exists.
 
 Close removes only that tab and its saved replay history. Closing the active tab
 selects its previous neighbor in the stable pinned-first visual order, or the next
 neighbor when there is no previous one. Duplicate clones the saved tab and history
 with a fresh UUID, unpinned, and a new sequence above the current counter and all
-tab sequences; it preserves current focus. Neither operation reparses requests,
-hydrates response bodies, sends traffic, or changes unrelated saved data.
+tab sequences; it preserves current focus. Set-pinned assigns the requested pin
+state while preserving focus, physical array order, counters, and tab content. Repeating the same value never toggles
+it; each accepted write still advances the workspace revision. None of these
+operations reparse requests, hydrate response bodies, send traffic, or change
+unrelated saved data.
 
 The CLI pins one session (explicit IDs also work for inactive sessions), reads its
-workspace revision, then sends one ID-only compare-and-swap request. An inferred
-session is guarded against an active-session switch. Conflicts and lost, invalid,
+workspace revision, then sends one metadata-only compare-and-swap request.
+An inferred session is guarded against an active-session switch. Conflicts and lost, invalid,
 or redirected responses are never retried. Inspect saved tabs before a deliberate
 retry; these operations do not use `saved.v1` receipts.
 
 Success is bounded metadata: `session_id`, `revision`, `active_tab_id`, and either
-`closed_tab_id` or `source_tab_id` plus `new_tab_id`. Direct commands return that
-object; `call` puts it under `data` and adds `meta.session_id`. See the
+`closed_tab_id`, `source_tab_id` plus `new_tab_id`, or `tab_id` plus `pinned`.
+Direct commands return that object; `call` puts it under `data` and adds
+`meta.session_id`. See the
 [saved-tab API contract](docs/integrations/saved-replay-tabs.md) for wire details.
+
+### Opt-in HTTP history retention
+
+Capture → Settings → HTTP History automatic cleanup saves a policy per session. Off is
+always the default, preserving existing traffic. Explicitly enabling keep-newest
+allows permanent deletion of the oldest unprotected excess rows. N is a soft
+**total-history** target: in-progress records and source originals referenced by
+durably saved HTTP Replay tabs are protected, so totals can stay above N.
+
+```bash
+sniper-cli capture http retention get --session-id <session-uuid>
+sniper-cli capture http retention set --max-entries 10000 --session-id <session-uuid> --dry-run
+sniper-cli capture http retention set --max-entries 10000 --session-id <session-uuid> --yes
+sniper-cli capture http retention set --off --session-id <session-uuid> --yes
+```
+
+N must be an integer from 1 through 4294967295. Dry-run is completely offline;
+`--yes` is required to save either policy. Saved-policy success is separate from
+pending logical cleanup and disk reclamation. Off does not restore deleted rows.
+Canonical operations are `capture.http.retention.get` and
+`capture.http.retention.set`. See [the retention contract](docs/integrations/http-history-retention.md)
+for session binding, concurrency, metadata, protection, and uncertain outcomes.
 
 ### Passive scanner configuration
 
@@ -444,6 +587,65 @@ sniper-cli skills install --all --dry-run
 sniper-cli skills install --all --yes
 ```
 
+Check installed skill files without modifying them:
+
+```bash
+sniper-cli skills status --all
+sniper-cli skills status --codex --codex-dir /tmp/example-skills
+sniper-cli call skills.status --input '{"claude":true}'
+sniper-cli schema output skills.status
+```
+
+Select at least one of `--codex`, `--claude`, or `--all`. Optional
+`--codex-dir` and `--claude-dir` specify skills roots, just as for install.
+Status reads only this CLI host's `sniper-operator/SKILL.md` files, even when
+`--api` points elsewhere. It performs no API discovery, installation, directory
+creation, or update; `--yes` is not needed. Discovery, schemas, examples, and
+`--dry-run` are offline and do not inspect installed files.
+
+The result has `scope: "cli_host"`, the CLI's `bundled_version`, and `entries`
+with agent, absolute path, bundled and installed SHA-256 hashes, and status.
+`current` means exact byte equality; `modified_or_outdated` only means the hashes
+differ. The installed version is unknown, so differences cannot distinguish
+user edits from an older template. `missing`, `unreadable`, and `unsupported`
+report files that could not be compared; the installed hash is null and error
+rows include `error_code`. Reads are byte-bounded and reject final-component symlinks/reparse points,
+non-regular files, and oversized files. Ancestor directory links retain normal
+filesystem semantics; this is not a general filesystem I/O timeout. Source text is never returned.
+Completed inspections exit zero, including missing/error rows: automation must
+check each row's `status` and `error_code`. Invalid arguments or failure to
+resolve a selected path exit nonzero. Existing install behavior is unchanged.
+
+### Local skill maintenance
+
+`skills update-preview` compares active installed bytes with this binary's bundle
+without writing. Experimental enrollment and staging preserve a known baseline.
+The partial activation milestone adds explicit `skills apply-update --yes`,
+read-only `skills update-result`, and transaction-bound `skills rollback-update
+--yes`. Keep the original canonical lowercase operation UUID for inspection and
+rollback, especially after interrupted or lost output. Different bytes must come
+from a strictly newer bundled semantic version; edited or mismatched files are
+refused, and recovery artifacts are preserved.
+
+These explicit operations do not themselves grant automatic-update consent.
+Automatic updates are Off by default. `skills enable-auto-updates --codex --yes`
+records host-local consent for one unchanged managed installation without
+updating it immediately. `skills auto-update-status --codex` reads the policy;
+`skills auto-update-once --codex --yes` attempts an eligible bundled update, and
+`skills disable-auto-updates --codex --yes` revokes future updates. Use `--claude`
+for Claude. Status, disable and one-shot execution use the stored target and
+reject directory overrides. Re-enabling an existing policy requires its current
+`--policy-revision` and creates fresh authorization. The desktop schedules one
+background pass after its first idle event; no agent reload or network template
+fetch occurs. Uncertain attempts pause rather than silently retrying.
+
+Linux exchange is covered by native fixtures. Hosted macOS 15 ARM64
+[focused policy/transaction tests and native desktop compilation](https://github.com/sm1ee/Sniper/actions/runs/38423109820)
+were verified at `e7cbe95`. Actual GUI behavior, Intel Macs and user-installed
+skills remain unverified. Windows activation, rollback, transaction-result
+inspection and host-policy operations are currently unsupported. See [safe skill maintenance](docs/integrations/skill-maintenance.md)
+for the review workflow, confirmation requirements, recovery and platform limits.
+
 AI agents can drive the full workflow through CLI — capture, scope, replay, fuzz — no UI scraping needed.
 
 - [Using Sniper from Claude Code](docs/integrations/claude-code.md)
@@ -471,7 +673,7 @@ AI agents can drive the full workflow through CLI — capture, scope, replay, fu
 | UI server | `axum` serving embedded SPA |
 | Frontend | Vanilla **JS** + **CSS** — zero framework, zero build step |
 | Desktop shell | Native **WebView** (`wry`) |
-| Packaging | macOS `.app` + `.dmg`; Windows portable `.zip` with desktop, server and CLI |
+| Packaging | macOS `.app` + `.dmg`; Windows portable `.zip`; Debian 13 x86_64 development candidates (`.tar.gz` + `.deb`); each includes desktop, server and CLI |
 
 ## Build from source
 

@@ -16,7 +16,7 @@ use anyhow::Result;
 use reqwest::StatusCode;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -76,6 +76,19 @@ fn proxy_listener_online(status: u64) -> bool {
     status & 1 == 1
 }
 
+enum SessionActivationOutcome {
+    BeforeActivationReplacement {
+        error: anyhow::Error,
+    },
+    Replaced {
+        summary: SessionSummary,
+        finalization_error: Option<anyhow::Error>,
+    },
+    Uncertain {
+        error: anyhow::Error,
+    },
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -117,6 +130,14 @@ pub struct AppState {
     pub ws_replay: Arc<WsReplayStore>,
     /// Stable owner token for runtime-state writes from this app process.
     pub runtime_instance_id: uuid::Uuid,
+    /// Session-keyed so an uncertain read-only workspace commit remains gated
+    /// when that context is promoted to a writable one.
+    workspace_retention_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
+    retention_persistence_uncertain: Arc<crate::history_retention::WorkspaceDurabilityGate>,
+    upstream_peer_durability_gates: Arc<crate::upstream_peer_settings::DurabilityGates>,
+    /// Bounds queued plus running ordinary Service Map jobs across all sessions.
+    /// Other API reads and proxy work never acquire this permit.
+    service_map_read_slot: Arc<Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,7 +195,8 @@ impl AppState {
         let active_proxy_addr = config.proxy_addr;
         let active_ui_addr = config.ui_addr;
         let runtime_instance_id = uuid::Uuid::new_v4();
-        Ok(Self {
+        let initial_session = active_session.clone();
+        let state = Self {
             config,
             certificates,
             startup,
@@ -198,7 +220,36 @@ impl AppState {
             read_only_session_contexts: Arc::new(AsyncMutex::new(HashMap::new())),
             ws_replay: Arc::new(WsReplayStore::new()),
             runtime_instance_id,
-        })
+            workspace_retention_uncertain: Arc::new(Default::default()),
+            retention_persistence_uncertain: Arc::new(Default::default()),
+            upstream_peer_durability_gates: Arc::new(Default::default()),
+            service_map_read_slot: Arc::new(Semaphore::new(1)),
+        };
+        state.bind_upstream_peer_durability(&initial_session);
+        state.start_history_retention_worker(&initial_session);
+        Ok(state)
+    }
+
+    /// Takes the map slot only if free: tests hold it to stage a running read.
+    #[cfg(test)]
+    pub(crate) fn try_service_map_read(&self) -> Option<OwnedSemaphorePermit> {
+        self.service_map_read_slot.clone().try_acquire_owned().ok()
+    }
+
+    /// Waits a bounded time for the map read already running. A filter
+    /// change, Reload or history invalidation aborts the read it replaces, but
+    /// that read's worker keeps the slot until it finishes; refusing at once
+    /// failed the new read as busy. Once it finishes, an unchanged history
+    /// answers the same request from its cache.
+    pub(crate) async fn service_map_read(&self) -> Option<OwnedSemaphorePermit> {
+        #[cfg(not(test))]
+        const WAIT: Duration = Duration::from_secs(20);
+        #[cfg(test)]
+        const WAIT: Duration = Duration::from_millis(200);
+        tokio::time::timeout(WAIT, self.service_map_read_slot.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()
     }
 
     pub fn set_proxy_online(&self, online: bool) {
@@ -258,7 +309,88 @@ impl AppState {
     }
 
     pub async fn session(&self) -> Arc<SessionContext> {
+        let session = self.active_session.read().await.clone();
+        self.start_history_retention_worker(&session);
+        session
+    }
+
+    /// Inspect the already-active context without starting retention work or
+    /// resolving a saved session. Bounded passive reads must not load history.
+    pub(crate) async fn active_session_for_read(&self) -> Arc<SessionContext> {
         self.active_session.read().await.clone()
+    }
+
+    fn bind_upstream_peer_durability(&self, session: &Arc<SessionContext>) {
+        let gate = self
+            .upstream_peer_durability_gates
+            .lock()
+            .unwrap()
+            .entry(session.id())
+            .or_default()
+            .clone();
+        session.upstream_peer_settings.bind(gate);
+    }
+
+    pub(crate) fn start_history_retention_worker(&self, session: &Arc<SessionContext>) {
+        crate::history_retention::start_worker(
+            session,
+            crate::history_retention::RetentionEnvironment {
+                sessions: Arc::downgrade(&self.sessions),
+                active: Arc::downgrade(&self.active_session),
+                contexts: Arc::downgrade(&self.session_contexts),
+                operations: Arc::downgrade(&self.session_operation_locks),
+                workspace_uncertain: Arc::downgrade(&self.workspace_retention_uncertain),
+                persistence_uncertain: Arc::downgrade(&self.retention_persistence_uncertain),
+            },
+        );
+    }
+
+    pub(crate) fn retention_persistence_is_uncertain(&self, id: uuid::Uuid) -> bool {
+        self.retention_persistence_uncertain
+            .lock()
+            .unwrap()
+            .contains(&id)
+    }
+
+    pub(crate) fn mark_retention_policy_durability(
+        &self,
+        session: &Arc<SessionContext>,
+        durable: bool,
+    ) {
+        let mut gate = self.retention_persistence_uncertain.lock().unwrap();
+        if durable {
+            gate.remove(&session.id());
+        } else {
+            gate.insert(session.id());
+        }
+        session
+            .history_retention
+            .persistence_error
+            .store(!durable, Ordering::Release);
+        drop(gate);
+        session.store.notify_retention_work();
+    }
+
+    pub(crate) fn workspace_retention_is_uncertain(&self, id: uuid::Uuid) -> bool {
+        self.workspace_retention_uncertain
+            .lock()
+            .unwrap()
+            .contains(&id)
+    }
+
+    pub(crate) fn mark_workspace_retention_durability(
+        &self,
+        session: &Arc<SessionContext>,
+        durable: bool,
+    ) {
+        let mut gate = self.workspace_retention_uncertain.lock().unwrap();
+        if durable {
+            gate.remove(&session.id());
+        } else {
+            gate.insert(session.id());
+        }
+        drop(gate);
+        session.store.notify_retention_work();
     }
 
     pub(crate) async fn session_with_proxy_owner(
@@ -352,6 +484,7 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let session = self.sessions.load_context_read_only(id)?;
+        self.bind_upstream_peer_durability(&session);
         read_only_contexts.insert(id, session.clone());
         Ok(session)
     }
@@ -392,7 +525,9 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let session = self.sessions.load_context(id)?;
+        self.bind_upstream_peer_durability(&session);
         contexts.insert(id, session.clone());
+        self.start_history_retention_worker(&session);
         Ok(session)
     }
 
@@ -439,29 +574,7 @@ impl AppState {
 
     pub async fn create_session(&self, name: Option<String>) -> Result<SessionSummary> {
         let metadata = self.sessions.create_session(name)?;
-        match self.activate_session(metadata.id).await {
-            Ok(summary) => Ok(summary),
-            Err(error) => {
-                if let Err(cleanup_error) = self.sessions.delete_session(metadata.id) {
-                    tracing::warn!(
-                        ?cleanup_error,
-                        session_id = %metadata.id,
-                        "failed to remove session created before activation failure"
-                    );
-                }
-                self.ws_replay.remove_session(metadata.id).await;
-                self.session_operation_locks
-                    .lock()
-                    .await
-                    .remove(&metadata.id);
-                self.session_contexts.lock().await.remove(&metadata.id);
-                self.read_only_session_contexts
-                    .lock()
-                    .await
-                    .remove(&metadata.id);
-                Err(error)
-            }
-        }
+        self.activate_session_inner(metadata.id, false, true).await
     }
 
     pub async fn rename_session(&self, id: uuid::Uuid, name: String) -> Result<SessionSummary> {
@@ -503,11 +616,14 @@ impl AppState {
             let sessions = state.sessions.clone();
             let renamed_contexts = contexts.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let metadata = sessions.rename_session(id, &name)?;
+                let commit = sessions.rename_session_with_commit_status(id, &name)?;
                 for context in renamed_contexts {
-                    context.apply_renamed_metadata(&metadata);
+                    context.apply_renamed_metadata(&commit.metadata);
                 }
-                Ok(())
+                match commit.finalization_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
             })
             .await
             .context("session rename writer panicked")??;
@@ -540,150 +656,253 @@ impl AppState {
         id: uuid::Uuid,
         force: bool,
     ) -> Result<SessionSummary> {
-        let _activation_guard = self.session_activation_lock.lock().await;
-        if !self.sessions.contains_session(id) {
-            anyhow::bail!("session {id} was not found");
-        }
-        let operation_lock = self.session_operation_lock(id).await;
-        let operation_guard = operation_lock.lock().await;
-        if !self.sessions.contains_session(id) {
-            drop(operation_guard);
-            self.remove_session_operation_lock(id).await;
-            anyhow::bail!("session {id} was not found");
-        }
-        let current_id = self.sessions.active_session_id();
-        let _current_operation_guard = if current_id != id {
-            Some(
-                self.session_operation_lock(current_id)
-                    .await
-                    .lock_owned()
-                    .await,
-            )
-        } else {
-            None
-        };
-        // Give in-flight proxy work a moment to finish rather than refusing on the
-        // spot — an ordinary request is done in milliseconds. This runs before the
-        // active-session write lock is taken, so the rest of the app keeps serving
-        // while we wait.
-        if current_id != id {
-            for session_id in [current_id, id] {
-                if !crate::proxy::session_has_active_proxy_work(session_id) {
-                    continue;
-                }
-                if force {
-                    // Stops everything a session can be holding: streamed
-                    // responses, and the long-running tasks behind HTTPS tunnels
-                    // and WebSocket relays. A browser keeps tunnels open for
-                    // minutes, so none of this drains on its own. Whatever they
-                    // were carrying is cut and never recorded.
-                    crate::proxy::wait_for_session_proxy_work_to_finish(
-                        session_id,
-                        SESSION_SWITCH_FORCE_TIMEOUT,
-                    )
-                    .await;
-                    if crate::proxy::session_has_active_proxy_work(session_id) {
-                        let aborted = crate::proxy::abort_session_tracked_tasks(session_id);
-                        tracing::warn!(
-                            %session_id,
-                            aborted,
-                            "cutting long-running proxy tasks for a forced session switch"
-                        );
-                        let deadline = Instant::now() + SESSION_SWITCH_FORCE_TIMEOUT;
-                        while crate::proxy::session_has_active_proxy_work(session_id)
-                            && Instant::now() < deadline
-                        {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
+        self.activate_session_inner(id, force, false).await
+    }
+
+    async fn activate_session_inner(
+        &self,
+        id: uuid::Uuid,
+        force: bool,
+        newly_created: bool,
+    ) -> Result<SessionSummary> {
+        let prepared = async {
+            let _activation_guard = self.session_activation_lock.clone().lock_owned().await;
+            if !self.sessions.contains_session(id) {
+                anyhow::bail!("session {id} was not found");
+            }
+            let operation_lock = self.session_operation_lock(id).await;
+            let operation_guard = operation_lock.lock_owned().await;
+            if !self.sessions.contains_session(id) {
+                drop(operation_guard);
+                self.remove_session_operation_lock(id).await;
+                anyhow::bail!("session {id} was not found");
+            }
+            let current_id = self.sessions.active_session_id();
+            let _current_operation_guard = if current_id != id {
+                Some(
+                    self.session_operation_lock(current_id)
+                        .await
+                        .lock_owned()
+                        .await,
+                )
+            } else {
+                None
+            };
+            // Give in-flight proxy work a moment to finish rather than refusing on the
+            // spot — an ordinary request is done in milliseconds. This runs before the
+            // active-session write lock is taken, so the rest of the app keeps serving
+            // while we wait.
+            if current_id != id {
+                for session_id in [current_id, id] {
+                    if !crate::proxy::session_has_active_proxy_work(session_id) {
+                        continue;
                     }
-                } else {
-                    // Give work that is about to finish a moment to do so.
-                    let deadline = Instant::now() + SESSION_SWITCH_DRAIN_TIMEOUT;
-                    while crate::proxy::session_has_active_proxy_work(session_id)
-                        && Instant::now() < deadline
-                    {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    // What is usually left is an idle HTTPS tunnel a browser keeps
-                    // open between requests. That carries nothing — a request
-                    // inside one registers its own work and would still be holding
-                    // the session here — so close them rather than making the user
-                    // confirm on every single switch. The client reconnects.
-                    if crate::proxy::session_has_active_proxy_work(session_id) {
-                        let closed = crate::proxy::abort_session_idle_tunnels(session_id);
-                        if closed > 0 {
-                            tracing::info!(
+                    if force {
+                        // Stops everything a session can be holding: streamed
+                        // responses, and the long-running tasks behind HTTPS tunnels
+                        // and WebSocket relays. A browser keeps tunnels open for
+                        // minutes, so none of this drains on its own. Whatever they
+                        // were carrying is cut and never recorded.
+                        crate::proxy::wait_for_session_proxy_work_to_finish(
+                            session_id,
+                            SESSION_SWITCH_FORCE_TIMEOUT,
+                        )
+                        .await;
+                        if crate::proxy::session_has_active_proxy_work(session_id) {
+                            let aborted = crate::proxy::abort_session_tracked_tasks(session_id);
+                            tracing::warn!(
                                 %session_id,
-                                closed,
-                                "closed idle HTTPS tunnels to switch sessions"
+                                aborted,
+                                "cutting long-running proxy tasks for a forced session switch"
                             );
-                            let deadline = Instant::now() + SESSION_SWITCH_DRAIN_TIMEOUT;
+                            let deadline = Instant::now() + SESSION_SWITCH_FORCE_TIMEOUT;
                             while crate::proxy::session_has_active_proxy_work(session_id)
                                 && Instant::now() < deadline
                             {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
                         }
+                    } else {
+                        // Give work that is about to finish a moment to do so.
+                        let deadline = Instant::now() + SESSION_SWITCH_DRAIN_TIMEOUT;
+                        while crate::proxy::session_has_active_proxy_work(session_id)
+                            && Instant::now() < deadline
+                        {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        // What is usually left is an idle HTTPS tunnel a browser keeps
+                        // open between requests. That carries nothing — a request
+                        // inside one registers its own work and would still be holding
+                        // the session here — so close them rather than making the user
+                        // confirm on every single switch. The client reconnects.
+                        if crate::proxy::session_has_active_proxy_work(session_id) {
+                            let closed = crate::proxy::abort_session_idle_tunnels(session_id);
+                            if closed > 0 {
+                                tracing::info!(
+                                    %session_id,
+                                    closed,
+                                    "closed idle HTTPS tunnels to switch sessions"
+                                );
+                                let deadline = Instant::now() + SESSION_SWITCH_DRAIN_TIMEOUT;
+                                while crate::proxy::session_has_active_proxy_work(session_id)
+                                    && Instant::now() < deadline
+                                {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        let mut active_session = self.active_session.write().await;
-        let current = active_session.clone();
-        let current_id = current.id();
-        if current_id != id {
-            if crate::proxy::session_has_active_proxy_work(current_id)
-                || crate::proxy::session_has_active_proxy_work(id)
-            {
-                let busy = [current_id, id]
-                    .into_iter()
-                    .map(crate::proxy::describe_session_proxy_work)
-                    .find(|description| !description.is_empty())
-                    .unwrap_or_else(|| "proxy work".to_string());
-                anyhow::bail!(
-                    "cannot switch sessions while proxy activity is still running ({busy})"
-                );
+            let active_session = self.active_session.clone().write_owned().await;
+            let current = active_session.clone();
+            let current_id = current.id();
+            let session = if current_id != id {
+                if crate::proxy::session_has_active_proxy_work(current_id)
+                    || crate::proxy::session_has_active_proxy_work(id)
+                {
+                    let busy = [current_id, id]
+                        .into_iter()
+                        .map(crate::proxy::describe_session_proxy_work)
+                        .find(|description| !description.is_empty())
+                        .unwrap_or_else(|| "proxy work".to_string());
+                    anyhow::bail!(
+                        "cannot switch sessions while proxy activity is still running ({busy})"
+                    );
+                }
+                self.persist_session_context(&current).await?;
+                {
+                    let mut contexts = self.session_contexts.lock().await;
+                    contexts.insert(current_id, current.clone());
+                }
+                self.read_only_session_contexts
+                    .lock()
+                    .await
+                    .remove(&current_id);
+                self.read_only_session_contexts.lock().await.remove(&id);
+                {
+                    let mut contexts = self.session_contexts.lock().await;
+                    if let Some(session) = contexts.get(&id) {
+                        session.clone()
+                    } else {
+                        let session = self.sessions.load_context(id)?;
+                        contexts.insert(id, session.clone());
+                        session
+                    }
+                }
+            } else {
+                current.clone()
+            };
+            Ok::<_, anyhow::Error>((
+                _activation_guard,
+                operation_guard,
+                _current_operation_guard,
+                active_session,
+                current,
+                session,
+            ))
+        }
+        .await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if newly_created {
+                    self.cleanup_failed_session_activation(id).await;
+                }
+                return Err(error);
             }
-            self.persist_session_context(&current).await?;
-            {
-                let mut contexts = self.session_contexts.lock().await;
-                contexts.insert(current_id, current.clone());
-            }
-            self.read_only_session_contexts
-                .lock()
+        };
+        let state = self.clone();
+        // Preparation waits remain cancellable. After dispatch, the same owner
+        // must reconcile visible activation and any proven-before cleanup.
+        let outcome = tokio::spawn(async move {
+            let outcome = {
+                let (
+                    _activation_guard,
+                    _operation_guard,
+                    _current_operation_guard,
+                    mut active_session,
+                    current,
+                    session,
+                ) = prepared;
+                let sessions = state.sessions.clone();
+                match tokio::task::spawn_blocking(move || {
+                    sessions.activate_session_with_commit_status(id)
+                })
                 .await
-                .remove(&current_id);
-            self.read_only_session_contexts.lock().await.remove(&id);
-            let session = {
-                let mut contexts = self.session_contexts.lock().await;
-                if let Some(session) = contexts.get(&id) {
-                    session.clone()
-                } else {
-                    let session = self.sessions.load_context(id)?;
-                    contexts.insert(id, session.clone());
-                    session
+                {
+                    Ok(Ok(commit)) => {
+                        session.replace_metadata(commit.metadata.clone());
+                        let current_id = current.id();
+                        if current_id != id {
+                            let dropped_requests = current.intercepts.drop_all().await;
+                            let dropped_responses = current.response_intercepts.drop_all().await;
+                            if dropped_requests > 0 || dropped_responses > 0 {
+                                tracing::info!(
+                                    session_id = %current_id,
+                                    dropped_requests,
+                                    dropped_responses,
+                                    "dropped pending intercepts before switching sessions"
+                                );
+                            }
+                            state.bind_upstream_peer_durability(&session);
+                            *active_session = session.clone();
+                        }
+                        state.start_history_retention_worker(&session);
+                        SessionActivationOutcome::Replaced {
+                            summary: session
+                                .summary(commit.metadata.id == state.sessions.active_session_id()),
+                            finalization_error: commit.finalization_error,
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        SessionActivationOutcome::BeforeActivationReplacement { error }
+                    }
+                    Err(error) => SessionActivationOutcome::Uncertain {
+                        error: anyhow::Error::new(error)
+                            .context("session activation writer panicked"),
+                    },
                 }
             };
-            let metadata = self.sessions.activate_session(id)?;
-            session.replace_metadata(metadata.clone());
-            let dropped_requests = current.intercepts.drop_all().await;
-            let dropped_responses = current.response_intercepts.drop_all().await;
-            if dropped_requests > 0 || dropped_responses > 0 {
-                tracing::info!(
-                    session_id = %current_id,
-                    dropped_requests,
-                    dropped_responses,
-                    "dropped pending intercepts before switching sessions"
-                );
+            // Activation owns both session-operation guards. Release them before
+            // deletion reacquires the new session's guard and mutation lock.
+            if newly_created
+                && matches!(
+                    &outcome,
+                    SessionActivationOutcome::BeforeActivationReplacement { .. }
+                )
+            {
+                state.cleanup_failed_session_activation(id).await;
             }
-            *active_session = session.clone();
-            return Ok(session.summary(metadata.id == self.sessions.active_session_id()));
+            outcome
+        })
+        .await
+        .unwrap_or_else(|error| SessionActivationOutcome::Uncertain {
+            error: anyhow::Error::new(error).context("session activation task failed"),
+        });
+        match outcome {
+            SessionActivationOutcome::Replaced {
+                summary,
+                finalization_error: None,
+            } => Ok(summary),
+            SessionActivationOutcome::Replaced {
+                finalization_error: Some(error),
+                ..
+            }
+            | SessionActivationOutcome::BeforeActivationReplacement { error }
+            | SessionActivationOutcome::Uncertain { error } => Err(error),
         }
+    }
 
-        let metadata = self.sessions.activate_session(id)?;
-        current.replace_metadata(metadata.clone());
-        Ok(current.summary(metadata.id == self.sessions.active_session_id()))
+    async fn cleanup_failed_session_activation(&self, id: uuid::Uuid) {
+        if let Err(cleanup_error) = self.delete_session(id).await {
+            tracing::warn!(
+                ?cleanup_error,
+                session_id = %id,
+                "failed to remove session created before activation failure"
+            );
+        }
     }
 
     pub async fn delete_session(&self, id: uuid::Uuid) -> Result<()> {
@@ -691,7 +910,7 @@ impl AppState {
             anyhow::bail!("session {id} was not found");
         }
         let operation_lock = self.session_operation_lock(id).await;
-        let operation_guard = operation_lock.lock().await;
+        let operation_guard = operation_lock.lock_owned().await;
         if !self.sessions.contains_session(id) {
             drop(operation_guard);
             self.remove_session_operation_lock(id).await;
@@ -710,23 +929,88 @@ impl AppState {
             let contexts = self.session_contexts.lock().await;
             contexts.get(&id).cloned()
         };
-        let _mutation_guard = match cached_session.as_ref() {
-            Some(session) => Some(session.mutation_guard().await),
+        let mutation_guard = match cached_session.as_ref() {
+            Some(session) => Some(session.owned_mutation_guard().await),
             None => None,
         };
-        let result = self.sessions.delete_session(id);
-        drop(operation_guard);
-        if result.is_ok() {
-            self.ws_replay.remove_session(id).await;
-            self.session_operation_locks.lock().await.remove(&id);
-            self.session_contexts.lock().await.remove(&id);
-            self.read_only_session_contexts.lock().await.remove(&id);
+        if let Some(session) = cached_session.as_ref() {
+            session.recon.stop(None).await;
         }
-        result
+        // A canceled full-save waiter may have released its mutation guard while
+        // its blocking writer still owns persistence. Drain it before quarantine.
+        let persist_guard = match cached_session.as_ref() {
+            Some(session) => Some(session.owned_persist_guard().await),
+            None => None,
+        };
+        let state = self.clone();
+        // Waiting for either guard remains cancellable. Once persistence starts,
+        // finish cache teardown before releasing them even if the caller leaves.
+        tokio::spawn(async move {
+            let _operation_guard = operation_guard;
+            let _mutation_guard = mutation_guard;
+            let _persist_guard = persist_guard;
+            let sessions = state.sessions.clone();
+            let commit =
+                tokio::task::spawn_blocking(move || sessions.delete_session_with_commit_status(id))
+                    .await
+                    .context("session delete writer panicked")??;
+            state.ws_replay.remove_session(id).await;
+            if let Some(removed) = state.session_contexts.lock().await.remove(&id) {
+                removed.store.notify_retention_work();
+            }
+            state.read_only_session_contexts.lock().await.remove(&id);
+            state
+                .workspace_retention_uncertain
+                .lock()
+                .unwrap()
+                .remove(&id);
+            state
+                .retention_persistence_uncertain
+                .lock()
+                .unwrap()
+                .remove(&id);
+            state
+                .upstream_peer_durability_gates
+                .lock()
+                .unwrap()
+                .remove(&id);
+            state.remove_session_operation_lock(id).await;
+            match commit.finalization_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+        .await
+        .context("session delete task failed")?
     }
 
     pub fn session_storage_path(&self, id: uuid::Uuid) -> Result<std::path::PathBuf> {
         self.sessions.session_storage_path(id)
+    }
+
+    /// Stop every cached session's discovery before shutdown. A switched-away
+    /// session may still own a job, so persisting only the active one loses it.
+    pub async fn stop_recon_jobs(&self) -> Result<()> {
+        let mut contexts: Vec<_> = self
+            .session_contexts
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        let active = self.session().await;
+        if !contexts.iter().any(|session| session.id() == active.id()) {
+            contexts.push(active);
+        }
+        for session in contexts {
+            let operation_lock = self.session_operation_lock(session.id()).await;
+            let _operation_guard = operation_lock.lock_owned().await;
+            let _guard = session.owned_mutation_guard().await;
+            if session.recon.stop(None).await && self.sessions.contains_session(session.id()) {
+                session.persist_state_only().await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn persist_active_session(&self) -> Result<SessionSummary> {
@@ -834,12 +1118,26 @@ impl AppState {
             .lock()
             .await
             .remove(&session.id());
-        {
+        let old_context = self
+            .session_contexts
+            .lock()
+            .await
+            .get(&session.id())
+            .filter(|current| !Arc::ptr_eq(current, session))
+            .cloned();
+        // Operation-serialized replacement must wait for an old context's
+        // detached snapshot writer before another context uses the same files.
+        let _old_persist_guard = match old_context.as_ref() {
+            Some(current) => Some(current.owned_persist_guard().await),
+            None => None,
+        };
+        if old_context.is_some() {
             let mut contexts = self.session_contexts.lock().await;
-            if contexts
-                .get(&session.id())
-                .is_some_and(|current| !Arc::ptr_eq(current, session))
-            {
+            if contexts.get(&session.id()).is_some_and(|current| {
+                old_context
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(current, old))
+            }) {
                 contexts.remove(&session.id());
             }
         }
@@ -853,7 +1151,14 @@ impl AppState {
                 crate::workspace::WorkspaceReplaceError::Persist(error) => {
                     crate::workspace::WorkspaceReplaceError::Persist(error.to_string())
                 }
+                crate::workspace::WorkspaceReplaceError::CommittedButUncertain(error) => {
+                    self.mark_workspace_retention_durability(session, false);
+                    crate::workspace::WorkspaceReplaceError::CommittedButUncertain(
+                        error.to_string(),
+                    )
+                }
             })?;
+        self.mark_workspace_retention_durability(session, true);
         if let Some(metadata) = fallback_metadata {
             self.finalize_session_persist(session, metadata)
                 .map_err(|error| {
@@ -1310,6 +1615,7 @@ impl AppState {
     }
 
     async fn prepare_for_self_update_shutdown(&self) -> Result<()> {
+        self.stop_recon_jobs().await?;
         self.ws_replay.disconnect_all().await;
         let relay_result = crate::proxy::close_live_websocket_relays(
             self,
@@ -2471,7 +2777,7 @@ mod tests {
     };
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -3043,6 +3349,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_finalization_failure_updates_active_context_before_error() {
+        let (data_dir, state) = rename_session_test_state();
+        let context = state.session().await;
+        let before = context.summary(true);
+        state
+            .sessions
+            .fail_next_rename(crate::session::SessionRenameFault::AfterReplacement);
+        assert!(state
+            .rename_session(before.id, "After".to_owned())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("finalization"));
+        assert_eq!(context.summary(true).name, "After");
+        assert_eq!(state.active_session_summary().await.name, "After");
+        state.persist_active_session().await.unwrap();
+        let config = state.config.clone();
+        drop(context);
+        drop(state);
+        let restarted = AppState::new(config).unwrap();
+        let summary = restarted.active_session_summary().await;
+        assert_eq!(summary.id, before.id);
+        assert_eq!(summary.name, "After");
+        assert_eq!(summary.storage_path, before.storage_path);
+        drop(restarted);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_failure_keeps_all_inactive_caches_coherent() {
+        for after_replacement in [false, true] {
+            let (data_dir, state) = rename_session_test_state();
+            let original = state.session().await;
+            let before = original.summary(true);
+            let second = state
+                .create_session(Some("Second".to_owned()))
+                .await
+                .unwrap();
+            // Keep distinct writable and read-only contexts cached together.
+            state.session_contexts.lock().await.remove(&before.id);
+            let read_only = state.read_session_context_for_id(before.id).await.unwrap();
+            state
+                .session_contexts
+                .lock()
+                .await
+                .insert(before.id, original.clone());
+            assert!(!std::sync::Arc::ptr_eq(&original, &read_only));
+            let fault = if after_replacement {
+                crate::session::SessionRenameFault::AfterReplacement
+            } else {
+                crate::session::SessionRenameFault::BeforeReplacement
+            };
+            let registry_path = data_dir.join("sessions/registry.json");
+            let disk_before = std::fs::read(&registry_path).unwrap();
+            state.sessions.fail_next_rename(fault);
+            assert!(state
+                .rename_session(before.id, "After".to_owned())
+                .await
+                .is_err());
+            let expected = if after_replacement {
+                "After"
+            } else {
+                &before.name
+            };
+            assert_eq!(original.summary(false).name, expected);
+            assert_eq!(read_only.summary(false).name, expected);
+            assert_eq!(
+                state
+                    .list_sessions()
+                    .await
+                    .iter()
+                    .find(|s| s.id == before.id)
+                    .unwrap()
+                    .name,
+                expected
+            );
+            if !after_replacement {
+                assert_eq!(std::fs::read(&registry_path).unwrap(), disk_before);
+            }
+            let disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+            assert_eq!(
+                disk["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["id"] == before.id.to_string())
+                    .unwrap()["name"],
+                expected
+            );
+            state.persist_session_context(&original).await.unwrap();
+            assert_eq!(state.active_session_summary().await.id, second.id);
+            let config = state.config.clone();
+            drop(original);
+            drop(read_only);
+            drop(state);
+            let restarted = AppState::new(config).unwrap();
+            let summary = restarted
+                .list_sessions()
+                .await
+                .into_iter()
+                .find(|s| s.id == before.id)
+                .unwrap();
+            assert_eq!(summary.name, expected);
+            assert_eq!(summary.storage_path, before.storage_path);
+            assert_eq!(summary.created_at, before.created_at);
+            // Faults are one-shot and normal persistence remains available.
+            restarted
+                .rename_session(before.id, "Retry".to_owned())
+                .await
+                .unwrap();
+            drop(restarted);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn rename_session_updates_active_context_and_survives_persist_and_restart() {
         let (data_dir, state) = rename_session_test_state();
         let context = state.session().await;
@@ -3440,6 +3863,9 @@ mod tests {
                 assert!(message.contains("workspace snapshot is invalid"));
             }
             WorkspaceReplaceError::Conflict(_) => panic!("invalid snapshot should fail validation"),
+            WorkspaceReplaceError::CommittedButUncertain(_) => {
+                panic!("invalid snapshot must not be committed")
+            }
         }
 
         let current = session.workspace.snapshot().await;
@@ -3811,6 +4237,968 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    fn activation_commit_test_state() -> (std::path::PathBuf, AppState) {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-state-activation-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 32,
+            max_transaction_entries: 32,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        (data_dir, state)
+    }
+
+    fn activation_commit_fault(after: bool) -> crate::session::SessionActivationFault {
+        if after {
+            crate::session::SessionActivationFault::AfterReplacement
+        } else {
+            crate::session::SessionActivationFault::BeforeReplacement
+        }
+    }
+
+    fn activation_commit_disk_metadata(
+        state: &AppState,
+        id: uuid::Uuid,
+    ) -> crate::session::SessionMetadata {
+        let disk: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.config.data_dir.join("sessions/registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            disk["active_session_id"],
+            state.sessions.active_session_id().to_string()
+        );
+        serde_json::from_value(
+            disk["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == id.to_string())
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+    }
+
+    async fn activation_commit_ready(ready: tokio::sync::oneshot::Receiver<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn activation_commit_reconciles_cached_and_uncached_targets_before_error() {
+        for cached in [false, true] {
+            for after in [false, true] {
+                let (data_dir, state) = activation_commit_test_state();
+                let original = state.session().await;
+                let target = state
+                    .sessions
+                    .create_session(Some("Synthetic target".to_owned()))
+                    .unwrap();
+                let cached_target = if cached {
+                    Some(state.session_context_for_id(target.id).await.unwrap())
+                } else {
+                    None
+                };
+                state
+                    .sessions
+                    .fail_next_activation(activation_commit_fault(after));
+                let error = state.activate_session(target.id).await.unwrap_err();
+                assert!(error.to_string().contains(if after {
+                    "finalization"
+                } else {
+                    "before replacement"
+                }));
+                let current = state.session().await;
+                let expected_id = if after { target.id } else { original.id() };
+                assert_eq!(current.id(), expected_id);
+                assert_eq!(state.sessions.active_session_id(), expected_id);
+                let target_context = state
+                    .session_contexts
+                    .lock()
+                    .await
+                    .get(&target.id)
+                    .unwrap()
+                    .clone();
+                if let Some(cached_target) = cached_target.as_ref() {
+                    assert!(Arc::ptr_eq(&target_context, cached_target));
+                }
+                assert!(Arc::ptr_eq(
+                    &original,
+                    state
+                        .session_contexts
+                        .lock()
+                        .await
+                        .get(&original.id())
+                        .unwrap()
+                ));
+                assert!(state.is_current_session_context(&original).await);
+                if after {
+                    assert!(Arc::ptr_eq(&current, &target_context));
+                } else {
+                    assert!(Arc::ptr_eq(&current, &original));
+                }
+                let registered = state
+                    .sessions
+                    .summaries()
+                    .into_iter()
+                    .find(|entry| entry.id == target.id)
+                    .unwrap();
+                assert_eq!(
+                    target_context.summary(after).last_opened_at,
+                    registered.last_opened_at
+                );
+                assert_eq!(
+                    registered.last_opened_at,
+                    activation_commit_disk_metadata(&state, target.id).last_opened_at
+                );
+                if after {
+                    assert!(registered.last_opened_at >= target.last_opened_at);
+                } else {
+                    assert_eq!(registered.last_opened_at, target.last_opened_at);
+                }
+                state.persist_active_session().await.unwrap();
+                let config = state.config.clone();
+                drop(current);
+                drop(target_context);
+                drop(cached_target);
+                drop(original);
+                drop(state);
+                let reopened = AppState::new(config).unwrap();
+                assert_eq!(reopened.active_session_summary().await.id, expected_id);
+                drop(reopened);
+                std::fs::remove_dir_all(data_dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_commit_same_active_reconciles_only_visible_timestamp() {
+        for after in [false, true] {
+            let (data_dir, state) = activation_commit_test_state();
+            let original = state.session().await;
+            let before = original.summary(true);
+            state
+                .sessions
+                .fail_next_activation(activation_commit_fault(after));
+            let error = state.activate_session(original.id()).await.unwrap_err();
+            assert!(error.to_string().contains(if after {
+                "finalization"
+            } else {
+                "before replacement"
+            }));
+            assert!(Arc::ptr_eq(&original, &state.session().await));
+            let registered = state
+                .sessions
+                .summaries()
+                .into_iter()
+                .find(|entry| entry.id == original.id())
+                .unwrap();
+            assert_eq!(
+                original.summary(true).last_opened_at,
+                registered.last_opened_at
+            );
+            assert_eq!(
+                registered.last_opened_at,
+                activation_commit_disk_metadata(&state, original.id()).last_opened_at
+            );
+            if after {
+                assert!(registered.last_opened_at >= before.last_opened_at);
+            } else {
+                assert_eq!(registered.last_opened_at, before.last_opened_at);
+            }
+            state.persist_active_session().await.unwrap();
+            let config = state.config.clone();
+            drop(original);
+            drop(state);
+            let reopened = AppState::new(config).unwrap();
+            assert_eq!(reopened.active_session_summary().await.id, before.id);
+            drop(reopened);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_commit_old_snapshot_error_never_switches_target() {
+        for after in [false, true] {
+            let (data_dir, state) = activation_commit_test_state();
+            let original = state.session().await;
+            let target = state
+                .sessions
+                .create_session(Some("Synthetic target".to_owned()))
+                .unwrap();
+            original
+                .event_log
+                .push(
+                    crate::event_log::EventLevel::Info,
+                    "synthetic",
+                    "Saved",
+                    "Synthetic preparation data",
+                )
+                .await;
+            state.sessions.fail_next_metadata_write(
+                crate::session::SessionMetadataWrite::Update,
+                if after {
+                    crate::session::SessionMetadataFault::AfterReplacement
+                } else {
+                    crate::session::SessionMetadataFault::BeforeReplacement
+                },
+            );
+            let error = state.activate_session(target.id).await.unwrap_err();
+            assert!(error.to_string().contains("synthetic metadata"));
+            assert!(Arc::ptr_eq(&original, &state.session().await));
+            assert_eq!(state.sessions.active_session_id(), original.id());
+            let stored = state
+                .sessions
+                .summaries()
+                .into_iter()
+                .find(|entry| entry.id == original.id())
+                .unwrap();
+            assert_eq!(stored.event_count, usize::from(after));
+            assert!(state.sessions.contains_session(target.id));
+            let active_id = original.id();
+            let config = state.config.clone();
+            drop(original);
+            drop(state);
+            let reopened = AppState::new(config).unwrap();
+            let active = reopened.session().await;
+            assert_eq!(active.id(), active_id);
+            assert_eq!(
+                active.event_log.snapshot(None).await[0].message,
+                "Synthetic preparation data"
+            );
+            assert!(reopened.sessions.contains_session(target.id));
+            drop(active);
+            drop(reopened);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_commit_wait_cancellation_leaves_no_latent_switch() {
+        for wait_on in 0..4 {
+            let (data_dir, state) = activation_commit_test_state();
+            let original = state.session().await;
+            let target = state
+                .sessions
+                .create_session(Some("Synthetic target".to_owned()))
+                .unwrap();
+            let held_mutex = match wait_on {
+                0 => Some(state.session_activation_lock.clone().lock_owned().await),
+                1 => Some(
+                    state
+                        .session_operation_lock(target.id)
+                        .await
+                        .lock_owned()
+                        .await,
+                ),
+                2 => Some(
+                    state
+                        .session_operation_lock(original.id())
+                        .await
+                        .lock_owned()
+                        .await,
+                ),
+                _ => None,
+            };
+            let held_active = if wait_on == 3 {
+                Some(state.active_session.clone().write_owned().await)
+            } else {
+                None
+            };
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(25),
+                state.activate_session(target.id)
+            )
+            .await
+            .is_err());
+            assert_eq!(state.sessions.active_session_id(), original.id());
+            drop(held_active);
+            drop(held_mutex);
+            let activation_guard = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.session_activation_lock.lock(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(state.sessions.active_session_id(), original.id());
+            assert!(Arc::ptr_eq(&original, &state.session().await));
+            drop(activation_guard);
+            drop(original);
+            drop(state);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_commit_create_wait_cancellation_retains_inactive_storage() {
+        let (data_dir, state) = activation_commit_test_state();
+        let original = state.session().await;
+        let activation_guard = state.session_activation_lock.lock().await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            state.create_session(Some("Synthetic canceled create".to_owned()))
+        )
+        .await
+        .is_err());
+        let created = state
+            .sessions
+            .summaries()
+            .into_iter()
+            .find(|entry| entry.id != original.id())
+            .unwrap();
+        drop(activation_guard);
+        let activation_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.session_activation_lock.lock(),
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&original, &state.session().await));
+        assert!(!created.active);
+        assert!(state
+            .sessions
+            .session_storage_path(created.id)
+            .unwrap()
+            .is_dir());
+        drop(activation_guard);
+        drop(original);
+        drop(state);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_commit_caller_abort_after_dispatch_keeps_all_guards_until_reconciled() {
+        for fault in [None, Some(false), Some(true)] {
+            let (data_dir, state) = activation_commit_test_state();
+            let original = state.session().await;
+            let target = state
+                .sessions
+                .create_session(Some("Synthetic target".to_owned()))
+                .unwrap();
+            let target_lock = state.session_operation_lock(target.id).await;
+            let current_lock = state.session_operation_lock(original.id()).await;
+            if let Some(after) = fault {
+                state
+                    .sessions
+                    .fail_next_activation(activation_commit_fault(after));
+            }
+            let (ready, resume) = state.sessions.pause_next_activation();
+            let request = tokio::spawn({
+                let state = state.clone();
+                async move { state.activate_session(target.id).await }
+            });
+            activation_commit_ready(ready).await;
+            assert!(state.session_activation_lock.try_lock().is_err());
+            assert!(target_lock.try_lock().is_err());
+            assert!(current_lock.try_lock().is_err());
+            assert!(state.active_session.try_write().is_err());
+            request.abort();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert!(state.session_activation_lock.try_lock().is_err());
+            assert!(target_lock.try_lock().is_err());
+            assert!(current_lock.try_lock().is_err());
+            assert!(state.active_session.try_write().is_err());
+            resume.send(()).unwrap();
+            let guard = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.session_activation_lock.lock(),
+            )
+            .await
+            .unwrap();
+            let expected_id = if fault == Some(false) {
+                original.id()
+            } else {
+                target.id
+            };
+            assert_eq!(state.sessions.active_session_id(), expected_id);
+            assert_eq!(state.session().await.id(), expected_id);
+            assert!(target_lock.try_lock().is_ok());
+            assert!(current_lock.try_lock().is_ok());
+            drop(guard);
+            state.persist_active_session().await.unwrap();
+            let config = state.config.clone();
+            drop(original);
+            drop(state);
+            let reopened = AppState::new(config).unwrap();
+            assert_eq!(reopened.active_session_summary().await.id, expected_id);
+            drop(reopened);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_commit_create_cleanup_follows_delete_commit_and_preserves_primary_error() {
+        for cleanup_fault in [None, Some(false), Some(true)] {
+            let (data_dir, state) = activation_commit_test_state();
+            let original = state.session().await;
+            state
+                .sessions
+                .fail_next_activation(activation_commit_fault(false));
+            if let Some(after) = cleanup_fault {
+                state.sessions.fail_next_delete_write(
+                    crate::session::SessionDeleteWrite::Commit,
+                    if after {
+                        crate::session::SessionDeleteFault::AfterReplacement
+                    } else {
+                        crate::session::SessionDeleteFault::BeforeReplacement
+                    },
+                );
+            }
+            let (ready, resume) = state.sessions.pause_next_activation();
+            let request = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    state
+                        .create_session(Some("Synthetic create".to_owned()))
+                        .await
+                }
+            });
+            activation_commit_ready(ready).await;
+            let created = state
+                .sessions
+                .summaries()
+                .into_iter()
+                .find(|entry| entry.id != original.id())
+                .unwrap();
+            let target_context = state
+                .session_contexts
+                .lock()
+                .await
+                .get(&created.id)
+                .unwrap()
+                .clone();
+            let target_lock = state.session_operation_lock(created.id).await;
+            let ws_id = uuid::Uuid::new_v4();
+            state
+                .ws_replay
+                .remember_disconnected_connection_for_test(ws_id, created.id)
+                .await;
+            resume.send(()).unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "synthetic activation failure before replacement"
+            );
+            assert!(Arc::ptr_eq(&original, &state.session().await));
+            let retained = cleanup_fault == Some(false);
+            assert_eq!(state.sessions.contains_session(created.id), retained);
+            assert_eq!(
+                std::path::Path::new(&created.storage_path).exists(),
+                retained
+            );
+            if retained {
+                assert!(Arc::ptr_eq(
+                    &target_context,
+                    state
+                        .session_contexts
+                        .lock()
+                        .await
+                        .get(&created.id)
+                        .unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    &target_lock,
+                    state
+                        .session_operation_locks
+                        .lock()
+                        .await
+                        .get(&created.id)
+                        .unwrap()
+                ));
+                assert!(state.ws_replay.snapshot(ws_id).await.is_some());
+            } else {
+                assert!(!state
+                    .session_contexts
+                    .lock()
+                    .await
+                    .contains_key(&created.id));
+                assert!(!state
+                    .session_operation_locks
+                    .lock()
+                    .await
+                    .contains_key(&created.id));
+                assert!(state.ws_replay.snapshot(ws_id).await.is_none());
+            }
+            let active_id = original.id();
+            let config = state.config.clone();
+            drop(target_context);
+            drop(original);
+            drop(state);
+            let reopened = AppState::new(config).unwrap();
+            assert_eq!(reopened.active_session_summary().await.id, active_id);
+            assert_eq!(reopened.sessions.contains_session(created.id), retained);
+            drop(reopened);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_commit_create_retains_storage_after_visible_or_uncertain_result() {
+        for panic_writer in [false, true] {
+            let (data_dir, state) = activation_commit_test_state();
+            let original = state.session().await;
+            if panic_writer {
+                state.sessions.panic_next_activation();
+            } else {
+                state
+                    .sessions
+                    .fail_next_activation(activation_commit_fault(true));
+            }
+            let (ready, resume) = state.sessions.pause_next_activation();
+            let request = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    state
+                        .create_session(Some("Synthetic retained create".to_owned()))
+                        .await
+                }
+            });
+            activation_commit_ready(ready).await;
+            let created = state
+                .sessions
+                .summaries()
+                .into_iter()
+                .find(|entry| entry.id != original.id())
+                .unwrap();
+            let target_context = state
+                .session_contexts
+                .lock()
+                .await
+                .get(&created.id)
+                .unwrap()
+                .clone();
+            resume.send(()).unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains(if panic_writer {
+                "writer panicked"
+            } else {
+                "finalization"
+            }));
+            let expected_id = if panic_writer {
+                original.id()
+            } else {
+                created.id
+            };
+            assert_eq!(state.sessions.active_session_id(), expected_id);
+            let current = state.session().await;
+            assert!(Arc::ptr_eq(
+                &current,
+                if panic_writer {
+                    &original
+                } else {
+                    &target_context
+                }
+            ));
+            assert!(state.sessions.contains_session(created.id));
+            assert!(state
+                .sessions
+                .session_storage_path(created.id)
+                .unwrap()
+                .is_dir());
+            assert!(Arc::ptr_eq(
+                &target_context,
+                state
+                    .session_contexts
+                    .lock()
+                    .await
+                    .get(&created.id)
+                    .unwrap()
+            ));
+            state.persist_active_session().await.unwrap();
+            let config = state.config.clone();
+            drop(current);
+            drop(target_context);
+            drop(original);
+            drop(state);
+            let reopened = AppState::new(config).unwrap();
+            assert_eq!(reopened.active_session_summary().await.id, expected_id);
+            assert!(reopened.sessions.contains_session(created.id));
+            drop(reopened);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_commit_aborted_create_still_finishes_proven_before_cleanup() {
+        let (data_dir, state) = activation_commit_test_state();
+        let original = state.session().await;
+        state
+            .sessions
+            .fail_next_activation(activation_commit_fault(false));
+        let (ready, resume) = state.sessions.pause_next_activation();
+        let request = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .create_session(Some("Synthetic canceled create".to_owned()))
+                    .await
+            }
+        });
+        activation_commit_ready(ready).await;
+        let created = state
+            .sessions
+            .summaries()
+            .into_iter()
+            .find(|entry| entry.id != original.id())
+            .unwrap();
+        let target_context = state
+            .session_contexts
+            .lock()
+            .await
+            .get(&created.id)
+            .unwrap()
+            .clone();
+        let target_lock = state.session_operation_lock(created.id).await;
+        let cleanup_guard = state.read_only_session_contexts.lock().await;
+        request.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.sessions.contains_session(created.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(target_lock.try_lock().is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            target_context.mutation_guard()
+        )
+        .await
+        .is_err());
+        drop(cleanup_guard);
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(2), target_lock.lock())
+            .await
+            .unwrap();
+        assert!(!state
+            .session_contexts
+            .lock()
+            .await
+            .contains_key(&created.id));
+        assert!(!state
+            .session_operation_locks
+            .lock()
+            .await
+            .contains_key(&created.id));
+        assert!(!std::path::Path::new(&created.storage_path).exists());
+        assert!(Arc::ptr_eq(&original, &state.session().await));
+        drop(guard);
+        let config = state.config.clone();
+        let active_id = original.id();
+        drop(target_context);
+        drop(original);
+        drop(state);
+        let reopened = AppState::new(config).unwrap();
+        assert_eq!(reopened.active_session_summary().await.id, active_id);
+        assert!(!reopened.sessions.contains_session(created.id));
+        drop(reopened);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn activation_commit_intercepts_drop_only_for_visible_session_switch() {
+        for switch in [false, true] {
+            for after in [false, true] {
+                let (data_dir, state) = activation_commit_test_state();
+                let original = state.session().await;
+                let target_id = if switch {
+                    state
+                        .sessions
+                        .create_session(Some("Synthetic target".to_owned()))
+                        .unwrap()
+                        .id
+                } else {
+                    original.id()
+                };
+                let request_task = tokio::spawn({
+                    let context = original.clone();
+                    async move {
+                        context
+                            .intercepts
+                            .enqueue(crate::intercept::InterceptRecord {
+                                id: uuid::Uuid::new_v4(),
+                                started_at: chrono::Utc::now(),
+                                peer_addr: "127.0.0.1:1".to_owned(),
+                                is_websocket: false,
+                                request: crate::model::EditableRequest {
+                                    scheme: "https".to_owned(),
+                                    host: "example.com".to_owned(),
+                                    method: "GET".to_owned(),
+                                    path: "/synthetic".to_owned(),
+                                    headers: vec![],
+                                    body: String::new(),
+                                    body_encoding: crate::model::BodyEncoding::Utf8,
+                                    preview_truncated: false,
+                                },
+                            })
+                            .await
+                    }
+                });
+                let response_task = tokio::spawn({
+                    let context = original.clone();
+                    async move {
+                        context
+                            .response_intercepts
+                            .enqueue(crate::intercept::ResponseInterceptRecord {
+                                id: uuid::Uuid::new_v4(),
+                                started_at: chrono::Utc::now(),
+                                scheme: "https".to_owned(),
+                                host: "example.com".to_owned(),
+                                method: "GET".to_owned(),
+                                path: "/synthetic".to_owned(),
+                                status: 200,
+                                response: crate::model::EditableResponse {
+                                    status: 200,
+                                    headers: vec![],
+                                    body: String::new(),
+                                    body_encoding: crate::model::BodyEncoding::Utf8,
+                                },
+                            })
+                            .await
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while original.intercepts.list().await.len() != 1
+                        || original.response_intercepts.list().await.len() != 1
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                state
+                    .sessions
+                    .fail_next_activation(activation_commit_fault(after));
+                assert!(state.activate_session(target_id).await.is_err());
+                let remaining = usize::from(!(switch && after));
+                assert_eq!(original.intercepts.list().await.len(), remaining);
+                assert_eq!(original.response_intercepts.list().await.len(), remaining);
+                original.intercepts.drop_all().await;
+                original.response_intercepts.drop_all().await;
+                assert!(matches!(
+                    request_task.await.unwrap(),
+                    crate::intercept::InterceptResolution::Drop(_)
+                ));
+                assert!(matches!(
+                    response_task.await.unwrap(),
+                    crate::intercept::ResponseInterceptResolution::Drop
+                ));
+                drop(original);
+                drop(state);
+                std::fs::remove_dir_all(data_dir).unwrap();
+            }
+        }
+    }
+
+    fn delete_commit_test_state() -> (std::path::PathBuf, AppState) {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-state-delete-commit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = AppState::new(AppConfig {
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            ui_addr: "127.0.0.1:0".parse().unwrap(),
+            max_entries: 100,
+            max_transaction_entries: 100,
+            body_preview_bytes: 4096,
+            data_dir: data_dir.clone(),
+        })
+        .unwrap();
+        (data_dir, state)
+    }
+
+    #[tokio::test]
+    async fn delete_commit_failure_reconciles_only_committed_contexts() {
+        for after_replacement in [false, true] {
+            let (data_dir, state) = delete_commit_test_state();
+            let original = state.session().await;
+            let id = original.id();
+            let second = state
+                .create_session(Some("Synthetic survivor".to_owned()))
+                .await
+                .unwrap();
+            state.session_contexts.lock().await.remove(&id);
+            let read_only = state.read_session_context_for_id(id).await.unwrap();
+            state
+                .session_contexts
+                .lock()
+                .await
+                .insert(id, original.clone());
+            assert!(!std::sync::Arc::ptr_eq(&original, &read_only));
+            let ws_id = uuid::Uuid::new_v4();
+            state
+                .ws_replay
+                .remember_disconnected_connection_for_test(ws_id, id)
+                .await;
+            let operation_lock = state.session_operation_lock(id).await;
+            state.sessions.fail_next_delete_write(
+                crate::session::SessionDeleteWrite::Commit,
+                if after_replacement {
+                    crate::session::SessionDeleteFault::AfterReplacement
+                } else {
+                    crate::session::SessionDeleteFault::BeforeReplacement
+                },
+            );
+            let error = state.delete_session(id).await.unwrap_err();
+            assert!(error.to_string().contains(if after_replacement {
+                "finalization"
+            } else {
+                "before replacement"
+            }));
+            assert_eq!(state.sessions.contains_session(id), !after_replacement);
+            assert_eq!(
+                state
+                    .list_sessions()
+                    .await
+                    .iter()
+                    .any(|session| session.id == id),
+                !after_replacement
+            );
+            assert_eq!(state.active_session_summary().await.id, second.id);
+            if after_replacement {
+                assert!(!state.session_contexts.lock().await.contains_key(&id));
+                assert!(!state
+                    .read_only_session_contexts
+                    .lock()
+                    .await
+                    .contains_key(&id));
+                assert!(!state.session_operation_locks.lock().await.contains_key(&id));
+                assert!(state.ws_replay.snapshot(ws_id).await.is_none());
+                assert!(state.session_context_for_id(id).await.is_err());
+                assert!(state.read_session_context_for_id(id).await.is_err());
+                assert!(state.persist_session_context(&original).await.is_err());
+            } else {
+                assert!(std::sync::Arc::ptr_eq(
+                    &original,
+                    state.session_contexts.lock().await.get(&id).unwrap()
+                ));
+                assert!(std::sync::Arc::ptr_eq(
+                    &read_only,
+                    state
+                        .read_only_session_contexts
+                        .lock()
+                        .await
+                        .get(&id)
+                        .unwrap()
+                ));
+                assert!(std::sync::Arc::ptr_eq(
+                    &operation_lock,
+                    state.session_operation_locks.lock().await.get(&id).unwrap()
+                ));
+                assert!(state.ws_replay.snapshot(ws_id).await.is_some());
+            }
+            state.persist_active_session().await.unwrap();
+            let config = state.config.clone();
+            drop(original);
+            drop(read_only);
+            drop(state);
+            let reopened = AppState::new(config).unwrap();
+            assert_eq!(reopened.sessions.contains_session(id), !after_replacement);
+            assert_eq!(reopened.active_session_summary().await.id, second.id);
+            drop(reopened);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_commit_finishes_teardown_under_guards_after_caller_cancellation() {
+        for fail_finalization in [false, true] {
+            let (data_dir, state) = delete_commit_test_state();
+            let original = state.session().await;
+            let id = original.id();
+            state
+                .create_session(Some("Synthetic survivor".to_owned()))
+                .await
+                .unwrap();
+            let ws_id = uuid::Uuid::new_v4();
+            state
+                .ws_replay
+                .remember_disconnected_connection_for_test(ws_id, id)
+                .await;
+            let operation_lock = state.session_operation_lock(id).await;
+            // Deletion can publish, but cannot finish teardown until released.
+            let read_only_guard = state.read_only_session_contexts.lock().await;
+            if fail_finalization {
+                state.sessions.fail_next_delete_write(
+                    crate::session::SessionDeleteWrite::Commit,
+                    crate::session::SessionDeleteFault::AfterReplacement,
+                );
+            }
+            let request = tokio::spawn({
+                let state = state.clone();
+                async move { state.delete_session(id).await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while state.sessions.contains_session(id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert!(operation_lock.try_lock().is_err());
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                original.mutation_guard()
+            )
+            .await
+            .is_err());
+            drop(read_only_guard);
+            let operation_guard =
+                tokio::time::timeout(std::time::Duration::from_secs(2), operation_lock.lock())
+                    .await
+                    .unwrap();
+            assert!(!state.session_contexts.lock().await.contains_key(&id));
+            assert!(!state
+                .read_only_session_contexts
+                .lock()
+                .await
+                .contains_key(&id));
+            assert!(!state.session_operation_locks.lock().await.contains_key(&id));
+            assert!(state.ws_replay.snapshot(ws_id).await.is_none());
+            assert!(state.persist_session_context(&original).await.is_err());
+            let mutation_guard = original.mutation_guard().await;
+            drop(mutation_guard);
+            drop(operation_guard);
+            let config = state.config.clone();
+            drop(original);
+            drop(state);
+            let reopened = AppState::new(config).unwrap();
+            assert!(!reopened.sessions.contains_session(id));
+            drop(reopened);
+            std::fs::remove_dir_all(data_dir).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn session_operation_lock_blocks_delete_until_released() {
         let data_dir =
@@ -3839,6 +5227,9 @@ mod tests {
         .await;
         assert!(delete_result.is_err());
 
+        drop(operation_guard);
+        let operation_guard = operation_lock.lock().await;
+        assert!(state.sessions.contains_session(original_id));
         drop(operation_guard);
         state.delete_session(original_id).await.unwrap();
 
@@ -4231,6 +5622,9 @@ mod tests {
         assert!(delete_result.is_err());
 
         drop(mutation_guard);
+        let mutation_guard = original.mutation_guard().await;
+        assert!(state.sessions.contains_session(original_id));
+        drop(mutation_guard);
         state.delete_session(original_id).await.unwrap();
 
         let _ = std::fs::remove_dir_all(data_dir);
@@ -4442,5 +5836,161 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+    #[tokio::test]
+    async fn snapshot_canceled_writer_blocks_session_deletion_and_cannot_recreate_root() {
+        let (root, state) = delete_commit_test_state();
+        let session = state.session().await;
+        let id = session.id();
+        state
+            .create_session(Some("Synthetic survivor".into()))
+            .await
+            .unwrap();
+        let (entered, resume) =
+            session.pause_next_snapshot(crate::session::SnapshotTestPhase::Prepared);
+        let save = tokio::spawn({
+            let session = session.clone();
+            async move { session.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        let mut deletion = tokio::spawn({
+            let state = state.clone();
+            async move { state.delete_session(id).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut deletion)
+                .await
+                .is_err()
+        );
+        assert!(session.storage_dir().is_dir());
+        resume.send(()).unwrap();
+        deletion.await.unwrap().unwrap();
+        assert!(!session.storage_dir().exists());
+        assert!(session.persist().await.is_err());
+        assert!(session.persist_state_only().await.is_err());
+        assert!(
+            !session.storage_dir().exists(),
+            "queued stale persistence must not recreate deleted storage"
+        );
+        drop(session);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_canceled_writer_blocks_different_context_eviction() {
+        let (root, state) = delete_commit_test_state();
+        let original = state.session().await;
+        let id = original.id();
+        state
+            .create_session(Some("Synthetic active".into()))
+            .await
+            .unwrap();
+        let replacement = state.sessions.load_context_read_only(id).unwrap();
+        let workspace = replacement.workspace.snapshot().await;
+        let (entered, resume) =
+            original.pause_next_snapshot(crate::session::SnapshotTestPhase::Prepared);
+        let save = tokio::spawn({
+            let original = original.clone();
+            async move { original.persist().await }
+        });
+        entered.await.unwrap();
+        save.abort();
+        assert!(save.await.unwrap_err().is_cancelled());
+        let mut replace = tokio::spawn({
+            let state = state.clone();
+            let replacement = replacement.clone();
+            async move {
+                let operation = state.session_operation_lock(id).await;
+                let _operation = operation.lock().await;
+                state
+                    .replace_workspace_state_and_persist(&replacement, workspace)
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut replace)
+                .await
+                .is_err()
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            state.session_contexts.lock().await.get(&id).unwrap(),
+            &original
+        ));
+        resume.send(()).unwrap();
+        replace.await.unwrap().unwrap();
+        assert!(!state.session_contexts.lock().await.contains_key(&id));
+        assert!(replacement.storage_dir().is_dir());
+        drop(replacement);
+        drop(original);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn snapshot_canceled_offline_rotation_blocks_deletion_until_its_worker_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (root, state) = delete_commit_test_state();
+            let metadata = state
+                .sessions
+                .create_session(Some("Synthetic offline journal".into()))
+                .unwrap();
+            let id = metadata.id;
+            let mut session = state.sessions.load_context(id).unwrap();
+            std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut session).unwrap().store)
+                .unwrap()
+                .disconnect_journal_writer_for_test()
+                .unwrap();
+            state
+                .session_contexts
+                .lock()
+                .await
+                .insert(id, session.clone());
+            let (blocked, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = blocked.send(());
+                wait.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let save = tokio::spawn({
+                let session = session.clone();
+                async move { session.persist().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !session.store.persistence_mutation_locked_for_test() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            save.abort();
+            assert!(save.await.unwrap_err().is_cancelled());
+            let mut deletion = tokio::spawn({
+                let state = state.clone();
+                async move { state.delete_session(id).await }
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut deletion)
+                    .await
+                    .is_err()
+            );
+            assert!(session.storage_dir().is_dir());
+            release.send(()).unwrap();
+            occupied.await.unwrap();
+            deletion.await.unwrap().unwrap();
+            assert!(!session.storage_dir().exists());
+            assert!(session.persist().await.is_err());
+            assert!(!session.storage_dir().exists());
+            drop(session);
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        });
     }
 }

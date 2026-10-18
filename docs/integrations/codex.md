@@ -65,14 +65,16 @@ $ echo $?
 0
 ```
 
-Two things to know about that file. It is a **copy of the template embedded in
-the binary that wrote it**, not a link to the repository, so a Sniper upgrade
-does not refresh an existing install — re-run it after upgrading. On the machine
-this page was written on, a skill installed by an older build was 2708 bytes
-against the 4769-byte current
-[`packaging/skills/codex/sniper-operator/SKILL.md`](../../packaging/skills/codex/sniper-operator/SKILL.md),
-81 diff lines apart. And `--yes` **overwrites** an existing `SKILL.md`; if you
-have hand-edited yours, copy it aside first.
+The installed file is a **copy of the template embedded in the binary**, not a
+link to the repository. Upgrading Sniper alone does not refresh it. Inspect it first
+with `sniper-cli skills status --codex` or `sniper-cli skills update-preview --codex`.
+`skills install --codex --yes` **overwrites** an existing `SKILL.md`; preserve any
+edits before deliberately choosing replacement. See
+[safe skill maintenance](skill-maintenance.md) for read-only checks and the
+experimental staging and activation workflows. Automatic updates are Off by
+default and need separate explicit `enable-auto-updates --codex --yes` consent;
+that command only records authorization. Inspect the host-local policy with
+`auto-update-status --codex`.
 
 Installing both agents into one directory is rejected, because both would write
 the same `SKILL.md`:
@@ -85,7 +87,10 @@ $ sniper-cli --output compact skills install --all --codex-dir /tmp/x --claude-d
 `sniper-desktop` can install on launch, but only when
 `SNIPER_INSTALL_AGENT_SKILLS` is set to `1`, `true` or `yes` — any other value,
 including `on`, is ignored — and that path writes only when no `SKILL.md` is
-already there. A normal launch installs nothing.
+already there. Publication never replaces a file created concurrently, and
+startup logs report only newly created installations. The no-replace publication
+requires filesystem hard-link support; unsupported publication fails closed
+rather than falling back to replacement. A normal launch installs nothing.
 
 ## Point the CLI at the right instance
 
@@ -118,6 +123,25 @@ Exit codes observed: `0` success, `1` a CLI-level error, `2` bad input, `5` a
 from it. Codex can branch on those without parsing prose. The `2` an agent hits
 most is not a malformed argument but `CONFIRMATION_REQUIRED` — a write run with
 neither `--dry-run` nor `--yes`.
+
+After discovery, legacy JSON GET failures such as `session.list` report
+`HTTP_STATUS_ERROR` with the received `error.details.status`, regardless of
+server wording: 4xx means exit `5`, `retryable:false`; 5xx means exit `6`,
+`retryable:true` for reads. Their message now contains only the status; server
+error bodies are neither read nor echoed, including structured diagnostics that
+could contain private data. This adds no automatic retries. Confirmed writes
+remain non-retryable even when a preliminary GET fails. Discovery, successful
+response decoding, other non-GET error handling, and the separate
+[`saved.v1` error contract](saved-data-v1.md) are unchanged.
+
+Legacy `session create`, `rename`, `switch`, and `delete` also classify unsuccessful
+HTTP responses from headers alone, without reading or echoing error bodies.
+They return `HTTP_STATUS_ERROR` with the actual `error.details.status`, exit `5`
+for 3xx/4xx or `6` for 5xx, and always `retryable:false`. Their details include
+`idempotent:false` and `outcome:"unknown"`: the status does not establish whether
+the mutation applied. Inspect `session list` and current state before deliberately
+issuing another write; these operations have no `saved.v1` mutation receipts.
+A locally missing `--yes` still returns `CONFIRMATION_REQUIRED` before API access.
 
 ## What to ask for
 
@@ -223,6 +247,19 @@ JSON Schema and `sniper-cli examples <operation>` a worked input. Codex can call
 any of them uniformly with `sniper-cli call <operation> --input '<json>'`, whose
 successful output is wrapped in an envelope with the result under `data`. The
 older subcommands return raw JSON instead.
+
+## Manage opt-in HTTP history retention
+
+`capture http retention get` reads a session's saved policy and cleanup status.
+`capture http retention set --off` or `--max-entries N` requires `--yes`; use
+`--dry-run` for an offline exact-policy preview. Off is the default. Keep-newest
+permanently removes oldest unprotected excess rows toward a soft total-history
+target, protecting in-progress records and durably saved HTTP tab source originals.
+Obtain explicit approval for this destructive opt-in. Policy-save success does
+not mean pending logical or disk cleanup is finished. Prefer `--session-id`;
+never automatically retry or infer that a lost response means no change.
+See [the retention contract](http-history-retention.md) for canonical `call`
+names, limits, and same-session recovery reads.
 
 ## Manage passive scanner configuration
 
@@ -332,3 +369,19 @@ CLI.
   exchanged for a session cookie, described in the
   [architecture notes](../architecture.md) — but `sniper-cli` is only ever
   exercised same-machine, so point an agent at a loopback instance.
+
+## Opt-in observed socket peer capture
+
+`capture http upstream-peer get --session-id <active-uuid>` reads the saved
+switch and effective status. `set --session-id <active-uuid> --enabled true|false
+--yes` explicitly changes future eligibility; use `--dry-run` first for an
+offline plan. Canonical operations are `capture.http.upstream_peer.get` and
+`capture.http.upstream_peer.set`. The CLI performs one pinned settings GET and
+one token-bound POST, with no automatic retry or session activation.
+
+Default map/evidence reads remain unchanged. Explicit `--include-socket-peer`
+on exact-row evidence adds a retained observation without enabling capture or
+sending probes. A peer may be a proxy, CDN or shared endpoint, not evidence of
+origin ownership. Observations persist in session files, exports and full-record
+JSON, including after Off. Read the [capture, privacy and recovery contract](observed-socket-peer.md)
+before enabling it or sharing those files.

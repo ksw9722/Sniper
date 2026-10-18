@@ -36,8 +36,10 @@ const ACTIVE_TOOL_OPTIONS: &[&str] = &[
     "dashboard",
     "target",
     "proxy",
+    "map",
     "fuzzer",
     "sequence",
+    "recon",
     "replay",
     "tools",
     "logger",
@@ -82,6 +84,8 @@ const WEBSOCKET_QUERY_MAX_CHARS: usize = 512;
 const HTTP_QUERY_MAX_CHARS: usize = 512;
 const HTTP_FILTER_TEXT_MAX_CHARS: usize = 512;
 const HTTP_FILTER_COLOR_TAG_MAX_COUNT: usize = 16;
+const SERVICE_MAP_ENTRY_MAX_BYTES: usize = 300;
+const SERVICE_MAP_ENTRY_MAX_COUNT: usize = 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -350,10 +354,25 @@ pub struct AppUiSettingsSnapshot {
     pub http_sort_key: String,
     pub http_sort_direction: String,
     pub http_filter_settings: HttpFilterSettingsSnapshot,
+    /// Service Map's own display filter, as Burp keeps one for its site map: the
+    /// HTTP history conditions, set apart so each view hides what suits it.
+    pub service_map_filter_settings: HttpFilterSettingsSnapshot,
+    /// Request kinds whose links the map does not draw: by default all but API
+    /// calls, page navigations and other requests.
+    pub service_map_hidden_link_kinds: Vec<String>,
+    /// Service Map cards gather the origins of one site, except the leading
+    /// origin's site and the sites listed in `service_map_expanded_sites`.
+    pub service_map_group_sites: bool,
+    pub service_map_expanded_sites: Vec<String>,
+    /// Origins (`https://host`) and sites (`example.com`) the map hides in
+    /// every session.
+    pub service_map_hidden: Vec<String>,
     pub workbench_height: Option<u16>,
     #[serde(default, skip_serializing_if = "WorkbenchPaneWidthsSnapshot::is_empty")]
     pub workbench_pane_widths: WorkbenchPaneWidthsSnapshot,
     pub websocket_pane_width: Option<u16>,
+    /// The Service Map inspector's width, once dragged.
+    pub service_map_detail_width: Option<u16>,
     pub websocket_query: String,
     pub websocket_sort_key: String,
     pub websocket_sort_direction: String,
@@ -383,9 +402,15 @@ impl Default for AppUiSettingsSnapshot {
             http_sort_key: "index".to_string(),
             http_sort_direction: "desc".to_string(),
             http_filter_settings: HttpFilterSettingsSnapshot::default(),
+            service_map_filter_settings: HttpFilterSettingsSnapshot::default(),
+            service_map_hidden_link_kinds: vec!["frame".into(), "script".into(), "static".into()],
+            service_map_group_sites: true,
+            service_map_expanded_sites: Vec::new(),
+            service_map_hidden: Vec::new(),
             workbench_height: None,
             workbench_pane_widths: WorkbenchPaneWidthsSnapshot::default(),
             websocket_pane_width: None,
+            service_map_detail_width: None,
             websocket_query: String::new(),
             websocket_sort_key: "started_at".to_string(),
             websocket_sort_direction: "desc".to_string(),
@@ -425,6 +450,20 @@ impl AppUiSettingsSnapshot {
         sanitized.http_sort_direction =
             sanitize_option(self.http_sort_direction, "desc", &["asc", "desc"]);
         sanitized.http_filter_settings = self.http_filter_settings.sanitized();
+        sanitized.service_map_filter_settings = self.service_map_filter_settings.sanitized();
+        sanitized.service_map_hidden_link_kinds = crate::service_map::REQUEST_KINDS
+            .iter()
+            .filter(|kind| {
+                self.service_map_hidden_link_kinds
+                    .iter()
+                    .any(|hidden| hidden == *kind)
+            })
+            .map(|kind| kind.to_string())
+            .collect();
+        sanitized.service_map_group_sites = self.service_map_group_sites;
+        sanitized.service_map_expanded_sites =
+            sanitize_map_entries(self.service_map_expanded_sites);
+        sanitized.service_map_hidden = sanitize_map_entries(self.service_map_hidden);
         sanitized.workbench_height = self
             .workbench_height
             .filter(|height| *height > 0)
@@ -434,6 +473,10 @@ impl AppUiSettingsSnapshot {
             .websocket_pane_width
             .filter(|width| *width > 0)
             .map(|width| width.clamp(300, 4_096));
+        sanitized.service_map_detail_width = self
+            .service_map_detail_width
+            .filter(|width| *width > 0)
+            .map(|width| width.clamp(260, 4_096));
         sanitized.websocket_query =
             trim_to_char_limit(self.websocket_query.trim(), WEBSOCKET_QUERY_MAX_CHARS);
         sanitized.websocket_sort_key = sanitize_option(
@@ -558,7 +601,13 @@ fn load_ui_settings_snapshot(data_dir: &Path) -> Result<AppUiSettingsSnapshot> {
 
     match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice::<AppUiSettingsSnapshot>(&bytes)
-            .map(AppUiSettingsSnapshot::sanitized)
+            .map(|snapshot| {
+                let mut snapshot = snapshot.sanitized();
+                // Loaded preferences must reject revision-zero defaults from a page
+                // that has not fetched them yet, including files predating revisions.
+                snapshot.server_revision = snapshot.server_revision.max(1);
+                snapshot
+            })
             .or_else(|error| {
                 warn!(
                     ?error,
@@ -686,6 +735,23 @@ fn sanitize_option(value: String, fallback: &str, allowed: &[&str]) -> String {
     }
 }
 
+/// Service Map site and origin lists: lowercase, unique and bounded, without
+/// the spaces or control characters no origin or host contains.
+fn sanitize_map_entries(entries: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeMap::new();
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| {
+            !entry.is_empty()
+                && entry.len() <= SERVICE_MAP_ENTRY_MAX_BYTES
+                && !entry.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
+        .filter(|entry| seen.insert(entry.clone(), ()).is_none())
+        .take(SERVICE_MAP_ENTRY_MAX_COUNT)
+        .collect()
+}
+
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
@@ -701,7 +767,7 @@ fn default_history_column_widths() -> BTreeMap<String, u16> {
         ("length".to_string(), 104),
         ("method".to_string(), 110),
         ("mime".to_string(), 128),
-        ("notes".to_string(), 90),
+        ("notes".to_string(), 220),
         ("path".to_string(), 420),
         ("started_at".to_string(), 176),
         ("status".to_string(), 110),
@@ -808,6 +874,405 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    fn saved_settings_fixture(metadata: serde_json::Value) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "display_settings": {
+                "theme": "paper", "size_px": 16, "ui_font": "system",
+                "mono_font": "sfmono", "render_resources": true
+            },
+            "active_tool": "replay",
+            "active_proxy_tab": "websockets-history",
+            "history_column_widths": {"host": 444},
+            "ws_column_widths": {"frame_count": 123},
+            "history_column_order": ["path", "host"],
+            "http_query": "saved query",
+            "http_method": "POST",
+            "http_sort_key": "edited",
+            "http_sort_direction": "asc",
+            "http_filter_settings": {"only_notes": true, "color_tags": ["blue"]},
+            "workbench_height": 777,
+            "workbench_pane_widths": {
+                "request_percent": 34, "response_percent": 41, "inspector_width": 390
+            },
+            "websocket_pane_width": 444,
+            "websocket_query": "saved frames",
+            "websocket_sort_key": "host",
+            "websocket_sort_direction": "asc",
+            "websocket_in_scope_only": true,
+            "websocket_live_only": true,
+            "websocket_stack_height": 345,
+            "ws_replay_left_width": 555,
+            "ws_replay_frame_detail_height": 222,
+            "browser": {"preferred": "chrome"}
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        serde_json::to_vec_pretty(&value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_legacy_snapshot_rejects_early_defaults_without_writes() {
+        for metadata in [
+            serde_json::json!({}),
+            serde_json::json!({"server_revision": 0, "client_id": "", "client_version": 0}),
+            serde_json::json!({"server_revision": 0, "client_id": "old-page", "client_version": 5}),
+        ] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let original = saved_settings_fixture(metadata);
+            std::fs::write(&path, &original).unwrap();
+            let mut expected = serde_json::from_slice::<AppUiSettingsSnapshot>(&original)
+                .unwrap()
+                .sanitized();
+            expected.server_revision = 1;
+            let expected_json = serde_json::to_value(&expected).unwrap();
+
+            // Each restart must protect the unchanged legacy file without migrating it.
+            for _ in 0..2 {
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                for client_id in ["fresh-page", ""] {
+                    let early = AppUiSettingsSnapshot {
+                        client_id: client_id.to_string(),
+                        client_version: 1,
+                        ..AppUiSettingsSnapshot::default()
+                    };
+                    let rejected = store.replace_snapshot(early).await.unwrap();
+                    assert_eq!(rejected.display_settings.theme, "paper");
+                    assert_eq!(serde_json::to_value(rejected).unwrap(), expected_json);
+                    assert_eq!(
+                        serde_json::to_value(store.snapshot().await).unwrap(),
+                        expected_json
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                assert_eq!(
+                    directory_entries(&data_dir.0),
+                    vec![super::UI_SETTINGS_FILE]
+                );
+            }
+
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            let mut fetched = store.snapshot().await;
+            fetched.client_id = "fresh-page".to_string();
+            fetched.client_version = 1;
+            fetched.http_query = "intentional edit".to_string();
+            // A whole-snapshot save still cannot change the server-owned browser.
+            fetched.browser.preferred = Some("ego".to_string());
+            let saved = store.replace_snapshot(fetched).await.unwrap();
+            expected.client_id = "fresh-page".to_string();
+            expected.client_version = 1;
+            expected.server_revision = 2;
+            expected.http_query = "intentional edit".to_string();
+            let expected_json = serde_json::to_value(expected).unwrap();
+            assert_eq!(serde_json::to_value(&saved).unwrap(), expected_json);
+            let saved_bytes = std::fs::read(&path).unwrap();
+            assert_ne!(saved_bytes, original);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&saved_bytes).unwrap(),
+                expected_json
+            );
+            drop(store);
+            let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.snapshot().await).unwrap(),
+                expected_json
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_browser_change_keeps_fetched_revision_saves_valid() {
+        for client_id in ["fresh-page", ""] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            std::fs::write(&path, saved_settings_fixture(serde_json::json!({}))).unwrap();
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            let mut fetched = store.snapshot().await;
+            assert_eq!(fetched.server_revision, 1);
+            fetched.client_id = client_id.to_string();
+            fetched.client_version = 1;
+            fetched.http_query = "intentional edit".to_string();
+
+            store
+                .set_browser_preferred(Some("ego".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(store.snapshot().await.server_revision, 1);
+            let saved = store.replace_snapshot(fetched.clone()).await.unwrap();
+            fetched.server_revision = 2;
+            fetched.browser.preferred = Some("ego".to_string());
+            let expected_json = serde_json::to_value(fetched).unwrap();
+            assert_eq!(serde_json::to_value(saved).unwrap(), expected_json);
+            drop(store);
+            let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.snapshot().await).unwrap(),
+                expected_json
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_positive_revision_and_identity_are_unchanged() {
+        for revision in [1, 7, u64::MAX] {
+            for metadata in [
+                serde_json::json!({"server_revision": revision}),
+                serde_json::json!({"server_revision": revision, "client_id": "old-page", "client_version": 5}),
+            ] {
+                let data_dir = TestDataDir::new();
+                let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+                let original = saved_settings_fixture(metadata);
+                std::fs::write(&path, &original).unwrap();
+                let expected = serde_json::from_slice::<AppUiSettingsSnapshot>(&original)
+                    .unwrap()
+                    .sanitized();
+                let expected_json = serde_json::to_value(expected).unwrap();
+                for _ in 0..2 {
+                    let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                    assert_eq!(
+                        serde_json::to_value(store.snapshot().await).unwrap(),
+                        expected_json
+                    );
+                    let rejected = store
+                        .replace_snapshot(AppUiSettingsSnapshot::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(serde_json::to_value(rejected).unwrap(), expected_json);
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                assert_eq!(
+                    directory_entries(&data_dir.0),
+                    vec![super::UI_SETTINGS_FILE]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_loaded_same_client_keeps_version_ordering() {
+        for stored_revision in [0, 7] {
+            for (incoming_version, incoming_revision, accepted) in
+                [(6, 0, true), (5, 7, false), (4, 999, false)]
+            {
+                let data_dir = TestDataDir::new();
+                let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+                let original = saved_settings_fixture(serde_json::json!({
+                    "server_revision": stored_revision, "client_id": "old-page", "client_version": 5
+                }));
+                std::fs::write(&path, &original).unwrap();
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                let mut expected = store.snapshot().await;
+                assert_eq!(expected.server_revision, stored_revision.max(1));
+                let mut incoming = expected.clone();
+                incoming.server_revision = incoming_revision;
+                incoming.client_version = incoming_version;
+                incoming.http_query = "intentional edit".to_string();
+                let saved = store.replace_snapshot(incoming).await.unwrap();
+                if accepted {
+                    expected.server_revision += 1;
+                    expected.client_version = incoming_version;
+                    expected.http_query = "intentional edit".to_string();
+                } else {
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+                let expected_json = serde_json::to_value(expected).unwrap();
+                assert_eq!(serde_json::to_value(saved).unwrap(), expected_json);
+                let saved_bytes = std::fs::read(&path).unwrap();
+                drop(store);
+                let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                assert_eq!(
+                    serde_json::to_value(restarted.snapshot().await).unwrap(),
+                    expected_json
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), saved_bytes);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_fresh_notes_width_matches_frontend_default_after_reload() {
+        let data_dir = TestDataDir::new();
+        let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+        let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+        assert_eq!(store.snapshot().await.history_column_widths["notes"], 220);
+        let bytes = std::fs::read(&path).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(disk["history_column_widths"]["notes"], 220);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        drop(store);
+        let reloaded = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+        assert_eq!(
+            reloaded.snapshot().await.history_column_widths["notes"],
+            220
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_settings_omitted_notes_width_uses_default_without_rewriting_saved_bytes() {
+        for omit_map in [false, true] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let mut value: serde_json::Value = serde_json::from_slice(&saved_settings_fixture(
+                serde_json::json!({"server_revision": 7}),
+            ))
+            .unwrap();
+            if omit_map {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("history_column_widths");
+            }
+            let bytes = serde_json::to_vec_pretty(&value).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            for _ in 0..2 {
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                let snapshot = store.snapshot().await;
+                assert_eq!(snapshot.history_column_widths["notes"], 220);
+                assert_eq!(
+                    snapshot.history_column_widths["host"],
+                    if omit_map { 320 } else { 444 }
+                );
+                assert_eq!(snapshot.http_query, "saved query");
+                assert_eq!(snapshot.server_revision, 7);
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    modified
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_explicit_notes_width_survives_reload_without_migration() {
+        for width in [90, 310, 640] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let bytes = saved_settings_fixture(serde_json::json!({
+                "server_revision": 9,
+                "history_column_widths": {"notes": width, "host": 444}
+            }));
+            std::fs::write(&path, &bytes).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            for _ in 0..2 {
+                let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+                let snapshot = store.snapshot().await;
+                assert_eq!(snapshot.history_column_widths["notes"], width);
+                assert_eq!(snapshot.history_column_widths["host"], 444);
+                assert_eq!(snapshot.http_query, "saved query");
+                assert_eq!(snapshot.server_revision, 9);
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    modified
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_missing_file_starts_at_zero_until_saved_or_reloaded() {
+        assert_eq!(AppUiSettingsSnapshot::default().server_revision, 0);
+        assert_eq!(
+            AppUiSettingsSnapshot::default().sanitized().server_revision,
+            0
+        );
+        for save_before_restart in [false, true] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            assert_eq!(store.snapshot().await.server_revision, 0);
+            let mut expected = AppUiSettingsSnapshot::default();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap())
+                    .unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            if save_before_restart {
+                expected.client_id = "fresh-page".to_string();
+                expected.client_version = 1;
+                expected.display_settings.theme = "paper".to_string();
+                expected = store.replace_snapshot(expected).await.unwrap();
+                assert_eq!(expected.server_revision, 1);
+                assert_eq!(expected.display_settings.theme, "paper");
+            }
+            let original = std::fs::read(&path).unwrap();
+            drop(store);
+            let restarted = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            expected.server_revision = 1;
+            let expected_json = serde_json::to_value(expected).unwrap();
+            assert_eq!(
+                serde_json::to_value(restarted.snapshot().await).unwrap(),
+                expected_json
+            );
+            let rejected = restarted
+                .replace_snapshot(AppUiSettingsSnapshot::default())
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_value(rejected).unwrap(), expected_json);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                directory_entries(&data_dir.0),
+                vec![super::UI_SETTINGS_FILE]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_settings_invalid_metadata_still_recovers_with_zero_revision_defaults() {
+        for (field, invalid) in [
+            ("server_revision", serde_json::json!(null)),
+            ("server_revision", serde_json::json!("0")),
+            ("server_revision", serde_json::json!(-1)),
+            ("server_revision", serde_json::json!(1.5)),
+            ("server_revision", serde_json::json!(true)),
+            ("client_id", serde_json::json!(null)),
+            ("client_id", serde_json::json!(42)),
+            ("client_id", serde_json::json!([])),
+            ("client_version", serde_json::json!(null)),
+            ("client_version", serde_json::json!("0")),
+            ("client_version", serde_json::json!(-1)),
+            ("client_version", serde_json::json!(1.5)),
+            ("client_version", serde_json::json!(false)),
+        ] {
+            let data_dir = TestDataDir::new();
+            let path = data_dir.0.join(super::UI_SETTINGS_FILE);
+            let mut metadata = serde_json::json!({});
+            metadata[field] = invalid;
+            let original = saved_settings_fixture(metadata);
+            assert!(serde_json::from_slice::<AppUiSettingsSnapshot>(&original).is_err());
+            std::fs::write(&path, &original).unwrap();
+            let store = AppUiSettingsStore::load_or_create(&data_dir.0).unwrap();
+            let defaults = serde_json::to_value(AppUiSettingsSnapshot::default()).unwrap();
+            assert_eq!(
+                serde_json::to_value(store.snapshot().await).unwrap(),
+                defaults
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap())
+                    .unwrap(),
+                defaults
+            );
+            let names = directory_entries(&data_dir.0);
+            assert_eq!(names.len(), 2);
+            let backup = names
+                .iter()
+                .find(|name| name.starts_with(".ui-settings.corrupt-"))
+                .unwrap();
+            assert_eq!(std::fs::read(data_dir.0.join(backup)).unwrap(), original);
+        }
     }
 
     #[test]
@@ -1148,6 +1613,7 @@ mod tests {
         snapshot.workbench_pane_widths.response_percent = Some(41);
         snapshot.workbench_pane_widths.inspector_width = Some(390);
         snapshot.websocket_pane_width = Some(444);
+        snapshot.service_map_detail_width = Some(512);
         snapshot.websocket_query = "chat.example".to_string();
         snapshot.websocket_sort_key = "host".to_string();
         snapshot.websocket_sort_direction = "asc".to_string();
@@ -1194,6 +1660,7 @@ mod tests {
         assert_eq!(persisted.workbench_pane_widths.response_percent, Some(41));
         assert_eq!(persisted.workbench_pane_widths.inspector_width, Some(390));
         assert_eq!(persisted.websocket_pane_width, Some(444));
+        assert_eq!(persisted.service_map_detail_width, Some(512));
         assert_eq!(persisted.websocket_query, "chat.example");
         assert_eq!(persisted.websocket_sort_key, "host");
         assert_eq!(persisted.websocket_sort_direction, "asc");
@@ -1698,5 +2165,88 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // The map keeps its own filter: a file saved before it existed opens with
+    // static files hidden, and one view's filter never rewrites the other's.
+    #[test]
+    fn service_map_filter_defaults_and_stays_apart_from_history() {
+        let static_files = "png,ico,css,woff,woff2,ttf,svg,jpg,jpeg,gif";
+        let older: super::AppUiSettingsSnapshot = serde_json::from_value(
+            serde_json::json!({"http_filter_settings": {"hidden_extensions": ""}}),
+        )
+        .unwrap();
+        let older = older.sanitized();
+        assert_eq!(older.http_filter_settings.hidden_extensions, "");
+        assert_eq!(
+            older.service_map_filter_settings.hidden_extensions,
+            static_files
+        );
+
+        let saved: super::AppUiSettingsSnapshot = serde_json::from_value(serde_json::json!({
+            "service_map_filter_settings": {"hidden_extensions": "png,js", "only_parameterized": true}
+        }))
+        .unwrap();
+        let reopened: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::to_value(saved.sanitized()).unwrap()).unwrap();
+        let reopened = reopened.sanitized();
+        assert_eq!(
+            reopened.service_map_filter_settings.hidden_extensions,
+            "png,js"
+        );
+        assert!(reopened.service_map_filter_settings.only_parameterized);
+        assert_eq!(
+            reopened.http_filter_settings.hidden_extensions,
+            static_files
+        );
+    }
+
+    // Frames and resource loads stay hidden on a file saved before the setting existed;
+    // unknown or repeated kinds are dropped, and an empty list shows every kind.
+    #[test]
+    fn service_map_hidden_link_kinds_default_to_frames_and_resource_loads() {
+        let older: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            older.sanitized().service_map_hidden_link_kinds,
+            ["frame", "script", "static"]
+        );
+        let saved: super::AppUiSettingsSnapshot = serde_json::from_value(serde_json::json!({
+            "service_map_hidden_link_kinds": ["static", "bogus", "static", "api"]
+        }))
+        .unwrap();
+        assert_eq!(
+            saved.sanitized().service_map_hidden_link_kinds,
+            ["api", "static"]
+        );
+        let none: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({"service_map_hidden_link_kinds": []}))
+                .unwrap();
+        assert!(none.sanitized().service_map_hidden_link_kinds.is_empty());
+    }
+
+    // Sites group unless switched off; the site and origin lists come back
+    // lowercase, unique and free of spaces, as a hand-edited file may not be.
+    #[test]
+    fn service_map_site_display_defaults_and_sanitizes() {
+        let older: super::AppUiSettingsSnapshot =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let older = older.sanitized();
+        assert!(older.service_map_group_sites);
+        assert!(older.service_map_expanded_sites.is_empty());
+        assert!(older.service_map_hidden.is_empty());
+        let saved: super::AppUiSettingsSnapshot = serde_json::from_value(serde_json::json!({
+            "service_map_group_sites": false,
+            "service_map_expanded_sites": [" Example.COM ", "example.com", "", "bad entry"],
+            "service_map_hidden": ["https://cdn.example.com", "example.net", "https://cdn.example.com"]
+        }))
+        .unwrap();
+        let saved = saved.sanitized();
+        assert!(!saved.service_map_group_sites);
+        assert_eq!(saved.service_map_expanded_sites, ["example.com"]);
+        assert_eq!(
+            saved.service_map_hidden,
+            ["https://cdn.example.com", "example.net"]
+        );
     }
 }

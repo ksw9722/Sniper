@@ -5,13 +5,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc,
+        mpsc, Arc, Mutex,
     },
     thread,
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -251,17 +251,144 @@ pub struct TransactionStore {
     // Sequence numbers may be reused after reloading a trimmed/cleared store.
     // Saved-data cursors expire when the underlying store is reconstructed.
     saved_cursor_generation: Uuid,
-    inner: RwLock<StoreInner>,
-    insert_lock: AsyncMutex<()>,
+    inner: Arc<RwLock<StoreInner>>,
+    insert_lock: Arc<AsyncMutex<()>>,
     events: broadcast::Sender<TransactionEvent>,
-    retention_events: broadcast::Sender<()>,
+    retention_events: broadcast::Sender<TransactionRetentionEvent>,
+    in_progress: Arc<InProgressTransactions>,
+    retention_trim_sequence: AtomicU64,
+    retention_compacted_sequence: AtomicU64,
     journal_tx: Option<mpsc::Sender<TransactionJournalCommand>>,
+    // Set only when startup proves no journal writer ever became ready.
+    journal_start_failed: bool,
     /// Session directory, so a record whose bodies were dropped can be read back
     /// out of transactions.ndjson. Derived from the journal path.
     storage_dir: Option<PathBuf>,
+    /// `storage_dir` is only where bodies are read back: the store of a session
+    /// read without activation keeps no journal, so persisting it confirms no
+    /// rotation, as a store without a directory never did.
+    read_only_bodies: bool,
+    /// Libraries read from retained scripts and pages; see `LibraryCaches`.
+    library_versions: Mutex<LibraryCaches>,
+    /// The last whole-history map, serialized; see `cached_service_map`.
+    service_map_result: Mutex<Option<CachedServiceMap>>,
     max_entries: Option<usize>,
     next_sequence: AtomicU64,
     next_event_sequence: AtomicU64,
+    #[cfg(test)]
+    before_transaction_event_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// A persistence plan binds its records to the journal and file versions from
+/// which they were captured. A later live mutation must never adopt its bodies.
+#[derive(Debug)]
+pub struct TransactionPersistenceSnapshot {
+    entries: Vec<(TransactionRecord, Option<crate::session::BodyLocator>)>,
+    body_generations: HashMap<Uuid, Uuid>,
+    file_generation: Uuid,
+    complete_capture: bool,
+    pub latest_event_sequence: u64,
+    pub journal_rotation_confirmed: bool,
+}
+
+impl std::ops::Deref for TransactionPersistenceSnapshot {
+    type Target = [(TransactionRecord, Option<crate::session::BodyLocator>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl IntoIterator for TransactionPersistenceSnapshot {
+    type Item = (TransactionRecord, Option<crate::session::BodyLocator>);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+/// Metadata-only ownership of provisional records. The synchronous mutex is
+/// never held across an await, filesystem operation, or callback.
+#[derive(Default)]
+struct InProgressTransactions {
+    leases: Mutex<HashMap<Uuid, HashSet<Uuid>>>,
+    notify: Arc<Notify>,
+}
+
+impl InProgressTransactions {
+    fn register(self: &Arc<Self>, id: Uuid) -> InProgressTransactionGuard {
+        let token = Uuid::new_v4();
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(id)
+            .or_default()
+            .insert(token);
+        InProgressTransactionGuard {
+            registry: Arc::clone(self),
+            id,
+            token,
+        }
+    }
+
+    fn release(&self, id: Uuid, token: Uuid) {
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = leases
+            .get_mut(&id)
+            .is_some_and(|tokens| tokens.remove(&token) && tokens.is_empty());
+        if remove {
+            leases.remove(&id);
+        }
+        drop(leases);
+        if remove {
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// A single non-cloneable lease. Dropping it only releases its own token and
+/// wakes the cleanup worker; it never touches records or performs persistence.
+#[must_use = "hold this guard through the provisional record's final update"]
+pub struct InProgressTransactionGuard {
+    registry: Arc<InProgressTransactions>,
+    id: Uuid,
+    token: Uuid,
+}
+
+impl Drop for InProgressTransactionGuard {
+    fn drop(&mut self) {
+        self.registry.release(self.id, self.token);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransactionRetentionEvent {
+    /// Existing manual-delete and legacy-cap invalidation behavior.
+    Gap,
+    Deleted {
+        ids: Vec<Uuid>,
+        generation: Uuid,
+        event_sequence: u64,
+    },
+}
+
+pub(crate) struct RetentionStatusDetails {
+    pub total_count: usize,
+    pub protected_count: usize,
+    pub all_records_protected: bool,
+    pub identity_conflict: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionTrimOutcome {
+    pub deleted_ids: Vec<Uuid>,
+    pub current_count: usize,
+    pub protected_count: usize,
+    pub event_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -356,13 +483,35 @@ enum TransactionJournalCommand {
     Rotate {
         ack: mpsc::Sender<io::Result<()>>,
     },
+    #[cfg(test)]
+    StopForTest {
+        ack: mpsc::Sender<()>,
+    },
 }
 
-#[derive(Default)]
+/// A private publication fence, unrelated to persisted rows or evidence tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ServiceMapMetadataEpoch(Uuid);
+
 struct StoreInner {
     /// Oldest to newest. New captures append, queries iterate in reverse.
     entries: Vec<TransactionRecord>,
     summaries: Vec<CachedSummary>,
+    // Parallel to entries, including duplicate IDs. Only annotations retain a token.
+    body_generations: Vec<Uuid>,
+    // Displaced lazy rows whose saved bodies could not be recovered. Their
+    // ordering rows remain present, but no compaction may silently erase them.
+    unresolved_body_generations: HashSet<Uuid>,
+    // Changed only after publishing a replacement transactions file.
+    file_generation: Uuid,
+    // Changes under the metadata mutation lock, before event publication. Pure
+    // append, annotations and body-file changes preserve the projected rows.
+    service_map_metadata_epoch: Uuid,
+    // Annotations change filtered map membership without changing evidence.
+    service_map_annotation_epoch: Uuid,
+    /// Changes only when rows are removed or replaced, which moves the rows a
+    /// whole-history map reads by index; updates and appends keep it.
+    service_map_structure_epoch: Uuid,
     by_id: HashMap<Uuid, usize>,
     /// Where a record's line sits in transactions.ndjson, for records whose bodies
     /// were dropped after loading. Bodies are read back through this rather than
@@ -402,6 +551,369 @@ pub(crate) fn strip_transaction_bodies(record: &mut TransactionRecord) {
     {
         message.body_preview = String::new();
     }
+}
+
+/// Leaves a record's bodies to disk when its persisted line is current.
+fn keep_located_bodies_on_disk(
+    records: &mut [TransactionRecord],
+    locators: &mut HashMap<Uuid, crate::session::BodyLocator>,
+    replayed_ids: &HashSet<Uuid>,
+) {
+    for id in replayed_ids {
+        locators.remove(id);
+    }
+    for record in records.iter_mut() {
+        if !locators.contains_key(&record.id) {
+            continue;
+        }
+        if transaction_carries_bodies(record) {
+            // It has a locator, so a copy of it was persisted, yet it still
+            // holds its bodies: it came back from an Update entry in the
+            // journal, which means memory is the newer copy. Reading it from
+            // the stale line would serve the pre-update record, and copying
+            // that line on the next persist would discard the update for good.
+            locators.remove(&record.id);
+        } else {
+            strip_transaction_bodies(record);
+        }
+    }
+}
+
+/// The caller holds `inner` through the complete disk read. Mutation callers
+/// propagate failure before invoking their edit closure or appending a journal.
+fn rehydrate_checked(
+    record: &TransactionRecord,
+    inner: &StoreInner,
+    storage_dir: Option<&Path>,
+) -> io::Result<TransactionRecord> {
+    let Some(locator) = inner.locators.get(&record.id).copied() else {
+        return Ok(record.clone());
+    };
+    let storage_dir = storage_dir.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "transaction body storage is unavailable",
+        )
+    })?;
+    let mut full = crate::session::read_transaction_at(storage_dir, locator).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transaction body could not be read",
+        )
+    })?;
+    if full.id != record.id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transaction body locator points to a different record",
+        ));
+    }
+    full.notes = record.notes.clone();
+    full.color_tag = record.color_tag.clone();
+    full.user_note = record.user_note.clone();
+    full.annotation_revision = record.annotation_revision;
+    full.annotation_client_versions = record.annotation_client_versions.clone();
+    Ok(full)
+}
+
+// Resolve the full row token rather than UUID: older retained duplicates can
+// only use their own resident preview, never the newest row's disk locator.
+fn service_map_row_index(
+    inner: &StoreInner,
+    key: &crate::service_map::EvidenceKey,
+) -> Result<usize, &'static str> {
+    let index = inner
+        .entries
+        .binary_search_by_key(&key.sequence, |record| record.sequence)
+        .map_err(|_| "record_missing")?;
+    if inner.entries[index].id != key.record_id {
+        return Err("record_missing");
+    }
+    if inner.body_generations[index] != key.revision {
+        return Err("record_changed");
+    }
+    Ok(index)
+}
+
+/// Notes the newest icon row of each origin. It runs before the display
+/// filter, which hides `ico` and `png` rows by default, so an origin keeps its
+/// icon whatever the map shows.
+fn note_favicon(
+    favicons: &mut std::collections::BTreeMap<String, String>,
+    record: &TransactionRecord,
+    evidence: impl FnOnce() -> String,
+) {
+    if let Some(origin) = crate::service_map::favicon_origin(record) {
+        favicons.entry(origin).or_insert_with(evidence);
+    }
+}
+
+fn service_map_body_row_index(
+    inner: &StoreInner,
+    key: &crate::service_map::EvidenceKey,
+) -> Result<usize, &'static str> {
+    let index = service_map_row_index(inner, key)?;
+    if inner.unresolved_body_generations.contains(&key.revision) {
+        return Err("body_identity_unverifiable");
+    }
+    Ok(index)
+}
+
+fn validate_service_map_body_locator(
+    inner: &StoreInner,
+    key: &crate::service_map::EvidenceKey,
+    file_generation: Uuid,
+    locator: crate::session::BodyLocator,
+) -> Result<(), &'static str> {
+    let index = service_map_body_row_index(inner, key)?;
+    if inner.file_generation != file_generation
+        || inner.by_id.get(&key.record_id) != Some(&index)
+        || inner.locators.get(&key.record_id) != Some(&locator)
+    {
+        return Err("body_identity_unverifiable");
+    }
+    Ok(())
+}
+
+/// A path without its fragment, split from its query string.
+fn path_and_query(path: &str) -> (&str, Option<&str>) {
+    let path = path.split('#').next().unwrap_or("");
+    match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    }
+}
+
+/// A row for a parameter read: its query, and its request body or, when the
+/// row still owns one, the locator to read it from.
+fn parameter_row(
+    inner: &StoreInner,
+    index: usize,
+    session_id: Uuid,
+    generation: Uuid,
+    query: Option<&str>,
+) -> crate::service_map_parameters::ParameterRow {
+    let record = &inner.entries[index];
+    let locator = (inner.by_id.get(&record.id) == Some(&index))
+        .then(|| inner.locators.get(&record.id).copied())
+        .flatten();
+    crate::service_map_parameters::ParameterRow {
+        key: crate::service_map::EvidenceKey {
+            session_id,
+            generation,
+            sequence: record.sequence,
+            revision: inner.body_generations[index],
+            record_id: record.id,
+        },
+        query: query.map(str::to_string),
+        content_type: record.request.content_type.clone(),
+        // Only a body's start is parsed (`ParameterTally::add_row`), so only
+        // that much of an unsaved one is copied.
+        body: (locator.is_none() && record.request.body_encoding == BodyEncoding::Utf8).then(
+            || {
+                let body = &record.request.body_preview;
+                let mut end = body
+                    .len()
+                    .min(crate::service_map_parameters::MAX_BODY_BYTES);
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body[..end].to_string()
+            },
+        ),
+        locator,
+    }
+}
+
+/// A parameter row's request body: held in memory, or read from its locator
+/// while `budget` lasts. None when the budget did not cover it; empty when it
+/// cannot be shown to be this row's UTF-8 body.
+fn parameter_body(
+    inner: &RwLock<StoreInner>,
+    file: Option<&mut fs::File>,
+    file_generation: Uuid,
+    budget: &mut usize,
+    row: &mut crate::service_map_parameters::ParameterRow,
+) -> Option<String> {
+    match (row.body.take(), row.locator, file) {
+        (Some(body), _, _) => Some(body),
+        (None, Some(locator), Some(_)) if locator.len as usize > *budget => None,
+        (None, Some(locator), Some(file)) => {
+            *budget -= locator.len as usize;
+            let current = validate_service_map_body_locator(
+                &inner.blocking_read(),
+                &row.key,
+                file_generation,
+                locator,
+            );
+            Some(
+                current
+                    .ok()
+                    .and_then(|_| {
+                        crate::service_map_parameters::read_request_body(
+                            file,
+                            locator,
+                            row.key.record_id,
+                        )
+                    })
+                    .unwrap_or_default(),
+            )
+        }
+        _ => Some(String::new()),
+    }
+}
+
+#[cfg(test)]
+type ServiceMapBodyReadHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Libraries already read by row revision, and detections by bounded body
+/// content and kind. URL and size cannot identify a response across captures.
+#[derive(Default)]
+struct LibraryCaches {
+    rows: HashMap<(Uuid, Uuid), Vec<crate::service_map_libraries::Detection>>,
+    bodies: HashMap<
+        (crate::service_map_libraries::Kind, [u8; 32]),
+        Vec<crate::service_map_libraries::Detection>,
+    >,
+}
+
+impl LibraryCaches {
+    // ponytail: forget everything at a cap rather than track recency.
+    fn trim(&mut self) {
+        if self.rows.len() > 100_000 || self.bodies.len() > 100_000 {
+            *self = Self::default();
+        }
+    }
+}
+
+/// Body reads one map may make; a row past it waits for a later map.
+#[derive(Default)]
+struct LibraryBudget {
+    reads: usize,
+    bytes: usize,
+    exhausted: bool,
+}
+
+/// The libraries a script or page row declares when read before (`Ok`); or,
+/// within the budget, how to read them (`Err`); None when the row declares
+/// nothing to read, or must wait for a later map.
+fn library_lookup(
+    inner: &StoreInner,
+    caches: &mut LibraryCaches,
+    row: &crate::service_map::ServiceMapRow,
+    budget: &mut LibraryBudget,
+) -> Option<Result<Vec<crate::service_map_libraries::Detection>, PendingLibrary>> {
+    use crate::{
+        service_map::EvidenceKey,
+        service_map_body::BodySource,
+        service_map_libraries::{kind, MAX_BYTES_PER_MAP, MAX_READS, MAX_ROW_BYTES},
+    };
+    let body_kind = kind(row)?;
+    let key = EvidenceKey::parse(&row.evidence_id)?;
+    let row_key = (key.record_id, key.revision);
+    if let Some(found) = caches.rows.get(&row_key) {
+        return Some(Ok(found.clone()));
+    }
+    let index = service_map_body_row_index(inner, &key).ok()?;
+    let record = &inner.entries[index];
+    let response = record.response.as_ref()?;
+    if BodySource::from_text_record(record).is_err() {
+        caches.rows.insert(row_key, Vec::new());
+        return Some(Ok(Vec::new()));
+    }
+    let locator = (inner.by_id.get(&record.id) == Some(&index))
+        .then(|| inner.locators.get(&record.id).copied())
+        .flatten();
+    let size = locator.map_or(response.body_preview.len().min(MAX_ROW_BYTES), |l| {
+        l.len as usize
+    });
+    if budget.reads >= MAX_READS || budget.bytes + size > MAX_BYTES_PER_MAP {
+        budget.exhausted = true;
+        return None;
+    }
+    budget.reads += 1;
+    budget.bytes += size;
+    let source = match locator {
+        Some(locator) => LibrarySource::Retained(locator, inner.file_generation),
+        None => {
+            let mut end = response.body_preview.len().min(MAX_ROW_BYTES);
+            while !response.body_preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            if response.body_encoding == crate::model::BodyEncoding::Base64 {
+                // Whole base64 quanta only, so the copy still decodes.
+                end -= end % 4;
+            }
+            LibrarySource::Resident(
+                response.body_preview[..end].to_string(),
+                response.body_encoding.clone(),
+            )
+        }
+    };
+    Some(Err(PendingLibrary {
+        key,
+        kind: body_kind,
+        url: format!("{}{}", row.origin, record.path),
+        source,
+    }))
+}
+
+#[derive(Debug)]
+pub(crate) enum ServiceMapStreamError {
+    HistoryChanged,
+    ScopeWorkLimit,
+}
+
+const SERVICE_MAP_CHUNK: usize = 8_192;
+
+/// Where the rows a whole-history read has yet to fold end, after rows were
+/// removed: at the oldest row of its last chunk that is still retained, found
+/// by ID and body generation. Nothing read yet starts again from the newest.
+fn resume_below(inner: &StoreInner, read: &[(Uuid, Uuid)]) -> Option<usize> {
+    if read.is_empty() {
+        return Some(inner.entries.len());
+    }
+    read.iter().find_map(|&(id, generation)| {
+        inner
+            .by_id
+            .get(&id)
+            .copied()
+            .filter(|&index| inner.body_generations.get(index) == Some(&generation))
+    })
+}
+
+/// The last whole-history map, serialized, and the history it was built from.
+struct CachedServiceMap {
+    key: String,
+    token: (Uuid, Uuid, usize),
+    built: std::time::Instant,
+    cost: std::time::Duration,
+    /// Every script and page body was read; otherwise rebuild for the rest.
+    complete: bool,
+    bytes: bytes::Bytes,
+}
+
+fn merge_libraries(
+    found: &mut Vec<crate::service_map_libraries::Detection>,
+    more: Vec<crate::service_map_libraries::Detection>,
+) {
+    for detection in more {
+        crate::service_map_libraries::merge(found, detection);
+    }
+}
+
+/// A script or page row to scan after the store lock is released.
+struct PendingLibrary {
+    key: crate::service_map::EvidenceKey,
+    kind: crate::service_map_libraries::Kind,
+    url: String,
+    source: LibrarySource,
+}
+
+enum LibrarySource {
+    /// A copy of a body still in memory, as stored.
+    Resident(String, crate::model::BodyEncoding),
+    /// Where a retained body sits in transactions.ndjson, and in which file.
+    Retained(crate::session::BodyLocator, Uuid),
 }
 
 #[derive(Clone, Debug)]
@@ -510,17 +1022,38 @@ impl StoreInner {
             summaries.push(CachedSummary::new(record.summary()));
             by_id.insert(record.id, index);
         }
+        let body_generations = entries.iter().map(|_| Uuid::new_v4()).collect();
         Self {
             entries,
             summaries,
+            body_generations,
+            unresolved_body_generations: HashSet::new(),
+            file_generation: Uuid::new_v4(),
+            service_map_metadata_epoch: Uuid::new_v4(),
+            service_map_annotation_epoch: Uuid::new_v4(),
+            service_map_structure_epoch: Uuid::new_v4(),
             by_id,
             locators: HashMap::new(),
+        }
+    }
+
+    fn require_resolved_bodies(&self) -> io::Result<()> {
+        if self.unresolved_body_generations.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot save snapshot while a preserved transaction body dependency is unresolved",
+            ))
         }
     }
 
     fn push(&mut self, record: TransactionRecord, summary: TransactionSummary) {
         let index = self.entries.len();
         self.by_id.insert(record.id, index);
+        // Reusing an ID creates a new full record, never a view of the old body.
+        self.locators.remove(&record.id);
+        self.body_generations.push(Uuid::new_v4());
         self.entries.push(record);
         self.summaries.push(CachedSummary::new(summary));
     }
@@ -531,7 +1064,14 @@ impl StoreInner {
                 !self.entries.is_empty() || !self.summaries.is_empty() || !self.by_id.is_empty();
             self.entries.clear();
             self.summaries.clear();
+            self.body_generations.clear();
+            self.unresolved_body_generations.clear();
             self.by_id.clear();
+            self.locators.clear();
+            if trimmed {
+                self.service_map_metadata_epoch = Uuid::new_v4();
+                self.service_map_structure_epoch = Uuid::new_v4();
+            }
             return trimmed;
         }
 
@@ -540,13 +1080,20 @@ impl StoreInner {
         }
 
         let remove_count = self.entries.len().saturating_sub(max_entries);
-        for record in self.entries.drain(0..remove_count) {
-            self.by_id.remove(&record.id);
-        }
+        self.entries.drain(0..remove_count);
         self.summaries.drain(0..remove_count);
-        for index in self.by_id.values_mut() {
-            *index = index.saturating_sub(remove_count);
+        for generation in self.body_generations.drain(0..remove_count) {
+            self.unresolved_body_generations.remove(&generation);
         }
+        self.by_id = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (record.id, index))
+            .collect();
+        self.locators.retain(|id, _| self.by_id.contains_key(id));
+        self.service_map_metadata_epoch = Uuid::new_v4();
+        self.service_map_structure_epoch = Uuid::new_v4();
         true
     }
 }
@@ -586,15 +1133,24 @@ impl TransactionStore {
         let max_seq = inner.entries.iter().map(|r| r.sequence).max().unwrap_or(0);
         Self {
             saved_cursor_generation: Uuid::new_v4(),
-            inner: RwLock::new(inner),
-            insert_lock: AsyncMutex::new(()),
+            inner: Arc::new(RwLock::new(inner)),
+            insert_lock: Arc::new(AsyncMutex::new(())),
             events,
             retention_events,
+            in_progress: Arc::new(InProgressTransactions::default()),
+            retention_trim_sequence: AtomicU64::new(0),
+            retention_compacted_sequence: AtomicU64::new(0),
             journal_tx: None,
+            journal_start_failed: false,
             storage_dir: None,
+            read_only_bodies: false,
+            library_versions: Mutex::new(LibraryCaches::default()),
+            service_map_result: Mutex::new(None),
             max_entries,
             next_sequence: AtomicU64::new(max_seq + 1),
             next_event_sequence: AtomicU64::new(max_seq.max(latest_event_sequence) + 1),
+            #[cfg(test)]
+            before_transaction_event_hook: Mutex::new(None),
         }
     }
 
@@ -619,24 +1175,7 @@ impl TransactionStore {
         journal_path: PathBuf,
         latest_event_sequence: u64,
     ) -> Self {
-        for id in replayed_ids {
-            locators.remove(id);
-        }
-        for record in records.iter_mut() {
-            if !locators.contains_key(&record.id) {
-                continue;
-            }
-            if transaction_carries_bodies(record) {
-                // It has a locator, so a copy of it was persisted, yet it still
-                // holds its bodies: it came back from an Update entry in the
-                // journal, which means memory is the newer copy. Reading it from
-                // the stale line would serve the pre-update record, and copying
-                // that line on the next persist would discard the update for good.
-                locators.remove(&record.id);
-            } else {
-                strip_transaction_bodies(record);
-            }
-        }
+        keep_located_bodies_on_disk(&mut records, &mut locators, replayed_ids);
         // No cap: captured traffic is kept. Bodies live on disk, so what a record
         // costs resident no longer scales with its response size.
         let store = Self::from_records_with_journal_and_event_sequence(
@@ -645,6 +1184,35 @@ impl TransactionStore {
             None,
             latest_event_sequence,
         );
+        store
+            .inner
+            .try_write()
+            .expect("new store is not shared yet")
+            .locators = locators;
+        store
+    }
+
+    /// The store of a session read without being activated: bodies are read
+    /// back from disk by their locators, as in a writable store, but there is
+    /// no journal. It used to drop the locators, so every body it served was
+    /// empty (`history get --session-id` showed none, and a search reported
+    /// complete with no match), and a capture that landed in it and persisted
+    /// wrote its older rows back without their bodies.
+    pub fn from_located_records_read_only(
+        mut records: Vec<TransactionRecord>,
+        mut locators: HashMap<Uuid, crate::session::BodyLocator>,
+        replayed_ids: &HashSet<Uuid>,
+        storage_dir: PathBuf,
+        latest_event_sequence: u64,
+    ) -> Self {
+        keep_located_bodies_on_disk(&mut records, &mut locators, replayed_ids);
+        let mut store = Self::from_records_with_max_entries_and_event_sequence(
+            records,
+            None,
+            latest_event_sequence,
+        );
+        store.storage_dir = Some(storage_dir);
+        store.read_only_bodies = true;
         store
             .inner
             .try_write()
@@ -666,11 +1234,27 @@ impl TransactionStore {
         );
         store.storage_dir = journal_path.parent().map(Path::to_path_buf);
         store.journal_tx = start_transaction_journal_writer(journal_path);
+        store.journal_start_failed = store.journal_tx.is_none();
         store
     }
 
-    pub async fn insert(&self, mut record: TransactionRecord) -> TransactionInsertOutcome {
+    pub async fn insert(&self, record: TransactionRecord) -> TransactionInsertOutcome {
         let _insert_guard = self.insert_lock.lock().await;
+        self.insert_locked(record).await
+    }
+
+    /// Registers protection and inserts under the same mutation lock. If this
+    /// future is cancelled, its unreturned lease is released synchronously.
+    pub async fn insert_in_progress(
+        &self,
+        record: TransactionRecord,
+    ) -> (TransactionInsertOutcome, InProgressTransactionGuard) {
+        let _insert_guard = self.insert_lock.lock().await;
+        let guard = self.in_progress.register(record.id);
+        (self.insert_locked(record).await, guard)
+    }
+
+    async fn insert_locked(&self, mut record: TransactionRecord) -> TransactionInsertOutcome {
         record.sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let journal_fallback_required = match &self.journal_tx {
             Some(tx) => match encode_transaction_insert_journal_line(&record) {
@@ -696,6 +1280,22 @@ impl TransactionStore {
         };
         let summary = record.summary();
         let mut inner = self.inner.write().await;
+        if let Some(&index) = inner.by_id.get(&record.id) {
+            inner.service_map_metadata_epoch = Uuid::new_v4();
+            // Duplicate IDs remain separate ordering rows. Before moving the
+            // authoritative ID to the new row, keep the old row self-contained.
+            if inner.locators.contains_key(&record.id) {
+                match rehydrate_checked(&inner.entries[index], &inner, self.storage_dir.as_deref())
+                {
+                    Ok(full) => inner.entries[index] = full,
+                    Err(error) => {
+                        let generation = inner.body_generations[index];
+                        inner.unresolved_body_generations.insert(generation);
+                        warn!(?error, record_id = %record.id, "could not preserve older duplicate transaction body; snapshot persistence is blocked")
+                    }
+                }
+            }
+        }
         inner.push(record, summary.clone());
         let mut retention_trimmed = false;
         if let Some(max_entries) = self.max_entries {
@@ -704,8 +1304,9 @@ impl TransactionStore {
         drop(inner);
         self.publish_transaction_event(summary);
         if retention_trimmed {
-            let _ = self.retention_events.send(());
+            let _ = self.retention_events.send(TransactionRetentionEvent::Gap);
         }
+        self.in_progress.notify.notify_one();
         TransactionInsertOutcome {
             journal_fallback_required,
         }
@@ -770,6 +1371,14 @@ impl TransactionStore {
     }
 
     async fn delete_ids_locked(&self, ids: &[Uuid]) -> io::Result<usize> {
+        self.delete_ids_locked_with_event(ids, false).await
+    }
+
+    async fn delete_ids_locked_with_event(
+        &self,
+        ids: &[Uuid],
+        automatic_retention: bool,
+    ) -> io::Result<usize> {
         if ids.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -797,10 +1406,11 @@ impl TransactionStore {
                 "transaction journal writer is not available",
             )
         })?;
-        let line = encode_transaction_journal_line(&TransactionJournalEntry::Delete { ids })
-            .ok_or_else(|| {
-                io::Error::other("failed to encode transaction deletion journal entry")
-            })?;
+        let line =
+            encode_transaction_journal_line(&TransactionJournalEntry::Delete { ids: ids.clone() })
+                .ok_or_else(|| {
+                    io::Error::other("failed to encode transaction deletion journal entry")
+                })?;
         // InvalidInput is reserved for selection checks before an append. Even
         // that OS error can follow a written tombstone (for example at fsync),
         // so callers must treat every append/ack failure as uncertain persistence.
@@ -809,9 +1419,27 @@ impl TransactionStore {
             .map_err(io::Error::other)?;
 
         let mut inner = self.inner.write().await;
+        let mut removed_generations = Vec::new();
+        let retained_generations = inner
+            .entries
+            .iter()
+            .zip(&inner.body_generations)
+            .filter_map(|(record, generation)| {
+                if selected.contains(&record.id) {
+                    removed_generations.push(*generation);
+                    None
+                } else {
+                    Some(*generation)
+                }
+            })
+            .collect();
+        for generation in removed_generations {
+            inner.unresolved_body_generations.remove(&generation);
+        }
         inner
             .entries
             .retain(|record| !selected.contains(&record.id));
+        inner.body_generations = retained_generations;
         inner
             .summaries
             .retain(|cached| !selected.contains(&cached.summary.id));
@@ -822,9 +1450,22 @@ impl TransactionStore {
             .enumerate()
             .map(|(index, record)| (record.id, index))
             .collect();
+        inner.service_map_metadata_epoch = Uuid::new_v4();
+        inner.service_map_structure_epoch = Uuid::new_v4();
         drop(inner);
-        self.next_event_sequence.fetch_add(1, Ordering::Relaxed);
-        let _ = self.retention_events.send(());
+        let event_sequence = self.next_event_sequence.fetch_add(1, Ordering::Relaxed);
+        let event = if automatic_retention {
+            self.retention_trim_sequence
+                .fetch_max(event_sequence, Ordering::Release);
+            TransactionRetentionEvent::Deleted {
+                ids,
+                generation: self.saved_cursor_generation,
+                event_sequence,
+            }
+        } else {
+            TransactionRetentionEvent::Gap
+        };
+        let _ = self.retention_events.send(event);
         Ok(selected.len())
     }
 
@@ -1028,6 +1669,1320 @@ impl TransactionStore {
         }
     }
 
+    /// Capture row-exact metadata while one read lock fixes membership, order and
+    /// revisions. Never clone a full transaction or rehydrate a body here.
+    #[cfg(test)]
+    pub(crate) async fn service_map_snapshot(
+        &self,
+        session_id: Uuid,
+        max_records: usize,
+    ) -> crate::service_map::MetadataSnapshot {
+        self.service_map_snapshot_for_catalog(
+            session_id,
+            max_records,
+            crate::service_map_technology::CatalogVersion::V1,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn service_map_snapshot_for_catalog(
+        &self,
+        session_id: Uuid,
+        max_records: usize,
+        catalog: crate::service_map_technology::CatalogVersion,
+    ) -> crate::service_map::MetadataSnapshot {
+        let inner = self.inner.read().await;
+        self.service_map_snapshot_locked(
+            &inner,
+            session_id,
+            max_records,
+            catalog,
+            &ListFilters::default(),
+        )
+    }
+
+    /// Call only in a blocking worker. The fence and projection share one read
+    /// lock, which is released before aggregation or response serialization.
+    pub(crate) fn service_map_snapshot_blocking_for_catalog(
+        &self,
+        session_id: Uuid,
+        max_records: usize,
+        catalog: crate::service_map_technology::CatalogVersion,
+        filters: &ListFilters,
+    ) -> (
+        crate::service_map::MetadataSnapshot,
+        ServiceMapMetadataEpoch,
+    ) {
+        let inner = self.inner.blocking_read();
+        let epoch = ServiceMapMetadataEpoch(inner.service_map_metadata_epoch);
+        let mut snapshot =
+            self.service_map_snapshot_locked(&inner, session_id, max_records, catalog, filters);
+        let pending = self.cached_library_versions(&inner, &mut snapshot);
+        drop(inner);
+        self.read_library_versions(&mut snapshot, pending);
+        (snapshot, epoch)
+    }
+
+    /// Fills in the libraries each script and page row declares: from the cache
+    /// when read before, otherwise copied or located within this map's budget,
+    /// to read after the lock is released. Later maps read the rest.
+    fn cached_library_versions(
+        &self,
+        inner: &StoreInner,
+        snapshot: &mut crate::service_map::MetadataSnapshot,
+    ) -> Vec<(usize, PendingLibrary)> {
+        let mut caches = self.library_caches();
+        caches.trim();
+        let mut budget = LibraryBudget::default();
+        let mut pending = Vec::new();
+        for (row_index, row) in snapshot.rows.iter_mut().enumerate() {
+            match library_lookup(inner, &mut caches, row, &mut budget) {
+                Some(Ok(found)) => merge_libraries(&mut row.libraries, found),
+                Some(Err(item)) => pending.push((row_index, item)),
+                None => {}
+            }
+        }
+        pending
+    }
+
+    fn read_library_versions(
+        &self,
+        snapshot: &mut crate::service_map::MetadataSnapshot,
+        pending: Vec<(usize, PendingLibrary)>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let mut file = self.transactions_file();
+        for (row_index, item) in pending {
+            if let Some(found) = self.read_library(&mut file, item) {
+                merge_libraries(&mut snapshot.rows[row_index].libraries, found);
+            }
+        }
+    }
+
+    /// Scans a copied or retained body without the store lock. A retained row
+    /// must still own its locator in this file, as for a body inspection.
+    fn read_library(
+        &self,
+        file: &mut Option<fs::File>,
+        item: PendingLibrary,
+    ) -> Option<Vec<crate::service_map_libraries::Detection>> {
+        use crate::service_map_libraries::{detect, drop_library_source_map, read_body, scan_text};
+        use rsa::sha2::{Digest, Sha256};
+        let body = match item.source {
+            LibrarySource::Resident(body, encoding) => scan_text(body, encoding)?,
+            LibrarySource::Retained(locator, file_generation) => {
+                let file = file.as_mut()?;
+                validate_service_map_body_locator(
+                    &self.inner.blocking_read(),
+                    &item.key,
+                    file_generation,
+                    locator,
+                )
+                .ok()?;
+                read_body(file, locator, item.key.record_id)?
+            }
+        };
+        // Hash only the budgeted scan text, after validating and reading this
+        // row's own body. Repeated content skips detection, never verification.
+        let body_key = (item.kind, Sha256::digest(body.as_bytes()).into());
+        let cached = self.library_caches().bodies.get(&body_key).cloned();
+        let mut found = cached.unwrap_or_else(|| {
+            let found = detect(&body, item.kind);
+            self.library_caches().bodies.insert(body_key, found.clone());
+            found
+        });
+        // This suppression depends on the file name, not just its contents.
+        drop_library_source_map(&mut found, &item.url);
+        self.library_caches()
+            .rows
+            .insert((item.key.record_id, item.key.revision), found.clone());
+        Some(found)
+    }
+
+    fn library_caches(&self) -> std::sync::MutexGuard<'_, LibraryCaches> {
+        self.library_versions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn transactions_file(&self) -> Option<fs::File> {
+        self.storage_dir
+            .as_ref()
+            .and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok())
+    }
+
+    /// Discover admissible page origins before charging for bodies. Scripts
+    /// usually follow their page in capture order, so a newest-first fold has
+    /// not seen that page yet. Matching the canonical Referer against scope
+    /// would also lose the captured host spelling used for IDNs and IPv6.
+    fn service_map_scoped_origins(
+        &self,
+        (mut structure, mut next): (Uuid, usize),
+        scope: &mut crate::service_map::BoundedScope,
+        origin_filter: Option<&String>,
+        filters: &ListFilters,
+        advanced_matcher: Option<&AdvancedSearchMatcher>,
+    ) -> Result<HashSet<String>, ServiceMapStreamError> {
+        use crate::service_map::{request_target, MAX_ORIGINS};
+        let mut origins = HashSet::new();
+        let mut read = Vec::new();
+        while next > 0 {
+            let inner = self.inner.blocking_read();
+            if inner.service_map_structure_epoch != structure {
+                next = resume_below(&inner, &read).ok_or(ServiceMapStreamError::HistoryChanged)?;
+                structure = inner.service_map_structure_epoch;
+            }
+            let from = next.saturating_sub(SERVICE_MAP_CHUNK);
+            for index in (from..next).rev() {
+                let record = &inner.entries[index];
+                if record.method == "CONNECT"
+                    || !matches_filters(
+                        &inner.summaries[index],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        filters,
+                        advanced_matcher,
+                        false,
+                    )
+                {
+                    continue;
+                }
+                // These are the same admission checks as row projection and
+                // MapBuilder, without headers, body copies or derived clues.
+                let Some((target, _)) = request_target(record) else {
+                    continue;
+                };
+                if !scope
+                    .contains(&record.host)
+                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?
+                {
+                    continue;
+                }
+                let origin = target.origin().ascii_serialization();
+                if origin_filter.is_some_and(|only| only != &origin) {
+                    continue;
+                }
+                origins.insert(origin);
+                if origins.len() == MAX_ORIGINS {
+                    return Ok(origins);
+                }
+            }
+            read.clear();
+            read.extend(
+                (from..next).map(|index| (inner.entries[index].id, inner.body_generations[index])),
+            );
+            next = from;
+        }
+        Ok(origins)
+    }
+
+    /// The map over every retained row, newest first. Rows are folded as they
+    /// are projected, so none are kept, and the store lock is held a chunk at a
+    /// time, so captures continue while a large session is read. Appends and
+    /// updates during the read wait for the next map. Retention at its limit
+    /// removes a row with every capture, which moves the rows not yet read, so
+    /// the read continues below the oldest row it read that is still retained;
+    /// only losing all of its last chunk ends it as HistoryChanged. The flag says
+    /// whether every script and page body was read, or some wait for a later map.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn service_map_all_rows_blocking(
+        &self,
+        session_id: Uuid,
+        catalog: crate::service_map_technology::CatalogVersion,
+        filters: &ListFilters,
+        in_scope_only: bool,
+        origin_filter: Option<String>,
+        include: &[String],
+        exclude: &[String],
+    ) -> Result<(crate::service_map::ServiceMap, bool), ServiceMapStreamError> {
+        use crate::service_map::{
+            evidence_id, library_page, project_record, project_record_for_catalog, BoundedScope,
+            MapBuilder, MetadataSnapshot,
+        };
+        let mut scope = BoundedScope::new(include, exclude)
+            .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
+        let advanced_matcher = AdvancedSearchMatcher::new(filters);
+        // A one-origin map reads only that origin's bodies: the builder leaves
+        // every other row out, so reading theirs would spend the read budget on
+        // nothing, and a large session could leave the origin's own pages unread.
+        let only = origin_filter.clone();
+        let mut builder = MapBuilder::new(in_scope_only, origin_filter);
+        let (mut structure, retained, first, last) = {
+            let inner = self.inner.blocking_read();
+            (
+                inner.service_map_structure_epoch,
+                inner.entries.len(),
+                inner.entries.first().map(|r| r.started_at),
+                inner.entries.last().map(|r| r.started_at),
+            )
+        };
+        let mut meta = MetadataSnapshot {
+            generation: self.saved_cursor_generation,
+            captured_at: chrono::Utc::now(),
+            first_retained_started_at: first,
+            last_retained_started_at: last,
+            oldest_considered_at: None,
+            latest_considered_at: None,
+            retained_rows: retained,
+            considered_rows: 0,
+            non_http_rows: 0,
+            filtered_rows: 0,
+            omitted_rows: 0,
+            stopped_by: Default::default(),
+            rows: Vec::new(),
+            favicons: Default::default(),
+        };
+        let scoped_origins = in_scope_only
+            .then(|| {
+                self.service_map_scoped_origins(
+                    (structure, retained),
+                    &mut scope,
+                    only.as_ref(),
+                    filters,
+                    advanced_matcher.as_ref(),
+                )
+            })
+            .transpose()?;
+        let mut budget = LibraryBudget::default();
+        let mut pending = Vec::new();
+        let mut next = retained;
+        // The last chunk's rows, oldest first, by ID and body generation.
+        let mut read = Vec::new();
+        while next > 0 {
+            let inner = self.inner.blocking_read();
+            if inner.service_map_structure_epoch != structure {
+                next = resume_below(&inner, &read).ok_or(ServiceMapStreamError::HistoryChanged)?;
+                structure = inner.service_map_structure_epoch;
+            }
+            let mut caches = self.library_caches();
+            caches.trim();
+            let from = next.saturating_sub(SERVICE_MAP_CHUNK);
+            for index in (from..next).rev() {
+                let record = &inner.entries[index];
+                meta.considered_rows += 1;
+                meta.oldest_considered_at = Some(
+                    meta.oldest_considered_at
+                        .map_or(record.started_at, |time| time.min(record.started_at)),
+                );
+                meta.latest_considered_at = Some(
+                    meta.latest_considered_at
+                        .map_or(record.started_at, |time| time.max(record.started_at)),
+                );
+                if record.method == "CONNECT" {
+                    meta.non_http_rows += 1;
+                    continue;
+                }
+                note_favicon(&mut meta.favicons, record, || {
+                    evidence_id(
+                        session_id,
+                        self.saved_cursor_generation,
+                        inner.body_generations[index],
+                        record,
+                    )
+                });
+                if !matches_filters(
+                    &inner.summaries[index],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    filters,
+                    advanced_matcher.as_ref(),
+                    false,
+                ) {
+                    meta.filtered_rows += 1;
+                    continue;
+                }
+                let id = evidence_id(
+                    session_id,
+                    self.saved_cursor_generation,
+                    inner.body_generations[index],
+                    record,
+                );
+                let row = match catalog {
+                    crate::service_map_technology::CatalogVersion::V1 => project_record(record, id),
+                    crate::service_map_technology::CatalogVersion::V2 => {
+                        project_record_for_catalog(record, id, catalog)
+                    }
+                };
+                let Some(mut row) = row else {
+                    meta.omitted_rows += 1;
+                    meta.stopped_by
+                        .insert("unsupported_or_oversized_metadata".into());
+                    continue;
+                };
+                let in_scope = scope
+                    .contains(&row.scope_host)
+                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
+                // Charge only for included origins or assets their pages took
+                // from elsewhere. Excluded pages cannot use a read that would
+                // then be discarded, starving older included pages forever.
+                let page = library_page(&row);
+                let wanted = builder.wants_page(page.as_ref())
+                    && scoped_origins.as_ref().is_none_or(|origins| {
+                        page.as_ref().is_some_and(|page| origins.contains(page))
+                    });
+                let included = (!in_scope_only || in_scope)
+                    && only.as_ref().is_none_or(|origin| *origin == row.origin)
+                    && scoped_origins
+                        .as_ref()
+                        .is_none_or(|origins| origins.contains(&row.origin));
+                let lookup = if included || wanted {
+                    library_lookup(&inner, &mut caches, &row, &mut budget)
+                } else {
+                    None
+                };
+                let waiting = match lookup {
+                    Some(Ok(found)) => {
+                        merge_libraries(&mut row.libraries, found);
+                        None
+                    }
+                    Some(Err(item)) => Some((
+                        item,
+                        page,
+                        row.origin.clone(),
+                        row.evidence_id.clone(),
+                        std::mem::take(&mut row.libraries),
+                    )),
+                    None => None,
+                };
+                if builder.add(row, in_scope) || wanted {
+                    pending.extend(waiting);
+                }
+            }
+            read.clear();
+            read.extend(
+                (from..next).map(|index| (inner.entries[index].id, inner.body_generations[index])),
+            );
+            next = from;
+        }
+        let mut file = self.transactions_file();
+        for (item, page, origin, evidence, mut found) in pending {
+            if let Some(more) = self.read_library(&mut file, item) {
+                merge_libraries(&mut found, more);
+            }
+            builder.add_libraries(page, origin, found, evidence);
+        }
+        Ok((
+            builder.finish(session_id, meta, retained.max(1)),
+            !budget.exhausted,
+        ))
+    }
+
+    /// A whole-history map from the last read with the same key, when history
+    /// is unchanged since, or when that read is recent: a large session is
+    /// rebuilt no more often than four times its build time, at least every
+    /// 1.2 seconds' poll, unless the caller asks for a fresh map. Retention at
+    /// its limit removes a row with every capture, so a recent map is served
+    /// whatever changed, and shows rows removed since until the next.
+    pub(crate) fn cached_service_map(&self, key: &str, fresh: bool) -> Option<bytes::Bytes> {
+        let token = self.service_map_history_token();
+        let cache = self
+            .service_map_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = cache.as_ref().filter(|cached| cached.key == key)?;
+        let unchanged = cached.complete && cached.token == token;
+        let recent = !fresh
+            && cached.built.elapsed()
+                < (cached.cost * 4).max(std::time::Duration::from_millis(1_200));
+        (unchanged || recent).then(|| cached.bytes.clone())
+    }
+
+    pub(crate) fn store_service_map(
+        &self,
+        key: String,
+        token: (Uuid, Uuid, usize),
+        cost: std::time::Duration,
+        complete: bool,
+        bytes: bytes::Bytes,
+    ) {
+        *self
+            .service_map_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedServiceMap {
+            key,
+            token,
+            built: std::time::Instant::now(),
+            cost,
+            complete,
+            bytes,
+        });
+    }
+
+    /// What a whole-history map was built from: an update or removal changes
+    /// metadata epoch, an annotation edit its own epoch, and an append the row
+    /// count. Evidence and bounded-map publication ignore annotation-only edits.
+    pub(crate) fn service_map_history_token(&self) -> (Uuid, Uuid, usize) {
+        let inner = self.inner.blocking_read();
+        (
+            inner.service_map_metadata_epoch,
+            inner.service_map_annotation_epoch,
+            inner.entries.len(),
+        )
+    }
+
+    pub(crate) async fn service_map_metadata_epoch_matches(
+        &self,
+        epoch: ServiceMapMetadataEpoch,
+    ) -> bool {
+        self.inner.read().await.service_map_metadata_epoch == epoch.0
+    }
+
+    fn service_map_snapshot_locked(
+        &self,
+        inner: &StoreInner,
+        session_id: Uuid,
+        max_records: usize,
+        catalog: crate::service_map_technology::CatalogVersion,
+        filters: &ListFilters,
+    ) -> crate::service_map::MetadataSnapshot {
+        use crate::service_map::{
+            evidence_id, project_record, project_record_for_catalog, MetadataSnapshot,
+            MAX_METADATA_BYTES,
+        };
+        // The display filter is HTTP history's own row matcher, so the map hides
+        // exactly the rows History would hide; scope stays with `in_scope_only`.
+        let advanced_matcher = AdvancedSearchMatcher::new(filters);
+        let mut snapshot = MetadataSnapshot {
+            generation: self.saved_cursor_generation,
+            captured_at: chrono::Utc::now(),
+            first_retained_started_at: inner.entries.first().map(|r| r.started_at),
+            last_retained_started_at: inner.entries.last().map(|r| r.started_at),
+            oldest_considered_at: None,
+            latest_considered_at: None,
+            retained_rows: inner.entries.len(),
+            considered_rows: 0,
+            non_http_rows: 0,
+            filtered_rows: 0,
+            omitted_rows: 0,
+            stopped_by: Default::default(),
+            rows: Vec::new(),
+            favicons: Default::default(),
+        };
+        let mut bytes = 0usize;
+        for ((record, revision), cached) in inner
+            .entries
+            .iter()
+            .zip(&inner.body_generations)
+            .zip(&inner.summaries)
+            .rev()
+        {
+            if snapshot.considered_rows >= max_records {
+                snapshot.stopped_by.insert("max_records".into());
+                break;
+            }
+            snapshot.considered_rows += 1;
+            snapshot.oldest_considered_at = Some(
+                snapshot
+                    .oldest_considered_at
+                    .map_or(record.started_at, |time| time.min(record.started_at)),
+            );
+            snapshot.latest_considered_at = Some(
+                snapshot
+                    .latest_considered_at
+                    .map_or(record.started_at, |time| time.max(record.started_at)),
+            );
+            if record.method == "CONNECT" {
+                snapshot.non_http_rows += 1;
+                continue;
+            }
+            note_favicon(&mut snapshot.favicons, record, || {
+                evidence_id(session_id, self.saved_cursor_generation, *revision, record)
+            });
+            if !matches_filters(
+                cached,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                filters,
+                advanced_matcher.as_ref(),
+                false,
+            ) {
+                snapshot.filtered_rows += 1;
+                continue;
+            }
+            let id = evidence_id(session_id, self.saved_cursor_generation, *revision, record);
+            let row = match catalog {
+                crate::service_map_technology::CatalogVersion::V1 => project_record(record, id),
+                crate::service_map_technology::CatalogVersion::V2 => {
+                    project_record_for_catalog(record, id, catalog)
+                }
+            };
+            let Some(row) = row else {
+                snapshot.omitted_rows += 1;
+                snapshot
+                    .stopped_by
+                    .insert("unsupported_or_oversized_metadata".into());
+                continue;
+            };
+            // Serialization measures only the safe projection, never bodies or
+            // raw headers. Bound cumulative memory even for high-cardinality paths.
+            bytes = bytes.saturating_add(
+                serde_json::to_vec(&row).map_or(MAX_METADATA_BYTES + 1, |v| v.len()),
+            );
+            if bytes > MAX_METADATA_BYTES {
+                snapshot.stopped_by.insert("metadata_bytes".into());
+                snapshot.omitted_rows += 1;
+                break;
+            }
+            snapshot.rows.push(row);
+        }
+        snapshot
+    }
+
+    pub(crate) async fn service_map_evidence(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map::ServiceMapEvidence {
+        self.service_map_evidence_with_socket_peer(session_id, id, false)
+            .await
+    }
+
+    pub(crate) async fn service_map_evidence_with_socket_peer(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        include_socket_peer: bool,
+    ) -> crate::service_map::ServiceMapEvidence {
+        self.service_map_evidence_for_catalog(
+            session_id,
+            id,
+            include_socket_peer,
+            crate::service_map_technology::CatalogVersion::V1,
+        )
+        .await
+    }
+
+    pub(crate) async fn service_map_evidence_for_catalog(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        include_socket_peer: bool,
+        catalog: crate::service_map_technology::CatalogVersion,
+    ) -> crate::service_map::ServiceMapEvidence {
+        use crate::service_map::{project_record_for_catalog, EvidenceKey, ServiceMapEvidence};
+        let missing = |reason| ServiceMapEvidence::missing(session_id, id.into(), reason);
+        let Some(key) = EvidenceKey::parse(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        let inner = self.inner.read().await;
+        // UUID lookup deliberately cannot resolve this: retained legacy rows may
+        // share an ID and get(id) selects the latest one.
+        let Ok(index) = inner
+            .entries
+            .binary_search_by_key(&key.sequence, |record| record.sequence)
+        else {
+            return missing("record_missing");
+        };
+        let record = &inner.entries[index];
+        if record.id != key.record_id {
+            return missing("record_missing");
+        }
+        if inner.body_generations[index] != key.revision {
+            return missing("record_changed");
+        }
+        match project_record_for_catalog(record, id.into(), catalog) {
+            Some(row) => {
+                let mut evidence = ServiceMapEvidence::found(session_id, row);
+                if include_socket_peer {
+                    evidence.socket_peer =
+                        Some(crate::service_map::ServiceMapSocketPeerEvidence::from_record(record));
+                }
+                evidence
+            }
+            None => missing("metadata_unavailable"),
+        }
+    }
+
+    /// Explicit retained peer equality. There is no body/locator dependency,
+    /// global peer index, traffic hydration, or ordinary-map projection here.
+    pub async fn service_map_socket_peer_matches(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        in_scope_only: bool,
+        max_records: usize,
+        include: &[String],
+        exclude: &[String],
+    ) -> crate::service_map_peer_matches::ServiceMapSocketPeerMatches {
+        self.service_map_socket_peer_matches_impl(
+            session_id,
+            id,
+            in_scope_only,
+            max_records,
+            include,
+            exclude,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn service_map_socket_peer_matches_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        in_scope_only: bool,
+        max_records: usize,
+        include: &[String],
+        exclude: &[String],
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_peer_matches::ServiceMapSocketPeerMatches {
+        use crate::service_map_peer_matches::{
+            canonical_evidence_key, inspect_retained, ServiceMapSocketPeerMatches,
+        };
+        let max_records = max_records.clamp(1, crate::service_map::MAX_RECORDS);
+        let missing = |reason| {
+            ServiceMapSocketPeerMatches::missing(
+                session_id,
+                id.into(),
+                in_scope_only,
+                max_records,
+                reason,
+            )
+        };
+        let Some(key) = canonical_evidence_key(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        if !crate::scope::PreparedScope::within_limits(
+            include,
+            exclude,
+            crate::service_map_peer_matches::MAX_SCOPE_PATTERN_ENTRIES,
+            crate::service_map_peer_matches::MAX_SCOPE_PATTERN_BYTES,
+        ) {
+            return missing("scope_work_limit");
+        }
+        let generation = self.saved_cursor_generation;
+        let inner = Arc::clone(&self.inner);
+        let evidence_id = id.to_owned();
+        let include = include.to_vec();
+        let exclude = exclude.to_vec();
+        // Bounded CPU work runs off the async executor. One read lock fixes row
+        // membership and revisions. Nonmatching rows cause no string copies.
+        let task = tokio::task::spawn_blocking(move || {
+            // Scope lists are bounded by runtime settings. Normalize once off
+            // lock; dense include/exclude lists must not allocate per row/pattern.
+            let Some(prepared_scope) = crate::scope::PreparedScope::try_new(
+                &include,
+                &exclude,
+                crate::service_map_peer_matches::MAX_SCOPE_PATTERN_ENTRIES,
+                crate::service_map_peer_matches::MAX_SCOPE_PATTERN_BYTES,
+            ) else {
+                return ServiceMapSocketPeerMatches::missing(
+                    session_id,
+                    evidence_id,
+                    in_scope_only,
+                    max_records,
+                    "scope_work_limit",
+                );
+            };
+            drop(include);
+            drop(exclude);
+            let result = {
+                let locked = inner.blocking_read();
+                let source = match service_map_row_index(&locked, &key) {
+                    Ok(index) => &locked.entries[index],
+                    Err(reason) => {
+                        return ServiceMapSocketPeerMatches::missing(
+                            session_id,
+                            evidence_id,
+                            in_scope_only,
+                            max_records,
+                            reason,
+                        )
+                    }
+                };
+                inspect_retained(
+                    session_id,
+                    generation,
+                    &evidence_id,
+                    source,
+                    locked
+                        .entries
+                        .iter()
+                        .zip(locked.body_generations.iter().copied())
+                        .rev(),
+                    max_records,
+                    in_scope_only,
+                    &prepared_scope,
+                )
+            };
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("after_snapshot");
+            }
+            match service_map_row_index(&inner.blocking_read(), &key) {
+                Ok(_) => result,
+                Err(reason) => ServiceMapSocketPeerMatches::missing(
+                    session_id,
+                    evidence_id,
+                    in_scope_only,
+                    max_records,
+                    reason,
+                ),
+            }
+        });
+        task.await
+            .unwrap_or_else(|_| missing("peer_inspection_failed"))
+    }
+
+    /// Metadata-only exact-row inspection. Body storage is deliberately absent
+    /// from both acquisition and publication checks, even for duplicate UUIDs.
+    pub async fn service_map_link_declarations(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map_links::ServiceMapLinkDeclarations {
+        self.service_map_link_declarations_impl(
+            session_id,
+            id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn service_map_link_source_status(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> Result<(), &'static str> {
+        let key = crate::service_map::EvidenceKey::parse(id).ok_or("invalid_evidence_id")?;
+        if key.session_id != session_id {
+            return Err("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return Err("stale_generation");
+        }
+        let inner = self.inner.read().await;
+        service_map_row_index(&inner, &key).map(|_| ())
+    }
+
+    async fn service_map_link_declarations_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_links::ServiceMapLinkDeclarations {
+        use crate::{
+            service_map::EvidenceKey,
+            service_map_links::{self, LinkSource, ServiceMapLinkDeclarations},
+        };
+        let missing = |reason| ServiceMapLinkDeclarations::missing(session_id, id.into(), reason);
+        let Some(key) = EvidenceKey::parse(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        let source = {
+            let inner = self.inner.read().await;
+            let index = match service_map_row_index(&inner, &key) {
+                Ok(index) => index,
+                Err(reason) => return missing(reason),
+            };
+            match LinkSource::from_record(&inner.entries[index]) {
+                Ok(source) => source,
+                Err("unsupported_source_context") => {
+                    return ServiceMapLinkDeclarations::unsupported(session_id, id.into())
+                }
+                Err(reason) => return missing(reason),
+            }
+        };
+        let inner = Arc::clone(&self.inner);
+        let evidence_id = id.to_owned();
+        let task = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("before_scan");
+            }
+            let result = service_map_links::inspect_source(session_id, evidence_id.clone(), source);
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("after_scan");
+            }
+            // Revisions change for full record mutations; annotation-only edits
+            // remain valid. No body locator ambiguity can invalidate headers.
+            match service_map_row_index(&inner.blocking_read(), &key) {
+                Ok(_) => result,
+                Err(reason) => ServiceMapLinkDeclarations::missing(session_id, evidence_id, reason),
+            }
+        });
+        task.await
+            .unwrap_or_else(|_| missing("link_inspection_failed"))
+    }
+
+    /// Opt-in, exact-token reads of a retained response preview. No generic
+    /// transaction lookup, body decoding, or full record hydration is allowed.
+    pub async fn service_map_body_references(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map_body::ServiceMapBodyReferences {
+        self.service_map_body_references_impl(
+            session_id,
+            id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn service_map_body_references_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_body::ServiceMapBodyReferences {
+        use crate::service_map_body::{self, BodySource, ServiceMapBodyReferences};
+        self.service_map_retained_preview(
+            session_id,
+            id,
+            BodySource::from_record,
+            service_map_body::scan_preview,
+            ServiceMapBodyReferences::missing,
+            ServiceMapBodyReferences::unsupported,
+            #[cfg(test)]
+            hook,
+        )
+        .await
+    }
+
+    /// The icon a map named by evidence: the row's whole retained body, when it
+    /// is still that icon row and its bytes are a raster image.
+    pub async fn service_map_favicon(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> Option<(&'static str, Vec<u8>)> {
+        let key = crate::service_map::EvidenceKey::parse(id)?;
+        if key.session_id != session_id || key.generation != self.saved_cursor_generation {
+            return None;
+        }
+        let record = {
+            let inner = self.inner.read().await;
+            let index = service_map_body_row_index(&inner, &key).ok()?;
+            let record = &inner.entries[index];
+            crate::service_map::favicon_origin(record)?;
+            self.rehydrate(record, &inner)
+        };
+        let bytes = record.response?.body_bytes();
+        crate::service_map::favicon_type(&bytes).map(|kind| (kind, bytes))
+    }
+
+    /// A separate opt-in operation; default metadata and body-reference reads
+    /// never invoke the HTML parser or enrich their existing output.
+    pub async fn service_map_html_generators(
+        &self,
+        session_id: Uuid,
+        id: &str,
+    ) -> crate::service_map_html::ServiceMapHtmlGenerators {
+        self.service_map_html_generators_impl(
+            session_id,
+            id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn service_map_html_generators_impl(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> crate::service_map_html::ServiceMapHtmlGenerators {
+        use crate::{
+            service_map_body::BodySource,
+            service_map_html::{self, ServiceMapHtmlGenerators},
+        };
+        self.service_map_retained_preview(
+            session_id,
+            id,
+            BodySource::from_html_record,
+            service_map_html::scan_preview,
+            ServiceMapHtmlGenerators::missing,
+            ServiceMapHtmlGenerators::unsupported,
+            #[cfg(test)]
+            hook,
+        )
+        .await
+    }
+
+    // Keep inspection inside the read fence. Returning an unfenced preview to
+    // callers would permit evidence to escape after retention or file replacement.
+    async fn service_map_retained_preview<R: Send + 'static>(
+        &self,
+        session_id: Uuid,
+        id: &str,
+        source_from_record: fn(
+            &TransactionRecord,
+        )
+            -> Result<crate::service_map_body::BodySource, &'static str>,
+        scan_preview: fn(
+            Uuid,
+            String,
+            crate::service_map_body::BodySource,
+            crate::service_map_body::RetainedPreview,
+        ) -> R,
+        missing_result: fn(Uuid, String, &str) -> R,
+        unsupported_result: fn(Uuid, String, &str) -> R,
+        #[cfg(test)] hook: Option<ServiceMapBodyReadHook>,
+    ) -> R {
+        use crate::{
+            service_map::EvidenceKey,
+            service_map_body::{read_preview, RetainedPreview, MAX_SERIALIZED_ROW_BYTES},
+        };
+        let missing = |reason| missing_result(session_id, id.into(), reason);
+        let Some(key) = EvidenceKey::parse(id) else {
+            return missing("invalid_evidence_id");
+        };
+        if key.session_id != session_id {
+            return missing("session_mismatch");
+        }
+        if key.generation != self.saved_cursor_generation {
+            return missing("stale_generation");
+        }
+        let (source, resident, located) = {
+            let inner = self.inner.read().await;
+            let index = match service_map_body_row_index(&inner, &key) {
+                Ok(index) => index,
+                Err(reason) => return missing(reason),
+            };
+            let record = &inner.entries[index];
+            let source = match source_from_record(record) {
+                Ok(source) => source,
+                Err("response_unavailable") => return missing("response_unavailable"),
+                Err(reason) => return unsupported_result(session_id, id.into(), reason),
+            };
+            let locator = (inner.by_id.get(&record.id) == Some(&index))
+                .then(|| inner.locators.get(&record.id).copied())
+                .flatten();
+            match locator {
+                Some(locator) => {
+                    if locator.len as usize > MAX_SERIALIZED_ROW_BYTES {
+                        return missing("serialized_row_limit");
+                    }
+                    (source, None, Some((locator, inner.file_generation)))
+                }
+                None => {
+                    let preview = RetainedPreview::from_str(
+                        &record
+                            .response
+                            .as_ref()
+                            .expect("supported response")
+                            .body_preview,
+                    );
+                    (source, Some(preview), None)
+                }
+            }
+        };
+        let inner = Arc::clone(&self.inner);
+        let storage_dir = self.storage_dir.clone();
+        let evidence_id = id.to_owned();
+        let task = tokio::task::spawn_blocking(move || {
+            let missing = |reason| missing_result(session_id, evidence_id.clone(), reason);
+            let preview = if let Some((locator, file_generation)) = located {
+                let Some(storage_dir) = storage_dir else {
+                    return missing("body_storage_unavailable");
+                };
+                // Opening before the generation check gives us a stable inode.
+                // Publication renames and adopts locators under the write lock:
+                // either this handle and captured offsets agree, or we reject.
+                let file = match fs::File::open(storage_dir.join("transactions.ndjson")) {
+                    Ok(file) => file,
+                    Err(_) => return missing("body_storage_unavailable"),
+                };
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook("after_open");
+                }
+                if let Err(reason) = validate_service_map_body_locator(
+                    &inner.blocking_read(),
+                    &key,
+                    file_generation,
+                    locator,
+                ) {
+                    return missing(reason);
+                }
+                // All file I/O and JSON parsing happen without a store lock.
+                read_preview(file, locator, key.record_id, &source)
+            } else {
+                Ok(resident.expect("resident preview or locator"))
+            };
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("before_scan");
+            }
+            let result = match preview {
+                Ok(preview) => scan_preview(session_id, evidence_id.clone(), source, preview),
+                Err(reason) => missing(reason),
+            };
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("after_scan");
+            }
+            // Never publish evidence after deletion, retention, full mutation,
+            // duplicate displacement, or a transactions-file replacement.
+            let current = inner.blocking_read();
+            let validity = match located {
+                Some((locator, file_generation)) => {
+                    validate_service_map_body_locator(&current, &key, file_generation, locator)
+                }
+                None => service_map_body_row_index(&current, &key).map(|_| ()),
+            };
+            match validity {
+                Ok(()) => result,
+                Err(reason) => missing(reason),
+            }
+        });
+        task.await.unwrap_or_else(|_| missing("body_scan_failed"))
+    }
+
+    /// The parameters one endpoint was called with, from its newest retained
+    /// rows. Queries come from row metadata; bodies are read here, on request,
+    /// never to build the map.
+    pub async fn service_map_parameters(
+        &self,
+        session_id: Uuid,
+        origin: &str,
+        method: &str,
+        path: &str,
+    ) -> crate::service_map_parameters::EndpointParameters {
+        use crate::service_map_parameters::{
+            EndpointParameters, ParameterTally, MAX_ROWS, MAX_TOTAL_BODY_BYTES,
+        };
+        let mut result =
+            EndpointParameters::new(session_id, origin.into(), method.into(), path.into());
+        let mut rows = Vec::new();
+        let file_generation = {
+            let inner = self.inner.read().await;
+            for (index, record) in inner.entries.iter().enumerate().rev() {
+                let (record_path, query) = path_and_query(&record.path);
+                if record.method != method
+                    || record_path != path
+                    || crate::service_map::canonical_origin(&format!(
+                        "{}://{}",
+                        record.scheme, record.host
+                    ))
+                    .as_deref()
+                        != Some(origin)
+                {
+                    continue;
+                }
+                if rows.len() == MAX_ROWS {
+                    result.more_rows = true;
+                    break;
+                }
+                rows.push(parameter_row(
+                    &inner,
+                    index,
+                    session_id,
+                    self.saved_cursor_generation,
+                    query,
+                ));
+            }
+            inner.file_generation
+        };
+        let inner = Arc::clone(&self.inner);
+        let storage_dir = self.storage_dir.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            // All file I/O and parsing happen without a store lock; each row
+            // must still own its locator in this file, as for a body inspection.
+            let mut file =
+                storage_dir.and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok());
+            let mut tally = ParameterTally::default();
+            let (mut read, mut budget, mut unread) = (0, MAX_TOTAL_BODY_BYTES, 0);
+            for mut row in rows {
+                let body = parameter_body(
+                    &inner,
+                    file.as_mut(),
+                    file_generation,
+                    &mut budget,
+                    &mut row,
+                );
+                unread += usize::from(body.is_none());
+                tally.add_row(
+                    row.query.as_deref(),
+                    row.content_type.as_deref(),
+                    body.as_deref().unwrap_or(""),
+                );
+                read += 1;
+            }
+            (tally.finish(), read, unread)
+        });
+        match task.await {
+            Ok(((parameters, omitted), read, unread)) => {
+                result.parameters = parameters;
+                result.omitted_parameters = omitted;
+                result.rows = read;
+                result.unread_bodies = unread;
+            }
+            Err(_) => {
+                result.available = false;
+                result.reasons = vec!["parameter_read_failed".into()];
+            }
+        }
+        result
+    }
+
+    /// One origin's API in OpenAPI (`service_map_openapi`), from every retained
+    /// row of it. Parameters come from each operation's newest rows, within the
+    /// same body budget as one endpoint's parameters.
+    pub async fn service_map_openapi(
+        &self,
+        session_id: Uuid,
+        origin: &str,
+    ) -> Option<serde_json::Value> {
+        use crate::service_map_openapi::{
+            document, media_type, operation_path, static_path, Operation, MAX_OPERATIONS,
+            MAX_ROWS_PER_OPERATION, METHODS,
+        };
+        use crate::service_map_parameters::{ParameterTally, MAX_TOTAL_BODY_BYTES};
+        let inner = Arc::clone(&self.inner);
+        let storage_dir = self.storage_dir.clone();
+        let generation = self.saved_cursor_generation;
+        let origin = origin.to_string();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut found: std::collections::BTreeMap<(String, String), (Operation, Vec<_>)> =
+                Default::default();
+            let mut omitted = std::collections::BTreeSet::new();
+            let mut static_requests = 0;
+            let mut held = 0;
+            // ponytail: one read-locked pass over the history; read it in
+            // chunks as the map does if exporting a huge session stalls capture.
+            let file_generation = {
+                let inner = inner.blocking_read();
+                let mut same_origin = HashMap::new();
+                for (index, record) in inner.entries.iter().enumerate().rev() {
+                    let method = record.method.to_ascii_lowercase();
+                    let (path, query) = path_and_query(&record.path);
+                    if !METHODS.contains(&method.as_str())
+                        || !path.starts_with('/')
+                        || !*same_origin
+                            .entry((record.scheme.as_str(), record.host.as_str()))
+                            .or_insert_with(|| {
+                                crate::service_map::canonical_origin(&format!(
+                                    "{}://{}",
+                                    record.scheme, record.host
+                                ))
+                                .as_deref()
+                                    == Some(origin.as_str())
+                            })
+                    {
+                        continue;
+                    }
+                    // Never in the document, so never taking an API's place
+                    // under the cap: 500 images used to leave it empty.
+                    if static_path(path) {
+                        static_requests += 1;
+                        continue;
+                    }
+                    let key = (operation_path(path), method);
+                    if found.len() == MAX_OPERATIONS && !found.contains_key(&key) {
+                        omitted.insert(key);
+                        continue;
+                    }
+                    let (operation, rows) = found.entry(key).or_default();
+                    // Rows are read newest first.
+                    operation.newest.get_or_insert((record.sequence, record.id));
+                    operation.requests += 1;
+                    if let Some(status) = record.status.filter(|status| (100..600).contains(status))
+                    {
+                        let types = operation.responses.entry(status).or_default();
+                        types.extend(
+                            record
+                                .response
+                                .as_ref()
+                                .and_then(|response| response.content_type.as_deref())
+                                .and_then(media_type),
+                        );
+                    }
+                    if record.request.body_size > 0 {
+                        let request_type = record.request.content_type.as_deref();
+                        operation
+                            .request_types
+                            .extend(request_type.and_then(media_type));
+                    }
+                    operation
+                        .auth
+                        .extend(crate::service_map_auth::detect(record));
+                    if rows.len() < MAX_ROWS_PER_OPERATION {
+                        let mut row = parameter_row(&inner, index, session_id, generation, query);
+                        // Unsaved bodies held for the read share its budget,
+                        // so thousands of them cannot pile up in memory.
+                        held += row.body.as_ref().map_or(0, String::len);
+                        if held > MAX_TOTAL_BODY_BYTES {
+                            row.body = None;
+                        }
+                        rows.push(row);
+                    }
+                }
+                inner.file_generation
+            };
+            let mut file =
+                storage_dir.and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok());
+            let mut budget = MAX_TOTAL_BODY_BYTES;
+            let operations = found
+                .into_iter()
+                .map(|(key, (mut operation, rows))| {
+                    let mut tally = ParameterTally::named_only();
+                    for mut row in rows {
+                        let body = parameter_body(
+                            &inner,
+                            file.as_mut(),
+                            file_generation,
+                            &mut budget,
+                            &mut row,
+                        );
+                        tally.add_row(
+                            row.query.as_deref(),
+                            row.content_type.as_deref(),
+                            body.as_deref().unwrap_or(""),
+                        );
+                    }
+                    operation.json_types = tally.json_types();
+                    operation.parameters = tally.finish().0;
+                    (key, operation)
+                })
+                .collect();
+            document(&origin, &operations, omitted.len(), static_requests)
+        });
+        task.await.ok()
+    }
+
     pub async fn site_map_records(&self) -> Vec<SiteMapRecord> {
         let inner = self.inner.read().await;
         inner
@@ -1094,16 +3049,14 @@ impl TransactionStore {
             return outcome;
         }
 
-        // Collect candidates under the lock, then let it go: the reads below are
-        // blocking file I/O and holding a read lock across them would stall every
-        // writer for the length of the scan. A rewrite in the meantime moves the
-        // offsets, and the id check in the read path turns that into a record we
-        // count as unsearchable rather than someone else's traffic.
+        // Keep the original row identity as well as ordering hints. An ID may
+        // occur more than once, so resolving every candidate through by_id would
+        // scan the newest duplicate repeatedly and omit older bodies.
         struct Candidate {
             id: Uuid,
-            sequence: u64,
-            locator: Option<crate::session::BodyLocator>,
-            in_memory: Option<TransactionRecord>,
+            index: usize,
+            body_generation: Uuid,
+            sort_offset: u64,
         }
         let candidates: Vec<Candidate> = {
             let inner = self.inner.read().await;
@@ -1150,17 +3103,14 @@ impl TransactionStore {
                 })
                 .map(|(index, cached)| {
                     let id = cached.summary.id;
-                    let locator = inner.locators.get(&id).copied();
                     Candidate {
                         id,
-                        sequence: cached.summary.sequence,
-                        locator,
-                        // Anything captured since the last persist still holds its
-                        // bodies here, and has no locator to read them back from.
-                        in_memory: if locator.is_none() {
-                            inner.entries.get(index).cloned()
+                        index,
+                        body_generation: inner.body_generations[index],
+                        sort_offset: if inner.by_id.get(&id) == Some(&index) {
+                            inner.locators.get(&id).map_or(0, |locator| locator.offset)
                         } else {
-                            None
+                            0
                         },
                     }
                 })
@@ -1171,11 +3121,12 @@ impl TransactionStore {
         // The reads are blocking file I/O over as much as the byte budget allows,
         // which is far too long to hold a runtime worker that proxy tasks share.
         let storage_dir = self.storage_dir.clone();
+        let inner = Arc::clone(&self.inner);
         let request = request.clone();
         let scan = tokio::task::spawn_blocking(move || {
             // File order, so the pass over transactions.ndjson only moves forward.
             let mut ordered = candidates;
-            ordered.sort_by_key(|candidate| candidate.locator.map(|l| l.offset).unwrap_or(0));
+            ordered.sort_by_key(|candidate| candidate.sort_offset);
             for candidate in ordered {
                 if outcome.match_count >= request.max_matches {
                     outcome.stop("max_matches");
@@ -1185,21 +3136,30 @@ impl TransactionStore {
                     outcome.stop("byte_budget");
                     break;
                 }
-                let record = match (candidate.in_memory, candidate.locator, &storage_dir) {
-                    (Some(record), _, _) => record,
-                    (None, Some(locator), Some(dir)) => {
-                        match crate::session::read_transaction_at(dir, locator) {
-                            // Same reason rehydrate checks: a byte range is not a key.
-                            Some(full) if full.id == candidate.id => full,
-                            _ => {
-                                outcome.unsearchable += 1;
-                                continue;
-                            }
+                let record = {
+                    let inner = inner.blocking_read();
+                    let current = inner.entries.get(candidate.index).filter(|record| {
+                        record.id == candidate.id
+                            && inner.body_generations.get(candidate.index)
+                                == Some(&candidate.body_generation)
+                            && !inner
+                                .unresolved_body_generations
+                                .contains(&candidate.body_generation)
+                    });
+                    match current.and_then(|record| {
+                        if inner.by_id.get(&candidate.id) == Some(&candidate.index) {
+                            rehydrate_checked(record, &inner, storage_dir.as_deref()).ok()
+                        } else {
+                            // An older duplicate owns its resident body, never
+                            // the locator belonging to the newest same-ID row.
+                            Some(record.clone())
                         }
-                    }
-                    _ => {
-                        outcome.unsearchable += 1;
-                        continue;
+                    }) {
+                        Some(record) => record,
+                        None => {
+                            outcome.unsearchable += 1;
+                            continue;
+                        }
                     }
                 };
                 outcome.records_scanned += 1;
@@ -1213,13 +3173,7 @@ impl TransactionStore {
                             .map(|message| message.body_size as u64)
                             .unwrap_or(0),
                     );
-                collect_record_matches(
-                    &record,
-                    candidate.sequence,
-                    &needle,
-                    &request,
-                    &mut outcome,
-                );
+                collect_record_matches(&record, record.sequence, &needle, &request, &mut outcome);
             }
             if outcome.unsearchable > 0 {
                 outcome.complete = false;
@@ -1248,64 +3202,88 @@ impl TransactionStore {
     /// The in-memory copy carries the current annotations, which may be ahead of
     /// what is on disk, so those are kept and only the bodies come from the file.
     fn rehydrate(&self, record: &TransactionRecord, inner: &StoreInner) -> TransactionRecord {
-        let Some(locator) = inner.locators.get(&record.id).copied() else {
-            return record.clone();
-        };
-        let Some(storage_dir) = self.storage_dir.as_deref() else {
-            return record.clone();
-        };
-        let Some(mut full) = crate::session::read_transaction_at(storage_dir, locator) else {
-            warn!(record_id = %record.id, "could not read transaction bodies back from disk");
-            return record.clone();
-        };
-        // The locator is a byte range, not a key: nothing in the read path ties it
-        // to this record. A stale one that happens to land on another record's line
-        // parses cleanly, and the caller would be handed someone else's traffic with
-        // no error and no crash — the failure AGENTS.md section 5.1 warns about.
-        // Checking the id costs nothing and turns that into a missing body.
-        if full.id != record.id {
-            warn!(
-                record_id = %record.id,
-                "transaction locator pointed at a different record; serving the copy in memory"
-            );
-            return record.clone();
-        }
-        full.notes = record.notes.clone();
-        full.color_tag = record.color_tag.clone();
-        full.user_note = record.user_note.clone();
-        full.annotation_revision = record.annotation_revision;
-        full.annotation_client_versions = record.annotation_client_versions.clone();
-        full
+        rehydrate_checked(record, inner, self.storage_dir.as_deref()).unwrap_or_else(|error| {
+            warn!(?error, record_id = %record.id, "could not read transaction bodies back from disk");
+            record.clone()
+        })
     }
 
-    /// Records to write, each with where its bodies already sit on disk. The
-    /// writer copies those lines across rather than loading them, so compaction
-    /// never has to hold the whole history in memory.
+    /// Drain any detached persistence worker before changing the session's
+    /// directory lifetime. Acquire after the session persistence guard.
+    pub(crate) async fn owned_persistence_mutation_guard(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.insert_lock).lock_owned().await
+    }
+
+    /// Records, body locations and the exact journal boundary captured together.
+    /// The writer can stream existing bodies without materializing the history.
     pub async fn snapshot_for_persistence(
         &self,
         limit: Option<usize>,
-    ) -> io::Result<Vec<(TransactionRecord, Option<crate::session::BodyLocator>)>> {
-        let _insert_guard = self.insert_lock.lock().await;
+    ) -> io::Result<TransactionPersistenceSnapshot> {
+        let mut _insert_guard = self.owned_persistence_mutation_guard().await;
         let inner = self.inner.read().await;
-        if let Some(tx) = &self.journal_tx {
-            if let Err(error) = rotate_transaction_journal(tx) {
-                if error.kind() == io::ErrorKind::BrokenPipe {
-                    warn!(
-                        ?error,
-                        "transaction journal writer stopped; continuing with full snapshot"
-                    );
-                } else {
-                    return Err(error);
+        inner.require_resolved_bodies()?;
+        let journal_rotation_confirmed = match &self.journal_tx {
+            Some(tx) => match rotate_transaction_journal(tx) {
+                Ok(()) => self.storage_dir.is_some(),
+                Err(JournalRotationError::SendDisconnected) => {
+                    if let Some(storage_dir) = &self.storage_dir {
+                        // A failed send proves no receiver can still append. An
+                        // absent acknowledgement proves no such thing.
+                        _insert_guard =
+                            rotate_stopped_transaction_journal(storage_dir, _insert_guard).await?;
+                        true
+                    } else {
+                        false
+                    }
                 }
+                Err(JournalRotationError::AckLost) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "transaction journal rotation acknowledgement was lost",
+                    ));
+                }
+                Err(JournalRotationError::Writer(error)) => return Err(error),
+            },
+            None if self.journal_start_failed && self.storage_dir.is_some() => {
+                _insert_guard = rotate_stopped_transaction_journal(
+                    self.storage_dir.as_ref().unwrap(),
+                    _insert_guard,
+                )
+                .await?;
+                true
             }
+            None if self.storage_dir.is_some() && !self.read_only_bodies => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "transaction journal rotation cannot be confirmed",
+                ));
+            }
+            None => false,
+        };
+        let mut entries = Vec::new();
+        let mut body_generations = HashMap::new();
+        for index in (0..inner.entries.len())
+            .rev()
+            .take(limit.unwrap_or(usize::MAX))
+        {
+            let record = &inner.entries[index];
+            body_generations
+                .entry(record.id)
+                .or_insert(inner.body_generations[index]);
+            let locator = (inner.by_id.get(&record.id) == Some(&index))
+                .then(|| inner.locators.get(&record.id).copied())
+                .flatten();
+            entries.push((record.clone(), locator));
         }
-        Ok(snapshot_entries(&inner, limit)
-            .into_iter()
-            .map(|record| {
-                let locator = inner.locators.get(&record.id).copied();
-                (record, locator)
-            })
-            .collect())
+        Ok(TransactionPersistenceSnapshot {
+            complete_capture: entries.len() == inner.entries.len(),
+            entries,
+            body_generations,
+            file_generation: inner.file_generation,
+            latest_event_sequence: self.latest_event_sequence(),
+            journal_rotation_confirmed,
+        })
     }
 
     pub async fn update_annotations(
@@ -1377,7 +3355,7 @@ impl TransactionStore {
             // go — and with no locator the writer serialises whatever is in memory,
             // which has to be the whole record by then. Without this the update
             // survives only in memory and the journal.
-            self.rehydrate(record, &inner)
+            rehydrate_checked(record, &inner, self.storage_dir.as_deref())?
         };
         update(&mut updated_record);
         updated_record.id = id;
@@ -1415,6 +3393,8 @@ impl TransactionStore {
             return Ok(None);
         }
         inner.entries[index] = updated_record;
+        inner.service_map_metadata_epoch = Uuid::new_v4();
+        inner.body_generations[index] = Uuid::new_v4();
         inner.summaries[index] = CachedSummary::new(summary.clone());
         // Memory is now newer than the line on disk. Leaving the locator in place
         // makes the next persist copy that stale line byte for byte and throw this
@@ -1578,6 +3558,9 @@ impl TransactionStore {
         let applied_color_tag = record.color_tag.clone();
         let applied_user_note = record.user_note.clone();
         inner.summaries[index] = CachedSummary::new(summary.clone());
+        if has_annotation_patch {
+            inner.service_map_annotation_epoch = Uuid::new_v4();
+        }
         drop(inner);
         if has_annotation_patch {
             self.publish_transaction_event(summary.clone());
@@ -1659,6 +3642,7 @@ impl TransactionStore {
         record.annotation_revision = next_annotation_revision;
         let summary = record.summary();
         inner.summaries[index] = CachedSummary::new(summary.clone());
+        inner.service_map_annotation_epoch = Uuid::new_v4();
         drop(inner);
         self.publish_transaction_event(summary);
         Ok(true)
@@ -1671,24 +3655,243 @@ impl TransactionStore {
             inner.trim_to_max_entries(max_entries);
         }
         let max_seq = inner.entries.iter().map(|r| r.sequence).max().unwrap_or(0);
-        *self.inner.write().await = inner;
+        let mut current = self.inner.write().await;
+        // Replacing memory does not replace the file; preserve its publication guard.
+        inner.file_generation = current.file_generation;
+        *current = inner;
+        drop(current);
         self.next_sequence.store(max_seq + 1, Ordering::Relaxed);
-        self.next_event_sequence
-            .store(max_seq + 1, Ordering::Relaxed);
+        let mut current = self.next_event_sequence.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .expect("transaction event sequence exhausted")
+                .max(max_seq + 1);
+            match self.next_event_sequence.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TransactionEvent> {
         self.events.subscribe()
     }
 
-    pub fn subscribe_retention(&self) -> broadcast::Receiver<()> {
+    pub fn subscribe_retention(&self) -> broadcast::Receiver<TransactionRetentionEvent> {
         self.retention_events.subscribe()
     }
 
-    /// Points the store at where a compaction just put each record, and drops the
-    /// bodies it no longer has to hold. Must be called after every rewrite of
-    /// transactions.ndjson: the offsets from before it are stale, and a stale
-    /// offset silently returns a different request's traffic.
+    /// Publish the prepared file and its offsets as one reader-visible change.
+    /// Call from a blocking worker. The closure must perform only the atomic
+    /// rename: successful rename cannot be followed by a fallible adoption step.
+    pub(crate) fn publish_persistence_snapshot(
+        &self,
+        snapshot: &TransactionPersistenceSnapshot,
+        mut locators: HashMap<Uuid, crate::session::BodyLocator>,
+        rename: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut inner = self.inner.blocking_write();
+        // A duplicate insertion may have discovered a missing dependency after
+        // this plan was prepared. Do not publish over the only recovery source.
+        inner.require_resolved_bodies()?;
+        if !snapshot.complete_capture {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a partial transaction snapshot cannot replace the complete file",
+            ));
+        }
+        if inner.file_generation != snapshot.file_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction snapshot source file changed before publication",
+            ));
+        }
+        if self.storage_dir.is_some()
+            && !self.read_only_bodies
+            && !snapshot.journal_rotation_confirmed
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction snapshot journal boundary is not confirmed",
+            ));
+        }
+        // Precompute every decision before rename. New full records keep their
+        // resident bodies; annotation-only edits retain their generation and data.
+        locators.retain(|id, _| {
+            inner.by_id.get(id).is_some_and(|&index| {
+                snapshot.body_generations.get(id) == inner.body_generations.get(index)
+            })
+        });
+        let next_file_generation = Uuid::new_v4();
+        rename()?;
+        for index in 0..inner.entries.len() {
+            let id = inner.entries[index].id;
+            if locators.contains_key(&id) && inner.by_id.get(&id) == Some(&index) {
+                strip_transaction_bodies(&mut inner.entries[index]);
+            }
+        }
+        inner.locators = locators;
+        inner.file_generation = next_file_generation;
+        Ok(())
+    }
+
+    /// Single-worker notification with a retained permit. Register a waiter
+    /// before checking work so an insert or final lease release cannot be lost.
+    pub fn retention_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.in_progress.notify)
+    }
+
+    pub fn notify_retention_work(&self) {
+        self.in_progress.notify.notify_one();
+    }
+
+    fn protected_existing_ids(
+        &self,
+        inner: &StoreInner,
+        saved_source_ids: &HashSet<Uuid>,
+    ) -> HashSet<Uuid> {
+        let leases = self
+            .in_progress
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        saved_source_ids
+            .iter()
+            .chain(leases.keys())
+            .filter(|id| inner.by_id.contains_key(id))
+            .copied()
+            .collect()
+    }
+
+    /// Counts only metadata; dangling references and duplicate lease owners do
+    /// not inflate the number of protected existing UUIDs.
+    pub async fn retention_status(&self, saved_source_ids: &HashSet<Uuid>) -> (usize, usize) {
+        let _mutation_guard = self.insert_lock.lock().await;
+        let inner = self.inner.read().await;
+        (
+            inner.entries.len(),
+            self.protected_existing_ids(&inner, saved_source_ids).len(),
+        )
+    }
+
+    /// UUID tombstones are indivisible. Distinguish protected records from a
+    /// malformed duplicate-ID group whose removal would overshoot the target.
+    pub(crate) async fn retention_status_details(
+        &self,
+        saved_source_ids: &HashSet<Uuid>,
+        target: Option<usize>,
+    ) -> RetentionStatusDetails {
+        let _mutation_guard = self.insert_lock.lock().await;
+        let inner = self.inner.read().await;
+        let protected = self.protected_existing_ids(&inner, saved_source_ids);
+        let all_records_protected = inner.by_id.keys().all(|id| protected.contains(id));
+        let excess = target.map_or(0, |target| inner.entries.len().saturating_sub(target));
+        let identity_conflict =
+            if excess == 0 || all_records_protected || inner.by_id.len() == inner.entries.len() {
+                false
+            } else {
+                let mut counts = HashMap::<Uuid, usize>::new();
+                for record in &inner.entries {
+                    if !protected.contains(&record.id) {
+                        *counts.entry(record.id).or_default() += 1;
+                    }
+                }
+                !counts.values().any(|count| *count <= excess)
+            };
+        RetentionStatusDetails {
+            total_count: inner.entries.len(),
+            protected_count: protected.len(),
+            all_records_protected,
+            identity_conflict,
+        }
+    }
+
+    /// Durably removes one bounded chunk of oldest eligible excess records.
+    /// Saved-source protection must be stabilized by the caller's workspace
+    /// mutation guard. Provisional insertion and tombstone selection are atomic
+    /// with respect to each other under the store mutation lock.
+    pub async fn trim_retention(
+        &self,
+        max_entries: usize,
+        saved_source_ids: &HashSet<Uuid>,
+        chunk_size: usize,
+    ) -> io::Result<RetentionTrimOutcome> {
+        const MAX_TOMBSTONE_IDS: usize = 1024;
+        let _mutation_guard = self.insert_lock.lock().await;
+        let ids = {
+            let inner = self.inner.read().await;
+            let protected = self.protected_existing_ids(&inner, saved_source_ids);
+            let mut remaining = inner.entries.len().saturating_sub(max_entries);
+            let limit = chunk_size.min(MAX_TOMBSTONE_IDS);
+            let mut ids = Vec::new();
+            let mut seen = HashSet::new();
+            // Preserve existing insertion/UUID behavior. A UUID tombstone can
+            // cover multiple rows; never remove more rows than the excess.
+            let occurrences = if inner.by_id.len() == inner.entries.len() {
+                None
+            } else {
+                let mut counts = HashMap::<Uuid, usize>::new();
+                for record in &inner.entries {
+                    *counts.entry(record.id).or_default() += 1;
+                }
+                Some(counts)
+            };
+            for record in &inner.entries {
+                if remaining == 0 || ids.len() == limit {
+                    break;
+                }
+                if protected.contains(&record.id) || !seen.insert(record.id) {
+                    continue;
+                }
+                let count = occurrences.as_ref().map_or(1, |counts| counts[&record.id]);
+                if count <= remaining {
+                    ids.push(record.id);
+                    remaining -= count;
+                }
+            }
+            ids
+        };
+        if !ids.is_empty() {
+            self.delete_ids_locked_with_event(&ids, true).await?;
+        }
+        let inner = self.inner.read().await;
+        Ok(RetentionTrimOutcome {
+            deleted_ids: ids,
+            current_count: inner.entries.len(),
+            protected_count: self.protected_existing_ids(&inner, saved_source_ids).len(),
+            event_sequence: self.latest_event_sequence(),
+        })
+    }
+
+    /// Restores pending work when journal replay was applied but compaction
+    /// could not finish. The boundary is the replayed mutation event sequence.
+    pub fn mark_retention_compaction_pending(&self, event_sequence: u64) {
+        self.retention_trim_sequence
+            .fetch_max(event_sequence, Ordering::Release);
+    }
+
+    pub fn retention_compaction_pending(&self) -> bool {
+        self.retention_trim_sequence.load(Ordering::Acquire)
+            > self.retention_compacted_sequence.load(Ordering::Acquire)
+    }
+
+    /// Called inside the owned snapshot worker after confirmed journal rotation,
+    /// body/state publication, and checkpoint cleanup, using the captured boundary.
+    /// A later trim remains pending even when an older snapshot finishes last.
+    pub(crate) fn mark_retention_compacted(&self, event_sequence: u64) {
+        self.retention_compacted_sequence
+            .fetch_max(event_sequence, Ordering::Release);
+    }
+
+    // Synthetic fixtures may install a file written outside the production
+    // publisher. Production callers must always use the versioned barrier above.
+    #[cfg(test)]
     pub async fn adopt_written_locators(
         &self,
         mut locators: HashMap<Uuid, crate::session::BodyLocator>,
@@ -1701,6 +3904,30 @@ impl TransactionStore {
             }
         }
         inner.locators = locators;
+        inner.file_generation = Uuid::new_v4();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_mutation_locked_for_test(&self) -> bool {
+        self.insert_lock.try_lock().is_err()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_journal_writer_for_test(&mut self) -> io::Result<()> {
+        if let Some(tx) = self.journal_tx.take() {
+            let (ack, finished) = mpsc::channel();
+            if tx
+                .send(TransactionJournalCommand::StopForTest { ack })
+                .is_ok()
+            {
+                finished.recv().map_err(io::Error::other)?;
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        self.journal_tx = Some(tx);
+        self.journal_start_failed = false;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1723,6 +3950,13 @@ impl TransactionStore {
     }
 
     fn publish_transaction_event(&self, summary: TransactionSummary) {
+        #[cfg(test)]
+        {
+            let hook = self.before_transaction_event_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let event = TransactionEvent {
             event_sequence: self.next_event_sequence.fetch_add(1, Ordering::Relaxed),
             summary,
@@ -1909,6 +4143,12 @@ fn start_transaction_journal_writer(
                             return;
                         }
                     }
+                    #[cfg(test)]
+                    TransactionJournalCommand::StopForTest { ack } => {
+                        drop(file);
+                        let _ = ack.send(());
+                        return;
+                    }
                     TransactionJournalCommand::Rotate { ack } => {
                         let result = rotate_transaction_journal_file(&mut file, &journal_path);
                         if let Err(error) = &result {
@@ -1945,21 +4185,22 @@ fn start_transaction_journal_writer(
     }
 }
 
-fn rotate_transaction_journal(tx: &mpsc::Sender<TransactionJournalCommand>) -> io::Result<()> {
+#[derive(Debug)]
+enum JournalRotationError {
+    SendDisconnected,
+    AckLost,
+    Writer(io::Error),
+}
+
+fn rotate_transaction_journal(
+    tx: &mpsc::Sender<TransactionJournalCommand>,
+) -> Result<(), JournalRotationError> {
     let (ack, rx) = mpsc::channel();
     tx.send(TransactionJournalCommand::Rotate { ack })
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "transaction journal writer stopped",
-            )
-        })?;
-    rx.recv().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "transaction journal writer stopped",
-        )
-    })?
+        .map_err(|_| JournalRotationError::SendDisconnected)?;
+    rx.recv()
+        .map_err(|_| JournalRotationError::AckLost)?
+        .map_err(JournalRotationError::Writer)
 }
 
 async fn append_transaction_journal(
@@ -1983,6 +4224,22 @@ async fn append_transaction_journal(
             "transaction journal writer stopped",
         )
     })?
+}
+
+async fn rotate_stopped_transaction_journal(
+    storage_dir: &Path,
+    mutation_guard: OwnedMutexGuard<()>,
+) -> io::Result<OwnedMutexGuard<()>> {
+    let path = storage_dir.join("transactions.journal");
+    tokio::task::spawn_blocking(move || {
+        // A cancelled async waiter must not let another mutation or rotation
+        // enter while this worker still owns the journal files.
+        let mut file = open_private_append_file(&path)?;
+        rotate_transaction_journal_file(&mut file, &path)?;
+        Ok(mutation_guard)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 fn rotate_transaction_journal_file(file: &mut fs::File, journal_path: &Path) -> io::Result<()> {
@@ -2725,6 +4982,2533 @@ pub(crate) mod tests {
             None,
             None,
         )
+    }
+
+    mod service_map_body_tests {
+        use super::*;
+        use crate::service_map::{evidence_id, EvidenceKey};
+        use crate::service_map_body::{ServiceMapBodyReferences, MAX_SERIALIZED_ROW_BYTES};
+        use std::time::Duration as WaitDuration;
+
+        fn body_record(body: &str, sequence: u64) -> TransactionRecord {
+            let mut record = test_record("source.example.com");
+            record.sequence = sequence;
+            let response = record.response.as_mut().unwrap();
+            response.content_type = Some("text/html".into());
+            response.body_preview = body.into();
+            response.body_size = body.len();
+            record
+        }
+
+        async fn fixture_store(
+            records: &[TransactionRecord],
+            lazy: bool,
+        ) -> (Arc<TransactionStore>, PathBuf) {
+            let dir = std::env::temp_dir().join(format!("sniper-passive-body-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let store = Arc::new(TransactionStore::from_records_with_journal(
+                records.iter().rev().cloned().collect(),
+                dir.join("transactions.journal"),
+                None,
+            ));
+            if lazy {
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &dir, records,
+                )
+                .unwrap();
+                store.adopt_written_locators(locators).await;
+            }
+            (store, dir)
+        }
+
+        async fn token(store: &TransactionStore, session: Uuid, sequence: u64) -> String {
+            let inner = store.inner.read().await;
+            let index = inner
+                .entries
+                .binary_search_by_key(&sequence, |r| r.sequence)
+                .unwrap();
+            evidence_id(
+                session,
+                store.saved_cursor_generation,
+                inner.body_generations[index],
+                &inner.entries[index],
+            )
+        }
+
+        #[tokio::test]
+        async fn exact_socket_peer_reads_remain_metadata_only_with_missing_body_storage() {
+            use crate::model::{ObservedSocketPeer, ObservedSocketPeerRoute};
+            let mut record = body_record("retained synthetic body", 1);
+            record.observed_socket_peer = Some(ObservedSocketPeer::from_remote_addr(
+                record.started_at,
+                ObservedSocketPeerRoute::HttpProxy,
+                Some("198.51.100.7:8080".parse().unwrap()),
+            ));
+            let (store, dir) = fixture_store(&[record.clone()], true).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            let evidence = store
+                .service_map_evidence_with_socket_peer(session, &id, true)
+                .await;
+            assert!(evidence.available);
+            let observation = evidence.socket_peer.unwrap().observation.unwrap();
+            assert_eq!(observation.address.unwrap().ip.to_string(), "198.51.100.7");
+            assert!(store.inner.read().await.entries[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            crate::session::write_transactions_file_for_test_returning_locators(
+                &dir,
+                &[record.clone()],
+            )
+            .unwrap();
+            assert!(store
+                .update_record(record.id, |row| row.path = "/changed".into())
+                .await
+                .is_some());
+            let stale = store
+                .service_map_evidence_with_socket_peer(session, &id, true)
+                .await;
+            assert!(!stale.available);
+            assert!(stale.socket_peer.is_none());
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        fn barrier(
+            stage: &'static str,
+        ) -> (
+            ServiceMapBodyReadHook,
+            oneshot::Receiver<()>,
+            mpsc::Sender<()>,
+        ) {
+            let (ready, started) = oneshot::channel();
+            let ready = Mutex::new(Some(ready));
+            let (release, wait) = mpsc::channel();
+            let wait = Mutex::new(wait);
+            let hook = Arc::new(move |current: &str| {
+                if current == stage {
+                    ready.lock().unwrap().take().unwrap().send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(WaitDuration::from_secs(10))
+                        .unwrap();
+                }
+            });
+            (hook, started, release)
+        }
+
+        fn paused_read(
+            store: Arc<TransactionStore>,
+            session: Uuid,
+            token: String,
+            hook: ServiceMapBodyReadHook,
+        ) -> tokio::task::JoinHandle<ServiceMapBodyReferences> {
+            tokio::spawn(async move {
+                store
+                    .service_map_body_references_impl(session, &token, Some(hook))
+                    .await
+            })
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_distinguishes_resident_and_lazy_duplicate_rows() {
+            let first = body_record("https://older.example.com/private?secret=one ", 1);
+            let mut second = body_record("https://newer.example.com/private?secret=two ", 2);
+            second.id = first.id;
+            let (store, dir) = fixture_store(&[first, second], false).await;
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            let staged = dir.join("replacement");
+            fs::create_dir_all(&staged).unwrap();
+            // The fixture writer uses last-wins UUID locators, so give it
+            // oldest-first rows. Production streaming uses newest-first and
+            // first-wins locators; both must select the same authoritative row.
+            let records: Vec<_> = snapshot
+                .iter()
+                .rev()
+                .map(|(record, _)| record.clone())
+                .collect();
+            let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &staged, &records,
+            )
+            .unwrap();
+            let publisher = store.clone();
+            let destination = dir.join("transactions.ndjson");
+            tokio::task::spawn_blocking(move || {
+                publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                    crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let session = Uuid::new_v4();
+            let older_token = token(&store, session, 1).await;
+            let newer_token = token(&store, session, 2).await;
+            let older = store
+                .service_map_body_references(session, &older_token)
+                .await;
+            let newer = store
+                .service_map_body_references(session, &newer_token)
+                .await;
+            assert_eq!(
+                older.references[0].target_origin,
+                "https://older.example.com"
+            );
+            assert_eq!(
+                newer.references[0].target_origin,
+                "https://newer.example.com"
+            );
+            let inner = store.inner.read().await;
+            assert!(!inner.entries[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            assert!(inner.entries[1]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            drop(inner);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_invalid_session_generation_and_revision_tokens() {
+            let record = body_record("https://example.com/ ", 1);
+            let (store, dir) = fixture_store(&[record.clone()], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_body_references(session, "bad")
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            assert_eq!(
+                store
+                    .service_map_body_references(Uuid::new_v4(), &id)
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            let replacement = TransactionStore::from_records(vec![record.clone()]);
+            assert_eq!(
+                replacement
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            store
+                .update_record(record.id, |r| {
+                    r.response.as_mut().unwrap().body_preview =
+                        "https://changed.example.com/ ".into()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["record_changed"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_fails_closed_for_oversized_wrong_missing_and_malformed_disk_rows(
+        ) {
+            for case in [
+                "oversized",
+                "wrong_locator",
+                "missing_file",
+                "malformed_json",
+                "malformed_utf8",
+                "wrong_sequence",
+                "missing_preview",
+            ] {
+                let first = body_record("https://first.example.com/ ", 1);
+                let second = body_record("https://second.example.com/ ", 2);
+                let (store, dir) = fixture_store(&[first.clone(), second.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let expected = match case {
+                    "oversized" => {
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: u64::MAX,
+                                    len: (MAX_SERIALIZED_ROW_BYTES + 1) as u32,
+                                },
+                            )
+                            .await;
+                        "serialized_row_limit"
+                    }
+                    "wrong_locator" => {
+                        let locator = store.inner.read().await.locators[&second.id];
+                        store.set_body_locator_for_test(first.id, locator).await;
+                        "body_identity_unverifiable"
+                    }
+                    "missing_file" => {
+                        fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                        "body_storage_unavailable"
+                    }
+                    case => {
+                        let mut value = serde_json::to_value(&first).unwrap();
+                        let bytes = match case {
+                            "malformed_json" => b"{not json}".to_vec(),
+                            "malformed_utf8" => {
+                                // Put invalid UTF-8 in an ignored request field:
+                                // malformed bytes must not bypass the projection.
+                                let mut bytes = serde_json::to_vec(&first).unwrap();
+                                let needle = b"\"body_preview\":\"\"";
+                                let start = bytes
+                                    .windows(needle.len())
+                                    .position(|part| part == needle)
+                                    .unwrap();
+                                bytes.insert(start + needle.len() - 1, 0xff);
+                                bytes
+                            }
+                            "wrong_sequence" => {
+                                value["sequence"] = 0.into();
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            "missing_preview" => {
+                                value["response"]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("body_preview");
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            _ => unreachable!(),
+                        };
+                        fs::write(dir.join("transactions.ndjson"), &bytes).unwrap();
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: 0,
+                                    len: bytes.len() as u32,
+                                },
+                            )
+                            .await;
+                        match case {
+                            "wrong_sequence" => "body_identity_unverifiable",
+                            "missing_preview" => "retained_preview_unavailable",
+                            _ => "malformed_retained_row",
+                        }
+                    }
+                };
+                let result = store.service_map_body_references(session, &id).await;
+                assert!(!result.available, "{case}");
+                assert!(result.references.is_empty(), "{case}");
+                assert_eq!(result.reasons, [expected], "{case}");
+                // The normal map and metadata evidence remain independent of
+                // body storage, including missing/corrupt files and bad locators.
+                assert_eq!(store.service_map_snapshot(session, 10).await.rows.len(), 2);
+                assert!(store.service_map_evidence(session, &id).await.available);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_unresolved_and_nonresident_older_duplicate() {
+            let first = body_record("https://older.example.com/ ", 1);
+            let mut second = body_record("https://newer.example.com/ ", 2);
+            second.id = first.id;
+            // A legacy-loaded older duplicate has no authoritative locator.
+            let (store, dir) = fixture_store(&[first, second], true).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["retained_preview_unavailable"]
+            );
+            let key = EvidenceKey::parse(&id).unwrap();
+            store
+                .inner
+                .write()
+                .await
+                .unresolved_body_generations
+                .insert(key.revision);
+            assert_eq!(
+                store
+                    .service_map_body_references(session, &id)
+                    .await
+                    .reasons,
+                ["body_identity_unverifiable"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_resident_and_lazy_reject_deletion_retention_and_mutation_races()
+        {
+            for lazy in [false, true] {
+                for mutation in ["delete", "retention", "body"] {
+                    let first = body_record("https://before.example.com/ ", 1);
+                    let (store, dir) = fixture_store(&[first.clone()], lazy).await;
+                    let session = Uuid::new_v4();
+                    let id = token(&store, session, 1).await;
+                    let (hook, started, release) = barrier("after_scan");
+                    let reading = paused_read(store.clone(), session, id, hook);
+                    tokio::time::timeout(WaitDuration::from_secs(10), started)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // If the reader held the store lock during file/scan work,
+                    // these real mutations would deadlock at this barrier.
+                    let expected = match mutation {
+                        "delete" => {
+                            assert_eq!(store.delete_ids(&[first.id]).await.unwrap(), 1);
+                            "record_missing"
+                        }
+                        "retention" => {
+                            assert_eq!(
+                                store
+                                    .trim_retention(0, &HashSet::new(), 10)
+                                    .await
+                                    .unwrap()
+                                    .deleted_ids,
+                                [first.id]
+                            );
+                            "record_missing"
+                        }
+                        _ => {
+                            store
+                                .update_record(first.id, |r| {
+                                    r.response.as_mut().unwrap().body_preview =
+                                        "https://after.example.com/ ".into()
+                                })
+                                .await
+                                .unwrap();
+                            "record_changed"
+                        }
+                    };
+                    release.send(()).unwrap();
+                    let result = reading.await.unwrap();
+                    assert!(!result.available, "{lazy} {mutation}");
+                    assert_eq!(result.reasons, [expected], "{lazy} {mutation}");
+                    drop(store);
+                    fs::remove_dir_all(dir).unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_annotations_keep_evidence_valid_during_scan() {
+            for lazy in [false, true] {
+                let record = body_record("https://example.com/ ", 1);
+                let (store, dir) = fixture_store(&[record.clone()], lazy).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier("after_scan");
+                let reading = paused_read(store.clone(), session, id, hook);
+                started.await.unwrap();
+                store
+                    .update_annotations(record.id, None, Some(Some("note".into())))
+                    .await
+                    .unwrap();
+                release.send(()).unwrap();
+                assert!(reading.await.unwrap().complete);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_atomic_publication_before_and_after_disk_scan() {
+            for stage in ["after_open", "after_scan"] {
+                let record = body_record("https://example.com/ ", 1);
+                let (store, dir) = fixture_store(&[record.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+                let staged = dir.join("replacement");
+                fs::create_dir_all(&staged).unwrap();
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &staged,
+                    &[record],
+                )
+                .unwrap();
+                let (hook, started, release) = barrier(stage);
+                let reading = paused_read(store.clone(), session, id.clone(), hook);
+                started.await.unwrap();
+                let publisher = store.clone();
+                let destination = dir.join("transactions.ndjson");
+                tokio::task::spawn_blocking(move || {
+                    publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                        crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert_eq!(result.reasons, ["body_identity_unverifiable"], "{stage}");
+                assert!(result.references.is_empty());
+                // A fresh explicit read uses the adopted locator/file generation.
+                assert!(
+                    store
+                        .service_map_body_references(session, &id)
+                        .await
+                        .complete
+                );
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_body_read_rejects_base64_from_invalid_utf8_capture() {
+            let mut record = body_record("", 1);
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/html"),
+            );
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                &[0xff, 0xfe, 0xfd],
+                100,
+            ));
+            assert_eq!(
+                record.response.as_ref().unwrap().body_encoding,
+                BodyEncoding::Base64
+            );
+            let (store, dir) = fixture_store(&[record], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store.service_map_body_references(session, &id).await;
+            assert_eq!(result.status, "unsupported");
+            assert_eq!(result.reasons, ["unsupported_body_encoding"]);
+            assert!(!result.available);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+        fn paused_html_read(
+            store: Arc<TransactionStore>,
+            session: Uuid,
+            token: String,
+            hook: ServiceMapBodyReadHook,
+        ) -> tokio::task::JoinHandle<crate::service_map_html::ServiceMapHtmlGenerators> {
+            tokio::spawn(async move {
+                store
+                    .service_map_html_generators_impl(session, &token, Some(hook))
+                    .await
+            })
+        }
+
+        fn peer_record(host: &str, sequence: u64, address: &str) -> TransactionRecord {
+            let mut row = body_record("PRIVATE_RESPONSE_BODY", sequence);
+            row.host = host.into();
+            row.path = "/PRIVATE_PATH?token=PRIVATE_QUERY".into();
+            row.observed_socket_peer = Some(crate::model::ObservedSocketPeer::from_remote_addr(
+                row.started_at + chrono::Duration::milliseconds(sequence as i64),
+                crate::model::ObservedSocketPeerRoute::Direct,
+                Some(address.parse().unwrap()),
+            ));
+            row
+        }
+
+        #[tokio::test]
+        async fn peer_matches_compare_typed_family_route_port_and_diagnostic_buckets() {
+            use crate::model::{ObservedSocketPeerReason, ObservedSocketPeerRoute, TrafficKind};
+            let source = peer_record("source.example.com", 1, "198.51.100.7:443");
+            let mut rows = vec![
+                source.clone(),
+                peer_record("other.example.com", 2, "198.51.100.7:443"),
+            ];
+            for (seq, address) in [
+                (3, "198.51.100.8:443"),
+                (4, "198.51.100.7:8443"),
+                (5, "[::ffff:198.51.100.7]:443"),
+            ] {
+                rows.push(peer_record("different.example.com", seq, address));
+            }
+            for (seq, route) in [
+                (6, ObservedSocketPeerRoute::HttpProxy),
+                (7, ObservedSocketPeerRoute::SocksProxy),
+                (8, ObservedSocketPeerRoute::Unknown),
+            ] {
+                let mut row = source.clone();
+                row.sequence = seq;
+                row.id = Uuid::new_v4();
+                row.observed_socket_peer.as_mut().unwrap().route = route;
+                rows.push(row);
+            }
+            let mut row = source.clone();
+            row.sequence = 9;
+            row.observed_socket_peer = None;
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 10;
+            row.observed_socket_peer.as_mut().unwrap().address = None;
+            row.observed_socket_peer.as_mut().unwrap().reason =
+                Some(ObservedSocketPeerReason::RemoteAddrUnavailable);
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 11;
+            row.observed_socket_peer.as_mut().unwrap().reason =
+                Some(ObservedSocketPeerReason::RemoteAddrUnavailable);
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 12;
+            row.kind = TrafficKind::Tunnel;
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 13;
+            row.method = "CONNECT".into();
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 14;
+            row.status = Some(101);
+            rows.push(row);
+            let mut row = source.clone();
+            row.sequence = 15;
+            row.host = "user:PRIVATE_CREDENTIAL@example.com".into();
+            rows.push(row);
+            let (store, dir) = fixture_store(&rows, false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 100, &[], &[])
+                .await;
+            assert!(result.available && !result.complete);
+            assert_eq!(result.counts.matching_rows, 1);
+            assert_eq!(result.counts.different_peer_rows, 3);
+            assert_eq!(result.counts.non_direct_rows, 3);
+            assert_eq!(result.counts.not_recorded_rows, 1);
+            assert_eq!(result.counts.unavailable_observation_rows, 1);
+            assert_eq!(result.counts.invalid_observation_rows, 1);
+            assert_eq!(result.counts.non_http_rows, 3);
+            assert_eq!(result.counts.invalid_metadata_rows, 1);
+            assert_eq!(result.reasons, ["invalid_metadata"]);
+            assert_eq!(result.origins[0].origin, "https://other.example.com");
+            assert!(result.validate_response(session, &id, false, 100));
+            let text = serde_json::to_string(&result).unwrap();
+            for secret in [
+                "PRIVATE_RESPONSE_BODY",
+                "PRIVATE_PATH",
+                "PRIVATE_QUERY",
+                "PRIVATE_CREDENTIAL",
+            ] {
+                assert!(!text.contains(secret));
+            }
+            let map = crate::service_map::build(
+                session,
+                store.service_map_snapshot(session, 100).await,
+                100,
+                false,
+                None,
+                &[],
+                &[],
+            );
+            let ordinary = serde_json::to_string(&map).unwrap();
+            assert!(!ordinary.contains("198.51.100.7") && !ordinary.contains("socket_peer"));
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_reject_unusable_seed_addresses_and_source_contexts() {
+            use crate::model::{ObservedSocketPeerReason, ObservedSocketPeerRoute};
+            for address in [
+                "0.0.0.0:443",
+                "0.1.2.3:443",
+                "169.254.1.2:443",
+                "224.1.2.3:443",
+                "255.255.255.255:443",
+                "240.0.0.1:443",
+                "198.51.100.7:0",
+                "[::]:443",
+                "[ff02::1]:443",
+                "[fe80::1]:443",
+                "[::ffff:169.254.1.2]:443",
+                "[::ffff:0.1.2.3]:443",
+                "[::ffff:224.1.2.3]:443",
+            ] {
+                let row = peer_record("example.com", 1, address);
+                let store = TransactionStore::from_records(vec![row]);
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                    .await;
+                assert_eq!(result.reasons, ["invalid_observation"], "{address}");
+                assert!(
+                    result.peer.is_none() && result.source.is_none() && result.origins.is_empty()
+                );
+                assert!(result.validate_response(session, &id, false, 10));
+            }
+            for reason in [
+                "observation_not_recorded",
+                "observation_unavailable",
+                "non_direct_observation",
+                "unsupported_source_context",
+                "metadata_unavailable",
+            ] {
+                let mut row = peer_record("example.com", 1, "198.51.100.7:443");
+                match reason {
+                    "observation_not_recorded" => row.observed_socket_peer = None,
+                    "observation_unavailable" => {
+                        let o = row.observed_socket_peer.as_mut().unwrap();
+                        o.address = None;
+                        o.reason = Some(ObservedSocketPeerReason::RemoteAddrUnavailable);
+                    }
+                    "non_direct_observation" => {
+                        row.observed_socket_peer.as_mut().unwrap().route =
+                            ObservedSocketPeerRoute::Unknown
+                    }
+                    "unsupported_source_context" => row.status = Some(101),
+                    _ => row.host = "x".repeat(513),
+                }
+                let store = TransactionStore::from_records(vec![row]);
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                    .await;
+                assert_eq!(result.reasons, [reason]);
+                assert!(result.validate_response(session, &id, false, 10));
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_duplicate_tokens_missing_bodies_and_reopened_generations() {
+            let first = peer_record("older.example.com", 1, "[::ffff:198.51.100.7]:443");
+            let mut second = peer_record("newer.example.com", 2, "[::ffff:198.51.100.7]:443");
+            second.id = first.id;
+            let (store, dir) = fixture_store(&[first.clone(), second.clone()], true).await;
+            let session = Uuid::new_v4();
+            let first_token = token(&store, session, 1).await;
+            let second_token = token(&store, session, 2).await;
+            fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            {
+                let mut inner = store.inner.write().await;
+                for id in [&first_token, &second_token] {
+                    inner
+                        .unresolved_body_generations
+                        .insert(EvidenceKey::parse(id).unwrap().revision);
+                }
+            }
+            for (seed, sample) in [(&first_token, &second_token), (&second_token, &first_token)] {
+                let result = store
+                    .service_map_socket_peer_matches(session, seed, false, 10, &[], &[])
+                    .await;
+                assert!(result.available && result.complete);
+                assert_eq!(result.origins[0].samples[0].evidence_id, *sample);
+                assert!(result.validate_response(session, seed, false, 10));
+            }
+            let reopened = TransactionStore::from_records(vec![second, first]);
+            assert_eq!(
+                reopened
+                    .service_map_socket_peer_matches(session, &first_token, false, 10, &[], &[])
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            assert_eq!(
+                store
+                    .service_map_socket_peer_matches(
+                        Uuid::new_v4(),
+                        &first_token,
+                        false,
+                        10,
+                        &[],
+                        &[]
+                    )
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            assert_eq!(
+                store
+                    .service_map_socket_peer_matches(session, "bad", false, 10, &[], &[])
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_scope_uses_original_authority_and_discloses_seed_outside_window() {
+            let rows = [
+                peer_record("0x7f000001", 1, "127.0.0.1:443"),
+                peer_record("outside.example.com", 2, "127.0.0.1:443"),
+                peer_record("0x7f000001", 3, "127.0.0.1:443"),
+            ];
+            let (store, dir) = fixture_store(&rows, false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let include = vec!["0x7f000001".into()];
+            let result = store
+                .service_map_socket_peer_matches(session, &id, true, 2, &include, &[])
+                .await;
+            assert!(result.available && !result.complete);
+            assert!(!result.source.as_ref().unwrap().in_window);
+            assert_eq!(result.source.as_ref().unwrap().origin, "https://127.0.0.1");
+            assert_eq!(result.counts.scope_excluded_rows, 1);
+            assert_eq!(result.counts.matching_rows, 1);
+            assert_eq!(result.reasons, ["max_records", "source_outside_window"]);
+            assert!(result.validate_response(session, &id, true, 2));
+            let mut normalized = peer_record("127.0.0.1", 4, "127.0.0.1:443");
+            normalized.id = Uuid::new_v4();
+            store.insert(normalized).await;
+            let all = store
+                .service_map_socket_peer_matches(session, &id, false, 10, &include, &[])
+                .await;
+            let canonical_group = all
+                .origins
+                .iter()
+                .find(|g| g.origin == "https://127.0.0.1")
+                .unwrap();
+            assert!(
+                canonical_group.in_scope,
+                "group scope is OR across original authorities"
+            );
+            assert_eq!(canonical_group.matching_rows, 2);
+            assert!(all.validate_response(session, &id, false, 10));
+            let excluded = store
+                .service_map_socket_peer_matches(session, &id, true, 2, &[], &include)
+                .await;
+            assert_eq!(excluded.reasons, ["source_out_of_scope"]);
+            assert!(excluded.peer.is_none());
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_snapshot_fences_source_changes_without_body_identity_checks() {
+            for mutation in ["delete", "retention", "peer", "path"] {
+                let row = peer_record("example.com", 1, "198.51.100.7:443");
+                let (store, dir) = fixture_store(&[row.clone()], false).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier("after_snapshot");
+                let reading_store = store.clone();
+                let reading_id = id.clone();
+                let reading = tokio::spawn(async move {
+                    reading_store
+                        .service_map_socket_peer_matches_impl(
+                            session,
+                            &reading_id,
+                            false,
+                            10,
+                            &[],
+                            &[],
+                            Some(hook),
+                        )
+                        .await
+                });
+                tokio::time::timeout(WaitDuration::from_secs(10), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let expected = match mutation {
+                    "delete" => {
+                        store.delete_ids(&[row.id]).await.unwrap();
+                        "record_missing"
+                    }
+                    "retention" => {
+                        store.trim_retention(0, &HashSet::new(), 10).await.unwrap();
+                        "record_missing"
+                    }
+                    "peer" => {
+                        store
+                            .update_record(row.id, |r| r.observed_socket_peer = None)
+                            .await
+                            .unwrap();
+                        "record_changed"
+                    }
+                    _ => {
+                        store
+                            .update_record(row.id, |r| r.path = "/changed".into())
+                            .await
+                            .unwrap();
+                        "record_changed"
+                    }
+                };
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert_eq!(result.reasons, [expected]);
+                assert!(result.peer.is_none() && result.origins.is_empty());
+                assert_eq!(result.counts, Default::default());
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_caps_count_rows_without_unbounded_origin_sets() {
+            for long_host in [false, true] {
+                let mut rows = vec![peer_record("source.example.com", 1, "198.51.100.7:443")];
+                for index in 0..500 {
+                    let host = if long_host {
+                        format!(
+                            "{}.{}.{}.n{index}.example.com",
+                            "a".repeat(63),
+                            "b".repeat(63),
+                            "c".repeat(63)
+                        )
+                    } else {
+                        format!("n{index}.example.com")
+                    };
+                    for _ in 0..if long_host { 5 } else { 1 } {
+                        rows.push(peer_record(
+                            &host,
+                            rows.len() as u64 + 1,
+                            "198.51.100.7:443",
+                        ));
+                    }
+                }
+                let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10_000, &[], &[])
+                    .await;
+                assert_eq!(
+                    result.counts.matching_rows,
+                    if long_host { 2500 } else { 500 }
+                );
+                assert!(result.counts.omitted_matching_rows > 0);
+                assert!(result.origins.len() <= 100);
+                assert!(result.origins.iter().all(|g| g.samples.len() <= 3));
+                assert!(result.reasons.iter().any(|r| r
+                    == if long_host {
+                        "projection_byte_limit"
+                    } else {
+                        "origin_group_limit"
+                    }));
+                assert!(
+                    serde_json::to_vec(&result).unwrap().len()
+                        <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES
+                );
+                assert!(result.validate_response(session, &id, false, 10_000));
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_high_cardinality_lock_duration_is_measured_with_bounded_work() {
+            const ROWS: usize = 1000;
+            let mut rows = Vec::new();
+            for index in 0..ROWS {
+                let mut row = peer_record(
+                    &format!("n{index}.example.com"),
+                    index as u64 + 1,
+                    "198.51.100.7:443",
+                );
+                row.response.as_mut().unwrap().headers = vec![
+                    HeaderRecord {
+                        name: "X-Private".into(),
+                        value: "H".repeat(4096)
+                    };
+                    8
+                ];
+                row.path = "/PRIVATE_OVERSIZED_PATH".repeat(1000);
+                rows.push(row);
+            }
+            let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let prepared_scope = crate::scope::PreparedScope::new(&[], &[]);
+            let locked = store.inner.read().await;
+            let started = std::time::Instant::now();
+            let result = crate::service_map_peer_matches::inspect_retained(
+                session,
+                store.saved_cursor_generation,
+                &id,
+                &locked.entries[0],
+                locked
+                    .entries
+                    .iter()
+                    .zip(locked.body_generations.iter().copied())
+                    .rev(),
+                500,
+                false,
+                &prepared_scope,
+            );
+            let lock_duration = started.elapsed();
+            drop(locked);
+            let serialized = serde_json::to_vec(&result).unwrap();
+            eprintln!("recorded peer snapshot: retained_rows={ROWS}, considered_rows={}, matching_rows={}, returned_groups={}, exact_samples={}, projected_bytes={}, measured_read_lock_duration={lock_duration:?}, retained_header_bytes={}",result.snapshot.as_ref().unwrap().considered_rows,result.counts.matching_rows,result.origins.len(),result.counts.sample_rows,serialized.len(),ROWS*8*4096);
+            assert_eq!(result.snapshot.as_ref().unwrap().considered_rows, 500);
+            assert_eq!(result.counts.matching_rows, 500);
+            assert_eq!(result.origins.len(), 100);
+            assert_eq!(result.counts.sample_rows, 100);
+            assert!(result.validate_response(session, &id, false, 500));
+            assert!(serialized.len() <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES);
+        }
+
+        #[tokio::test]
+        async fn peer_matches_response_validator_rejects_inconsistent_or_unbound_results() {
+            let rows = [
+                peer_record("source.example.com", 1, "198.51.100.7:443"),
+                peer_record("other.example.com", 2, "198.51.100.7:443"),
+            ];
+            let (store, dir) = fixture_store(&rows, false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &id, false, 10));
+            for change in 0..10 {
+                let mut changed = result.clone();
+                match change {
+                    0 => changed.counts.matching_rows = usize::MAX,
+                    1 => changed.origins[0].samples[0].evidence_id = id.clone(),
+                    2 => changed.source.as_mut().unwrap().in_window = false,
+                    3 => {
+                        changed.origins[0].origin =
+                            "https://user:PRIVATE@example.com/path?token=PRIVATE".into()
+                    }
+                    4 => {
+                        changed.peer.as_mut().unwrap().route =
+                            crate::model::ObservedSocketPeerRoute::HttpProxy
+                    }
+                    5 => changed.snapshot.as_mut().unwrap().generation = Uuid::new_v4(),
+                    6 => changed.origins[0].samples[0].sequence = "02".into(),
+                    7 => changed.origins[0].omitted_samples = 1,
+                    8 => changed.reasons = vec!["PRIVATE_ERROR".into()],
+                    _ => {
+                        let duplicate = changed.origins[0].samples[0].clone();
+                        changed.origins[0].samples.push(duplicate);
+                    }
+                }
+                assert!(
+                    !changed.validate_response(session, &id, false, 10),
+                    "case={change}"
+                );
+            }
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn peer_matches_reject_noncanonical_tokens_and_impossible_window_extrema() {
+            let rows = [
+                peer_record("source.example.com", 10, "198.51.100.7:443"),
+                peer_record("other.example.com", 11, "198.51.100.7:443"),
+            ];
+            let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 10).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &id, false, 10));
+            for field in [1, 2, 4, 5] {
+                for uppercase in [false, true] {
+                    let mut fields: Vec<String> = id.split('.').map(str::to_owned).collect();
+                    fields[field] = if uppercase {
+                        fields[field].to_uppercase()
+                    } else {
+                        fields[field].replace('-', "")
+                    };
+                    let alias = fields.join(".");
+                    if alias == id {
+                        continue;
+                    }
+                    assert!(!crate::service_map_peer_matches::is_canonical_evidence_id(
+                        &alias
+                    ));
+                    let rejected = store
+                        .service_map_socket_peer_matches(session, &alias, false, 10, &[], &[])
+                        .await;
+                    assert_eq!(rejected.reasons, ["invalid_evidence_id"]);
+                }
+            }
+            let mut alias = result.clone();
+            let sample = &mut alias.origins[0].samples[0];
+            let mut fields: Vec<String> =
+                sample.evidence_id.split('.').map(str::to_owned).collect();
+            fields[4] = fields[4].replace('-', "");
+            sample.evidence_id = fields.join(".");
+            assert!(!alias.validate_response(session, &id, false, 10));
+            let mut padded: Vec<String> = id.split('.').map(str::to_owned).collect();
+            padded[3].insert(0, '0');
+            assert!(!crate::service_map_peer_matches::is_canonical_evidence_id(
+                &padded.join(".")
+            ));
+            for extra_unknown_row in [false, true] {
+                let mut changed = result.clone();
+                let window = changed.snapshot.as_mut().unwrap();
+                window.oldest_considered_sequence = Some("1".into());
+                window.latest_considered_sequence = Some("100".into());
+                if extra_unknown_row {
+                    window.considered_rows += 1;
+                    window.retained_rows += 1;
+                    changed.counts.different_peer_rows += 1;
+                }
+                assert!(!changed.validate_response(session, &id, false, 10));
+            }
+            let single = TransactionStore::from_records(vec![peer_record(
+                "source.example.com",
+                10,
+                "198.51.100.7:443",
+            )]);
+            let single_id = token(&single, session, 10).await;
+            let mut result = single
+                .service_map_socket_peer_matches(session, &single_id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &single_id, false, 10));
+            result.snapshot.as_mut().unwrap().oldest_considered_sequence = Some("1".into());
+            assert!(!result.validate_response(session, &single_id, false, 10));
+        }
+
+        #[tokio::test]
+        async fn peer_matches_validator_requires_truthful_projection_and_sample_limits() {
+            let mut rows = vec![peer_record("source.example.com", 1, "198.51.100.7:443")];
+            for index in 0..100 {
+                let host = format!(
+                    "{}.{}.n{index:03}.example.com",
+                    "a".repeat(63),
+                    "b".repeat(30)
+                );
+                for _ in 0..5 {
+                    rows.push(peer_record(
+                        &host,
+                        rows.len() as u64 + 1,
+                        "198.51.100.7:443",
+                    ));
+                }
+            }
+            let store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store
+                .service_map_socket_peer_matches(session, &id, false, 10_000, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &id, false, 10_000));
+            assert!(result
+                .origins
+                .iter()
+                .any(|g| g.samples.len() < 3 && g.omitted_samples > 0));
+            for reason in ["projection_byte_limit", "sample_limit"] {
+                let mut changed = result.clone();
+                changed.reasons.retain(|r| r != reason);
+                assert!(
+                    !changed.validate_response(session, &id, false, 10_000),
+                    "missing {reason}"
+                );
+            }
+            // A group omission may justify the byte reason, but cannot hide a
+            // sample omission when one more fixed-size sample still fits.
+            let mut impossible_sample = result.clone();
+            let full_group = impossible_sample
+                .origins
+                .iter_mut()
+                .find(|group| group.samples.len() == 3)
+                .unwrap();
+            full_group.samples.pop();
+            full_group.omitted_samples += 1;
+            impossible_sample.counts.sample_rows -= 1;
+            impossible_sample.counts.omitted_sample_rows += 1;
+            assert!(!impossible_sample.validate_response(session, &id, false, 10_000));
+            let small = TransactionStore::from_records(vec![
+                peer_record("other.example.com", 2, "198.51.100.7:443"),
+                peer_record("source.example.com", 1, "198.51.100.7:443"),
+            ]);
+            let small_id = token(&small, session, 1).await;
+            let mut impossible = small
+                .service_map_socket_peer_matches(session, &small_id, false, 10, &[], &[])
+                .await;
+            impossible.complete = false;
+            impossible.reasons = vec!["projection_byte_limit".into()];
+            impossible.origins[0].samples.clear();
+            impossible.origins[0].omitted_samples = 1;
+            impossible.counts.sample_rows = 0;
+            impossible.counts.omitted_sample_rows = 1;
+            assert!(!impossible.validate_response(session, &small_id, false, 10));
+            let time_rows = (1..=5)
+                .map(|seq| {
+                    peer_record(
+                        if seq == 1 {
+                            "source.example.com"
+                        } else {
+                            "other.example.com"
+                        },
+                        seq,
+                        "198.51.100.7:443",
+                    )
+                })
+                .rev()
+                .collect();
+            let times = TransactionStore::from_records(time_rows);
+            let times_id = token(&times, session, 1).await;
+            let mut result = times
+                .service_map_socket_peer_matches(session, &times_id, false, 10, &[], &[])
+                .await;
+            assert!(result.validate_response(session, &times_id, false, 10));
+            assert_eq!(result.origins[0].omitted_samples, 1);
+            result.origins[0].first_observed_at -= chrono::Duration::days(1);
+            result.origins[0].last_observed_at += chrono::Duration::days(1);
+            assert!(!result.validate_response(session, &times_id, false, 10));
+        }
+
+        #[tokio::test]
+        async fn peer_matches_fifty_thousand_rows_measure_bounded_metadata_scan() {
+            const ROWS: usize = 50_000;
+            for distribution in ["same_origin", "distinct_origins", "different_peer"] {
+                let rows = (0..ROWS)
+                    .map(|index| {
+                        let host = if distribution == "distinct_origins" {
+                            format!("n{index}.example.com")
+                        } else {
+                            "same.example.com".into()
+                        };
+                        let mut row = peer_record(
+                            &host,
+                            index as u64 + 1,
+                            if distribution == "different_peer" && index > 0 {
+                                "198.51.100.8:443"
+                            } else {
+                                "198.51.100.7:443"
+                            },
+                        );
+                        row.path = "/".into();
+                        row.response.as_mut().unwrap().body_preview.clear();
+                        row.response.as_mut().unwrap().body_size = 0;
+                        row
+                    })
+                    .rev()
+                    .collect();
+                let store = TransactionStore::from_records(rows);
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let prepared_scope = crate::scope::PreparedScope::new(&[], &[]);
+                for max_records in [10_000, ROWS] {
+                    let locked = store.inner.read().await;
+                    let started = std::time::Instant::now();
+                    let result = crate::service_map_peer_matches::inspect_retained(
+                        session,
+                        store.saved_cursor_generation,
+                        &id,
+                        &locked.entries[0],
+                        locked
+                            .entries
+                            .iter()
+                            .zip(locked.body_generations.iter().copied())
+                            .rev(),
+                        max_records,
+                        false,
+                        &prepared_scope,
+                    );
+                    let lock_duration = started.elapsed();
+                    drop(locked);
+                    let bytes = serde_json::to_vec(&result).unwrap().len();
+                    eprintln!("recorded peer microbenchmark: distribution={distribution}, retained_rows={ROWS}, considered_rows={max_records}, matching_rows={}, groups={}, samples={}, projected_bytes={bytes}, measured_read_lock_duration={lock_duration:?}", result.counts.matching_rows, result.origins.len(), result.counts.sample_rows);
+                    assert_eq!(
+                        result.snapshot.as_ref().unwrap().considered_rows,
+                        max_records
+                    );
+                    assert_eq!(
+                        result.counts.matching_rows,
+                        if distribution == "different_peer" {
+                            0
+                        } else {
+                            max_records - usize::from(max_records == ROWS)
+                        }
+                    );
+                    assert!(result.validate_response(session, &id, false, max_records));
+                    assert!(result.origins.len() <= 100 && result.counts.sample_rows <= 300);
+                    assert!(bytes <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_dense_scope_measures_preparation_outside_snapshot_lock() {
+            const ROWS: usize = 50_000;
+            let rows = (0..ROWS)
+                .map(|index| {
+                    let mut row = peer_record(
+                        &format!("n{index}.example.com"),
+                        index as u64 + 1,
+                        "198.51.100.7:443",
+                    );
+                    row.path = "/".into();
+                    row.response.as_mut().unwrap().body_preview.clear();
+                    row.response.as_mut().unwrap().body_size = 0;
+                    row
+                })
+                .rev()
+                .collect();
+            let store = TransactionStore::from_records(rows);
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            for shape in ["short_exact", "long_exact", "wildcard"] {
+                let mut include = (0..499)
+                    .map(|i| match shape {
+                        "long_exact" => format!("include-{i}.{}.example.com", "a".repeat(470)),
+                        "wildcard" => format!("*never-included-{i}*"),
+                        _ => format!("include-{i}.unmatched.example.com"),
+                    })
+                    .collect::<Vec<_>>();
+                include.push("*.example.com".into());
+                let exclude = (0..500)
+                    .map(|i| match shape {
+                        "long_exact" => format!("exclude-{i}.{}.example.com", "b".repeat(470)),
+                        "wildcard" => format!("*never-excluded-{i}*"),
+                        _ => format!("exclude-{i}.unmatched.example.com"),
+                    })
+                    .collect::<Vec<_>>();
+                assert!(include
+                    .iter()
+                    .chain(exclude.iter())
+                    .all(|pattern| pattern.len() <= 512));
+                let prepared_at = std::time::Instant::now();
+                let prepared_scope = crate::scope::PreparedScope::new(&include, &exclude);
+                let preparation = prepared_at.elapsed();
+                for max_records in [10_000, ROWS] {
+                    let locked = store.inner.read().await;
+                    let started = std::time::Instant::now();
+                    let result = crate::service_map_peer_matches::inspect_retained(
+                        session,
+                        store.saved_cursor_generation,
+                        &id,
+                        &locked.entries[0],
+                        locked
+                            .entries
+                            .iter()
+                            .zip(locked.body_generations.iter().copied())
+                            .rev(),
+                        max_records,
+                        true,
+                        &prepared_scope,
+                    );
+                    let lock_duration = started.elapsed();
+                    drop(locked);
+                    let bytes = serde_json::to_vec(&result).unwrap().len();
+                    eprintln!("recorded peer dense-scope microbenchmark: shape={shape}, include=500, exclude=500, retained_rows={ROWS}, considered_rows={max_records}, matching_rows={}, preparation_outside_lock={preparation:?}, measured_read_lock_duration={lock_duration:?}, projected_bytes={bytes}",result.counts.matching_rows);
+                    if shape == "wildcard" {
+                        assert_eq!(result.reasons, ["scope_work_limit"]);
+                        assert!(
+                            !result.available
+                                && result.source.is_none()
+                                && result.peer.is_none()
+                                && result.snapshot.is_none()
+                        );
+                        assert!(result.origins.is_empty());
+                        assert_eq!(
+                            result.counts,
+                            crate::service_map_peer_matches::SocketPeerMatchCounts::default()
+                        );
+                    } else {
+                        assert_eq!(
+                            result.counts.matching_rows,
+                            max_records - usize::from(max_records == ROWS)
+                        );
+                        assert!(
+                            result.source.as_ref().unwrap().in_scope
+                                && result.origins.iter().all(|group| group.in_scope)
+                        );
+                    }
+                    assert!(result.validate_response(session, &id, true, max_records));
+                    assert!(bytes <= crate::service_map_peer_matches::MAX_PROJECTION_BYTES);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_matches_scope_work_limit_discards_all_partial_metadata() {
+            let host = format!(
+                "{}.{}.{}.{}.example.com",
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(63),
+                "a".repeat(63)
+            );
+            let rows = (1..=50_000)
+                .map(|sequence| {
+                    let mut row = peer_record(&host, sequence, "198.51.100.7:443");
+                    row.response.as_mut().unwrap().body_preview.clear();
+                    row.response.as_mut().unwrap().body_size = 0;
+                    row
+                })
+                .rev()
+                .collect();
+            let store = TransactionStore::from_records(rows);
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let include = vec!["*.example.com".into(); 500];
+            let exclude = (0..500)
+                .map(|i| format!("{}z{i}*", "*a".repeat(240)))
+                .collect::<Vec<_>>();
+            let prepared =
+                crate::scope::PreparedScope::try_new(&include, &exclude, 500, 512).unwrap();
+            for max_records in [10_000, 50_000] {
+                for scope_only in [false, true] {
+                    let locked = store.inner.read().await;
+                    let started = std::time::Instant::now();
+                    let result = crate::service_map_peer_matches::inspect_retained(
+                        session,
+                        store.saved_cursor_generation,
+                        &id,
+                        &locked.entries[0],
+                        locked
+                            .entries
+                            .iter()
+                            .zip(locked.body_generations.iter().copied())
+                            .rev(),
+                        max_records,
+                        scope_only,
+                        &prepared,
+                    );
+                    let elapsed = started.elapsed();
+                    drop(locked);
+                    eprintln!("recorded peer long-glob work-bound microbenchmark: patterns500+500, host_bytes={}, rows={max_records}, scope_only={scope_only}, read_lock={elapsed:?}",host.len());
+                    assert_eq!(result.reasons, ["scope_work_limit"]);
+                    assert!(
+                        !result.available
+                            && result.peer.is_none()
+                            && result.source.is_none()
+                            && result.snapshot.is_none()
+                            && result.origins.is_empty()
+                    );
+                    assert_eq!(
+                        result.counts,
+                        crate::service_map_peer_matches::SocketPeerMatchCounts::default()
+                    );
+                    assert!(result.validate_response(session, &id, scope_only, max_records));
+                    let json = serde_json::to_string(&result).unwrap();
+                    assert!(
+                        !json.contains(&host)
+                            && !json.contains("198.51.100.7")
+                            && !json.contains("PRIVATE")
+                    );
+                }
+            }
+            for (include, exclude) in [
+                (vec!["*".into(); 501], vec![]),
+                (vec![], vec!["x".repeat(513)]),
+            ] {
+                let result = store
+                    .service_map_socket_peer_matches(session, &id, false, 10, &include, &exclude)
+                    .await;
+                assert_eq!(result.reasons, ["scope_work_limit"]);
+                assert!(result.validate_response(session, &id, false, 10));
+            }
+        }
+
+        fn link_record(origin: &str, sequence: u64) -> TransactionRecord {
+            let mut record = body_record("SYNTHETIC_PRIVATE_BODY", sequence);
+            record.response.as_mut().unwrap().headers = vec![crate::model::HeaderRecord {
+                name: "Link".into(),
+                value: format!("<{origin}/private?token=HIDDEN>; rel=service-doc"),
+            }];
+            record
+        }
+
+        fn paused_link_read(
+            store: Arc<TransactionStore>,
+            session: Uuid,
+            token: String,
+            hook: ServiceMapBodyReadHook,
+        ) -> tokio::task::JoinHandle<crate::service_map_links::ServiceMapLinkDeclarations> {
+            tokio::spawn(async move {
+                store
+                    .service_map_link_declarations_impl(session, &token, Some(hook))
+                    .await
+            })
+        }
+
+        #[tokio::test]
+        async fn link_declarations_distinguish_resident_lazy_and_ambiguous_duplicate_metadata() {
+            for lazy in [false, true] {
+                let first = link_record("https://older.example.com", 1);
+                let mut second = link_record("https://newer.example.com", 2);
+                second.id = first.id;
+                second.method = "HEAD".into();
+                let (store, dir) = fixture_store(&[first, second], lazy).await;
+                let session = Uuid::new_v4();
+                let first_token = token(&store, session, 1).await;
+                let second_token = token(&store, session, 2).await;
+                // Header identity survives both absent body files and known
+                // ambiguous UUID-only body locators for either exact row.
+                if lazy {
+                    fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                }
+                {
+                    let mut inner = store.inner.write().await;
+                    for id in [&first_token, &second_token] {
+                        inner
+                            .unresolved_body_generations
+                            .insert(EvidenceKey::parse(id).unwrap().revision);
+                    }
+                }
+                for (id, origin, method) in [
+                    (&first_token, "https://older.example.com", "GET"),
+                    (&second_token, "https://newer.example.com", "HEAD"),
+                ] {
+                    let result = store.service_map_link_declarations(session, id).await;
+                    assert!(result.available && result.complete, "lazy={lazy}");
+                    assert_eq!(result.observations[0].target_origin, origin);
+                    assert_eq!(result.source_method.as_deref(), Some(method));
+                    assert_eq!(result.retained_header_count, Some(1));
+                    assert!(store
+                        .service_map_link_source_status(session, id)
+                        .await
+                        .is_ok());
+                }
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn link_declarations_reject_invalid_session_generation_row_and_revision_tokens() {
+            let first = link_record("https://example.com", 1);
+            let (store, dir) = fixture_store(&[first.clone()], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_link_declarations(session, "bad")
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            assert_eq!(
+                store
+                    .service_map_link_declarations(Uuid::new_v4(), &id)
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            let replacement = TransactionStore::from_records(vec![first.clone()]);
+            assert_eq!(
+                replacement
+                    .service_map_link_declarations(session, &id)
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            let key = EvidenceKey::parse(&id).unwrap();
+            let wrong_id = format!(
+                "v1.{}.{}.{}.{}.{}",
+                session,
+                key.generation,
+                key.sequence,
+                key.revision,
+                Uuid::new_v4()
+            );
+            assert_eq!(
+                store
+                    .service_map_link_declarations(session, &wrong_id)
+                    .await
+                    .reasons,
+                ["record_missing"]
+            );
+            store
+                .update_record(first.id, |row| {
+                    row.response.as_mut().unwrap().headers.clear()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .service_map_link_declarations(session, &id)
+                    .await
+                    .reasons,
+                ["record_changed"]
+            );
+            assert_eq!(
+                store.service_map_link_source_status(session, &id).await,
+                Err("record_changed")
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn link_declarations_fence_mutation_deletion_and_retention_before_and_after_scan() {
+            for lazy in [false, true] {
+                for stage in ["before_scan", "after_scan"] {
+                    for mutation in ["delete", "retention", "headers", "body"] {
+                        let first = link_record("https://example.com", 1);
+                        let (store, dir) = fixture_store(&[first.clone()], lazy).await;
+                        let session = Uuid::new_v4();
+                        let id = token(&store, session, 1).await;
+                        let before = store.service_map_link_declarations(session, &id).await;
+                        assert!(before.complete && before.observations.len() == 1);
+                        let (hook, started, release) = barrier(stage);
+                        let reading = paused_link_read(store.clone(), session, id, hook);
+                        tokio::time::timeout(WaitDuration::from_secs(10), started)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let expected = match mutation {
+                            "delete" => {
+                                assert_eq!(store.delete_ids(&[first.id]).await.unwrap(), 1);
+                                "record_missing"
+                            }
+                            "retention" => {
+                                assert_eq!(
+                                    store
+                                        .trim_retention(0, &HashSet::new(), 10)
+                                        .await
+                                        .unwrap()
+                                        .deleted_ids,
+                                    [first.id]
+                                );
+                                "record_missing"
+                            }
+                            "headers" => {
+                                store
+                                    .update_record(first.id, |row| {
+                                        row.response.as_mut().unwrap().headers.clear()
+                                    })
+                                    .await
+                                    .unwrap();
+                                "record_changed"
+                            }
+                            _ => {
+                                store
+                                    .update_record(first.id, |row| {
+                                        row.response.as_mut().unwrap().body_preview =
+                                            "changed".into()
+                                    })
+                                    .await
+                                    .unwrap();
+                                "record_changed"
+                            }
+                        };
+                        release.send(()).unwrap();
+                        let result = reading.await.unwrap();
+                        assert!(
+                            !result.available && !result.complete,
+                            "{lazy} {stage} {mutation}"
+                        );
+                        assert_eq!(result.reasons, [expected]);
+                        assert!(result.observations.is_empty());
+                        assert_eq!(
+                            result.counts,
+                            crate::service_map_links::ServiceMapLinkCounts::default()
+                        );
+                        assert!(
+                            result.source_origin.is_none()
+                                && result.retained_header_count.is_none()
+                        );
+                        drop(store);
+                        fs::remove_dir_all(dir).unwrap();
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn link_declarations_ignore_annotation_and_body_file_generation_changes() {
+            for stage in ["before_scan", "after_scan"] {
+                let first = link_record("https://example.com", 1);
+                let (store, dir) = fixture_store(&[first.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier(stage);
+                let reading = paused_link_read(store.clone(), session, id, hook);
+                started.await.unwrap();
+                store
+                    .update_annotations(first.id, None, Some(Some("note".into())))
+                    .await
+                    .unwrap();
+                // The retained metadata row does not change during body-file
+                // publication. No file/locator state belongs in this read fence.
+                let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+                let staged = dir.join("replacement");
+                fs::create_dir_all(&staged).unwrap();
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &staged,
+                    &[first],
+                )
+                .unwrap();
+                let publisher = store.clone();
+                let destination = dir.join("transactions.ndjson");
+                tokio::task::spawn_blocking(move || {
+                    publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                        crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert!(result.complete && result.available);
+                assert_eq!(result.observations.len(), 1);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn link_declarations_worker_failure_has_fixed_empty_envelope() {
+            let record = link_record("https://example.com", 1);
+            let (store, dir) = fixture_store(&[record], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let hook: ServiceMapBodyReadHook = Arc::new(|_| panic!("synthetic worker failure"));
+            let result = store
+                .service_map_link_declarations_impl(session, &id, Some(hook))
+                .await;
+            assert_eq!(result.reasons, ["link_inspection_failed"]);
+            assert!(!result.available && result.observations.is_empty());
+            assert_eq!(
+                result.counts,
+                crate::service_map_links::ServiceMapLinkCounts::default()
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_distinguishes_resident_and_lazy_duplicate_rows() {
+            let first = body_record(
+                "<html><head><meta name='generator' content='WordPress 6.8.1'></head>",
+                1,
+            );
+            let mut second = body_record(
+                "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                2,
+            );
+            second.id = first.id;
+            let (store, dir) = fixture_store(&[first, second], false).await;
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            let staged = dir.join("replacement");
+            fs::create_dir_all(&staged).unwrap();
+            // The fixture writer uses last-wins UUID locators, so give it
+            // oldest-first rows. Production streaming uses newest-first and
+            // first-wins locators; both must select the same authoritative row.
+            let records: Vec<_> = snapshot
+                .iter()
+                .rev()
+                .map(|(record, _)| record.clone())
+                .collect();
+            let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &staged, &records,
+            )
+            .unwrap();
+            let publisher = store.clone();
+            let destination = dir.join("transactions.ndjson");
+            tokio::task::spawn_blocking(move || {
+                publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                    crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let session = Uuid::new_v4();
+            let older_token = token(&store, session, 1).await;
+            let newer_token = token(&store, session, 2).await;
+            let older = store
+                .service_map_html_generators(session, &older_token)
+                .await;
+            let newer = store
+                .service_map_html_generators(session, &newer_token)
+                .await;
+            assert_eq!(older.observations[0].product_id, "wordpress");
+            assert_eq!(newer.observations[0].product_id, "drupal");
+            let inner = store.inner.read().await;
+            assert!(!inner.entries[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            assert!(inner.entries[1]
+                .response
+                .as_ref()
+                .unwrap()
+                .body_preview
+                .is_empty());
+            drop(inner);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_invalid_session_generation_and_revision_tokens() {
+            let record = body_record(
+                "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                1,
+            );
+            let (store, dir) = fixture_store(&[record.clone()], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, "bad")
+                    .await
+                    .reasons,
+                ["invalid_evidence_id"]
+            );
+            assert_eq!(
+                store
+                    .service_map_html_generators(Uuid::new_v4(), &id)
+                    .await
+                    .reasons,
+                ["session_mismatch"]
+            );
+            let replacement = TransactionStore::from_records(vec![record.clone()]);
+            assert_eq!(
+                replacement
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["stale_generation"]
+            );
+            store
+                .update_record(record.id, |r| {
+                    r.response.as_mut().unwrap().body_preview =
+                        "https://changed.example.com/ ".into()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["record_changed"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_fails_closed_for_oversized_wrong_missing_and_malformed_disk_rows(
+        ) {
+            for case in [
+                "oversized",
+                "wrong_locator",
+                "missing_file",
+                "malformed_json",
+                "malformed_utf8",
+                "wrong_sequence",
+                "missing_preview",
+            ] {
+                let first = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    1,
+                );
+                let second = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    2,
+                );
+                let (store, dir) = fixture_store(&[first.clone(), second.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let expected = match case {
+                    "oversized" => {
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: u64::MAX,
+                                    len: (MAX_SERIALIZED_ROW_BYTES + 1) as u32,
+                                },
+                            )
+                            .await;
+                        "serialized_row_limit"
+                    }
+                    "wrong_locator" => {
+                        let locator = store.inner.read().await.locators[&second.id];
+                        store.set_body_locator_for_test(first.id, locator).await;
+                        "body_identity_unverifiable"
+                    }
+                    "missing_file" => {
+                        fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+                        "body_storage_unavailable"
+                    }
+                    case => {
+                        let mut value = serde_json::to_value(&first).unwrap();
+                        let bytes = match case {
+                            "malformed_json" => b"{not json}".to_vec(),
+                            "malformed_utf8" => {
+                                // Put invalid UTF-8 in an ignored request field:
+                                // malformed bytes must not bypass the projection.
+                                let mut bytes = serde_json::to_vec(&first).unwrap();
+                                let needle = b"\"body_preview\":\"\"";
+                                let start = bytes
+                                    .windows(needle.len())
+                                    .position(|part| part == needle)
+                                    .unwrap();
+                                bytes.insert(start + needle.len() - 1, 0xff);
+                                bytes
+                            }
+                            "wrong_sequence" => {
+                                value["sequence"] = 0.into();
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            "missing_preview" => {
+                                value["response"]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("body_preview");
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            _ => unreachable!(),
+                        };
+                        fs::write(dir.join("transactions.ndjson"), &bytes).unwrap();
+                        store
+                            .set_body_locator_for_test(
+                                first.id,
+                                crate::session::BodyLocator {
+                                    offset: 0,
+                                    len: bytes.len() as u32,
+                                },
+                            )
+                            .await;
+                        match case {
+                            "wrong_sequence" => "body_identity_unverifiable",
+                            "missing_preview" => "retained_preview_unavailable",
+                            _ => "malformed_retained_row",
+                        }
+                    }
+                };
+                let result = store.service_map_html_generators(session, &id).await;
+                assert!(!result.available, "{case}");
+                assert!(result.observations.is_empty(), "{case}");
+                assert_eq!(result.reasons, [expected], "{case}");
+                // The normal map and metadata evidence remain independent of
+                // body storage, including missing/corrupt files and bad locators.
+                assert_eq!(store.service_map_snapshot(session, 10).await.rows.len(), 2);
+                assert!(store.service_map_evidence(session, &id).await.available);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_unresolved_and_nonresident_older_duplicate() {
+            let first = body_record(
+                "<html><head><meta name='generator' content='WordPress 6.8.1'></head>",
+                1,
+            );
+            let mut second = body_record(
+                "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                2,
+            );
+            second.id = first.id;
+            // A legacy-loaded older duplicate has no authoritative locator.
+            let (store, dir) = fixture_store(&[first, second], true).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["retained_preview_unavailable"]
+            );
+            let key = EvidenceKey::parse(&id).unwrap();
+            store
+                .inner
+                .write()
+                .await
+                .unresolved_body_generations
+                .insert(key.revision);
+            assert_eq!(
+                store
+                    .service_map_html_generators(session, &id)
+                    .await
+                    .reasons,
+                ["body_identity_unverifiable"]
+            );
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_resident_and_lazy_reject_deletion_retention_and_mutation_races(
+        ) {
+            for lazy in [false, true] {
+                for mutation in ["delete", "retention", "body"] {
+                    let first = body_record(
+                        "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                        1,
+                    );
+                    let (store, dir) = fixture_store(&[first.clone()], lazy).await;
+                    let session = Uuid::new_v4();
+                    let id = token(&store, session, 1).await;
+                    let (hook, started, release) = barrier("after_scan");
+                    let reading = paused_html_read(store.clone(), session, id, hook);
+                    tokio::time::timeout(WaitDuration::from_secs(10), started)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // If the reader held the store lock during file/scan work,
+                    // these real mutations would deadlock at this barrier.
+                    let expected = match mutation {
+                        "delete" => {
+                            assert_eq!(store.delete_ids(&[first.id]).await.unwrap(), 1);
+                            "record_missing"
+                        }
+                        "retention" => {
+                            assert_eq!(
+                                store
+                                    .trim_retention(0, &HashSet::new(), 10)
+                                    .await
+                                    .unwrap()
+                                    .deleted_ids,
+                                [first.id]
+                            );
+                            "record_missing"
+                        }
+                        _ => {
+                            store
+                                .update_record(first.id, |r| {
+                                    r.response.as_mut().unwrap().body_preview =
+                                        "https://after.example.com/ ".into()
+                                })
+                                .await
+                                .unwrap();
+                            "record_changed"
+                        }
+                    };
+                    release.send(()).unwrap();
+                    let result = reading.await.unwrap();
+                    assert!(!result.available, "{lazy} {mutation}");
+                    assert_eq!(result.reasons, [expected], "{lazy} {mutation}");
+                    drop(store);
+                    fs::remove_dir_all(dir).unwrap();
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_annotations_keep_evidence_valid_during_scan() {
+            for lazy in [false, true] {
+                let record = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    1,
+                );
+                let (store, dir) = fixture_store(&[record.clone()], lazy).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let (hook, started, release) = barrier("after_scan");
+                let reading = paused_html_read(store.clone(), session, id, hook);
+                started.await.unwrap();
+                store
+                    .update_annotations(record.id, None, Some(Some("note".into())))
+                    .await
+                    .unwrap();
+                release.send(()).unwrap();
+                assert!(reading.await.unwrap().complete);
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_atomic_publication_before_and_after_disk_scan() {
+            for stage in ["after_open", "after_scan"] {
+                let record = body_record(
+                    "<html><head><meta name='generator' content='Drupal 11.0'></head>",
+                    1,
+                );
+                let (store, dir) = fixture_store(&[record.clone()], true).await;
+                let session = Uuid::new_v4();
+                let id = token(&store, session, 1).await;
+                let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+                let staged = dir.join("replacement");
+                fs::create_dir_all(&staged).unwrap();
+                let locators = crate::session::write_transactions_file_for_test_returning_locators(
+                    &staged,
+                    &[record],
+                )
+                .unwrap();
+                let (hook, started, release) = barrier(stage);
+                let reading = paused_html_read(store.clone(), session, id.clone(), hook);
+                started.await.unwrap();
+                let publisher = store.clone();
+                let destination = dir.join("transactions.ndjson");
+                tokio::task::spawn_blocking(move || {
+                    publisher.publish_persistence_snapshot(&snapshot, locators, || {
+                        crate::platform::rename(&staged.join("transactions.ndjson"), &destination)
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                release.send(()).unwrap();
+                let result = reading.await.unwrap();
+                assert_eq!(result.reasons, ["body_identity_unverifiable"], "{stage}");
+                assert!(result.observations.is_empty());
+                // A fresh explicit read uses the adopted locator/file generation.
+                assert!(
+                    store
+                        .service_map_html_generators(session, &id)
+                        .await
+                        .complete
+                );
+                drop(store);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn html_generator_read_rejects_base64_from_invalid_utf8_capture() {
+            let mut record = body_record("", 1);
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/html"),
+            );
+            record.response = Some(MessageRecord::from_headers_and_body(
+                &headers,
+                &[0xff, 0xfe, 0xfd],
+                100,
+            ));
+            assert_eq!(
+                record.response.as_ref().unwrap().body_encoding,
+                BodyEncoding::Base64
+            );
+            let (store, dir) = fixture_store(&[record], false).await;
+            let session = Uuid::new_v4();
+            let id = token(&store, session, 1).await;
+            let result = store.service_map_html_generators(session, &id).await;
+            assert_eq!(result.status, "unsupported");
+            assert_eq!(result.reasons, ["unsupported_body_encoding"]);
+            assert!(!result.available);
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    mod retention_tests {
+        use super::*;
+        use futures_util::{poll, FutureExt};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        fn records(count: usize) -> Vec<TransactionRecord> {
+            (0..count)
+                .map(|index| {
+                    let mut record = test_record("example.com");
+                    record.path = format!("/{index}");
+                    record.sequence = index as u64 + 1;
+                    record
+                })
+                .collect()
+        }
+
+        fn journal_store(records: Vec<TransactionRecord>) -> (TransactionStore, PathBuf) {
+            let path =
+                std::env::temp_dir().join(format!("sniper-retention-store-{}", Uuid::new_v4()));
+            let store = TransactionStore::from_records_with_journal(
+                records.into_iter().rev().collect(),
+                path.join("transactions.journal"),
+                None,
+            );
+            (store, path)
+        }
+
+        #[tokio::test]
+        async fn retention_oldest_eligible_holes_deduplicated_protection_and_target() {
+            let records = records(7);
+            let ids: Vec<_> = records.iter().map(|record| record.id).collect();
+            let (store, path) = journal_store(records);
+            let lease = store.in_progress.register(ids[2]);
+            let saved = HashSet::from([ids[0], ids[2], ids[5], Uuid::new_v4()]);
+            assert_eq!(store.retention_status(&saved).await, (7, 3));
+            let outcome = store.trim_retention(4, &saved, 10).await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![ids[1], ids[3], ids[4]]);
+            assert_eq!((outcome.current_count, outcome.protected_count), (4, 3));
+            assert!(store.get(ids[6]).await.is_some());
+            let outcome = store.trim_retention(1, &saved, 10).await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![ids[6]]);
+            assert_eq!((outcome.current_count, outcome.protected_count), (3, 3));
+            let outcome = store.trim_retention(1, &saved, 10).await.unwrap();
+            assert!(outcome.deleted_ids.is_empty());
+            drop(lease);
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_chunks_and_zero_work_do_not_append_or_publish() {
+            let (store, path) = journal_store(records(6));
+            let mut events = store.subscribe_retention();
+            let initial_sequence = store.latest_event_sequence();
+            let no_work = store.trim_retention(6, &HashSet::new(), 2).await.unwrap();
+            assert!(no_work.deleted_ids.is_empty());
+            assert_eq!(no_work.event_sequence, initial_sequence);
+            assert!(!store.retention_compaction_pending());
+            let zero_chunk = store.trim_retention(1, &HashSet::new(), 0).await.unwrap();
+            assert!(zero_chunk.deleted_ids.is_empty());
+            assert!(events.try_recv().is_err());
+            assert_eq!(
+                fs::metadata(path.join("transactions.journal"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            let first = store.trim_retention(1, &HashSet::new(), 2).await.unwrap();
+            assert_eq!(first.deleted_ids.len(), 2);
+            assert_eq!(first.current_count, 4);
+            assert_eq!(first.event_sequence, initial_sequence + 1);
+            let second = store.trim_retention(1, &HashSet::new(), 2).await.unwrap();
+            assert_eq!(second.deleted_ids.len(), 2);
+            assert_eq!(second.current_count, 2);
+            store.mark_retention_compacted(first.event_sequence);
+            assert!(store.retention_compaction_pending());
+            store.mark_retention_compacted(second.event_sequence);
+            assert!(!store.retention_compaction_pending());
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_tombstone_ids_are_hard_bounded() {
+            let (store, path) = journal_store(records(1030));
+            let outcome = store
+                .trim_retention(1, &HashSet::new(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(outcome.deleted_ids.len(), 1024);
+            assert_eq!(outcome.current_count, 6);
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_duplicate_leases_release_only_owned_token_and_notify_last() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let store = TransactionStore::from_records(vec![record]);
+            let first = store.in_progress.register(id);
+            let second = store.in_progress.register(id);
+            let first_token = first.token;
+            let notify = store.retention_notify();
+            drop(second);
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 1));
+            assert!(notify.notified().now_or_never().is_none());
+            store.in_progress.release(id, Uuid::new_v4());
+            assert_eq!(store.retention_status(&HashSet::from([id])).await, (1, 1));
+            drop(first);
+            assert!(notify.notified().now_or_never().is_some());
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 0));
+            store.in_progress.release(id, first_token);
+            store.in_progress.release(Uuid::new_v4(), first_token);
+            assert!(notify.notified().now_or_never().is_none());
+        }
+
+        #[tokio::test]
+        async fn retention_in_progress_insert_and_cleanup_are_atomic() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let mut store = TransactionStore::new();
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let mut insertion = Box::pin(store.insert_in_progress(record));
+            assert!(poll!(&mut insertion).is_pending());
+            let TransactionJournalCommand::Append { ack: Some(ack), .. } = rx.try_recv().unwrap()
+            else {
+                panic!("expected provisional append");
+            };
+            let saved = HashSet::new();
+            let mut cleanup = Box::pin(store.trim_retention(0, &saved, 10));
+            assert!(poll!(&mut cleanup).is_pending());
+            assert_eq!(store.len().await, 0);
+            ack.send(Ok(())).unwrap();
+            let (outcome, guard) = insertion.await;
+            assert!(!outcome.immediate_snapshot_required());
+            let cleanup = cleanup.await.unwrap();
+            assert!(cleanup.deleted_ids.is_empty());
+            assert_eq!((cleanup.current_count, cleanup.protected_count), (1, 1));
+            assert_eq!(store.get(id).await.unwrap().id, id);
+            assert!(rx.try_recv().is_err());
+            drop(guard);
+            assert_eq!(store.retention_status(&saved).await, (1, 0));
+        }
+
+        #[tokio::test]
+        async fn retention_cancelled_insertion_and_owner_panic_release_their_leases() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let mut store = TransactionStore::new();
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let mut insertion = Box::pin(store.insert_in_progress(record));
+            assert!(poll!(&mut insertion).is_pending());
+            let command = rx.try_recv().unwrap();
+            assert!(store.in_progress.leases.lock().unwrap().contains_key(&id));
+            drop(insertion);
+            drop(command);
+            assert!(store.in_progress.leases.lock().unwrap().is_empty());
+            assert_eq!(store.len().await, 0);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _guard = store.in_progress.register(id);
+                panic!("synthetic owner panic");
+            }));
+            assert!(result.is_err());
+            assert!(store.in_progress.leases.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn retention_insert_fallback_and_cancelled_owner_keep_then_release_protection() {
+            let store = Arc::new(TransactionStore::new());
+            let record = test_record("example.com");
+            let id = record.id;
+            let notify = store.retention_notify();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let owner = {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let (outcome, _guard) = store.insert_in_progress(record).await;
+                    assert!(outcome.immediate_snapshot_required());
+                    // Controlled stand-in for the completion/persistence scope.
+                    ready_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                })
+            };
+            ready_rx.await.unwrap();
+            assert!(notify.notified().now_or_never().is_some());
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 1));
+            assert!(store
+                .trim_retention(0, &HashSet::new(), 10)
+                .await
+                .unwrap()
+                .deleted_ids
+                .is_empty());
+            owner.abort();
+            assert!(owner.await.unwrap_err().is_cancelled());
+            assert!(notify.notified().now_or_never().is_some());
+            assert_eq!(store.retention_status(&HashSet::new()).await, (1, 0));
+            assert!(store.get(id).await.is_some());
+        }
+
+        #[tokio::test]
+        async fn retention_manual_clear_and_absent_update_do_not_resurrect_on_drop() {
+            let (store, path) = journal_store(Vec::new());
+            let record = test_record("example.com");
+            let id = record.id;
+            let (_, guard) = store.insert_in_progress(record).await;
+            let mut events = store.subscribe_retention();
+            assert_eq!(store.delete_all().await.unwrap(), 1);
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                TransactionRetentionEvent::Gap
+            ));
+            assert!(store
+                .update_record_durable(id, |_| panic!("absent update called"))
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(store.retention_status(&HashSet::from([id])).await, (0, 0));
+            drop(guard);
+            assert_eq!(store.len().await, 0);
+            assert!(store.in_progress.leases.lock().unwrap().is_empty());
+            assert!(events.try_recv().is_err());
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[tokio::test]
+        async fn retention_waits_for_durable_ack_before_memory_event_or_compaction_flag() {
+            let rows = records(2);
+            let first_id = rows[0].id;
+            let mut store = TransactionStore::from_records(rows.into_iter().rev().collect());
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let mut events = store.subscribe_retention();
+            let sequence = store.latest_event_sequence();
+            let saved = HashSet::new();
+            let mut cleanup = Box::pin(store.trim_retention(1, &saved, 10));
+            assert!(poll!(&mut cleanup).is_pending());
+            let TransactionJournalCommand::Append {
+                line,
+                ack: Some(ack),
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected acknowledged tombstone");
+            };
+            let entry: TransactionJournalEntry = serde_json::from_slice(&line).unwrap();
+            assert!(
+                matches!(entry, TransactionJournalEntry::Delete { ids } if ids == vec![first_id])
+            );
+            assert_eq!(store.len().await, 2);
+            assert!(store.get(first_id).await.is_some());
+            assert_eq!(store.latest_event_sequence(), sequence);
+            assert!(!store.retention_compaction_pending());
+            assert!(events.try_recv().is_err());
+            ack.send(Ok(())).unwrap();
+            let outcome = cleanup.await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![first_id]);
+            assert_eq!(outcome.event_sequence, sequence + 1);
+            assert_eq!(outcome.current_count, 1);
+            assert!(store.retention_compaction_pending());
+            assert_eq!(
+                events.try_recv().unwrap(),
+                TransactionRetentionEvent::Deleted {
+                    ids: vec![first_id],
+                    generation: store.saved_cursor_generation(),
+                    event_sequence: sequence + 1,
+                }
+            );
+            assert!(events.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn retention_failed_or_lost_ack_keeps_memory_and_event_boundary() {
+            for lose_ack in [false, true] {
+                let rows = records(2);
+                let mut store = TransactionStore::from_records(rows.into_iter().rev().collect());
+                let (tx, rx) = mpsc::channel();
+                store.journal_tx = Some(tx);
+                let before = serde_json::to_value(store.snapshot(None).await).unwrap();
+                let sequence = store.latest_event_sequence();
+                let mut events = store.subscribe_retention();
+                let saved = HashSet::new();
+                let mut cleanup = Box::pin(store.trim_retention(1, &saved, 10));
+                assert!(poll!(&mut cleanup).is_pending());
+                let TransactionJournalCommand::Append { ack: Some(ack), .. } =
+                    rx.try_recv().unwrap()
+                else {
+                    panic!("expected acknowledged tombstone");
+                };
+                if lose_ack {
+                    drop(ack);
+                } else {
+                    ack.send(Err(io::Error::other("synthetic fsync failure")))
+                        .unwrap();
+                }
+                assert!(cleanup.await.is_err());
+                assert_eq!(
+                    serde_json::to_value(store.snapshot(None).await).unwrap(),
+                    before
+                );
+                assert_eq!(store.latest_event_sequence(), sequence);
+                assert!(!store.retention_compaction_pending());
+                assert!(events.try_recv().is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn retention_deletion_only_restart_preserves_survivor_bodies_after_ack_or_failure() {
+            for fail_ack in [false, true] {
+                let path = std::env::temp_dir()
+                    .join(format!("sniper-retention-restart-{}", Uuid::new_v4()));
+                let (registry, session) =
+                    crate::session::SessionRegistry::load_or_create(&path, 32, 32).unwrap();
+                session
+                    .scanner
+                    .update_config(crate::scanner::ScannerConfig {
+                        enabled: false,
+                        ..crate::scanner::ScannerConfig::default()
+                    })
+                    .await;
+                let mut rows = records(3);
+                for (index, record) in rows.iter_mut().enumerate() {
+                    record.request.body_preview = format!("synthetic body {index}");
+                    record.request.body_size = record.request.body_preview.len();
+                    session.store.insert(record.clone()).await;
+                }
+                session.persist().await.unwrap();
+                let journal_path = session.storage_dir().join("transactions.journal");
+                // The baseline is fully compacted before deletion. Restart
+                // replays only tombstones, never inserts or scanner recovery.
+                assert_eq!(fs::metadata(&journal_path).unwrap().len(), 0);
+                let protected_id = rows[0].id;
+                let survivor_body = rows[0].request.body_preview.clone();
+                drop(session);
+                drop(registry);
+                let mut store = TransactionStore::from_records(rows.into_iter().rev().collect());
+                let (tx, rx) = mpsc::channel();
+                store.journal_tx = Some(tx);
+                let saved = HashSet::from([protected_id]);
+                let mut cleanup = Box::pin(store.trim_retention(1, &saved, 10));
+                assert!(poll!(&mut cleanup).is_pending());
+                let TransactionJournalCommand::Append {
+                    line,
+                    ack: Some(ack),
+                } = rx.try_recv().unwrap()
+                else {
+                    panic!("expected acknowledged tombstone");
+                };
+                let mut journal = OpenOptions::new().append(true).open(&journal_path).unwrap();
+                journal.write_all(&line).unwrap();
+                journal.flush().unwrap();
+                journal.sync_all().unwrap();
+                drop(journal);
+                if fail_ack {
+                    ack.send(Err(io::Error::other("synthetic acknowledgement failure")))
+                        .unwrap();
+                    assert!(cleanup.await.is_err());
+                    assert_eq!(store.len().await, 3);
+                } else {
+                    ack.send(Ok(())).unwrap();
+                    assert_eq!(cleanup.await.unwrap().current_count, 1);
+                }
+                drop(store);
+                let (registry, reloaded) =
+                    crate::session::SessionRegistry::load_or_create(&path, 32, 32).unwrap();
+                assert!(!reloaded.scanner.get_config().await.enabled);
+                assert_eq!(reloaded.store.len().await, 1);
+                assert_eq!(
+                    reloaded
+                        .store
+                        .get(protected_id)
+                        .await
+                        .unwrap()
+                        .request
+                        .body_preview,
+                    survivor_body
+                );
+                assert_eq!(fs::metadata(&journal_path).unwrap().len(), 0);
+                drop(reloaded);
+                drop(registry);
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn retention_keeps_duplicate_uuid_insertion_semantics_and_counts_once() {
+            let record = test_record("example.com");
+            let id = record.id;
+            let (store, path) = journal_store(Vec::new());
+            let (_, first) = store.insert_in_progress(record.clone()).await;
+            let (_, second) = store.insert_in_progress(record).await;
+            assert_eq!(store.len().await, 2);
+            assert_eq!(store.retention_status(&HashSet::from([id])).await, (2, 1));
+            drop(first);
+            assert_eq!(store.retention_status(&HashSet::new()).await, (2, 1));
+            assert!(store
+                .trim_retention(0, &HashSet::new(), 10)
+                .await
+                .unwrap()
+                .deleted_ids
+                .is_empty());
+            drop(second);
+            let outcome = store.trim_retention(0, &HashSet::new(), 10).await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![id]);
+            assert_eq!(outcome.current_count, 0);
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     fn history_header_record() -> TransactionRecord {
@@ -4541,6 +9325,830 @@ pub(crate) mod tests {
         assert_eq!(after.sequence, before.sequence);
     }
 
+    async fn publish_fixture_snapshot(
+        store: Arc<TransactionStore>,
+        snapshot: TransactionPersistenceSnapshot,
+        storage_dir: &Path,
+    ) -> io::Result<()> {
+        let staged = storage_dir.join(format!("staged-{}", Uuid::new_v4()));
+        fs::create_dir_all(&staged)?;
+        let records: Vec<_> = snapshot.iter().map(|(record, _)| record.clone()).collect();
+        let locators =
+            crate::session::write_transactions_file_for_test_returning_locators(&staged, &records)
+                .unwrap();
+        let source = staged.join("transactions.ndjson");
+        let destination = storage_dir.join("transactions.ndjson");
+        let result = tokio::task::spawn_blocking(move || {
+            store.publish_persistence_snapshot(&snapshot, locators, || {
+                crate::platform::rename(&source, &destination)
+            })
+        })
+        .await
+        .unwrap();
+        let _ = fs::remove_dir_all(staged);
+        result
+    }
+
+    #[tokio::test]
+    async fn publication_keeps_late_updates_inserts_annotations_and_deletions() {
+        let dir = std::env::temp_dir().join(format!("sniper-publication-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let updated = record_with_bodies("example.com", "old update", "saved");
+        let annotated = record_with_bodies("example.com", "annotated body", "saved");
+        let deleted = record_with_bodies("example.com", "deleted body", "saved");
+        let reused = record_with_bodies("example.com", "old reused body", "saved");
+        let (updated_id, annotated_id, deleted_id, reused_id) =
+            (updated.id, annotated.id, deleted.id, reused.id);
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![updated, annotated, deleted, reused],
+            dir.join("transactions.journal"),
+            None,
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let captured_event = snapshot.latest_event_sequence;
+        assert!(snapshot.journal_rotation_confirmed);
+        store
+            .update_record(updated_id, |record| {
+                record.request.body_preview = "late update".into();
+                record.request.body_size = 11;
+            })
+            .await
+            .unwrap();
+        store
+            .update_annotations(
+                annotated_id,
+                Some(Some("blue".into())),
+                Some(Some("late note".into())),
+            )
+            .await
+            .unwrap();
+        store.delete_ids(&[deleted_id]).await.unwrap();
+        let inserted = record_with_bodies("example.com", "late insert", "saved");
+        let inserted_id = inserted.id;
+        store.insert(inserted).await;
+        let mut replacement = record_with_bodies("example.com", "late same id", "saved");
+        replacement.id = reused_id;
+        store.insert(replacement).await;
+        assert!(store.latest_event_sequence() > captured_event);
+
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(updated_id).await.unwrap().request.body_preview,
+            "late update"
+        );
+        assert_eq!(
+            store.get(inserted_id).await.unwrap().request.body_preview,
+            "late insert"
+        );
+        assert_eq!(
+            store.get(reused_id).await.unwrap().request.body_preview,
+            "late same id"
+        );
+        assert!(store.get(deleted_id).await.is_none());
+        let annotated = store.get(annotated_id).await.unwrap();
+        assert_eq!(annotated.request.body_preview, "annotated body");
+        assert_eq!(annotated.color_tag.as_deref(), Some("blue"));
+        assert_eq!(annotated.user_note.as_deref(), Some("late note"));
+        let inner = store.inner.read().await;
+        assert_eq!(inner.locators.len(), 1);
+        assert!(inner.locators.contains_key(&annotated_id));
+        assert!(inner.entries[inner.by_id[&annotated_id]]
+            .request
+            .body_preview
+            .is_empty());
+        drop(inner);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn duplicate_insert_unreadable_dependency_blocks_capture_and_prepared_publication() {
+        let mut failures = Vec::new();
+        for mismatched in [false, true] {
+            let dir = std::env::temp_dir()
+                .join(format!("sniper-duplicate-dependency-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let original = record_with_bodies("example.com", "original saved body", "saved");
+            let id = original.id;
+            let store = Arc::new(TransactionStore::from_records_with_journal(
+                vec![original],
+                dir.join("transactions.journal"),
+                None,
+            ));
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            publish_fixture_snapshot(store.clone(), snapshot, &dir)
+                .await
+                .unwrap();
+            let prepared = store.snapshot_for_persistence(None).await.unwrap();
+            if mismatched {
+                let other = record_with_bodies("example.com", "unrelated saved body", "saved");
+                crate::session::write_transactions_file_for_test(&dir, &[other]).unwrap();
+            } else {
+                fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            }
+            let mut replacement = record_with_bodies("example.com", "new supplied body", "saved");
+            replacement.id = id;
+            store.insert(replacement).await;
+            assert_eq!(
+                store.len().await,
+                2,
+                "same-ID ordering rows must remain present"
+            );
+            assert_eq!(
+                store.get(id).await.unwrap().request.body_preview,
+                "new supplied body"
+            );
+            let capture_rejected = store.snapshot_for_persistence(None).await.is_err();
+            let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let attempted_by_publisher = attempted.clone();
+            let publisher = store.clone();
+            let publication_rejected = tokio::task::spawn_blocking(move || {
+                publisher.publish_persistence_snapshot(
+                    &prepared,
+                    HashMap::from([(id, crate::session::BodyLocator { offset: 0, len: 1 })]),
+                    || {
+                        attempted_by_publisher.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .is_err();
+            let renamed = attempted.load(Ordering::SeqCst);
+            if !capture_rejected || !publication_rejected || renamed {
+                failures.push(format!("{} source: capture_rejected={capture_rejected}, publication_rejected={publication_rejected}, rename_attempted={renamed}", if mismatched { "mismatched" } else { "missing" }));
+            }
+            if mismatched {
+                store.replace_all(Vec::new()).await;
+            } else {
+                store.delete_ids(&[id]).await.unwrap();
+            }
+            assert!(
+                store
+                    .snapshot_for_persistence(None)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "removing all dependent rows must clear the blocker"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+        assert!(
+            failures.is_empty(),
+            "unreadable duplicate bodies must fail closed: {}",
+            failures.join("; ")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_body_search_keeps_each_ordering_rows_distinct_body() {
+        let older = record_with_bodies("example.com", "older-only-needle", "saved");
+        let mut newer = record_with_bodies("example.com", "newer-only-needle", "saved");
+        newer.id = older.id;
+        let store = TransactionStore::from_records(vec![newer, older]);
+        let older_outcome = store
+            .search_bodies(
+                &ListFilters::default(),
+                &search_request("older-only-needle"),
+            )
+            .await;
+        let newer_outcome = store
+            .search_bodies(
+                &ListFilters::default(),
+                &search_request("newer-only-needle"),
+            )
+            .await;
+        assert_eq!(
+            (older_outcome.match_count, newer_outcome.match_count),
+            (1, 1),
+            "duplicate ordering rows must search their own bodies exactly once"
+        );
+        assert!(older_outcome.complete && newer_outcome.complete);
+        assert_ne!(
+            older_outcome.transactions[0].sequence,
+            newer_outcome.transactions[0].sequence
+        );
+    }
+
+    async fn unreadable_duplicate_fixture(
+        max_entries: Option<usize>,
+    ) -> (Arc<TransactionStore>, PathBuf, TransactionRecord) {
+        let dir = std::env::temp_dir().join(format!("sniper-unresolved-row-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let original = record_with_bodies("example.com", "original saved body", "saved");
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![original.clone()],
+            dir.join("transactions.journal"),
+            max_entries,
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+        let mut replacement = record_with_bodies("example.com", "new supplied body", "saved");
+        replacement.id = original.id;
+        store.insert(replacement).await;
+        (store, dir, original)
+    }
+
+    #[tokio::test]
+    async fn unresolved_duplicate_dependency_survives_annotations_noops_and_source_restore() {
+        let (store, dir, original) = unreadable_duplicate_fixture(None).await;
+        let id = original.id;
+        store
+            .update_annotations(id, Some(Some("blue".into())), Some(Some("new note".into())))
+            .await
+            .unwrap();
+        store.update_record(id, |_| {}).await.unwrap();
+        crate::session::write_transactions_file_for_test(&dir, &[original]).unwrap();
+        let journal_before = fs::read(dir.join("transactions.journal")).unwrap();
+        let error = store.snapshot_for_persistence(None).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("preserved transaction body dependency"));
+        assert_eq!(
+            fs::read(dir.join("transactions.journal")).unwrap(),
+            journal_before,
+            "a blocked capture must not rotate the journal"
+        );
+        assert_eq!(store.len().await, 2);
+        assert_eq!(
+            store.inner.read().await.unresolved_body_generations.len(),
+            1
+        );
+        let outcome = store
+            .search_bodies(
+                &ListFilters::default(),
+                &search_request("new supplied body"),
+            )
+            .await;
+        assert_eq!(outcome.match_count, 1);
+        assert_eq!(outcome.unsearchable, 1);
+        assert!(!outcome.complete);
+        store.delete_all().await.unwrap();
+        assert!(store
+            .snapshot_for_persistence(None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .inner
+            .read()
+            .await
+            .unresolved_body_generations
+            .is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn late_retention_trim_keeps_survivor_and_new_body_during_publication() {
+        let dir = std::env::temp_dir().join(format!("sniper-late-trim-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let oldest = record_with_bodies("example.com", "trimmed body", "saved");
+        let oldest_id = oldest.id;
+        let survivor = record_with_bodies("example.com", "surviving body", "saved");
+        let survivor_id = survivor.id;
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![survivor, oldest],
+            dir.join("transactions.journal"),
+            Some(2),
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let newest = record_with_bodies("example.com", "new resident body", "saved");
+        let newest_id = newest.id;
+        store.insert(newest).await;
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        assert_eq!(store.len().await, 2);
+        assert!(store.get(oldest_id).await.is_none());
+        assert_eq!(
+            store.get(survivor_id).await.unwrap().request.body_preview,
+            "surviving body"
+        );
+        assert_eq!(
+            store.get(newest_id).await.unwrap().request.body_preview,
+            "new resident body"
+        );
+        let inner = store.inner.read().await;
+        assert!(inner.locators.contains_key(&survivor_id));
+        assert!(!inner.locators.contains_key(&oldest_id));
+        assert!(!inner.locators.contains_key(&newest_id));
+        drop(inner);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn retention_removes_only_the_discarded_duplicate_dependency() {
+        let (store, dir, original) = unreadable_duplicate_fixture(Some(1)).await;
+        assert_eq!(store.len().await, 1);
+        assert!(store
+            .inner
+            .read()
+            .await
+            .unresolved_body_generations
+            .is_empty());
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        assert_eq!(snapshot[0].0.request.body_preview, "new supplied body");
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(original.id).await.unwrap().request.body_preview,
+            "new supplied body"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn queued_body_search_never_rebinds_displaced_or_replaced_rows() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for replace_body in [false, true] {
+                let record = record_with_bodies("example.com", "original-only-needle", "saved");
+                let id = record.id;
+                let store = Arc::new(TransactionStore::from_records(vec![record]));
+                let (started_tx, started_rx) = oneshot::channel();
+                let (resume_tx, resume_rx) = mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                });
+                started_rx.await.unwrap();
+                let searching = store.clone();
+                let (queued_tx, queued_rx) = oneshot::channel();
+                let search = tokio::spawn(async move {
+                    let filters = ListFilters::default();
+                    let request = search_request("original-only-needle");
+                    let future = searching.search_bodies(&filters, &request);
+                    tokio::pin!(future);
+                    let mut queued_tx = Some(queued_tx);
+                    std::future::poll_fn(|context| {
+                        match std::future::Future::poll(future.as_mut(), context) {
+                            std::task::Poll::Pending => {
+                                if let Some(tx) = queued_tx.take() {
+                                    tx.send(()).unwrap();
+                                }
+                                std::task::Poll::Pending
+                            }
+                            ready => ready,
+                        }
+                    })
+                    .await
+                });
+                queued_rx.await.unwrap();
+                if replace_body {
+                    store
+                        .update_record(id, |record| {
+                            record.request.body_preview = "replacement-only-needle".into();
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    let mut replacement =
+                        record_with_bodies("example.com", "replacement-only-needle", "saved");
+                    replacement.id = id;
+                    store.insert(replacement).await;
+                }
+                resume_tx.send(()).unwrap();
+                blocker.await.unwrap();
+                let outcome = search.await.unwrap();
+                if replace_body {
+                    assert_eq!(outcome.match_count, 0);
+                    assert_eq!(outcome.unsearchable, 1);
+                    assert!(!outcome.complete);
+                } else {
+                    assert_eq!(outcome.match_count, 1);
+                    assert_eq!(outcome.unsearchable, 0);
+                    assert!(outcome.complete);
+                }
+                let latest = store
+                    .search_bodies(
+                        &ListFilters::default(),
+                        &search_request("replacement-only-needle"),
+                    )
+                    .await;
+                assert_eq!(latest.match_count, 1);
+                assert!(latest.complete);
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn same_id_insert_invalidates_locator_and_preserves_older_ordering_row() {
+        let dir = std::env::temp_dir().join(format!("sniper-same-id-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let record = record_with_bodies("example.com", "older body", "saved");
+        let id = record.id;
+        let store = Arc::new(TransactionStore::from_records_with_journal(
+            vec![record],
+            dir.join("transactions.journal"),
+            None,
+        ));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        publish_fixture_snapshot(store.clone(), snapshot, &dir)
+            .await
+            .unwrap();
+        let old_generation = store.inner.read().await.body_generations[0];
+        let mut replacement = record_with_bodies("example.com", "replacement body", "saved");
+        replacement.id = id;
+        store.insert(replacement).await;
+        assert_eq!(
+            store.get(id).await.unwrap().request.body_preview,
+            "replacement body"
+        );
+        let inner = store.inner.read().await;
+        assert_eq!(inner.entries.len(), 2);
+        assert_eq!(inner.by_id[&id], 1);
+        assert!(!inner.locators.contains_key(&id));
+        assert_eq!(inner.entries[0].request.body_preview, "older body");
+        assert_eq!(inner.body_generations[0], old_generation);
+        assert_ne!(inner.body_generations[1], old_generation);
+        drop(inner);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publication_generation_survives_replace_all_and_rejects_stale_file() {
+        let record = record_with_bodies("example.com", "before", "saved");
+        let id = record.id;
+        let store = Arc::new(TransactionStore::from_records(vec![record.clone()]));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let stale_snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let old_token = snapshot.body_generations[&id];
+        store
+            .update_annotations(id, None, Some(Some("one".into())))
+            .await
+            .unwrap();
+        store
+            .update_annotations(id, None, Some(Some("two".into())))
+            .await
+            .unwrap();
+        let event_before_replace = store.latest_event_sequence();
+        let mut replacement = record;
+        replacement.request.body_preview = "after replacement".into();
+        store.replace_all(vec![replacement]).await;
+        assert!(store.latest_event_sequence() > event_before_replace);
+        assert_ne!(store.inner.read().await.body_generations[0], old_token);
+        let publisher = store.clone();
+        tokio::task::spawn_blocking(move || {
+            publisher.publish_persistence_snapshot(
+                &snapshot,
+                HashMap::from([(id, crate::session::BodyLocator { offset: 0, len: 1 })]),
+                || Ok(()),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            store.get(id).await.unwrap().request.body_preview,
+            "after replacement"
+        );
+        assert!(store.inner.read().await.locators.is_empty());
+        let file_generation = store.inner.read().await.file_generation;
+        store.replace_all(Vec::new()).await;
+        assert_eq!(store.inner.read().await.file_generation, file_generation);
+        let result = tokio::task::spawn_blocking(move || {
+            store.publish_persistence_snapshot(&stale_snapshot, HashMap::new(), || {
+                panic!("stale snapshot must not attempt rename")
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn partial_snapshot_cannot_publish_or_discard_omitted_rows() {
+        let store = Arc::new(TransactionStore::from_records(vec![
+            record_with_bodies("example.com", "first", "saved"),
+            record_with_bodies("example.com", "second", "saved"),
+        ]));
+        let snapshot = store.snapshot_for_persistence(Some(1)).await.unwrap();
+        assert_eq!(snapshot.len(), 1);
+        let generation = snapshot.file_generation;
+        let publisher = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            publisher.publish_persistence_snapshot(&snapshot, HashMap::new(), || {
+                panic!("partial snapshots must not rename the file")
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let inner = store.inner.read().await;
+        assert_eq!(inner.entries.len(), 2);
+        assert_eq!(inner.file_generation, generation);
+        assert!(inner.locators.is_empty());
+        assert!(inner
+            .entries
+            .iter()
+            .all(|record| !record.request.body_preview.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn publication_rename_error_leaves_generations_and_bodies_unchanged() {
+        let record = record_with_bodies("example.com", "resident body", "saved");
+        let id = record.id;
+        let store = Arc::new(TransactionStore::from_records(vec![record]));
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        let old_generation = snapshot.file_generation;
+        let publisher = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            publisher.publish_persistence_snapshot(
+                &snapshot,
+                HashMap::from([(id, crate::session::BodyLocator { offset: 0, len: 1 })]),
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "synthetic rename failure",
+                    ))
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let inner = store.inner.read().await;
+        assert_eq!(inner.file_generation, old_generation);
+        assert!(inner.locators.is_empty());
+        assert_eq!(inner.entries[0].request.body_preview, "resident body");
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatched_body_aborts_update_before_edit_or_journal() {
+        let dir = std::env::temp_dir().join(format!("sniper-missing-body-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let record = record_with_bodies("example.com", "saved body", "saved");
+        let id = record.id;
+        let other = record_with_bodies("example.com", "other body", "saved");
+        let locators = crate::session::write_transactions_file_for_test_returning_locators(
+            &dir,
+            &[other.clone()],
+        )
+        .unwrap();
+        let mut stripped = record;
+        strip_transaction_bodies(&mut stripped);
+        let store = TransactionStore::from_records_with_journal(
+            vec![stripped],
+            dir.join("transactions.journal"),
+            None,
+        );
+        store
+            .set_body_locator_for_test(id, locators[&other.id])
+            .await;
+        for remove_file in [false, true] {
+            if remove_file {
+                fs::remove_file(dir.join("transactions.ndjson")).unwrap();
+            }
+            let result = store
+                .update_record_durable(id, |_| panic!("edit must not run without its body"))
+                .await;
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert!(fs::read(dir.join("transactions.journal"))
+                .unwrap()
+                .is_empty());
+            assert!(store.inner.read().await.locators.contains_key(&id));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn body_search_resolves_current_locator_after_queued_worker_resumes() {
+        // Occupy the sole blocking worker so publication definitely occurs
+        // between candidate collection and disk access, with no timing sleeps.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("sniper-search-publication-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let mut first = record_with_bodies("example.com", "first-only-needle", "saved");
+            first.sequence = 2;
+            let mut second = record_with_bodies("example.com", "other body", "saved");
+            second.sequence = 1;
+            let old_locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &dir,
+                &[second.clone(), first.clone()],
+            )
+            .unwrap();
+            let store = Arc::new(TransactionStore::from_records_with_journal(
+                vec![first.clone(), second.clone()],
+                dir.join("transactions.journal"),
+                None,
+            ));
+            store.adopt_written_locators(old_locators).await;
+            let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+            let staged = dir.join("staged");
+            fs::create_dir_all(&staged).unwrap();
+            let new_locators = crate::session::write_transactions_file_for_test_returning_locators(
+                &staged,
+                &[first.clone(), second],
+            )
+            .unwrap();
+            let source = staged.join("transactions.ndjson");
+            let destination = dir.join("transactions.ndjson");
+            let (started_tx, started_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let searching = store.clone();
+            let (queued_tx, queued_rx) = oneshot::channel();
+            let search = tokio::spawn(async move {
+                let filters = ListFilters::default();
+                let request = search_request("first-only-needle");
+                let future = searching.search_bodies(&filters, &request);
+                tokio::pin!(future);
+                // Poll once to enqueue its blocking scan before announcing the barrier.
+                let mut queued_tx = Some(queued_tx);
+                std::future::poll_fn(|context| {
+                    match std::future::Future::poll(future.as_mut(), context) {
+                        std::task::Poll::Pending => {
+                            if let Some(tx) = queued_tx.take() {
+                                tx.send(()).unwrap();
+                            }
+                            std::task::Poll::Pending
+                        }
+                        ready => ready,
+                    }
+                })
+                .await
+            });
+            queued_rx.await.unwrap();
+            let publisher = store.clone();
+            thread::spawn(move || {
+                publisher.publish_persistence_snapshot(&snapshot, new_locators, || {
+                    crate::platform::rename(&source, &destination)
+                })
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+            resume_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let outcome = search.await.unwrap();
+            assert!(outcome.complete);
+            assert_eq!(outcome.unsearchable, 0);
+            assert_eq!(outcome.match_count, 1);
+            assert_eq!(outcome.transactions[0].id, first.id);
+            let _ = fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn cancelled_offline_rotation_keeps_mutation_guard_until_worker_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("sniper-cancel-offline-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let record = test_record("example.com");
+            let line = encode_transaction_insert_journal_line(&record).unwrap();
+            fs::write(dir.join("transactions.journal"), &line).unwrap();
+            let mut store = TransactionStore::from_records(vec![record]);
+            store.storage_dir = Some(dir.clone());
+            let (tx, rx) = mpsc::channel();
+            drop(rx);
+            store.journal_tx = Some(tx);
+            let (started_tx, started_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let mut snapshot = Box::pin(store.snapshot_for_persistence(None));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(snapshot.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(snapshot);
+            assert!(
+                store.insert_lock.try_lock().is_err(),
+                "detached worker must own the mutation barrier"
+            );
+            resume_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let _guard =
+                tokio::time::timeout(std::time::Duration::from_secs(5), store.insert_lock.lock())
+                    .await
+                    .unwrap();
+            assert!(fs::read(dir.join("transactions.journal"))
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                fs::read(dir.join("transactions.journal.checkpoint")).unwrap(),
+                line
+            );
+            let _ = fs::remove_dir_all(dir);
+        });
+    }
+
+    #[tokio::test]
+    async fn disconnected_writer_rotates_offline_before_confirming_snapshot() {
+        let dir = std::env::temp_dir().join(format!("sniper-offline-rotate-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let record = test_record("example.com");
+        let line = encode_transaction_insert_journal_line(&record).unwrap();
+        fs::write(dir.join("transactions.journal"), &line).unwrap();
+        let mut store = TransactionStore::from_records(vec![record]);
+        store.storage_dir = Some(dir.clone());
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        store.journal_tx = Some(tx);
+        let snapshot = store.snapshot_for_persistence(None).await.unwrap();
+        assert!(snapshot.journal_rotation_confirmed);
+        assert!(fs::read(dir.join("transactions.journal"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fs::read(dir.join("transactions.journal.checkpoint")).unwrap(),
+            line
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn lost_rotation_ack_or_writer_error_never_truncates_offline() {
+        for explicit_error in [false, true] {
+            let dir =
+                std::env::temp_dir().join(format!("sniper-uncertain-rotate-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let record = test_record("example.com");
+            let line = encode_transaction_insert_journal_line(&record).unwrap();
+            fs::write(dir.join("transactions.journal"), &line).unwrap();
+            let mut store = TransactionStore::from_records(vec![record]);
+            store.storage_dir = Some(dir.clone());
+            let (tx, rx) = mpsc::channel();
+            store.journal_tx = Some(tx);
+            let writer = thread::spawn(move || match rx.recv().unwrap() {
+                TransactionJournalCommand::Rotate { ack } => {
+                    if explicit_error {
+                        ack.send(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "explicit writer error",
+                        )))
+                        .unwrap();
+                    }
+                }
+                _ => panic!("expected rotation"),
+            });
+            assert!(store.snapshot_for_persistence(None).await.is_err());
+            writer.join().unwrap();
+            assert_eq!(fs::read(dir.join("transactions.journal")).unwrap(), line);
+            assert!(!dir.join("transactions.journal.checkpoint").exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_writer_startup_can_rotate_after_storage_recovers() {
+        let dir = std::env::temp_dir().join(format!("sniper-startup-rotate-{}", Uuid::new_v4()));
+        let journal = dir.join("transactions.journal");
+        fs::create_dir_all(&journal).unwrap();
+        let record = test_record("example.com");
+        let line = encode_transaction_insert_journal_line(&record).unwrap();
+        let store =
+            TransactionStore::from_records_with_journal(vec![record], journal.clone(), None);
+        assert!(store.journal_tx.is_none());
+        assert!(store.journal_start_failed);
+        fs::remove_dir(&journal).unwrap();
+        fs::write(&journal, &line).unwrap();
+        assert!(
+            store
+                .snapshot_for_persistence(None)
+                .await
+                .unwrap()
+                .journal_rotation_confirmed
+        );
+        assert!(fs::read(&journal).unwrap().is_empty());
+        assert_eq!(
+            fs::read(dir.join("transactions.journal.checkpoint")).unwrap(),
+            line
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn snapshot_for_persistence_continues_when_journal_writer_stopped() {
         let mut store =
@@ -4553,6 +10161,7 @@ pub(crate) mod tests {
 
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].0.host, "example.com");
+        assert!(!snapshot.journal_rotation_confirmed);
     }
 
     #[tokio::test]
@@ -6188,3 +11797,82 @@ pub(crate) mod tests {
         assert_eq!(filtered[0].host, "api.example.test:9443");
     }
 }
+
+#[cfg(test)]
+mod retention_status_tests {
+    use super::*;
+
+    fn record() -> TransactionRecord {
+        TransactionRecord::http(
+            chrono::Utc::now(),
+            "GET".into(),
+            "https".into(),
+            "example.com".into(),
+            "/synthetic".into(),
+            Some(200),
+            1,
+            crate::model::MessageRecord::from_headers_and_body(
+                &http::HeaderMap::new(),
+                b"fixture",
+                1024,
+            ),
+            None,
+            vec![],
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn history_retention_duplicate_identity_and_protection_status_are_distinct() {
+        let record = record();
+        let id = record.id;
+        let store = TransactionStore::from_records_with_max_entries_and_event_sequence(
+            vec![record.clone(), record],
+            None,
+            0,
+        );
+        let conflict = store
+            .retention_status_details(&HashSet::new(), Some(1))
+            .await;
+        assert_eq!((conflict.total_count, conflict.protected_count), (2, 0));
+        assert!(conflict.identity_conflict);
+        assert!(!conflict.all_records_protected);
+        let protected = store
+            .retention_status_details(&HashSet::from([id]), Some(1))
+            .await;
+        assert_eq!((protected.total_count, protected.protected_count), (2, 1));
+        assert!(protected.all_records_protected);
+        assert!(!protected.identity_conflict);
+        assert!(
+            !store
+                .retention_status_details(&HashSet::new(), Some(2))
+                .await
+                .identity_conflict
+        );
+        assert!(
+            !store
+                .retention_status_details(&HashSet::new(), None)
+                .await
+                .identity_conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn history_retention_duplicate_group_is_eligible_when_within_excess() {
+        let duplicate = record();
+        let store = TransactionStore::from_records_with_max_entries_and_event_sequence(
+            vec![duplicate.clone(), duplicate, record()],
+            None,
+            0,
+        );
+        let status = store
+            .retention_status_details(&HashSet::new(), Some(1))
+            .await;
+        assert!(!status.identity_conflict);
+    }
+}
+
+#[cfg(test)]
+#[path = "store_service_map_epoch_tests.rs"]
+mod service_map_epoch_tests;

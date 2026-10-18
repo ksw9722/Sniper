@@ -78,6 +78,24 @@ flowchart LR
   - restores runtime settings, records, websockets, rules, and fuzzer records per session
 - `src/model.rs`
   - defines the shared transaction schema used by proxy, API, and future tooling
+- `src/service_map.rs`
+  - builds a bounded, on-demand projection of retained HTTP metadata for Scope and
+    the CLI, with exact-row evidence and explicitly typed header declarations
+  - reads no bodies and starts no network discovery or persistent index; see
+    [Service Map](integrations/service-map.md) for limits and evidence semantics
+- `src/service_map_body.rs`
+  - inspects one explicitly selected retained UTF-8 HTML/JavaScript response
+    preview for bounded literal absolute HTTP(S) references in the active session
+  - returns canonical origins and retained-preview offsets, with explicit limits
+    and unsupported/unavailable states; it performs no target requests and never
+    augments the default metadata projection automatically
+- `web/service-map.js`
+  - renders the metadata inventory and exact-source inspector without loading
+    whole-history bodies
+  - can collect up to eight explicitly shown body, Link and recorded-peer
+    inspections in one session-local graph with exact provenance and removal
+  - typed references and undirected address observations share display caps;
+    the collection changes no captured counts or API catalog and is never persisted
 - `src/api.rs`
   - exposes record/detail APIs
   - serves the lightweight desktop UI
@@ -104,6 +122,32 @@ replacement and still adopt the new body locators. File contents are synced
 before replacement; Unix also syncs the parent directory, while Windows uses
 write-through renames with the standard library's rename fallback where needed.
 Windows does not provide the same directory fsync operation as Unix.
+
+### Interrupted session deletion
+
+Deletion first moves session storage into a `.deleted-<session UUID>-<UUID>`
+quarantine, then commits its registry tombstone. If that registry write and the
+attempt to restore the directory both fail, the original data can remain in
+quarantine while the registry still lists the session. Startup now refuses this
+state before cleanup or registry repair, preserving the registry, quarantine,
+and any canonical directory for recovery. It does not automatically restore or
+merge them. Stop Sniper and preserve the entire sessions directory before
+recovery; deleting a quarantine can discard the original stored data.
+
+Startup also refuses quarantine evidence when the registry is missing, corrupt,
+or omits its session membership array, and refuses malformed quarantine names.
+These are intentional safety restrictions: an uncertain deletion must not be
+completed merely because its directory looks like cleanup debris. A valid
+registry's explicit tombstones retain authority for normally generated
+quarantines. Exact generated quarantines unreferenced by a valid explicit
+membership array retain normal orphan cleanup. Missing-active-ID and empty-array
+registry compatibility remains unchanged, as does recovery without quarantine
+evidence.
+
+This safeguard applies at startup only. A running process is not fenced after a
+failed rollback: cached workspace or state writes can still recreate partial
+canonical storage. Startup then stops and preserves both copies; that is
+recoverable data preservation, not a claim that the session has been restored.
 
 Same-machine UI clients are trusted so the local desktop shell and `sniper-cli`
 keep their existing workflow. A non-loopback UI listener authenticates clients

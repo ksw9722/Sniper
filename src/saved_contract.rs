@@ -329,6 +329,25 @@ pub fn validate_output(name: &str, value: &Value) -> Result<(), String> {
             if items.len() as u64 > limit {
                 return Err("output.items exceeds output.limit".into());
             }
+            let mut ids = HashSet::with_capacity(items.len());
+            let mut previous_id = None;
+            let mut previous_sequence = None;
+            for item in items {
+                let id = validated_uuid(&item["id"]);
+                if !ids.insert(id) {
+                    return Err("output.items contains duplicate UUIDs".into());
+                }
+                if name == "saved.v1.http.list" {
+                    let sequence = item["sequence"].as_u64().expect("validated integer");
+                    if previous_sequence.is_some_and(|previous| sequence >= previous) {
+                        return Err("output HTTP items are not in descending sequence order".into());
+                    }
+                    previous_sequence = Some(sequence);
+                } else if previous_id.is_some_and(|previous| id <= previous) {
+                    return Err("output session items are not in ascending UUID order".into());
+                }
+                previous_id = Some(id);
+            }
             if !value["continuation"].is_null() {
                 let cursor = &value["continuation"];
                 let last = items
@@ -338,25 +357,29 @@ pub fn validate_output(name: &str, value: &Value) -> Result<(), String> {
                     return Err("output continuation limit does not match the page".into());
                 }
                 if name == "saved.v1.http.list" {
-                    if cursor["session_id"] != value["session_id"]
+                    if validated_uuid(&cursor["session_id"]) != validated_uuid(&value["session_id"])
                         || cursor["before_sequence"] != last["sequence"]
                     {
                         return Err("output HTTP continuation does not match the page".into());
                     }
-                } else if cursor["after_id"] != last["id"] {
+                } else if validated_uuid(&cursor["after_id"]) != validated_uuid(&last["id"]) {
                     return Err("output session continuation does not match the page".into());
                 }
             }
         }
         "saved.v1.http.select" => {
-            if value["count"].as_u64()
-                != Some(value["ids"].as_array().expect("validated IDs").len() as u64)
-            {
+            let ids = value["ids"].as_array().expect("validated IDs");
+            if value["count"].as_u64() != Some(ids.len() as u64) {
                 return Err("output.count does not match output.ids".into());
+            }
+            let unique: HashSet<_> = ids.iter().map(validated_uuid).collect();
+            if unique.len() != ids.len() {
+                return Err("output.ids contains duplicate UUIDs".into());
             }
         }
         "saved.v1.operation.get" if value["found"] == json!(true) => {
-            if value["operation_id"] != value["receipt"]["operation_id"]
+            if validated_uuid(&value["operation_id"])
+                != validated_uuid(&value["receipt"]["operation_id"])
                 || value["outcome"] != value["receipt"]["outcome"]
             {
                 return Err("output lookup does not match its receipt".into());
@@ -364,7 +387,20 @@ pub fn validate_output(name: &str, value: &Value) -> Result<(), String> {
         }
         _ => {}
     }
+    if let Some(receipt) = value.get("receipt").filter(|receipt| {
+        receipt["operation"] == "saved.v1.session.rename" && receipt["outcome"] == "applied"
+    }) {
+        if validated_uuid(&receipt["result"]["session"]["id"])
+            != validated_uuid(&receipt["session_id"])
+        {
+            return Err("output renamed session does not match its receipt".into());
+        }
+    }
     Ok(())
+}
+
+fn validated_uuid(value: &Value) -> Uuid {
+    Uuid::parse_str(value.as_str().expect("validated UUID string")).expect("validated UUID")
 }
 
 /// Error envelopes are distinct from each operation's successful data schema.
@@ -626,6 +662,9 @@ pub fn receipt_schema(operation: Option<&str>) -> Value {
             {"properties":{"operation":{"const":"saved.v1.session.rename"},"result":{"properties":{"kind":{"const":"session_renamed"}}}}}
         ]}
     ]);
+    schema["x-sniper-semantic"] = json!("renamed-session-identity");
+    schema["description"] =
+        json!("An applied session rename result identifies the same session UUID as its receipt.");
     schema
 }
 
@@ -1009,6 +1048,101 @@ mod tests {
         }
     }
 
+    fn ordered_http_page(rows: &[(u128, u64)]) -> Value {
+        let items: Vec<_> = rows.iter().map(|(id, sequence)| {
+            json!({"id":Uuid::from_u128(*id),"sequence":sequence,"started_at":"2026-10-10T00:00:00Z",
+                "kind":"http","method":"GET","scheme":"https","host":"example.com","path":"/fixture",
+                "status":200,"duration_ms":0,"request_bytes":0,"response_bytes":0,"note_count":0,
+                "has_response":true,"content_type":null,"is_websocket":false,"has_match_replace":false,"has_user_note":false})
+        }).collect();
+        json!({"contract_version":CONTRACT_VERSION,"session_id":Uuid::from_u128(0xabcdef),
+            "items":items,"limit":2,"has_more":false,"continuation":null})
+    }
+
+    fn ordered_session_page(ids: &[u128]) -> Value {
+        let items: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let mut summary = session();
+                summary.id = Uuid::from_u128(*id);
+                summary
+            })
+            .collect();
+        json!({"contract_version":CONTRACT_VERSION,"items":items,"limit":2,"has_more":false,"continuation":null})
+    }
+
+    #[test]
+    fn output_http_pages_require_descending_sequences_and_unique_uuids() {
+        for (rows, valid) in [
+            (vec![], true),
+            (vec![(1, 2)], true),
+            (vec![(1, 2), (2, 1)], true),
+            (vec![(1, 1), (2, 2)], false),
+            (vec![(1, 2), (2, 2)], false),
+            (vec![(1, 2), (1, 1)], false),
+        ] {
+            assert_eq!(
+                validate_output("saved.v1.http.list", &ordered_http_page(&rows)).is_ok(),
+                valid
+            );
+        }
+        let mut duplicate = ordered_http_page(&[(0xabcdef, 2), (0xabcdee, 1)]);
+        duplicate["items"][1]["id"] = json!(Uuid::from_u128(0xabcdef).to_string().to_uppercase());
+        assert!(validate_output("saved.v1.http.list", &duplicate).is_err());
+    }
+
+    #[test]
+    fn output_session_pages_require_strict_uuid_order_instead_of_text_order() {
+        for (ids, valid) in [
+            (vec![], true),
+            (vec![1], true),
+            (vec![1, 2], true),
+            (vec![2, 1], false),
+            (vec![1, 1], false),
+        ] {
+            assert_eq!(
+                validate_output("saved.v1.session.list", &ordered_session_page(&ids)).is_ok(),
+                valid
+            );
+        }
+        let mut page = ordered_session_page(&[0xabcdee, 0xabcdef]);
+        page["items"][1]["id"] = json!(Uuid::from_u128(0xabcdef).to_string().to_uppercase());
+        assert!(validate_output("saved.v1.session.list", &page).is_ok());
+        page["items"][1]["id"] = json!(Uuid::from_u128(0xabcdee).to_string().to_uppercase());
+        assert!(validate_output("saved.v1.session.list", &page).is_err());
+    }
+
+    #[test]
+    fn output_continuations_compare_uuid_values_and_preserve_input_compatibility() {
+        let mut http = ordered_http_page(&[(1, 2), (2, 1)]);
+        http["has_more"] = json!(true);
+        http["continuation"] = json!({"session_id":Uuid::from_u128(0xabcdef).to_string().to_uppercase(),
+            "store_generation":Uuid::from_u128(3),"before_sequence":1,"limit":2});
+        validate_output("saved.v1.http.list", &http).unwrap();
+        validate_input(
+            "saved.v1.http.list",
+            &json!({"continuation":http["continuation"]}),
+        )
+        .unwrap();
+        let mut sessions = ordered_session_page(&[0xabcdee, 0xabcdef]);
+        sessions["has_more"] = json!(true);
+        sessions["continuation"] =
+            json!({"after_id":Uuid::from_u128(0xabcdef).to_string().to_uppercase(),"limit":2});
+        validate_output("saved.v1.session.list", &sessions).unwrap();
+        validate_input("saved.v1.session.list", &sessions["continuation"]).unwrap();
+    }
+
+    #[test]
+    fn output_selection_rejects_case_variant_duplicate_uuids() {
+        let uuid = Uuid::from_u128(0xabcdef);
+        let mut selection = json!({"contract_version":CONTRACT_VERSION,"session_id":id(),"count":1,
+            "ids":[uuid.to_string().to_uppercase()],"selection_token":"a".repeat(64)});
+        validate_output("saved.v1.http.select", &selection).unwrap();
+        selection["ids"] = json!([uuid, uuid.to_string().to_uppercase()]);
+        selection["count"] = json!(2);
+        assert!(validate_output("saved.v1.http.select", &selection).is_err());
+    }
+
     #[test]
     fn real_serialized_summaries_match_complete_output_schemas() {
         let mut summary = TransactionSummary {
@@ -1119,6 +1253,88 @@ mod tests {
         validate_schema(&schema, &absent, "output").unwrap();
         absent["outcome"] = json!("not_applied");
         assert!(validate_schema(&schema, &absent, "output").is_err());
+    }
+
+    #[test]
+    fn operation_lookup_matches_receipt_uuid_identity() {
+        let lower = "abcdef00-1234-5678-9abc-def012345678";
+        let upper = lower.to_uppercase();
+        let lookup = |outer: &str, inner: &str| {
+            json!({"contract_version":CONTRACT_VERSION,"operation_id":outer,"found":true,
+                "outcome":"unknown","receipt":{"contract_version":CONTRACT_VERSION,
+                    "operation_id":inner,"session_id":id(),"operation":"saved.v1.http.clear",
+                    "outcome":"unknown","code":"pending","message":"Pending.",
+                    "created_at":"2026-10-10T00:00:00Z"}})
+        };
+        for (outer, inner) in [(upper.as_str(), lower), (lower, upper.as_str())] {
+            validate_output("saved.v1.operation.get", &lookup(outer, inner)).unwrap();
+        }
+        let different = "abcdef00-1234-5678-9abc-def012345679";
+        for (outer, inner) in [(lower, different), (different, upper.as_str())] {
+            assert_eq!(
+                validate_output("saved.v1.operation.get", &lookup(outer, inner)),
+                Err("output lookup does not match its receipt".into())
+            );
+        }
+        for malformed in [
+            "not-a-uuid",
+            "abcdef00123456789abcdef012345678",
+            "urn:uuid:abcdef00-1234-5678-9abc-def012345678",
+            "{abcdef00-1234-5678-9abc-def012345678}",
+        ] {
+            for (outer, inner) in [(malformed, lower), (lower, malformed)] {
+                assert!(validate_output("saved.v1.operation.get", &lookup(outer, inner)).is_err());
+            }
+        }
+        let mut wrong_outcome = lookup(lower, &upper);
+        wrong_outcome["outcome"] = json!("not_applied");
+        assert_eq!(
+            validate_output("saved.v1.operation.get", &wrong_outcome),
+            Err("output lookup does not match its receipt".into())
+        );
+    }
+
+    #[test]
+    fn serialized_rename_receipts_bind_nested_session_uuid_for_mutations_and_lookups() {
+        let session_id = Uuid::parse_str("abcdef00-1234-5678-9abc-def012345678").unwrap();
+        let mut summary = session();
+        summary.id = session_id;
+        let receipt = SavedOperationReceipt {
+            contract_version: CONTRACT_VERSION.into(),
+            operation_id: id(),
+            session_id,
+            operation: SavedOperationKind::SessionRename,
+            outcome: SavedOperationOutcome::Applied,
+            code: SavedOperationCode::Applied,
+            message: SavedOperationCode::Applied.message().into(),
+            result: Some(SavedOperationResult::SessionRenamed { session: summary }),
+            created_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+        };
+        for (nested_id, valid) in [
+            (session_id.to_string(), true),
+            (session_id.to_string().to_uppercase(), true),
+            (Uuid::from_u128(1).to_string(), false),
+        ] {
+            let mut receipt = serde_json::to_value(&receipt).unwrap();
+            receipt["result"]["session"]["id"] = json!(nested_id);
+            for (operation, value) in [
+                (
+                    "saved.v1.session.rename",
+                    json!({"contract_version":CONTRACT_VERSION,"receipt":receipt,"replayed":false}),
+                ),
+                (
+                    "saved.v1.operation.get",
+                    json!({"contract_version":CONTRACT_VERSION,"operation_id":id(),"found":true,"outcome":"applied","receipt":receipt}),
+                ),
+            ] {
+                assert_eq!(
+                    validate_output(operation, &value).is_ok(),
+                    valid,
+                    "{operation}: {value}"
+                );
+            }
+        }
     }
 
     #[test]

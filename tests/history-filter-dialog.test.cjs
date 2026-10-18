@@ -61,12 +61,20 @@ function fixture() {
   document.activeElement = els.openFilterSettingsButton;
   document.querySelector = () => els.openFilterSettingsButton;
   const state = { displaySettings: {}, historyColumnWidths: {}, historyColumnOrder: [], wsColumnWidths: {} };
+  const mapFilterChanges = [];
   const context = loadFunctions([
     "createDefaultFilterSettings", "openFilterModal", "closeFilterModal", "isModalVisible", "restoreModalFocus", "trapModalFocus", "getActiveModalAction",
     "hydrateFilterForm", "applyFilterSettings", "syncColorTagFilterUI", "truncateUiSettingsText", "sanitizeHttpFilterSettings", "sanitizeHttpBooleanMap", "sanitizeHttpColorTags", "serializeHttpFilterSettings",
-    "loadUiSettings", "applyUiSettingsSnapshot", "updateUiSettingsServerRevision", "snapshotUiSettings", "nextUiSettingsSnapshot", "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "persistUiSettings",
+    "isUiSettingsLoadSnapshot", "loadUiSettings", "applyUiSettingsSnapshot", "updateUiSettingsServerRevision", "snapshotUiSettings", "nextUiSettingsSnapshot", "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "persistUiSettings",
+    "serviceMapFilterApplied", "serviceMapFilterQuery", "serviceMapFilterSummary", "selectedMimeTypes", "selectedStatusClasses",
   ], {
+    targetServiceMapController: { filterChanged: () => mapFilterChanges.push(true) },
+    SERVICE_MAP_FILTER_MIME_LABELS: { html: "HTML", script: "script", json: "JSON", css: "CSS", image: "images", websocket: "WebSocket", other: "other types" },
+    SERVICE_MAP_FILTER_STATUS_LABELS: { success: "2xx", redirect: "3xx", clientError: "4xx", serverError: "5xx", other: "other status" },
     state, els, document, activeConfirmDialog: null, filterSettingsReturnFocus: null, filterSettingsEditedControls: new Set(),
+    uiSettingsLoadState: "loading", uiSettingsLoadPromise: null, displaySettingsReady: true, pendingDisplaySettingsApply: null,
+    uiSettingsInitialPostGeneration: 0, uiSettingsInitialPostRevision: 0,
+    updateDisplaySettingsReadiness() {}, hydrateDisplaySettingsForm() {},
     uiSettingsClientId: "fixture-client", uiSettingsSaveVersion: 0, uiSettingsServerRevision: 0,
     uiSettingsDirty: false, uiSettingsInFlight: false, uiSettingsSavePromise: null, uiSettingsSaveTimer: null, lastUiSettingsPayload: null,
     HTTP_COLOR_TAG_OPTIONS: new Set(["red", "orange", "yellow", "green", "blue", "purple"]), WS_COLUMN_RULES: {},
@@ -80,12 +88,13 @@ function fixture() {
     sanitizeDisplaySettings: value => value, sanitizeActiveTool: value => value || "proxy", sanitizeActiveProxyTab: value => value || "http-history",
     sanitizeHistoryColumnWidths: value => value || {}, sanitizeHistoryColumnOrder: value => value || [],
     sanitizeHttpQuery: value => value || "", sanitizeHttpMethod: value => value || "", sanitizeHttpSortKey: value => value || "index", sanitizeHttpSortDirection: value => value || "desc",
-    sanitizeWorkbenchHeight: () => null, sanitizeWorkbenchPaneWidths: () => null, sanitizeWebsocketPaneWidth: () => null,
+    sanitizeWorkbenchHeight: () => null, sanitizeWorkbenchPaneWidths: () => null, sanitizeWebsocketPaneWidth: () => null, sanitizeServiceMapDetailWidth: () => null, applyServiceMapDetailWidth() {},
     sanitizeWebsocketQuery: () => "", sanitizeWebsocketSortKey: () => "started_at", sanitizeWebsocketSortDirection: () => "desc",
     sanitizeWebsocketStackHeight: () => null, sanitizeWsReplayLeftWidth: () => null, sanitizeWsReplayFrameDetailHeight: () => null,
     serializeWorkbenchPaneWidths: () => ({}), applyDisplaySettingsState() {}, renderHistoryHeader() {}, applyHistoryColumnWidths() {}, applyWsColumnWidths() {},
     updateWebsocketSortIndicators() {}, applySavedWorkbenchPaneWidths() {}, applySavedWebsocketPaneWidth() {}, applySavedWebsocketStackHeight() {}, applySavedWsReplayLayout() {},
   });
+  state.serviceMapFilterSettings = context.createDefaultFilterSettings();
   state.filterSettings = context.createDefaultFilterSettings();
   state.filterSettings.searchTerm = "saved";
   state.filterSettings.onlyNotes = true;
@@ -99,7 +108,7 @@ function fixture() {
   const keyEnd = appSource.indexOf('    if (\n      !event.defaultPrevented', keyStart);
   vm.runInContext(appSource.slice(keyStart, keyEnd) + "  });", context);
   return {
-    context, state, els, document, timers, writes, refreshes, notices,
+    context, state, els, document, timers, writes, refreshes, notices, mapFilterChanges,
     get selectionClears() { return selectionClears; },
     async save() { context.uiSettingsDirty = true; await context.persistUiSettings(); },
     key(key, target = document.activeElement, options = {}) {
@@ -280,13 +289,14 @@ function startInitialSettingsLoad(f, filters = savedInitialFilters) {
   f.context.fetch = (url, options) => options?.method === "POST" ? post(url, options) : response;
   const pending = f.context.loadUiSettings();
   return async () => {
-    resolveResponse({ ok: true, json: async () => ({ server_revision: 7, http_filter_settings: filters }) });
+    resolveResponse({ ok: true, json: async () => ({ server_revision: 7, display_settings: {}, http_filter_settings: filters }) });
     await pending;
   };
 }
 
 function startupFixture() {
   const f = fixture();
+  f.context.displaySettingsReady = false;
   f.state.filterSettings = f.context.createDefaultFilterSettings();
   return f;
 }
@@ -446,14 +456,95 @@ test("retrying a failed initial settings GET merges untouched controls and prese
   assert.deepEqual(f.writes[0].http_filter_settings, { ...savedInitialFilters, search_term: "typed before retry" });
 });
 
-test("Apply before the initial GET keeps its existing save and late-snapshot behavior", async () => {
+test("Filter Apply before the initial GET still saves, while the ambiguous GET requires a fresh read", async () => {
   const f = startupFixture(), finishLoad = startInitialSettingsLoad(f);
   f.context.openFilterModal(); editControl(f, "filterSearchTerm", "early apply");
   f.context.applyFilterSettings(); await f.context.persistUiSettings();
   assert.equal(f.writes.length, 1); assert.equal(f.writes[0].http_filter_settings.search_term, "early apply");
   assert.equal(f.writes[0].server_revision, 0);
+  f.context.console = { error() {} };
   await finishLoad();
+  assert.equal(f.context.uiSettingsLoadState, "failed");
+  assert.equal(f.state.filterSettings.searchTerm, "early apply");
+  const retry = startInitialSettingsLoad(f); await retry();
   assert.equal(f.state.filterSettings.searchTerm, "saved search");
   assert.equal(f.els.filterSearchTerm.value, "saved search");
   assert.equal(f.writes.length, 1); assert.equal(f.context.uiSettingsDirty, false);
+});
+
+test("composing Escape retains the unapplied Filter draft and normal Escape still cancels", () => {
+  const f = fixture(); f.context.openFilterModal();
+  const draft = "보존할 검색어";
+  f.els.filterSearchTerm.value = draft; f.els.filterSearchTerm.dispatch("input");
+  f.els.filterSearchTerm.focus();
+  const composing = f.key("Escape", f.els.filterSearchTerm, { isComposing: true });
+  assert.equal(composing.defaultPrevented, false, "the IME keeps its Escape event");
+  assert.equal(f.els.filterModal.classList.contains("hidden"), false);
+  assert.equal(f.els.filterSearchTerm.value, draft);
+  assert.equal(f.document.activeElement, f.els.filterSearchTerm);
+  assert.equal(f.state.filterSettings.searchTerm, "saved");
+  assert.equal(f.context.uiSettingsDirty, false);
+  assert.equal(f.writes.length, 0); assert.equal(f.refreshes.length, 0);
+  const ended = f.key("Escape", f.els.filterSearchTerm, { isComposing: false });
+  assert.equal(ended.defaultPrevented, true);
+  assert.equal(f.els.filterModal.classList.contains("hidden"), true);
+  assert.equal(f.document.activeElement, f.els.openFilterSettingsButton);
+  f.context.openFilterModal(); assert.equal(f.els.filterSearchTerm.value, "saved");
+  assert.equal(f.writes.length, 0); assert.equal(f.refreshes.length, 0);
+});
+
+test("the Service Map Filter edits only the map's own settings and saves both filters apart", async () => {
+  const f = fixture();
+  assert.deepEqual({ ...f.context.serviceMapFilterQuery() }, { hidden_extensions: "png,ico,css,woff,woff2,ttf,svg,jpg,jpeg,gif" },
+    "by default only static files are hidden; groups with every option selected are not sent");
+  f.context.openFilterModal("serviceMap");
+  assert.equal(f.els.filterSearchTerm.value, "", "the map opens with its own settings, not History's");
+  f.els.filterMimeImage.checked = false; f.els.filterMimeImage.dispatch("change");
+  f.els.filterHiddenExtensions.value = "png,js"; f.els.filterHiddenExtensions.dispatch("input");
+  f.els.applyFilterSettingsButton.dispatch("click");
+  assert.equal(f.state.serviceMapFilterSettings.mime.image, false);
+  assert.equal(f.state.filterSettings.searchTerm, "saved", "History keeps its filter");
+  assert.equal(f.mapFilterChanges.length, 1, "the map re-reads once");
+  assert.equal(f.refreshes.length, 0, "History does not reload");
+  assert.deepEqual({ ...f.context.serviceMapFilterQuery() }, { mime_types: "html,script,json,css,websocket,other", hidden_extensions: "png,js" });
+  assert.equal(f.context.serviceMapFilterSummary().text, "hiding png, js · no images");
+  await f.save();
+  const saved = f.writes.at(-1);
+  assert.equal(saved.service_map_filter_settings.mime.image, false);
+  assert.equal(saved.service_map_filter_settings.hidden_extensions, "png,js");
+  assert.equal(saved.http_filter_settings.search_term, "saved");
+
+  f.context.openFilterModal();
+  assert.equal(f.els.filterSearchTerm.value, "saved", "History's dialog still shows History's filter");
+  f.context.closeFilterModal();
+  f.context.openFilterModal("serviceMap");
+  f.els.resetFilterSettingsButton.dispatch("click");
+  assert.equal(f.state.serviceMapFilterSettings.mime.image, true, "Reset restores the map defaults");
+  assert.equal(f.mapFilterChanges.length, 2);
+  assert.equal(f.state.filterSettings.searchTerm, "saved");
+});
+
+test("the map's hidden link kinds load from settings, default to frames and resource loads, and save back", async () => {
+  const f = fixture();
+  f.context.applyUiSettingsSnapshot({});
+  assert.deepEqual([...f.state.serviceMapHiddenLinkKinds], ["frame", "script", "static"], "settings saved before the list existed");
+  f.context.applyUiSettingsSnapshot({ service_map_hidden_link_kinds: ["static", "bogus", "api", "static"] });
+  assert.deepEqual([...f.state.serviceMapHiddenLinkKinds], ["api", "static"], "known kinds only, in order");
+  f.context.applyUiSettingsSnapshot({ service_map_hidden_link_kinds: [] });
+  assert.deepEqual([...f.state.serviceMapHiddenLinkKinds], [], "drawing every kind is kept");
+  await f.save();
+  assert.deepEqual([...f.writes.at(-1).service_map_hidden_link_kinds], []);
+});
+
+test("the map's site grouping and hidden origins load from settings and save back", async () => {
+  const f = fixture();
+  f.context.applyUiSettingsSnapshot({});
+  assert.deepEqual(JSON.parse(JSON.stringify(f.state.serviceMapSiteDisplay)), { groupSites: true, expandedSites: [], hidden: [] }, "sites group by default");
+  f.context.applyUiSettingsSnapshot({ service_map_group_sites: false, service_map_expanded_sites: ["example.net", 5], service_map_hidden: ["https://cdn.example.net"] });
+  assert.deepEqual(JSON.parse(JSON.stringify(f.state.serviceMapSiteDisplay)), { groupSites: false, expandedSites: ["example.net"], hidden: ["https://cdn.example.net"] });
+  await f.save();
+  const saved = f.writes.at(-1);
+  assert.equal(saved.service_map_group_sites, false);
+  assert.deepEqual([...saved.service_map_expanded_sites], ["example.net"]);
+  assert.deepEqual([...saved.service_map_hidden], ["https://cdn.example.net"]);
 });

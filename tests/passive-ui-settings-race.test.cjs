@@ -24,7 +24,7 @@ function fixture() {
     "persistUiSettings", "snapshotUiSettings", "nextUiSettingsSnapshot",
     "scheduleUiSettingsSave", "scheduleUiSettingsRetry", "updateUiSettingsServerRevision",
   ], {
-    state, uiSettingsClientId: "fixture-local", uiSettingsSaveVersion: 0,
+    state, displaySettingsReady: true, pendingDisplaySettingsApply: null, uiSettingsClientId: "fixture-local", uiSettingsSaveVersion: 0,
     uiSettingsServerRevision: 3, uiSettingsSaveTimer: null, uiSettingsDirty: false,
     uiSettingsInFlight: false, uiSettingsSavePromise: null, lastUiSettingsPayload: null,
     console: { error(error) { errors.push(error); } },
@@ -53,6 +53,7 @@ function fixture() {
     sanitizeWebsocketQuery: () => "", sanitizeWebsocketSortKey: () => "started_at",
     sanitizeWebsocketSortDirection: () => "desc",
     applyUiSettingsSnapshot: snapshot => appliedSnapshots.push(snapshot),
+    updateDisplaySettingsReadiness() {},
   });
   const payload = index => JSON.parse(requests[index].options.body);
   const succeed = (index, revision = 4) => requests[index].resolve({

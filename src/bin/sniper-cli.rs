@@ -1,5 +1,7 @@
 use std::{
-    env, fmt, fs,
+    env,
+    ffi::OsStr,
+    fmt, fs,
     io::{self, Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
@@ -8,13 +10,14 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use reqwest::{Method, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sniper::{
     event_log::EventLogEntry,
     fuzzer::FuzzerAttackRecord,
+    history_retention::{history_retention_config_token, HistoryRetentionPolicy},
     history_selection::HistorySelection,
     intercept::{
         InterceptRecord, InterceptRule, InterceptSummary, ResponseInterceptRecord,
@@ -35,7 +38,13 @@ use sniper::{
         MAX_SCANNER_FIELD_BYTES,
     },
     sequence::{SequenceDefinition, SequenceRunRecord, SequenceRunSummary},
-    session::SessionSummary,
+    service_map::{ServiceMap, ServiceMapEvidence, ServiceMapSocketPeerStatus},
+    service_map_body::ServiceMapBodyReferences,
+    service_map_html::ServiceMapHtmlGenerators,
+    service_map_links::ServiceMapLinkDeclarations,
+    service_map_peer_matches::ServiceMapSocketPeerMatches,
+    service_map_technology::CatalogVersion,
+    session::{validate_session_creation_name, SessionSummary},
     skills,
     workspace::{
         FuzzerWorkspaceState, ReplayHistoryEntryState, ReplayTabState, ReplayWorkspaceState,
@@ -44,6 +53,11 @@ use sniper::{
 };
 use url::Url;
 use uuid::Uuid;
+
+const SERVICE_MAP_CATALOG_HEADER: &str = "X-Sniper-Technology-Catalog-Version";
+const SERVICE_MAP_ERROR_HEADER: &str = "x-sniper-service-map-error";
+const SERVICE_MAP_LEGACY_CATALOG_WARNING: &str = "Warning: Service Map API returned legacy technology catalog v1; technology coverage is limited to v1.";
+const SERVICE_MAP_PEER_SCOPE_WORK_WARNING: &str = "Warning: Recorded socket peer scope matching exceeded the work limit; use a smaller --max-records window or deliberately simplify scope rules. No retries or settings changes were made.";
 
 const DEFAULT_READ_LIST_LIMIT: usize = 100;
 const CLI_REPEATER_HISTORY_LIMIT: usize = 30;
@@ -58,6 +72,15 @@ const SNIPER_API_PROBE_RETRY_DELAYS: [std::time::Duration; 2] = [
 const CLI_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const SNIPER_DATA_DIR_ENV: &str = "SNIPER_DATA_DIR";
 const CLI_SCHEMA_VERSION: &str = "2026-06-22";
+
+const SAVED_READ_QUICK_START: &str = r#"Saved-data quick start (read-only):
+  sniper-cli schema input saved.v1.session.list
+  sniper-cli examples saved.v1.session.list
+  sniper-cli call saved.v1.session.list --input '{"limit":20}'
+
+Schema and examples are offline. The call reads a bounded page from a running local API;
+it does not switch the active session. Use --api to select another known instance.
+Saved-data operations are available through call; use manifest to discover them."#;
 
 static CLI_OUTPUT_CONTEXT: OnceLock<CliOutputContext> = OnceLock::new();
 
@@ -89,7 +112,7 @@ struct CliOutputContext {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.")]
+#[command(name = "sniper-cli", version = env!("CARGO_PKG_VERSION"), about = "Operate a local Sniper proxy through its JSON API.", after_help = SAVED_READ_QUICK_START)]
 struct Cli {
     #[arg(long, global = true)]
     api: Option<String>,
@@ -136,17 +159,18 @@ fn parse_oast_polling_interval(value: &str) -> std::result::Result<u64, String> 
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// List operation names and their contracts without contacting an API.
     Manifest,
+    /// Show one operation's input or output JSON Schema offline.
     Schema {
         #[arg(value_enum)]
         kind: SchemaKind,
         operation: String,
     },
     /// Example inputs for one operation, or for every operation when none is named.
-    Examples {
-        operation: Option<String>,
-    },
+    Examples { operation: Option<String> },
     /// Invoke an operation by canonical manifest name.
+    #[command(after_help = SAVED_READ_QUICK_START)]
     Call(CallArgs),
     Session {
         #[command(subcommand)]
@@ -513,6 +537,7 @@ struct ProxyChainArgs {
 #[derive(Subcommand, Debug)]
 enum SessionCommand {
     List,
+    /// Create and activate a new Sniper session.
     Create(CreateSessionArgs),
     Switch(SessionSwitchArgs),
     Delete(SessionDeleteArgs),
@@ -522,6 +547,7 @@ enum SessionCommand {
 
 #[derive(Args, Debug)]
 struct CreateSessionArgs {
+    /// Optional name for the new session.
     #[arg(long)]
     name: Option<String>,
 }
@@ -554,6 +580,16 @@ struct SessionRevealArgs {
 
 #[derive(Subcommand, Debug)]
 enum HistoryCommand {
+    /// Inspect or explicitly enable future observed socket peer capture for the active session.
+    UpstreamPeer {
+        #[command(subcommand)]
+        command: UpstreamPeerCommand,
+    },
+    /// Inspect or explicitly opt into automatic saved HTTP history cleanup.
+    Retention {
+        #[command(subcommand)]
+        command: HistoryRetentionCommand,
+    },
     List(HistoryListArgs),
     Get(HistoryGetArgs),
     /// Find a literal value in URLs, headers and bodies. Says what it scanned,
@@ -568,6 +604,83 @@ enum HistoryCommand {
     Replay(HistoryReplayArgs),
     Fuzzer(HistoryFuzzerArgs),
     Annotate(HistoryAnnotateArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum UpstreamPeerCommand {
+    /// Read saved configuration and effective status; requires the current active session.
+    Get(UpstreamPeerGetArgs),
+    /// Save the active session switch. Off is the default and does not erase observations.
+    #[command(
+        after_help = "Requires --yes. Applies only to eligible future ordinary captured HTTP(S) responses; eligible in-flight work may finish after Off. Socket peers may be proxies or shared endpoints, not origin ownership. Observations persist in session files, exports and full-record JSON. No probes, backfill, Replay, WebSocket, CONNECT, TLS details or rendered-resource capture."
+    )]
+    Set(UpstreamPeerSetArgs),
+}
+
+impl UpstreamPeerCommand {
+    fn session_id(&self) -> Uuid {
+        match self {
+            Self::Get(args) => args.session_id,
+            Self::Set(args) => args.session_id,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct UpstreamPeerGetArgs {
+    /// Explicit current active session UUID; this command never switches sessions.
+    #[arg(long)]
+    session_id: Uuid,
+}
+
+#[derive(Args, Debug)]
+struct UpstreamPeerSetArgs {
+    /// Explicit current active session UUID; this command never switches sessions.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Enable or disable future socket peer capture. Off does not erase retained observations.
+    #[arg(long, action = ArgAction::Set, required = true)]
+    enabled: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum HistoryRetentionCommand {
+    /// Read the saved policy and current cleanup status for one session.
+    Get(SessionReadArgs),
+    /// Save a retention policy. Keep-newest can permanently delete old unprotected history.
+    Set(HistoryRetentionSetArgs),
+}
+
+impl HistoryRetentionCommand {
+    fn session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Get(args) => args.session_id,
+            Self::Set(args) => args.session_id,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("retention_policy").required(true).args(["off", "max_entries"])))]
+struct HistoryRetentionSetArgs {
+    /// Change this session without switching it; omission pins the active session once.
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Disable automatic cleanup. Does not restore deleted history.
+    #[arg(long)]
+    off: bool,
+    /// Soft total-history target, including protected rows; oldest unprotected rows are removed first.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    max_entries: Option<u32>,
+}
+
+impl HistoryRetentionSetArgs {
+    fn policy(&self) -> Value {
+        match self.max_entries {
+            Some(max_entries) => json!({"mode":"keep_newest","max_entries":max_entries}),
+            None => json!({"mode":"off"}),
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -613,6 +726,20 @@ impl HistorySelectionArgs {
     }
 }
 
+const HISTORY_SORT_KEYS: [&str; 11] = [
+    "index",
+    "host",
+    "method",
+    "path",
+    "status",
+    "length",
+    "mime",
+    "notes",
+    "tls",
+    "edited",
+    "started_at",
+];
+
 #[derive(Args, Debug, Default)]
 struct HistoryListArgs {
     #[arg(long)]
@@ -649,8 +776,8 @@ struct HistoryListArgs {
     /// Filter by response MIME type (substring match), e.g. "json" or "text/html"
     #[arg(long)]
     mime: Option<String>,
-    /// Sort key for paged history output, e.g. index, host, method, path, status, length, mime, notes, tls, started_at.
-    #[arg(long, value_parser = ["index", "host", "method", "path", "status", "length", "mime", "notes", "tls", "edited", "started_at"])]
+    /// Sort key for paged history output, e.g. index, host, method, path, status, length, mime, notes, tls, edited, started_at.
+    #[arg(long, value_parser = HISTORY_SORT_KEYS)]
     sort_key: Option<String>,
     /// Sort direction for paged history output.
     #[arg(long, value_parser = ["asc", "desc"])]
@@ -760,6 +887,453 @@ struct HistoryAnnotateArgs {
 enum TargetCommand {
     GetScope(TargetSessionArgs),
     SetScope(TargetSetScopeArgs),
+    /// Summarize retained captured metadata; never contacts an upstream service.
+    ServiceMap(ServiceMapArgs),
+    /// Read safe metadata for the exact retained row referenced by a service map.
+    ServiceMapEvidence(ServiceMapEvidenceArgs),
+}
+
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+struct ServiceMapArgs {
+    #[command(subcommand)]
+    command: Option<ServiceMapCommand>,
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Exact canonical HTTP(S) origin, with no path, credentials, query or fragment.
+    #[arg(long, value_parser = parse_service_map_origin)]
+    origin: Option<String>,
+    /// Include only rows matching the selected session's current scope.
+    #[arg(long)]
+    in_scope_only: bool,
+    /// Bound the retained rows considered; incomplete results say why.
+    #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
+    max_records: usize,
+    /// Read every retained row, as the desktop map does, instead of the newest
+    /// --max-records rows. The server may answer from its last map of an
+    /// unchanged or recent history.
+    #[arg(long, conflicts_with = "max_records")]
+    all_rows: bool,
+    /// Select the literal response-header technology catalog (default: 2).
+    #[arg(long, default_value_t = 2, value_parser = parse_service_map_catalog_version)]
+    technology_catalog_version: u32,
+    #[command(flatten)]
+    filter: ServiceMapFilterArgs,
+}
+
+const SERVICE_MAP_MIME_TYPES: [&str; 7] = [
+    "html",
+    "script",
+    "json",
+    "css",
+    "image",
+    "websocket",
+    "other",
+];
+const SERVICE_MAP_STATUS_CLASSES: [&str; 5] = [
+    "success",
+    "redirect",
+    "client_error",
+    "server_error",
+    "other",
+];
+
+/// The Service Map display filter. Each condition hides rows exactly as the
+/// HTTP history filter does; omitted conditions hide nothing.
+#[derive(Args, Debug, Default)]
+struct ServiceMapFilterArgs {
+    /// Keep only rows in these MIME groups. Repeat or comma-separate.
+    #[arg(long, value_delimiter = ',', value_parser = SERVICE_MAP_MIME_TYPES)]
+    mime_types: Vec<String>,
+    /// Keep only rows in these status classes. Repeat or comma-separate.
+    #[arg(long, value_delimiter = ',', value_parser = SERVICE_MAP_STATUS_CLASSES)]
+    status_classes: Vec<String>,
+    /// Hide rows whose path ends in these extensions, e.g. png,css,woff2.
+    #[arg(long, value_delimiter = ',', value_parser = parse_service_map_extension)]
+    hidden_extensions: Vec<String>,
+    /// Hide rows that have no response.
+    #[arg(long)]
+    hide_without_responses: bool,
+    /// Keep only rows whose URL has a query string.
+    #[arg(long)]
+    only_parameterized: bool,
+}
+
+fn parse_service_map_extension(value: &str) -> Result<String, String> {
+    let extension = value.trim().trim_start_matches('.').to_ascii_lowercase();
+    if !extension.is_empty()
+        && extension.len() <= 16
+        && extension.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        Ok(extension)
+    } else {
+        Err(format!(
+            "extension must be 1-16 letters or digits, such as png or woff2: {value}"
+        ))
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceMapCommand {
+    /// Explicitly inspect one retained response preview in the active session only.
+    #[command(
+        after_help = "Requires the current active session UUID and an exact-row evidence token. An inactive session returns unavailable; this command never loads or activates it. Reads one retained UTF-8 HTML/JavaScript preview only, with no target requests, automatic reads, or batch reads. Literal HTTP(S) references do not establish calls or ownership; offsets address the retained preview, not wire bytes or a full body."
+    )]
+    BodyReferences(ServiceMapBodyReferencesArgs),
+    /// Explicitly inspect literal generator declarations in one retained HTML preview.
+    #[command(
+        after_help = "Requires the current active session UUID and exact-row evidence token. Reads one retained UTF-8 text/html preview only; no inactive-session loading, target requests, automatic reads, batch reads, retries, or fallback. Fixed generator catalog 1 recognizes WordPress and Drupal declarations in an explicit HTML head. Partial or unsupported inspection does not mean no generator was found. Reported products and numeric versions are literal declarations, not verified software installations. Spans address retained UTF-8 bytes; the parser stop is a raw byte cursor, not a slicing boundary."
+    )]
+    HtmlGenerators(ServiceMapHtmlGeneratorsArgs),
+    /// Explicitly inspect literal declarations in one retained response's Link headers.
+    #[command(
+        after_help = "Requires the current active session UUID and exact-row evidence token. Reads bounded retained response headers for GET or HEAD status 200 only; no bodies, inactive-session loading, target requests, automatic/batch reads, retries, redirects, or fallback. Fixed relation catalog 1 recognizes service-doc, service-desc, describedby, and preconnect. Partial or unsupported inspection does not mean no declarations exist. Origins and retained-header UTF-8 spans describe literal declarations, not verified calls, ownership, or connections."
+    )]
+    LinkDeclarations(ServiceMapLinkDeclarationsArgs),
+    /// Explicitly compare recorded direct socket peers for one exact retained source row.
+    #[command(
+        after_help = "Requires the current active session UUID and unchanged exact-row evidence token. Compares only retained direct-route source, address family, IP and port observations in a bounded latest-row window. No arbitrary IP/host/URL input, target requests, discovery, capture changes, inactive loading, body/header reads, retries, redirects, or fallback. Counts are retained rows, including duplicate transaction UUIDs, and exclude the source. Inspect source.in_window, timestamps, reasons and omissions. Equal recorded peer values do not prove a shared physical endpoint, deployment, ownership, or origin IP."
+    )]
+    SocketPeerMatches(ServiceMapSocketPeerMatchesArgs),
+    /// List the parameters one endpoint was called with, read from its newest retained rows.
+    #[command(
+        after_help = "Requires the current active session UUID. Reads the endpoint's newest 200 retained rows: query string pairs, and form, top-level JSON or multipart body fields from each body's first 64 KiB, at most 32 MiB of retained rows per read. Lists each parameter's name, where it was sent, the rows that carried it and up to three values as captured, each cut to 80 characters. No target requests, inactive-session loading or automatic reads."
+    )]
+    Parameters(ServiceMapParametersArgs),
+    /// Describe one origin's API as an OpenAPI 3.1 document, from its retained rows.
+    #[command(
+        after_help = "Requires the current active session UUID. Reads every retained row of the origin: each method and path template (ID segments as {number}, {uuid}, {hex} or mixed {id}), query and form, top-level JSON or multipart body field names from each observed method/path variant's newest 20 rows, with native JSON types preserved and text types guessed from their values, response statuses with media types, and the credentials the rows showed as security schemes. No captured value is included. Operations that only answered with pages or static files, OPTIONS requests and methods OpenAPI cannot hold are left out; at most 500 operations are listed. No target requests, inactive-session loading or automatic reads."
+    )]
+    Openapi(ServiceMapOpenApiArgs),
+    /// List what no rule names across the whole map, most widespread first.
+    #[command(
+        after_help = "Reads the session's whole map (every retained row) and gathers each origin's unnamed signals: Server and X-Powered-By banners, header names and cookie names no rule names. Each signal comes with how many origins and rows carried it, up to five of those origins and three evidence tokens to open with `scope service-map-evidence`. Most widespread first; --kind keeps one kind and --limit bounds the list. snapshot preserves source-map coverage, including complete, stopped_by and omitted_rows; omitted_signals counts only signals hidden by --limit, after --kind. No target requests or body reads beyond the map's own."
+    )]
+    Unnamed(ServiceMapUnnamedArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapUnnamedArgs {
+    /// Session UUID; the active session when omitted.
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Keep only banners, headers or cookies.
+    #[arg(long, value_parser = ["banners", "headers", "cookies"])]
+    kind: Option<String>,
+    /// Signals returned, most widespread first.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
+}
+
+impl ServiceMapUnnamedArgs {
+    /// The whole-history map this summary reads.
+    fn map_args(&self) -> ServiceMapArgs {
+        ServiceMapArgs {
+            command: None,
+            session_id: self.session_id,
+            origin: None,
+            in_scope_only: false,
+            max_records: 10_000,
+            all_rows: true,
+            technology_catalog_version: 2,
+            filter: ServiceMapFilterArgs::default(),
+        }
+    }
+}
+
+const UNNAMED_SAMPLE_ORIGINS: usize = 5;
+const UNNAMED_SAMPLE_EVIDENCE: usize = 3;
+
+/// One signal no rule names, with where it was seen.
+#[derive(Debug, Serialize)]
+struct UnnamedSignalSummary {
+    kind: &'static str,
+    value: String,
+    origins: usize,
+    rows: usize,
+    sample_origins: Vec<String>,
+    evidence: Vec<String>,
+    /// What the map named on the same origins, most often first: a signal
+    /// that travels with one product is likely that product's own.
+    named_alongside: Vec<NamedAlongside>,
+    #[serde(skip)]
+    alongside: std::collections::BTreeMap<String, usize>,
+}
+
+/// A product the map named on the origins that carried a signal.
+#[derive(Debug, Serialize)]
+struct NamedAlongside {
+    name: String,
+    origins: usize,
+}
+
+/// What no rule names across one map: the queue an agent or a reader judges.
+#[derive(Debug, Serialize)]
+struct UnnamedSummary {
+    schema_version: u32,
+    session_id: Uuid,
+    /// Source-map coverage is independent of the summary's kind and limit.
+    snapshot: sniper::service_map::ServiceMapSnapshot,
+    origins_read: usize,
+    origins_with_unnamed: usize,
+    distinct_signals: usize,
+    omitted_signals: usize,
+    signals: Vec<UnnamedSignalSummary>,
+}
+
+fn summarize_unnamed(map: &ServiceMap, kind: Option<&str>, limit: usize) -> UnnamedSummary {
+    let origins = &map.origins;
+    let mut by_value: std::collections::BTreeMap<(&'static str, String), UnnamedSignalSummary> =
+        Default::default();
+    let mut carrying = 0;
+    for origin in origins {
+        // The origin's own products: its servers, and what it served or set.
+        let named: std::collections::BTreeSet<&str> = origin
+            .server_technologies
+            .iter()
+            .map(|product| product.name.as_str())
+            .chain(
+                origin
+                    .front_technologies
+                    .iter()
+                    .filter(|product| product.source_origin == origin.origin)
+                    .map(|product| product.name.as_str()),
+            )
+            .collect();
+        let groups = [
+            ("banners", &origin.unnamed.banners),
+            ("headers", &origin.unnamed.headers),
+            ("cookies", &origin.unnamed.cookies),
+        ];
+        let mut any = false;
+        for (name, signals) in groups {
+            if kind.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            for signal in signals {
+                any = true;
+                let entry = by_value
+                    .entry((name, signal.value.clone()))
+                    .or_insert_with(|| UnnamedSignalSummary {
+                        kind: name,
+                        value: signal.value.clone(),
+                        origins: 0,
+                        rows: 0,
+                        sample_origins: Vec::new(),
+                        evidence: Vec::new(),
+                        named_alongside: Vec::new(),
+                        alongside: Default::default(),
+                    });
+                entry.origins += 1;
+                entry.rows += signal.row_count;
+                for name in &named {
+                    *entry.alongside.entry((*name).to_string()).or_default() += 1;
+                }
+                if entry.sample_origins.len() < UNNAMED_SAMPLE_ORIGINS {
+                    entry.sample_origins.push(origin.origin.clone());
+                }
+                for token in &signal.evidence {
+                    if entry.evidence.len() < UNNAMED_SAMPLE_EVIDENCE {
+                        entry.evidence.push(token.clone());
+                    }
+                }
+            }
+        }
+        carrying += usize::from(any);
+    }
+    let mut signals: Vec<_> = by_value.into_values().collect();
+    signals.sort_by(|a, b| {
+        (b.origins, b.rows)
+            .cmp(&(a.origins, a.rows))
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    let distinct = signals.len();
+    signals.truncate(limit);
+    for signal in &mut signals {
+        let mut named: Vec<_> = std::mem::take(&mut signal.alongside).into_iter().collect();
+        named.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        signal.named_alongside = named
+            .into_iter()
+            .take(UNNAMED_SAMPLE_ORIGINS)
+            .map(|(name, origins)| NamedAlongside { name, origins })
+            .collect();
+    }
+    UnnamedSummary {
+        schema_version: 1,
+        session_id: map.session_id,
+        snapshot: map.snapshot.clone(),
+        origins_read: origins.len(),
+        origins_with_unnamed: carrying,
+        distinct_signals: distinct,
+        omitted_signals: distinct - signals.len(),
+        signals,
+    }
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapOpenApiArgs {
+    /// Explicit current active session UUID; an inactive session is refused.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Exact canonical HTTP(S) origin to describe.
+    #[arg(long, value_parser = parse_service_map_origin)]
+    origin: String,
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapParametersArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Exact canonical HTTP(S) origin of the endpoint.
+    #[arg(long, value_parser = parse_service_map_origin)]
+    origin: String,
+    /// The endpoint's exact method, such as GET or POST.
+    #[arg(long, value_parser = parse_service_map_parameters_method)]
+    method: String,
+    /// The endpoint's exact path, without query or fragment.
+    #[arg(long, value_parser = parse_service_map_parameters_path)]
+    path: String,
+}
+
+fn parse_service_map_parameters_method(value: &str) -> Result<String, String> {
+    (value.len() <= 64 && is_http_method_token(value))
+        .then(|| value.to_string())
+        .ok_or_else(|| "method must be an HTTP method token of at most 64 characters".to_string())
+}
+
+fn parse_service_map_parameters_path(value: &str) -> Result<String, String> {
+    (value.starts_with('/') && value.len() <= 4096 && !value.contains(['?', '#']))
+        .then(|| value.to_string())
+        .ok_or_else(|| {
+            "path must start with / and carry no query or fragment, at most 4096 bytes".to_string()
+        })
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapSocketPeerMatchesArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained source row.
+    #[arg(long, value_parser = parse_service_map_peer_evidence_id)]
+    evidence_id: String,
+    /// Include only rows matching the active session's current shared scope matcher.
+    #[arg(long)]
+    in_scope_only: bool,
+    /// Bound the latest retained rows considered, excluding the source from match counts.
+    #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
+    max_records: usize,
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapLinkDeclarationsArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained row.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapHtmlGeneratorsArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained row.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapBodyReferencesArgs {
+    /// Explicit current active session UUID; inactive sessions remain unavailable.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Complete unchanged token from Service Map for exactly one retained row.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapEvidenceArgs {
+    /// Select the literal response-header technology catalog (default: 2).
+    #[arg(long, default_value_t = 2, value_parser = parse_service_map_catalog_version)]
+    technology_catalog_version: u32,
+    /// Use the exact session returned by the map; never resolve evidence across sessions.
+    #[arg(long)]
+    session_id: Uuid,
+    /// Explicitly include one retained socket peer observation; never probes or enables capture.
+    #[arg(long)]
+    include_socket_peer: bool,
+    /// Opaque evidence token returned by the map, not a transaction UUID.
+    #[arg(long, value_parser = parse_service_map_evidence_id)]
+    evidence_id: String,
+}
+
+fn parse_service_map_catalog_version(value: &str) -> std::result::Result<u32, String> {
+    match value {
+        "1" => Ok(1),
+        "2" => Ok(2),
+        _ => Err("technology-catalog-version must be 1 or 2".into()),
+    }
+}
+
+fn call_service_map_catalog_version(input: &Value) -> Result<u32> {
+    match input.get("technology_catalog_version") {
+        None => Ok(2),
+        Some(value) => value
+            .as_u64()
+            .filter(|version| matches!(*version, 1 | 2))
+            .map(|version| version as u32)
+            .ok_or_else(|| anyhow!("field `technology_catalog_version` must be integer 1 or 2")),
+    }
+}
+
+fn parse_service_map_origin(value: &str) -> std::result::Result<String, String> {
+    if sniper::service_map::canonical_origin(value).as_deref() != Some(value) {
+        return Err("origin must be an exact canonical HTTP(S) origin without a path, credentials, query or fragment".into());
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_service_map_max_records(value: &str) -> std::result::Result<usize, String> {
+    let value = parse_nonzero_usize(value)?;
+    if value > 50_000 {
+        return Err("max-records must be between 1 and 50000".into());
+    }
+    Ok(value)
+}
+
+fn parse_service_map_peer_evidence_id(value: &str) -> std::result::Result<String, String> {
+    if !sniper::service_map_peer_matches::is_canonical_evidence_id(value) {
+        return Err(
+            "evidence-id must be a complete unchanged canonical v1 token returned by Service Map"
+                .into(),
+        );
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_service_map_evidence_id(value: &str) -> std::result::Result<String, String> {
+    let fields: Vec<_> = value.split('.').collect();
+    let valid = value.len() <= 200
+        && fields.len() == 6
+        && fields[0] == "v1"
+        && [1, 2, 4, 5].into_iter().all(|index| {
+            Uuid::parse_str(fields[index]).is_ok_and(|id| id.to_string() == fields[index])
+        })
+        && fields[3]
+            .parse::<u64>()
+            .is_ok_and(|sequence| sequence.to_string() == fields[3]);
+    if !valid {
+        return Err(
+            "evidence-id must be a complete unchanged v1 token returned by Service Map".into(),
+        );
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Args, Debug, Default)]
@@ -798,6 +1372,8 @@ enum ReplayCommand {
     Close(ReplaySavedTabArgs),
     /// Clone one saved HTTP tab without sending traffic or changing the active tab.
     Duplicate(ReplaySavedTabArgs),
+    /// Set saved HTTP tab pin state without sending traffic or changing focus.
+    SetPinned(ReplaySetPinnedArgs),
     Send(ReplaySendArgs),
 }
 
@@ -879,6 +1455,15 @@ struct ReplaySavedTabArgs {
     tab_id: String,
     #[arg(long)]
     session_id: Option<Uuid>,
+}
+
+#[derive(Args, Debug)]
+struct ReplaySetPinnedArgs {
+    #[command(flatten)]
+    tab: ReplaySavedTabArgs,
+    /// Desired pin state; repeated values never toggle it.
+    #[arg(long, required = true, action = ArgAction::Set)]
+    pinned: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1165,6 +1750,121 @@ struct WebSocketGetArgs {
 #[derive(Subcommand, Debug)]
 enum SkillsCommand {
     Install(SkillsInstallArgs),
+    /// Inspect installed skill hashes on this CLI host without changing files.
+    #[command(
+        after_help = "Reads files on this CLI host, even when --api points elsewhere; no network or file changes.\ncurrent means installed bytes match the current bundle. modified_or_outdated means they differ;\nthis alone cannot distinguish personal edits from an older bundle.\nExit status 0 means inspection completed. Check each entries[].status and error_code;\nit does not mean every installation is current. Preserve edits before any manual update."
+    )]
+    Status(SkillsInstallArgs),
+    /// Experimental: record local enrollment for one installed, exact bundled skill.
+    Enroll(SingleSkillArgs),
+    /// Compare local files and enrollment with this CLI's bundle; never writes.
+    #[command(
+        after_help = "Reads files on this CLI host without network or file changes.\nmodified compares installed bytes with the enrollment baseline, not the current bundle.\nupdate_available means the enrolled baseline is unchanged and a different bundle is available.\nAfter a manual update, status may be current while update-preview remains modified.\nExit status 0 means inspection completed. Check each entries[].state, stage_eligible and error_code;\nit does not mean every installation is current or safe to replace. Preserve edited files."
+    )]
+    UpdatePreview(SkillsInstallArgs),
+    /// Experimental: stage a bundled candidate in a new directory without activating it.
+    StageUpdate(SkillsStageArgs),
+    /// Experimental: explicitly activate one reviewed staged update with a durable operation ID.
+    #[command(
+        after_help = "Requires --yes outside dry run. Select exactly one agent and retain the original operation UUID.\nThe staged candidate, enrollment baseline and executing binary bundle must agree; different bytes need a strictly newer semantic version.\nAfter uncertain output, inspect skills update-result with that same UUID before any deliberate retry.\nDoes not grant automatic-update consent or reload the agent. Linux exchange and macOS swap adapters only; Windows is unsupported."
+    )]
+    ApplyUpdate(SkillsApplyArgs),
+    /// Inspect one local update transaction without changing files or resuming it.
+    #[command(
+        after_help = "Read-only and CLI-host local; no --yes, API contact, resume, repair, or agent reload.\nInspect both state and current_state: a historical applied receipt does not prove the active file remains unchanged.\nKeep the original operation UUID and all transaction artifacts. Windows inspection is currently unsupported."
+    )]
+    UpdateResult(SkillsOperationArgs),
+    /// Explicitly restore the baseline of one update transaction, preserving displaced files.
+    #[command(
+        after_help = "Requires --yes outside dry run. Use the original apply-update UUID, not a new rollback ID.\nOnly a bound transaction can be restored; changed or unsupported objects can block rollback.\nAfter uncertain output, inspect skills update-result with the same UUID. Preserve all artifacts and do not blindly retry."
+    )]
+    RollbackUpdate(SkillsOperationArgs),
+    /// Inspect the selected agent's host-local automatic-update policy without writes.
+    #[command(
+        after_help = "CLI-host local only, even with remote --api. Uses the target already stored in the policy; no directory overrides.
+Read-only inspection never creates, repairs, resumes, or enables a policy. Inspect state and error_code; paused is not permission to retry."
+    )]
+    AutoUpdateStatus(StoredSkillArgs),
+    /// Explicitly authorize future bundled updates of one unchanged managed installation.
+    #[command(
+        after_help = "Requires --yes outside dry run. Records consent only; it does not update SKILL.md now.
+Select exactly one agent and an unchanged managed baseline. Re-enabling an existing policy requires its current --policy-revision and creates a fresh authorization generation.
+Only host-local bundled templates are eligible; no network fetch, arbitrary content, or agent reload."
+    )]
+    EnableAutoUpdates(SkillsEnableAutoUpdatesArgs),
+    /// Revoke future automatic updates for the policy's stored target.
+    #[command(
+        after_help = "Requires --yes outside dry run. Uses the selected agent's stored target; no directory overrides.
+Preserves active files, receipts, attempts and recovery artifacts. Does not roll back an already committed update."
+    )]
+    DisableAutoUpdates(StoredSkillArgs),
+    /// Make one guarded automatic-update attempt for an explicitly enabled local policy.
+    #[command(
+        after_help = "Requires --yes outside dry run. Uses the policy's stored target; no directory overrides or replacement operation IDs.
+No policy means no authorization. Modified, replaced, unsupported or uncertain state is preserved and pauses updates. Inspect auto-update-status before any deliberate re-enable."
+    )]
+    AutoUpdateOnce(StoredSkillArgs),
+}
+
+#[derive(Args, Debug, Default)]
+#[command(group(ArgGroup::new("skill_agent").args(["codex", "claude"]).required(true)))]
+struct StoredSkillArgs {
+    #[arg(long)]
+    codex: bool,
+    #[arg(long)]
+    claude: bool,
+}
+
+#[derive(Args, Debug)]
+struct SkillsEnableAutoUpdatesArgs {
+    #[command(flatten)]
+    target: SingleSkillArgs,
+    /// Current policy revision from auto-update-status; required when re-enabling a policy.
+    #[arg(long)]
+    policy_revision: Option<u64>,
+}
+
+#[derive(Args, Debug, Default)]
+#[command(group(ArgGroup::new("skill_agent").args(["codex", "claude"]).required(true)))]
+struct SingleSkillArgs {
+    #[arg(long)]
+    codex: bool,
+    #[arg(long)]
+    claude: bool,
+    #[arg(long)]
+    codex_dir: Option<PathBuf>,
+    #[arg(long)]
+    claude_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct SkillsStageArgs {
+    #[command(flatten)]
+    target: SingleSkillArgs,
+    /// New local directory for candidate and staging receipt; it must not exist.
+    #[arg(long)]
+    staging_dir: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct SkillsApplyArgs {
+    #[command(flatten)]
+    target: SingleSkillArgs,
+    /// Existing reviewed staging directory made by this CLI's bundled version.
+    #[arg(long)]
+    staging_dir: PathBuf,
+    /// Canonical lowercase hyphenated UUID; retain it for result inspection and rollback.
+    #[arg(long)]
+    operation_id: String,
+}
+
+#[derive(Args, Debug)]
+struct SkillsOperationArgs {
+    #[command(flatten)]
+    target: SingleSkillArgs,
+    /// The original apply-update UUID, in canonical lowercase hyphenated form.
+    #[arg(long)]
+    operation_id: String,
 }
 
 #[derive(Args, Debug, Default)]
@@ -1251,6 +1951,10 @@ struct ResponseInterceptDropArgs {
 enum InterceptRuleCommand {
     List(InterceptRuleSessionArgs),
     Create(InterceptRuleCreateArgs),
+    /// Change explicitly supplied fields on an existing saved rule.
+    Update(InterceptRuleUpdateArgs),
+    /// Assign an existing rule's enabled state; never toggles or creates it.
+    SetEnabled(InterceptRuleSetEnabledArgs),
     Delete(InterceptRuleDeleteArgs),
 }
 
@@ -1283,6 +1987,71 @@ struct InterceptRuleCreateArgs {
     method_filter: Vec<String>,
     #[arg(long)]
     enabled: Option<bool>,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("rule_update")
+        .args(["scope", "host_pattern", "path_pattern", "method_filter", "clear_methods", "enabled"])
+        .multiple(true)
+        .required(true)
+))]
+struct InterceptRuleUpdateArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    #[arg(long)]
+    id: Uuid,
+    #[arg(long, value_parser = ["request", "response", "both"])]
+    scope: Option<String>,
+    /// Replace the host pattern; an empty string clears it.
+    #[arg(long)]
+    host_pattern: Option<String>,
+    /// Replace the path pattern; an empty string clears it.
+    #[arg(long)]
+    path_pattern: Option<String>,
+    /// Replace the method list; repeat for multiple methods.
+    #[arg(long = "method", action = ArgAction::Append, conflicts_with = "clear_methods")]
+    method_filter: Option<Vec<String>>,
+    /// Clear the method list, preserving host and path patterns.
+    #[arg(long)]
+    clear_methods: bool,
+    #[arg(long)]
+    enabled: Option<bool>,
+}
+
+impl InterceptRuleUpdateArgs {
+    fn patch(&self) -> Value {
+        let mut patch = serde_json::Map::new();
+        for (key, value) in [
+            ("scope", self.scope.as_ref()),
+            ("host_pattern", self.host_pattern.as_ref()),
+            ("path_pattern", self.path_pattern.as_ref()),
+        ] {
+            if let Some(value) = value {
+                patch.insert(key.into(), json!(value));
+            }
+        }
+        if let Some(methods) = &self.method_filter {
+            patch.insert("method_filter".into(), json!(methods));
+        } else if self.clear_methods {
+            patch.insert("method_filter".into(), json!([]));
+        }
+        if let Some(enabled) = self.enabled {
+            patch.insert("enabled".into(), json!(enabled));
+        }
+        Value::Object(patch)
+    }
+}
+
+#[derive(Args, Debug)]
+struct InterceptRuleSetEnabledArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    #[arg(long)]
+    id: Uuid,
+    /// Desired state; the explicit true or false value is required.
+    #[arg(long, required = true, action = ArgAction::Set)]
+    enabled: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1370,6 +2139,7 @@ struct SequenceRunsArgs {
 #[derive(Serialize)]
 struct ResponseInterceptForwardPayload {
     response: EditableResponse,
+    edited: bool,
 }
 
 #[derive(Deserialize)]
@@ -1523,6 +2293,7 @@ struct ApiClient {
     base_url: String,
     client: reqwest::Client,
     long_client: reqwest::Client,
+    session_metadata_write_errors: bool,
 }
 
 impl ApiClient {
@@ -1546,6 +2317,7 @@ impl ApiClient {
             base_url,
             client,
             long_client,
+            session_metadata_write_errors: false,
         })
     }
 
@@ -1670,6 +2442,9 @@ impl ApiClient {
             .with_context(|| format!("failed to DELETE {}", path))?;
         let status = response.status();
         if !status.is_success() {
+            if self.session_metadata_write_errors {
+                return Err(SessionMetadataHttpStatusError { status }.into());
+            }
             let message = response.text().await.unwrap_or_else(|_| String::new());
             let detail = api_failure_detail(status, message);
             bail!("request to {} failed ({}): {}", path, status, detail);
@@ -1713,6 +2488,16 @@ impl ApiClient {
 
         let status = response.status();
         if !status.is_success() {
+            if method == Method::GET {
+                // Classify by headers alone: diagnostics can contain arbitrary
+                // prose or sensitive data, and an error body can be incomplete.
+                return Err(ReadHttpStatusError { status }.into());
+            }
+            if self.session_metadata_write_errors {
+                // A sent mutation's status cannot be reclassified by untrusted
+                // diagnostics, nor depend on a complete or timely error body.
+                return Err(SessionMetadataHttpStatusError { status }.into());
+            }
             let message = response.text().await.unwrap_or_else(|_| String::new());
             let detail = api_failure_detail(status, message);
             bail!("request to {} failed ({}): {}", path, status, detail);
@@ -1931,6 +2716,10 @@ struct SequenceCreateInput {
 #[derive(Serialize)]
 struct InterceptForwardPayload {
     request: EditableRequest,
+    /// Whether the forwarded request differs from the held one. The server keeps
+    /// the original and marks the row modified only when told: without this an
+    /// edit from a file replaced the captured request with no trace.
+    edited: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2099,6 +2888,14 @@ impl CaptureCommand {
 impl HistoryCommand {
     fn operation_name(&self) -> &'static str {
         match self {
+            HistoryCommand::UpstreamPeer { command } => match command {
+                UpstreamPeerCommand::Get(_) => "capture.http.upstream_peer.get",
+                UpstreamPeerCommand::Set(_) => "capture.http.upstream_peer.set",
+            },
+            HistoryCommand::Retention { command } => match command {
+                HistoryRetentionCommand::Get(_) => "capture.http.retention.get",
+                HistoryRetentionCommand::Set(_) => "capture.http.retention.set",
+            },
             HistoryCommand::List(_) => "capture.http.list",
             HistoryCommand::Get(_) => "capture.http.get",
             HistoryCommand::Search(_) => "capture.http.search",
@@ -2117,6 +2914,25 @@ impl TargetCommand {
         match self {
             TargetCommand::GetScope(_) => "scope.get",
             TargetCommand::SetScope(_) => "scope.set",
+            TargetCommand::ServiceMap(args) => match &args.command {
+                Some(ServiceMapCommand::BodyReferences(_)) => {
+                    "target.service_map.body_references.get"
+                }
+                Some(ServiceMapCommand::HtmlGenerators(_)) => {
+                    "target.service_map.html_generators.get"
+                }
+                Some(ServiceMapCommand::LinkDeclarations(_)) => {
+                    "target.service_map.link_declarations.get"
+                }
+                Some(ServiceMapCommand::SocketPeerMatches(_)) => {
+                    "target.service_map.socket_peer_matches.get"
+                }
+                Some(ServiceMapCommand::Parameters(_)) => "target.service_map.parameters.get",
+                Some(ServiceMapCommand::Openapi(_)) => "target.service_map.openapi.get",
+                Some(ServiceMapCommand::Unnamed(_)) => "target.service_map.unnamed.get",
+                None => "target.service_map.get",
+            },
+            TargetCommand::ServiceMapEvidence(_) => "target.service_map.evidence.get",
         }
     }
 }
@@ -2129,6 +2945,7 @@ impl ReplayCommand {
             ReplayCommand::Update(_) => "replay.update",
             ReplayCommand::Close(_) => "replay.close",
             ReplayCommand::Duplicate(_) => "replay.duplicate",
+            ReplayCommand::SetPinned(_) => "replay.set_pinned",
             ReplayCommand::Send(_) => "replay.send",
         }
     }
@@ -2198,6 +3015,8 @@ impl InterceptRuleCommand {
         match self {
             InterceptRuleCommand::List(_) => "capture.intercept_rule.list",
             InterceptRuleCommand::Create(_) => "capture.intercept_rule.create",
+            InterceptRuleCommand::Update(_) => "capture.intercept_rule.update",
+            InterceptRuleCommand::SetEnabled(_) => "capture.intercept_rule.set_enabled",
             InterceptRuleCommand::Delete(_) => "capture.intercept_rule.delete",
         }
     }
@@ -2234,6 +3053,17 @@ impl SkillsCommand {
     fn operation_name(&self) -> &'static str {
         match self {
             SkillsCommand::Install(_) => "skills.install",
+            SkillsCommand::Status(_) => "skills.status",
+            SkillsCommand::Enroll(_) => "skills.enroll",
+            SkillsCommand::UpdatePreview(_) => "skills.update_preview",
+            SkillsCommand::StageUpdate(_) => "skills.stage_update",
+            SkillsCommand::ApplyUpdate(_) => "skills.apply_update",
+            SkillsCommand::UpdateResult(_) => "skills.update_result",
+            SkillsCommand::RollbackUpdate(_) => "skills.rollback_update",
+            SkillsCommand::AutoUpdateStatus(_) => "skills.auto_update_status",
+            SkillsCommand::EnableAutoUpdates(_) => "skills.enable_auto_updates",
+            SkillsCommand::DisableAutoUpdates(_) => "skills.disable_auto_updates",
+            SkillsCommand::AutoUpdateOnce(_) => "skills.auto_update_once",
         }
     }
 }
@@ -2261,12 +3091,21 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         ),
         op(
             "examples",
-            "examples <operation>",
-            "Print example inputs for one Sniper CLI operation.",
+            "examples [operation]",
+            "Print example inputs for one Sniper CLI operation, or all operations when omitted.",
             Read,
             false,
-            &["operation"],
-            vec![json!({"operation":"capture.http.list"})],
+            &[],
+            vec![json!({}), json!({"operation":"capture.http.list"})],
+        ),
+        op(
+            "skills.status",
+            "skills status",
+            "Inspect local CLI-host skill hashes without installing or updating files.",
+            Read,
+            false,
+            &[],
+            vec![json!({"all":true}), json!({"codex":true,"codex_dir":"/tmp/example-skills"})],
         ),
         op(
             "skills.install",
@@ -2276,6 +3115,96 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &[],
             vec![json!({"all":true})],
+        ),
+        op(
+            "skills.enroll",
+            "skills enroll <--codex|--claude>",
+            "Experimental: record explicit local enrollment of one exact bundled skill. Does not permit automatic updates or change SKILL.md.",
+            Write,
+            true,
+            &[],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills"})],
+        ),
+        op(
+            "skills.update_preview",
+            "skills update-preview",
+            "Compare local skills and enrollment against this CLI's bundle without changing files. Unmanaged files remain unmanaged.",
+            Read,
+            false,
+            &[],
+            vec![json!({"all":true}), json!({"codex":true,"codex_dir":"/tmp/example-skills"})],
+        ),
+        op(
+            "skills.stage_update",
+            "skills stage-update <--codex|--claude> --staging-dir <new-directory>",
+            "Experimental: stage one enrolled, unchanged skill's bundled update and receipt in a new local directory. Does not activate it or replace the active SKILL.md.",
+            Write,
+            true,
+            &["staging_dir"],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","staging_dir":"/tmp/example-skill-candidate"})],
+        ),
+        op(
+            "skills.apply_update",
+            "skills apply-update <--codex|--claude> --staging-dir <reviewed-directory> --operation-id <uuid>",
+            "Experimental: explicitly activate one strictly bound, newer staged bundle. Retain the operation UUID for read-only result inspection and rollback; no startup updates or agent reload.",
+            Write,
+            true,
+            &["staging_dir", "operation_id"],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","staging_dir":"/tmp/example-skill-candidate","operation_id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
+            "skills.update_result",
+            "skills update-result <--codex|--claude> --operation-id <original-uuid>",
+            "Read one local skill update transaction and current state without resuming or changing files. Use the original operation UUID after lost output or any recovery-required result.",
+            Read,
+            false,
+            &["operation_id"],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","operation_id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
+            "skills.rollback_update",
+            "skills rollback-update <--codex|--claude> --operation-id <original-uuid>",
+            "Explicitly restore a partial or completed skill update's baseline using its original operation UUID. Preserve transaction artifacts and displaced files; never blindly retry an uncertain mutation.",
+            Write,
+            true,
+            &["operation_id"],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","operation_id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
+            "skills.auto_update_status",
+            "skills auto-update-status <--codex|--claude>",
+            "Read the selected agent's host-local automatic-update policy and stored target without creating, repairing, or resuming anything. Remote --api is never contacted.",
+            Read,
+            false,
+            &[],
+            vec![json!({"codex":true}), json!({"claude":true})],
+        ),
+        op(
+            "skills.enable_auto_updates",
+            "skills enable-auto-updates <--codex|--claude> [--policy-revision <current-revision>]",
+            "Explicitly authorize future updates from this host's bundled templates for one unchanged managed installation. Records consent only; does not update active files. Re-enabling requires the current policy revision and creates a fresh authorization generation.",
+            Write,
+            true,
+            &[],
+            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills"}), json!({"codex":true,"codex_dir":"/tmp/example-skills","policy_revision":2})],
+        ),
+        op(
+            "skills.disable_auto_updates",
+            "skills disable-auto-updates <--codex|--claude>",
+            "Revoke future automatic updates using the selected agent's stored target. Preserve active files and all policy, attempt, transaction and recovery artifacts; do not roll back committed updates.",
+            Write,
+            true,
+            &[],
+            vec![json!({"codex":true})],
+        ),
+        op(
+            "skills.auto_update_once",
+            "skills auto-update-once <--codex|--claude>",
+            "Run one guarded local bundled-update attempt under existing explicit consent. Uses only the stored target; edited, replaced, unsupported or uncertain objects are preserved and pause updates. Never fetch content or reload an agent.",
+            Write,
+            true,
+            &[],
+            vec![json!({"codex":true})],
         ),
         op(
             "session.list",
@@ -2289,7 +3218,7 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         op(
             "session.create",
             "session create",
-            "Create a Sniper session.",
+            "Create and activate a new Sniper session.",
             Write,
             false,
             &[],
@@ -2329,7 +3258,7 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         ),
         op(
             "findings.list", "findings list",
-            "List newest stored finding summaries without detail, evidence or captured bodies. Defaults to 100; limit-only, not cursor pagination. Omitted session_id pins the active session.",
+            "List newest stored finding summaries without detail, evidence or captured bodies. Each issue is stored once: a missing header, CORS policy or cookie flag per host, an exposed endpoint or open redirect per endpoint, a leaked value per value, linked to the first request that showed it. Defaults to 100; limit-only, not cursor pagination. Omitted session_id pins the active session.",
             Read, false, &[], vec![json!({"limit":20})],
         ),
         op(
@@ -2400,6 +3329,26 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["value"],
             vec![json!({"value":"access_token","side":["response-body"]})],
+        ),
+        op(
+            "capture.http.upstream_peer.get", "capture http upstream-peer get --session-id <uuid>",
+            "Read default-Off observed socket peer configuration and effective status for the current active session only; no activation, upstream requests or traffic reads.",
+            Read, false, &["session_id"], vec![json!({"session_id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.upstream_peer.set", "capture http upstream-peer set --session-id <uuid> --enabled <true|false>",
+            "Explicitly save the active session's future observed socket peer switch. Requires --yes. One pinned configuration GET then one compare-and-swap POST; no retry or backfill. Retained observations remain in session files, exports and full-record JSON after Off. A socket peer may be a proxy or shared endpoint, not origin ownership.",
+            Write, true, &["session_id", "enabled"], vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","enabled":true}), json!({"session_id":"00000000-0000-0000-0000-000000000000","enabled":false})],
+        ),
+        op(
+            "capture.http.retention.get", "capture http retention get [--session-id <uuid>]",
+            "Read one session's saved HTTP retention policy and cleanup status without changing it. Off is the default.",
+            Read, false, &[], vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.http.retention.set", "capture http retention set [--session-id <uuid>] (--off|--max-entries <integer>)",
+            "Explicitly save Off or a keep-newest total-history target. Cleanup permanently deletes oldest unprotected rows; durable saved HTTP tab source originals and in-progress rows are protected, so totals may exceed the target. Requires --yes.",
+            Write, true, &[], vec![json!({"off":true}), json!({"max_entries":10000})],
         ),
         op(
             "capture.http.select", "capture http select --session-id <uuid> [--id <uuid>|filters]",
@@ -2482,11 +3431,11 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         op(
             "replay.update",
             "replay update --tab-id <id>",
-            "Update a Replay tab request or connection target.",
+            "Update an HTTP Replay request or target, or change only the saved label of an HTTP or WebSocket tab. Label-only updates preserve all other saved tab fields and use workspace revision checks.",
             Write,
             false,
             &["tab_id"],
-            vec![json!({"tab_id":"tab-1","host":"example.com"})],
+            vec![json!({"tab_id":"tab-1","host":"example.com"}), json!({"tab_id":"11111111-1111-4111-8111-111111111111","label":"Saved conversation"})],
         ),
         op(
             "replay.close",
@@ -2505,6 +3454,15 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             true,
             &["tab_id"],
             vec![json!({"tab_id":"tab-1"})],
+        ),
+        op(
+            "replay.set_pinned",
+            "replay set-pinned --tab-id <exact-id> --pinned <true|false> [--session-id <uuid>]",
+            "Set one saved HTTP tab's pin state using one revision-checked write. Focus and saved array order are preserved; no traffic is sent.",
+            Write,
+            true,
+            &["tab_id", "pinned"],
+            vec![json!({"tab_id":"tab-1","pinned":true})],
         ),
         op(
             "replay.send",
@@ -2597,6 +3555,17 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             vec![json!({})],
         ),
         op(
+            "capture.intercept.get", "capture intercept get --id <uuid>",
+            "Get one held request, including its potentially sensitive headers and body.",
+            Read, false, &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "capture.intercept.wait", "capture intercept wait",
+            "Poll for a held request, then return its full detail without forwarding it. Timeout zero performs one queue check; the polling budget excludes API discovery and detail retrieval.",
+            Read, false, &[], vec![json!({"timeout":30,"poll_interval":200})],
+        ),
+        op(
             "capture.intercept.forward",
             "capture intercept forward --id <uuid>",
             "Forward one held request.",
@@ -2669,6 +3638,11 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             vec![json!({})],
         ),
         op(
+            "capture.response_intercept.wait", "capture response-intercept wait",
+            "Poll for a held response, then return its full detail without forwarding it. Timeout zero performs one queue check; the polling budget excludes API discovery and detail retrieval.",
+            Read, false, &[], vec![json!({"timeout":30,"poll_interval":200})],
+        ),
+        op(
             "capture.response_intercept.get",
             "capture response-intercept get --id <uuid>",
             "Get one held response.",
@@ -2721,6 +3695,24 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &[],
             vec![json!({"all":true})],
+        ),
+        op(
+            "capture.intercept_rule.update",
+            "capture intercept-rule update --id <uuid>",
+            "Patch explicit fields of an existing saved intercept rule. Omitted fields are preserved; empty patterns or method lists clear them. Missing IDs never create rules.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000","path_pattern":"/saved","method_filter":[]})],
+        ),
+        op(
+            "capture.intercept_rule.set_enabled",
+            "capture intercept-rule set-enabled --id <uuid> --enabled <true|false>",
+            "Assign an existing saved rule's enabled boolean, preserving its matchers and scope. Repeated values never toggle or create it.",
+            Write,
+            true,
+            &["id", "enabled"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000","enabled":false})],
         ),
         op(
             "capture.intercept_rule.delete",
@@ -2867,9 +3859,1165 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             vec![json!({"provider":"interactsh","url":"https://oast.example","token_stdin":true})],
         ),
     ];
+    operations.extend(service_map_manifest_operations());
     operations.extend(scanner_manifest_operations());
     operations.extend(saved_manifest_operations());
     operations
+}
+
+fn service_map_object(properties: Value) -> Value {
+    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+    json!({"type":"object","additionalProperties":false,"required":required,"properties":properties})
+}
+
+// Keep product identities tied to the parser's fixed catalog. Header values and
+// arbitrary server declarations must never become output-schema alternatives.
+fn service_map_technology_schema(exact_row: bool, catalog_version: CatalogVersion) -> Value {
+    use sniper::service_map_technology::{
+        catalog_entries, MAX_OBSERVATIONS_PER_ROW, MAX_VERSION_BYTES,
+    };
+    let span = service_map_object(json!({
+        "start":{"type":"integer","minimum":0,"maximum":4095},
+        "end":{"type":"integer","minimum":1,"maximum":4096}
+    }));
+    let numeric_version = json!({
+        "type":"string",
+        "allOf":[
+            {"pattern":"^[0-9]+(?:\\.[0-9]+)*$"},
+            {"pattern":format!("^[0-9.]{{1,{MAX_VERSION_BYTES}}}$")}
+        ]
+    });
+    let mut schema = service_map_object(json!({
+        "product_id":{"type":"string"},"name":{"type":"string"},
+        "catalog_category":{"type":"string","enum":["web_server","application_server","application_framework","language_runtime","cms","edge_service","connector","unknown"]},
+        "reported_version":{"anyOf":[{"type":"null"},numeric_version]},
+        "version_status":{"type":"string","enum":["reported","not_reported","unsupported_format","non_product_version"]},
+        "source":{"type":"string","enum":["response_header"]},
+        "strength":{"type":"string","enum":["literal_declaration"]},
+        "header_name":{"type":"string"}
+    }));
+    let properties = schema["properties"].as_object_mut().unwrap();
+    if exact_row {
+        properties.extend([
+            (
+                "header_index".into(),
+                json!({"type":"integer","minimum":0,"maximum":127}),
+            ),
+            ("product_span".into(), span.clone()),
+            (
+                "version_span".into(),
+                json!({"anyOf":[{"type":"null"},span]}),
+            ),
+            (
+                "offset_basis".into(),
+                json!({"type":"string","enum":["retained_header_value_utf8"]}),
+            ),
+            ("rule_id".into(), json!({"type":"string"})),
+        ]);
+    } else {
+        properties.extend([
+            ("row_count".into(), json!({"type":"integer","minimum":1,"maximum":50000})),
+            ("first_seen".into(), json!({"type":"string","format":"date-time"})),
+            ("last_seen".into(), json!({"type":"string","format":"date-time"})),
+            ("evidence".into(), json!({"type":"array","minItems":1,"maxItems":3,"items":{
+                "type":"string","pattern":"^v1\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}\\.(0|[1-9][0-9]{0,19})\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}$"
+            }})),
+        ]);
+    }
+    let required: Vec<_> = properties.keys().cloned().collect();
+    schema["required"] = json!(required);
+    let catalog: Vec<_> = catalog_entries(catalog_version).map(|entry| {
+        let mut fields = json!({
+            "product_id":{"enum":[entry.product_id]},"name":{"enum":[entry.name]},
+            "catalog_category":{"enum":[entry.catalog_category]},
+            "header_name":{"enum":[entry.header_name]},
+            "version_status":{"enum":if serde_json::to_value(entry.catalog_category).unwrap() == "connector" {
+                json!(["not_reported","unsupported_format","non_product_version"])
+            } else if exact_row && entry.rule_id == "server.jetty_parenthesized.v1" {
+                json!(["reported","unsupported_format"])
+            } else {
+                json!(["reported","not_reported","unsupported_format"])
+            }}
+        });
+        if exact_row {
+            fields["rule_id"] = json!({"enum":[entry.rule_id]});
+        }
+        json!({"properties":fields})
+    }).collect();
+    schema["allOf"] = json!([
+        {"anyOf":catalog},
+        {"oneOf":[
+            {"properties":{"version_status":{"enum":["reported"]},"reported_version":{"type":"string"}}},
+            {"properties":{"version_status":{"enum":["not_reported","unsupported_format","non_product_version"]},"reported_version":{"type":"null"}}}
+        ]}
+    ]);
+    if exact_row {
+        schema["allOf"][1]["oneOf"][0]["properties"]["version_span"] = json!({"type":"object"});
+        schema["allOf"][1]["oneOf"][1]["properties"]["version_span"] = json!({"type":"null"});
+        schema["description"] = json!(format!("Literal allowlisted response-header declaration with UTF-8 byte spans. At most {MAX_OBSERVATIONS_PER_ROW} per exact retained row; no inferred software identity."));
+    }
+    schema
+}
+
+// The union supports negotiated v2 without allowing an unmarked legacy response
+// to claim products that its effective v1 catalog cannot recognize.
+fn service_map_catalog_output_schema(mut schema: Value, exact_row: bool) -> Value {
+    schema["properties"]["technology_catalog_version"] = json!({"type":"integer","enum":[1,2],"description":"Present only when the API recognizes catalog negotiation. Absence means legacy v1 coverage; rule IDs retain their own version."});
+    let observations =
+        json!({"items":service_map_technology_schema(exact_row, CatalogVersion::V1)});
+    let legacy_properties = if exact_row {
+        json!({"technology_catalog_version":{"enum":[1]},"row":{"properties":{"technology_observations":observations}}})
+    } else {
+        json!({"technology_catalog_version":{"enum":[1]},"origins":{"items":{"properties":{"technology_observations":observations}}}})
+    };
+    schema["allOf"] = json!([{"anyOf":[
+        {"required":["technology_catalog_version"],"properties":{"technology_catalog_version":{"enum":[2]}}},
+        {"properties":legacy_properties}
+    ]}]);
+    schema
+}
+
+fn service_map_parameters_output_schema() -> Value {
+    use sniper::service_map_parameters::{MAX_EXAMPLES, MAX_PARAMETERS, MAX_ROWS};
+    let count = json!({"type":"integer","minimum":0});
+    let parameter = service_map_object(json!({
+        "name":{"type":"string"},
+        "location":{"type":"string","enum":["query","form","json","multipart"]},
+        "rows":{"type":"integer","minimum":1,"maximum":MAX_ROWS},
+        "examples":{"type":"array","maxItems":MAX_EXAMPLES,"items":{"type":"string"},"description":"Distinct values as captured, each cut to 80 characters."}
+    }));
+    let mut result = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},
+        "session_id":{"type":"string"},
+        "available":{"type":"boolean"},
+        "reasons":{"type":"array","items":{"type":"string"},"description":"Why the read was unavailable, such as inactive_session."},
+        "origin":{"type":"string"},"method":{"type":"string"},"path":{"type":"string"},
+        "rows":{"type":"integer","minimum":0,"maximum":MAX_ROWS,"description":"Matching rows read, newest first."},
+        "more_rows":{"type":"boolean","description":"More rows matched than were read."},
+        "parameters":{"type":"array","maxItems":MAX_PARAMETERS,"items":parameter},
+        "omitted_parameters":count,
+        "unread_bodies":{"type":"integer","minimum":1,"description":"Retained rows whose body was not read once the per-read byte budget was spent; their query strings still count."}
+    }));
+    result["required"] = json!([
+        "schema_version",
+        "session_id",
+        "available",
+        "origin",
+        "method",
+        "path",
+        "rows",
+        "more_rows",
+        "parameters",
+        "omitted_parameters"
+    ]);
+    result
+}
+
+fn service_map_openapi_output_schema() -> Value {
+    use sniper::service_map_openapi::MAX_OPERATIONS;
+    json!({
+        "type":"object",
+        "description":"An OpenAPI 3.1 document of what one origin's retained rows showed (https://spec.openapis.org/oas/v3.1.0). Path templates mark ID segments as {number}, {uuid}, {hex} or mixed {id}; equivalent hierarchies combine their observations. JSON fields retain native types including null and mixed types; text field types are guessed from captured values, which are not included. Each operation's x-sniper-requests counts the rows it stands for and x-sniper-newest-transaction names the newest of them (open it with capture http get); security lists each credential the rows showed as an alternative, not what the server requires.",
+        "required":["openapi","info","servers","paths"],
+        "properties":{
+            "openapi":{"type":"string","enum":["3.1.0"]},
+            "info":{"type":"object","required":["title","version","description"],"properties":{
+                "title":{"type":"string","description":"The origin."},
+                "version":{"type":"string","enum":["observed"]},
+                "description":{"type":"string","description":"How many rows it was built from, and what was left out."}
+            }},
+            "servers":{"type":"array","minItems":1,"maxItems":1,"items":{"type":"object","required":["url"],"properties":{"url":{"type":"string"}}}},
+            "paths":{"type":"object","maxProperties":MAX_OPERATIONS,"propertyNames":{"pattern":"^/"}},
+            "components":{"type":"object","properties":{"securitySchemes":{"type":"object"}}}
+        }
+    })
+}
+
+fn service_map_snapshot_schema() -> Value {
+    let strings = json!({"type":"array","items":{"type":"string"}});
+    let count = json!({"type":"integer","minimum":0});
+    let timestamp = json!({"type":"string","format":"date-time"});
+    let nullable_timestamp = json!({"type":["string","null"],"format":"date-time"});
+    let uuid = json!({"type":"string","format":"uuid"});
+    let boolean = json!({"type":"boolean"});
+    let mut limits = serde_json::Map::new();
+    for field in [
+        "max_records",
+        "metadata_bytes",
+        "origins",
+        "endpoints",
+        "endpoints_per_origin",
+        "evidence_per_item",
+        "redirects_per_origin",
+        "header_links_per_origin",
+        "technology_clues_per_row",
+        "statuses_per_endpoint",
+        "content_types_per_endpoint",
+        "path_bytes",
+        "host_bytes",
+        "method_bytes",
+        "headers_per_row",
+        "header_bytes_per_row",
+        "header_value_bytes",
+    ] {
+        limits.insert(field.into(), json!({"type":"integer","minimum":1}));
+    }
+    let mut limits = service_map_object(Value::Object(limits));
+    for (name, cap) in [
+        ("technology_observations_per_row", 8),
+        ("technology_observations_per_origin", 32),
+        ("technology_observations", 2000),
+        ("technology_version_bytes", 32),
+        ("technology_token_candidates_per_row", 128),
+    ] {
+        limits["properties"][name] = json!({"type":"integer","enum":[cap]});
+    }
+    let mut snapshot = service_map_object(json!({
+        "id":uuid,"generation":uuid,"captured_at":timestamp,
+        "first_retained_started_at":nullable_timestamp,"last_retained_started_at":nullable_timestamp,
+        "window_order":{"type":"string","enum":["newest_capture_sequence"]},
+        "oldest_considered_at":nullable_timestamp,"latest_considered_at":nullable_timestamp,
+        "retained_rows":count,"considered_rows":count,"non_http_rows":count,"filtered_rows":count,"projected_rows":count,"included_rows":count,
+        "excluded_rows":count,"omitted_rows":count,"origin_count":count,"endpoint_count":count,
+        "complete":boolean,"stopped_by":strings,"limits":limits
+    }));
+    // Present only when a display filter hid rows; older servers never send it.
+    snapshot["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|name| name != "filtered_rows");
+    snapshot["description"] = json!("Coverage of the source map before summary kind/limit filtering. complete is false when stopped_by reports a source limit or omission; omitted_rows counts omitted rows, not omitted signals. No completeness claim about removed or uncaptured traffic.");
+    snapshot
+}
+
+fn service_map_unnamed_output_schema() -> Value {
+    let count = json!({"type":"integer","minimum":0});
+    json!({
+        "type":"object", "additionalProperties":false,
+        "description":"What no rule names across the session's whole map, most widespread first. A signal is a Server or X-Powered-By banner (`server: <value>`), a response header name, or a Set-Cookie name; never a header or cookie value. Open a signal's evidence tokens with `scope service-map-evidence` to judge it.",
+        "required":["schema_version","session_id","snapshot","origins_read","origins_with_unnamed","distinct_signals","omitted_signals","signals"],
+        "properties":{
+            "schema_version":{"type":"integer","enum":[1]},
+            "session_id":{"type":"string"},
+            "snapshot":service_map_snapshot_schema(),
+            "origins_read":count, "origins_with_unnamed":count,
+            "distinct_signals":{"type":"integer","minimum":0,"description":"Distinct available source-map signals after --kind, before --limit; not a count of all captured or uncaptured signals."},
+            "omitted_signals":{"type":"integer","minimum":0,"description":"Signals hidden only by --limit, after --kind. Zero does not imply complete source coverage; inspect snapshot.complete and snapshot.stopped_by."},
+            "signals":{"type":"array","maxItems":1000,"items":{
+                "type":"object", "additionalProperties":false,
+                "required":["kind","value","origins","rows","sample_origins","evidence","named_alongside"],
+                "properties":{
+                    "kind":{"type":"string","enum":["banners","headers","cookies"]},
+                    "value":{"type":"string"},
+                    "origins":{"type":"integer","minimum":1,"description":"Origins whose responses carried it."},
+                    "rows":count,
+                    "sample_origins":{"type":"array","maxItems":UNNAMED_SAMPLE_ORIGINS,"items":{"type":"string"}},
+                    "evidence":{"type":"array","maxItems":UNNAMED_SAMPLE_EVIDENCE,"items":{"type":"string"},"description":"Evidence tokens for `scope service-map-evidence`."},
+                    "named_alongside":{"type":"array","maxItems":UNNAMED_SAMPLE_ORIGINS,"description":"Products the map named on the same origins, most often first. A signal whose origins all carry one product is likely that product's own.","items":{
+                        "type":"object", "additionalProperties":false, "required":["name","origins"],
+                        "properties":{"name":{"type":"string"},"origins":{"type":"integer","minimum":1}}
+                    }}
+                }
+            }}
+        }
+    })
+}
+
+fn service_map_html_generators_output_schema() -> Value {
+    use sniper::service_map_html::{ACQUISITION_REASONS, PARSER_STOP_REASONS, TRUNCATION_REASONS};
+    let span = service_map_object(json!({
+        "start":{"type":"integer","minimum":0,"maximum":262143},
+        "end":{"type":"integer","minimum":1,"maximum":262144}
+    }));
+    let mut observation = service_map_object(json!({
+        "product_id":{"type":"string","enum":["wordpress","drupal"]},
+        "name":{"type":"string","enum":["WordPress","Drupal"]},
+        "catalog_category":{"type":"string","enum":["cms"]},
+        "reported_version":{"anyOf":[{"type":"null"},{"type":"string","allOf":[
+            {"pattern":"^[0-9]+(?:\\.[0-9]+)*$"},{"pattern":"^[0-9.]{1,32}$"}
+        ]}]},
+        "version_status":{"type":"string","enum":["reported","not_reported","unsupported_format"]},
+        "source":{"type":"string","enum":["response_html_meta_generator"]},
+        "strength":{"type":"string","enum":["literal_declaration"]},
+        "rule_id":{"type":"string","enum":["html_meta_generator.wordpress.v1","html_meta_generator.drupal.v1"]},
+        "tag_span":span,"content_span":span,"product_span":span,
+        "version_span":{"anyOf":[{"type":"null"},span]},
+        "offset_basis":{"type":"string","enum":["retained_utf8_preview"]}
+    }));
+    observation["allOf"] = json!([
+        {"oneOf":[
+            {"properties":{"product_id":{"enum":["wordpress"]},"name":{"enum":["WordPress"]},"rule_id":{"enum":["html_meta_generator.wordpress.v1"]}}},
+            {"properties":{"product_id":{"enum":["drupal"]},"name":{"enum":["Drupal"]},"rule_id":{"enum":["html_meta_generator.drupal.v1"]}}}
+        ]},
+        {"oneOf":[
+            {"properties":{"version_status":{"enum":["reported"]},"reported_version":{"type":"string"},"version_span":{"type":"object"}}},
+            {"properties":{"version_status":{"enum":["not_reported","unsupported_format"]},"reported_version":{"type":"null"},"version_span":{"type":"null"}}}
+        ]}
+    ]);
+    observation["description"] = json!("Literal declaration only. Half-open retained UTF-8 byte spans must be ordered and contained: product starts at content.start, content is inside tag, numeric version ends at content.end after 1–32 ASCII whitespace bytes. Tags are disjoint and ordered. No raw HTML, unknown product or rejected version text.");
+    let scan_reasons: Vec<_> = TRUNCATION_REASONS
+        .iter()
+        .chain(PARSER_STOP_REASONS)
+        .copied()
+        .collect();
+    let reasons: Vec<_> = ACQUISITION_REASONS
+        .iter()
+        .copied()
+        .chain(scan_reasons.iter().copied())
+        .collect();
+    let mut schema = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},
+        "generator_catalog_version":{"type":"integer","enum":[1]},
+        "session_id":{"type":"string","format":"uuid"},
+        "evidence_id":{"type":"string","pattern":"^v1\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}\\.(0|[1-9][0-9]{0,19})\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}$"},
+        "available":{"type":"boolean"},
+        "status":{"type":"string","enum":["scanned","unsupported","unavailable"]},
+        "complete":{"type":"boolean"},
+        "reasons":{"type":"array","maxItems":3,"items":{"type":"string","enum":reasons}},
+        "source_origin":{"type":["string","null"]},
+        "source_sequence":{"type":["string","null"],"pattern":"^(0|[1-9][0-9]{0,19})$"},
+        "source_started_at":{"type":["string","null"],"format":"date-time"},
+        "retained_preview_bytes":{"type":["integer","null"],"minimum":0},
+        "scan_prefix_bytes":{"type":"integer","minimum":0,"maximum":262144,"description":"Bounded UTF-8 prefix offered to the parser, not bytes fully parsed."},
+        "capture_preview_truncated":{"type":"boolean"},"scan_prefix_truncated":{"type":"boolean"},
+        "coverage":{"type":"string","enum":["literal_html_generator_explicit_head"]},
+        "head_closed":{"type":"boolean"},
+        "parser_stop":{"anyOf":[{"type":"null"},service_map_object(json!({
+            "reason":{"type":"string","enum":PARSER_STOP_REASONS},
+            "byte_cursor":{"type":"integer","minimum":0,"maximum":262144,"description":"Raw byte cursor; may split UTF-8. Never use to slice text."}
+        }))]},
+        "tag_candidates_inspected":{"type":"integer","minimum":0,"maximum":4096},
+        "additional_tag_candidate_encountered":{"type":"boolean"},
+        "additional_observation_encountered":{"type":"boolean"},
+        "unknown_product_declarations":{"type":"integer","minimum":0,"maximum":4096},
+        "observations":{"type":"array","maxItems":8,"items":observation},
+        "limits":service_map_object(json!({
+            "scan_bytes":{"type":"integer","enum":[262144]},
+            "serialized_row_bytes":{"type":"integer","enum":[2097152]},
+            "tag_candidates":{"type":"integer","enum":[4096]},
+            "tag_bytes":{"type":"integer","enum":[4096]},
+            "attributes":{"type":"integer","enum":[32]},
+            "observations":{"type":"integer","enum":[8]},
+            "version_bytes":{"type":"integer","enum":[32]},
+            "version_separator_bytes":{"type":"integer","enum":[32]}
+        })),
+        "offset_basis":{"type":"string","enum":["retained_utf8_preview"]}
+    }));
+    schema["oneOf"] = json!([
+        {"properties":{
+            "available":{"enum":[true]},"status":{"enum":["scanned"]},
+            "source_origin":{"type":"string"},"source_sequence":{"type":"string"},
+            "source_started_at":{"type":"string"},"retained_preview_bytes":{"type":"integer"},
+            "reasons":{"items":{"enum":scan_reasons}}
+        },"allOf":[
+            {"oneOf":[
+                {"properties":{"head_closed":{"enum":[true]},"parser_stop":{"type":"null"},"tag_candidates_inspected":{"minimum":3}}},
+                {"properties":{"head_closed":{"enum":[false]},"parser_stop":{"type":"object"}}}
+            ]},
+            {"oneOf":[
+                {"properties":{"complete":{"enum":[true]},"reasons":{"enum":[[]]},"head_closed":{"enum":[true]},"capture_preview_truncated":{"enum":[false]},"scan_prefix_truncated":{"enum":[false]},"additional_tag_candidate_encountered":{"enum":[false]},"additional_observation_encountered":{"enum":[false]}}},
+                {"properties":{"complete":{"enum":[false]},"reasons":{"minItems":1}}}
+            ]}
+        ]},
+        {"properties":{
+            "available":{"enum":[false]},"status":{"enum":["unsupported","unavailable"]},
+            "complete":{"enum":[false]},"reasons":{"minItems":1,"maxItems":1,"items":{"enum":ACQUISITION_REASONS}},
+            "source_origin":{"type":"null"},"source_sequence":{"type":"null"},
+            "source_started_at":{"type":"null"},"retained_preview_bytes":{"type":"null"},
+            "scan_prefix_bytes":{"enum":[0]},"capture_preview_truncated":{"enum":[false]},"scan_prefix_truncated":{"enum":[false]},
+            "head_closed":{"enum":[false]},"parser_stop":{"type":"null"},
+            "tag_candidates_inspected":{"enum":[0]},"additional_tag_candidate_encountered":{"enum":[false]},
+            "additional_observation_encountered":{"enum":[false]},"unknown_product_declarations":{"enum":[0]},"observations":{"enum":[[]]}
+        }}
+    ]);
+    schema["description"] = json!("Fixed generator catalog 1. Exact requested session/token binding is required. Partial accepted scans stay available=true/status=scanned; partial or unsupported never means no generator found. Source metadata and scan counters are cleared for unavailable/unsupported results. All nullable fields must be explicit null. Reasons are unique fixed codes and match truncation flags and parser stop. Bounds, span containment/order and exact source sequence are additionally checked at runtime. Declaration counters require two opening-tag candidates and, for a closed head, one closing-tag candidate in addition to each declaration.");
+    schema
+}
+
+const LINK_ACQUISITION_REASONS: &[&str] = sniper::service_map_links::ACQUISITION_REASONS;
+const LINK_SCAN_REASONS: &[&str] = sniper::service_map_links::PARSER_REASONS;
+
+fn service_map_link_declarations_output_schema() -> Value {
+    let span = service_map_object(json!({
+        "start":{"type":"integer","minimum":0,"maximum":4095},
+        "end":{"type":"integer","minimum":1,"maximum":4096}
+    }));
+    let mut observation = service_map_object(json!({
+        "relation":{"type":"string","enum":["service-doc","service-desc","describedby","preconnect"]},
+        "target_origin":{"type":"string"},
+        "source":{"type":"string","enum":["response_link_header"]},
+        "strength":{"type":"string","enum":["literal_declaration"]},
+        "header_name":{"type":"string","enum":["link"]},
+        "header_index":{"type":"integer","minimum":0,"maximum":127},
+        "header_value_bytes":{"type":"integer","minimum":1,"maximum":4096},
+        "link_value_span":span,"target_span":span,"relation_span":span,
+        "rule_id":{"type":"string","enum":["response_link.service_doc.v1","response_link.service_desc.v1","response_link.describedby.v1","response_link.preconnect.v1"]},
+        "offset_basis":{"type":"string","enum":["retained_header_value_utf8"]}
+    }));
+    observation["oneOf"] = json!([
+        {"properties":{"relation":{"enum":["service-doc"]},"rule_id":{"enum":["response_link.service_doc.v1"]}}},
+        {"properties":{"relation":{"enum":["service-desc"]},"rule_id":{"enum":["response_link.service_desc.v1"]}}},
+        {"properties":{"relation":{"enum":["describedby"]},"rule_id":{"enum":["response_link.describedby.v1"]}}},
+        {"properties":{"relation":{"enum":["preconnect"]},"rule_id":{"enum":["response_link.preconnect.v1"]}}}
+    ]);
+    observation["description"] = json!("Canonical origin only, at most 268 ASCII bytes. Half-open original retained-header UTF-8 spans: member starts at '<', target excludes brackets, relation follows target and has its literal relation-name length. Relations may share identical member/target spans with ordered distinct relation spans; separate members and headers remain ordered and disjoint. Same-header value lengths must agree. No raw header, rejected/unknown value, URL suffix, or parser diagnostic.");
+    let count = |max| json!({"type":"integer","minimum":0,"maximum":max});
+    let counts = service_map_object(json!({
+        "headers_inspected":count(128),"header_bytes_admitted":count(32768),
+        "link_fields_inspected":count(128),"candidates_inspected":count(128),
+        "members_framed":count(128),"parameters_inspected":count(4096),
+        "relation_tokens_inspected":count(4096),"unknown_relation_tokens_inspected":count(4096)
+    }));
+    let zero_counts = service_map_object(json!({
+        "headers_inspected":{"enum":[0]},"header_bytes_admitted":{"enum":[0]},
+        "link_fields_inspected":{"enum":[0]},"candidates_inspected":{"enum":[0]},
+        "members_framed":{"enum":[0]},"parameters_inspected":{"enum":[0]},
+        "relation_tokens_inspected":{"enum":[0]},"unknown_relation_tokens_inspected":{"enum":[0]}
+    }));
+    let reasons: Vec<_> = LINK_ACQUISITION_REASONS
+        .iter()
+        .chain(LINK_SCAN_REASONS)
+        .copied()
+        .collect();
+    let mut schema = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},
+        "relation_catalog_version":{"type":"integer","enum":[1]},
+        "session_id":{"type":"string","format":"uuid"},
+        "evidence_id":{"type":"string","pattern":"^v1\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}\\.(0|[1-9][0-9]{0,19})\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}$"},
+        "available":{"type":"boolean"},"status":{"type":"string","enum":["scanned","unsupported","unavailable"]},
+        "complete":{"type":"boolean"},"reasons":{"type":"array","maxItems":12,"items":{"type":"string","enum":reasons}},
+        "source_origin":{"type":["string","null"]},
+        "source_sequence":{"type":["string","null"],"pattern":"^(0|[1-9][0-9]{0,19})$"},
+        "source_started_at":{"type":["string","null"],"format":"date-time"},
+        "source_method":{"type":["string","null"],"enum":["GET","HEAD",null]},
+        "source_status":{"type":["integer","null"],"enum":[200,null]},
+        "retained_header_count":{"type":["integer","null"],"minimum":0,"maximum":9007199254740991u64},
+        "coverage":{"type":"string","enum":["absolute_http_link_declarations"]},
+        "offset_basis":{"type":"string","enum":["retained_header_value_utf8"]},
+        "counts":counts,"observations":{"type":"array","maxItems":32,"items":observation},
+        "limits":service_map_object(json!({
+            "headers":{"type":"integer","enum":[128]},"header_bytes":{"type":"integer","enum":[32768]},
+            "link_field_bytes":{"type":"integer","enum":[4096]},"target_bytes":{"type":"integer","enum":[4096]},
+            "candidates":{"type":"integer","enum":[128]},"parameters_per_member":{"type":"integer","enum":[32]},
+            "relation_tokens_per_member":{"type":"integer","enum":[32]},"observations":{"type":"integer","enum":[32]},
+            "target_origin_bytes":{"type":"integer","enum":[268]}
+        }))
+    }));
+    schema["oneOf"] = json!([
+        {"properties":{
+            "available":{"enum":[true]},"status":{"enum":["scanned"]},
+            "source_origin":{"type":"string"},"source_sequence":{"type":"string"},
+            "source_started_at":{"type":"string"},"source_method":{"type":"string"},
+            "source_status":{"type":"integer"},"retained_header_count":{"type":"integer"},
+            "reasons":{"items":{"enum":LINK_SCAN_REASONS}}
+        },"oneOf":[
+            {"properties":{"complete":{"enum":[true]},"reasons":{"enum":[[]]}}},
+            {"properties":{"complete":{"enum":[false]},"reasons":{"minItems":1}}}
+        ]},
+        {"properties":{
+            "available":{"enum":[false]},"status":{"enum":["unsupported","unavailable"]},
+            "complete":{"enum":[false]},"reasons":{"minItems":1,"maxItems":1,"items":{"enum":LINK_ACQUISITION_REASONS}},
+            "source_origin":{"type":"null"},"source_sequence":{"type":"null"},"source_started_at":{"type":"null"},
+            "source_method":{"type":"null"},"source_status":{"type":"null"},"retained_header_count":{"type":"null"},
+            "counts":zero_counts,"observations":{"enum":[[]]}
+        }}
+    ]);
+    schema["description"] = json!("Fixed relation catalog 1, exact requested session/token and canonical decimal uint64 source sequence binding. Required nullable fields are explicit null. Reasons are sorted unique fixed codes; complete means no reasons within this bounded fixed grammar, never all relationships. Partial scans remain available. Runtime additionally validates canonical origins, ordered/contained spans, inspected counters and actual-cap consistency. Unknown-only complete coverage is valid. Unavailable/unsupported results contain exactly one acquisition reason and no source metadata or observations.");
+    schema
+}
+
+fn service_map_socket_peer_matches_output_schema() -> Value {
+    use sniper::service_map_peer_matches::{
+        ACQUISITION_REASONS, MAX_HOST_BYTES, MAX_ORIGIN_GROUPS, MAX_PROJECTION_BYTES,
+        MAX_SAMPLES_PER_ORIGIN, MAX_SCHEME_BYTES, MAX_SCOPE_PATTERN_BYTES,
+        MAX_SCOPE_PATTERN_ENTRIES, MAX_SCOPE_WORK_UNITS, PARTIAL_REASONS,
+    };
+    let uuid_pattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+    let uuid = json!({"type":"string","format":"uuid","pattern":format!("^{uuid_pattern}$")});
+    let token = json!({"type":"string","pattern":format!("^v1\\.{uuid_pattern}\\.{uuid_pattern}\\.(0|[1-9][0-9]{{0,19}})\\.{uuid_pattern}\\.{uuid_pattern}$")});
+    let sequence = json!({"type":"string","pattern":"^(0|[1-9][0-9]{0,19})$","description":"Canonical decimal uint64, checked without floating-point conversion and bound to the exact evidence token."});
+    let timestamp = json!({"type":"string","format":"date-time"});
+    let origin = json!({"type":"string","description":"Bounded canonical HTTP(S) origin only; no credentials, path, query, fragment or raw rejected values."});
+    let boolean = json!({"type":"boolean"});
+    let count = json!({"type":"integer","minimum":0,"maximum":50000});
+    let count_names = [
+        "non_http_rows",
+        "not_recorded_rows",
+        "unavailable_observation_rows",
+        "non_direct_rows",
+        "invalid_observation_rows",
+        "different_peer_rows",
+        "invalid_metadata_rows",
+        "scope_excluded_rows",
+        "matching_rows",
+        "returned_matching_rows",
+        "omitted_matching_rows",
+        "sample_rows",
+        "omitted_sample_rows",
+    ];
+    let counts = service_map_object(Value::Object(
+        count_names
+            .iter()
+            .map(|name| ((*name).into(), count.clone()))
+            .collect(),
+    ));
+    let zero_counts = service_map_object(Value::Object(
+        count_names
+            .iter()
+            .map(|name| ((*name).into(), json!({"type":"integer","enum":[0]})))
+            .collect(),
+    ));
+    let mut peer = service_map_object(json!({
+        "source":{"type":"string","enum":["http_response_remote_addr"]},
+        "route":{"type":"string","enum":["direct"]},
+        "address_family":{"type":"string","enum":["ipv4","ipv6"]},
+        "address":service_map_object(json!({
+            "ip":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535}
+        }))
+    }));
+    peer["oneOf"] = json!([
+        {"properties":{"address_family":{"enum":["ipv4"]},"address":{"properties":{"ip":{"format":"ipv4"}}}}},
+        {"properties":{"address_family":{"enum":["ipv6"]},"address":{"properties":{"ip":{"format":"ipv6"}}}}}
+    ]);
+    peer["description"] = json!("Canonical IP serialization and permitted unicast address classes are additionally validated at runtime. IPv4 and mapped IPv6 remain distinct. This is a recorded observation key, never a physical endpoint, ownership, deployment or origin-IP finding.");
+    let source = service_map_object(json!({
+        "evidence_id":token,"sequence":sequence,"origin":origin,
+        "started_at":timestamp,"observed_at":timestamp,"in_scope":boolean,"in_window":boolean
+    }));
+    let snapshot = service_map_object(json!({
+        "id":uuid,"generation":uuid,"captured_at":timestamp,
+        "window_order":{"type":"string","enum":["latest_retained_sequence"]},
+        "retained_rows":{"type":"integer","minimum":1,"maximum":9007199254740991u64},
+        "considered_rows":{"type":"integer","minimum":1,"maximum":50000},
+        "oldest_considered_sequence":{"anyOf":[{"type":"null"},sequence]},
+        "latest_considered_sequence":{"anyOf":[{"type":"null"},sequence]}
+    }));
+    let sample = service_map_object(json!({
+        "evidence_id":token,"sequence":sequence,"started_at":timestamp,"observed_at":timestamp
+    }));
+    let group = service_map_object(json!({
+        "origin":origin,"in_scope":boolean,"matching_rows":{"type":"integer","minimum":1,"maximum":50000},
+        "first_observed_at":timestamp,"last_observed_at":timestamp,
+        "samples":{"type":"array","maxItems":MAX_SAMPLES_PER_ORIGIN,"items":sample},
+        "omitted_samples":count
+    }));
+    let reasons: Vec<_> = ACQUISITION_REASONS
+        .iter()
+        .chain(PARTIAL_REASONS)
+        .copied()
+        .collect();
+    let mut schema = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":token,
+        "available":boolean,"status":{"type":"string","enum":["matched","no_matches","unavailable"]},
+        "complete":boolean,"reasons":{"type":"array","maxItems":PARTIAL_REASONS.len(),"items":{"type":"string","enum":reasons}},
+        "in_scope_only":boolean,"coverage":{"type":"string","enum":["retained_direct_socket_peer_equality"]},
+        "peer":{"anyOf":[{"type":"null"},peer]},
+        "source":{"anyOf":[{"type":"null"},source]},
+        "snapshot":{"anyOf":[{"type":"null"},snapshot]},
+        "counts":counts,"origins":{"type":"array","maxItems":MAX_ORIGIN_GROUPS,"items":group},
+        "limits":service_map_object(json!({
+            "max_records":{"type":"integer","minimum":1,"maximum":50000},
+            "origin_groups":{"type":"integer","enum":[MAX_ORIGIN_GROUPS]},
+            "samples_per_origin":{"type":"integer","enum":[MAX_SAMPLES_PER_ORIGIN]},
+            "projection_bytes":{"type":"integer","enum":[MAX_PROJECTION_BYTES]},
+            "host_bytes":{"type":"integer","enum":[MAX_HOST_BYTES]},
+            "scheme_bytes":{"type":"integer","enum":[MAX_SCHEME_BYTES]},
+            "scope_pattern_entries":{"type":"integer","enum":[MAX_SCOPE_PATTERN_ENTRIES]},
+            "scope_pattern_bytes":{"type":"integer","enum":[MAX_SCOPE_PATTERN_BYTES]},
+            "scope_work_units":{"type":"integer","enum":[MAX_SCOPE_WORK_UNITS]}
+        }))
+    }));
+    schema["oneOf"] = json!([
+        {"properties":{
+            "available":{"enum":[true]},"status":{"enum":["matched","no_matches"]},
+            "peer":{"type":"object"},"source":{"type":"object"},"snapshot":{"type":"object","properties":{
+                "oldest_considered_sequence":{"type":"string"},"latest_considered_sequence":{"type":"string"}
+            }},"reasons":{"items":{"enum":PARTIAL_REASONS}}
+        },"allOf":[
+            {"oneOf":[
+                {"properties":{"complete":{"enum":[true]},"reasons":{"enum":[[]]}}},
+                {"properties":{"complete":{"enum":[false]},"reasons":{"minItems":1}}}
+            ]},
+            {"oneOf":[
+                {"properties":{"status":{"enum":["matched"]},"counts":{"properties":{"matching_rows":{"minimum":1}}}}},
+                {"properties":{"status":{"enum":["no_matches"]},"origins":{"enum":[[]]},"counts":{"properties":{
+                    "matching_rows":{"enum":[0]},"returned_matching_rows":{"enum":[0]},"omitted_matching_rows":{"enum":[0]},
+                    "sample_rows":{"enum":[0]},"omitted_sample_rows":{"enum":[0]}
+                }}}}
+            ]}
+        ]},
+        {"properties":{
+            "available":{"enum":[false]},"status":{"enum":["unavailable"]},"complete":{"enum":[false]},
+            "reasons":{"minItems":1,"maxItems":1,"items":{"enum":ACQUISITION_REASONS}},
+            "peer":{"type":"null"},"source":{"type":"null"},"snapshot":{"type":"null"},
+            "counts":zero_counts,"origins":{"enum":[[]]}
+        }}
+    ]);
+    schema["description"] = json!("Explicit exact-source passive comparison. All nullable fields must be present. Runtime additionally validates session/token/generation/uint64 bindings, canonical IP/UUID/origin strings, sorted unique reasons/origins, descending unique sample sequences, window/counter partition, and honest cap/omission relationships. Counts classify considered rows excluding the source; duplicate transaction UUIDs are distinct rows. Samples bind to a containing group's time range; actual captured-origin membership is verified only by a later explicit exact-evidence read. Unavailable responses expose no peer/source/snapshot/groups. Partial coverage never means there are no other matches. Recorded observation times do not describe occupancy or connection duration. Scope preparation and matching are bounded by the fixed scope limits; scope_work_limit discards the whole inspection with no partial counts or source data. The encoded response is at most 262144 bytes.");
+    schema
+}
+
+fn service_map_output_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "target.service_map.get"
+            | "target.service_map.evidence.get"
+            | "target.service_map.body_references.get"
+            | "target.service_map.html_generators.get"
+            | "target.service_map.link_declarations.get"
+            | "target.service_map.socket_peer_matches.get"
+            | "target.service_map.parameters.get"
+            | "target.service_map.openapi.get"
+            | "target.service_map.unnamed.get"
+    ) {
+        return None;
+    }
+    if operation == "target.service_map.unnamed.get" {
+        return Some(service_map_unnamed_output_schema());
+    }
+    if operation == "target.service_map.parameters.get" {
+        return Some(service_map_parameters_output_schema());
+    }
+    if operation == "target.service_map.openapi.get" {
+        return Some(service_map_openapi_output_schema());
+    }
+    if operation == "target.service_map.socket_peer_matches.get" {
+        return Some(service_map_socket_peer_matches_output_schema());
+    }
+    if operation == "target.service_map.link_declarations.get" {
+        return Some(service_map_link_declarations_output_schema());
+    }
+    if operation == "target.service_map.html_generators.get" {
+        return Some(service_map_html_generators_output_schema());
+    }
+    let string = json!({"type":"string"});
+    let strings = json!({"type":"array","items":string});
+    let count = json!({"type":"integer","minimum":0});
+    let timestamp = json!({"type":"string","format":"date-time"});
+    let uuid = json!({"type":"string","format":"uuid"});
+    let boolean = json!({"type":"boolean"});
+    let port = json!({"type":"integer","minimum":0,"maximum":65535});
+    let header_link = service_map_object(json!({
+        "source_origin":string,
+        "relationship":{"type":"string","enum":["origin_header","referer_header"]}
+    }));
+    if operation == "target.service_map.body_references.get" {
+        let reference = service_map_object(json!({
+            "target_origin":string,"occurrences":{"type":"integer","minimum":1,"maximum":4096},
+            "preview_byte_offsets":{"type":"array","minItems":1,"maxItems":5,"items":{"type":"integer","minimum":0,"maximum":262143}},
+            "omitted_offsets":{"type":"integer","minimum":0,"maximum":4091}
+        }));
+        let mut schema = service_map_object(json!({
+            "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":string,
+            "available":boolean,"status":{"type":"string","enum":["scanned","partial","unsupported","unavailable"]},
+            "complete":boolean,"reasons":strings,
+            "source_origin":string,"source_sequence":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+            "source_started_at":timestamp,"retained_preview_bytes":count,
+            "scanned_bytes":{"type":"integer","minimum":0,"maximum":262144},
+            "capture_preview_truncated":boolean,"scan_prefix_truncated":boolean,
+            "candidates_scanned":{"type":"integer","minimum":0,"maximum":4096},
+            "omitted_reference_occurrences":{"type":"integer","minimum":0,"maximum":4096},"references":{"type":"array","maxItems":100,"items":reference},
+            "limits":service_map_object(json!({
+                "scan_bytes":{"type":"integer","enum":[262144]},
+                "serialized_row_bytes":{"type":"integer","enum":[2097152]},
+                "origins":{"type":"integer","enum":[100]},
+                "candidates":{"type":"integer","enum":[4096]},
+                "candidate_bytes":{"type":"integer","enum":[4096]},
+                "offsets_per_origin":{"type":"integer","enum":[5]}
+            })),
+            "coverage":{"type":"string","enum":["literal_absolute_http_urls"]},
+            "offset_basis":{"type":"string","enum":["retained_utf8_preview"]}
+        }));
+        schema["required"].as_array_mut().unwrap().retain(|name| {
+            ![
+                "source_origin",
+                "source_sequence",
+                "source_started_at",
+                "retained_preview_bytes",
+            ]
+            .contains(&name.as_str().unwrap())
+        });
+        schema["oneOf"] = json!([
+            {"required":["source_origin","source_sequence","source_started_at","retained_preview_bytes"],"properties":{"available":{"enum":[true]},"status":{"enum":["scanned"]},"complete":{"enum":[true]},"reasons":{"enum":[[]]},"capture_preview_truncated":{"enum":[false]},"scan_prefix_truncated":{"enum":[false]}}},
+            {"required":["source_origin","source_sequence","source_started_at","retained_preview_bytes"],"properties":{"available":{"enum":[true]},"status":{"enum":["partial"]},"complete":{"enum":[false]},"reasons":{"minItems":1}}},
+            {"properties":{"available":{"enum":[false]},"status":{"enum":["unsupported","unavailable"]},"complete":{"enum":[false]},"reasons":{"minItems":1},"references":{"enum":[[]]},"scanned_bytes":{"enum":[0]},"candidates_scanned":{"enum":[0]},"omitted_reference_occurrences":{"enum":[0]}}}
+        ]);
+        return Some(schema);
+    }
+    if operation == "target.service_map.evidence.get" {
+        let mut row = service_map_object(json!({
+            "evidence_id":string,"record_id":uuid,
+            "sequence":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+            "started_at":timestamp,"method":string,"origin":string,"host":string,
+            "scheme":{"type":"string","enum":["http","https"]},"port":port,"path":string,
+            "status":{"type":["integer","null"],"minimum":0,"maximum":65535},
+            "content_type":{"type":["string","null"]},"is_websocket":boolean,
+            "technology_clues":{"type":"array","items":service_map_object(json!({"name":string,"header_name":string}))},
+            "redirect":{"anyOf":[{"type":"null"},service_map_object(json!({"target_origin":string,"target_path":string}))]},
+            "header_links":{"type":"array","items":header_link},
+            "metadata_complete":boolean,"omitted":strings
+        }));
+        row["properties"]["technology_observations"] = json!({
+            "type":"array","maxItems":8,"items":service_map_technology_schema(true, CatalogVersion::V2)
+        });
+        let mut schema = service_map_object(json!({
+            "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"evidence_id":string,
+            "available":boolean,"reason":{"type":["string","null"]},
+            "source":{"type":"string","enum":["captured_http_metadata"]},
+            "row":{"anyOf":[{"type":"null"},row]}
+        }));
+        let observation = service_map_object(json!({
+            "source":{"type":"string","enum":["http_response_remote_addr"]},
+            "observed_at":timestamp,
+            "route":{"type":"string","enum":["direct","http_proxy","socks_proxy","unknown"]},
+            "address":{"anyOf":[{"type":"null"},service_map_object(json!({
+                "ip":{"anyOf":[{"type":"string","format":"ipv4"},{"type":"string","format":"ipv6"}]},"port":port
+            }))]},
+            "reason":{"type":["string","null"],"enum":[null,"remote_addr_unavailable"]}
+        }));
+        let mut peer = service_map_object(json!({
+            "status":{"type":"string","enum":["observed","not_recorded","unavailable"]},
+            "observation":{"anyOf":[{"type":"null"},observation]}
+        }));
+        peer["oneOf"] = json!([
+            {"properties":{"status":{"enum":["observed"]},"observation":{"type":"object","properties":{"address":{"type":"object"},"reason":{"type":"null"}}}}},
+            {"properties":{"status":{"enum":["not_recorded"]},"observation":{"type":"null"}}},
+            {"properties":{"status":{"enum":["unavailable"]},"observation":{"type":"object","properties":{"address":{"type":"null"},"reason":{"enum":["remote_addr_unavailable"]}}}}}
+        ]);
+        peer["description"] = json!("Present only after explicit include_socket_peer and successful exact-row validation. One bounded retained observation, never origin ownership or an aggregate peer map.");
+        schema["properties"]["socket_peer"] = peer;
+        schema["oneOf"] = json!([
+            {"properties":{"available":{"enum":[true]},"reason":{"type":"null"},"row":{"type":"object"}}},
+            {"properties":{"available":{"enum":[false]},"reason":{"type":"string"},"row":{"type":"null"},"socket_peer":{"enum":[]}}}
+        ]);
+        return Some(service_map_catalog_output_schema(schema, true));
+    }
+    let mut endpoint = service_map_object(json!({
+        "method":string,"path":string,"path_group":{"type":["string","null"]},
+        "request_count":count,"statuses":{"type":"array","items":port},
+        "content_types":strings,"evidence":strings
+    }));
+    // Optional: older servers, and endpoints whose rows named no method, omit it.
+    endpoint["properties"]["auth"] = json!({
+        "type":"array","maxItems":15,"items":{"type":"string","enum":sniper::service_map_auth::KINDS},
+        "description":"How this endpoint's rows authenticated, in the order of the kinds list."
+    });
+    let mut links = header_link;
+    links["properties"]["source"] = json!({"type":"string","enum":["request_header_declaration"]});
+    links["properties"]["evidence"] = strings.clone();
+    links["required"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("source"), json!("evidence")]);
+    // Optional: older servers send neither count.
+    let request_count = json!({"type":"integer","minimum":1,"maximum":50000});
+    links["properties"]["request_count"] = request_count.clone();
+    links["properties"]["request_kinds"] = json!({
+        "type":"object","additionalProperties":false,
+        "properties":sniper::service_map::REQUEST_KINDS
+            .iter()
+            .map(|kind| (kind.to_string(), request_count.clone()))
+            .collect::<serde_json::Map<_, _>>(),
+        "description":"Rows carrying this declaration by request kind: Sec-Fetch-Dest when the client sent it, else the response type, then an Origin header or a non-GET method."
+    });
+    let mut cors = request_count.clone();
+    cors["description"] = json!("Rows whose response let the source origin read it: a single Access-Control-Allow-Origin naming it or *. Absent when none.");
+    links["properties"]["cors_allowed_count"] = cors;
+    let mut credentials = request_count.clone();
+    credentials["description"] = json!("Of those rows, how many named the source origin and sent Access-Control-Allow-Credentials: true. Absent when none.");
+    links["properties"]["cors_credentials_count"] = credentials;
+    let mut redirect = service_map_object(json!({
+        "target_origin":string,"target_path":string,
+        "relationship":{"type":"string","enum":["redirect_instruction"]},
+        "source":{"type":"string","enum":["response_location_header"]},"evidence":strings
+    }));
+    redirect["properties"]["request_count"] = request_count;
+    let mut origin = service_map_object(json!({
+        "origin":string,"host":string,"scheme":{"type":"string","enum":["http","https"]},
+        "port":port,"in_scope":boolean,"request_count":count,"first_seen":timestamp,"last_seen":timestamp,
+        "endpoints":{"type":"array","items":endpoint},
+        "technology_clues":{"type":"array","items":service_map_object(json!({
+            "name":string,"source":{"type":"string","enum":["response_header"]},"header_name":string,
+            "confidence":{"type":"string","enum":["observed_header"]},"evidence":strings
+        }))},
+        "redirects":{"type":"array","items":redirect},
+        "header_links":{"type":"array","items":links}
+    }));
+    origin["properties"]["technology_observations"] = json!({
+        "type":"array","maxItems":32,"items":service_map_technology_schema(false, CatalogVersion::V2)
+    });
+    // Optional: older servers, and origins nothing names, omit it.
+    let mut front = service_map_object(json!({
+        "product_id":{"type":"string","pattern":"^[a-z0-9_]{1,40}$"},
+        "name":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9 .!+_-]{0,39}$"},
+        "category":{"type":"string","enum":sniper::service_map_libraries::CATEGORIES},
+        "version":{"type":"string","pattern":"^[0-9][0-9A-Za-z.+-]{0,39}$"},
+        "source_origin":string,"row_count":count,"evidence":strings
+    }));
+    // A product named without a version omits it.
+    front["required"] = json!([
+        "product_id",
+        "name",
+        "category",
+        "source_origin",
+        "row_count",
+        "evidence"
+    ]);
+    let mut server = service_map_object(json!({
+        "product_id":{"type":"string","pattern":"^[a-z0-9_]{1,40}$"},
+        "name":{"type":"string","pattern":"^[A-Za-z.][A-Za-z0-9 .()!+_-]{0,39}$"},
+        "category":{"type":"string","enum":sniper::service_map_servers::CATEGORIES},
+        "version":{"type":"string","pattern":"^[0-9][0-9A-Za-z.+-]{0,39}$"},
+        "signals":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string","enum":sniper::service_map_servers::SIGNALS}},
+        "row_count":count,"evidence":strings
+    }));
+    server["required"] = json!([
+        "product_id",
+        "name",
+        "category",
+        "signals",
+        "row_count",
+        "evidence"
+    ]);
+    origin["properties"]["server_technologies"] = json!({
+        "type":"array","maxItems":32,
+        "description":"What the origin's own responses say about the servers behind it, outermost layer first (edge, gateway, platform, web_server, app_server, backend, language, database, os), and what they expose (category exposure: debug pages, stack traces, SQL errors, directory listings, API documents, a backend address in a BIG-IP cookie). Read from vendor header names, header values the technology catalog does not name, the names of cookies it sets, and error, default and debug page bodies. Never from another origin's rows.",
+        "items":server
+    });
+    let mut auth = service_map_object(json!({
+        "kind":{"type":"string","enum":sniper::service_map_auth::KINDS},
+        "name":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$"},
+        "row_count":count,"evidence":strings
+    }));
+    // A kind with no header, cookie, parameter or scheme name omits it.
+    auth["required"] = json!(["kind", "row_count", "evidence"]);
+    origin["properties"]["auth"] = json!({
+        "type":"array","maxItems":16,
+        "description":"How the origin's requests authenticate, busiest first: the Authorization scheme (bearer_jwt, bearer, basic, digest, negotiate, ntlm, aws_sigv4, or another scheme), an API key header, session or JWT cookies by name, a credential in the query string, and OAuth 2.0, OpenID Connect and SAML parameters. Read from names and shapes only; no credential value is kept or reported.",
+        "items":auth
+    });
+    let unnamed_signal = service_map_object(json!({
+        "value":{"type":"string","pattern":"^[\\x20-\\x7e]{1,80}$"},
+        "row_count":count,"evidence":strings
+    }));
+    let unnamed_list = |what: &str| json!({"type":"array","maxItems":16,"items":unnamed_signal.clone(),"description":what});
+    origin["properties"]["unnamed"] = json!({
+        "type":"object","additionalProperties":false,
+        "properties":{
+            "banners":unnamed_list("Server and X-Powered-By values no rule names, as `server: HeRay`."),
+            "headers":unnamed_list("Response header names no rule names and no server sends by default."),
+            "cookies":unnamed_list("Names of cookies the origin set that no rule names.")
+        },
+        "description":"What the origin's responses carried that no rule names, busiest first and at most 16 of each, for the reader to judge: a banner, a header name, a cookie name. Only the Server and X-Powered-By values are kept, never another header's value; each entry's evidence opens a row that carried it. Absent when everything was named, and on older servers."
+    });
+    origin["properties"]["favicon"] = json!({
+        "type":"string","pattern":"^v1\\.",
+        "description":"Evidence of the origin's newest retained icon: a GET answered 200 with a raster image at a favicon or apple-touch-icon path, kept whole. The GUI's card shows it. Found before the display filter; never fetched from the target. Absent when none was captured."
+    });
+    origin["properties"]["front_technologies"] = json!({
+        "type":"array","maxItems":32,
+        "description":"Front-end frameworks, CMSs, UI kits, libraries and analytics retained scripts, pages and asset URLs name: license banners, runtime values such as Next.js's window.next, page markup such as ng-version or data-v- attributes, <meta name=generator>, CDN package@version paths, versioned file names and build directories such as /_next/static/. An asset's goes to the page that loaded it when that page is in the map.",
+        "items":front
+    });
+    let entry_kinds = sniper::service_map::REQUEST_KINDS
+        .iter()
+        .map(|kind| (kind.to_string(), json!({"type":"integer","minimum":1})))
+        .collect::<serde_json::Map<_, _>>();
+    let mut client_origin = service_map_object(json!({
+        "origin":string,"request_count":count,
+        "entry_kinds":{"type":"object","additionalProperties":false,"properties":entry_kinds,
+            "description":"Rows the client sent to this origin itself, with no Origin or Referer (a typed address, a bookmark, an app's call), by request kind. Absent when a page started every row."}
+    }));
+    client_origin["required"] = json!(["origin", "request_count"]);
+    let mut client = service_map_object(json!({
+        "kind":{"type":"string","enum":sniper::service_map_clients::KINDS},
+        "name":{"type":"string","enum":sniper::service_map_clients::names()},
+        "versions":{"type":"array","maxItems":8,"items":{"type":"integer","minimum":0},"description":"Major versions its rows named, newest first; one client however many versions it updated through."},
+        "os":{"type":"string","enum":sniper::service_map_clients::SYSTEMS},
+        "request_count":count,
+        "addresses":{"type":"array","maxItems":8,"items":{"type":"string","pattern":"^[0-9A-Fa-f:.]{2,45}$"},"description":"IP addresses the client connected to the proxy from (this machine, a phone on the network). Absent when none was kept, and on older servers."},
+        "origins":{"type":"array","maxItems":64,"items":client_origin},
+        "evidence":strings
+    }));
+    client["required"] = json!(["kind", "name", "request_count", "origins", "evidence"]);
+    let mut map = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},"session_id":uuid,"snapshot":service_map_snapshot_schema(),
+        "in_scope_only":boolean,"origin_filter":{"type":["string","null"]},
+        "origins":{"type":"array","items":origin},
+        "clients":{"type":"array","maxItems":16,"items":client,
+            "description":"Clients named by each row's User-Agent and, for Chromium browsers, Client Hints: browsers, app WebViews, app HTTP stacks, tools, libraries and crawlers, busiest first. Only these fixed names are reported, never the header. Absent when there are none, and on older servers."},
+        "unavailable":strings,"deferred":strings,"warnings":strings
+    }));
+    map["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|name| name != "clients");
+    Some(service_map_catalog_output_schema(map, false))
+}
+
+fn service_map_input_schema(operation: &str) -> Option<Value> {
+    let uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+    let evidence_pattern =
+        format!("^v1\\.{uuid}\\.{uuid}\\.(0|[1-9][0-9]{{0,19}})\\.{uuid}\\.{uuid}$");
+    let catalog = json!({"type":"integer","enum":[1,2],"default":2,"description":"Request this technology catalog using an API-only header. One target GET, without retries or fallback requests. An unmarked legacy response is strictly v1 and reports reduced coverage on stderr."});
+    match operation {
+        "target.service_map.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":[],
+            "properties":{
+                "technology_catalog_version":catalog,
+                "session_id":legacy_uuid_input_schema(true, "Read this retained session without switching it. Omitted or null pins the active session once."),
+                "origin":{"type":["string","null"],"description":"Exact canonical HTTP(S) origin (for example https://example.com), without path, credentials, query, fragment, or explicit default port. Omitted or null selects all observed origins."},
+                "in_scope_only":{"type":["boolean","null"],"default":false,"description":"Filter retained rows using the session's current shared scope matcher. Null uses false."},
+                "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Bound the retained metadata rows considered. Null uses the default; inspect snapshot.complete and stopped_by."},
+                "all_rows":{"type":["boolean","null"],"default":false,"description":"Read every retained row, as the desktop map does, instead of the newest max_records rows; omit max_records with it. The server may answer from its last map of an unchanged or recent history. Null uses false."},
+                "mime_types":{"type":["array","null"],"items":{"type":"string","enum":SERVICE_MAP_MIME_TYPES},"description":"Display filter: keep only rows in these MIME groups, as HTTP history does. Omitted, null or empty keeps every group; snapshot.filtered_rows counts hidden rows."},
+                "status_classes":{"type":["array","null"],"items":{"type":"string","enum":SERVICE_MAP_STATUS_CLASSES},"description":"Display filter: keep only rows in these status classes. Omitted, null or empty keeps every class."},
+                "hidden_extensions":{"type":["array","null"],"items":{"type":"string","pattern":"^\\.?[A-Za-z0-9]{1,16}$"},"description":"Display filter: hide rows whose path ends in these extensions, such as png or woff2. Omitted, null or empty hides none."},
+                "hide_without_responses":{"type":["boolean","null"],"default":false,"description":"Display filter: hide rows that have no response. Null uses false."},
+                "only_parameterized":{"type":["boolean","null"],"default":false,"description":"Display filter: keep only rows whose URL has a query string. Null uses false."}
+            }
+        })),
+        "target.service_map.socket_peer_matches.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. This read never loads or activates an inactive session."),
+                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged exact source-row token from Service Map. Never an IP, hostname, URL or transaction UUID."},
+                "in_scope_only":{"type":"boolean","default":false,"description":"Filter with the existing shared scope matcher on captured host spelling. Omission selects false; null is invalid."},
+                "max_records":{"type":"integer","minimum":1,"maximum":50000,"default":10000,"description":"Latest retained rows considered, including the source when in-window. Counts of matches exclude the source. Omission selects 10000; null is invalid."}
+            }
+        })),
+        "target.service_map.body_references.get"
+        | "target.service_map.html_generators.get"
+        | "target.service_map.link_declarations.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
+                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete unchanged v1 evidence token for one retained row. Explicit one-row retained inspection only; no batch reads or target requests."}
+            }
+        })),
+        "target.service_map.parameters.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","origin","method","path"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. Inactive sessions return unavailable; this read never loads or activates a session."),
+                "origin":{"type":"string","description":"Exact canonical HTTP(S) origin of the endpoint, as a map card names it."},
+                "method":{"type":"string","minLength":1,"maxLength":64,"not":{"pattern":"[^A-Za-z0-9!#$%&'*+.^_`|~-]"},"description":"The endpoint's exact HTTP method token, preserving case and punctuation."},
+                "path":{"type":"string","pattern":"^/[^?#]{0,4095}$","description":"The endpoint's exact path, without query or fragment."}
+            }
+        })),
+        "target.service_map.unnamed.get" => Some(json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Session UUID; the active session when omitted."),
+                "kind":{"type":"string","enum":["banners","headers","cookies"],"description":"Keep only one kind of signal."},
+                "limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Signals returned, most widespread first."}
+            }
+        })),
+        "target.service_map.openapi.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","origin"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(false, "Explicit current active session UUID. An inactive session is refused; this read never loads or activates a session."),
+                "origin":{"type":"string","description":"Exact canonical HTTP(S) origin to describe, as a map card names it."}
+            }
+        })),
+        "target.service_map.evidence.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
+            "properties":{
+                "technology_catalog_version":catalog,
+                "include_socket_peer":{"type":"boolean","default":false,"description":"Explicitly read one retained observed socket peer after exact-token validation. Does not enable capture, probe, aggregate peers or infer origin ownership. Omission preserves the default evidence shape."},
+                "session_id":legacy_uuid_input_schema(false, "Exact session UUID returned by the service map. Always explicit, including for inactive sessions."),
+                "evidence_id":{"type":"string","minLength":1,"maxLength":200,"pattern":evidence_pattern,"description":"Complete v1 evidence token returned by the map, with canonical UUID components and an unsigned 64-bit sequence. At most 200 UTF-8 bytes; pass unchanged, not a transaction UUID."}
+            }
+        })),
+        _ => None,
+    }
+}
+
+fn service_map_path(args: &ServiceMapArgs, session_id: Option<Uuid>) -> String {
+    let mut params = vec![
+        ("in_scope_only".into(), args.in_scope_only.to_string()),
+        if args.all_rows {
+            ("all_rows".into(), "true".into())
+        } else {
+            ("max_records".into(), args.max_records.to_string())
+        },
+    ];
+    if let Some(origin) = &args.origin {
+        params.push(("origin".into(), origin.clone()));
+    }
+    let filter = &args.filter;
+    for (name, values) in [
+        ("mime_types", &filter.mime_types),
+        ("status_classes", &filter.status_classes),
+        ("hidden_extensions", &filter.hidden_extensions),
+    ] {
+        if !values.is_empty() {
+            params.push((name.into(), values.join(",")));
+        }
+    }
+    for (name, enabled) in [
+        ("hide_without_responses", filter.hide_without_responses),
+        ("only_parameterized", filter.only_parameterized),
+    ] {
+        if enabled {
+            params.push((name.into(), "true".into()));
+        }
+    }
+    let query = encode_query(params);
+    session_query_path(&format!("/api/target/service-map?{query}"), session_id)
+}
+
+fn service_map_evidence_path(args: &ServiceMapEvidenceArgs) -> String {
+    let mut params = vec![("evidence_id".into(), args.evidence_id.clone())];
+    if args.include_socket_peer {
+        params.push(("include_socket_peer".into(), "true".into()));
+    }
+    let query = encode_query(params);
+    session_query_path(
+        &format!("/api/target/service-map/evidence?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_body_references_path(args: &ServiceMapBodyReferencesArgs) -> String {
+    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/body-references?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_parameters_path(args: &ServiceMapParametersArgs) -> String {
+    let query = encode_query(vec![
+        ("origin".into(), args.origin.clone()),
+        ("method".into(), args.method.clone()),
+        ("path".into(), args.path.clone()),
+    ]);
+    session_query_path(
+        &format!("/api/target/service-map/parameters?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_openapi_path(args: &ServiceMapOpenApiArgs) -> String {
+    let query = encode_query(vec![("origin".into(), args.origin.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/openapi?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_html_generators_path(args: &ServiceMapHtmlGeneratorsArgs) -> String {
+    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/html-generators?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_link_declarations_path(args: &ServiceMapLinkDeclarationsArgs) -> String {
+    let query = encode_query(vec![("evidence_id".into(), args.evidence_id.clone())]);
+    session_query_path(
+        &format!("/api/target/service-map/link-declarations?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_socket_peer_matches_path(args: &ServiceMapSocketPeerMatchesArgs) -> String {
+    let query = encode_query(vec![
+        ("evidence_id".into(), args.evidence_id.clone()),
+        ("in_scope_only".into(), args.in_scope_only.to_string()),
+        ("max_records".into(), args.max_records.to_string()),
+    ]);
+    session_query_path(
+        &format!("/api/target/service-map/socket-peer-matches?{query}"),
+        Some(args.session_id),
+    )
+}
+
+fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
+    vec![
+        op(
+            "target.service_map.get",
+            "scope service-map [--technology-catalog-version <1|2>]",
+            "Read a bounded passive inventory from retained captured metadata. No requests to mapped services, scans, replay, or crawling. Counts include duplicate-ID rows; inspect completeness and unavailable fields. Catalog 2 is requested by default; explicit 1 limits coverage. Legacy servers return strict v1 with a stderr warning; negotiation never adds requests or retries.",
+            CliSideEffect::Read,
+            false,
+            &[],
+            vec![json!({}), json!({"session_id":"00000000-0000-0000-0000-000000000000","in_scope_only":true,"max_records":10000,"technology_catalog_version":2}), json!({"all_rows":true}), json!({"technology_catalog_version":1})],
+        ),
+        op(
+            "target.service_map.body_references.get",
+            "scope service-map body-references --session-id <uuid> --evidence-id <token>",
+            "Explicitly read literal absolute HTTP(S) URL references from one retained UTF-8 HTML/JavaScript response preview. Active session only; inactive sessions return unavailable without loading or activation. Returns origins and preview-byte offsets, never body text or URL paths, queries, or credentials. No target requests or automatic/batch reads; references do not prove calls or ownership. Inspect status, completeness, truncation, reasons, and limits.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "target.service_map.parameters.get",
+            "scope service-map parameters --session-id <uuid> --origin <origin> --method <method> --path <path>",
+            "List the parameters one endpoint was called with, from its newest 200 retained rows: query string pairs and form, top-level JSON or multipart body fields, each with where it was sent, the rows that carried it and up to three values as captured, cut to 80 characters. Active session only; inactive sessions return unavailable without loading or activation. Reads retained request bodies from their first 64 KiB, at most 32 MiB per read; no target requests or automatic reads.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "origin", "method", "path"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com","method":"GET","path":"/search"})],
+        ),
+        op(
+            "target.service_map.unnamed.get",
+            "scope service-map unnamed [--session-id <uuid>] [--kind banners|headers|cookies] [--limit <n>]",
+            "List what no rule names across the session's whole map: Server and X-Powered-By banners, response header names and Set-Cookie names, each with how many origins and rows carried it, up to five of those origins and three evidence tokens. Most widespread first. Reads the same whole-history map as `scope service-map --all-rows`; no target requests. Judge a signal by opening its evidence, then record a conclusion with `capture http annotate`.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "kind", "limit"],
+            vec![json!({}), json!({"kind":"headers","limit":50})],
+        ),
+        op(
+            "target.service_map.openapi.get",
+            "scope service-map openapi --session-id <uuid> --origin <origin>",
+            "Describe one origin's API as an OpenAPI 3.1 document built from all its retained rows: each method and path template with ID segments as {number}, {uuid}, {hex} or mixed {id}, query and body field names with native JSON types preserved and text types guessed from their values, response statuses and media types, and the credentials the rows showed as security schemes. No captured value is included; operations that only served pages or static files are left out, and at most 500 are listed. Active session only; an inactive session is refused without loading or activation. No target requests or automatic reads.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "origin"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com"})],
+        ),
+        op(
+            "target.service_map.html_generators.get",
+            "scope service-map html-generators --session-id <uuid> --evidence-id <token>",
+            "Explicitly inspect one retained UTF-8 text/html response preview for literal WordPress or Drupal meta generator declarations. Active session only; no loading or activation. Fixed generator catalog 1, independent of response-header catalogs and URL references. One inspection GET after existing identity checks, with no target requests, automatic/batch reads, retries, or fallback. Returns safe products, numeric versions, bounded counters and original preview byte spans, never raw content. Inspect completeness, head closure, truncation and parser stop; partial/unsupported never means no generator found. Declarations do not prove installed software or ownership.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "target.service_map.link_declarations.get",
+            "scope service-map link-declarations --session-id <uuid> --evidence-id <token>",
+            "Explicitly inspect bounded retained response Link headers for one exact active-session GET or HEAD status 200 row. Fixed relation catalog 1 recognizes service-doc, service-desc, describedby, and preconnect, independently of technology catalogs and body inspectors. One inspection GET after identity checks; no bodies, inactive loading, target requests, automatic/batch reads, retries, redirects, or fallback. Returns origin-only literal declarations and original retained-header UTF-8 spans. Partial/unsupported never means no declarations exist; completeness is within the fixed grammar only. Declarations do not prove calls, ownership, or connections.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "target.service_map.socket_peer_matches.get",
+            "scope service-map socket-peer-matches --session-id <uuid> --evidence-id <token> [--in-scope-only] [--max-records <1..50000>]",
+            "Explicitly compare equal recorded direct-route socket source/address-family/IP/port observations for one exact active-session source row. Bounded latest retained window; row counts include duplicate transaction UUIDs and exclude the source. One feature GET after existing identity checks; no target traffic, capture changes, discovery, body/header reads, inactive loading, retries, redirects, or fallback. Inspect source.in_window, recorded times, limits, partial reasons, origin-group and sample omissions. Equal recorded values do not establish physical endpoint identity, deployment, ownership, or origin IP. Default map/evidence output is unchanged.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","in_scope_only":false,"max_records":10000})],
+        ),
+        op(
+            "target.service_map.evidence.get",
+            "scope service-map-evidence --session-id <uuid> --evidence-id <token> [--include-socket-peer] [--technology-catalog-version <1|2>]",
+            "Read safe metadata for an exact retained row using its session-bound opaque evidence token. Stale, edited, deleted, or ambiguous evidence is explicitly unavailable; never falls back to UUID-only history lookup. Explicit include_socket_peer adds one retained observation without enabling capture or probing; socket peers do not prove origin ownership. Catalog 2 is requested by default; explicit 1 limits coverage. An unmarked legacy response is strictly v1 with a stderr warning; no negotiation retries or fallback requests.",
+            CliSideEffect::Read,
+            false,
+            &["session_id", "evidence_id"],
+            vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","technology_catalog_version":2}), json!({"session_id":"00000000-0000-0000-0000-000000000000","evidence_id":"v1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000.1.00000000-0000-0000-0000-000000000000.00000000-0000-0000-0000-000000000000","include_socket_peer":true,"technology_catalog_version":1})],
+        ),
+    ]
 }
 
 fn scanner_manifest_operations() -> Vec<CliOperationSpec> {
@@ -2919,6 +5067,21 @@ fn saved_manifest_operations() -> Vec<CliOperationSpec> {
     }).collect()
 }
 
+fn intercept_rule_update_output_schema(operation: &str) -> Option<Value> {
+    matches!(operation, "capture.intercept_rule.update" | "capture.intercept_rule.set_enabled").then(|| json!({
+        "type":"object", "additionalProperties":false,
+        "required":["id","session_id","enabled","scope","host_pattern","path_pattern","method_filter"],
+        "properties":{
+            "id":{"type":"string","format":"uuid"},
+            "session_id":{"type":"string","format":"uuid"},
+            "enabled":{"type":"boolean"},
+            "scope":{"type":"string","enum":["request","response","both"]},
+            "host_pattern":{"type":"string"}, "path_pattern":{"type":"string"},
+            "method_filter":{"type":"array","items":{"type":"string"}}
+        }
+    }))
+}
+
 fn op(
     operation: &'static str,
     command: &'static str,
@@ -2935,9 +5098,19 @@ fn op(
         side_effect,
         requires_confirmation: requires_confirmation || side_effect == CliSideEffect::Write,
         input_schema: input_schema(operation, required_fields),
-        output_schema: replay_saved_tab_output_schema(operation)
+        output_schema: intercept_rule_update_output_schema(operation)
+            .or_else(|| replay_saved_tab_output_schema(operation))
+            .or_else(|| service_map_output_schema(operation))
             .or_else(|| scanner_output_schema(operation))
+            .or_else(|| upstream_peer_output_schema(operation))
+            .or_else(|| history_retention_output_schema(operation))
+            .or_else(|| session_list_output_schema(operation))
             .or_else(|| session_read_output_schema(operation))
+            .or_else(|| skills_status_output_schema(operation))
+            .or_else(|| skills_managed_output_schema(operation))
+            .or_else(|| skills_auto_update_output_schema(operation))
+            .or_else(|| examples_output_schema(operation))
+            .or_else(|| history_list_output_schema(operation))
             .unwrap_or_else(|| {
                 json!({
                     "type": "object",
@@ -2949,8 +5122,63 @@ fn op(
     }
 }
 
+fn examples_output_schema(operation: &str) -> Option<Value> {
+    if operation != "examples" {
+        return None;
+    }
+    let specific = json!({
+        "type":"object", "additionalProperties":false,
+        "required":["operation","examples"],
+        "properties":{
+            "operation":{"type":"string"},
+            "examples":{"type":"array","items":{}}
+        }
+    });
+    let mut catalog_item = specific.clone();
+    catalog_item["properties"]["command"] = json!({"type":"string"});
+    catalog_item["required"]
+        .as_array_mut()?
+        .push(json!("command"));
+    Some(json!({
+        "description":"Example inputs returned in the envelope data field: a catalog array when operation is omitted or null, or an object for one operation.",
+        "oneOf":[
+            {"type":"array","items":catalog_item},
+            specific
+        ]
+    }))
+}
+
+fn history_list_output_schema(operation: &str) -> Option<Value> {
+    if operation != "capture.http.list" {
+        return None;
+    }
+    let mut item = sniper::saved_contract::transaction_summary_schema();
+    item["properties"]["label"] = json!({"type":"string"});
+    item["required"].as_array_mut()?.push(json!("label"));
+    let items = json!({"type":"array","items":item});
+    let count = json!({"type":["integer","null"],"minimum":0});
+    Some(json!({
+        "description":"Labeled transaction summaries returned in the envelope data field. Only page=true includes pagination metadata; sorting, offset and cursor options alone still return an array. Unavailable page metadata is null.",
+        "oneOf":[
+            items,
+            {
+                "type":"object", "additionalProperties":false,
+                "required":["items","total","filtered_total","hidden_connect_total","offset","limit","has_more"],
+                "properties":{
+                    "items":items,
+                    "total":count,"filtered_total":count,"hidden_connect_total":count,
+                    "offset":count,"limit":count,"has_more":{"type":["boolean","null"]}
+                }
+            }
+        ]
+    }))
+}
+
 fn replay_saved_tab_output_schema(operation: &str) -> Option<Value> {
-    if !matches!(operation, "replay.close" | "replay.duplicate") {
+    if !matches!(
+        operation,
+        "replay.close" | "replay.duplicate" | "replay.set_pinned"
+    ) {
         return None;
     }
     let mut schema = json!({
@@ -2964,8 +5192,10 @@ fn replay_saved_tab_output_schema(operation: &str) -> Option<Value> {
     });
     let fields: &[&str] = if operation == "replay.close" {
         &["closed_tab_id"]
-    } else {
+    } else if operation == "replay.duplicate" {
         &["source_tab_id", "new_tab_id"]
+    } else {
+        &["tab_id"]
     };
     for field in fields {
         schema["required"].as_array_mut()?.push(json!(field));
@@ -2973,8 +5203,22 @@ fn replay_saved_tab_output_schema(operation: &str) -> Option<Value> {
     }
     if operation == "replay.duplicate" {
         schema["properties"]["new_tab_id"]["format"] = json!("uuid");
+    } else if operation == "replay.set_pinned" {
+        schema["required"].as_array_mut()?.push(json!("pinned"));
+        schema["properties"]["pinned"] = json!({"type":"boolean"});
     }
     Some(schema)
+}
+
+fn session_list_output_schema(operation: &str) -> Option<Value> {
+    if operation != "session.list" {
+        return None;
+    }
+    Some(json!({
+        "type":"array",
+        "description":"Session summaries returned in the envelope data field.",
+        "items":sniper::saved_contract::session_summary_schema()
+    }))
 }
 
 fn session_read_output_schema(operation: &str) -> Option<Value> {
@@ -3034,15 +5278,379 @@ fn session_read_output_schema(operation: &str) -> Option<Value> {
     })
 }
 
+fn skills_status_output_schema(operation: &str) -> Option<Value> {
+    if operation != "skills.status" {
+        return None;
+    }
+    Some(json!({
+        "type":"object","additionalProperties":false,
+        "required":["scope","bundled_version","entries"],
+        "properties":{
+            "scope":{"type":"string","const":"cli_host"},
+            "bundled_version":{"type":"string","description":"Version of this CLI's bundled templates; installed version is unknown."},
+            "entries":{"type":"array","minItems":1,"maxItems":2,"items":{
+                "type":"object","additionalProperties":false,
+                "required":["agent","path","bundled_sha256","installed_sha256","status"],
+                "properties":{
+                    "agent":{"type":"string","enum":["codex","claude"]},
+                    "path":{"type":"string","description":"Absolute local SKILL.md path; no source text is returned."},
+                    "bundled_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                    "installed_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
+                    "status":{"type":"string","enum":["missing","current","modified_or_outdated","unreadable","unsupported"],"description":"Current means exact byte hash equality. A different hash cannot distinguish user edits from an older template."},
+                    "error_code":{"type":"string","enum":["symlink","reparse_point","non_regular_file","file_too_large","platform_unsupported","permission_denied","io_error","changed_during_read"]}
+                }
+            }}
+        }
+    }))
+}
+
+fn is_skill_auto_update_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "skills.auto_update_status"
+            | "skills.enable_auto_updates"
+            | "skills.disable_auto_updates"
+            | "skills.auto_update_once"
+    )
+}
+
+fn skills_auto_update_output_schema(operation: &str) -> Option<Value> {
+    if !is_skill_auto_update_operation(operation) {
+        return None;
+    }
+    Some(json!({
+        "type":"object", "additionalProperties":false,
+        "required":["agent","state","enabled","policy_id","revision","generation","path","operation_id","agent_reloaded"],
+        "properties":{
+            "agent":{"type":"string","enum":["codex","claude"]},
+            "state":{"type":"string","enum":["disabled","enabled","paused","current","updated"],"description":"Disabled includes absent consent. Paused requires inspection and fresh explicit re-authorization; enabled alone does not mean an attempt is eligible."},
+            "enabled":{"type":"boolean","description":"Stored consent; may remain true while state is paused. Inspect state and error_code before acting."},
+            "policy_id":{"type":["string","null"]},
+            "revision":{"type":["integer","null"],"minimum":0,"maximum":u64::MAX},
+            "generation":{"type":["string","null"],"description":"Authorization generation; changes on explicit re-enable."},
+            "path":{"type":["string","null"],"description":"The policy's stored absolute active SKILL.md path; never source text."},
+            "operation_id":{"type":["string","null"],"description":"Retained operation ID for the policy's update attempt; never replace it to bypass recovery."},
+            "agent_reloaded":{"type":"boolean","const":false},
+            "error_code":{"type":"string","description":"Stable bounded local refusal code. A durable pause reports policy_paused; inspect pause_reason for its retained cause."},
+            "pause_reason":{"type":["string","null"],"minLength":1,"maxLength":64,"pattern":"^[a-z_]+$","description":"Optional bounded stored cause of a durable pause; no source text. Pending attempts can be paused without a recorded cause."}
+        }
+    }))
+}
+
+fn skills_managed_output_schema(operation: &str) -> Option<Value> {
+    let string = json!({"type":"string"});
+    let hash = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    let mut entry = json!({
+        "type":"object", "additionalProperties":false,
+        "required":["agent","path","receipt_path"],
+        "properties":{
+            "agent":{"type":"string","enum":["codex","claude"]},
+            "path":{"type":"string","description":"Absolute active local SKILL.md path; source text is never returned."},
+            "receipt_path":{"type":"string"}
+        }
+    });
+    let (required, properties) = match operation {
+        "skills.update_preview" => (
+            json!([
+                "installed_sha256",
+                "bundled_sha256",
+                "bundled_version",
+                "enrolled_sha256",
+                "enrolled_version",
+                "state",
+                "stage_eligible"
+            ]),
+            json!({
+                "installed_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
+                "bundled_sha256":hash,
+                "bundled_version":string,
+                "enrolled_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
+                "enrolled_version":{"type":["string","null"],"description":"Recorded enrollment version, not inferred provenance."},
+                "state":{"type":"string","enum":["unmanaged","current","update_available","modified","missing","error"],"description":"Unmanaged files are never adopted by preview. Update availability requires enrolled bytes still matching the active file."},
+                "stage_eligible":{"type":"boolean"},
+                "error_code":{"type":"string","description":"Stable local inspection error code; no file contents."}
+            }),
+        ),
+        "skills.enroll" => (
+            json!([
+                "enrolled_sha256",
+                "enrolled_version",
+                "allows_automatic_updates"
+            ]),
+            json!({
+                "enrolled_sha256":hash,
+                "enrolled_version":string,
+                "allows_automatic_updates":{"type":"boolean","const":false}
+            }),
+        ),
+        "skills.stage_update" => (
+            json!([
+                "staging_dir",
+                "candidate_path",
+                "installed_sha256",
+                "bundled_sha256",
+                "bundled_version",
+                "activated"
+            ]),
+            json!({
+                "staging_dir":string,
+                "candidate_path":{"type":"string","description":"Staged candidate only; active SKILL.md remains unchanged."},
+                "installed_sha256":hash,
+                "bundled_sha256":hash,
+                "bundled_version":string,
+                "activated":{"type":"boolean","const":false}
+            }),
+        ),
+        "skills.apply_update" | "skills.update_result" | "skills.rollback_update" => (
+            json!([
+                "transaction_dir",
+                "operation_id",
+                "state",
+                "current_state",
+                "installed_sha256",
+                "allows_automatic_updates",
+                "agent_reloaded"
+            ]),
+            json!({
+                "transaction_dir":string,
+                "operation_id":skill_operation_id_schema(),
+                "state":{"type":"string","enum":["prepared","applied","rolled_back","recovery_required"],"description":"Recorded transaction state; inspect current_state separately. A recovered result does not itself resume a write."},
+                "current_state":{"type":"string","enum":["baseline","updated","changed","unavailable"],"description":"Current observation relative to the bound baseline and update; changed or unavailable requires inspection."},
+                "installed_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
+                "allows_automatic_updates":{"type":"boolean","const":false},
+                "agent_reloaded":{"type":"boolean","const":false},
+                "error_code":{"type":"string","description":"Stable bounded inspection or recovery code; never source text."}
+            }),
+        ),
+        _ => return None,
+    };
+    entry["required"]
+        .as_array_mut()?
+        .extend(required.as_array()?.iter().cloned());
+    entry["properties"].as_object_mut()?.extend(
+        properties
+            .as_object()?
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    if operation == "skills.update_preview" {
+        Some(json!({
+            "type":"object","additionalProperties":false,
+            "required":["scope","bundled_version","entries"],
+            "properties":{
+                "scope":{"type":"string","const":"cli_host"},
+                "bundled_version":string,
+                "entries":{"type":"array","minItems":1,"maxItems":2,"items":entry}
+            }
+        }))
+    } else {
+        Some(entry)
+    }
+}
+
+// A root override must never silently fall back to another agent's default root.
+fn skill_root_selection_schema(allow_all: bool) -> Value {
+    let constraints: Vec<Value> = [("codex", "codex_dir"), ("claude", "claude_dir")]
+        .into_iter()
+        .map(|(agent, root)| {
+            let mut choices = vec![
+                json!({"properties":{root:{"type":"null"}}}),
+                json!({"required":[agent],"properties":{agent:{"const":true}}}),
+            ];
+            if allow_all {
+                choices.push(json!({"required":["all"],"properties":{"all":{"const":true}}}));
+            }
+            json!({"anyOf":choices})
+        })
+        .collect();
+    json!(constraints)
+}
+
+fn skill_operation_id_schema() -> Value {
+    json!({"type":"string","minLength":36,"maxLength":36,"pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$","description":"Exact canonical lowercase hyphenated UUID. Save the original apply-update ID for result inspection and rollback; alternate spellings are rejected."})
+}
+
+// Legacy Uuid arguments accept spellings that strict JSON Schema uuid formats reject.
+fn legacy_uuid_input_schema(nullable: bool, context: &str) -> Value {
+    json!({
+        "type": if nullable { json!(["string", "null"]) } else { json!("string") },
+        "description": format!("UUID: hyphenated, 32 hexadecimal digits, braced hyphenated, or lowercase urn:uuid: prefix followed by a hyphenated UUID. Hexadecimal digits may use either case. {context}")
+    })
+}
+
 fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
-    if matches!(operation, "replay.close" | "replay.duplicate") {
+    if matches!(
+        operation,
+        "capture.intercept.get" | "capture.intercept.wait" | "capture.response_intercept.wait"
+    ) {
+        let mut schema = json!({"type":"object","additionalProperties":false,"required":required_fields,
+            "properties":{"session_id":legacy_uuid_input_schema(true, "Read this session without switching it; omitted or null selects the active session.")}});
+        if operation.ends_with(".get") {
+            schema["properties"]["id"] = legacy_uuid_input_schema(false, "Held request UUID.");
+        } else {
+            schema["properties"]["timeout"] = json!({"type":["integer","null"],"minimum":0,"maximum":u64::MAX,"default":30,"description":"Polling timeout in seconds; must fit the host's monotonic clock. Zero checks once. Omission or null uses 30."});
+            schema["properties"]["poll_interval"] = json!({"type":["integer","null"],"minimum":0,"maximum":u64::MAX,"default":200,"description":"Polling interval in milliseconds, clamped to at least 25 and the remaining polling budget. Omission or null uses 200."});
+        }
+        return schema;
+    }
+    if let Some(schema) = service_map_input_schema(operation) {
+        return schema;
+    }
+    if let Some(schema) = upstream_peer_input_schema(operation) {
+        return schema;
+    }
+    if let Some(schema) = history_retention_input_schema(operation) {
+        return schema;
+    }
+    if is_skill_auto_update_operation(operation) {
+        let mut schema = json!({
+            "type":"object", "additionalProperties":false, "required":[],
+            "properties":{
+                "codex":{"type":["boolean","null"],"default":false},
+                "claude":{"type":["boolean","null"],"default":false}
+            },
+            "oneOf":[
+                {"required":["codex"],"properties":{"codex":{"const":true},"claude":{"enum":[false,null]}}},
+                {"required":["claude"],"properties":{"claude":{"const":true},"codex":{"enum":[false,null]}}}
+            ]
+        });
+        if operation == "skills.enable_auto_updates" {
+            for (agent, root) in [("codex", "codex_dir"), ("claude", "claude_dir")] {
+                schema["properties"][root] = json!({"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":format!("Host-local {agent} skills root; requires its matching selector. Omission or null uses that agent's install default. Only enable may select a target; later commands use the recorded target.")});
+            }
+            schema["allOf"] = skill_root_selection_schema(false);
+            schema["properties"]["policy_revision"] = json!({"type":["integer","null"],"minimum":0,"maximum":u64::MAX,"description":"Expected current revision from auto-update-status. Required to re-enable an existing policy; omission or null does not authorize replacing existing consent."});
+        }
+        return schema;
+    }
+    if matches!(
+        operation,
+        "skills.install" | "skills.status" | "skills.update_preview"
+    ) {
         return json!({
+            "type":"object", "additionalProperties":false, "required":[],
+            "properties":{
+                "codex":{"type":["boolean","null"],"default":false},
+                "claude":{"type":["boolean","null"],"default":false},
+                "all":{"type":["boolean","null"],"default":false},
+                "codex_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Codex skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."},
+                "claude_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Claude skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."}
+            },
+            "allOf":skill_root_selection_schema(true),
+            "anyOf":[
+                {"required":["codex"],"properties":{"codex":{"const":true}}},
+                {"required":["claude"],"properties":{"claude":{"const":true}}},
+                {"required":["all"],"properties":{"all":{"const":true}}}
+            ]
+        });
+    }
+    if matches!(
+        operation,
+        "skills.enroll"
+            | "skills.stage_update"
+            | "skills.apply_update"
+            | "skills.update_result"
+            | "skills.rollback_update"
+    ) {
+        let mut schema = json!({
+            "type":"object", "additionalProperties":false, "required":[],
+            "properties":{
+                "codex":{"type":["boolean","null"],"default":false},
+                "claude":{"type":["boolean","null"],"default":false},
+                "codex_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Codex skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."},
+                "claude_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Claude skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."}
+            },
+            "allOf":skill_root_selection_schema(false),
+            "oneOf":[
+                {"required":["codex"],"properties":{"codex":{"const":true},"claude":{"enum":[false,null]}}},
+                {"required":["claude"],"properties":{"claude":{"const":true},"codex":{"enum":[false,null]}}}
+            ]
+        });
+        if operation == "skills.stage_update" {
+            schema["required"] = json!(["staging_dir"]);
+            schema["properties"]["staging_dir"] = json!({"type":"string","minLength":1,"pattern":"^[^\\u0000]*$","description":"Explicit new local staging directory, which must not exist. The active SKILL.md is never replaced."});
+        }
+        if operation == "skills.apply_update" {
+            schema["required"] = json!(["staging_dir"]);
+            schema["properties"]["staging_dir"] = json!({"type":"string","minLength":1,"pattern":"^[^\\u0000]*$","description":"Existing reviewed staging directory; candidate, staging receipt, enrollment baseline and running binary bundle must agree."});
+        }
+        if matches!(
+            operation,
+            "skills.apply_update" | "skills.update_result" | "skills.rollback_update"
+        ) {
+            schema["required"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("operation_id"));
+            schema["properties"]["operation_id"] = skill_operation_id_schema();
+        }
+        return schema;
+    }
+    if matches!(
+        operation,
+        "replay.close" | "replay.duplicate" | "replay.set_pinned"
+    ) {
+        let mut schema = json!({
             "type":"object", "additionalProperties":false, "required":["tab_id"],
             "properties":{
                 "tab_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"\\S","description":"Exact saved HTTP tab ID; nonblank, at most 128 UTF-8 bytes, never trimmed or treated as a label."},
-                "session_id":{"type":"string","format":"uuid","description":"Selected saved session, including inactive sessions. Omission pins the active session once."}
+                "session_id":legacy_uuid_input_schema(false, "Selected saved session, including inactive sessions. Omission pins the active session once.")
             }
         });
+        if operation == "replay.set_pinned" {
+            schema["required"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("pinned"));
+            schema["properties"]["pinned"] = json!({"type":"boolean"});
+        }
+        return schema;
+    }
+    if matches!(
+        operation,
+        "capture.intercept_rule.update" | "capture.intercept_rule.set_enabled"
+    ) {
+        let mut schema = json!({
+            "type":"object", "additionalProperties":false, "required":required_fields,
+            "properties":{
+                "id":legacy_uuid_input_schema(false, "Existing rule UUID; missing IDs never create a rule."),
+                "session_id":legacy_uuid_input_schema(false, "Select a saved session without switching it; omission pins the active session."),
+                "enabled":{"type":"boolean","description":"Desired enabled state, never a toggle."}
+            }
+        });
+        if operation == "capture.intercept_rule.update" {
+            for (key, value) in [
+                (
+                    "scope",
+                    json!({"type":"string","enum":["request","response","both"]}),
+                ),
+                (
+                    "host_pattern",
+                    json!({"type":"string","description":"Replacement host pattern. Empty string clears; omission preserves."}),
+                ),
+                (
+                    "path_pattern",
+                    json!({"type":"string","description":"Replacement path pattern. Empty string clears; omission preserves."}),
+                ),
+                (
+                    "method_filter",
+                    json!({"type":"array","items":{"type":"string"},"description":"Replacement method list. Empty array clears; omission preserves."}),
+                ),
+                (
+                    "clear_methods",
+                    json!({"type":"boolean","default":false,"description":"Clear the method list; conflicts with method_filter even when empty."}),
+                ),
+            ] {
+                schema["properties"][key] = value;
+            }
+            schema["anyOf"] = json!([
+                {"required":["scope"]}, {"required":["host_pattern"]}, {"required":["path_pattern"]},
+                {"required":["method_filter"]}, {"required":["enabled"]},
+                {"required":["clear_methods"],"properties":{"clear_methods":{"const":true}}}
+            ]);
+            schema["not"] = json!({"required":["method_filter","clear_methods"],"properties":{"clear_methods":{"const":true}}});
+        }
+        return schema;
     }
     if let Some(schema) = scanner_input_schema(operation, required_fields) {
         return schema;
@@ -3057,13 +5665,69 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
             }),
         );
     }
-    if session_read_output_schema(operation).is_some() {
-        properties.insert("session_id".into(), json!({
-            "type":["string","null"],"format":"uuid",
-            "description":"Read this session without switching it; omitted or null pins the active session."
+    if operation == "capture.http.list" {
+        let mut sort_keys: Vec<Value> = HISTORY_SORT_KEYS.into_iter().map(Value::from).collect();
+        sort_keys.push(Value::Null);
+        properties.insert("sort_key".into(), json!({
+            "type":["string","null"],"enum":sort_keys,
+            "description":"Sort key for paged history output. Omission or null uses the server's default order."
         }));
+    }
+    if operation == "examples" {
+        properties.insert("operation".into(), json!({
+            "type":["string","null"],
+            "description":"Operation to show examples for; omitted or null lists all operations."
+        }));
+    }
+    if operation == "schema" {
+        properties.insert(
+            "kind".into(),
+            json!({"type":"string","enum":["input","output"]}),
+        );
+        properties.insert(
+            "operation".into(),
+            json!({
+                "type":"string","description":"Operation name from the CLI manifest."
+            }),
+        );
+    }
+    if operation == "session.create" {
+        properties.insert("name".into(), json!({
+            "type":["string","null"],
+            "description":"The server trims the name and limits it to 256 UTF-8 bytes after trimming. Omitted, null, empty or whitespace-only names use the server's timestamp-based default."
+        }));
+    }
+    if matches!(
+        operation,
+        "session.switch" | "session.delete" | "session.reveal"
+    ) {
+        properties.insert(
+            "id".into(),
+            legacy_uuid_input_schema(false, "Session UUID."),
+        );
+    }
+    if operation == "replay.list" {
+        properties.insert(
+            "session_id".into(),
+            legacy_uuid_input_schema(
+                true,
+                "Session UUID. Omitted or null selects the active session.",
+            ),
+        );
+    }
+    if session_read_output_schema(operation).is_some() {
+        properties.insert(
+            "session_id".into(),
+            legacy_uuid_input_schema(
+                true,
+                "Read this session without switching it; omitted or null pins the active session.",
+            ),
+        );
         if properties.contains_key("id") {
-            properties.insert("id".into(), json!({"type":"string","format":"uuid"}));
+            properties.insert(
+                "id".into(),
+                legacy_uuid_input_schema(false, "Finding UUID."),
+            );
         }
         if properties.contains_key("limit") {
             properties.insert("limit".into(), json!({
@@ -3106,6 +5770,12 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
             }
         }
     }
+    if operation == "session.rename" {
+        properties.insert(
+            "id".into(),
+            legacy_uuid_input_schema(false, "Session UUID."),
+        );
+    }
     let mut schema = json!({
         "type": "object",
         "additionalProperties": false,
@@ -3138,7 +5808,32 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "manifest" | "session.list" => &[],
         "schema" => &["kind", "operation"],
         "examples" => &["operation"],
-        "skills.install" => &["codex", "claude", "all", "codex_dir", "claude_dir"],
+        "skills.install" | "skills.status" | "skills.update_preview" => {
+            &["codex", "claude", "all", "codex_dir", "claude_dir"]
+        }
+        "skills.enroll" => &["codex", "claude", "codex_dir", "claude_dir"],
+        "skills.auto_update_status" | "skills.disable_auto_updates" | "skills.auto_update_once" => {
+            &["codex", "claude"]
+        }
+        "skills.enable_auto_updates" => &[
+            "codex",
+            "claude",
+            "codex_dir",
+            "claude_dir",
+            "policy_revision",
+        ],
+        "skills.stage_update" => &["codex", "claude", "codex_dir", "claude_dir", "staging_dir"],
+        "skills.apply_update" => &[
+            "codex",
+            "claude",
+            "codex_dir",
+            "claude_dir",
+            "staging_dir",
+            "operation_id",
+        ],
+        "skills.update_result" | "skills.rollback_update" => {
+            &["codex", "claude", "codex_dir", "claude_dir", "operation_id"]
+        }
         "session.create" => &["name"],
         "session.rename" => &["id", "name"],
         "findings.list" | "event_log.list" => &["session_id", "limit"],
@@ -3150,6 +5845,10 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "scanner.custom.get" | "scanner.custom.delete" => &["session_id", "id"],
         "scanner.custom.create" => &["session_id", "rule", "file", "stdin"],
         "scanner.custom.update" => &["session_id", "id", "patch", "file", "stdin"],
+        "capture.http.upstream_peer.get" => &["session_id"],
+        "capture.http.upstream_peer.set" => &["session_id", "enabled"],
+        "capture.http.retention.get" => &["session_id"],
+        "capture.http.retention.set" => &["session_id", "off", "max_entries"],
         "capture.http.clear" => &["session_id"],
         "capture.http.select" | "capture.http.delete" => &[
             "session_id",
@@ -3211,6 +5910,34 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "note",
             "clear_note",
         ],
+        "target.service_map.get" => &[
+            "session_id",
+            "origin",
+            "in_scope_only",
+            "max_records",
+            "all_rows",
+            "technology_catalog_version",
+            "mime_types",
+            "status_classes",
+            "hidden_extensions",
+            "hide_without_responses",
+            "only_parameterized",
+        ],
+        "target.service_map.evidence.get" => &[
+            "session_id",
+            "evidence_id",
+            "include_socket_peer",
+            "technology_catalog_version",
+        ],
+        "target.service_map.body_references.get"
+        | "target.service_map.html_generators.get"
+        | "target.service_map.link_declarations.get" => &["session_id", "evidence_id"],
+        "target.service_map.parameters.get" => &["session_id", "origin", "method", "path"],
+        "target.service_map.openapi.get" => &["session_id", "origin"],
+        "target.service_map.unnamed.get" => &["session_id", "kind", "limit"],
+        "target.service_map.socket_peer_matches.get" => {
+            &["session_id", "evidence_id", "in_scope_only", "max_records"]
+        }
         "scope.get" => &["session_id"],
         "scope.set" => &[
             "session_id",
@@ -3222,6 +5949,7 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         ],
         "replay.list" => &["session_id"],
         "replay.close" | "replay.duplicate" => &["tab_id", "session_id"],
+        "replay.set_pinned" => &["tab_id", "session_id", "pinned"],
         "replay.open" => &[
             "session_id",
             "transaction_id",
@@ -3268,6 +5996,10 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         | "capture.oast.status"
         | "capture.oast.generate"
         | "capture.oast.clear" => &["session_id"],
+        "capture.intercept.get" => &["id", "session_id"],
+        "capture.intercept.wait" | "capture.response_intercept.wait" => {
+            &["session_id", "timeout", "poll_interval"]
+        }
         "capture.intercept.forward" => &["id", "session_id", "request_file", "stdin"],
         "capture.intercept.drop"
         | "capture.response_intercept.get"
@@ -3292,6 +6024,17 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "capture.websocket.get" => &["id", "session_id", "frame_limit", "before_index"],
         "capture.auto_replace.set" => &["session_id", "file", "stdin"],
         "capture.response_intercept.forward" => &["id", "session_id", "response_file", "stdin"],
+        "capture.intercept_rule.set_enabled" => &["id", "session_id", "enabled"],
+        "capture.intercept_rule.update" => &[
+            "id",
+            "session_id",
+            "scope",
+            "host_pattern",
+            "path_pattern",
+            "method_filter",
+            "clear_methods",
+            "enabled",
+        ],
         "capture.intercept_rule.create" => &[
             "session_id",
             "scope",
@@ -3378,6 +6121,54 @@ fn command_input_preview(command: &Command) -> Value {
             json!({"session_id":args.session_id,"limit":args.limit})
         }
         Command::Scope { command } => match command {
+            TargetCommand::ServiceMap(args) => match &args.command {
+                Some(ServiceMapCommand::BodyReferences(args)) => json!({
+                    "session_id": args.session_id,"evidence_id":args.evidence_id,
+                }),
+                Some(ServiceMapCommand::HtmlGenerators(args)) => json!({
+                    "session_id": args.session_id,"evidence_id":args.evidence_id,
+                }),
+                Some(ServiceMapCommand::LinkDeclarations(args)) => json!({
+                    "session_id": args.session_id,"evidence_id":args.evidence_id,
+                }),
+                Some(ServiceMapCommand::SocketPeerMatches(args)) => json!({
+                    "session_id":args.session_id,"evidence_id":args.evidence_id,
+                    "in_scope_only":args.in_scope_only,"max_records":args.max_records,
+                }),
+                Some(ServiceMapCommand::Parameters(args)) => json!({
+                    "session_id":args.session_id,"origin":args.origin,
+                    "method":args.method,"path":args.path,
+                }),
+                Some(ServiceMapCommand::Openapi(args)) => json!({
+                    "session_id":args.session_id,"origin":args.origin,
+                }),
+                Some(ServiceMapCommand::Unnamed(args)) => json!({
+                    "session_id":args.session_id,"kind":args.kind,"limit":args.limit,
+                }),
+                None => {
+                    let mut preview = json!({
+                        "session_id": args.session_id,
+                        "in_scope_only": args.in_scope_only,
+                        "origin": args.origin,
+                        "max_records": args.max_records,
+                        "technology_catalog_version": args.technology_catalog_version,
+                    });
+                    // A whole-history read has no row window to show.
+                    if args.all_rows {
+                        preview["all_rows"] = json!(true);
+                        preview
+                            .as_object_mut()
+                            .map(|fields| fields.remove("max_records"));
+                    }
+                    preview
+                }
+            },
+            TargetCommand::ServiceMapEvidence(args) => json!({
+                "session_id": args.session_id,
+                "evidence_id": args.evidence_id,
+                "include_socket_peer": args.include_socket_peer,
+                "technology_catalog_version": args.technology_catalog_version,
+            }),
             TargetCommand::GetScope(args) => json!({ "session_id": args.session_id }),
             TargetCommand::SetScope(args) => json!({
                 "session_id": args.session_id,
@@ -3391,13 +6182,42 @@ fn command_input_preview(command: &Command) -> Value {
         Command::Fuzzer { command } => fuzzer_input_preview(command),
         Command::Sequence { command } => sequence_input_preview(command),
         Command::Skills { command } => match command {
-            SkillsCommand::Install(args) => json!({
+            SkillsCommand::Install(args)
+            | SkillsCommand::Status(args)
+            | SkillsCommand::UpdatePreview(args) => json!({
                 "codex": args.codex,
                 "claude": args.claude,
                 "all": args.all,
                 "codex_dir": args.codex_dir,
                 "claude_dir": args.claude_dir,
             }),
+            SkillsCommand::Enroll(args) => single_skill_input_preview(args),
+            SkillsCommand::AutoUpdateStatus(args)
+            | SkillsCommand::DisableAutoUpdates(args)
+            | SkillsCommand::AutoUpdateOnce(args) => {
+                json!({"codex":args.codex,"claude":args.claude})
+            }
+            SkillsCommand::EnableAutoUpdates(args) => {
+                let mut input = single_skill_input_preview(&args.target);
+                input["policy_revision"] = json!(args.policy_revision);
+                input
+            }
+            SkillsCommand::StageUpdate(args) => {
+                let mut input = single_skill_input_preview(&args.target);
+                input["staging_dir"] = json!(args.staging_dir);
+                input
+            }
+            SkillsCommand::ApplyUpdate(args) => {
+                let mut input = single_skill_input_preview(&args.target);
+                input["staging_dir"] = json!(args.staging_dir);
+                input["operation_id"] = json!(args.operation_id);
+                input
+            }
+            SkillsCommand::UpdateResult(args) | SkillsCommand::RollbackUpdate(args) => {
+                let mut input = single_skill_input_preview(&args.target);
+                input["operation_id"] = json!(args.operation_id);
+                input
+            }
         },
         Command::History { command } => history_input_preview(command),
         Command::Intercept { command } => intercept_input_preview(command),
@@ -3406,8 +6226,30 @@ fn command_input_preview(command: &Command) -> Value {
     }
 }
 
+fn single_skill_input_preview(args: &SingleSkillArgs) -> Value {
+    json!({"codex":args.codex,"claude":args.claude,"codex_dir":args.codex_dir,"claude_dir":args.claude_dir})
+}
+
 fn history_input_preview(command: &HistoryCommand) -> Value {
     match command {
+        HistoryCommand::UpstreamPeer { command } => match command {
+            UpstreamPeerCommand::Get(args) => json!({"session_id":args.session_id}),
+            UpstreamPeerCommand::Set(args) => {
+                json!({"session_id":args.session_id,"enabled":args.enabled})
+            }
+        },
+        HistoryCommand::Retention { command } => match command {
+            HistoryRetentionCommand::Get(args) => json!({"session_id":args.session_id}),
+            HistoryRetentionCommand::Set(args) => {
+                let mut input = json!({"session_id":args.session_id});
+                if args.off {
+                    input["off"] = json!(true);
+                } else {
+                    input["max_entries"] = json!(args.max_entries);
+                }
+                input
+            }
+        },
         HistoryCommand::Clear(args) => json!({ "session_id": args.session_id }),
         HistoryCommand::Select(args) | HistoryCommand::Delete(args) => {
             serde_json::to_value(args.payload()).expect("selection serializes")
@@ -3500,6 +6342,13 @@ fn replay_input_preview(command: &ReplayCommand) -> Value {
             }
             input
         }
+        ReplayCommand::SetPinned(args) => {
+            let mut input = json!({"tab_id":args.tab.tab_id,"pinned":args.pinned});
+            if let Some(session_id) = args.tab.session_id {
+                input["session_id"] = json!(session_id);
+            }
+            input
+        }
         ReplayCommand::Send(args) => {
             json!({ "tab_id": args.tab_id, "session_id": args.session_id })
         }
@@ -3545,7 +6394,7 @@ fn intercept_input_preview(command: &InterceptCommand) -> Value {
         InterceptCommand::Drop(args) => json!({ "id": args.id, "session_id": args.session_id }),
         InterceptCommand::Get(args) => json!({ "id": args.id, "session_id": args.session_id }),
         InterceptCommand::Wait(args) => {
-            json!({ "session_id": args.session_id, "timeout": args.timeout })
+            json!({ "session_id": args.session_id, "timeout": args.timeout, "poll_interval": args.poll_interval })
         }
     }
 }
@@ -3589,7 +6438,7 @@ fn response_intercept_input_preview(command: &ResponseInterceptCommand) -> Value
             json!({ "session_id": args.session_id })
         }
         ResponseInterceptCommand::Wait(args) => {
-            json!({ "session_id": args.session_id, "timeout": args.timeout })
+            json!({ "session_id": args.session_id, "timeout": args.timeout, "poll_interval": args.poll_interval })
         }
         ResponseInterceptCommand::Get(args) => {
             json!({ "id": args.id, "session_id": args.session_id })
@@ -3618,6 +6467,21 @@ fn intercept_rule_input_preview(command: &InterceptRuleCommand) -> Value {
             "method_filter": args.method_filter,
             "enabled": args.enabled,
         }),
+        InterceptRuleCommand::Update(args) => {
+            let mut input = args.patch();
+            input["id"] = json!(args.id);
+            if let Some(session_id) = args.session_id {
+                input["session_id"] = json!(session_id);
+            }
+            input
+        }
+        InterceptRuleCommand::SetEnabled(args) => {
+            let mut input = json!({"id":args.id,"enabled":args.enabled});
+            if let Some(session_id) = args.session_id {
+                input["session_id"] = json!(session_id);
+            }
+            input
+        }
         InterceptRuleCommand::Delete(args) => {
             json!({ "id": args.id, "session_id": args.session_id })
         }
@@ -3701,17 +6565,60 @@ fn command_api_preview(command: &Command) -> Result<Value> {
         ),
         Command::Capture { command } => capture_api_preview(command)?,
         Command::Scope { command } => match command {
+            TargetCommand::ServiceMap(args) => match &args.command {
+                Some(ServiceMapCommand::BodyReferences(args)) => {
+                    api_preview("GET", service_map_body_references_path(args), None)
+                }
+                Some(ServiceMapCommand::HtmlGenerators(args)) => {
+                    api_preview("GET", service_map_html_generators_path(args), None)
+                }
+                Some(ServiceMapCommand::Parameters(args)) => {
+                    api_preview("GET", service_map_parameters_path(args), None)
+                }
+                Some(ServiceMapCommand::Openapi(args)) => {
+                    api_preview("GET", service_map_openapi_path(args), None)
+                }
+                Some(ServiceMapCommand::Unnamed(args)) => service_map_catalog_api_preview(
+                    service_map_path(&args.map_args(), args.session_id),
+                    2,
+                ),
+                Some(ServiceMapCommand::LinkDeclarations(args)) => {
+                    api_preview("GET", service_map_link_declarations_path(args), None)
+                }
+                Some(ServiceMapCommand::SocketPeerMatches(args)) => {
+                    api_preview("GET", service_map_socket_peer_matches_path(args), None)
+                }
+                None => service_map_catalog_api_preview(
+                    service_map_path(args, args.session_id),
+                    args.technology_catalog_version,
+                ),
+            },
+            TargetCommand::ServiceMapEvidence(args) => service_map_catalog_api_preview(
+                service_map_evidence_path(args),
+                args.technology_catalog_version,
+            ),
             TargetCommand::GetScope(args) => api_preview(
                 "GET",
                 session_query_path("/api/runtime", args.session_id),
                 None,
             ),
+            // The run replaces the whole list; null here read as "keep the
+            // current scope". A file or stdin is named, not read: a dry run
+            // stays offline and must not consume stdin.
             TargetCommand::SetScope(args) => api_preview(
                 "POST",
                 "/api/runtime",
                 Some(json!({
                     "session_id": args.session_id,
-                    "scope_patterns": if args.clear { Some(Vec::<String>::new()) } else { None },
+                    "scope_patterns": if args.clear {
+                        json!([])
+                    } else if let Some(file) = &args.file {
+                        json!({ "replaced_by_lines_of": file })
+                    } else if args.stdin {
+                        json!({ "replaced_by_lines_of": "stdin" })
+                    } else {
+                        json!(args.patterns)
+                    },
                 })),
             ),
         },
@@ -3768,6 +6675,8 @@ fn capture_api_preview(command: &CaptureCommand) -> Result<Value> {
 
 fn history_api_preview(command: &HistoryCommand) -> Result<Value> {
     Ok(match command {
+        HistoryCommand::UpstreamPeer { command } => upstream_peer_api_preview(command),
+        HistoryCommand::Retention { command } => history_retention_api_preview(command),
         HistoryCommand::Select(args) => api_preview(
             "POST",
             "/api/transactions/select",
@@ -3817,6 +6726,17 @@ fn replay_api_preview(command: &ReplayCommand) -> Value {
             session_query_path("/api/workspace-state", args.session_id),
             None,
         ),
+        ReplayCommand::Update(args) if replay_update_is_label_only(args) => api_preview(
+            "POST",
+            "/api/replay/tabs/set-label",
+            Some(json!({
+                "tab_id":args.tab_id,
+                "label":normalize_replay_tab_label(args.label.as_deref().unwrap()),
+                "session_id":args.session_id.map(|id| json!(id)).unwrap_or_else(|| json!("<resolved active session ID>")),
+                "expected_workspace_revision":"<loaded workspace revision>",
+                "note":"changes only the saved label on an existing HTTP or WebSocket tab; no traffic is sent"
+            })),
+        ),
         ReplayCommand::Open(_) | ReplayCommand::Update(_) => api_preview(
             "POST",
             "/api/workspace-state",
@@ -3833,9 +6753,24 @@ fn replay_api_preview(command: &ReplayCommand) -> Value {
             }
             api_preview(
                 "POST",
-                replay_saved_tab_path(matches!(command, ReplayCommand::Duplicate(_))),
+                replay_saved_tab_path(if matches!(command, ReplayCommand::Duplicate(_)) {
+                    SavedReplayTabAction::Duplicate
+                } else {
+                    SavedReplayTabAction::Close
+                }),
                 Some(body),
             )
+        }
+        ReplayCommand::SetPinned(args) => {
+            let mut preview = replay_api_preview(&ReplayCommand::Close(ReplaySavedTabArgs {
+                tab_id: args.tab.tab_id.clone(),
+                session_id: args.tab.session_id,
+            }));
+            preview["path"] = json!(replay_saved_tab_path(SavedReplayTabAction::SetPinned(
+                args.pinned
+            )));
+            preview["body"]["pinned"] = json!(args.pinned);
+            preview
         }
         ReplayCommand::Send(_) => api_preview(
             "POST",
@@ -3862,12 +6797,10 @@ fn fuzzer_api_preview(command: &FuzzerCommand) -> Value {
             session_query_path(&format!("/api/fuzzer/attacks/{}", args.id), args.session_id),
             None,
         ),
+        // The attack record carries its results; there is no `/results` route.
         FuzzerCommand::Results(args) => api_preview(
             "GET",
-            session_query_path(
-                &format!("/api/fuzzer/attacks/{}/results", args.id),
-                args.session_id,
-            ),
+            session_query_path(&format!("/api/fuzzer/attacks/{}", args.id), args.session_id),
             None,
         ),
         FuzzerCommand::List(args) => api_preview(
@@ -4010,10 +6943,34 @@ fn intercept_rule_api_preview(command: &InterceptRuleCommand) -> Value {
             session_query_path("/api/intercept-rules", args.session_id),
             None,
         ),
+        // The rule as it is sent; its id is minted when the command runs.
         InterceptRuleCommand::Create(args) => api_preview(
             "POST",
             session_query_path("/api/intercept-rules", args.session_id),
-            Some(json!({ "scope": args.scope, "all": args.all })),
+            Some(json!({
+                "id": "<new uuid>",
+                "enabled": args.enabled.unwrap_or(true),
+                "scope": args.scope,
+                "host_pattern": args.host_pattern.clone().unwrap_or_default(),
+                "path_pattern": args.path_pattern.clone().unwrap_or_default(),
+                "method_filter": args.method_filter,
+            })),
+        ),
+        InterceptRuleCommand::Update(args) => api_preview(
+            "PATCH",
+            session_query_path(
+                &format!("/api/intercept-rules/{}", args.id),
+                args.session_id,
+            ),
+            Some(args.patch()),
+        ),
+        InterceptRuleCommand::SetEnabled(args) => api_preview(
+            "PATCH",
+            session_query_path(
+                &format!("/api/intercept-rules/{}", args.id),
+                args.session_id,
+            ),
+            Some(json!({"enabled": args.enabled})),
         ),
         InterceptRuleCommand::Delete(args) => api_preview(
             "DELETE",
@@ -4038,15 +6995,19 @@ fn sequence_api_preview(command: &SequenceCommand) -> Value {
             session_query_path(&format!("/api/sequences/{}", args.id), args.session_id),
             None,
         ),
+        // Both send the session in the body, which is where the server reads it.
         SequenceCommand::Create(args) => api_preview(
             "POST",
-            session_query_path("/api/sequences", args.session_id),
-            Some(json!({ "note": "sequence definition from file/stdin" })),
+            "/api/sequences",
+            Some(json!({
+                "session_id": args.session_id,
+                "definition": "<sequence definition from file/stdin>",
+            })),
         ),
         SequenceCommand::Run(args) => api_preview(
             "POST",
-            session_query_path(&format!("/api/sequences/{}/run", args.id), args.session_id),
-            Some(json!({})),
+            &format!("/api/sequences/{}/run", args.id),
+            Some(json!({ "session_id": args.session_id })),
         ),
         SequenceCommand::RunGet(args) => api_preview(
             "GET",
@@ -4120,6 +7081,12 @@ fn findings_api_preview(command: &FindingsCommand) -> Value {
     api_preview("GET", path, None)
 }
 
+fn service_map_catalog_api_preview(path: String, version: u32) -> Value {
+    let mut preview = api_preview("GET", path, None);
+    preview["headers"] = json!({(SERVICE_MAP_CATALOG_HEADER):version.to_string()});
+    preview
+}
+
 fn api_preview(method: &str, path: impl Into<String>, body: Option<Value>) -> Value {
     json!({
         "method": method,
@@ -4130,16 +7097,109 @@ fn api_preview(method: &str, path: impl Into<String>, body: Option<Value>) -> Va
 
 fn dry_run_notes(command: &Command) -> Vec<&'static str> {
     let mut notes = Vec::new();
+    if matches!(
+        command.operation_name(),
+        "target.service_map.get"
+            | "target.service_map.evidence.get"
+            | "target.service_map.body_references.get"
+            | "target.service_map.html_generators.get"
+            | "target.service_map.link_declarations.get"
+            | "target.service_map.socket_peer_matches.get"
+            | "target.service_map.parameters.get"
+            | "target.service_map.openapi.get"
+            | "target.service_map.unnamed.get"
+    ) {
+        if command.operation_name() == "target.service_map.unnamed.get" {
+            notes.push("Reads the session's whole map, as `scope service-map --all-rows` does, and gathers its unnamed signals locally. snapshot preserves source-map coverage; omitted_signals counts only --limit truncation after --kind. One GET; no target requests, retries or fallback.");
+            notes.push("Signals are banner values, header names and cookie names, never header or cookie values. Counts are origins and rows in this map; open the evidence tokens before naming anything.");
+        } else if command.operation_name() == "target.service_map.openapi.get" {
+            notes.push("Explicit read of every retained row of one origin in an already active session. One GET after identity checks; no target requests, inactive-session loading, automatic reads, retries or fallback.");
+            notes.push("The document holds names, guessed types, statuses, media types and security schemes, never captured values. Parameters come from each operation's newest 20 rows, at most 32 MiB of retained rows per read; at most 500 operations are listed.");
+        } else if command.operation_name() == "target.service_map.parameters.get" {
+            notes.push("Explicit read of one endpoint's newest 200 retained rows in an already active session. One GET after identity checks; no target requests, inactive-session loading, automatic reads, retries or fallback.");
+            notes.push("Values are shown as captured, each cut to 80 characters, and may hold credentials or personal data. Request bodies are parsed from their first 64 KiB, at most 32 MiB of retained rows per read; unread_bodies counts the rest, whose query strings still count.");
+        } else if command.operation_name() == "target.service_map.socket_peer_matches.get" {
+            notes.push("Explicit recorded direct socket peer equality inspection only. Requires an already active session and an unchanged exact source-row token. One feature GET after identity checks; no arbitrary address input, target requests, capture/settings changes, discovery, body/header reads, inactive loading, retries, redirects, or fallback.");
+            notes.push("Counts are rows, including duplicate transaction UUIDs, within a latest retained sequence window and exclude the source. Inspect source.in_window, recorded timestamps, diagnostics, origin-group and sample omissions. Equal source/address-family/IP/port values do not prove a shared physical endpoint, deployment, ownership, or origin IP. Samples may become stale; no UUID-only fallback is permitted.");
+        } else if command.operation_name() == "target.service_map.link_declarations.get" {
+            notes.push("Explicit one-row retained response-header inspection only, with fixed relation catalog 1. Requires an already active session and retained GET/HEAD status 200 metadata. One inspection GET after identity checks, with no body reads, inactive loading, target requests, automatic/batch reads, retries, redirects, fallback, or technology-catalog selector.");
+            notes.push("Only canonical origins, fixed relation names, bounded counters and original retained-header UTF-8 spans are returned. Multiple relations may share a member. Partial/unsupported does not mean no declarations exist; completeness applies only to the fixed literal grammar. Declarations do not establish calls, ownership, availability, or connections.");
+        } else if command.operation_name() == "target.service_map.html_generators.get" {
+            notes.push("Explicit one-row retained UTF-8 text/html preview read only, with fixed generator catalog 1. The session must already be active. One inspection GET after identity checks, with no target requests, inactive-session loading, automatic/batch reads, retries, fallback, or technology-catalog selector.");
+            notes.push("Products and numeric versions are literal generator declarations, not proven software installations or ownership. Partial/unsupported never means no generator found. Inspect head_closed, complete, reasons, truncation and bounds. scan_prefix_bytes describes the offered prefix, not bytes fully parsed; parser_stop.byte_cursor may split UTF-8 and must not be used to slice text. No raw HTML or rejected declaration text is exposed.");
+        } else if command.operation_name() == "target.service_map.body_references.get" {
+            notes.push("Explicit one-row retained-preview read only. The session must already be active; an inactive session returns unavailable without being loaded or activated. No target requests, automatic reads, or batch reads.");
+            notes.push("Literal absolute HTTP(S) references do not prove calls or ownership. Results expose canonical origins and retained UTF-8 preview byte offsets, never body text or full URLs. Completeness applies only to the supported bounded literal grammar.");
+        } else {
+            notes.push("Offline preview only. Execution reads retained metadata from one pinned session; it never probes, scans, replays, crawls, or follows service redirects.");
+            notes.push("The API-only technology catalog header requests catalog 2 by default or explicit catalog 1. One target GET is made, with no negotiation retries or fallback requests. An unmarked legacy response is validated only as v1 and reports reduced coverage on stderr.");
+            notes.push("Counts include retained rows with duplicate UUIDs. Inspect completeness and unavailable data; evidence tokens identify exact row states and never fall back to UUID-only lookup.");
+        }
+    }
     if command.requires_confirmation() {
         notes.push("Use --yes to apply this side-effecting operation after reviewing the dry-run.");
     }
     if matches!(
+        command,
+        Command::Session {
+            command: SessionCommand::Create(_)
+        }
+    ) {
+        notes.push("On success, the new session becomes the active session; this preview does not create or activate a session.");
+    }
+    if matches!(
         command.operation_name(),
-        "replay.close" | "replay.duplicate"
+        "replay.close" | "replay.duplicate" | "replay.set_pinned"
     ) {
         notes.push("Dry-run is fully offline: it does not discover Sniper, resolve a session, read saved tabs or check whether the exact tab ID exists.");
-        notes.push("Execution pins one session, reads its saved workspace revision, and posts only IDs plus revision to the dedicated endpoint once. An inferred session also guards against an active-session switch. Conflicts, redirects and ambiguous responses are not retried.");
+        notes.push("Execution pins one session, reads its saved workspace revision, and posts only IDs, revision and any requested pin state to the dedicated endpoint once. An inferred session also guards against an active-session switch. Conflicts, redirects and ambiguous responses are not retried.");
         notes.push("Saved HTTP tabs only, including legacy empty types. No request parsing, body hydration, Replay send, WebSocket connection or full workspace replacement occurs. Success returns only acknowledgement metadata.");
+    }
+    if matches!(
+        command,
+        Command::Skills {
+            command: SkillsCommand::Enroll(_)
+                | SkillsCommand::UpdatePreview(_)
+                | SkillsCommand::StageUpdate(_)
+        }
+    ) {
+        notes.push("CLI-host local only; no Sniper API discovery or contact. Dry-run validates arguments and describes the plan without reading skill files or checking eligibility.");
+        notes.push("Enrollment records explicit local opt-in only and does not enable startup or automatic updates. Preview never implies ownership of unmanaged files.");
+        notes.push("Staging requires an unchanged enrolled skill with different bundled bytes and a new output directory. It writes a candidate and receipt only; the active SKILL.md remains unchanged and nothing is activated.");
+    }
+    if is_skill_auto_update_operation(command.operation_name()) {
+        notes.push("CLI-host local only; remote --api is never contacted. Dry-run validates arguments only, with no filesystem reads/writes, policy inspection, eligibility checks, or API discovery.");
+        notes.push("Canonical call dry runs require inline JSON in --input; @file and stdin are rejected before opening or reading them. Other commands retain their ordinary input-source behavior.");
+        notes.push("Enable records consent for one unchanged managed baseline without updating active files. Existing consent can be re-enabled only with its current policy revision, creating a new authorization generation.");
+        notes.push("Status, disable and one-shot execution use only the stored target. No automatic enrollment, adoption of edits, network templates, overwrite fallback, artifact pruning, or agent reload. Paused or uncertain state needs inspection and fresh explicit re-authorization.");
+    }
+    if matches!(
+        command.operation_name(),
+        "skills.apply_update" | "skills.update_result" | "skills.rollback_update"
+    ) {
+        notes.push("CLI-host local only; dry-run validates arguments without filesystem reads, host/API discovery, or checking eligibility. It does not reserve the operation UUID.");
+        notes.push("This explicit operation does not grant automatic-update consent or reload an agent. Apply requires a reviewed candidate bound to the unchanged enrollment baseline and this binary's newer bundle.");
+        notes.push("Keep the original operation UUID and all transaction artifacts. After uncertain output, use skills update-result with that same UUID; do not blindly retry or replace the ID. Rollback uses that original UUID and preserves displaced objects.");
+    }
+    if matches!(
+        command.operation_name(),
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+    ) {
+        notes.push("Dry-run is fully offline. The explicit session must already be active; execution never switches or activates it. Discovery and settings reads do not inspect traffic or contact upstream services.");
+        if command.operation_name().ends_with(".set") {
+            notes.push("Execution performs one session-fenced configuration GET and one token-bound POST with expected_active_session_id. No redirects, automatic retry or uncertain-write readback. Inspect the same session's settings deliberately after an uncertain outcome.");
+        }
+        notes.push("Default Off. Eligibility is frozen before an ordinary captured HTTP(S) request's first send; eligible in-flight responses may finish after Off. No backfill, probes, Replay, WebSocket, CONNECT, rendered resources or TLS/DNS details. Observations persist in session files, exports and full-record JSON; Off does not erase them. A proxy, CDN or shared socket peer does not prove origin ownership or a backend chain.");
+    }
+    if matches!(
+        command.operation_name(),
+        "capture.http.retention.get" | "capture.http.retention.set"
+    ) {
+        notes.push("Dry-run is fully offline: no API discovery, session resolution, token read, history inspection or deletion count.");
+        if command.operation_name() == "capture.http.retention.set" {
+            notes.push("The exact requested policy is shown in api.write.body.policy. Write execution pins one session, fetches its policy-configuration config_token and sends one compare-and-swap write. An inferred session also carries expected_active_session_id. No redirect, automatic retry or uncertain-write readback is performed.");
+        }
+        notes.push("Off is the default. Keep-newest is a soft total-history target: oldest unprotected rows are removed first, while durable saved HTTP tab source originals and in-progress rows survive. Policy-save success does not mean pending logical or disk cleanup is finished.");
     }
     if matches!(command, Command::Scanner { .. }) {
         notes.push("Dry-run is offline and validates supplied rule JSON before API discovery. It does not resolve sessions, fetch configuration, apply writes or inspect traffic.");
@@ -4175,16 +7235,25 @@ fn command_from_call_args(args: CallArgs) -> Result<Command> {
 }
 
 fn parse_call_input(source: Option<String>) -> Result<Value> {
+    // Local paths may contain words used by the legacy error classifier. Keep
+    // input failures typed so those words cannot change the code or retry hint.
+    load_call_input(source).map_err(Into::into)
+}
+
+fn load_call_input(source: Option<String>) -> std::result::Result<Value, CallInputError> {
     let Some(source) = source else {
         return Ok(json!({}));
     };
     let raw = if source == "-" {
-        read_text_input(None, true)?
+        read_text_input(None, true).map_err(|error| CallInputError::Source(error.to_string()))?
     } else if let Some(path) = source.strip_prefix('@') {
         if path.is_empty() {
-            bail!("call --input @ requires a file path");
+            return Err(CallInputError::Source(
+                "call --input @ requires a file path".into(),
+            ));
         }
-        read_text_input(Some(PathBuf::from(path)), false)?
+        read_text_input(Some(PathBuf::from(path)), false)
+            .map_err(|error| CallInputError::Source(error.to_string()))?
     } else {
         source
     };
@@ -4192,7 +7261,7 @@ fn parse_call_input(source: Option<String>) -> Result<Value> {
     if trimmed.is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(trimmed).context("failed to parse call input JSON")
+    serde_json::from_str(trimmed).map_err(|_| CallInputError::JsonSyntax)
 }
 
 fn command_from_operation_input(operation: &str, input: &Value) -> Result<Command> {
@@ -4223,6 +7292,91 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
         "examples" => Command::Examples {
             operation: call_optional(operation, input, "operation")?,
         },
+        "skills.status" | "skills.update_preview" => {
+            let args = SkillsInstallArgs {
+                codex: call_bool(operation, input, "codex")?,
+                claude: call_bool(operation, input, "claude")?,
+                all: call_bool(operation, input, "all")?,
+                codex_dir: call_optional_path(operation, input, "codex_dir")?,
+                claude_dir: call_optional_path(operation, input, "claude_dir")?,
+            };
+            Command::Skills {
+                command: if operation == "skills.status" {
+                    SkillsCommand::Status(args)
+                } else {
+                    SkillsCommand::UpdatePreview(args)
+                },
+            }
+        }
+        "skills.auto_update_status" | "skills.disable_auto_updates" | "skills.auto_update_once" => {
+            let target = StoredSkillArgs {
+                codex: call_bool(operation, input, "codex")?,
+                claude: call_bool(operation, input, "claude")?,
+            };
+            Command::Skills {
+                command: match operation {
+                    "skills.auto_update_status" => SkillsCommand::AutoUpdateStatus(target),
+                    "skills.disable_auto_updates" => SkillsCommand::DisableAutoUpdates(target),
+                    _ => SkillsCommand::AutoUpdateOnce(target),
+                },
+            }
+        }
+        "skills.enable_auto_updates" => Command::Skills {
+            command: SkillsCommand::EnableAutoUpdates(SkillsEnableAutoUpdatesArgs {
+                target: SingleSkillArgs {
+                    codex: call_bool(operation, input, "codex")?,
+                    claude: call_bool(operation, input, "claude")?,
+                    codex_dir: call_optional_path(operation, input, "codex_dir")?,
+                    claude_dir: call_optional_path(operation, input, "claude_dir")?,
+                },
+                policy_revision: call_optional(operation, input, "policy_revision")?,
+            }),
+        },
+        "skills.enroll"
+        | "skills.stage_update"
+        | "skills.apply_update"
+        | "skills.update_result"
+        | "skills.rollback_update" => {
+            let target = SingleSkillArgs {
+                codex: call_bool(operation, input, "codex")?,
+                claude: call_bool(operation, input, "claude")?,
+                codex_dir: call_optional_path(operation, input, "codex_dir")?,
+                claude_dir: call_optional_path(operation, input, "claude_dir")?,
+            };
+            Command::Skills {
+                command: match operation {
+                    "skills.enroll" => SkillsCommand::Enroll(target),
+                    "skills.stage_update" => SkillsCommand::StageUpdate(SkillsStageArgs {
+                        target,
+                        staging_dir: PathBuf::from(call_required::<String>(
+                            operation,
+                            input,
+                            "staging_dir",
+                        )?),
+                    }),
+                    "skills.apply_update" => SkillsCommand::ApplyUpdate(SkillsApplyArgs {
+                        target,
+                        staging_dir: PathBuf::from(call_required::<String>(
+                            operation,
+                            input,
+                            "staging_dir",
+                        )?),
+                        operation_id: call_required(operation, input, "operation_id")?,
+                    }),
+                    _ => {
+                        let args = SkillsOperationArgs {
+                            target,
+                            operation_id: call_required(operation, input, "operation_id")?,
+                        };
+                        if operation == "skills.update_result" {
+                            SkillsCommand::UpdateResult(args)
+                        } else {
+                            SkillsCommand::RollbackUpdate(args)
+                        }
+                    }
+                },
+            }
+        }
         "skills.install" => Command::Skills {
             command: SkillsCommand::Install(SkillsInstallArgs {
                 codex: call_bool(operation, input, "codex")?,
@@ -4255,6 +7409,20 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 id: call_required(operation, input, "id")?,
                 name: call_required(operation, input, "name")?,
             }),
+        },
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set" => Command::Capture {
+            command: CaptureCommand::Http {
+                command: HistoryCommand::UpstreamPeer {
+                    command: upstream_peer_from_input(operation, input)?,
+                },
+            },
+        },
+        "capture.http.retention.get" | "capture.http.retention.set" => Command::Capture {
+            command: CaptureCommand::Http {
+                command: HistoryCommand::Retention {
+                    command: history_retention_from_input(operation, input)?,
+                },
+            },
         },
         "capture.http.clear" => Command::Capture {
             command: CaptureCommand::Http {
@@ -4323,18 +7491,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                             operation,
                             input,
                             "sort_key",
-                            &[
-                                "index",
-                                "host",
-                                "method",
-                                "path",
-                                "status",
-                                "length",
-                                "mime",
-                                "notes",
-                                "tls",
-                                "started_at",
-                            ],
+                            &HISTORY_SORT_KEYS,
                         )?,
                         sort_direction: call_optional_enum_string(
                             operation,
@@ -4391,7 +7548,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 command: HistoryCommand::Search(HistorySearchArgs {
                     value: call_required(operation, input, "value")?,
                     session_id: call_optional(operation, input, "session_id")?,
-                    side: call_optional(operation, input, "side")?.unwrap_or_default(),
+                    side: call_history_search_sides(operation, input)?,
                     case_sensitive: call_bool(operation, input, "case_sensitive")?,
                     max_matches: call_optional_nonzero_usize(operation, input, "max_matches")?,
                     byte_budget: call_optional(operation, input, "byte_budget")?,
@@ -4482,6 +7639,259 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                     .unwrap_or(DEFAULT_READ_LIST_LIMIT),
             }),
         },
+        "target.service_map.get" => {
+            let all_rows = call_bool(operation, input, "all_rows")?;
+            let explicit_max_records =
+                call_optional_nonzero_usize(operation, input, "max_records")?;
+            if all_rows && explicit_max_records.is_some() {
+                bail!("field `all_rows` cannot be combined with `max_records`: it reads every retained row");
+            }
+            let max_records = explicit_max_records.unwrap_or(10_000);
+            parse_service_map_max_records(&max_records.to_string())
+                .map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: None,
+                    session_id: call_optional(operation, input, "session_id")?,
+                    in_scope_only: call_bool(operation, input, "in_scope_only")?,
+                    origin: call_optional::<String>(operation, input, "origin")?
+                        .map(|value| {
+                            parse_service_map_origin(&value).map_err(|message| anyhow!(message))
+                        })
+                        .transpose()?,
+                    max_records,
+                    all_rows,
+                    technology_catalog_version: call_service_map_catalog_version(input)?,
+                    filter: ServiceMapFilterArgs {
+                        mime_types: call_service_map_tokens(
+                            operation,
+                            input,
+                            "mime_types",
+                            &SERVICE_MAP_MIME_TYPES,
+                        )?,
+                        status_classes: call_service_map_tokens(
+                            operation,
+                            input,
+                            "status_classes",
+                            &SERVICE_MAP_STATUS_CLASSES,
+                        )?,
+                        hidden_extensions: call_optional::<Vec<String>>(
+                            operation,
+                            input,
+                            "hidden_extensions",
+                        )?
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|value| {
+                            parse_service_map_extension(value).map_err(|message| anyhow!(message))
+                        })
+                        .collect::<Result<_>>()?,
+                        hide_without_responses: call_bool(
+                            operation,
+                            input,
+                            "hide_without_responses",
+                        )?,
+                        only_parameterized: call_bool(operation, input, "only_parameterized")?,
+                    },
+                }),
+            }
+        }
+        "target.service_map.body_references.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::BodyReferences(
+                        ServiceMapBodyReferencesArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.unnamed.get" => {
+            let kind: Option<String> = call_present(operation, input, "kind")?;
+            if kind
+                .as_deref()
+                .is_some_and(|kind| !["banners", "headers", "cookies"].contains(&kind))
+            {
+                return Err(anyhow!("kind must be banners, headers or cookies"));
+            }
+            let limit: u32 = call_present(operation, input, "limit")?.unwrap_or(100);
+            if !(1..=1000).contains(&limit) {
+                return Err(anyhow!("limit must be between 1 and 1000"));
+            }
+            let args = ServiceMapUnnamedArgs {
+                session_id: call_present(operation, input, "session_id")?,
+                kind,
+                limit,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::Unnamed(args)),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.openapi.get" => {
+            let origin: String = call_required(operation, input, "origin")?;
+            let args = ServiceMapOpenApiArgs {
+                session_id: call_required(operation, input, "session_id")?,
+                origin: parse_service_map_origin(&origin).map_err(|message| anyhow!(message))?,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::Openapi(args)),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.parameters.get" => {
+            let text = |field: &str| -> Result<String> { call_required(operation, input, field) };
+            let args = ServiceMapParametersArgs {
+                session_id: call_required(operation, input, "session_id")?,
+                origin: parse_service_map_origin(&text("origin")?)
+                    .map_err(|message| anyhow!(message))?,
+                method: parse_service_map_parameters_method(&text("method")?)
+                    .map_err(|message| anyhow!(message))?,
+                path: parse_service_map_parameters_path(&text("path")?)
+                    .map_err(|message| anyhow!(message))?,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::Parameters(args)),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.html_generators.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::HtmlGenerators(
+                        ServiceMapHtmlGeneratorsArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.socket_peer_matches.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id = parse_service_map_peer_evidence_id(&evidence_id)
+                .map_err(|message| anyhow!(message))?;
+            let in_scope_only = match input.get("in_scope_only") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| anyhow!("field `in_scope_only` must be a boolean"))?,
+            };
+            let max_records = match input.get("max_records") {
+                None => 10_000,
+                Some(value) => value
+                    .as_u64()
+                    .filter(|value| (1..=50_000).contains(value))
+                    .ok_or_else(|| {
+                        anyhow!("field `max_records` must be an integer between 1 and 50000")
+                    })? as usize,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::SocketPeerMatches(
+                        ServiceMapSocketPeerMatchesArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                            in_scope_only,
+                            max_records,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.link_declarations.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::LinkDeclarations(
+                        ServiceMapLinkDeclarationsArgs {
+                            session_id: call_required(operation, input, "session_id")?,
+                            evidence_id,
+                        },
+                    )),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.evidence.get" => {
+            let evidence_id: String = call_required(operation, input, "evidence_id")?;
+            let evidence_id =
+                parse_service_map_evidence_id(&evidence_id).map_err(|message| anyhow!(message))?;
+            Command::Scope {
+                command: TargetCommand::ServiceMapEvidence(ServiceMapEvidenceArgs {
+                    technology_catalog_version: call_service_map_catalog_version(input)?,
+                    session_id: call_required(operation, input, "session_id")?,
+                    evidence_id,
+                    include_socket_peer: match input.get("include_socket_peer") {
+                        None => false,
+                        Some(value) => value.as_bool().ok_or_else(|| {
+                            anyhow!("field `include_socket_peer` must be a boolean")
+                        })?,
+                    },
+                }),
+            }
+        }
         "scope.get" => Command::Scope {
             command: TargetCommand::GetScope(TargetSessionArgs {
                 session_id: call_optional(operation, input, "session_id")?,
@@ -4580,7 +7990,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 }),
             }
         }
-        "replay.close" | "replay.duplicate" => {
+        "replay.close" | "replay.duplicate" | "replay.set_pinned" => {
             let args = ReplaySavedTabArgs {
                 tab_id: call_required(operation, input, "tab_id")?,
                 session_id: if input.get("session_id").is_some() {
@@ -4592,8 +8002,13 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
             Command::Replay {
                 command: if operation == "replay.close" {
                     ReplayCommand::Close(args)
-                } else {
+                } else if operation == "replay.duplicate" {
                     ReplayCommand::Duplicate(args)
+                } else {
+                    ReplayCommand::SetPinned(ReplaySetPinnedArgs {
+                        tab: args,
+                        pinned: call_required(operation, input, "pinned")?,
+                    })
                 },
             }
         }
@@ -4695,6 +8110,32 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 }),
             },
         },
+        "capture.intercept.get" => Command::Capture {
+            command: CaptureCommand::Intercept {
+                command: InterceptCommand::Get(InterceptGetArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "capture.intercept.wait" | "capture.response_intercept.wait" => {
+            let args = InterceptWaitArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                timeout: call_optional(operation, input, "timeout")?.unwrap_or(30),
+                poll_interval: call_optional(operation, input, "poll_interval")?.unwrap_or(200),
+            };
+            Command::Capture {
+                command: if operation == "capture.intercept.wait" {
+                    CaptureCommand::Intercept {
+                        command: InterceptCommand::Wait(args),
+                    }
+                } else {
+                    CaptureCommand::ResponseIntercept {
+                        command: ResponseInterceptCommand::Wait(args),
+                    }
+                },
+            }
+        }
         "capture.intercept.forward" => {
             let request_file = call_optional_path(operation, input, "request_file")?;
             let stdin = call_bool(operation, input, "stdin")?;
@@ -4887,6 +8328,33 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 },
             }
         }
+        "capture.intercept_rule.update" => {
+            let args = InterceptRuleUpdateArgs {
+                id: call_required(operation, input, "id")?,
+                session_id: call_present(operation, input, "session_id")?,
+                scope: call_present(operation, input, "scope")?,
+                host_pattern: call_present(operation, input, "host_pattern")?,
+                path_pattern: call_present(operation, input, "path_pattern")?,
+                method_filter: call_present(operation, input, "method_filter")?,
+                clear_methods: call_present(operation, input, "clear_methods")?.unwrap_or(false),
+                enabled: call_present(operation, input, "enabled")?,
+            };
+            validate_intercept_rule_update(&args)?;
+            Command::Capture {
+                command: CaptureCommand::InterceptRule {
+                    command: InterceptRuleCommand::Update(args),
+                },
+            }
+        }
+        "capture.intercept_rule.set_enabled" => Command::Capture {
+            command: CaptureCommand::InterceptRule {
+                command: InterceptRuleCommand::SetEnabled(InterceptRuleSetEnabledArgs {
+                    id: call_required(operation, input, "id")?,
+                    session_id: call_present(operation, input, "session_id")?,
+                    enabled: call_required(operation, input, "enabled")?,
+                }),
+            },
+        },
         "capture.intercept_rule.delete" => Command::Capture {
             command: CaptureCommand::InterceptRule {
                 command: InterceptRuleCommand::Delete(InterceptRuleDeleteArgs {
@@ -5059,6 +8527,18 @@ fn call_required<T: DeserializeOwned>(operation: &str, input: &Value, field: &st
         .with_context(|| format!("invalid field `{field}` for `{operation}`"))
 }
 
+fn call_present<T: DeserializeOwned>(
+    operation: &str,
+    input: &Value,
+    field: &str,
+) -> Result<Option<T>> {
+    if input.get(field).is_some() {
+        call_required(operation, input, field).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn call_optional<T: DeserializeOwned>(
     operation: &str,
     input: &Value,
@@ -5083,6 +8563,22 @@ fn call_bool(operation: &str, input: &Value, field: &str) -> Result<bool> {
     Ok(call_optional::<bool>(operation, input, field)?.unwrap_or(false))
 }
 
+fn call_service_map_tokens(
+    operation: &str,
+    input: &Value,
+    field: &str,
+    allowed: &[&str],
+) -> Result<Vec<String>> {
+    let values = call_optional::<Vec<String>>(operation, input, field)?.unwrap_or_default();
+    if let Some(value) = values
+        .iter()
+        .find(|value| !allowed.contains(&value.as_str()))
+    {
+        bail!("{field} accepts {}; got {value}", allowed.join(", "));
+    }
+    Ok(values)
+}
+
 fn call_optional_nonzero_usize(
     operation: &str,
     input: &Value,
@@ -5093,6 +8589,20 @@ fn call_optional_nonzero_usize(
         bail!("field `{field}` for `{operation}` must be greater than zero");
     }
     Ok(value)
+}
+
+/// The `--side` values the command line accepts. Unchecked here, `"body"`
+/// passed a dry run and then failed with 400.
+fn call_history_search_sides(operation: &str, input: &Value) -> Result<Vec<String>> {
+    const SIDES: [&str; 4] = ["url", "request-body", "response-body", "headers"];
+    let sides: Vec<String> = call_optional(operation, input, "side")?.unwrap_or_default();
+    if let Some(side) = sides.iter().find(|side| !SIDES.contains(&side.as_str())) {
+        bail!(
+            "field `side` for `{operation}` must contain only {}; got `{side}`",
+            SIDES.join(", ")
+        );
+    }
+    Ok(sides)
 }
 
 fn call_optional_http_status(operation: &str, input: &Value, field: &str) -> Result<Option<u16>> {
@@ -5357,13 +8867,29 @@ async fn main() {
             error.exit();
         }
         Err(error) => {
-            let raw_args: Vec<String> = env::args().skip(1).collect();
+            let raw_args: Vec<_> = env::args_os().skip(1).collect();
             let operation = cli_parse_error_operation(&raw_args);
             let _ = CLI_OUTPUT_CONTEXT.set(CliOutputContext {
                 format: cli_output_format_from_raw_args(&raw_args),
                 operation: operation.clone(),
                 success_envelope: true,
             });
+            // Some clap diagnostics render rejected OS strings lossily. Keep
+            // those argument bytes out of JSON and the stderr fallback alike.
+            let error = if operation.starts_with("target.service_map.")
+                || matches!(
+                    operation.as_str(),
+                    "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+                ) {
+                clap::Error::raw(error.kind(), "Invalid command arguments; inspect the command's --help or input schema. Argument values are omitted.")
+            } else if raw_args.iter().any(|arg| arg.to_str().is_none()) {
+                clap::Error::raw(
+                    clap::error::ErrorKind::InvalidUtf8,
+                    "Command-line arguments must contain valid Unicode.",
+                )
+            } else {
+                error
+            };
             let payload = clap_error_payload(&error);
             if let Err(write_error) = print_error_json(&operation, payload.exit_code, &payload) {
                 eprintln!("sniper-cli: failed to write JSON error output: {write_error}");
@@ -5400,7 +8926,22 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Call(args) if args.operation.starts_with("saved.v1.") => {
             return run_saved_call(api_override, args, dry_run, yes).await;
         }
-        Command::Call(args) => command_from_call_args(args)?,
+        Command::Call(args) => {
+            // These previews promise argument-only execution, including input
+            // acquisition. Never open an input file or block on a stdin stream.
+            if dry_run
+                && is_skill_auto_update_operation(&args.operation)
+                && args
+                    .input
+                    .as_deref()
+                    .is_some_and(|source| source == "-" || source.starts_with('@'))
+            {
+                return Err(CallInputError::Source(
+                    "Automatic-update dry runs require inline JSON in --input; @file and stdin are not opened.".into(),
+                ).into());
+            }
+            command_from_call_args(args)?
+        }
         command => command,
     };
 
@@ -5457,13 +8998,128 @@ async fn run(cli: Cli) -> Result<()> {
                 .collect::<Vec<_>>(),
         ),
         Command::Skills {
+            command: SkillsCommand::Status(args),
+        } => print_json(&skills_status(args)?),
+        Command::Skills {
             command: SkillsCommand::Install(args),
         } => {
             let result = install_skills(args)?;
             print_json(&result)
         }
+        Command::Skills {
+            command: SkillsCommand::UpdatePreview(args),
+        } => print_json(&skills_update_preview(args)?),
+        Command::Skills {
+            command: SkillsCommand::AutoUpdateStatus(args),
+        } => {
+            let (agent, _) = stored_skill_agent(args);
+            print_json(&sniper::skill_auto_update::status(&cli_data_dir(), agent)?)
+        }
+        Command::Skills {
+            command: SkillsCommand::EnableAutoUpdates(args),
+        } => {
+            let (agent, root, bundled) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_auto_update::enable(
+                &cli_data_dir(),
+                agent,
+                &root,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+                args.policy_revision,
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::DisableAutoUpdates(args),
+        } => {
+            let (agent, _) = stored_skill_agent(args);
+            print_json(&sniper::skill_auto_update::disable(&cli_data_dir(), agent)?)
+        }
+        Command::Skills {
+            command: SkillsCommand::AutoUpdateOnce(args),
+        } => {
+            let (agent, bundled) = stored_skill_agent(args);
+            print_json(&sniper::skill_auto_update::run_once(
+                &cli_data_dir(),
+                agent,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::Enroll(args),
+        } => {
+            let (agent, root, bundled) = single_skill_target(args)?;
+            print_json(&sniper::skill_managed::enroll_skill(
+                agent,
+                &root,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::StageUpdate(args),
+        } => {
+            let (agent, root, bundled) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_managed::stage_skill_update(
+                agent,
+                &root,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+                &args.staging_dir,
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::ApplyUpdate(args),
+        } => {
+            let (agent, root, bundled) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_activation::apply_skill_update(
+                agent,
+                &root,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+                &args.staging_dir,
+                &args.operation_id,
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::UpdateResult(args),
+        } => {
+            let (agent, root, _) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_activation::update_result(
+                agent,
+                &root,
+                &args.operation_id,
+            )?)
+        }
+        Command::Skills {
+            command: SkillsCommand::RollbackUpdate(args),
+        } => {
+            let (agent, root, _) = single_skill_target(args.target)?;
+            print_json(&sniper::skill_activation::rollback_skill_update(
+                agent,
+                &root,
+                &args.operation_id,
+            )?)
+        }
         command => {
-            let api = ApiClient::discover(api_override).await?;
+            let api = if matches!(
+                command.operation_name(),
+                "target.service_map.get"
+                    | "target.service_map.evidence.get"
+                    | "target.service_map.body_references.get"
+                    | "target.service_map.html_generators.get"
+                    | "target.service_map.link_declarations.get"
+                    | "target.service_map.socket_peer_matches.get"
+                    | "target.service_map.parameters.get"
+                    | "target.service_map.openapi.get"
+                    | "target.service_map.unnamed.get"
+                    | "capture.http.upstream_peer.get"
+                    | "capture.http.upstream_peer.set"
+            ) {
+                discover_service_map_api(api_override).await?
+            } else {
+                ApiClient::discover(api_override).await?
+            };
             match command {
                 Command::Session { command } => handle_session(api, command).await,
                 Command::Capture { command } => match command {
@@ -5504,9 +9160,156 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn validate_skill_root_selection(
+    codex_selected: bool,
+    claude_selected: bool,
+    codex_dir: &Option<PathBuf>,
+    claude_dir: &Option<PathBuf>,
+    allow_all: bool,
+) -> Result<()> {
+    for (agent, selected, root) in [
+        ("codex", codex_selected, codex_dir),
+        ("claude", claude_selected, claude_dir),
+    ] {
+        if root.is_some() && !selected {
+            let all = if allow_all {
+                " or --all (all=true)"
+            } else {
+                ""
+            };
+            bail!("invalid directory override: --{agent}-dir ({agent}_dir) requires --{agent} ({agent}=true){all}; select that agent or omit its directory override");
+        }
+    }
+    Ok(())
+}
+
 fn validate_command_preflight(command: &Command) -> Result<()> {
+    match command {
+        Command::Capture {
+            command:
+                CaptureCommand::Intercept {
+                    command: InterceptCommand::Wait(args),
+                },
+        }
+        | Command::Intercept {
+            command: InterceptCommand::Wait(args),
+        }
+        | Command::Capture {
+            command:
+                CaptureCommand::ResponseIntercept {
+                    command: ResponseInterceptCommand::Wait(args),
+                },
+        } => {
+            intercept_wait_deadline(args.timeout)?;
+        }
+        _ => {}
+    }
+    if let Command::Capture {
+        command:
+            CaptureCommand::InterceptRule {
+                command: InterceptRuleCommand::Update(args),
+            },
+    } = command
+    {
+        validate_intercept_rule_update(args)?;
+    }
+    if let Command::Schema { operation, .. }
+    | Command::Examples {
+        operation: Some(operation),
+    } = command
+    {
+        operation_spec(operation).ok_or_else(|| anyhow!("unknown operation `{operation}`"))?;
+    }
+
+    if let Command::Session {
+        command: SessionCommand::Create(args),
+    } = command
+    {
+        validate_session_creation_name(args.name.as_deref())?;
+    }
+
+    if let Command::Skills {
+        command:
+            SkillsCommand::Install(args)
+            | SkillsCommand::Status(args)
+            | SkillsCommand::UpdatePreview(args),
+    } = command
+    {
+        if !(args.codex || args.claude || args.all) {
+            bail!("must select at least one destination with --codex, --claude, or --all");
+        }
+        validate_skill_root_selection(
+            args.codex || args.all,
+            args.claude || args.all,
+            &args.codex_dir,
+            &args.claude_dir,
+            true,
+        )?;
+        for path in [&args.codex_dir, &args.claude_dir].into_iter().flatten() {
+            validate_skill_cli_path(path)?;
+        }
+    }
+
+    if let Command::Skills {
+        command:
+            SkillsCommand::Enroll(args)
+            | SkillsCommand::EnableAutoUpdates(SkillsEnableAutoUpdatesArgs { target: args, .. })
+            | SkillsCommand::StageUpdate(SkillsStageArgs { target: args, .. })
+            | SkillsCommand::ApplyUpdate(SkillsApplyArgs { target: args, .. })
+            | SkillsCommand::UpdateResult(SkillsOperationArgs { target: args, .. })
+            | SkillsCommand::RollbackUpdate(SkillsOperationArgs { target: args, .. }),
+    } = command
+    {
+        if args.codex == args.claude {
+            bail!("must select exactly one destination with --codex or --claude");
+        }
+        validate_skill_root_selection(
+            args.codex,
+            args.claude,
+            &args.codex_dir,
+            &args.claude_dir,
+            false,
+        )?;
+        for path in [&args.codex_dir, &args.claude_dir].into_iter().flatten() {
+            validate_skill_cli_path(path)?;
+        }
+    }
+    if let Command::Skills {
+        command:
+            SkillsCommand::AutoUpdateStatus(args)
+            | SkillsCommand::DisableAutoUpdates(args)
+            | SkillsCommand::AutoUpdateOnce(args),
+    } = command
+    {
+        if args.codex == args.claude {
+            bail!("must select exactly one destination with --codex or --claude");
+        }
+    }
+    if let Command::Skills {
+        command:
+            SkillsCommand::StageUpdate(SkillsStageArgs { staging_dir, .. })
+            | SkillsCommand::ApplyUpdate(SkillsApplyArgs { staging_dir, .. }),
+    } = command
+    {
+        validate_skill_cli_path(staging_dir)?;
+    }
+    if let Command::Skills {
+        command:
+            SkillsCommand::ApplyUpdate(SkillsApplyArgs { operation_id, .. })
+            | SkillsCommand::UpdateResult(SkillsOperationArgs { operation_id, .. })
+            | SkillsCommand::RollbackUpdate(SkillsOperationArgs { operation_id, .. }),
+    } = command
+    {
+        if !sniper::skill_activation::valid_operation_id(operation_id) {
+            bail!("operation_id must be a canonical lowercase hyphenated UUID");
+        }
+    }
+
     if let Command::Replay {
-        command: ReplayCommand::Close(args) | ReplayCommand::Duplicate(args),
+        command:
+            ReplayCommand::Close(args)
+            | ReplayCommand::Duplicate(args)
+            | ReplayCommand::SetPinned(ReplaySetPinnedArgs { tab: args, .. }),
     } = command
     {
         if args.tab_id.trim().is_empty() || args.tab_id.len() > 128 {
@@ -5675,7 +9478,17 @@ fn proxy_chain_output(runtime: &Value) -> Value {
     chain
 }
 
-async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
+async fn handle_session(mut api: ApiClient, command: SessionCommand) -> Result<()> {
+    if matches!(
+        &command,
+        SessionCommand::Create(_)
+            | SessionCommand::Switch(_)
+            | SessionCommand::Delete(_)
+            | SessionCommand::Rename(_)
+    ) {
+        api.client = saved_configuration_write_client()?;
+        api.session_metadata_write_errors = true;
+    }
     match command {
         SessionCommand::List => {
             let sessions: Vec<SessionSummary> = api.get_json("/api/sessions").await?;
@@ -5691,6 +9504,7 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
             let session: SessionSummary = api
                 .post_json(&format!("/api/sessions/{}/activate", args.id), &json!({}))
                 .await?;
+            validate_session_metadata_response_id(&session, args.id)?;
             print_json(&session)
         }
         SessionCommand::Delete(args) => {
@@ -5709,6 +9523,7 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
                     Some(json!({"name": args.name})),
                 )
                 .await?;
+            validate_session_metadata_response_id(&session, args.id)?;
             print_json(&session)
         }
         SessionCommand::Reveal(args) => {
@@ -5718,6 +9533,16 @@ async fn handle_session(api: ApiClient, command: SessionCommand) -> Result<()> {
             print_json(&result)
         }
     }
+}
+
+fn validate_session_metadata_response_id(
+    session: &SessionSummary,
+    requested_id: Uuid,
+) -> Result<()> {
+    if session.id != requested_id {
+        bail!("session metadata response did not match the requested session; mutation outcome is unknown; inspect current state before retrying");
+    }
+    Ok(())
 }
 
 async fn active_session_id(api: &ApiClient) -> Result<Option<Uuid>> {
@@ -5799,6 +9624,8 @@ fn auto_replace_write_session_id(
 
 async fn handle_history(api: ApiClient, command: HistoryCommand) -> Result<()> {
     match command {
+        HistoryCommand::UpstreamPeer { command } => handle_upstream_peer(api, command).await,
+        HistoryCommand::Retention { command } => handle_history_retention(api, command).await,
         HistoryCommand::Select(args) => {
             let result: Value = api
                 .post_json("/api/transactions/select", &args.payload())
@@ -5979,8 +9806,1639 @@ fn oast_fields_for_output(
     fields
 }
 
+#[derive(Debug)]
+struct ServiceMapCliError {
+    code: &'static str,
+    message: &'static str,
+    status: Option<u16>,
+}
+
+impl fmt::Display for ServiceMapCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+impl std::error::Error for ServiceMapCliError {}
+
+fn service_map_error(code: &'static str, message: &'static str) -> anyhow::Error {
+    ServiceMapCliError {
+        code,
+        message,
+        status: None,
+    }
+    .into()
+}
+
+fn service_map_runtime_state(data_dir: &Path) -> Result<Option<RuntimeStateSnapshot>> {
+    let invalid = || {
+        service_map_error("API_UNAVAILABLE", "Could not read valid local runtime identity for Service Map; existing state was preserved")
+    };
+    let path = sniper::runtime_state::runtime_state_path(data_dir);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(invalid()),
+    };
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err(invalid());
+    }
+    // Runtime-state replacements are atomic. Unlike the general loader, this
+    // passive path creates no lock file and never repairs or moves invalid state.
+    let mut file = fs::File::open(&path).map_err(|_| invalid())?;
+    let bytes =
+        read_limited_to_end(&mut file, "runtime identity", 64 * 1024).map_err(|_| invalid())?;
+    let mut snapshot: RuntimeStateSnapshot =
+        serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let proxy_addr: std::net::SocketAddr = snapshot.proxy_addr.parse().map_err(|_| invalid())?;
+    let ui_addr: std::net::SocketAddr = snapshot.ui_addr.parse().map_err(|_| invalid())?;
+    snapshot.proxy_addr = proxy_addr.to_string();
+    snapshot.ui_addr = sniper::runtime_state::advertise_local_api_addr(ui_addr).to_string();
+    Ok(Some(snapshot))
+}
+
+async fn discover_service_map_api(cli_api: Option<String>) -> Result<ApiClient> {
+    let explicit = cli_api.or_else(|| {
+        env::var("SNIPER_API_ADDR")
+            .ok()
+            .filter(|api| !api.trim().is_empty())
+    });
+    let data_dir = cli_data_dir();
+    let runtime_state = if explicit.is_none() {
+        service_map_runtime_state(&data_dir)?
+    } else {
+        None
+    };
+    let raw = explicit
+        .or_else(|| {
+            runtime_state
+                .as_ref()
+                .map(RuntimeStateSnapshot::api_base_url)
+        })
+        .ok_or_else(|| {
+            service_map_error(
+                "API_UNAVAILABLE",
+                "Could not discover the Service Map API; pass --api or start Sniper Desktop",
+            )
+        })?;
+    let base_url = normalize_api_base_url(&raw).map_err(|_| service_map_error(
+        "INVALID_INPUT", "Invalid Service Map API address; supply an HTTP(S) origin without credentials, path, query, or fragment",
+    ))?;
+    let client = service_map_read_client()?;
+    let api = ApiClient {
+        base_url,
+        client: client.clone(),
+        long_client: client,
+        session_metadata_write_errors: false,
+    };
+    let probe_client = service_map_client(SNIPER_API_PROBE_TIMEOUT)?;
+    let payload: Value = service_map_get(&api, &probe_client, "/api/settings").await?;
+    let expected = runtime_state
+        .as_ref()
+        .map(|runtime_state| SniperApiProbeExpectation {
+            runtime_state,
+            data_dir: &data_dir,
+        });
+    validate_sniper_settings_probe(&payload, expected).map_err(|_| service_map_error(
+        "INVALID_RESPONSE", "The selected Service Map API did not match the expected Sniper identity; existing runtime state was preserved",
+    ))?;
+    Ok(api)
+}
+
+fn service_map_read_client() -> Result<reqwest::Client> {
+    service_map_client(CLI_API_TIMEOUT)
+}
+
+fn service_map_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(timeout)
+        .build()
+        .map_err(|_| {
+            service_map_error(
+                "API_UNAVAILABLE",
+                "Could not prepare the Service Map read client",
+            )
+        })
+}
+
+async fn service_map_get<T: DeserializeOwned>(
+    api: &ApiClient,
+    client: &reqwest::Client,
+    path: &str,
+) -> Result<T> {
+    service_map_get_with_catalog(api, client, path, None).await
+}
+
+fn service_map_refresh_error(
+    path: &str,
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ServiceMapCliError> {
+    if !path.starts_with("/api/target/service-map?") {
+        return None;
+    }
+    let mut values = headers.get_all(SERVICE_MAP_ERROR_HEADER).iter();
+    let token = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    // Only this endpoint's fixed header contract may select a diagnostic.
+    // Never classify server prose, combined headers, or response bodies.
+    let (code, message) = match (status.as_u16(), token) {
+        (429, "busy") => (
+            "SERVICE_MAP_BUSY",
+            "A Service Map refresh is already running; wait for it to finish before deliberately refreshing again",
+        ),
+        (422, "scope_work_limit") => (
+            "SERVICE_MAP_SCOPE_WORK_LIMIT",
+            "Service Map scope matching exceeded the work limit; use a smaller --max-records window or deliberately simplify scope rules",
+        ),
+        (409, "session_changed") => (
+            "SERVICE_MAP_SESSION_CHANGED",
+            "The selected session changed while building the Service Map; deliberately refresh the same session",
+        ),
+        (409, "scope_changed") => (
+            "SERVICE_MAP_SCOPE_CHANGED",
+            "Scope changed while building the Service Map; deliberately refresh to use the current scope",
+        ),
+        (409, "history_changed") => (
+            "SERVICE_MAP_HISTORY_CHANGED",
+            "Retained history changed while building the Service Map; deliberately refresh to use the current history",
+        ),
+        (500, "build_failed") => (
+            "SERVICE_MAP_BUILD_FAILED",
+            "The selected API could not build the Service Map",
+        ),
+        _ => return None,
+    };
+    Some(ServiceMapCliError {
+        code,
+        message,
+        status: Some(status.as_u16()),
+    })
+}
+
+async fn service_map_get_with_catalog<T: DeserializeOwned>(
+    api: &ApiClient,
+    client: &reqwest::Client,
+    path: &str,
+    catalog_version: Option<u32>,
+) -> Result<T> {
+    let mut request = client.get(api.url(path));
+    if let Some(version) = catalog_version {
+        request = request.header(SERVICE_MAP_CATALOG_HEADER, version.to_string());
+    }
+    let response = request.send().await.map_err(|_| {
+        service_map_error(
+            "API_UNAVAILABLE",
+            "Could not read Service Map metadata from the selected API",
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        if let Some(error) = service_map_refresh_error(path, status, response.headers()) {
+            return Err(error.into());
+        }
+        if status == StatusCode::NOT_FOUND
+            && path.starts_with("/api/target/service-map/html-generators?")
+        {
+            return Err(ServiceMapCliError {
+                code: "UNSUPPORTED_FEATURE",
+                message: "The selected API does not support retained HTML generator inspection; update the app to use this feature",
+                status: Some(404),
+            }.into());
+        }
+        if status == StatusCode::NOT_FOUND
+            && path.starts_with("/api/target/service-map/socket-peer-matches?")
+        {
+            return Err(ServiceMapCliError {
+                code: "UNSUPPORTED_FEATURE",
+                message: "The selected API does not support recorded socket peer matches; update the app to use this feature",
+                status: Some(404),
+            }.into());
+        }
+        if path.starts_with("/api/target/service-map/openapi?") {
+            if status == StatusCode::NOT_FOUND {
+                return Err(ServiceMapCliError {
+                    code: "UNSUPPORTED_FEATURE",
+                    message: "The selected API does not describe origins in OpenAPI; update the app to use this feature",
+                    status: Some(404),
+                }
+                .into());
+            }
+            if status == StatusCode::CONFLICT {
+                return Err(ServiceMapCliError {
+                    code: "SESSION_INACTIVE",
+                    message: "OpenAPI reads the active session only; activate that session first",
+                    status: Some(409),
+                }
+                .into());
+            }
+        }
+        if status == StatusCode::NOT_FOUND
+            && path.starts_with("/api/target/service-map/link-declarations?")
+        {
+            return Err(ServiceMapCliError {
+                code: "UNSUPPORTED_FEATURE",
+                message: "The selected API does not support retained Link declaration inspection; update the app to use this feature",
+                status: Some(404),
+            }.into());
+        }
+        return Err(ServiceMapCliError {
+            code: if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            message: if status.is_redirection() {
+                "Service Map API redirects are not followed"
+            } else {
+                "The selected API could not return Service Map metadata"
+            },
+            status: Some(status.as_u16()),
+        }
+        .into());
+    }
+    if path.starts_with("/api/target/service-map/socket-peer-matches?") {
+        use sniper::service_map_peer_matches::MAX_PROJECTION_BYTES;
+        let invalid = || {
+            service_map_error(
+                "INVALID_RESPONSE",
+                "The selected API returned invalid or oversized recorded socket peer matches",
+            )
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_PROJECTION_BYTES as u64)
+        {
+            return Err(invalid());
+        }
+        // Bound the encoded response before JSON allocation, including chunked
+        // responses which cannot be checked from Content-Length alone.
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+            if chunk.len() > MAX_PROJECTION_BYTES.saturating_sub(bytes.len()) {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return serde_json::from_slice(&bytes).map_err(|_| invalid());
+    }
+    response.json().await.map_err(|_| {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned invalid Service Map metadata",
+        )
+    })
+}
+
+fn service_map_safe_path(path: &str) -> bool {
+    path.starts_with('/') && !path.contains(['?', '#']) && !path.chars().any(char::is_control)
+}
+
+fn service_map_safe_origin(origin: &str) -> bool {
+    sniper::service_map::canonical_origin(origin).as_deref() == Some(origin)
+}
+
+fn service_map_technology_response_valid(
+    result: &ServiceMap,
+    catalog_version: CatalogVersion,
+) -> bool {
+    use sniper::service_map_technology::{
+        MAX_OBSERVATIONS, MAX_OBSERVATIONS_PER_ORIGIN, MAX_OBSERVATIONS_PER_ROW,
+        MAX_TOKEN_CANDIDATES_PER_ROW, MAX_VERSION_BYTES,
+    };
+    let limits = &result.snapshot.limits;
+    if ![
+        (
+            limits.technology_observations_per_row,
+            MAX_OBSERVATIONS_PER_ROW,
+        ),
+        (
+            limits.technology_observations_per_origin,
+            MAX_OBSERVATIONS_PER_ORIGIN,
+        ),
+        (limits.technology_observations, MAX_OBSERVATIONS),
+        (limits.technology_version_bytes, MAX_VERSION_BYTES),
+        (
+            limits.technology_token_candidates_per_row,
+            MAX_TOKEN_CANDIDATES_PER_ROW,
+        ),
+    ]
+    .into_iter()
+    .all(|(actual, expected)| actual.is_none_or(|value| value == expected))
+    {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut row_sources = std::collections::HashMap::new();
+    let session = result.session_id.to_string();
+    let generation = result.snapshot.generation.to_string();
+    for origin in &result.origins {
+        let Some(observations) = &origin.technology_observations else {
+            continue;
+        };
+        total = total.saturating_add(observations.len());
+        if total > MAX_OBSERVATIONS || observations.len() > MAX_OBSERVATIONS_PER_ORIGIN {
+            return false;
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for observation in observations {
+            let mut rows = std::collections::HashSet::new();
+            if !observation.is_valid_for_catalog(catalog_version)
+                || observation.row_count > origin.request_count
+                || observation.first_seen < origin.first_seen
+                || observation.last_seen > origin.last_seen
+                || !keys.insert((
+                    observation.product_id.as_str(),
+                    observation.header_name.as_str(),
+                    observation.reported_version.as_deref(),
+                    observation.version_status,
+                ))
+                || !observation.evidence.iter().all(|token| {
+                    if parse_service_map_evidence_id(token).is_err() {
+                        return false;
+                    }
+                    let fields: Vec<_> = token.split('.').collect();
+                    fields[1] == session
+                        && fields[2] == generation
+                        && rows.insert(fields[3])
+                        && row_sources
+                            .insert(fields[3], (token.as_str(), origin.origin.as_str()))
+                            .is_none_or(|previous| {
+                                previous == (token.as_str(), origin.origin.as_str())
+                            })
+                })
+            {
+                return false;
+            }
+        }
+    }
+    // Existing evidence may sample a different subset of rows. When a sequence
+    // is shared, it must identify the same retained row revision everywhere.
+    for origin in &result.origins {
+        let evidence = origin
+            .endpoints
+            .iter()
+            .flat_map(|item| &item.evidence)
+            .chain(
+                origin
+                    .technology_clues
+                    .iter()
+                    .flat_map(|item| &item.evidence),
+            )
+            .chain(origin.redirects.iter().flat_map(|item| &item.evidence))
+            .chain(origin.header_links.iter().flat_map(|item| &item.evidence));
+        for token in evidence {
+            let fields: Vec<_> = token.split('.').collect();
+            if fields.len() == 6
+                && row_sources
+                    .get(fields[3])
+                    .is_some_and(|expected| *expected != (token.as_str(), origin.origin.as_str()))
+            {
+                return false;
+            }
+        }
+    }
+    (!result
+        .snapshot
+        .stopped_by
+        .iter()
+        .any(|reason| reason == "technology_observations_map_limit")
+        || total == MAX_OBSERVATIONS)
+        && (!result
+            .snapshot
+            .stopped_by
+            .iter()
+            .any(|reason| reason == "technology_observations_per_origin_limit")
+            || result.origins.iter().any(|origin| {
+                origin
+                    .technology_observations
+                    .as_ref()
+                    .is_some_and(|items| items.len() == MAX_OBSERVATIONS_PER_ORIGIN)
+            }))
+}
+
+fn service_map_row_technology_valid(
+    row: &sniper::service_map::ServiceMapRow,
+    catalog_version: CatalogVersion,
+) -> bool {
+    use sniper::service_map_technology::MAX_OBSERVATIONS_PER_ROW;
+    if row.metadata_complete
+        && row
+            .omitted
+            .iter()
+            .any(|reason| reason == "technology_token_scan_limit")
+    {
+        return false;
+    }
+    let Some(observations) = &row.technology_observations else {
+        return true;
+    };
+    let mut ranges = std::collections::HashMap::<usize, Vec<(usize, usize)>>::new();
+    let mut headers = std::collections::HashMap::new();
+    observations.len() <= MAX_OBSERVATIONS_PER_ROW
+        && row.metadata_complete == row.omitted.is_empty()
+        && (!row
+            .omitted
+            .iter()
+            .any(|reason| reason == "technology_observations_limit")
+            || observations.len() == MAX_OBSERVATIONS_PER_ROW)
+        && observations.iter().all(|observation| {
+            observation.is_valid_for_catalog(catalog_version)
+                && std::iter::once(observation.product_span)
+                    .chain(observation.version_span)
+                    .all(|span| {
+                        let retained = ranges.entry(observation.header_index).or_default();
+                        if retained
+                            .iter()
+                            .any(|(start, end)| span.start < *end && *start < span.end)
+                        {
+                            return false;
+                        }
+                        retained.push((span.start, span.end));
+                        true
+                    })
+                && headers
+                    .insert(observation.header_index, observation.header_name.as_str())
+                    .is_none_or(|name| name == observation.header_name)
+        })
+}
+
+fn service_map_response_catalog(marker: Option<u32>, requested: u32) -> Result<CatalogVersion> {
+    match marker {
+        None => Ok(CatalogVersion::V1),
+        Some(version) if version == requested => {
+            CatalogVersion::from_number(version).ok_or_else(|| {
+                service_map_error(
+                    "INVALID_RESPONSE",
+                    "Service Map returned an unsupported technology catalog",
+                )
+            })
+        }
+        Some(_) => Err(service_map_error(
+            "INVALID_RESPONSE",
+            "Service Map technology catalog does not match the requested catalog",
+        )),
+    }
+}
+
+fn warn_legacy_service_map_catalog(marker: Option<u32>) {
+    if marker.is_none() {
+        eprintln!("{SERVICE_MAP_LEGACY_CATALOG_WARNING}");
+    }
+}
+
+fn validate_service_map_response(
+    result: &ServiceMap,
+    args: &ServiceMapArgs,
+    session_id: Uuid,
+) -> Result<()> {
+    let catalog_version = service_map_response_catalog(
+        result.technology_catalog_version,
+        args.technology_catalog_version,
+    )?;
+    let snapshot = &result.snapshot;
+    let valid = result.schema_version == 1
+        && service_map_technology_response_valid(result, catalog_version)
+        && result.session_id == session_id
+        && result.in_scope_only == args.in_scope_only
+        && result.origin_filter == args.origin
+        && snapshot.window_order == "newest_capture_sequence"
+        // A whole-history read has no window: it considers every retained row.
+        && (args.all_rows || snapshot.limits.max_records == args.max_records)
+        && (args.all_rows || snapshot.considered_rows <= args.max_records)
+        && snapshot.considered_rows <= snapshot.retained_rows
+        && snapshot.projected_rows <= snapshot.considered_rows
+        && snapshot.complete == snapshot.stopped_by.is_empty()
+        && snapshot.origin_count == result.origins.len()
+        && result.clients.len() <= 16
+        && result.clients.iter().all(|client| {
+            let names = sniper::service_map_clients::names();
+            sniper::service_map_clients::KINDS.contains(&client.kind.as_str())
+                && names.contains(&client.name.as_str())
+                && client.os.as_deref().is_none_or(|os| {
+                    sniper::service_map_clients::SYSTEMS.contains(&os)
+                })
+                && client.request_count > 0
+                && client.origins.len() <= 64
+                // Each origin's rows are some of the client's, and its own
+                // visits some of those.
+                && client.origins.iter().map(|origin| origin.request_count).sum::<usize>()
+                    <= client.request_count
+                && client.origins.iter().all(|origin| {
+                    service_map_safe_origin(&origin.origin)
+                        && origin.request_count > 0
+                        && origin
+                            .entry_kinds
+                            .keys()
+                            .all(|kind| sniper::service_map::REQUEST_KINDS.contains(&kind.as_str()))
+                        && origin.entry_kinds.values().sum::<usize>() <= origin.request_count
+                })
+        })
+        && snapshot.endpoint_count
+            == result
+                .origins
+                .iter()
+                .map(|origin| origin.endpoints.len())
+                .sum::<usize>()
+        && result.origins.iter().all(|origin| {
+            service_map_safe_origin(&origin.origin)
+                && matches!(origin.scheme.as_str(), "http" | "https")
+                && (!args.in_scope_only || origin.in_scope)
+                && args
+                    .origin
+                    .as_ref()
+                    .is_none_or(|filter| *filter == origin.origin)
+                && origin.endpoints.iter().all(|endpoint| {
+                    service_map_safe_path(&endpoint.path)
+                        && endpoint
+                            .path_group
+                            .as_deref()
+                            .is_none_or(service_map_safe_path)
+                })
+                && origin.technology_clues.iter().all(|clue| {
+                    clue.source == "response_header" && clue.confidence == "observed_header"
+                })
+                && origin.redirects.iter().all(|redirect| {
+                    redirect.relationship == "redirect_instruction"
+                        && redirect.source == "response_location_header"
+                        && service_map_safe_origin(&redirect.target_origin)
+                        && service_map_safe_path(&redirect.target_path)
+                })
+                && origin.header_links.iter().all(|link| {
+                    link.source == "request_header_declaration"
+                        && matches!(
+                            link.relationship.as_str(),
+                            "origin_header" | "referer_header"
+                        )
+                        && service_map_safe_origin(&link.source_origin)
+                        && link
+                            .request_kinds
+                            .keys()
+                            .all(|kind| sniper::service_map::REQUEST_KINDS.contains(&kind.as_str()))
+                        // Every count is a share of the same rows.
+                        && link.request_kinds.values().sum::<usize>() == link.request_count
+                        && link.cors_credentials_count <= link.cors_allowed_count
+                        && link.cors_allowed_count <= link.request_count
+                })
+                && origin
+                    .favicon
+                    .as_deref()
+                    .is_none_or(|token| token.len() <= 200 && token.starts_with("v1."))
+                && [
+                    &origin.unnamed.banners,
+                    &origin.unnamed.headers,
+                    &origin.unnamed.cookies,
+                ]
+                .iter()
+                .all(|signals| {
+                    signals.len() <= 16
+                        && signals.iter().all(|signal| {
+                            signal.row_count > 0
+                                && (1..=80).contains(&signal.value.len())
+                                && signal.value.bytes().all(|b| (0x20..0x7f).contains(&b))
+                        })
+                })
+                && origin.auth.iter().all(|method| {
+                    sniper::service_map_auth::KINDS.contains(&method.kind.as_str())
+                        && method.row_count > 0
+                        && method.name.as_deref().is_none_or(|name| {
+                            !name.is_empty()
+                                && name.len() <= 64
+                                && name
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                        })
+                })
+                && origin.endpoints.iter().all(|endpoint| {
+                    endpoint
+                        .auth
+                        .iter()
+                        .all(|kind| sniper::service_map_auth::KINDS.contains(&kind.as_str()))
+                })
+                && origin.server_technologies.iter().all(|item| {
+                    !item.product_id.is_empty()
+                        && item.product_id.len() <= 40
+                        && item
+                            .product_id
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                        && !item.name.is_empty()
+                        && item.name.len() <= 40
+                        && sniper::service_map_servers::CATEGORIES.contains(&item.category.as_str())
+                        && !item.signals.is_empty()
+                        && item.signals.iter().all(|signal| {
+                            sniper::service_map_servers::SIGNALS.contains(&signal.as_str())
+                        })
+                        && item.version.as_deref().is_none_or(|version| {
+                            version.len() <= 40 && version.starts_with(|c: char| c.is_ascii_digit())
+                        })
+                        && item.row_count > 0
+                })
+                && origin.front_technologies.iter().all(|item| {
+                    !item.product_id.is_empty()
+                        && item.product_id.len() <= 40
+                        && item
+                            .product_id
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                        && item.name.len() <= 40
+                        // A brand may open with a digit: 6sense, 33Across.
+                        && item.name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                        && item.name.bytes().all(|b| {
+                            b.is_ascii_alphanumeric()
+                                || matches!(b, b' ' | b'.' | b'!' | b'+' | b'_' | b'-')
+                        })
+                        && sniper::service_map_libraries::CATEGORIES
+                            .contains(&item.category.as_str())
+                        && item.version.as_deref().is_none_or(|version| {
+                            version.len() <= 40
+                                && version.starts_with(|c: char| c.is_ascii_digit())
+                                && version.bytes().all(|b| {
+                                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')
+                                })
+                        })
+                        && service_map_safe_origin(&item.source_origin)
+                        && item.row_count > 0
+                })
+        });
+    if !valid {
+        return Err(service_map_error("INVALID_RESPONSE", "Service Map metadata does not match the requested session, filters, limits, or safe response contract"));
+    }
+    Ok(())
+}
+
+fn validate_service_map_evidence_response(
+    result: &ServiceMapEvidence,
+    args: &ServiceMapEvidenceArgs,
+) -> Result<()> {
+    let catalog_version = service_map_response_catalog(
+        result.technology_catalog_version,
+        args.technology_catalog_version,
+    )?;
+    let token_fields: Vec<_> = args.evidence_id.split('.').collect();
+    let token_valid = parse_service_map_evidence_id(&args.evidence_id).is_ok();
+    let row_valid = match (
+        result.available,
+        result.row.as_ref(),
+        result.reason.as_deref(),
+    ) {
+        (true, Some(row), None) => {
+            token_valid
+                && row.evidence_id == args.evidence_id
+                && token_fields[1] == args.session_id.to_string()
+                && token_fields[3] == row.sequence
+                && token_fields[5] == row.record_id.to_string()
+                && row
+                    .sequence
+                    .parse::<u64>()
+                    .is_ok_and(|sequence| sequence.to_string() == row.sequence)
+                && service_map_safe_origin(&row.origin)
+                && matches!(row.scheme.as_str(), "http" | "https")
+                && service_map_safe_path(&row.path)
+                && service_map_row_technology_valid(row, catalog_version)
+                && row.redirect.as_ref().is_none_or(|redirect| {
+                    service_map_safe_origin(&redirect.target_origin)
+                        && service_map_safe_path(&redirect.target_path)
+                })
+                && row.header_links.iter().all(|link| {
+                    service_map_safe_origin(&link.source_origin)
+                        && matches!(
+                            link.relationship.as_str(),
+                            "origin_header" | "referer_header"
+                        )
+                })
+        }
+        // Backend absence reasons are fixed protocol codes, never diagnostic
+        // text. Reject unknown values rather than echoing captured data here.
+        (false, None, Some(reason)) => matches!(
+            reason,
+            "invalid_evidence_id"
+                | "session_mismatch"
+                | "stale_generation"
+                | "record_missing"
+                | "record_changed"
+                | "metadata_unavailable"
+                | "session_source_changed"
+        ),
+        _ => false,
+    };
+    let peer_valid = match result.socket_peer.as_ref() {
+        None => !args.include_socket_peer || !result.available,
+        Some(peer) if args.include_socket_peer && result.available => {
+            match (&peer.status, peer.observation.as_ref()) {
+                (ServiceMapSocketPeerStatus::NotRecorded, None) => true,
+                (ServiceMapSocketPeerStatus::Observed, Some(observation)) => {
+                    observation.is_valid() && observation.address.is_some()
+                }
+                (ServiceMapSocketPeerStatus::Unavailable, Some(observation)) => {
+                    observation.is_valid() && observation.address.is_none()
+                }
+                _ => false,
+            }
+        }
+        Some(_) => false,
+    };
+    if result.schema_version != 1
+        || result.session_id != args.session_id
+        || result.evidence_id != args.evidence_id
+        || result.source != "captured_http_metadata"
+        || !peer_valid
+        || !row_valid
+    {
+        return Err(service_map_error("INVALID_RESPONSE", "Service Map evidence does not match the requested session, token, availability, or safe row contract"));
+    }
+    Ok(())
+}
+
+fn service_map_body_safe_origin(origin: &str) -> bool {
+    origin.len() <= sniper::service_map_body::MAX_CANDIDATE_BYTES
+        && Url::parse(origin).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.origin().ascii_serialization() == origin
+        })
+}
+
+fn validate_service_map_body_references_response(
+    result: &ServiceMapBodyReferences,
+    args: &ServiceMapBodyReferencesArgs,
+) -> Result<()> {
+    use sniper::service_map_body::{
+        MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_OFFSETS_PER_ORIGIN, MAX_ORIGINS, MAX_SCAN_BYTES,
+        MAX_SERIALIZED_ROW_BYTES,
+    };
+    let token_fields: Vec<_> = args.evidence_id.split('.').collect();
+    let token_valid = parse_service_map_evidence_id(&args.evidence_id).is_ok();
+    let partial_reasons = [
+        "capture_preview_truncated",
+        "scan_prefix_truncated",
+        "candidate_limit",
+        "candidate_bytes",
+        "origin_limit",
+        "offset_limit",
+    ];
+    let unsupported_reasons = [
+        "unsupported_metadata",
+        "metadata_limit",
+        "unsupported_content_type",
+        "unsupported_body_encoding",
+        "unsupported_content_encoding",
+    ];
+    let unavailable_reasons = [
+        "invalid_evidence_id",
+        "session_mismatch",
+        "stale_generation",
+        "record_missing",
+        "record_changed",
+        "body_identity_unverifiable",
+        "body_storage_unavailable",
+        "body_read_failed",
+        "serialized_row_limit",
+        "malformed_retained_row",
+        "response_unavailable",
+        "retained_preview_unavailable",
+        "body_scan_failed",
+        "inactive_session",
+        "session_source_changed",
+        "metadata_unavailable",
+    ];
+    let has_reason = |reason: &str| result.reasons.iter().any(|value| value == reason);
+    // An acquisition failure cannot authenticate references from a partial scan.
+    // Both failure constructors clear their source metadata and scan counters.
+    let status_valid = match result.status.as_str() {
+        "scanned" | "partial" => {
+            result.available
+                && result.complete == (result.status == "scanned")
+                && result.complete == result.reasons.is_empty()
+                && result.reasons.len() <= partial_reasons.len()
+                && result
+                    .reasons
+                    .iter()
+                    .all(|reason| partial_reasons.contains(&reason.as_str()))
+                && result.reasons.windows(2).all(|pair| pair[0] < pair[1])
+        }
+        "unsupported" | "unavailable" => {
+            !result.available
+                && !result.complete
+                && result.reasons.len() == 1
+                && if result.status == "unsupported" {
+                    unsupported_reasons.contains(&result.reasons[0].as_str())
+                } else {
+                    unavailable_reasons.contains(&result.reasons[0].as_str())
+                }
+                && result.source_origin.is_none()
+                && result.source_sequence.is_none()
+                && result.source_started_at.is_none()
+                && result.retained_preview_bytes.is_none()
+                && !result.capture_preview_truncated
+                && !result.scan_prefix_truncated
+                && result.references.is_empty()
+                && result.scanned_bytes == 0
+                && result.candidates_scanned == 0
+                && result.omitted_reference_occurrences == 0
+        }
+        _ => false,
+    };
+    let mut origins = std::collections::HashSet::new();
+    let references_valid = result.references.iter().all(|reference| {
+        service_map_body_safe_origin(&reference.target_origin)
+            && origins.insert(&reference.target_origin)
+            && reference.occurrences > 0
+            && reference.occurrences <= MAX_CANDIDATES
+            && reference.preview_byte_offsets.len()
+                == reference.occurrences.min(MAX_OFFSETS_PER_ORIGIN)
+            && reference.omitted_offsets
+                == reference.occurrences - reference.preview_byte_offsets.len()
+            && (reference.omitted_offsets == 0
+                || result.reasons.iter().any(|reason| reason == "offset_limit"))
+            && reference
+                .preview_byte_offsets
+                .iter()
+                .all(|offset| *offset < result.scanned_bytes)
+            && reference
+                .preview_byte_offsets
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+    });
+    let valid = result.schema_version == 1
+        && result.session_id == args.session_id
+        && result.evidence_id == args.evidence_id
+        && result.coverage == "literal_absolute_http_urls"
+        && result.offset_basis == "retained_utf8_preview"
+        && status_valid
+        && token_valid
+        && result
+            .source_origin
+            .as_deref()
+            .is_none_or(service_map_safe_origin)
+        && result.source_sequence.as_ref().is_none_or(|sequence| {
+            token_fields[1] == args.session_id.to_string()
+                && token_fields[3] == sequence
+                && sequence
+                    .parse::<u64>()
+                    .is_ok_and(|value| value.to_string() == *sequence)
+        })
+        && (!result.available
+            || (result.source_origin.is_some()
+                && result.source_sequence.is_some()
+                && result.source_started_at.is_some()
+                && result.retained_preview_bytes.is_some()))
+        && result.scanned_bytes <= MAX_SCAN_BYTES
+        && result
+            .retained_preview_bytes
+            .is_none_or(|bytes| result.scanned_bytes <= bytes)
+        && result.candidates_scanned <= MAX_CANDIDATES
+        && result.references.len() <= MAX_ORIGINS
+        && result.omitted_reference_occurrences <= result.candidates_scanned
+        && result.references.iter().fold(0usize, |total, reference| {
+            total.saturating_add(reference.occurrences)
+        }) <= result
+            .candidates_scanned
+            .saturating_sub(result.omitted_reference_occurrences)
+        && (!result.available
+            || (has_reason("capture_preview_truncated") == result.capture_preview_truncated
+                && has_reason("scan_prefix_truncated") == result.scan_prefix_truncated
+                && result.scan_prefix_truncated
+                    == result
+                        .retained_preview_bytes
+                        .is_some_and(|bytes| result.scanned_bytes < bytes)
+                && result.retained_preview_bytes.is_some_and(|bytes| {
+                    if bytes <= MAX_SCAN_BYTES {
+                        result.scanned_bytes == bytes
+                    } else {
+                        (MAX_SCAN_BYTES - 3..=MAX_SCAN_BYTES).contains(&result.scanned_bytes)
+                    }
+                })
+                && (!has_reason("candidate_limit")
+                    || result.candidates_scanned == MAX_CANDIDATES)
+                && (!has_reason("candidate_bytes") || result.candidates_scanned > 0)
+                && has_reason("origin_limit") == (result.omitted_reference_occurrences > 0)
+                && (!has_reason("origin_limit") || result.references.len() == MAX_ORIGINS)
+                && has_reason("offset_limit")
+                    == result
+                        .references
+                        .iter()
+                        .any(|reference| reference.omitted_offsets > 0)))
+        && result.limits.scan_bytes == MAX_SCAN_BYTES
+        && result.limits.serialized_row_bytes == MAX_SERIALIZED_ROW_BYTES
+        && result.limits.origins == MAX_ORIGINS
+        && result.limits.candidates == MAX_CANDIDATES
+        && result.limits.candidate_bytes == MAX_CANDIDATE_BYTES
+        && result.limits.offsets_per_origin == MAX_OFFSETS_PER_ORIGIN
+        && references_valid;
+    if !valid {
+        return Err(service_map_error("INVALID_RESPONSE", "Service Map body references do not match the requested session, exact-row token, bounds, or origin-only response contract"));
+    }
+    Ok(())
+}
+
+// Version 1 deliberately has no additive free-text fields. Compare the complete
+// shape before printing typed output, including every explicit nullable field.
+fn service_map_html_response_shape(raw: &Value, typed: &Value) -> bool {
+    match (raw, typed) {
+        (Value::Object(raw), Value::Object(typed)) => {
+            raw.len() == typed.len()
+                && typed.iter().all(|(key, value)| {
+                    raw.get(key)
+                        .is_some_and(|raw| service_map_html_response_shape(raw, value))
+                })
+        }
+        (Value::Array(raw), Value::Array(typed)) => {
+            raw.len() == typed.len()
+                && raw
+                    .iter()
+                    .zip(typed)
+                    .all(|(raw, typed)| service_map_html_response_shape(raw, typed))
+        }
+        _ => true,
+    }
+}
+
+fn validate_service_map_html_generators_response(
+    result: &ServiceMapHtmlGenerators,
+    args: &ServiceMapHtmlGeneratorsArgs,
+) -> Result<()> {
+    use sniper::service_map_html::{
+        ByteSpan, ServiceMapHtmlLimits, ACQUISITION_REASONS, MAX_OBSERVATIONS, MAX_SCAN_BYTES,
+        MAX_TAG_BYTES, MAX_TAG_CANDIDATES, MAX_VERSION_BYTES, MAX_VERSION_SEPARATOR_BYTES,
+        PARSER_STOP_REASONS, TRUNCATION_REASONS,
+    };
+    let invalid = || {
+        service_map_error("INVALID_RESPONSE", "HTML generator inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract")
+    };
+    let token_fields: Vec<_> = args.evidence_id.split('.').collect();
+    if parse_service_map_evidence_id(&args.evidence_id).is_err()
+        || result.schema_version != 1
+        || result.generator_catalog_version != 1
+        || result.session_id != args.session_id
+        || result.evidence_id != args.evidence_id
+        || result.coverage != "literal_html_generator_explicit_head"
+        || result.offset_basis != "retained_utf8_preview"
+        || serde_json::to_value(&result.limits).ok()
+            != serde_json::to_value(ServiceMapHtmlLimits::default()).ok()
+    {
+        return Err(invalid());
+    }
+    if !result.available {
+        let valid = matches!(result.status.as_str(), "unsupported" | "unavailable")
+            && !result.complete
+            && result.reasons.len() == 1
+            && ACQUISITION_REASONS.contains(&result.reasons[0].as_str())
+            // Missing constructors also accept eligibility reasons; only unsupported is narrower.
+            && (result.status != "unsupported"
+                || matches!(
+                    result.reasons[0].as_str(),
+                    "metadata_limit"
+                        | "unsupported_content_type"
+                        | "unsupported_body_encoding"
+                        | "unsupported_content_encoding"
+                        | "unsupported_metadata"
+                ))
+            && result.source_origin.is_none()
+            && result.source_sequence.is_none()
+            && result.source_started_at.is_none()
+            && result.retained_preview_bytes.is_none()
+            && result.scan_prefix_bytes == 0
+            && !result.capture_preview_truncated
+            && !result.scan_prefix_truncated
+            && !result.head_closed
+            && result.parser_stop.is_none()
+            && result.tag_candidates_inspected == 0
+            && !result.additional_tag_candidate_encountered
+            && !result.additional_observation_encountered
+            && result.unknown_product_declarations == 0
+            && result.observations.is_empty();
+        return if valid { Ok(()) } else { Err(invalid()) };
+    }
+    let Some(retained_bytes) = result.retained_preview_bytes else {
+        return Err(invalid());
+    };
+    let prefix_bytes = result.scan_prefix_bytes;
+    let mut expected_reasons = std::collections::BTreeSet::new();
+    if result.capture_preview_truncated {
+        expected_reasons.insert(TRUNCATION_REASONS[0]);
+    }
+    if result.scan_prefix_truncated {
+        expected_reasons.insert(TRUNCATION_REASONS[1]);
+    }
+    if let Some(stop) = &result.parser_stop {
+        // The parser's stop cursor is a raw byte position. Unlike an accepted
+        // span it need not be a character boundary, and never slices text here.
+        if !PARSER_STOP_REASONS.contains(&stop.reason.as_str())
+            || stop.byte_cursor > prefix_bytes
+            || (stop.reason == "end_of_preview"
+                && (stop.byte_cursor != prefix_bytes || result.scan_prefix_truncated))
+            || (stop.reason == "input_limit"
+                && (stop.byte_cursor != prefix_bytes || !result.scan_prefix_truncated))
+        {
+            return Err(invalid());
+        }
+        expected_reasons.insert(stop.reason.as_str());
+    }
+    let reasons: std::collections::BTreeSet<_> =
+        result.reasons.iter().map(String::as_str).collect();
+    let stop_reason = result.parser_stop.as_ref().map(|stop| stop.reason.as_str());
+    let capped_prefix_valid = if retained_bytes <= MAX_SCAN_BYTES {
+        prefix_bytes == retained_bytes
+    } else {
+        (MAX_SCAN_BYTES - 3..=MAX_SCAN_BYTES).contains(&prefix_bytes)
+    };
+    // Every declaration is inside the two explicit opening tags. A closed
+    // head adds its own candidate, including when it contains no declarations.
+    let declaration_count = result
+        .unknown_product_declarations
+        .saturating_add(result.observations.len())
+        .saturating_add(usize::from(result.additional_observation_encountered));
+    let minimum_candidates = if declaration_count > 0 {
+        declaration_count
+            .saturating_add(2)
+            .saturating_add(usize::from(result.head_closed))
+    } else if result.head_closed {
+        3
+    } else {
+        0
+    };
+    if result.status != "scanned"
+        || token_fields[1] != args.session_id.to_string()
+        || result.source_sequence.as_deref() != Some(token_fields[3])
+        || !result
+            .source_origin
+            .as_deref()
+            .is_some_and(service_map_safe_origin)
+        || result.source_started_at.is_none()
+        || !capped_prefix_valid
+        || result.scan_prefix_truncated != (prefix_bytes < retained_bytes)
+        || result.complete != expected_reasons.is_empty()
+        || result.head_closed != result.parser_stop.is_none()
+        || reasons != expected_reasons
+        || reasons.len() != result.reasons.len()
+        || result.tag_candidates_inspected > MAX_TAG_CANDIDATES
+        || result.tag_candidates_inspected > prefix_bytes
+        || result.tag_candidates_inspected < minimum_candidates
+        || result.parser_stop.as_ref().is_some_and(|stop| {
+            result.tag_candidates_inspected > stop.byte_cursor.saturating_add(1)
+        })
+        || result.observations.len() > MAX_OBSERVATIONS
+        || result.unknown_product_declarations > MAX_TAG_CANDIDATES
+        || result.additional_tag_candidate_encountered
+            != (stop_reason == Some("tag_candidate_limit"))
+        || (result.additional_tag_candidate_encountered
+            && result.tag_candidates_inspected != MAX_TAG_CANDIDATES)
+        || result.additional_observation_encountered != (stop_reason == Some("observation_limit"))
+        || (result.additional_observation_encountered
+            && result.observations.len() != MAX_OBSERVATIONS)
+    {
+        return Err(invalid());
+    }
+    let valid_span = |span: ByteSpan| span.start < span.end && span.end <= prefix_bytes;
+    let mut last_tag_end = 0;
+    for observation in &result.observations {
+        let (name, rule) = match observation.product_id.as_str() {
+            "wordpress" => ("WordPress", "html_meta_generator.wordpress.v1"),
+            "drupal" => ("Drupal", "html_meta_generator.drupal.v1"),
+            _ => return Err(invalid()),
+        };
+        let tag = observation.tag_span;
+        let content = observation.content_span;
+        let product = observation.product_span;
+        if observation.name != name
+            || observation.rule_id != rule
+            || observation.catalog_category != "cms"
+            || observation.source != "response_html_meta_generator"
+            || observation.strength != "literal_declaration"
+            || observation.offset_basis != "retained_utf8_preview"
+            || ![tag, content, product].into_iter().all(valid_span)
+            || tag.end - tag.start > MAX_TAG_BYTES
+            || tag.start < last_tag_end
+            || tag.start >= content.start
+            || content.end >= tag.end
+            || product.start != content.start
+            || product.end > content.end
+            || product.end - product.start != name.len()
+            || result
+                .parser_stop
+                .as_ref()
+                .is_some_and(|stop| tag.end > stop.byte_cursor)
+        {
+            return Err(invalid());
+        }
+        last_tag_end = tag.end;
+        let version_valid = match (
+            observation.version_status.as_str(),
+            observation.reported_version.as_deref(),
+            observation.version_span,
+        ) {
+            ("reported", Some(version), Some(span)) => {
+                !version.is_empty()
+                    && version.len() <= MAX_VERSION_BYTES
+                    && version.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    && valid_span(span)
+                    && span.start > product.end
+                    && span.start - product.end <= MAX_VERSION_SEPARATOR_BYTES
+                    && span.end == content.end
+                    && span.end - span.start == version.len()
+            }
+            ("not_reported", None, None) => product.end == content.end,
+            ("unsupported_format", None, None) => product.end < content.end,
+            _ => false,
+        };
+        if !version_valid {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_map_link_declarations_response(
+    result: &ServiceMapLinkDeclarations,
+    args: &ServiceMapLinkDeclarationsArgs,
+) -> Result<()> {
+    let invalid = || {
+        service_map_error("INVALID_RESPONSE", "Link declaration inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract")
+    };
+    let fields: Vec<_> = args.evidence_id.split('.').collect();
+    let c = &result.counts;
+    if parse_service_map_evidence_id(&args.evidence_id).is_err()
+        || result.schema_version != 1
+        || result.relation_catalog_version != 1
+        || result.session_id != args.session_id
+        || result.evidence_id != args.evidence_id
+        || result.coverage != "absolute_http_link_declarations"
+        || result.offset_basis != "retained_header_value_utf8"
+        || serde_json::to_value(&result.limits).ok()
+            != Some(json!({
+                "headers":128,"header_bytes":32768,"link_field_bytes":4096,"target_bytes":4096,
+                "candidates":128,"parameters_per_member":32,"relation_tokens_per_member":32,
+                "observations":32,"target_origin_bytes":268
+            }))
+    {
+        return Err(invalid());
+    }
+    if !result.available {
+        let valid = matches!(result.status.as_str(), "unsupported" | "unavailable")
+            && !result.complete
+            && result.reasons.len() == 1
+            && LINK_ACQUISITION_REASONS.contains(&result.reasons[0].as_str())
+            && (result.status != "unsupported"
+                || result.reasons[0] == "unsupported_source_context")
+            && result.source_origin.is_none()
+            && result.source_sequence.is_none()
+            && result.source_started_at.is_none()
+            && result.source_method.is_none()
+            && result.source_status.is_none()
+            && result.retained_header_count.is_none()
+            && c.headers_inspected == 0
+            && c.header_bytes_admitted == 0
+            && c.link_fields_inspected == 0
+            && c.candidates_inspected == 0
+            && c.members_framed == 0
+            && c.parameters_inspected == 0
+            && c.relation_tokens_inspected == 0
+            && c.unknown_relation_tokens_inspected == 0
+            && result.observations.is_empty();
+        return if valid { Ok(()) } else { Err(invalid()) };
+    }
+    let Some(retained) = result.retained_header_count else {
+        return Err(invalid());
+    };
+    let has = |reason: &str| result.reasons.iter().any(|value| value == reason);
+    if result.status != "scanned"
+        || fields[1] != args.session_id.to_string()
+        || result.source_sequence.as_deref() != Some(fields[3])
+        || !result
+            .source_origin
+            .as_deref()
+            .is_some_and(service_map_safe_origin)
+        || result.source_started_at.is_none()
+        || !matches!(result.source_method.as_deref(), Some("GET" | "HEAD"))
+        || result.source_status != Some(200)
+        || retained as u128 > 9_007_199_254_740_991
+        || result.complete != result.reasons.is_empty()
+        || !result
+            .reasons
+            .iter()
+            .all(|reason| LINK_SCAN_REASONS.contains(&reason.as_str()))
+        || !result.reasons.windows(2).all(|pair| pair[0] < pair[1])
+        || c.headers_inspected > 128
+        || c.headers_inspected > retained
+        || c.header_bytes_admitted > 32768
+        || (c.headers_inspected == 0 && c.header_bytes_admitted != 0)
+        || c.link_fields_inspected > c.headers_inspected
+        || c.header_bytes_admitted < c.link_fields_inspected * 4
+        || c.candidates_inspected > 128
+        || (c.link_fields_inspected == 0 && c.candidates_inspected != 0)
+        || c.members_framed > c.candidates_inspected
+        || c.parameters_inspected > c.candidates_inspected * 32
+        || c.relation_tokens_inspected > c.members_framed * 32
+        || c.unknown_relation_tokens_inspected > c.relation_tokens_inspected
+        || result.observations.len() > 32
+        || result.observations.len()
+            > c.relation_tokens_inspected
+                .saturating_sub(c.unknown_relation_tokens_inspected)
+        || (c.headers_inspected < retained
+            && !has("header_count_limit")
+            && !has("header_byte_limit")
+            && !has("candidate_limit"))
+        || (has("header_count_limit") && (c.headers_inspected != 128 || retained <= 128))
+        || (has("header_byte_limit") && c.headers_inspected >= retained)
+        || (has("candidate_limit") && c.candidates_inspected != 128)
+        || (has("parameter_limit") && c.parameters_inspected < 32)
+        || (has("relation_token_limit") && c.relation_tokens_inspected < 32)
+        || (has("link_field_byte_limit")
+            && (c.link_fields_inspected == 0 || c.header_bytes_admitted < 4101))
+        || (has("observation_limit")
+            && (result.observations.len() != 32
+                || c.relation_tokens_inspected
+                    .saturating_sub(c.unknown_relation_tokens_inspected)
+                    <= 32))
+        || (result.complete
+            && (c.headers_inspected != retained
+                || c.candidates_inspected != c.members_framed
+                || result.observations.len()
+                    != c.relation_tokens_inspected
+                        .saturating_sub(c.unknown_relation_tokens_inspected)))
+    {
+        return Err(invalid());
+    }
+    let mut previous: Option<&sniper::service_map_links::LinkDeclarationObservation> = None;
+    let mut emitted_headers = 0;
+    let mut emitted_members = 0;
+    let mut observed_header_bytes = 0;
+    for observation in &result.observations {
+        let rule = match observation.relation.as_str() {
+            "service-doc" => "response_link.service_doc.v1",
+            "service-desc" => "response_link.service_desc.v1",
+            "describedby" => "response_link.describedby.v1",
+            "preconnect" => "response_link.preconnect.v1",
+            _ => return Err(invalid()),
+        };
+        let member = (
+            observation.link_value_span.start,
+            observation.link_value_span.end,
+        );
+        let target = (observation.target_span.start, observation.target_span.end);
+        let relation = (
+            observation.relation_span.start,
+            observation.relation_span.end,
+        );
+        let bytes = observation.header_value_bytes;
+        if observation.rule_id != rule
+            || observation.source != "response_link_header"
+            || observation.strength != "literal_declaration"
+            || observation.header_name != "link"
+            || observation.offset_basis != "retained_header_value_utf8"
+            || !sniper::service_map_links::is_canonical_target_origin(&observation.target_origin)
+            || observation.header_index >= c.headers_inspected
+            || bytes > 4096
+            || ![member, target, relation]
+                .iter()
+                .all(|&(start, end)| start < end && end <= bytes)
+            || target.0 != member.0 + 1
+            || target.1 >= relation.0
+            || relation.1 > member.1
+            || relation.1 - relation.0 != observation.relation.len()
+        {
+            return Err(invalid());
+        }
+        // A rel list emits several ordered tokens from one fully framed member.
+        // It must not be mistaken for overlapping distinct members or deduplicated.
+        let mut new_header = true;
+        let mut new_member = true;
+        if let Some(last) = previous {
+            if observation.header_index < last.header_index {
+                return Err(invalid());
+            }
+            if observation.header_index == last.header_index {
+                new_header = false;
+                if bytes != last.header_value_bytes {
+                    return Err(invalid());
+                }
+                if observation.link_value_span == last.link_value_span {
+                    new_member = false;
+                    if observation.target_span != last.target_span
+                        || observation.target_origin != last.target_origin
+                        || relation.0 <= last.relation_span.end
+                    {
+                        return Err(invalid());
+                    }
+                } else if member.0 <= last.link_value_span.end {
+                    return Err(invalid());
+                }
+            }
+        }
+        emitted_headers += usize::from(new_header);
+        emitted_members += usize::from(new_member);
+        if new_header {
+            observed_header_bytes += bytes + 4;
+        }
+        previous = Some(observation);
+    }
+    if emitted_headers > c.link_fields_inspected
+        || emitted_members > c.members_framed
+        || emitted_members > c.parameters_inspected
+        || observed_header_bytes > c.header_bytes_admitted
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+async fn read_service_map_socket_peer_matches(
+    api: &ApiClient,
+    args: &ServiceMapSocketPeerMatchesArgs,
+) -> Result<ServiceMapSocketPeerMatches> {
+    let client = service_map_read_client()?;
+    let raw: Value =
+        service_map_get(api, &client, &service_map_socket_peer_matches_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid recorded socket peer match envelope",
+        )
+    };
+    let result: ServiceMapSocketPeerMatches =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    let typed = serde_json::to_value(&result).map_err(|_| invalid())?;
+    // Shape checks require explicit nullable keys. Compare only identities that
+    // must be canonical; valid RFC3339 timestamp offsets may normalize in serde.
+    if !service_map_html_response_shape(&raw, &typed)
+        || raw["session_id"] != args.session_id.to_string()
+        || raw["evidence_id"] != args.evidence_id
+        || raw.pointer("/snapshot/id") != typed.pointer("/snapshot/id")
+        || raw.pointer("/snapshot/generation") != typed.pointer("/snapshot/generation")
+        || raw.pointer("/peer/address/ip") != typed.pointer("/peer/address/ip")
+        || !result.validate_response(
+            args.session_id,
+            &args.evidence_id,
+            args.in_scope_only,
+            args.max_records,
+        )
+    {
+        return Err(invalid());
+    }
+    if !result.available
+        && result
+            .reasons
+            .iter()
+            .any(|reason| reason == "scope_work_limit")
+    {
+        eprintln!("{SERVICE_MAP_PEER_SCOPE_WORK_WARNING}");
+    }
+    Ok(result)
+}
+
+async fn read_service_map_link_declarations(
+    api: &ApiClient,
+    args: &ServiceMapLinkDeclarationsArgs,
+) -> Result<ServiceMapLinkDeclarations> {
+    let client = service_map_read_client()?;
+    let raw: Value =
+        service_map_get(api, &client, &service_map_link_declarations_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid Link declaration inspection envelope",
+        )
+    };
+    let result: ServiceMapLinkDeclarations =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    let typed = serde_json::to_value(&result).map_err(|_| invalid())?;
+    if !service_map_html_response_shape(&raw, &typed)
+        || raw["session_id"] != args.session_id.to_string()
+        || raw["evidence_id"] != args.evidence_id
+    {
+        return Err(invalid());
+    }
+    validate_service_map_link_declarations_response(&result, args)?;
+    Ok(result)
+}
+
+/// One endpoint's parameters, checked against what was asked and the
+/// server's own bounds before any of it is printed.
+fn validate_service_map_parameters_response(
+    result: &sniper::service_map_parameters::EndpointParameters,
+    args: &ServiceMapParametersArgs,
+) -> Result<()> {
+    use sniper::service_map_parameters::{
+        MAX_EXAMPLES, MAX_EXAMPLE_CHARS, MAX_PARAMETERS, MAX_ROWS,
+    };
+    let valid = result.schema_version == 1
+        && result.session_id == args.session_id
+        && result.origin == args.origin
+        && result.method == args.method
+        && result.path == args.path
+        && result.rows <= MAX_ROWS
+        && result.parameters.len() <= MAX_PARAMETERS
+        && (result.available || !result.reasons.is_empty() && result.parameters.is_empty())
+        && result.parameters.iter().all(|parameter| {
+            ["query", "form", "json", "multipart"].contains(&parameter.location.as_str())
+                && (1..=result.rows).contains(&parameter.rows)
+                && parameter.examples.len() <= MAX_EXAMPLES
+                // A cut value ends with an ellipsis.
+                && parameter
+                    .examples
+                    .iter()
+                    .all(|example| example.chars().count() <= MAX_EXAMPLE_CHARS + 1)
+        });
+    if !valid {
+        return Err(service_map_error(
+            "INVALID_RESPONSE",
+            "Endpoint parameters do not match the requested session, endpoint, or bounds",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_service_map_parameters(
+    api: &ApiClient,
+    args: &ServiceMapParametersArgs,
+) -> Result<sniper::service_map_parameters::EndpointParameters> {
+    let client = service_map_read_client()?;
+    let raw: Value = service_map_get(api, &client, &service_map_parameters_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid endpoint parameters envelope",
+        )
+    };
+    let result: sniper::service_map_parameters::EndpointParameters =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    // Unknown fields would be dropped above; refuse them instead.
+    if serde_json::to_value(&result).map_err(|_| invalid())? != raw {
+        return Err(invalid());
+    }
+    validate_service_map_parameters_response(&result, args)?;
+    Ok(result)
+}
+
+/// One origin's OpenAPI document, checked against the origin asked for and
+/// the server's own bounds before any of it is printed.
+fn validate_service_map_openapi_response(
+    document: &Value,
+    args: &ServiceMapOpenApiArgs,
+) -> Result<()> {
+    use sniper::service_map_openapi::{MAX_OPERATIONS, METHODS};
+    let paths = document["paths"].as_object();
+    let operations: usize = paths.map_or(0, |paths| {
+        paths
+            .values()
+            .map(|item| {
+                METHODS
+                    .iter()
+                    .filter(|method| item.get(**method).is_some())
+                    .count()
+            })
+            .sum()
+    });
+    let valid = document["openapi"] == "3.1.0"
+        && document["info"]["title"] == args.origin
+        && document["servers"] == json!([{ "url": args.origin }])
+        && paths.is_some_and(|paths| {
+            paths
+                .iter()
+                .all(|(path, item)| path.starts_with('/') && item.is_object())
+        })
+        && operations <= MAX_OPERATIONS;
+    if !valid {
+        return Err(service_map_error(
+            "INVALID_RESPONSE",
+            "The OpenAPI document does not match the requested origin or bounds",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_service_map_openapi(api: &ApiClient, args: &ServiceMapOpenApiArgs) -> Result<Value> {
+    let client = service_map_read_client()?;
+    let document: Value = service_map_get(api, &client, &service_map_openapi_path(args)).await?;
+    validate_service_map_openapi_response(&document, args)?;
+    Ok(document)
+}
+
+async fn read_service_map_html_generators(
+    api: &ApiClient,
+    args: &ServiceMapHtmlGeneratorsArgs,
+) -> Result<ServiceMapHtmlGenerators> {
+    let client = service_map_read_client()?;
+    let raw: Value = service_map_get(api, &client, &service_map_html_generators_path(args)).await?;
+    let invalid = || {
+        service_map_error(
+            "INVALID_RESPONSE",
+            "The selected API returned an invalid HTML generator inspection envelope",
+        )
+    };
+    let result: ServiceMapHtmlGenerators =
+        serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
+    let typed = serde_json::to_value(&result).map_err(|_| invalid())?;
+    if !service_map_html_response_shape(&raw, &typed) {
+        return Err(invalid());
+    }
+    validate_service_map_html_generators_response(&result, args)?;
+    Ok(result)
+}
+
+async fn read_service_map_body_references(
+    api: &ApiClient,
+    args: &ServiceMapBodyReferencesArgs,
+) -> Result<ServiceMapBodyReferences> {
+    let client = service_map_read_client()?;
+    let result: ServiceMapBodyReferences =
+        service_map_get(api, &client, &service_map_body_references_path(args)).await?;
+    validate_service_map_body_references_response(&result, args)?;
+    Ok(result)
+}
+
+async fn read_service_map(api: &ApiClient, args: &ServiceMapArgs) -> Result<ServiceMap> {
+    let client = service_map_read_client()?;
+    let session_id = if let Some(session_id) = args.session_id {
+        session_id
+    } else {
+        let sessions: Vec<SessionSummary> = service_map_get(api, &client, "/api/sessions").await?;
+        active_session_id_from_summaries(&sessions)?.ok_or_else(|| {
+            anyhow!("no active session; pass --session-id to choose a session explicitly")
+        })?
+    };
+    let result: ServiceMap = service_map_get_with_catalog(
+        api,
+        &client,
+        &service_map_path(args, Some(session_id)),
+        Some(args.technology_catalog_version),
+    )
+    .await?;
+    validate_service_map_response(&result, args, session_id)?;
+    warn_legacy_service_map_catalog(result.technology_catalog_version);
+    Ok(result)
+}
+
+async fn read_service_map_evidence(
+    api: &ApiClient,
+    args: &ServiceMapEvidenceArgs,
+) -> Result<ServiceMapEvidence> {
+    let client = service_map_read_client()?;
+    let result: ServiceMapEvidence = service_map_get_with_catalog(
+        api,
+        &client,
+        &service_map_evidence_path(args),
+        Some(args.technology_catalog_version),
+    )
+    .await?;
+    validate_service_map_evidence_response(&result, args)?;
+    warn_legacy_service_map_catalog(result.technology_catalog_version);
+    Ok(result)
+}
+
 async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
     match command {
+        TargetCommand::ServiceMap(args) => match &args.command {
+            Some(ServiceMapCommand::BodyReferences(args)) => {
+                let result = read_service_map_body_references(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::HtmlGenerators(args)) => {
+                let result = read_service_map_html_generators(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::Parameters(args)) => {
+                let result = read_service_map_parameters(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::Openapi(args)) => {
+                let result = read_service_map_openapi(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::Unnamed(args)) => {
+                let map = read_service_map(&api, &args.map_args()).await?;
+                let summary = summarize_unnamed(&map, args.kind.as_deref(), args.limit as usize);
+                print_session_read_json(&summary, summary.session_id)
+            }
+            Some(ServiceMapCommand::LinkDeclarations(args)) => {
+                let result = read_service_map_link_declarations(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::SocketPeerMatches(args)) => {
+                let result = read_service_map_socket_peer_matches(&api, args).await?;
+                print_session_read_json(&result, args.session_id)
+            }
+            None => {
+                let result = read_service_map(&api, &args).await?;
+                print_session_read_json(&result, result.session_id)
+            }
+        },
+        TargetCommand::ServiceMapEvidence(args) => {
+            let result = read_service_map_evidence(&api, &args).await?;
+            print_session_read_json(&result, args.session_id)
+        }
         TargetCommand::GetScope(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
             let path = session_query_path("/api/runtime", session_id);
@@ -6019,6 +11477,119 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct ReplayLabelUpdateResult {
+    session_id: Uuid,
+    revision: u64,
+    tab: ReplayTabState,
+}
+
+// Persistence defaults support old saved inputs, but cannot prove a complete
+// acknowledgement. Check the fields the current serializer actually emits,
+// allowing absent nullable fields and additive fields from newer servers.
+fn metadata_acknowledgement_has_fields(raw: &Value, serialized: &Value) -> bool {
+    match serialized {
+        Value::Object(fields) => fields.iter().all(|(key, value)| match raw.get(key) {
+            Some(actual) => metadata_acknowledgement_has_fields(actual, value),
+            None => value.is_null(),
+        }),
+        Value::Array(values) => raw.as_array().is_some_and(|actual| {
+            actual.len() == values.len()
+                && actual
+                    .iter()
+                    .zip(values)
+                    .all(|(raw, value)| metadata_acknowledgement_has_fields(raw, value))
+        }),
+        _ => true,
+    }
+}
+
+fn decode_metadata_acknowledgement<T: DeserializeOwned + Serialize>(raw: Value) -> Result<T> {
+    let result: T =
+        serde_json::from_value(raw.clone()).map_err(|_| MetadataAcknowledgementError)?;
+    let serialized = serde_json::to_value(&result).map_err(|_| MetadataAcknowledgementError)?;
+    if !metadata_acknowledgement_has_fields(&raw, &serialized) {
+        return Err(MetadataAcknowledgementError.into());
+    }
+    Ok(result)
+}
+
+fn metadata_acknowledgement_decode_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_decode() || error.is_body() || error.is_timeout())
+    {
+        MetadataAcknowledgementError.into()
+    } else {
+        error
+    }
+}
+
+fn replay_update_is_label_only(args: &ReplayUpdateArgs) -> bool {
+    args.label.is_some()
+        && args.request_file.is_none()
+        && !args.stdin
+        && args.scheme.is_none()
+        && args.host.is_none()
+        && args.port.is_none()
+}
+
+fn saved_configuration_write_client() -> Result<reqwest::Client> {
+    // A metadata write must not be replayed automatically or sent to a redirect target.
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(CLI_API_TIMEOUT)
+        .build()
+        .context("failed to prepare saved configuration client; no mutation was sent")
+}
+
+async fn update_saved_replay_label(api: &ApiClient, args: ReplayUpdateArgs) -> Result<()> {
+    let (session_id, expected_active_session_id) =
+        runtime_write_session_ids(api, args.session_id).await?;
+    let session_id = session_id
+        .ok_or_else(|| anyhow!("no active session was found; select an explicit --session-id"))?;
+    let workspace: WorkspaceStateSnapshot = api
+        .get_json(&session_query_path(
+            "/api/workspace-state",
+            Some(session_id),
+        ))
+        .await?;
+    if workspace.session_id != Some(session_id) {
+        bail!("workspace response did not match the selected session; no mutation was sent");
+    }
+    find_replay_tab(&workspace.replay, &args.tab_id)?;
+    let mut payload = json!({
+        "session_id":session_id,
+        "tab_id":args.tab_id,
+        "expected_workspace_revision":workspace.revision,
+        "label":normalize_replay_tab_label(args.label.as_deref().unwrap()),
+    });
+    if let Some(expected_active_session_id) = expected_active_session_id {
+        payload["expected_active_session_id"] = json!(expected_active_session_id);
+    }
+    let client = saved_configuration_write_client()?;
+    let raw: Value = api
+        .request_json_with_client(
+            &client,
+            Method::POST,
+            "/api/replay/tabs/set-label",
+            Some(&payload),
+        )
+        .await
+        .map_err(metadata_acknowledgement_decode_error)?;
+    let result: ReplayLabelUpdateResult = decode_metadata_acknowledgement(raw)?;
+    if result.session_id != session_id
+        || Some(result.revision) != workspace.revision.checked_add(1)
+        || result.tab.id != args.tab_id
+        || result.tab.custom_label != payload["label"].as_str().unwrap()
+    {
+        return Err(MetadataAcknowledgementError.into());
+    }
+    print_json_with_session(&result.tab, Some(result.session_id))
+}
+
 async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
     match command {
         ReplayCommand::List(args) => {
@@ -6050,6 +11621,9 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
             print_json_with_session(&tab, session_id)
         }
         ReplayCommand::Update(args) => {
+            if replay_update_is_label_only(&args) {
+                return update_saved_replay_label(&api, args).await;
+            }
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
             let tab = find_replay_tab_mut(&mut workspace.replay, &args.tab_id)?;
             ensure_http_replay_tab(tab, &args.tab_id)?;
@@ -6103,12 +11677,25 @@ async fn handle_replay(api: ApiClient, command: ReplayCommand) -> Result<()> {
                 }
                 tab.response_record = None;
             }
+            adopt_target_scheme_for_uncaptured_request(
+                tab.base_request.as_mut(),
+                tab.source_transaction_id,
+                &tab.target_scheme,
+            );
             let snapshot = post_workspace_state(&api, &mut workspace, args.session_id).await?;
             let tab = find_replay_tab(&snapshot.replay, &args.tab_id)?;
             print_json_with_session(tab, workspace.session_id)
         }
-        ReplayCommand::Close(args) => handle_saved_replay_tab(&api, args, false).await,
-        ReplayCommand::Duplicate(args) => handle_saved_replay_tab(&api, args, true).await,
+        ReplayCommand::Close(args) => {
+            handle_saved_replay_tab(&api, args, SavedReplayTabAction::Close).await
+        }
+        ReplayCommand::Duplicate(args) => {
+            handle_saved_replay_tab(&api, args, SavedReplayTabAction::Duplicate).await
+        }
+        ReplayCommand::SetPinned(args) => {
+            handle_saved_replay_tab(&api, args.tab, SavedReplayTabAction::SetPinned(args.pinned))
+                .await
+        }
         ReplayCommand::Send(args) => {
             let mut workspace = load_workspace_state(&api, args.session_id).await?;
             let tab = find_replay_tab_mut(&mut workspace.replay, &args.tab_id)?.clone();
@@ -6247,11 +11834,18 @@ fn replay_tab_error(
     })
 }
 
-fn replay_saved_tab_path(duplicate: bool) -> &'static str {
-    if duplicate {
-        "/api/replay/tabs/duplicate"
-    } else {
-        "/api/replay/tabs/close"
+#[derive(Clone, Copy)]
+enum SavedReplayTabAction {
+    Close,
+    Duplicate,
+    SetPinned(bool),
+}
+
+fn replay_saved_tab_path(action: SavedReplayTabAction) -> &'static str {
+    match action {
+        SavedReplayTabAction::Close => "/api/replay/tabs/close",
+        SavedReplayTabAction::Duplicate => "/api/replay/tabs/duplicate",
+        SavedReplayTabAction::SetPinned(_) => "/api/replay/tabs/set-pinned",
     }
 }
 
@@ -6385,12 +11979,12 @@ fn checked_saved_replay_ack(
     snapshot: &SavedReplayTabSnapshot,
     session_id: Uuid,
     tab_id: &str,
-    duplicate: bool,
+    action: SavedReplayTabAction,
 ) -> Result<Value> {
     let invalid = || {
         replay_tab_error("INVALID_RESPONSE", "Saved tab acknowledgement did not match this operation; inspect saved tabs before any further action", "unknown", Some(session_id))
     };
-    let expected_fields: &[&str] = if duplicate {
+    let expected_fields: &[&str] = if matches!(action, SavedReplayTabAction::Duplicate) {
         &[
             "session_id",
             "revision",
@@ -6398,8 +11992,16 @@ fn checked_saved_replay_ack(
             "new_tab_id",
             "active_tab_id",
         ]
-    } else {
+    } else if matches!(action, SavedReplayTabAction::Close) {
         &["session_id", "revision", "closed_tab_id", "active_tab_id"]
+    } else {
+        &[
+            "session_id",
+            "revision",
+            "tab_id",
+            "pinned",
+            "active_tab_id",
+        ]
     };
     let object = value.as_object().ok_or_else(invalid)?;
     if object.len() != expected_fields.len()
@@ -6407,10 +12009,10 @@ fn checked_saved_replay_ack(
     {
         return Err(invalid());
     }
-    let target_key = if duplicate {
-        "source_tab_id"
-    } else {
-        "closed_tab_id"
+    let target_key = match action {
+        SavedReplayTabAction::Close => "closed_tab_id",
+        SavedReplayTabAction::Duplicate => "source_tab_id",
+        SavedReplayTabAction::SetPinned(_) => "tab_id",
     };
     if value["session_id"]
         .as_str()
@@ -6419,11 +12021,15 @@ fn checked_saved_replay_ack(
         || value["revision"].as_u64() != snapshot.revision.checked_add(1)
         || value[target_key].as_str() != Some(tab_id)
         || value["active_tab_id"]
-            != json!(saved_replay_expected_active(snapshot, tab_id, duplicate))
+            != json!(saved_replay_expected_active(
+                snapshot,
+                tab_id,
+                !matches!(action, SavedReplayTabAction::Close)
+            ))
     {
         return Err(invalid());
     }
-    if duplicate {
+    if matches!(action, SavedReplayTabAction::Duplicate) {
         let new_id = value["new_tab_id"].as_str().ok_or_else(invalid)?;
         let uuid = Uuid::parse_str(new_id).map_err(|_| invalid())?;
         if snapshot
@@ -6434,13 +12040,18 @@ fn checked_saved_replay_ack(
             return Err(invalid());
         }
     }
+    if let SavedReplayTabAction::SetPinned(pinned) = action {
+        if value["pinned"].as_bool() != Some(pinned) {
+            return Err(invalid());
+        }
+    }
     Ok(value)
 }
 
 async fn handle_saved_replay_tab(
     api: &ApiClient,
     args: ReplaySavedTabArgs,
-    duplicate: bool,
+    action: SavedReplayTabAction,
 ) -> Result<()> {
     // Do not inherit redirect or protocol retry behavior from legacy clients:
     // an acknowledgement loss must never create a second duplicate or close.
@@ -6505,7 +12116,7 @@ async fn handle_saved_replay_tab(
     if !matches!(tab.tab_type.as_str(), "" | "http") {
         return Err(replay_tab_error(
             "INVALID_INPUT",
-            "Saved tab close and duplicate require an HTTP tab; no mutation was sent",
+            "Saved tab operations require an HTTP tab; no mutation was sent",
             "not_applied",
             Some(session_id),
         ));
@@ -6514,8 +12125,11 @@ async fn handle_saved_replay_tab(
     if args.session_id.is_none() {
         body["expected_active_session_id"] = json!(session_id);
     }
+    if let SavedReplayTabAction::SetPinned(pinned) = action {
+        body["pinned"] = json!(pinned);
+    }
     let response = client
-        .post(api.url(replay_saved_tab_path(duplicate)))
+        .post(api.url(replay_saved_tab_path(action)))
         .json(&body)
         .send()
         .await
@@ -6555,7 +12169,7 @@ async fn handle_saved_replay_tab(
     }
     let value = saved_replay_response_json(response, 4096).await.map_err(|_| replay_tab_error("INVALID_RESPONSE", "Saved tab acknowledgement was missing, malformed or too large; inspect saved tabs before any further action", "unknown", Some(session_id)))?;
     let acknowledgement =
-        checked_saved_replay_ack(value, &snapshot, session_id, &args.tab_id, duplicate)?;
+        checked_saved_replay_ack(value, &snapshot, session_id, &args.tab_id, action)?;
     print_session_read_json(&acknowledgement, session_id)
 }
 
@@ -6726,6 +12340,12 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
     }
 }
 
+fn intercept_wait_deadline(timeout_secs: u64) -> Result<std::time::Instant> {
+    std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(timeout_secs))
+        .ok_or_else(|| anyhow!("invalid timeout: exceeds the host monotonic clock range"))
+}
+
 /// Block until the queue at `list_path` holds something, and return the first
 /// entry.
 ///
@@ -6740,17 +12360,32 @@ async fn wait_for_first_intercept<T: DeserializeOwned>(
     poll_interval_ms: u64,
     _id_of: impl Fn(&T) -> Uuid,
 ) -> Result<Option<T>> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = intercept_wait_deadline(timeout_secs)?;
     let interval = std::time::Duration::from_millis(poll_interval_ms.max(25));
     loop {
-        let mut queued: Vec<T> = api.get_json(list_path).await?;
+        // Zero retains the one-shot queue check. Positive timeouts also bound
+        // an unresponsive queue read, not only the delay between polls.
+        let mut queued: Vec<T> = if timeout_secs == 0 {
+            api.get_json(list_path).await?
+        } else {
+            match tokio::time::timeout_at(deadline.into(), api.get_json(list_path)).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(None),
+            }
+        };
         if !queued.is_empty() {
             return Ok(Some(queued.remove(0)));
         }
         if std::time::Instant::now() >= deadline {
             return Ok(None);
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(
+            interval.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        )
+        .await;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
     }
 }
 
@@ -6908,12 +12543,26 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             let detail_path =
                 session_query_path(&format!("/api/intercepts/{}", args.id), read_session_id);
             let intercept: InterceptRecord = api.get_json(&detail_path).await?;
-            let request = if args.request_file.is_some() || args.stdin {
-                read_raw_request_input(args.request_file, args.stdin, Some(&intercept.request))?
-                    .0
-                    .request
+            let (request, edited) = if args.request_file.is_some() || args.stdin {
+                let parsed = read_raw_request_input(
+                    args.request_file,
+                    args.stdin,
+                    Some(&intercept.request),
+                )?
+                .0
+                .request;
+                // The held request as its raw text parses back: parsing normalises
+                // headers, so an unchanged file must not count as an edit.
+                let held = parse_editable_raw_request_with_version(
+                    &build_editable_raw_request(&intercept.request),
+                    Some(&intercept.request),
+                )
+                .map(|held| held.request)
+                .unwrap_or_else(|_| intercept.request.clone());
+                let edited = parsed != held && parsed != intercept.request;
+                (parsed, edited)
             } else {
-                intercept.request
+                (intercept.request, false)
             };
             let session_id = read_session_id;
             let action_path = session_query_path_with_expected_active(
@@ -6921,7 +12570,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                 read_session_id,
                 expected_active_session_id,
             );
-            api.post_status(&action_path, &InterceptForwardPayload { request })
+            api.post_status(&action_path, &InterceptForwardPayload { request, edited })
                 .await?;
             print_json(&InterceptActionResult {
                 ok: true,
@@ -7092,15 +12741,21 @@ async fn handle_response_intercept(
                 read_session_id,
             );
             let item: ResponseInterceptRecord = api.get_json(&detail_path).await?;
-            let response = if args.response_file.is_some() || args.stdin {
-                read_raw_response_input(
+            let (response, edited) = if args.response_file.is_some() || args.stdin {
+                let parsed = read_raw_response_input(
                     args.response_file,
                     args.stdin,
                     Some(&item.response),
                     &item.method,
-                )?
+                )?;
+                // ponytail: compared as parsed, so a file that only re-spells the
+                // held response may still read as an edit; that keeps the
+                // original either way.
+                let edited =
+                    serde_json::to_value(&parsed).ok() != serde_json::to_value(&item.response).ok();
+                (parsed, edited)
             } else {
-                item.response
+                (item.response, false)
             };
             let session_id = read_session_id;
             let action_path = session_query_path_with_expected_active(
@@ -7108,8 +12763,11 @@ async fn handle_response_intercept(
                 read_session_id,
                 expected_active_session_id,
             );
-            api.post_status(&action_path, &ResponseInterceptForwardPayload { response })
-                .await?;
+            api.post_status(
+                &action_path,
+                &ResponseInterceptForwardPayload { response, edited },
+            )
+            .await?;
             print_json(&InterceptActionResult {
                 ok: true,
                 action: "forward",
@@ -7156,6 +12814,57 @@ async fn handle_response_intercept(
     }
 }
 
+fn validate_intercept_rule_update(args: &InterceptRuleUpdateArgs) -> Result<()> {
+    if args
+        .scope
+        .as_deref()
+        .is_some_and(|scope| !matches!(scope, "request" | "response" | "both"))
+    {
+        bail!("invalid field `scope`: expected request, response, or both");
+    }
+    if args.clear_methods && args.method_filter.is_some() {
+        bail!("fields `clear_methods` and `method_filter` have conflicts");
+    }
+    if args.patch().as_object().unwrap().is_empty() {
+        bail!("provide at least one rule update field");
+    }
+    Ok(())
+}
+
+async fn patch_intercept_rule(
+    api: &ApiClient,
+    id: Uuid,
+    session_id: Option<Uuid>,
+    patch: Value,
+) -> Result<()> {
+    let (session_id, expected_active_session_id) =
+        runtime_write_session_ids(api, session_id).await?;
+    let session_id = session_id
+        .ok_or_else(|| anyhow!("no active session was found; select an explicit --session-id"))?;
+    let path = session_query_path_with_expected_active(
+        &format!("/api/intercept-rules/{id}"),
+        Some(session_id),
+        expected_active_session_id,
+    );
+    let client = saved_configuration_write_client()?;
+    let raw: Value = api
+        .request_json_with_client(&client, Method::PATCH, &path, Some(&patch))
+        .await
+        .map_err(metadata_acknowledgement_decode_error)?;
+    let rule: InterceptRule = decode_metadata_acknowledgement(raw)?;
+    let returned = serde_json::to_value(&rule)?;
+    if rule.id != id
+        || patch
+            .as_object()
+            .unwrap()
+            .iter()
+            .any(|(key, value)| returned.get(key) != Some(value))
+    {
+        return Err(MetadataAcknowledgementError.into());
+    }
+    print_json_with_session(&rule, Some(session_id))
+}
+
 async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) -> Result<()> {
     match command {
         InterceptRuleCommand::List(args) => {
@@ -7183,6 +12892,18 @@ async fn handle_intercept_rule(api: ApiClient, command: InterceptRuleCommand) ->
             );
             api.post_status(&path, &rule).await?;
             print_json_with_session(&rule, session_id)
+        }
+        InterceptRuleCommand::Update(args) => {
+            patch_intercept_rule(&api, args.id, args.session_id, args.patch()).await
+        }
+        InterceptRuleCommand::SetEnabled(args) => {
+            patch_intercept_rule(
+                &api,
+                args.id,
+                args.session_id,
+                json!({"enabled":args.enabled}),
+            )
+            .await
         }
         InterceptRuleCommand::Delete(args) => {
             let (session_id, expected_active_session_id) =
@@ -7309,6 +13030,782 @@ async fn pinned_read_session_id(api: &ApiClient, explicit: Option<Uuid>) -> Resu
     resolve_session_id_arg(api, explicit).await?.ok_or_else(|| {
         anyhow!("no active session; pass --session-id to choose a session explicitly")
     })
+}
+
+fn upstream_peer_input_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+    ) {
+        return None;
+    }
+    let mut session_id = legacy_uuid_input_schema(
+        false,
+        "Explicit current active session UUID. Never loads or activates a session.",
+    );
+    let hyphenated = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+    session_id["pattern"] = json!(format!(
+        r"^(?:[0-9a-fA-F]{{32}}|{hyphenated}|\{{{hyphenated}\}}|urn:uuid:{hyphenated})$"
+    ));
+    let mut schema = json!({
+        "type":"object","additionalProperties":false,"required":["session_id"],
+        "properties":{"session_id":session_id}
+    });
+    if operation.ends_with(".set") {
+        schema["required"].as_array_mut()?.push(json!("enabled"));
+        schema["properties"]["enabled"] = json!({"type":"boolean","description":"Save future observed socket peer capture On or Off; default Off. Does not erase retained observations or backfill old rows."});
+    }
+    Some(schema)
+}
+
+fn upstream_peer_output_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
+    ) {
+        return None;
+    }
+    let mut schema = service_map_object(json!({
+        "session_id":{"type":"string","format":"uuid"},
+        "enabled":{"type":"boolean"},
+        "config_revision":history_retention_revision_schema(),
+        "config_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"Opaque feature/session/configuration-bound compare-and-swap token. Pass unchanged only to this feature's pinned session POST."},
+        "status":service_map_object(json!({
+            "effective_enabled":{"type":"boolean"},
+            "blocked_reason":{"type":["string","null"],"enum":[null,"persistence_uncertain","invalid_configuration","http_capture_paused"]}
+        }))
+    }));
+    if operation.ends_with(".set") {
+        schema["required"].as_array_mut()?.push(json!("changed"));
+        schema["properties"]["changed"] = json!({"type":"boolean","description":"Whether the saved switch changed; not evidence that any response has been captured."});
+    }
+    Some(schema)
+}
+
+fn upstream_peer_from_input(operation: &str, input: &Value) -> Result<UpstreamPeerCommand> {
+    let session_id = call_required(operation, input, "session_id")?;
+    if operation.ends_with(".get") {
+        Ok(UpstreamPeerCommand::Get(UpstreamPeerGetArgs { session_id }))
+    } else {
+        Ok(UpstreamPeerCommand::Set(UpstreamPeerSetArgs {
+            session_id,
+            enabled: call_required(operation, input, "enabled")?,
+        }))
+    }
+}
+
+fn upstream_peer_path(session_id: Uuid) -> String {
+    session_query_path_with_expected_active(
+        "/api/transactions/upstream-peer-settings",
+        Some(session_id),
+        Some(session_id),
+    )
+}
+
+fn upstream_peer_api_preview(command: &UpstreamPeerCommand) -> Value {
+    let path = upstream_peer_path(command.session_id());
+    let read = api_preview("GET", path.clone(), None);
+    let UpstreamPeerCommand::Set(args) = command else {
+        return read;
+    };
+    json!({
+        "read":read,
+        "write":{
+            "method":"POST","path":path,
+            "body":{"enabled":args.enabled,"expected_config_token":"<from the pinned settings GET>"},
+            "automatic_retry":false
+        }
+    })
+}
+
+#[derive(Debug)]
+struct UpstreamPeerCliError {
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Uuid,
+    status: Option<u16>,
+}
+
+impl fmt::Display for UpstreamPeerCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for UpstreamPeerCliError {}
+
+fn upstream_peer_error(
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Uuid,
+    status: Option<StatusCode>,
+) -> anyhow::Error {
+    UpstreamPeerCliError {
+        code,
+        message,
+        outcome,
+        session_id,
+        status: status.map(|value| value.as_u16()),
+    }
+    .into()
+}
+
+fn checked_upstream_peer_response(
+    value: Value,
+    session_id: Uuid,
+    requested_enabled: Option<bool>,
+    expected_changed: Option<bool>,
+    expected_revision: Option<u64>,
+) -> Result<Value> {
+    let invalid = || {
+        upstream_peer_error(
+            "INVALID_RESPONSE",
+            if requested_enabled.is_some() {
+                "Socket peer settings acknowledgement did not match this operation; mutation outcome is unknown"
+            } else {
+                "Socket peer settings were invalid; no mutation was sent"
+            },
+            if requested_enabled.is_some() {
+                "unknown"
+            } else {
+                "not_applied"
+            },
+            session_id,
+            None,
+        )
+    };
+    if value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        != Some(session_id)
+    {
+        return Err(invalid());
+    }
+    let enabled = value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    if requested_enabled.is_some_and(|requested| requested != enabled) {
+        return Err(invalid());
+    }
+    let revision_text = value
+        .get("config_revision")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let revision = revision_text
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| revision.to_string() == revision_text)
+        .ok_or_else(invalid)?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(invalid());
+    }
+    let token = value
+        .get("config_token")
+        .and_then(Value::as_str)
+        .filter(|token| {
+            token.len() == 64
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(invalid)?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let effective = status
+        .get("effective_enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    let blocked = status.get("blocked_reason").ok_or_else(invalid)?;
+    if (!blocked.is_null()
+        && !matches!(
+            blocked.as_str(),
+            Some("persistence_uncertain" | "invalid_configuration" | "http_capture_paused")
+        ))
+        || effective != (enabled && blocked.is_null())
+    {
+        return Err(invalid());
+    }
+    // Project a narrow allowlist so unrelated response data cannot become CLI output.
+    let mut result = json!({
+        "session_id":session_id,"enabled":enabled,"config_revision":revision_text,"config_token":token,
+        "status":{"effective_enabled":effective,"blocked_reason":blocked}
+    });
+    if let Some(expected) = expected_changed {
+        if value.get("changed").and_then(Value::as_bool) != Some(expected) {
+            return Err(invalid());
+        }
+        result["changed"] = json!(expected);
+    }
+    Ok(result)
+}
+
+async fn handle_upstream_peer(api: ApiClient, command: UpstreamPeerCommand) -> Result<()> {
+    let session_id = command.session_id();
+    let client = saved_configuration_write_client().map_err(|_| {
+        upstream_peer_error(
+            "TRANSPORT_ERROR",
+            "Could not prepare socket peer settings client; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let path = upstream_peer_path(session_id);
+    let response = client.get(api.url(&path)).send().await.map_err(|_| {
+        upstream_peer_error(
+            "TRANSPORT_ERROR",
+            "Socket peer settings read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(upstream_peer_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Socket peer settings read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            Some(status),
+        ));
+    }
+    let raw = saved_replay_response_json(response, 16 * 1024).await.map_err(|_| upstream_peer_error(
+        "INVALID_RESPONSE", "Socket peer settings read was missing, malformed or too large; no mutation was sent", "not_applied", session_id, None,
+    ))?;
+    let current = checked_upstream_peer_response(raw, session_id, None, None, None)?;
+    let UpstreamPeerCommand::Set(args) = command else {
+        return print_session_read_json(&current, session_id);
+    };
+    let changed = current["enabled"] != args.enabled;
+    let revision = current["config_revision"]
+        .as_str()
+        .expect("validated revision")
+        .parse::<u64>()
+        .expect("validated revision");
+    let expected_revision = revision.checked_add(u64::from(changed)).ok_or_else(|| {
+        upstream_peer_error(
+            "UPSTREAM_PEER_REVISION_EXHAUSTED",
+            "Socket peer configuration revision cannot be advanced; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let response = client
+        .post(api.url(&path))
+        .json(&json!({"enabled":args.enabled,"expected_config_token":current["config_token"]}))
+        .send()
+        .await
+        .map_err(|_| {
+            upstream_peer_error(
+                "TRANSPORT_ERROR",
+                "Socket peer settings acknowledgement was lost; mutation outcome is unknown",
+                "unknown",
+                session_id,
+                None,
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        // Never follow a redirect, read diagnostic bodies, retry, or silently reconcile a write.
+        return Err(upstream_peer_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Socket peer settings write did not return success; mutation outcome is unknown",
+            "unknown",
+            session_id,
+            Some(status),
+        ));
+    }
+    let raw = saved_replay_response_json(response, 16 * 1024).await.map_err(|_| upstream_peer_error(
+        "INVALID_RESPONSE", "Socket peer settings acknowledgement was missing, malformed or too large; mutation outcome is unknown", "unknown", session_id, None,
+    ))?;
+    let saved = checked_upstream_peer_response(
+        raw,
+        session_id,
+        Some(args.enabled),
+        Some(changed),
+        Some(expected_revision),
+    )?;
+    if (changed && saved["config_token"] == current["config_token"])
+        || (!changed && saved["config_token"] != current["config_token"])
+        || saved["status"]["blocked_reason"] == "persistence_uncertain"
+    {
+        return Err(upstream_peer_error(
+            "INVALID_RESPONSE",
+            "Socket peer settings acknowledgement did not confirm the token transition and durable state; mutation outcome is unknown",
+            "unknown",
+            session_id,
+            None,
+        ));
+    }
+    print_session_read_json(&saved, session_id)
+}
+
+fn history_retention_limit_schema() -> Value {
+    json!({
+        "type":"integer","minimum":1,"maximum":u32::MAX,
+        "x-sniper-json-number-representation":"unsigned-integer",
+        "description":"An unsigned JSON integer token from 1 through 4294967295, without a decimal point or exponent. This is a soft total-history target including protected rows."
+    })
+}
+
+fn history_retention_revision_schema() -> Value {
+    let maximum = u64::MAX.to_string();
+    let mut alternatives = vec![
+        "0".to_owned(),
+        "[1-9][0-9]{0,18}".to_owned(),
+        maximum.clone(),
+    ];
+    for (index, digit) in maximum.bytes().enumerate().skip(1) {
+        if digit > b'0' {
+            alternatives.push(format!(
+                "{}[0-{}][0-9]{{{}}}",
+                &maximum[..index],
+                char::from(digit - 1),
+                maximum.len() - index - 1
+            ));
+        }
+    }
+    json!({"type":"string","pattern":format!("^(?:{})$", alternatives.join("|")),
+        "description":"Canonical decimal u64 configuration revision (0 through 18446744073709551615), encoded as a string to preserve precision. Changes advance the revision; a no-op preserves it."})
+}
+
+fn history_retention_policy_schema() -> Value {
+    json!({"oneOf":[
+        {"type":"object","additionalProperties":false,"required":["mode"],"properties":{"mode":{"const":"off"}}},
+        {"type":"object","additionalProperties":false,"required":["mode","max_entries"],"properties":{"mode":{"const":"keep_newest"},"max_entries":history_retention_limit_schema()}}
+    ]})
+}
+
+fn history_retention_input_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.retention.get" | "capture.http.retention.set"
+    ) {
+        return None;
+    }
+    let mut session_id = legacy_uuid_input_schema(true, "Explicit sessions, including inactive sessions, are isolated without switching. Omission or null pins the active session once.");
+    let hyphenated = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+    session_id["pattern"] = json!(format!(
+        r"^(?:[0-9a-fA-F]{{32}}|{hyphenated}|\{{{hyphenated}\}}|urn:uuid:{hyphenated})$"
+    ));
+    let mut schema = json!({
+        "type":"object","additionalProperties":false,"required":[],
+        "properties":{"session_id":session_id}
+    });
+    if operation.ends_with(".set") {
+        schema["properties"]["off"] = json!({"type":"boolean","default":false,"description":"True disables future automatic cleanup; it does not restore deleted history."});
+        schema["properties"]["max_entries"] = history_retention_limit_schema();
+        schema["oneOf"] = json!([
+            {"required":["off"],"properties":{"off":{"const":true}},"not":{"required":["max_entries"]}},
+            {"required":["max_entries"],"properties":{"off":{"const":false}}}
+        ]);
+    }
+    Some(schema)
+}
+
+fn history_retention_output_schema(operation: &str) -> Option<Value> {
+    if !matches!(
+        operation,
+        "capture.http.retention.get" | "capture.http.retention.set"
+    ) {
+        return None;
+    }
+    let count = json!({"type":"integer","minimum":0});
+    let mut schema = json!({
+        "type":"object","additionalProperties":false,
+        "description":"Validated retention metadata only. A saved policy acknowledgement does not mean cleanup or disk reclamation has finished.",
+        "required":["session_id","config_token","config_revision","policy","status"],
+        "properties":{
+            "session_id":{"type":"string","format":"uuid"},
+            "config_token":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"Compare-and-swap token bound to this session, saved policy and configuration revision, never traffic counts."},
+            "config_revision":history_retention_revision_schema(),
+            "policy":history_retention_policy_schema(),
+            "status":{
+                "type":"object","additionalProperties":false,
+                "required":["total_count","protected_count","pending","disk_cleanup_pending","blocked_reason"],
+                "properties":{
+                    "total_count":count,"protected_count":count,
+                    "pending":{"type":"boolean","description":"Logical work remains or disk cleanup is queued; protected rows can keep the total above the target."},
+                    "disk_cleanup_pending":{"type":"boolean","description":"Physical cleanup remains pending, independently of the saved policy acknowledgement."},
+                    "blocked_reason":{"type":["string","null"],"enum":[null,"protected_records","workspace_durability_uncertain","persistence_error","record_identity_conflict"]}
+                }
+            }
+        }
+    });
+    if operation.ends_with(".set") {
+        schema["required"].as_array_mut()?.push(json!("changed"));
+        schema["properties"]["changed"] = json!({"type":"boolean","description":"Whether the saved policy changed; this is not a deletion count or completion signal."});
+    }
+    Some(schema)
+}
+
+fn history_retention_from_input(operation: &str, input: &Value) -> Result<HistoryRetentionCommand> {
+    let session_id = call_optional(operation, input, "session_id")?;
+    if operation.ends_with(".get") {
+        return Ok(HistoryRetentionCommand::Get(SessionReadArgs { session_id }));
+    }
+    for field in ["off", "max_entries"] {
+        if input.get(field).is_some_and(Value::is_null) {
+            bail!("field `{field}` for `{operation}` cannot be null");
+        }
+    }
+    let off = call_bool(operation, input, "off")?;
+    let max_entries: Option<u32> = call_optional(operation, input, "max_entries")?;
+    validate_call_exactly_one(
+        operation,
+        "retention policy",
+        &[("off", off), ("max_entries", max_entries.is_some())],
+    )?;
+    if max_entries == Some(0) {
+        bail!("field `max_entries` for `{operation}` must be between 1 and 4294967295");
+    }
+    Ok(HistoryRetentionCommand::Set(HistoryRetentionSetArgs {
+        session_id,
+        off,
+        max_entries,
+    }))
+}
+
+fn history_retention_api_preview(command: &HistoryRetentionCommand) -> Value {
+    let read = api_preview(
+        "GET",
+        session_query_path("/api/transactions/retention", command.session_id()),
+        None,
+    );
+    let HistoryRetentionCommand::Set(args) = command else {
+        return read;
+    };
+    json!({
+        "read":read,
+        "write":{
+            "method":"POST","path":session_query_path("/api/transactions/retention", args.session_id),
+            "body":{"policy":args.policy(),"expected_config_token":"<from the pinned policy GET>"},
+            "expected_active_session_id":if args.session_id.is_none() { json!("<resolved active session ID; sent in query>") } else { Value::Null },
+            "automatic_retry":false
+        }
+    })
+}
+
+#[derive(Debug)]
+struct HistoryRetentionCliError {
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Option<Uuid>,
+    status: Option<u16>,
+}
+
+impl fmt::Display for HistoryRetentionCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for HistoryRetentionCliError {}
+
+fn history_retention_error(
+    code: &'static str,
+    message: &'static str,
+    outcome: &'static str,
+    session_id: Option<Uuid>,
+    status: Option<StatusCode>,
+) -> anyhow::Error {
+    HistoryRetentionCliError {
+        code,
+        message,
+        outcome,
+        session_id,
+        status: status.map(|status| status.as_u16()),
+    }
+    .into()
+}
+
+async fn history_retention_get(
+    api: &ApiClient,
+    client: &reqwest::Client,
+    path: &str,
+    session_id: Option<Uuid>,
+    limit: usize,
+) -> Result<Value> {
+    let response = client.get(api.url(path)).send().await.map_err(|_| {
+        history_retention_error(
+            "TRANSPORT_ERROR",
+            "Retention metadata read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            None,
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(history_retention_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Retention metadata read failed; no mutation was sent",
+            "not_applied",
+            session_id,
+            Some(status),
+        ));
+    }
+    saved_replay_response_json(response, limit)
+        .await
+        .map_err(|_| {
+            history_retention_error(
+                "INVALID_RESPONSE",
+                "Retention metadata read was missing, malformed or too large; no mutation was sent",
+                "not_applied",
+                session_id,
+                None,
+            )
+        })
+}
+
+fn checked_history_retention_response(
+    value: Value,
+    session_id: Uuid,
+    requested_policy: Option<&Value>,
+    expected_changed: Option<bool>,
+    expected_revision: Option<u64>,
+) -> Result<Value> {
+    let invalid = || {
+        history_retention_error(
+            "INVALID_RESPONSE",
+            if requested_policy.is_some() {
+                "Retention acknowledgement did not match this operation; mutation outcome is unknown"
+            } else {
+                "Retention metadata was invalid; no mutation was sent"
+            },
+            if requested_policy.is_some() {
+                "unknown"
+            } else {
+                "not_applied"
+            },
+            Some(session_id),
+            None,
+        )
+    };
+    if value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        != Some(session_id)
+    {
+        return Err(invalid());
+    }
+    let raw_policy = value
+        .get("policy")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    // Accept additive response fields, but project only validated known metadata.
+    // A known field in the wrong policy variant is still an invalid shape.
+    let policy = match raw_policy.get("mode").and_then(Value::as_str) {
+        Some("off") if !raw_policy.contains_key("max_entries") => json!({"mode":"off"}),
+        Some("keep_newest") => {
+            let limit = raw_policy
+                .get("max_entries")
+                .and_then(Value::as_u64)
+                .filter(|limit| (1..=u32::MAX as u64).contains(limit))
+                .ok_or_else(invalid)?;
+            json!({"mode":"keep_newest","max_entries":limit})
+        }
+        _ => return Err(invalid()),
+    };
+    let typed_policy: HistoryRetentionPolicy =
+        serde_json::from_value(policy.clone()).map_err(|_| invalid())?;
+    let revision_text = value
+        .get("config_revision")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let revision = revision_text
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| revision.to_string() == revision_text)
+        .ok_or_else(invalid)?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(invalid());
+    }
+    let config_token = value
+        .get("config_token")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if config_token != history_retention_config_token(session_id, &typed_policy, revision)
+        || requested_policy.is_some_and(|requested| requested != &policy)
+    {
+        return Err(invalid());
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let total = status
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(invalid)?;
+    let protected = status
+        .get("protected_count")
+        .and_then(Value::as_u64)
+        .filter(|protected| *protected <= total)
+        .ok_or_else(invalid)?;
+    let pending = status
+        .get("pending")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    let disk_pending = status
+        .get("disk_cleanup_pending")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    let blocked = status.get("blocked_reason").ok_or_else(invalid)?;
+    if !blocked.is_null()
+        && !matches!(
+            blocked.as_str(),
+            Some(
+                "protected_records"
+                    | "workspace_durability_uncertain"
+                    | "persistence_error"
+                    | "record_identity_conflict"
+            )
+        )
+    {
+        return Err(invalid());
+    }
+    let mut output = json!({
+        "session_id":session_id,"config_token":config_token,"config_revision":revision_text,"policy":policy,
+        "status":{"total_count":total,"protected_count":protected,"pending":pending,"disk_cleanup_pending":disk_pending,"blocked_reason":blocked}
+    });
+    if let Some(expected) = expected_changed {
+        if value.get("changed").and_then(Value::as_bool) != Some(expected) {
+            return Err(invalid());
+        }
+        output["changed"] = json!(expected);
+    }
+    Ok(output)
+}
+
+async fn handle_history_retention(api: ApiClient, command: HistoryRetentionCommand) -> Result<()> {
+    let explicit = command.session_id();
+    let client = saved_configuration_write_client().map_err(|_| {
+        history_retention_error(
+            "TRANSPORT_ERROR",
+            "Could not prepare retention metadata client; no mutation was sent",
+            "not_applied",
+            explicit,
+            None,
+        )
+    })?;
+    let session_id = if let Some(id) = explicit {
+        id
+    } else {
+        let value =
+            history_retention_get(&api, &client, "/api/sessions", None, MAX_CLI_INPUT_BYTES)
+                .await?;
+        let sessions: Vec<SessionSummary> = serde_json::from_value(value).map_err(|_| {
+            history_retention_error(
+                "INVALID_RESPONSE",
+                "Session metadata was invalid; no mutation was sent",
+                "not_applied",
+                None,
+                None,
+            )
+        })?;
+        active_session_id_from_summaries(&sessions)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                history_retention_error(
+                    "INVALID_RESPONSE",
+                    "Expected exactly one active session; pass --session-id explicitly",
+                    "not_applied",
+                    None,
+                    None,
+                )
+            })?
+    };
+    let path = session_query_path("/api/transactions/retention", Some(session_id));
+    let raw = history_retention_get(&api, &client, &path, Some(session_id), 64 * 1024).await?;
+    let current = checked_history_retention_response(raw, session_id, None, None, None)?;
+    let HistoryRetentionCommand::Set(args) = command else {
+        return print_session_read_json(&current, session_id);
+    };
+    let policy = args.policy();
+    let changed = policy != current["policy"];
+    let revision = current["config_revision"]
+        .as_str()
+        .expect("validated revision")
+        .parse::<u64>()
+        .expect("validated revision");
+    let expected_revision = revision.checked_add(u64::from(changed)).ok_or_else(|| {
+        history_retention_error(
+            "RETENTION_REVISION_EXHAUSTED",
+            "Retention configuration revision cannot be advanced; no mutation was sent",
+            "not_applied",
+            Some(session_id),
+            None,
+        )
+    })?;
+    let path = session_query_path_with_expected_active(
+        "/api/transactions/retention",
+        Some(session_id),
+        explicit.is_none().then_some(session_id),
+    );
+    let response = client
+        .post(api.url(&path))
+        .json(&json!({"expected_config_token":current["config_token"],"policy":policy}))
+        .send()
+        .await
+        .map_err(|_| {
+            history_retention_error(
+                "TRANSPORT_ERROR",
+                "Retention acknowledgement was lost; mutation outcome is unknown",
+                "unknown",
+                Some(session_id),
+                None,
+            )
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        // Status is authoritative; diagnostic bodies and redirect targets are never read.
+        return Err(history_retention_error(
+            if status.is_redirection() {
+                "REDIRECT_REFUSED"
+            } else {
+                "HTTP_STATUS_ERROR"
+            },
+            "Retention policy write did not return success; mutation outcome is unknown",
+            "unknown",
+            Some(session_id),
+            Some(status),
+        ));
+    }
+    let raw = saved_replay_response_json(response, 64 * 1024).await.map_err(|_| history_retention_error(
+        "INVALID_RESPONSE", "Retention acknowledgement was missing, malformed or too large; mutation outcome is unknown", "unknown", Some(session_id), None,
+    ))?;
+    let saved = checked_history_retention_response(
+        raw,
+        session_id,
+        Some(&policy),
+        Some(changed),
+        Some(expected_revision),
+    )?;
+    print_session_read_json(&saved, session_id)
 }
 
 fn scanner_rule_schema(patch: bool) -> Value {
@@ -8044,6 +14541,25 @@ struct ReplayOpenInput {
     label: Option<String>,
 }
 
+/// A request read from a file or stdin, or the placeholder `replay open` starts
+/// from, names no scheme of its own, so the scheme it is sent with is its scheme.
+/// Left at the parser's default, a different target scheme reads as an override,
+/// which the server refuses when the request's host is an IP address: plain HTTP to
+/// `127.0.0.1` could not be set up from the CLI at all. A captured request keeps the
+/// scheme it was captured with, and a scheme change on it stays an override.
+fn adopt_target_scheme_for_uncaptured_request(
+    request: Option<&mut EditableRequest>,
+    source_transaction_id: Option<Uuid>,
+    target_scheme: &str,
+) {
+    if source_transaction_id.is_some() || target_scheme.is_empty() {
+        return;
+    }
+    if let Some(request) = request {
+        request.scheme = target_scheme.to_string();
+    }
+}
+
 async fn open_replay_tab(
     api: &ApiClient,
     input: ReplayOpenInput,
@@ -8059,7 +14575,7 @@ async fn open_replay_tab(
         label,
     } = input;
     let mut workspace = load_workspace_state(api, session_id).await?;
-    let (base_request, source_transaction_id, request_text) = resolve_request_source(
+    let (mut base_request, source_transaction_id, request_text) = resolve_request_source(
         api,
         workspace.session_id,
         transaction_id,
@@ -8068,6 +14584,11 @@ async fn open_replay_tab(
     )
     .await?;
     let normalized = normalize_target_inputs(scheme, host, port, base_request.as_ref())?;
+    adopt_target_scheme_for_uncaptured_request(
+        base_request.as_mut(),
+        source_transaction_id,
+        &normalized.scheme,
+    );
     let sequence = next_replay_tab_sequence(&workspace.replay)?;
     let tab = ReplayTabState {
         id: Uuid::new_v4().to_string(),
@@ -8110,13 +14631,17 @@ async fn open_replay_tab(
 // set here looks exactly like one typed into the tab strip and stays within the
 // server's 80-character limit instead of failing the whole workspace save.
 fn normalize_replay_tab_label(label: &str) -> String {
+    // Trim the end after the cut: it can stop on the joining space, which the
+    // server's own pass removes, and the saved label then never matched.
     label
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
         .take(80)
-        .collect()
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn next_replay_tab_sequence(replay: &ReplayWorkspaceState) -> Result<usize> {
@@ -9027,12 +15552,9 @@ async fn discover_api_base_url_from_data_dir(
     client: &reqwest::Client,
     data_dir: PathBuf,
 ) -> Result<String> {
-    let runtime_state = load_runtime_state(&data_dir).with_context(|| {
-        format!(
-            "failed to read Sniper runtime-state; it may be mid-update or stale at {}",
-            data_dir.display()
-        )
-    })?;
+    // Drop path-bearing causes as well as their display text: output failures
+    // print the original error chain to stderr instead of the JSON envelope.
+    let runtime_state = load_runtime_state(&data_dir).map_err(|_| LocalRuntimeStateReadError)?;
     if let Some(runtime_state) = runtime_state {
         let url = runtime_state.api_base_url();
         let expected = SniperApiProbeExpectation {
@@ -9274,7 +15796,15 @@ async fn probe_sniper_api_base_url_once_classified(
             "Sniper API probe returned {status}"
         )));
     }
-    let payload: serde_json::Value = response.json().await.map_err(|error| {
+    // An incomplete body says nothing about server identity. Keep transport
+    // failures separate from invalid, fully received JSON so a live owner's
+    // runtime-state survives a timeout or a dropped connection after headers.
+    let body = response.bytes().await.map_err(|error| {
+        SniperApiProbeFailure::unreachable(anyhow!(
+            "failed to probe Sniper API at {url}: failed to read response body: {error}"
+        ))
+    })?;
+    let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
         SniperApiProbeFailure::rejected(anyhow!("Sniper API probe response was not JSON: {error}"))
     })?;
     validate_sniper_settings_probe(&payload, expected).map_err(SniperApiProbeFailure::rejected)
@@ -9584,6 +16114,20 @@ fn parse_editable_raw_request_parts(
     let mut absolute_form = false;
 
     if is_absolute_http_url(target) {
+        if target.bytes().any(|byte| byte.is_ascii_control()) {
+            bail!("absolute request target must not include control characters");
+        }
+        let authority_and_path = target.split_once("://").unwrap().1;
+        let authority_end = authority_and_path
+            .find(['/', '?', '#'])
+            .unwrap_or(authority_and_path.len());
+        let raw_authority = &authority_and_path[..authority_end];
+        if raw_authority.is_empty() || raw_authority.contains('\\') {
+            bail!("absolute request target has an invalid authority");
+        }
+        if raw_authority.contains('@') {
+            bail!("absolute request target must not include credentials");
+        }
         let parsed = Url::parse(target)
             .with_context(|| format!("request target is not a valid URL: {target}"))?;
         if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -9601,14 +16145,14 @@ fn parse_editable_raw_request_parts(
         let parsed_port = parsed.port();
         host = format_request_authority(&parsed_host, parsed_port);
         absolute_target_authority = Some(host.clone());
-        path = format!(
-            "{}{}",
-            parsed.path(),
-            parsed
-                .query()
-                .map(|value| format!("?{value}"))
-                .unwrap_or_default()
-        );
+        // URL parsing validates the destination but normalizes dot segments.
+        // Keep the original request-target bytes, including an empty query.
+        let raw_path_and_query = &authority_and_path[authority_end..];
+        path = if raw_path_and_query.starts_with('/') {
+            raw_path_and_query.to_string()
+        } else {
+            format!("/{raw_path_and_query}")
+        };
     } else {
         path = target.to_string();
     }
@@ -9962,6 +16506,37 @@ fn saved_uuid_field(value: &Value, field: &str) -> Option<Uuid> {
         .and_then(|text| Uuid::parse_str(text).ok())
 }
 
+fn saved_response_diagnostic(
+    operation: &str,
+    read_message: &'static str,
+    receipt_message: &'static str,
+) -> &'static str {
+    if sniper::saved_contract::OPERATIONS.contains(&operation)
+        && !sniper::saved_data::is_write(operation)
+        && operation != "saved.v1.operation.get"
+    {
+        read_message
+    } else {
+        receipt_message
+    }
+}
+
+// Call only after output schema and request binding validation: ok:true means
+// the receipt was read successfully, not that its mutation was applied.
+fn saved_receipt_warnings(operation: &str, data: &Value) -> Vec<&'static str> {
+    if operation == "saved.v1.operation.get" && data["found"] == false {
+        return vec!["No receipt was found. This does not prove the mutation was not applied. Inspect current saved state; do not automatically retry or issue a new operation_id to repeat the mutation."];
+    }
+    if operation != "saved.v1.operation.get" && !sniper::saved_data::is_write(operation) {
+        return Vec::new();
+    }
+    match data["receipt"]["outcome"].as_str() {
+        Some("unknown") => vec!["The mutation outcome is unknown. Inspect saved.v1.operation.get with the original operation_id and current saved state; do not automatically retry or issue a new operation_id to repeat the mutation."],
+        Some("not_applied") => vec!["This mutation attempt was not applied. Review the receipt's code and current saved state before deciding on a new attempt. Repeating the same request with the original operation_id returns its receipt, not a fresh attempt."],
+        _ => Vec::new(),
+    }
+}
+
 fn validate_saved_response_binding(operation: &str, input: &Value, data: &Value) -> Result<()> {
     if sniper::saved_data::is_write(operation) {
         if saved_uuid_field(&data["receipt"], "operation_id")
@@ -9981,6 +16556,75 @@ fn validate_saved_response_binding(operation: &str, input: &Value, data: &Value)
             bail!("saved HTTP response is not bound to the requested session");
         }
     }
+    match operation {
+        "saved.v1.session.rename" if data["receipt"]["outcome"] == "applied" => {
+            // Replayed receipts retain the original result and are bound to the
+            // same input fingerprint; do not compare with newer session state.
+            if data["receipt"]["result"]["session"]["name"] != input["name"] {
+                bail!("saved rename result is not bound to the requested name");
+            }
+        }
+        "saved.v1.http.select" => {
+            if let Some(requested) = input.get("ids").and_then(Value::as_array) {
+                // Selection resolves every requested ID, but sorts and deduplicates
+                // parsed UUIDs rather than preserving input order or letter case.
+                let uuid_set = |ids: &[Value]| -> Result<std::collections::HashSet<Uuid>> {
+                    ids.iter()
+                        .map(|id| {
+                            Uuid::parse_str(id.as_str().context("missing selection UUID")?)
+                                .context("invalid selection UUID")
+                        })
+                        .collect()
+                };
+                let returned = data["ids"].as_array().context("missing selection IDs")?;
+                if uuid_set(requested)? != uuid_set(returned)? {
+                    bail!("saved selection response is not bound to the requested IDs");
+                }
+            }
+        }
+        "saved.v1.http.list" | "saved.v1.session.list" => {
+            let source = input.get("continuation").unwrap_or(input);
+            let limit = source
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(sniper::saved_contract::DEFAULT_LIMIT as u64);
+            if data["limit"].as_u64() != Some(limit) {
+                bail!("saved page is not bound to the requested limit");
+            }
+            let items = data["items"]
+                .as_array()
+                .context("missing saved page items")?;
+            if operation == "saved.v1.http.list" {
+                if let Some(cursor) = input.get("continuation") {
+                    let before = cursor["before_sequence"]
+                        .as_u64()
+                        .context("missing HTTP continuation boundary")?;
+                    if items
+                        .iter()
+                        .any(|item| item["sequence"].as_u64().is_none_or(|seq| seq >= before))
+                    {
+                        bail!("saved HTTP page crosses the requested sequence boundary");
+                    }
+                    // Terminal pages do not return a generation. Only a next
+                    // cursor can carry forward the pinned generation.
+                    if !data["continuation"].is_null()
+                        && saved_uuid_field(&data["continuation"], "store_generation")
+                            != saved_uuid_field(cursor, "store_generation")
+                    {
+                        bail!("saved HTTP continuation changed the requested store generation");
+                    }
+                }
+            } else if let Some(after) = saved_uuid_field(input, "after_id") {
+                if items
+                    .iter()
+                    .any(|item| saved_uuid_field(item, "id").is_none_or(|id| id <= after))
+                {
+                    bail!("saved session page crosses the requested UUID boundary");
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -9990,14 +16634,9 @@ async fn run_saved_call(
     dry_run: bool,
     yes: bool,
 ) -> Result<()> {
-    let input = parse_call_input(args.input).map_err(|_| {
-        saved_cli_error(
-            "INVALID_INPUT",
-            "Could not parse saved-data input JSON",
-            "not_applied",
-            &Value::Null,
-        )
-    })?;
+    // Sanitize before propagation too: stdout failures can print the original
+    // error chain rather than the JSON payload.
+    let input = load_call_input(args.input).map_err(CallInputError::for_saved_input)?;
     let operation = args.operation;
     if saved_operation_name(&operation).is_none() {
         return Err(saved_cli_error(
@@ -10067,7 +16706,11 @@ async fn run_saved_call(
         .map_err(|_| {
             saved_cli_error(
                 "TRANSPORT_ERROR",
-                "Saved-data response unavailable; inspect the operation receipt",
+                saved_response_diagnostic(
+                    &operation,
+                    "Saved-data read response unavailable",
+                    "Saved-data response unavailable; inspect the operation receipt",
+                ),
                 uncertain_outcome,
                 &input,
             )
@@ -10076,7 +16719,11 @@ async fn run_saved_call(
     if status.is_redirection() {
         return Err(saved_cli_error(
             "REDIRECT_REFUSED",
-            "Saved-data redirects are not followed; inspect the original operation receipt",
+            saved_response_diagnostic(
+                &operation,
+                "Saved-data read redirects are not followed",
+                "Saved-data redirects are not followed; inspect the original operation receipt",
+            ),
             uncertain_outcome,
             &input,
         ));
@@ -10084,7 +16731,11 @@ async fn run_saved_call(
     let wire: Value = response.json().await.map_err(|_| {
         saved_cli_error(
             "INVALID_RESPONSE",
-            "Could not decode the saved-data response; inspect the operation receipt",
+            saved_response_diagnostic(
+                &operation,
+                "Could not decode the saved-data read response",
+                "Could not decode the saved-data response; inspect the operation receipt",
+            ),
             uncertain_outcome,
             &input,
         )
@@ -10094,18 +16745,42 @@ async fn run_saved_call(
     {
         return Err(saved_cli_error(
             "INVALID_RESPONSE",
-            "Server did not identify a saved.v1 response; inspect the operation receipt",
+            saved_response_diagnostic(
+                &operation,
+                "Server did not identify a saved.v1 read response",
+                "Server did not identify a saved.v1 response; inspect the operation receipt",
+            ),
             uncertain_outcome,
             &input,
         ));
     }
     if status.is_success() && wire.get("ok") == Some(&Value::Bool(true)) {
         if let Some(data) = wire.get("data") {
-            sniper::saved_contract::validate_output(&operation, data).map_err(|_| saved_cli_error(
-                "INVALID_RESPONSE", "Server data does not satisfy the saved.v1 output schema; inspect the operation receipt", uncertain_outcome, &input))?;
-            validate_saved_response_binding(&operation, &input, data).map_err(|_| saved_cli_error(
-                "INVALID_RESPONSE", "Saved-data response identifies a different request; inspect the original operation receipt", uncertain_outcome, &input))?;
-            return print_json(data);
+            sniper::saved_contract::validate_output(&operation, data).map_err(|_| {
+                saved_cli_error(
+                    "INVALID_RESPONSE",
+                    saved_response_diagnostic(
+                        &operation,
+                        "Server read data does not satisfy the saved.v1 output schema",
+                        "Server data does not satisfy the saved.v1 output schema; inspect the operation receipt",
+                    ),
+                    uncertain_outcome,
+                    &input,
+                )
+            })?;
+            validate_saved_response_binding(&operation, &input, data).map_err(|_| {
+                saved_cli_error(
+                    "INVALID_RESPONSE",
+                    saved_response_diagnostic(
+                        &operation,
+                        "Saved-data read response identifies a different request",
+                        "Saved-data response identifies a different request; inspect the original operation receipt",
+                    ),
+                    uncertain_outcome,
+                    &input,
+                )
+            })?;
+            return print_json_with_warnings(data, &saved_receipt_warnings(&operation, data));
         }
     }
     if let Some(error) = wire.get("error").and_then(|value| {
@@ -10120,7 +16795,16 @@ async fn run_saved_call(
             || error.operation_id != saved_uuid_field(&input, "operation_id")
             || error.session_id != sniper::saved_contract::input_session_id(&input)
         {
-            return Err(saved_cli_error("INVALID_RESPONSE", "Saved-data error does not match this request; inspect the original operation receipt", uncertain_outcome, &input));
+            return Err(saved_cli_error(
+                "INVALID_RESPONSE",
+                saved_response_diagnostic(
+                    &operation,
+                    "Saved-data read error does not match this request",
+                    "Saved-data error does not match this request; inspect the original operation receipt",
+                ),
+                uncertain_outcome,
+                &input,
+            ));
         }
         let outcome = match error.outcome {
             sniper::saved_operations::SavedOperationOutcome::Applied => "applied",
@@ -10134,8 +16818,97 @@ async fn run_saved_call(
             &input,
         ));
     }
-    Err(saved_cli_error("INVALID_RESPONSE", "Server did not return a saved.v1 response; inspect the operation receipt before any further action", uncertain_outcome, &input))
+    Err(saved_cli_error(
+        "INVALID_RESPONSE",
+        saved_response_diagnostic(
+            &operation,
+            "Server did not return a saved.v1 read response",
+            "Server did not return a saved.v1 response; inspect the operation receipt before any further action",
+        ),
+        uncertain_outcome,
+        &input,
+    ))
 }
+
+#[derive(Debug)]
+struct LocalRuntimeStateReadError;
+
+impl fmt::Display for LocalRuntimeStateReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Could not read local Sniper runtime-state; no API call was sent")
+    }
+}
+
+impl std::error::Error for LocalRuntimeStateReadError {}
+
+#[derive(Debug)]
+struct ReadHttpStatusError {
+    status: StatusCode,
+}
+
+impl fmt::Display for ReadHttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "API read failed ({})", self.status)
+    }
+}
+
+impl std::error::Error for ReadHttpStatusError {}
+
+#[derive(Debug)]
+struct SessionMetadataHttpStatusError {
+    status: StatusCode,
+}
+
+impl fmt::Display for SessionMetadataHttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Session metadata write failed ({}); mutation outcome is unknown",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for SessionMetadataHttpStatusError {}
+
+#[derive(Debug)]
+struct MetadataAcknowledgementError;
+
+impl fmt::Display for MetadataAcknowledgementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Saved metadata acknowledgement was incomplete or did not match; mutation outcome is unknown")
+    }
+}
+
+impl std::error::Error for MetadataAcknowledgementError {}
+
+#[derive(Debug)]
+enum CallInputError {
+    Source(String),
+    SavedSource,
+    JsonSyntax,
+}
+
+impl CallInputError {
+    fn for_saved_input(self) -> Self {
+        match self {
+            Self::Source(_) => Self::SavedSource,
+            other => other,
+        }
+    }
+}
+
+impl fmt::Display for CallInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(message) => formatter.write_str(message),
+            Self::SavedSource => formatter.write_str("Could not read saved-data input source"),
+            Self::JsonSyntax => formatter.write_str("failed to parse call input JSON"),
+        }
+    }
+}
+
+impl std::error::Error for CallInputError {}
 
 #[derive(Debug)]
 struct CliPartialApplyError {
@@ -10162,85 +16935,142 @@ struct CliErrorPayload {
     exit_code: i32,
 }
 
-fn cli_output_format_from_raw_args(args: &[String]) -> OutputFormat {
+fn cli_output_format_from_raw_args(args: &[impl AsRef<OsStr>]) -> OutputFormat {
     for (index, arg) in args.iter().enumerate() {
-        if let Some(value) = arg.strip_prefix("--output=") {
+        let arg = arg.as_ref();
+        if let Some(value) = arg.as_encoded_bytes().strip_prefix(b"--output=") {
             return output_format_from_raw_value(value).unwrap_or(OutputFormat::Pretty);
         }
         if arg == "--output" {
             if let Some(value) = args.get(index + 1) {
-                return output_format_from_raw_value(value).unwrap_or(OutputFormat::Pretty);
+                return output_format_from_raw_value(value.as_ref().as_encoded_bytes())
+                    .unwrap_or(OutputFormat::Pretty);
             }
         }
     }
     OutputFormat::Pretty
 }
 
-fn output_format_from_raw_value(value: &str) -> Option<OutputFormat> {
+fn output_format_from_raw_value(value: &[u8]) -> Option<OutputFormat> {
     match value {
-        "compact" => Some(OutputFormat::Compact),
-        "pretty" => Some(OutputFormat::Pretty),
+        b"compact" => Some(OutputFormat::Compact),
+        b"pretty" => Some(OutputFormat::Pretty),
         _ => None,
     }
 }
 
-fn cli_parse_error_operation(args: &[String]) -> String {
-    let mut tokens = Vec::new();
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
+fn cli_parse_error_option_takes_value(command: &clap::Command, name: &str) -> Option<bool> {
+    // Recognize misplaced child options too, so their operands cannot become
+    // command names merely because clap rejects the option at this position.
+    command
+        .get_arguments()
+        .find(|arg| {
+            arg.get_long() == Some(name)
+                || arg
+                    .get_all_aliases()
+                    .is_some_and(|aliases| aliases.contains(&name))
+        })
+        .map(|arg| arg.get_action().takes_values())
+        .or_else(|| {
+            command
+                .get_subcommands()
+                .find_map(|child| cli_parse_error_option_takes_value(child, name))
+        })
+}
+
+fn cli_parse_error_long_option(arg: &OsStr) -> Option<(&str, bool)> {
+    let option = arg.as_encoded_bytes().strip_prefix(b"--")?;
+    let (name, inline_value) = option
+        .iter()
+        .position(|&byte| byte == b'=')
+        .map_or((option, false), |index| (&option[..index], true));
+    // Only the name must be Unicode: an inline operand may contain arbitrary
+    // OS bytes, and still must not change option arity or become an operation.
+    Some((std::str::from_utf8(name).ok()?, inline_value))
+}
+
+fn cli_parse_error_operation(args: &[impl AsRef<OsStr>]) -> String {
+    let cli = Cli::command();
+    let mut command = &cli;
+    let mut path = Vec::new();
+    let mut args = args.iter().map(|arg| arg.as_ref()).peekable();
+    let mut positional_only = false;
+    while let Some(arg) = args.next() {
+        let is_call = path.as_slice() == ["call"];
+        if positional_only {
+            if let Some(arg) = arg.to_str() {
+                return arg.to_owned();
+            }
+            break;
+        }
+        if arg == "--" {
+            if is_call {
+                positional_only = true;
+                continue;
+            }
+            break;
+        }
+        if arg.as_encoded_bytes().starts_with(b"-") {
+            let takes_value = if is_call {
+                // Call operations are free-form, including unknown names. Keep
+                // their existing input skipping and delimiter semantics.
+                if arg.to_str().is_none() && cli_parse_error_long_option(arg).is_none() {
+                    break;
+                }
+                matches!(arg.as_encoded_bytes(), b"--output" | b"--api" | b"--input")
+            } else if let Some((name, inline_value)) = cli_parse_error_long_option(arg) {
+                let Some(takes_value) = cli_parse_error_option_takes_value(&cli, name) else {
+                    // An unknown option may own the following token. Do not
+                    // mistake that operand for a declared command or action.
+                    break;
+                };
+                takes_value && !inline_value
+            } else {
+                break;
+            };
+            if takes_value
+                && args.peek().is_some_and(|value| {
+                    let bytes = value.as_encoded_bytes();
+                    !bytes.starts_with(b"-") || bytes == b"-"
+                })
+            {
+                args.next();
+            }
             continue;
         }
-        if arg == "--output" || arg == "--api" {
-            skip_next = true;
-            continue;
+        let Some(arg) = arg.to_str() else {
+            break;
+        };
+        if is_call {
+            return arg.to_owned();
         }
-        if arg.starts_with("--output=") || arg.starts_with("--api=") || arg.starts_with('-') {
-            continue;
-        }
-        tokens.push(arg.as_str());
+        let Some(child) = command.find_subcommand(arg) else {
+            break;
+        };
+        path.push(child.get_name());
+        command = child;
     }
 
-    match tokens.as_slice() {
-        ["scanner", group, action, ..] => format!("scanner.{group}.{}", action.replace('-', "_")),
-        ["findings", action, ..] => format!("findings.{action}"),
-        ["event-log", action, ..] => format!("event_log.{action}"),
-        ["session", action, ..] => format!("session.{action}"),
-        ["scope" | "target", "get-scope", ..] => "scope.get".to_string(),
-        ["scope" | "target", "set-scope", ..] => "scope.set".to_string(),
-        ["replay" | "repeater", action, ..] => format!("replay.{action}"),
-        ["fuzzer", action, ..] => format!("fuzzer.{}", action.replace('-', "_")),
-        ["sequence", action, ..] => format!("sequence.{}", action.replace('-', "_")),
-        ["skills", action, ..] => format!("skills.{action}"),
-        ["capture", "http", action, ..] | ["http" | "history", action, ..] => {
-            format!("capture.http.{}", action.replace('-', "_"))
-        }
-        ["capture", "intercept", action, ..] | ["intercept", action, ..] => {
-            format!("capture.intercept.{}", action.replace('-', "_"))
-        }
-        ["capture", "response-intercept", action, ..] => {
-            format!("capture.response_intercept.{}", action.replace('-', "_"))
-        }
-        ["capture", "intercept-rule", action, ..] => {
-            format!("capture.intercept_rule.{}", action.replace('-', "_"))
-        }
-        ["capture", "web-socket", action, ..] | ["websocket", action, ..] => {
-            format!("capture.websocket.{}", action.replace('-', "_"))
-        }
-        ["capture", "auto-replace", action, ..] | ["auto-replace", action, ..] => {
-            format!("capture.auto_replace.{}", action.replace('-', "_"))
-        }
-        ["capture", "oast", action, ..] => format!("capture.oast.{}", action.replace('-', "_")),
-        ["capture", "browser", action, ..] => {
-            format!("capture.browser.{}", action.replace('-', "_"))
-        }
-        ["call", operation, ..] => (*operation).to_string(),
-        ["manifest", ..] => "manifest".to_string(),
-        ["schema", ..] => "schema".to_string(),
-        ["examples", ..] => "examples".to_string(),
-        [first, ..] => (*first).to_string(),
-        [] => "parse".to_string(),
+    // Hidden top-level wrappers expose the same operations as capture. Only
+    // canonical names from clap, never raw option operands, enter this path.
+    if matches!(
+        path.first(),
+        Some(&("http" | "intercept" | "web-socket" | "auto-replace"))
+    ) {
+        path.insert(0, "capture");
+    }
+    let fallback = path.first().copied().unwrap_or("parse");
+    let mut operations = manifest_operations().into_iter().filter(|spec| {
+        spec.command
+            .split_ascii_whitespace()
+            .take_while(|token| !token.starts_with(['-', '<', '[']))
+            .eq(path.iter().copied())
+    });
+    match (operations.next(), operations.next()) {
+        // Flag-dependent commands such as capture proxy deliberately retain
+        // the group fallback rather than guessing among multiple operations.
+        (Some(spec), None) => spec.operation.to_string(),
+        _ => fallback.to_string(),
     }
 }
 
@@ -10256,6 +17086,10 @@ fn cli_partial_apply_error(message: impl Into<String>, mut details: Value) -> an
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    print_json_with_warnings(value, &[])
+}
+
+fn print_json_with_warnings<T: Serialize>(value: &T, warnings: &[&str]) -> Result<()> {
     let data = serde_json::to_value(value).context("failed to encode JSON output")?;
     let context = output_context();
     if !context.success_envelope {
@@ -10267,7 +17101,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
         "schema_version": output_schema_version(&context.operation),
         "data": data,
         "meta": {},
-        "warnings": [],
+        "warnings": warnings,
     });
     write_json_envelope(&envelope, context.format)
 }
@@ -10335,6 +17169,153 @@ fn clap_error_payload(error: &clap::Error) -> CliErrorPayload {
 }
 
 fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload {
+    if let Some(map) = error.downcast_ref::<ServiceMapCliError>() {
+        return CliErrorPayload {
+            code: map.code,
+            message: map.message.into(),
+            hint: Some("Check the selected API and CLI/app compatibility, then deliberately reread the same session. Never substitute a UUID-only detail lookup or generate traffic to fill missing map evidence."),
+            retryable: false,
+            details: json!({"status":map.status}),
+            exit_code: if map.code == "INVALID_INPUT" { 2 } else if map.code == "API_UNAVAILABLE" || map.status.is_some_and(|status| status >= 500) { 6 } else { 5 },
+        };
+    }
+
+    if let Some(discovery) = error.downcast_ref::<LocalRuntimeStateReadError>() {
+        return CliErrorPayload {
+            code: "API_UNAVAILABLE",
+            message: discovery.to_string(),
+            hint: Some("Check Sniper's local data directory (SNIPER_DATA_DIR if set) and its runtime-state files, or pass --api http://HOST:PORT for the intended running instance. Preserve existing runtime-state files."),
+            retryable: false,
+            details: json!({}),
+            exit_code: 6,
+        };
+    }
+    if let Some(input) = error.downcast_ref::<CallInputError>() {
+        let saved = operation.starts_with("saved.v1.");
+        // Preserve the failure phase without exposing saved input paths,
+        // contents, or parser excerpts in diagnostics.
+        let (message, hint) = if saved {
+            match input {
+                CallInputError::Source(_) | CallInputError::SavedSource => (
+                    "Could not read saved-data input source".to_owned(),
+                    "Check a readable regular UTF-8 @file or UTF-8 stdin within the input size limit; then inspect `sniper-cli schema input <operation>`.",
+                ),
+                CallInputError::JsonSyntax => (
+                    "Could not parse saved-data input JSON".to_owned(),
+                    "Correct the JSON syntax in --input, @file, or stdin; see `sniper-cli examples <operation>` and `sniper-cli schema input <operation>`.",
+                ),
+            }
+        } else {
+            (
+                input.to_string(),
+                "Check `sniper-cli schema input <operation>` or run the command with --help.",
+            )
+        };
+        return CliErrorPayload {
+            code: "INVALID_INPUT",
+            message,
+            hint: Some(hint),
+            retryable: false,
+            details: if saved {
+                json!({"outcome":"not_applied","operation_id":null,"session_id":null})
+            } else {
+                json!({ "operation": operation })
+            },
+            exit_code: 2,
+        };
+    }
+    if let Some(managed) = error.downcast_ref::<sniper::skill_managed::ManagedSkillError>() {
+        let (message, hint) = match (operation, managed.code) {
+            (operation, "policy_revision_conflict" | "policy_revision_required") if is_skill_auto_update_operation(operation) => (
+                "The automatic-update policy needs fresh explicit authorization at its current revision.",
+                "Inspect skills auto-update-status for the same agent. Preserve all files and recovery artifacts; only deliberately re-enable with the returned --policy-revision after reviewing the stored target and pause reason.",
+            ),
+            (operation, _) if is_skill_auto_update_operation(operation) => (
+                "The host-local automatic-update action could not complete safely.",
+                "Inspect skills auto-update-status for the same agent and preserve active files, policy, attempt and transaction artifacts. Paused or uncertain state is not permission to retry, replace operation IDs, adopt edits or use legacy install. Re-enable only after review with the current --policy-revision.",
+            ),
+            ("skills.apply_update" | "skills.rollback_update", "recovery_required") => (
+                "The local skill mutation requires recovery inspection; its outcome must not be assumed.",
+                "Use skills update-result with the same selected agent, root and original --operation-id. Preserve all transaction and staging artifacts and displaced files; do not blindly retry or use a new operation ID.",
+            ),
+            ("skills.apply_update" | "skills.rollback_update", "platform_unsupported" | "swap_unsupported" | "metadata_unsupported") => (
+                "Safe skill activation or rollback is unavailable on this platform or filesystem.",
+                "Preserve the active skill and all artifacts. Use skills update-result with the original --operation-id if a transaction exists; never fall back to overwrite or legacy install.",
+            ),
+            ("skills.apply_update", "version_conflict") => (
+                "Different skill bytes do not have a strictly newer semantic version.",
+                "Preserve the active file, enrollment and stage. Inspect their versions and hashes; equal semantic-version precedence with different bytes is refused, including build-metadata-only changes.",
+            ),
+            ("skills.apply_update", "downgrade") => (
+                "The candidate's semantic version is older than the enrolled baseline.",
+                "Preserve the active file, enrollment and staged candidate. This activation path only accepts strictly newer bundled versions; use transaction-bound rollback with the original operation ID to restore that transaction's baseline.",
+            ),
+            ("skills.apply_update", "request_conflict") => (
+                "The operation ID is already bound to a different skill update request.",
+                "Inspect skills update-result using the original --operation-id, agent and root. Preserve its artifacts; do not reuse the ID for another bundle or staging directory or replace the ID to bypass an unresolved transaction.",
+            ),
+            ("skills.apply_update" | "skills.rollback_update", "transaction_busy" | "pending_transaction") => (
+                "Another local skill transaction blocks this action.",
+                "Stop concurrent writers and inspect the existing transaction with skills update-result and its original --operation-id. Preserve its lock and recovery artifacts; do not remove them or invent another ID to bypass the transaction.",
+            ),
+            ("skills.apply_update" | "skills.update_result" | "skills.rollback_update", _) => (
+                "The local skill transaction could not be completed or inspected safely.",
+                "Use skills update-result with the same selected agent, root and original --operation-id. Preserve transaction and staging artifacts and displaced files; inspect the reason before any deliberate action, and do not blindly retry or replace the operation ID.",
+            ),
+            ("skills.stage_update", "already_current") => (
+                "The active skill already matches this binary's bundled template.",
+                "Use skills status to check the active bytes; no update candidate is needed.",
+            ),
+            ("skills.enroll", "already_exists") => (
+                "The enrollment receipt path already exists.",
+                "Use skills update-preview to inspect the recorded baseline. Preserve the existing path; it may contain a valid or malformed receipt, or be a directory or link.",
+            ),
+            ("skills.stage_update", "already_exists") => (
+                "The staging directory or an output path already exists.",
+                "Inspect the staging directory and any partial output, then choose a new staging directory whose parent exists and which is outside the active skill directory.",
+            ),
+            ("skills.enroll", "installed_not_current") => (
+                "Enrollment requires active skill bytes that exactly match this binary's bundled template.",
+                "Use skills status to compare the active bytes. Review differences and preserve customizations; do not overwrite edits just to enroll.",
+            ),
+            ("skills.stage_update", "installed_modified") => (
+                "The active skill differs from its recorded enrollment baseline.",
+                "Use skills status to compare active bytes with the bundle and skills update-preview to inspect the baseline. Manual activation can leave an old receipt; preserve customizations before considering optional receipt recovery.",
+            ),
+            _ => (
+                "Local skill operation could not be completed safely.",
+                "Inspect skills update-preview and the local staging directory before deliberately trying again. No activation is performed.",
+            ),
+        };
+        return CliErrorPayload {
+            code: "MANAGED_SKILL_ERROR",
+            message: message.to_owned(),
+            hint: Some(hint),
+            retryable: false,
+            details: json!({"reason":managed.code}),
+            exit_code: 5,
+        };
+    }
+    if let Some(peer) = error.downcast_ref::<UpstreamPeerCliError>() {
+        return CliErrorPayload {
+            code: peer.code,
+            message: peer.message.to_owned(),
+            hint: Some("Deliberately inspect capture http upstream-peer get --session-id <the same active session UUID> before another write; never automatically retry or switch sessions."),
+            retryable: false,
+            details: json!({"session_id":peer.session_id,"outcome":peer.outcome,"status":peer.status}),
+            exit_code: if peer.status.is_some_and(|status| status >= 500) { 6 } else { 5 },
+        };
+    }
+    if let Some(retention) = error.downcast_ref::<HistoryRetentionCliError>() {
+        return CliErrorPayload {
+            code: retention.code,
+            message: retention.message.to_owned(),
+            hint: Some("Inspect capture http retention get --session-id <the same session UUID> before deliberately issuing another write; never automatically retry."),
+            retryable: false,
+            details: json!({"session_id":retention.session_id,"outcome":retention.outcome,"status":retention.status}),
+            exit_code: if retention.status.is_some_and(|status| status >= 500) { 6 } else { 5 },
+        };
+    }
     if let Some(tab) = error.downcast_ref::<ReplayTabCliError>() {
         return CliErrorPayload {
             code: tab.code,
@@ -10346,13 +17327,38 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
         };
     }
     if let Some(saved) = error.downcast_ref::<SavedCliError>() {
+        let known_read = saved.outcome == "not_applied"
+            && sniper::saved_contract::OPERATIONS.contains(&operation)
+            && !sniper::saved_data::is_write(operation);
+        let hint = if known_read && saved.code == "INVALID_INPUT" {
+            "Inspect sniper-cli schema input <operation> for this operation's accepted input, then correct the input."
+        } else if known_read && operation != "saved.v1.operation.get" {
+            // Summary/selection reads have no operation ID or mutation receipt.
+            match saved.code {
+                "STALE_CONTINUATION" if operation == "saved.v1.session.list" => "Discard the stale continuation and deliberately start a fresh session listing on the same selected API with the same page limit. Treat it as a new traversal, not a continuation of earlier results.",
+                "STALE_CONTINUATION" => "Discard the stale continuation and deliberately start a fresh listing with the same explicit session_id. Treat it as a new traversal, not a continuation of earlier results.",
+                "SESSION_NOT_FOUND" => "Use saved.v1.session.list to inspect available sessions, then deliberately select an existing session UUID. Do not silently switch sessions.",
+                "API_UNAVAILABLE" => "Check the selected API endpoint and that Sniper is running, then deliberately rerun this read.",
+                "UNKNOWN_OPERATION" => "The selected API does not recognize this saved-data operation. Check the intended API and compatibility of the CLI and running Sniper app before deliberately rerunning this read; never automatically retry a mutation.",
+                _ => "Inspect the error and selected API/session context before deliberately rerunning this read; never automatically retry a mutation.",
+            }
+        } else {
+            "Use saved.v1.operation.get with the original operation_id to inspect a receipt; never automatically retry a mutation."
+        };
         return CliErrorPayload {
             code: saved.code,
             message: saved.message.clone(),
-            hint: Some("Use saved.v1.operation.get with the original operation_id to inspect a receipt; never automatically retry a mutation."),
+            hint: Some(hint),
             retryable: false,
             details: json!({"outcome":saved.outcome,"operation_id":saved.operation_id,"session_id":saved.session_id}),
-            exit_code: if matches!(saved.code, "INVALID_INPUT" | "UNKNOWN_OPERATION" | "CONFIRMATION_REQUIRED") { 2 } else { 5 },
+            exit_code: if matches!(
+                saved.code,
+                "INVALID_INPUT" | "UNKNOWN_OPERATION" | "CONFIRMATION_REQUIRED"
+            ) {
+                2
+            } else {
+                5
+            },
         };
     }
     if let Some(partial) = error.downcast_ref::<CliPartialApplyError>() {
@@ -10368,8 +17374,46 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
         };
     }
 
+    if error
+        .downcast_ref::<MetadataAcknowledgementError>()
+        .is_some()
+    {
+        return CliErrorPayload {
+            code: "INVALID_RESPONSE",
+            message: MetadataAcknowledgementError.to_string(),
+            hint: Some("Inspect current state before deliberately issuing another write; never automatically retry."),
+            retryable: false,
+            details: json!({"idempotent":false,"outcome":"unknown"}),
+            exit_code: 5,
+        };
+    }
+
+    if let Some(write) = error.downcast_ref::<SessionMetadataHttpStatusError>() {
+        let status = write.status.as_u16();
+        return CliErrorPayload {
+            code: "HTTP_STATUS_ERROR",
+            message: write.to_string(),
+            hint: Some("Inspect session list and current state before deliberately issuing another write; never automatically retry."),
+            retryable: false,
+            details: json!({"status":status,"idempotent":false,"outcome":"unknown"}),
+            exit_code: if status < 500 { 5 } else { 6 },
+        };
+    }
+
     let message = error.to_string();
-    let mut payload = if message.contains("requires --dry-run or --yes") {
+    // A read's server diagnostic must not turn its actual HTTP status into a
+    // local confirmation, input, discovery, or workspace-conflict error.
+    let mut payload = if let Some(read) = error.downcast_ref::<ReadHttpStatusError>() {
+        let status = read.status.as_u16();
+        CliErrorPayload {
+            code: "HTTP_STATUS_ERROR",
+            message: read.to_string(),
+            hint: None,
+            retryable: status >= 500,
+            details: json!({ "status": status }),
+            exit_code: if status < 500 { 5 } else { 6 },
+        }
+    } else if message.contains("requires --dry-run or --yes") {
         CliErrorPayload {
             code: "CONFIRMATION_REQUIRED",
             message,
@@ -10462,6 +17506,7 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
     let write_may_have_been_sent = payload.code == "HTTP_STATUS_ERROR"
         || (payload.code == "CLI_ERROR"
             && (payload.message.contains("failed to POST")
+                || payload.message.contains("failed to PATCH")
                 || payload.message.contains("failed to DELETE")));
     if operation_spec(operation)
         .is_some_and(|spec| spec.side_effect == CliSideEffect::Write && spec.requires_confirmation)
@@ -10647,6 +17692,110 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
     } else {
         443
     }
+}
+
+fn validate_skill_cli_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
+        bail!("skill directory must be nonempty and contain no NUL characters");
+    }
+    Ok(())
+}
+
+fn stored_skill_agent(args: StoredSkillArgs) -> (&'static str, &'static str) {
+    if args.codex {
+        ("codex", skills::CODEX_SKILL_TEMPLATE)
+    } else {
+        ("claude", skills::CLAUDE_SKILL_TEMPLATE)
+    }
+}
+
+fn single_skill_target(args: SingleSkillArgs) -> Result<(&'static str, PathBuf, &'static str)> {
+    let (agent, root, default_root, bundled) = if args.codex {
+        (
+            "codex",
+            args.codex_dir,
+            skills::default_codex_skills_dir as fn() -> Option<PathBuf>,
+            skills::CODEX_SKILL_TEMPLATE,
+        )
+    } else {
+        (
+            "claude",
+            args.claude_dir,
+            skills::default_claude_skills_dir as fn() -> Option<PathBuf>,
+            skills::CLAUDE_SKILL_TEMPLATE,
+        )
+    };
+    let root = root.or_else(default_root).with_context(|| {
+        format!("could not determine {agent} skills directory; set HOME or pass --{agent}-dir")
+    })?;
+    Ok((agent, root, bundled))
+}
+
+fn skills_update_preview(args: SkillsInstallArgs) -> Result<Value> {
+    let mut entries = Vec::new();
+    for (selected, agent, root, default_root, bundled) in [
+        (
+            args.all || args.codex,
+            "codex",
+            args.codex_dir,
+            skills::default_codex_skills_dir as fn() -> Option<PathBuf>,
+            skills::CODEX_SKILL_TEMPLATE,
+        ),
+        (
+            args.all || args.claude,
+            "claude",
+            args.claude_dir,
+            skills::default_claude_skills_dir as fn() -> Option<PathBuf>,
+            skills::CLAUDE_SKILL_TEMPLATE,
+        ),
+    ] {
+        if selected {
+            let root = root.or_else(default_root).with_context(|| {
+                format!(
+                    "could not determine {agent} skills directory; set HOME or pass --{agent}-dir"
+                )
+            })?;
+            entries.push(sniper::skill_managed::preview_skill_update(
+                agent,
+                &root,
+                bundled,
+                env!("CARGO_PKG_VERSION"),
+            )?);
+        }
+    }
+    Ok(json!({"scope":"cli_host","bundled_version":env!("CARGO_PKG_VERSION"),"entries":entries}))
+}
+
+fn skills_status(args: SkillsInstallArgs) -> Result<Value> {
+    let mut entries = Vec::new();
+    for (selected, agent, root, default_root, bundled) in [
+        (
+            args.all || args.codex,
+            "codex",
+            args.codex_dir,
+            skills::default_codex_skills_dir as fn() -> Option<PathBuf>,
+            skills::CODEX_SKILL_TEMPLATE,
+        ),
+        (
+            args.all || args.claude,
+            "claude",
+            args.claude_dir,
+            skills::default_claude_skills_dir as fn() -> Option<PathBuf>,
+            skills::CLAUDE_SKILL_TEMPLATE,
+        ),
+    ] {
+        if selected {
+            let root = root.or_else(default_root).with_context(|| {
+                format!(
+                    "could not determine {agent} skills directory; set HOME or pass --{agent}-dir"
+                )
+            })?;
+            entries.push(sniper::skill_status::read_skill_status(
+                agent, &root, bundled,
+            )?);
+        }
+    }
+    Ok(json!({"scope":"cli_host","bundled_version":env!("CARGO_PKG_VERSION"),"entries":entries}))
 }
 
 fn install_skills(args: SkillsInstallArgs) -> Result<skills::SkillsInstallResult> {
@@ -10844,19 +17993,32 @@ fn parse_response_status_line(status_line: &str) -> Result<u16> {
 }
 
 #[cfg(test)]
+mod label_rule_tests {
+    // The server applies the rule again to what the CLI sends, and the CLI then
+    // compares the saved label with its own result.
+    #[test]
+    fn the_tab_label_rule_gives_the_same_label_when_applied_again() {
+        let label = super::normalize_replay_tab_label(&format!("{} tail", "a".repeat(79)));
+        assert_eq!(label, "a".repeat(79));
+        assert_eq!(super::normalize_replay_tab_label(&label), label);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::validate_saved_response_binding;
     use super::{
-        active_session_id_from_summaries, api_failure_detail, api_url, attach_session_id,
-        attach_workspace_save_error, auto_replace_write_session_id, browser_choices,
-        browser_open_body, build_annotations_payload, build_editable_raw_request,
+        active_session_id_from_summaries, adopt_target_scheme_for_uncaptured_request,
+        api_failure_detail, api_url, attach_session_id, attach_workspace_save_error,
+        auto_replace_write_session_id, browser_choices, browser_open_body,
+        build_annotations_payload, build_editable_raw_request,
         build_editable_raw_request_with_version, build_oast_configure_update, clap_error_payload,
         cli_data_dir, cli_error_payload, cli_output_format_from_raw_args,
-        cli_parse_error_operation, cli_partial_apply_error, command_from_call_args,
-        command_from_operation_input, command_input_preview, default_cli_data_dir,
-        default_editable_request, discover_api_base_url, discover_api_base_url_from_data_dir,
-        dry_run_command, ensure_http_replay_tab, explicit_or_active_session_id,
-        failed_record_output, fuzzer_active_target_for_request,
+        cli_parse_error_long_option, cli_parse_error_operation, cli_partial_apply_error,
+        command_from_call_args, command_from_operation_input, command_input_preview,
+        default_cli_data_dir, default_editable_request, discover_api_base_url,
+        discover_api_base_url_from_data_dir, dry_run_command, ensure_http_replay_tab,
+        explicit_or_active_session_id, failed_record_output, fuzzer_active_target_for_request,
         fuzzer_target_request_authority_for_request, history_list_path, history_search_path,
         install_skills, json_value_with_session_and_workspace_save_error, manifest_operations,
         next_replay_tab_sequence, normalize_api_base_url, normalize_replay_port,
@@ -10939,6 +18101,123 @@ mod tests {
             match &self.previous {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn assert_supplement_invalid_response(
+        error: anyhow::Error,
+        operation: &str,
+        message: &str,
+        reason: &str,
+    ) {
+        let payload = cli_error_payload(operation, &error);
+        assert_eq!(payload.code, "INVALID_RESPONSE");
+        assert_eq!(payload.message, message);
+        assert_eq!(payload.details, json!({"status":null}));
+        assert_eq!(payload.exit_code, 5);
+        assert!(!payload.retryable);
+        assert!(!serde_json::to_string(&payload).unwrap().contains(reason));
+    }
+
+    #[test]
+    fn service_map_html_supplement_status_reason_contract() {
+        use sniper::service_map_html::{ServiceMapHtmlGenerators, ACQUISITION_REASONS};
+        let session_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let args = super::ServiceMapHtmlGeneratorsArgs {
+            session_id,
+            evidence_id: format!("v1.{session_id}.22222222-2222-4222-8222-222222222222.9007199254740993.44444444-4444-4444-8444-444444444444.33333333-3333-4333-8333-333333333333"),
+        };
+        let unsupported = [
+            "metadata_limit",
+            "unsupported_content_type",
+            "unsupported_body_encoding",
+            "unsupported_content_encoding",
+            "unsupported_metadata",
+        ];
+        for reason in ACQUISITION_REASONS.iter().copied().chain([
+            "unsupported_source_context",
+            "malformed_tag",
+            "PRIVATE_CONTENT_SENTINEL",
+        ]) {
+            for status in [
+                "unavailable",
+                "unsupported",
+                "scanned",
+                "partial",
+                "UNSUPPORTED",
+            ] {
+                let mut result =
+                    ServiceMapHtmlGenerators::missing(session_id, args.evidence_id.clone(), reason);
+                // The constructor sanitizes unknown input; simulate the wire value directly.
+                result.reasons = vec![reason.into()];
+                result.status = status.into();
+                let valid = match status {
+                    "unavailable" => ACQUISITION_REASONS.contains(&reason),
+                    "unsupported" => unsupported.contains(&reason),
+                    _ => false,
+                };
+                let outcome = super::validate_service_map_html_generators_response(&result, &args);
+                assert_eq!(outcome.is_ok(), valid, "{status}/{reason}");
+                if !valid {
+                    assert_supplement_invalid_response(
+                        outcome.unwrap_err(),
+                        "target.service_map.html_generators.get",
+                        "HTML generator inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract",
+                        reason,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn service_map_link_supplement_status_reason_contract() {
+        use sniper::service_map_links::{ServiceMapLinkDeclarations, ACQUISITION_REASONS};
+        let session_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let args = super::ServiceMapLinkDeclarationsArgs {
+            session_id,
+            evidence_id: format!("v1.{session_id}.22222222-2222-4222-8222-222222222222.9007199254740993.44444444-4444-4444-8444-444444444444.33333333-3333-4333-8333-333333333333"),
+        };
+        for reason in ACQUISITION_REASONS.iter().copied().chain([
+            "metadata_limit",
+            "unsupported_content_type",
+            "unsupported_body_encoding",
+            "unsupported_content_encoding",
+            "unsupported_metadata",
+            "malformed_field",
+            "PRIVATE_CONTENT_SENTINEL",
+        ]) {
+            for status in [
+                "unavailable",
+                "unsupported",
+                "scanned",
+                "partial",
+                "UNSUPPORTED",
+            ] {
+                let mut result = ServiceMapLinkDeclarations::missing(
+                    session_id,
+                    args.evidence_id.clone(),
+                    reason,
+                );
+                result.reasons = vec![reason.into()];
+                result.status = status.into();
+                let valid = match status {
+                    "unavailable" => ACQUISITION_REASONS.contains(&reason),
+                    "unsupported" => reason == "unsupported_source_context",
+                    _ => false,
+                };
+                let outcome =
+                    super::validate_service_map_link_declarations_response(&result, &args);
+                assert_eq!(outcome.is_ok(), valid, "{status}/{reason}");
+                if !valid {
+                    assert_supplement_invalid_response(
+                        outcome.unwrap_err(),
+                        "target.service_map.link_declarations.get",
+                        "Link declaration inspection does not match the requested session, exact-row token, fixed catalog, bounds, or safe declaration contract",
+                        reason,
+                    );
+                }
             }
         }
     }
@@ -11153,6 +18432,19 @@ mod tests {
             active_session_id_from_summaries(&sessions).unwrap(),
             Some(active)
         );
+    }
+
+    #[test]
+    fn saved_call_input_errors_discard_source_details_before_propagation() {
+        let private = "SYNTHETIC_PRIVATE_SOURCE_PATH";
+        let legacy = super::CallInputError::Source(private.into());
+        assert_eq!(legacy.to_string(), private);
+        let saved: anyhow::Error = legacy.for_saved_input().into();
+        assert_eq!(saved.to_string(), "Could not read saved-data input source");
+        assert!(!format!("{saved:#}").contains(private));
+        assert!(!format!("{saved:?}").contains(private));
+        let syntax = super::CallInputError::JsonSyntax.for_saved_input();
+        assert_eq!(syntax.to_string(), "failed to parse call input JSON");
     }
 
     #[test]
@@ -11674,6 +18966,72 @@ mod tests {
         assert_eq!(request.scheme, "http");
         assert_eq!(request.host, "target.example:8080");
         assert_eq!(request.path, "/admin");
+    }
+
+    #[test]
+    fn raw_request_parser_preserves_absolute_target_bytes() {
+        for suffix in [
+            "/a/../b",
+            "/a/./b",
+            "/a/%2e%2E/b",
+            "/a/.%2e/b",
+            "/a/%2E./b",
+            "//a//b",
+            "/a//b/",
+            "/a?",
+            "/a?x=%2f%2F",
+            "/a@b?x=@example.com",
+            "/a/%2f%2F?x=/../%2e&x=",
+            "",
+            "?",
+            "?x=%2f%2F",
+        ] {
+            let raw = format!(
+                "GET HtTp://example.com:8080{suffix} HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+            );
+            let parsed = parse_editable_raw_request_with_version(&raw, None).unwrap();
+            let expected = if suffix.starts_with('/') {
+                suffix.to_string()
+            } else {
+                format!("/{suffix}")
+            };
+            assert_eq!(parsed.request.path, expected, "target suffix: {suffix:?}");
+            assert_eq!(parsed.request.scheme, "http");
+            assert_eq!(parsed.request.host, "example.com:8080");
+            assert_eq!(parsed.http_version.as_deref(), Some("HTTP/1.1"));
+        }
+    }
+
+    #[test]
+    fn raw_request_parser_preserves_origin_target_bytes() {
+        for target in ["/a/../b", "/a/.%2e/b", "//a//b?", "/a/%2f%2F?x=%2e"] {
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let request = parse_editable_raw_request(&raw, None).unwrap();
+            assert_eq!(request.path, target);
+            assert_eq!(request.scheme, "https");
+        }
+    }
+
+    #[test]
+    fn raw_request_parser_rejects_malformed_absolute_target() {
+        for target in [
+            "http:///example.com/a",
+            "http://?q",
+            "http://example.com:bad/a",
+            "http://[::1/a",
+            "http://example.com\\other/a",
+            "http://example.com/a\0b",
+            "http://@example.com/a",
+            "http://user:pass@example.com/a",
+            "http://example.com/a#",
+            "http://example.com/a#fragment",
+        ] {
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            assert!(
+                parse_editable_raw_request(&raw, None).is_err(),
+                "accepted {target:?}"
+            );
+        }
     }
 
     #[test]
@@ -12244,6 +19602,30 @@ mod tests {
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "mixed.example");
         assert_eq!(target.port, "9443");
+    }
+
+    #[test]
+    fn only_an_uncaptured_request_adopts_the_target_scheme() {
+        let mut typed = default_editable_request();
+        adopt_target_scheme_for_uncaptured_request(Some(&mut typed), None, "http");
+        assert_eq!(typed.scheme, "http");
+        adopt_target_scheme_for_uncaptured_request(Some(&mut typed), None, "");
+        assert_eq!(
+            typed.scheme, "http",
+            "an unset target scheme changes nothing"
+        );
+
+        let mut captured = default_editable_request();
+        let scheme = captured.scheme.clone();
+        adopt_target_scheme_for_uncaptured_request(
+            Some(&mut captured),
+            Some(Uuid::new_v4()),
+            "http",
+        );
+        assert_eq!(
+            captured.scheme, scheme,
+            "a captured request keeps its scheme; a change stays an override"
+        );
     }
 
     #[test]
@@ -12866,6 +20248,655 @@ mod tests {
     }
 
     #[test]
+    fn service_map_commands_are_read_only_and_match_manifest() {
+        let session = "11111111-1111-1111-1111-111111111111";
+        for (operation, args, input, endpoint) in [
+            (
+                "target.service_map.get",
+                vec!["scope", "service-map", "--session-id", session, "--in-scope-only", "--max-records", "25"],
+                json!({"session_id":session,"in_scope_only":true,"max_records":25}),
+                format!("/api/target/service-map?in_scope_only=true&max_records=25&session_id={session}"),
+            ),
+            (
+                "target.service_map.evidence.get",
+                vec!["target", "service-map-evidence", "--session-id", session, "--evidence-id", "v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"],
+                json!({"session_id":session,"evidence_id":"v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"}),
+                format!("/api/target/service-map/evidence?evidence_id=v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444&session_id={session}"),
+            ),
+            (
+                "target.service_map.body_references.get",
+                vec!["target", "service-map", "body-references", "--session-id", session, "--evidence-id", "v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"],
+                json!({"session_id":session,"evidence_id":"v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444"}),
+                format!("/api/target/service-map/body-references?evidence_id=v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444&session_id={session}"),
+            ),
+        ] {
+            let mut argv = vec!["sniper-cli"];
+            argv.extend(args);
+            let direct = Cli::try_parse_from(argv).unwrap().command;
+            let call = command_from_operation_input(operation, &input).unwrap();
+            assert_eq!(direct.operation_name(), operation);
+            assert_eq!(call.operation_name(), operation);
+            assert_eq!(command_input_preview(&direct), command_input_preview(&call));
+            assert!(!direct.requires_confirmation());
+            let plan = dry_run_command(&direct).unwrap();
+            assert_eq!(plan["side_effect"], "read");
+            assert_eq!(plan["api"]["method"], "GET");
+            assert_eq!(plan["api"]["path"], endpoint);
+            assert!(plan["api"]["body"].is_null());
+            let spec = operation_spec(operation).unwrap();
+            assert_eq!(spec.input_schema["additionalProperties"], false);
+        }
+    }
+
+    // The desktop map reads every retained row; the CLI can too, without a
+    // row window, and never with one.
+    #[test]
+    fn service_map_all_rows_reads_without_a_window() {
+        let command =
+            command_from_operation_input("target.service_map.get", &json!({"all_rows":true}))
+                .unwrap();
+        assert_eq!(
+            command_input_preview(&command),
+            json!({"session_id":null,"origin":null,"in_scope_only":false,"all_rows":true,"technology_catalog_version":2})
+        );
+        let path = super::command_api_preview(&command).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            path.contains("all_rows=true") && !path.contains("max_records"),
+            "{path}"
+        );
+        let error = command_from_operation_input(
+            "target.service_map.get",
+            &json!({"all_rows":true,"max_records":500}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            cli_error_payload("target.service_map.get", &error).code,
+            "INVALID_INPUT"
+        );
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "scope",
+            "service-map",
+            "--all-rows",
+            "--max-records",
+            "500"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["sniper-cli", "scope", "service-map", "--all-rows"]).is_ok());
+    }
+
+    #[test]
+    fn service_map_method_input_schema_matches_http_tokens() {
+        let schema = super::service_map_input_schema("target.service_map.parameters.get").unwrap();
+        let schema = &schema["properties"]["method"];
+        assert_eq!(schema["type"], "string");
+        let forbidden = regex::Regex::new(schema["not"]["pattern"].as_str().unwrap()).unwrap();
+        let mut values: Vec<String> = (0..=127u8)
+            .map(|byte| format!("X{}Y", char::from(byte)))
+            .collect();
+        values.extend([
+            "".into(),
+            "X".repeat(64),
+            "X".repeat(65),
+            "GÉT".into(),
+            "GET\u{a0}".into(),
+            "GET\u{2028}".into(),
+            "GET\u{2029}".into(),
+        ]);
+        for value in values {
+            let valid = value.len() <= 64 && http::Method::from_bytes(value.as_bytes()).is_ok();
+            assert_eq!(
+                super::parse_service_map_parameters_method(&value).is_ok(),
+                valid,
+                "{value:?}"
+            );
+            let length = value.chars().count() as u64;
+            let schema_valid = length >= schema["minLength"].as_u64().unwrap()
+                && length <= schema["maxLength"].as_u64().unwrap()
+                && !forbidden.is_match(&value);
+            assert_eq!(schema_valid, valid, "schema: {value:?}");
+        }
+    }
+
+    // An endpoint's parameters: an exact endpoint in, the endpoint asked about
+    // and the server's own bounds out.
+    #[test]
+    fn service_map_parameters_read_one_endpoint_and_check_the_answer() {
+        use sniper::service_map_parameters::{EndpointParameter, EndpointParameters};
+        let session = "00000000-0000-0000-0000-000000000001";
+        let input = json!({"session_id":session,"origin":"https://example.com","method":"POST","path":"/v1/items"});
+        let command =
+            command_from_operation_input("target.service_map.parameters.get", &input).unwrap();
+        assert_eq!(
+            command.operation_name(),
+            "target.service_map.parameters.get"
+        );
+        let path = super::command_api_preview(&command).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            path.starts_with("/api/target/service-map/parameters?")
+                && path.contains("method=POST")
+                && path.contains("path=%2Fv1%2Fitems"),
+            "{path}"
+        );
+        for bad in [
+            json!({"session_id":session,"origin":"https://example.com/x","method":"GET","path":"/"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET POST","path":"/"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET","path":"/?q=1"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET","path":"items"}),
+            json!({"session_id":session,"origin":"https://example.com","method":"GET"}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.parameters.get", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let args = super::ServiceMapParametersArgs {
+            session_id: session.parse().unwrap(),
+            origin: "https://example.com".into(),
+            method: "POST".into(),
+            path: "/v1/items".into(),
+        };
+        let mut result = EndpointParameters::new(
+            args.session_id,
+            args.origin.clone(),
+            args.method.clone(),
+            args.path.clone(),
+        );
+        result.rows = 2;
+        result.parameters.push(EndpointParameter {
+            name: "q".into(),
+            location: "query".into(),
+            rows: 2,
+            examples: vec!["shoes".into()],
+        });
+        assert!(super::validate_service_map_parameters_response(&result, &args).is_ok());
+        let mut other = result.clone();
+        other.path = "/v1/other".into();
+        assert!(
+            super::validate_service_map_parameters_response(&other, &args).is_err(),
+            "another endpoint"
+        );
+        let mut overcounted = result.clone();
+        overcounted.parameters[0].rows = 3;
+        assert!(
+            super::validate_service_map_parameters_response(&overcounted, &args).is_err(),
+            "more rows than were read"
+        );
+        let mut located = result.clone();
+        located.parameters[0].location = "cookie".into();
+        assert!(super::validate_service_map_parameters_response(&located, &args).is_err());
+        let unavailable = EndpointParameters::unavailable(
+            args.session_id,
+            args.origin.clone(),
+            args.method.clone(),
+            args.path.clone(),
+            "inactive_session",
+        );
+        assert!(super::validate_service_map_parameters_response(&unavailable, &args).is_ok());
+    }
+
+    // What no rule names: gathered across origins, most widespread first,
+    // with a few origins and evidence tokens each.
+    #[test]
+    fn service_map_unnamed_gathers_signals_across_origins() {
+        let input = json!({"kind":"headers","limit":2});
+        let command =
+            command_from_operation_input("target.service_map.unnamed.get", &input).unwrap();
+        assert_eq!(command.operation_name(), "target.service_map.unnamed.get");
+        let preview = super::command_api_preview(&command).unwrap();
+        let path = preview["path"].as_str().unwrap();
+        assert!(
+            path.starts_with("/api/target/service-map?") && path.contains("all_rows=true"),
+            "{path}"
+        );
+        for bad in [
+            json!({"kind":"values"}),
+            json!({"limit":0}),
+            json!({"limit":1001}),
+            json!({"origin":"https://example.com"}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.unnamed.get", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let origin = |id: &str,
+                      headers: &[(&str, usize)],
+                      banners: &[(&str, usize)],
+                      named: &[&str]| {
+            let signal = |(value, rows): &(&str, usize)| json!({"value": value, "row_count": rows, "evidence": [format!("token-{id}-{value}")]});
+            let product = |name: &&str| json!({"product_id": name.to_ascii_lowercase(), "name": name, "category": "edge", "signals": ["header"], "row_count": 1, "evidence": []});
+            json!({
+                "origin": id, "host": id.trim_start_matches("https://"), "scheme": "https", "port": 443,
+                "in_scope": true, "request_count": 1, "first_seen": "2026-10-17T00:00:00Z", "last_seen": "2026-10-17T00:00:00Z",
+                "endpoints": [], "technology_clues": [], "redirects": [], "header_links": [],
+                "server_technologies": named.iter().map(product).collect::<Vec<_>>(),
+                "unnamed": {
+                    "banners": banners.iter().map(signal).collect::<Vec<_>>(),
+                    "headers": headers.iter().map(signal).collect::<Vec<_>>(),
+                    "cookies": [],
+                }
+            })
+        };
+        let origins: Vec<sniper::service_map::ServiceOrigin> = [
+            origin(
+                "https://a.example.com",
+                &[("x-cdn-pop", 3), ("x-trace", 1)],
+                &[("server: HeRay", 2)],
+                &["HeRayCDN", "Envoy"],
+            ),
+            origin(
+                "https://b.example.com",
+                &[("x-cdn-pop", 4)],
+                &[],
+                &["HeRayCDN"],
+            ),
+            origin("https://c.example.com", &[], &[], &["HeRayCDN"]),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+        let session: Uuid = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let mut limits = serde_json::Map::new();
+        for name in [
+            "max_records",
+            "metadata_bytes",
+            "origins",
+            "endpoints",
+            "endpoints_per_origin",
+            "evidence_per_item",
+            "redirects_per_origin",
+            "header_links_per_origin",
+            "technology_clues_per_row",
+            "statuses_per_endpoint",
+            "content_types_per_endpoint",
+            "path_bytes",
+            "host_bytes",
+            "method_bytes",
+            "headers_per_row",
+            "header_bytes_per_row",
+            "header_value_bytes",
+        ] {
+            limits.insert(name.into(), json!(100));
+        }
+        let mut map: sniper::service_map::ServiceMap = serde_json::from_value(json!({
+            "schema_version":1, "session_id":session, "origins":origins,
+            "snapshot":{
+                "id":Uuid::nil(), "generation":Uuid::nil(), "captured_at":"2026-10-17T00:00:00Z",
+                "first_retained_started_at":null, "last_retained_started_at":null,
+                "oldest_considered_at":null, "latest_considered_at":null,
+                "window_order":"newest_capture_sequence", "retained_rows":8, "considered_rows":8,
+                "non_http_rows":0, "projected_rows":8, "included_rows":8, "excluded_rows":0,
+                "omitted_rows":0, "origin_count":3, "endpoint_count":0,
+                "complete":true, "stopped_by":[], "limits":limits
+            },
+            "in_scope_only":false, "origin_filter":null, "unavailable":[], "deferred":[], "warnings":[]
+        })).unwrap();
+        let all = super::summarize_unnamed(&map, None, 10);
+        assert_eq!(
+            (
+                all.origins_read,
+                all.origins_with_unnamed,
+                all.distinct_signals
+            ),
+            (3, 2, 3)
+        );
+        assert_eq!(all.signals[0].value, "x-cdn-pop", "most widespread first");
+        assert_eq!((all.signals[0].origins, all.signals[0].rows), (2, 7));
+        assert_eq!(
+            all.signals[0].sample_origins,
+            ["https://a.example.com", "https://b.example.com"]
+        );
+        assert_eq!(all.signals[0].evidence.len(), 2);
+        // Only the carrying origins count: c names HeRayCDN but carries none.
+        assert_eq!(
+            all.signals[0]
+                .named_alongside
+                .iter()
+                .map(|named| (named.name.as_str(), named.origins))
+                .collect::<Vec<_>>(),
+            [("HeRayCDN", 2), ("Envoy", 1)]
+        );
+        let serialized = serde_json::to_value(&all.signals[0]).unwrap();
+        assert!(serialized.get("alongside").is_none(), "{serialized}");
+        assert_eq!(
+            serialized["named_alongside"][0],
+            json!({"name": "HeRayCDN", "origins": 2})
+        );
+        let headers = super::summarize_unnamed(&map, Some("headers"), 1);
+        assert_eq!(
+            (
+                headers.distinct_signals,
+                headers.omitted_signals,
+                headers.signals.len()
+            ),
+            (2, 1, 1)
+        );
+        assert!(headers
+            .signals
+            .iter()
+            .all(|signal| signal.kind == "headers"));
+
+        // Summary filtering must not overwrite source coverage or count source
+        // losses as if they were a known number of distinct omitted signals.
+        for reasons in [
+            vec![],
+            vec!["unnamed_signals_per_origin_limit"],
+            vec!["header_value_limit", "origins_limit"],
+        ] {
+            map.snapshot.stopped_by = reasons.into_iter().map(str::to_string).collect();
+            map.snapshot.complete = map.snapshot.stopped_by.is_empty();
+            map.snapshot.omitted_rows = usize::from(map.snapshot.stopped_by.len() == 2);
+            for kind in [None, Some("headers"), Some("cookies")] {
+                for limit in [1, 100] {
+                    let summary = super::summarize_unnamed(&map, kind, limit);
+                    let output = serde_json::to_value(&summary).unwrap();
+                    assert_eq!(
+                        output["snapshot"],
+                        serde_json::to_value(&map.snapshot).unwrap()
+                    );
+                    assert_eq!(
+                        summary.omitted_signals,
+                        summary.distinct_signals.saturating_sub(limit)
+                    );
+                    assert_eq!(
+                        summary.signals.len() + summary.omitted_signals,
+                        summary.distinct_signals
+                    );
+                }
+            }
+        }
+        let summary_schema = super::service_map_unnamed_output_schema();
+        let map_schema = super::service_map_output_schema("target.service_map.get").unwrap();
+        assert_eq!(
+            summary_schema["properties"]["snapshot"],
+            map_schema["properties"]["snapshot"]
+        );
+        assert!(summary_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("snapshot")));
+    }
+
+    // An origin's OpenAPI document: an exact origin in, a document for that
+    // origin within the server's bounds out.
+    #[test]
+    fn service_map_openapi_reads_one_origin_and_checks_the_answer() {
+        let session = "00000000-0000-0000-0000-000000000001";
+        let input = json!({"session_id":session,"origin":"https://example.com"});
+        let command =
+            command_from_operation_input("target.service_map.openapi.get", &input).unwrap();
+        assert_eq!(command.operation_name(), "target.service_map.openapi.get");
+        let path = super::command_api_preview(&command).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            path.starts_with("/api/target/service-map/openapi?")
+                && path.contains("origin=https%3A%2F%2Fexample.com"),
+            "{path}"
+        );
+        for bad in [
+            json!({"session_id":session,"origin":"https://example.com/x"}),
+            json!({"session_id":session}),
+            json!({"session_id":session,"origin":"https://example.com","path":"/"}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.openapi.get", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let args = super::ServiceMapOpenApiArgs {
+            session_id: session.parse().unwrap(),
+            origin: "https://example.com".into(),
+        };
+        let document = json!({
+            "openapi":"3.1.0",
+            "info":{"title":"https://example.com","version":"observed","description":""},
+            "servers":[{"url":"https://example.com"}],
+            "paths":{"/v1/items":{"get":{"responses":{"200":{"description":"OK"}}}}},
+        });
+        assert!(super::validate_service_map_openapi_response(&document, &args).is_ok());
+        let mut other = document.clone();
+        other["servers"] = json!([{"url":"https://other.example.com"}]);
+        assert!(
+            super::validate_service_map_openapi_response(&other, &args).is_err(),
+            "another origin"
+        );
+        let mut relative = document.clone();
+        relative["paths"] = json!({"v1/items":{}});
+        assert!(super::validate_service_map_openapi_response(&relative, &args).is_err());
+    }
+
+    #[test]
+    fn service_map_rejects_active_operations_and_invalid_limits() {
+        for input in [
+            json!({"max_records":0}),
+            json!({"max_records":50001}),
+            json!({"max_records":-1}),
+            json!({"max_records":1.5}),
+            json!({"max_records":"10"}),
+            json!({"in_scope_only":"true"}),
+            json!({"session_id":"invalid"}),
+            json!({"url":"https://example.com"}),
+            json!({"scan":true}),
+            json!({"crawl":true}),
+            json!({"follow_redirects":true}),
+            json!({"offset":1}),
+            Value::Null,
+        ] {
+            let error = command_from_operation_input("target.service_map.get", &input).unwrap_err();
+            assert_eq!(
+                cli_error_payload("target.service_map.get", &error).code,
+                "INVALID_INPUT"
+            );
+        }
+
+        for origin in [
+            "https://example.com/",
+            "https://example.com?token=secret",
+            "https://user:secret@example.com",
+            "https://example.com:443",
+            "ftp://example.com",
+            "https://EXAMPLE.COM",
+        ] {
+            assert!(command_from_operation_input(
+                "target.service_map.get",
+                &json!({"origin":origin})
+            )
+            .is_err());
+            assert!(Cli::try_parse_from([
+                "sniper-cli",
+                "scope",
+                "service-map",
+                "--origin",
+                origin
+            ])
+            .is_err());
+        }
+        for limit in ["0", "50001", "-1", "1.5"] {
+            assert!(Cli::try_parse_from([
+                "sniper-cli",
+                "scope",
+                "service-map",
+                "--max-records",
+                limit
+            ])
+            .is_err());
+        }
+        let defaults = command_from_operation_input("target.service_map.get", &json!({})).unwrap();
+        assert_eq!(
+            command_input_preview(&defaults),
+            json!({"session_id":null,"origin":null,"in_scope_only":false,"max_records":10000,"technology_catalog_version":2})
+        );
+        let nulls = command_from_operation_input(
+            "target.service_map.get",
+            &json!({"session_id":null,"in_scope_only":null,"max_records":null}),
+        )
+        .unwrap();
+        assert_eq!(
+            command_input_preview(&defaults),
+            command_input_preview(&nulls)
+        );
+        for operation in [
+            "target.service_map.scan",
+            "target.service_map.crawl",
+            "target.service_map.follow",
+            "target.service_map.refresh",
+        ] {
+            assert!(operation_spec(operation).is_none());
+            assert!(command_from_operation_input(operation, &json!({})).is_err());
+        }
+    }
+
+    #[test]
+    fn service_map_evidence_requires_explicit_session_and_opaque_token() {
+        let session = "11111111-1111-1111-1111-111111111111";
+        for input in [
+            json!({}),
+            json!({"session_id":session}),
+            json!({"evidence_id":"token"}),
+            json!({"session_id":null,"evidence_id":"token"}),
+            json!({"session_id":session,"evidence_id":""}),
+            json!({"session_id":session,"evidence_id":"line\nbreak"}),
+            json!({"session_id":session,"evidence_id":"x".repeat(513)}),
+            json!({"session_id":session,"evidence_id":42}),
+            json!({"session_id":session,"evidence_id":"token","id":session}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.evidence.get", &input).is_err(),
+                "{input}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "scope",
+            "service-map-evidence",
+            "--evidence-id",
+            "token"
+        ])
+        .is_err());
+        assert!(command_from_operation_input(
+            "target.service_map.evidence.get",
+            &json!({"session_id":session,"evidence_id":"opaque&query=not-a-field"}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn service_map_body_references_require_one_explicit_row_and_reject_batch_or_map_options() {
+        let session = "11111111-1111-1111-1111-111111111111";
+        let token = "v1.11111111-1111-1111-1111-111111111111.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.44444444-4444-4444-4444-444444444444";
+        for input in [
+            json!({}),
+            json!({"session_id":session}),
+            json!({"evidence_id":token}),
+            json!({"session_id":null,"evidence_id":token}),
+            json!({"session_id":session,"evidence_id":null}),
+            json!({"session_id":session,"evidence_id":session}),
+            json!({"session_id":session,"evidence_id":[token]}),
+            json!({"session_id":session,"evidence_id":token,"max_records":1}),
+            json!({"session_id":session,"evidence_id":token,"origin":"https://example.com"}),
+            json!({"session_id":session,"evidence_id":token,"activate":true}),
+            json!({"session_id":session,"evidence_id":token,"automatic":true}),
+            json!({"session_id":session,"evidence_id":token,"body":true}),
+            json!({"session_id":session,"evidence_id":token,"follow_redirects":true}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.body_references.get", &input)
+                    .is_err(),
+                "{input}"
+            );
+        }
+        for args in [
+            vec![
+                "scope",
+                "service-map",
+                "body-references",
+                "--evidence-id",
+                token,
+            ],
+            vec![
+                "scope",
+                "service-map",
+                "--session-id",
+                session,
+                "body-references",
+                "--session-id",
+                session,
+                "--evidence-id",
+                token,
+            ],
+            vec![
+                "scope",
+                "service-map",
+                "body-references",
+                "--session-id",
+                session,
+                "--evidence-id",
+                token,
+                "--max-records",
+                "2",
+            ],
+        ] {
+            let mut argv = vec!["sniper-cli"];
+            argv.extend(args);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        for map_flags in [
+            vec!["--origin", "https://example.com"],
+            vec!["--in-scope-only"],
+            vec!["--max-records", "25"],
+            vec!["--technology-catalog-version", "1"],
+            vec!["--session-id", session],
+        ] {
+            let mut map = vec!["sniper-cli", "scope", "service-map"];
+            map.extend(map_flags.iter().copied());
+            assert!(Cli::try_parse_from(map.clone()).is_ok(), "{map_flags:?}");
+            map.extend([
+                "body-references",
+                "--session-id",
+                session,
+                "--evidence-id",
+                token,
+            ]);
+            assert!(
+                Cli::try_parse_from(map).is_err(),
+                "parent map flags must not be ignored: {map_flags:?}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "target",
+            "service-map",
+            "body-references",
+            "--session-id",
+            session,
+            "--evidence-id",
+            token,
+        ])
+        .is_ok());
+        let help = Cli::try_parse_from([
+            "sniper-cli",
+            "scope",
+            "service-map",
+            "body-references",
+            "--help",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(help.contains("active session"), "{help}");
+        assert!(help.contains("never loads or activates"), "{help}");
+        assert!(help.contains("not wire bytes"), "{help}");
+    }
+
+    #[test]
     fn findings_and_event_log_read_commands_match_the_manifest() {
         let session = "11111111-1111-1111-1111-111111111111";
         let id = "22222222-2222-2222-2222-222222222222";
@@ -12910,10 +20941,9 @@ mod tests {
             assert!(plan["api"]["body"].is_null());
             let spec = operation_spec(operation).unwrap();
             assert_eq!(spec.input_schema["additionalProperties"], false);
-            assert_eq!(
-                spec.input_schema["properties"]["session_id"]["format"],
-                "uuid"
-            );
+            let session_id_schema = &spec.input_schema["properties"]["session_id"];
+            assert!(session_id_schema.get("format").is_none());
+            assert_eq!(session_id_schema["type"], json!(["string", "null"]));
         }
     }
 
@@ -13096,6 +21126,379 @@ mod tests {
             cli_parse_error_operation(&browser_args),
             "capture.browser.open"
         );
+    }
+
+    #[test]
+    fn parse_error_helpers_accept_os_strings_without_changing_unicode_behavior() {
+        use std::ffi::{OsStr, OsString};
+
+        let args: Vec<OsString> = [
+            "--output=compact",
+            "call",
+            "--input",
+            "@synthetic-\u{96ea}.json",
+            "manifest",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(cli_parse_error_operation(&args), "manifest");
+        assert_eq!(
+            cli_output_format_from_raw_args(&args),
+            OutputFormat::Compact
+        );
+        assert_eq!(
+            cli_parse_error_long_option(OsStr::new("--input=synthetic-\u{96ea}")),
+            Some(("input", true))
+        );
+        assert_eq!(
+            cli_parse_error_operation(&[OsStr::new("call"), OsStr::new("unknown.\u{96ea}")]),
+            "unknown.\u{96ea}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parse_error_os_strings_preserve_non_unicode_operand_boundaries() {
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let mut inline = OsString::from("--input=");
+        inline.push(&invalid);
+        assert_eq!(cli_parse_error_long_option(&inline), Some(("input", true)));
+        for (args, expected) in [
+            (
+                vec![
+                    "call".into(),
+                    "--input".into(),
+                    invalid.clone(),
+                    "manifest".into(),
+                ],
+                "manifest",
+            ),
+            (vec!["call".into(), inline, "manifest".into()], "manifest"),
+            (
+                vec![
+                    "skills".into(),
+                    "--codex-dir".into(),
+                    invalid.clone(),
+                    "status".into(),
+                ],
+                "skills.status",
+            ),
+            (vec!["call".into(), invalid.clone()], "call"),
+            (vec![invalid.clone()], "parse"),
+        ] {
+            assert_eq!(cli_parse_error_operation(&args), expected);
+        }
+        assert_eq!(
+            cli_output_format_from_raw_args(&[OsString::from("--output"), invalid.clone()]),
+            OutputFormat::Pretty
+        );
+        // The fallback must not change clap's acceptance of OS-native path
+        // operands; only the rejected-argument diagnostic path is altered.
+        assert!(Cli::try_parse_from([
+            OsString::from("sniper-cli"),
+            "--dry-run".into(),
+            "skills".into(),
+            "status".into(),
+            "--codex".into(),
+            "--codex-dir".into(),
+            invalid,
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn parse_error_option_definitions_have_consistent_single_value_arity() {
+        fn check(command: &clap::Command, seen: &mut std::collections::BTreeMap<String, bool>) {
+            for arg in command
+                .get_arguments()
+                .filter(|arg| arg.get_long().is_some())
+            {
+                let takes_value = arg.get_action().takes_values();
+                assert!(!arg.is_allow_hyphen_values_set(), "{}", arg.get_id());
+                assert!(!arg.is_allow_negative_numbers_set(), "{}", arg.get_id());
+                if let Some(range) = arg.get_num_args() {
+                    assert_eq!(
+                        range.min_values(),
+                        usize::from(takes_value),
+                        "{}",
+                        arg.get_id()
+                    );
+                    assert_eq!(
+                        range.max_values(),
+                        usize::from(takes_value),
+                        "{}",
+                        arg.get_id()
+                    );
+                }
+                for name in arg
+                    .get_long()
+                    .into_iter()
+                    .chain(arg.get_all_aliases().unwrap_or_default())
+                {
+                    if let Some(previous) = seen.insert(name.to_owned(), takes_value) {
+                        assert_eq!(previous, takes_value, "conflicting arity for --{name}");
+                    }
+                }
+            }
+            for child in command.get_subcommands() {
+                check(child, seen);
+            }
+        }
+        check(
+            &<Cli as clap::CommandFactory>::command(),
+            &mut std::collections::BTreeMap::new(),
+        );
+    }
+
+    #[test]
+    fn parse_error_operation_matches_unique_direct_manifest_commands() {
+        for spec in manifest_operations() {
+            let raw_args = spec
+                .command
+                .split_ascii_whitespace()
+                .take_while(|token| !token.starts_with(['-', '<', '[']))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if raw_args.first().is_some_and(|command| command == "call") {
+                continue;
+            }
+            let expected = if spec.operation.starts_with("capture.proxy.") {
+                "capture"
+            } else {
+                spec.operation
+            };
+            assert_eq!(
+                cli_parse_error_operation(&raw_args),
+                expected,
+                "{}",
+                spec.command
+            );
+        }
+    }
+
+    #[test]
+    fn parse_error_operation_uses_only_trusted_direct_command_tokens() {
+        for (args, expected) in [
+            (
+                vec!["--dry-run", "skills", "status", "--unknown"],
+                "skills.status",
+            ),
+            (
+                vec!["--yes", "skills", "status", "--unknown"],
+                "skills.status",
+            ),
+            (
+                vec!["repeater", "set-pinned", "--unknown"],
+                "replay.set_pinned",
+            ),
+            (
+                vec!["capture", "history", "list", "--unknown"],
+                "capture.http.list",
+            ),
+            (
+                vec!["capture", "websocket", "list", "--unknown"],
+                "capture.websocket.list",
+            ),
+            (
+                vec!["web-socket", "list", "--unknown"],
+                "capture.websocket.list",
+            ),
+            (
+                vec!["match-replace", "list", "--unknown"],
+                "capture.auto_replace.list",
+            ),
+            (vec!["target", "get-scope", "--unknown"], "scope.get"),
+            (
+                vec!["skills", "--codex-dir", "SYNTHETIC_PRIVATE_PATH", "status"],
+                "skills.status",
+            ),
+            (vec!["skills", "--codex-dir", "status"], "skills"),
+            (vec!["skills", "--codex-dir=status"], "skills"),
+            (
+                vec!["skills", "--codex-dir", "status", "install"],
+                "skills.install",
+            ),
+            (vec!["capture", "--browser", "browser", "list"], "capture"),
+            (vec!["skills", "--unknown", "status"], "skills"),
+            (vec!["skills", "--unknown=status", "install"], "skills"),
+            (vec!["skills", "SYNTHETIC_PRIVATE_ACTION"], "skills"),
+            (vec!["SYNTHETIC_PRIVATE_ACTION"], "parse"),
+            (vec!["skills", "--", "status"], "skills"),
+            (vec!["--", "skills", "status"], "parse"),
+            (vec!["capture", "proxy", "--stdin", "--unknown"], "capture"),
+            (
+                vec!["call", "unknown.operation", "--unknown"],
+                "unknown.operation",
+            ),
+        ] {
+            let raw_args = args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(cli_parse_error_operation(&raw_args), expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn parse_error_operation_does_not_confuse_call_input_with_operation() {
+        for (args, expected) in [
+            (
+                vec![
+                    "call",
+                    "--input",
+                    r#"{"private":"saved metadata"}"#,
+                    "findings.list",
+                    "--unknown",
+                ],
+                "findings.list",
+            ),
+            (
+                vec![
+                    "call",
+                    "--input",
+                    "@local.json",
+                    "saved.v1.http.list",
+                    "--unknown",
+                ],
+                "saved.v1.http.list",
+            ),
+            (
+                vec!["call", "--input=-", "findings.list", "--unknown"],
+                "findings.list",
+            ),
+            (vec!["call", "findings.list", "--input"], "findings.list"),
+            (vec!["call", "--input"], "call"),
+            (
+                vec!["call", "--input", "-", "findings.list", "--unknown"],
+                "findings.list",
+            ),
+            (
+                vec!["call", "--input", "--output", "compact", "findings.list"],
+                "findings.list",
+            ),
+            (
+                vec!["--api", "--output", "compact", "call", "findings.list"],
+                "findings.list",
+            ),
+            (vec!["call", "--", "--api", "--unknown"], "--api"),
+        ] {
+            let raw_args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(cli_parse_error_operation(&raw_args), expected);
+        }
+    }
+
+    #[test]
+    fn managed_skill_errors_have_operation_specific_guidance_and_stable_contracts() {
+        for (operation, reason, message, hint_fragments) in [
+            (
+                "skills.stage_update",
+                "already_current",
+                "The active skill already matches this binary's bundled template.",
+                vec!["skills status", "no update candidate is needed"],
+            ),
+            (
+                "skills.enroll",
+                "already_exists",
+                "The enrollment receipt path already exists.",
+                vec!["skills update-preview", "malformed", "directory or link"],
+            ),
+            (
+                "skills.stage_update",
+                "already_exists",
+                "The staging directory or an output path already exists.",
+                vec!["partial output", "new staging directory", "parent exists", "outside the active skill directory"],
+            ),
+            (
+                "skills.enroll",
+                "installed_not_current",
+                "Enrollment requires active skill bytes that exactly match this binary's bundled template.",
+                vec!["skills status", "preserve customizations", "do not overwrite edits"],
+            ),
+            (
+                "skills.stage_update",
+                "installed_modified",
+                "The active skill differs from its recorded enrollment baseline.",
+                vec!["skills status", "skills update-preview", "Manual activation", "old receipt", "optional receipt recovery"],
+            ),
+            (
+                "skills.enroll",
+                "unrecognized_reason",
+                "Local skill operation could not be completed safely.",
+                vec!["local staging directory", "No activation is performed"],
+            ),
+            (
+                "skills.enroll",
+                "already_current",
+                "Local skill operation could not be completed safely.",
+                vec!["local staging directory", "No activation is performed"],
+            ),
+            (
+                "unknown.operation",
+                "already_exists",
+                "Local skill operation could not be completed safely.",
+                vec!["local staging directory", "No activation is performed"],
+            ),
+        ] {
+            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError { code: reason });
+            let payload = cli_error_payload(operation, &error);
+            assert_eq!(payload.code, "MANAGED_SKILL_ERROR");
+            assert_eq!(payload.exit_code, 5);
+            assert!(!payload.retryable);
+            assert_eq!(payload.details, json!({"reason": reason}));
+            assert_eq!(payload.message, message);
+            for fragment in hint_fragments {
+                assert!(payload.hint.unwrap().contains(fragment), "{operation}/{reason}: {fragment}");
+            }
+        }
+    }
+
+    #[test]
+    fn activation_recovery_errors_preserve_original_operation_guidance() {
+        for operation in ["skills.apply_update", "skills.rollback_update"] {
+            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError {
+                code: "recovery_required",
+            });
+            let payload = cli_error_payload(operation, &error);
+            assert_eq!(payload.code, "MANAGED_SKILL_ERROR");
+            assert_eq!(payload.exit_code, 5);
+            assert!(!payload.retryable);
+            assert_eq!(payload.details, json!({"reason":"recovery_required"}));
+            let hint = payload.hint.unwrap();
+            for fragment in [
+                "skills update-result",
+                "original --operation-id",
+                "Preserve",
+                "do not blindly retry",
+                "new operation ID",
+            ] {
+                assert!(hint.contains(fragment), "{operation}: {fragment}");
+            }
+            assert!(!hint.contains("No activation is performed"));
+        }
+        for operation in [
+            "skills.apply_update",
+            "skills.update_result",
+            "skills.rollback_update",
+        ] {
+            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError {
+                code: "unrecognized_reason",
+            });
+            let hint = cli_error_payload(operation, &error).hint.unwrap();
+            assert!(hint.contains("skills update-result"));
+            assert!(hint.contains("original --operation-id"));
+            assert!(!hint.contains("No activation is performed"));
+        }
     }
 
     #[test]
@@ -13384,6 +21787,90 @@ mod tests {
         assert_eq!(payload.code, "CONFIRMATION_REQUIRED");
         assert_eq!(payload.exit_code, 2);
         assert!(!payload.retryable);
+    }
+
+    #[test]
+    fn session_metadata_status_errors_ignore_misleading_outer_context() {
+        for status in [303, 400, 409, 503] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            let typed = anyhow::Error::new(super::SessionMetadataHttpStatusError { status })
+                .context(
+                "synthetic-private-diagnostic requires --dry-run or --yes failed (599 Synthetic)",
+            );
+            for operation in [
+                "session.create",
+                "session.rename",
+                "session.switch",
+                "session.delete",
+            ] {
+                let payload = cli_error_payload(operation, &typed);
+                assert_eq!(payload.code, "HTTP_STATUS_ERROR");
+                assert_eq!(payload.exit_code, if status.as_u16() < 500 { 5 } else { 6 });
+                assert!(!payload.retryable);
+                assert_eq!(
+                    payload.message,
+                    format!(
+                        "Session metadata write failed ({status}); mutation outcome is unknown"
+                    )
+                );
+                assert_eq!(
+                    payload.details,
+                    json!({
+                        "status":status.as_u16(),"idempotent":false,"outcome":"unknown"
+                    })
+                );
+                assert_eq!(payload.hint, Some(
+                    "Inspect session list and current state before deliberately issuing another write; never automatically retry."
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn read_http_status_errors_keep_write_retry_guards_and_safe_messages() {
+        let typed = anyhow::Error::new(super::ReadHttpStatusError {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        })
+        .context("synthetic diagnostic requires --dry-run or --yes");
+        let read = cli_error_payload("session.list", &typed);
+        assert_eq!(read.code, "HTTP_STATUS_ERROR");
+        assert_eq!(read.message, "API read failed (503 Service Unavailable)");
+        assert_eq!(read.details, json!({"status":503}));
+        assert_eq!(read.exit_code, 6);
+        assert!(read.retryable);
+
+        let legacy = anyhow::anyhow!(
+            "request to /api/sessions failed (503 Service Unavailable): synthetic failure"
+        );
+        for operation in manifest_operations()
+            .into_iter()
+            .filter(|spec| spec.side_effect == CliSideEffect::Write && spec.requires_confirmation)
+        {
+            for error in [&typed, &legacy] {
+                let payload = cli_error_payload(operation.operation, error);
+                assert_eq!(payload.code, "HTTP_STATUS_ERROR");
+                assert!(!payload.retryable, "{}", operation.operation);
+                assert_eq!(payload.details["status"], 503);
+                assert_eq!(payload.details["idempotent"], false);
+                assert!(payload.hint.unwrap().contains("partially applied"));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_workspace_conflict_classification_remains_unchanged() {
+        let error = anyhow::anyhow!(
+            "workspace state revision conflict: current revision 2; reload workspace state"
+        );
+        let payload = cli_error_payload("session.create", &error);
+        assert_eq!(payload.code, "WORKSPACE_CONFLICT");
+        assert_eq!(payload.exit_code, 5);
+        assert!(!payload.retryable);
+        assert_eq!(payload.details, json!({}));
+        assert_eq!(
+            payload.hint,
+            Some("Refresh workspace state and retry deliberately.")
+        );
     }
 
     #[test]
@@ -14449,6 +22936,132 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // The fixture only serves synthetic settings responses over loopback. A stalled
+    // connection stays open until the probe's own timeout closes it.
+    async fn assert_discovery_response_cleanup(
+        response: &'static [u8],
+        stall: bool,
+        live_owner: bool,
+        preserve: bool,
+        expected_message: &str,
+    ) {
+        let root = std::env::temp_dir().join(format!("sniper-cli-probe-body-{}", Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut snapshot = RuntimeStateSnapshot::with_proxy_status(
+            "127.0.0.1:18080".parse().unwrap(),
+            listener.local_addr().unwrap(),
+            true,
+        );
+        if !live_owner {
+            snapshot.pid = None;
+        }
+        persist_runtime_state(&root, &snapshot).unwrap();
+        let original = fs::read(runtime_state_path(&root)).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..=SNIPER_API_PROBE_RETRY_DELAYS.len() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(b"GET /api/settings HTTP/1.1\r\n"));
+                stream.write_all(response).await.unwrap();
+                if stall {
+                    let mut rest = Vec::new();
+                    // EOF or a reset both mean that the timed-out client closed.
+                    let _ = stream.read_to_end(&mut rest).await;
+                }
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            discover_api_base_url_from_data_dir(&client, root.clone()),
+        )
+        .await
+        .expect("discovery should finish after its bounded retries")
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(expected_message), "{message}");
+        assert_eq!(runtime_state_path(&root).exists(), preserve, "{message}");
+        if preserve {
+            assert_eq!(fs::read(runtime_state_path(&root)).unwrap(), original);
+        } else {
+            assert!(
+                message.contains("Removed the stale runtime-state"),
+                "{message}"
+            );
+        }
+        server.await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_preserves_live_owner_on_timeout_before_headers() {
+        assert_discovery_response_cleanup(b"", true, true, true, "Leaving runtime-state intact")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_preserves_live_owner_on_timeout_after_headers() {
+        assert_discovery_response_cleanup(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+            true,
+            true,
+            true,
+            "Leaving runtime-state intact",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_preserves_live_owner_on_truncated_response_body() {
+        assert_discovery_response_cleanup(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+            false,
+            true,
+            true,
+            "Leaving runtime-state intact",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_removes_stale_owner_on_truncated_response_body() {
+        assert_discovery_response_cleanup(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+            false,
+            false,
+            false,
+            "is not responding",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_complete_invalid_json_with_live_owner() {
+        assert_discovery_response_cleanup(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+            false,
+            true,
+            false,
+            "response was not JSON",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_complete_invalid_schema_with_live_owner() {
+        assert_discovery_response_cleanup(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            false,
+            true,
+            false,
+            "did not match the expected /api/settings schema",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn discovery_retries_runtime_state_probe_before_cleanup() {
         let root = std::env::temp_dir().join(format!("sniper-cli-probe-retry-{}", Uuid::new_v4()));
@@ -14751,14 +23364,16 @@ mod tests {
             assert_eq!(plan["operation"], operation);
             let spec = super::operation_spec(operation).unwrap();
             assert_eq!(spec.input_schema["additionalProperties"], false);
-            assert_eq!(
-                spec.input_schema["properties"][if operation == "session.rename" {
-                    "id"
-                } else {
-                    "session_id"
-                }]["format"],
-                "uuid"
-            );
+            if operation == "session.rename" {
+                let id_schema = &spec.input_schema["properties"]["id"];
+                assert!(id_schema.get("format").is_none());
+                assert_eq!(id_schema["type"], "string");
+            } else {
+                assert_eq!(
+                    spec.input_schema["properties"]["session_id"]["format"],
+                    "uuid"
+                );
+            }
         }
     }
 
@@ -14915,9 +23530,102 @@ mod tests {
         assert!(validate_saved_response_binding(
             "saved.v1.http.list",
             &json!({}),
-            &json!({"session_id":second})
+            &json!({"session_id":second,"limit":50,"items":[]})
         )
         .is_ok());
+    }
+
+    #[test]
+    fn saved_response_binding_matches_explicit_selection_uuid_sets() {
+        let first = Uuid::from_u128(0xabcdef);
+        let second = Uuid::from_u128(0xabcdee);
+        let input = json!({"session_id":first,"ids":[first,second]});
+        let data = json!({"session_id":first,"ids":[second,first.to_string().to_uppercase()]});
+        assert!(validate_saved_response_binding("saved.v1.http.select", &input, &data).is_ok());
+        for ids in [
+            json!([]),
+            json!([first]),
+            json!([first, Uuid::nil()]),
+            json!([first, second, Uuid::nil()]),
+        ] {
+            assert!(validate_saved_response_binding(
+                "saved.v1.http.select",
+                &input,
+                &json!({"session_id":first,"ids":ids})
+            )
+            .is_err());
+        }
+        assert!(validate_saved_response_binding(
+            "saved.v1.http.select",
+            &json!({"session_id":first,"host":"example.com"}),
+            &json!({"session_id":first,"ids":[]})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn saved_response_binding_checks_limits_even_on_empty_terminal_pages() {
+        for operation in ["saved.v1.http.list", "saved.v1.session.list"] {
+            for (input, expected) in [
+                (json!({}), 50),
+                (json!({"limit":1}), 1),
+                (json!({"limit":200}), 200),
+            ] {
+                for limit in [1, 50, 200] {
+                    let data = json!({"session_id":Uuid::nil(),"limit":limit,"items":[],"continuation":null});
+                    assert_eq!(
+                        validate_saved_response_binding(operation, &input, &data).is_ok(),
+                        limit == expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_response_binding_checks_http_cursor_even_on_terminal_pages() {
+        let sid = Uuid::from_u128(0xabcdef);
+        let generation = Uuid::from_u128(0xabcdee);
+        let input = json!({"continuation":{"session_id":sid,"store_generation":generation,"before_sequence":10,"limit":1}});
+        for (sequence, valid) in [(9, true), (10, false), (11, false)] {
+            let data = json!({"session_id":sid,"limit":1,"items":[{"sequence":sequence}],"continuation":null});
+            assert_eq!(
+                validate_saved_response_binding("saved.v1.http.list", &input, &data).is_ok(),
+                valid
+            );
+        }
+        let mut data = json!({"session_id":sid,"limit":1,"items":[],"continuation":null});
+        assert!(validate_saved_response_binding("saved.v1.http.list", &input, &data).is_ok());
+        data["limit"] = json!(2);
+        assert!(validate_saved_response_binding("saved.v1.http.list", &input, &data).is_err());
+        data["limit"] = json!(1);
+        for (returned, valid) in [
+            (generation.to_string().to_uppercase(), true),
+            (Uuid::nil().to_string(), false),
+        ] {
+            data["continuation"] = json!({"store_generation":returned});
+            assert_eq!(
+                validate_saved_response_binding("saved.v1.http.list", &input, &data).is_ok(),
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn saved_response_binding_checks_session_cursor_as_uuid() {
+        let after = Uuid::from_u128(0xabcdef);
+        let input = json!({"after_id":after.to_string().to_uppercase(),"limit":1});
+        for (id, valid) in [
+            (after.as_u128() - 1, false),
+            (after.as_u128(), false),
+            (after.as_u128() + 1, true),
+        ] {
+            let data = json!({"limit":1,"items":[{"id":Uuid::from_u128(id)}],"continuation":null});
+            assert_eq!(
+                validate_saved_response_binding("saved.v1.session.list", &input, &data).is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]
@@ -14944,5 +23652,89 @@ mod tests {
         assert_eq!(output["bypass_hosts"], json!(["localhost"]));
         let older_server = proxy_chain_output(&json!({"upstream_proxy": {"enabled": false}}));
         assert_eq!(older_server["bypass_hosts"], json!([]));
+    }
+
+    #[test]
+    fn saved_response_diagnostics_distinguish_metadata_reads_from_receipts() {
+        for operation in [
+            "saved.v1.http.list",
+            "saved.v1.http.select",
+            "saved.v1.session.list",
+        ] {
+            assert_eq!(
+                super::saved_response_diagnostic(
+                    operation,
+                    "read diagnostic",
+                    "receipt diagnostic"
+                ),
+                "read diagnostic"
+            );
+        }
+        for operation in [
+            "saved.v1.http.delete",
+            "saved.v1.http.clear",
+            "saved.v1.session.rename",
+            "saved.v1.operation.get",
+            "saved.v1.future",
+        ] {
+            assert_eq!(
+                super::saved_response_diagnostic(
+                    operation,
+                    "read diagnostic",
+                    "receipt diagnostic"
+                ),
+                "receipt diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_mutation_errors_keep_receipt_guidance() {
+        for operation in [
+            "saved.v1.http.delete",
+            "saved.v1.http.clear",
+            "saved.v1.session.rename",
+        ] {
+            for (code, outcome) in [
+                ("INVALID_INPUT", "not_applied"),
+                ("INVALID_RESPONSE", "unknown"),
+                ("API_UNAVAILABLE", "unknown"),
+            ] {
+                let error = super::saved_cli_error(
+                    code,
+                    "synthetic failure",
+                    outcome,
+                    &json!({"operation_id":"aabbccdd-0011-2233-4455-66778899aabb"}),
+                );
+                let payload = cli_error_payload(operation, &error);
+                assert_eq!(payload.code, code);
+                assert_eq!(payload.details["outcome"], outcome);
+                assert_eq!(
+                    payload.details["operation_id"],
+                    "aabbccdd-0011-2233-4455-66778899aabb"
+                );
+                assert!(!payload.retryable);
+                assert!(payload.hint.unwrap().contains("original operation_id"));
+                assert!(payload.hint.unwrap().contains("never automatically retry"));
+                assert_eq!(
+                    payload.exit_code,
+                    if code == "INVALID_INPUT" { 2 } else { 5 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_read_hint_keeps_receipt_guidance_for_unknown_outcomes_and_operations() {
+        for (operation, outcome) in [
+            ("saved.v1.http.list", "unknown"),
+            ("saved.v1.future", "not_applied"),
+        ] {
+            let error =
+                super::saved_cli_error("INVALID_INPUT", "synthetic failure", outcome, &json!({}));
+            let payload = cli_error_payload(operation, &error);
+            assert!(payload.hint.unwrap().contains("original operation_id"));
+            assert_eq!(payload.details["outcome"], outcome);
+        }
     }
 }

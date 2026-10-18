@@ -48,6 +48,15 @@ putting the skill at `~/.claude/skills/sniper-operator/SKILL.md` — byte-identi
 [`packaging/skills/claude/sniper-operator/SKILL.md`](../../packaging/skills/claude/sniper-operator/SKILL.md).
 Use `--claude-dir` to install into a project's `.claude/skills` instead.
 
+Before replacing an existing copy, use `skills status --claude` or
+`skills update-preview --claude` to inspect it without writing. See
+[safe skill maintenance](skill-maintenance.md) for explicit enrollment,
+experimental candidate staging, and preservation limits. Staging does not
+activate an update or enable unattended startup replacement. Automatic updates
+are Off by default and require separate explicit `enable-auto-updates --claude
+--yes` consent; it only records authorization. Inspect the host-local policy with
+`auto-update-status --claude`.
+
 Two things `skills install` does not do. It never touches `PATH` — put `sniper-cli`
 there yourself, as the [CLI section of the README](../../README.md#cli) describes. And
 it needs no running Sniper: `"api": {"local": true}` means the whole operation is a
@@ -118,6 +127,15 @@ Two overrides skip that lookup entirely and probe an address directly: `--api
 http://127.0.0.1:PORT`, and `SNIPER_API_ADDR` with the same value. Either works with
 no data directory present. Tell Claude Code the port once and it will pass `--api` on
 every call.
+
+Legacy `session create`, `rename`, `switch`, and `delete` classify unsuccessful
+HTTP responses from headers alone, without reading or echoing error bodies.
+They return `HTTP_STATUS_ERROR` with the actual `error.details.status`, exit `5`
+for 3xx/4xx or `6` for 5xx, and always `retryable:false`. Their details include
+`idempotent:false` and `outcome:"unknown"`: the status does not establish whether
+the mutation applied. Inspect `session list` and current state before deliberately
+issuing another write; these operations have no `saved.v1` mutation receipts.
+A locally missing `--yes` still returns `CONFIRMATION_REQUIRED` before API access.
 
 ## What to ask for
 
@@ -192,6 +210,19 @@ entries; `--limit` is positive and there is no offset/cursor pagination. Each re
 pins the active session once, or reads an explicit `--session-id` without switching
 it. `call` returns the pinned ID in `meta.session_id` for reuse on related reads.
 These commands only read stored data. See the [CLI contract](../../README.md#cli).
+
+## Manage opt-in HTTP history retention
+
+`capture http retention get` reads a session's saved policy and cleanup status.
+`capture http retention set --off` or `--max-entries N` requires `--yes`; use
+`--dry-run` for an offline exact-policy preview. Off is the default. Keep-newest
+permanently removes oldest unprotected excess rows toward a soft total-history
+target, protecting in-progress records and durably saved HTTP tab source originals.
+Obtain explicit approval for this destructive opt-in. Policy-save success does
+not mean pending logical or disk cleanup is finished. Prefer `--session-id`;
+never automatically retry or infer that a lost response means no change.
+See [the retention contract](http-history-retention.md) for canonical `call`
+names, limits, and same-session recovery reads.
 
 ## Manage passive scanner configuration
 
@@ -279,3 +310,19 @@ page was run on macOS, and the paths shown are macOS paths. Nothing here needs
 which is what the examples used. The local API is unauthenticated and bound to
 loopback by design ([architecture](../architecture.md)); a remote headless listener
 adds a bootstrap token, but `sniper-cli` is only ever tested same-machine.
+
+## Opt-in observed socket peer capture
+
+`capture http upstream-peer get --session-id <active-uuid>` reads the saved
+switch and effective status. `set --session-id <active-uuid> --enabled true|false
+--yes` explicitly changes future eligibility; use `--dry-run` first for an
+offline plan. Canonical operations are `capture.http.upstream_peer.get` and
+`capture.http.upstream_peer.set`. The CLI performs one pinned settings GET and
+one token-bound POST, with no automatic retry or session activation.
+
+Default map/evidence reads remain unchanged. Explicit `--include-socket-peer`
+on exact-row evidence adds a retained observation without enabling capture or
+sending probes. A peer may be a proxy, CDN or shared endpoint, not evidence of
+origin ownership. Observations persist in session files, exports and full-record
+JSON, including after Off. Read the [capture, privacy and recovery contract](observed-socket-peer.md)
+before enabling it or sharing those files.

@@ -1,0 +1,17 @@
+/* Fixture controls only; the product controls and map use production styles. */
+body { overflow: auto; user-select: text; -webkit-user-select: text; }
+.fixture-shell { min-height: 100vh; display: grid; grid-template-rows: auto minmax(540px, 1fr) auto; }
+.fixture-controls { padding: 10px 14px; background: var(--panel-code); border-bottom: 1px solid var(--line); }
+.fixture-controls h1 { margin: 0 0 5px; font-size: 16px; color: var(--point); }
+.fixture-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+.fixture-actions label { display: inline-flex; align-items: center; gap: 5px; }
+.fixture-actions select { max-width: 260px; }
+.fixture-controls p, .fixture-controls output, .fixture-log { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+.fixture-controls output { display: block; overflow-wrap: anywhere; }
+#fixtureCounters { color: var(--text-soft); }
+#fixtureMessage { color: var(--point); }
+#targetServiceMapPanel { min-height: 580px; height: max(580px, calc(100vh - 260px)); box-sizing: border-box; }
+.fixture-log { padding: 8px 14px; }
+.fixture-log li { overflow-wrap: anywhere; }
+.fixture-log ol { max-height: 150px; overflow: auto; }
+.fixture-visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }

@@ -90,7 +90,7 @@ function tabFixture() {
     loadTransactions: async () => loads.push("history"),
     consumeHistoryLoadOptions: () => ({}),
     applySavedWebsocketPaneWidth() {}, hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {},
-    displaySettingsReturnFocus: null, displaySettingsPreviewActive: false,
+    displaySettingsReturnFocus: null, displaySettingsPreviewActive: false, displaySettingsEditedControls: new Set(),
     window: { getComputedStyle: value => ({ visibility: value.visibility }) },
     fetch() { assert.fail("Passive tab tests must not make requests"); },
   });

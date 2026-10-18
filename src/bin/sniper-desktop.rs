@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use sniper::{api, config::AppConfig, proxy, runtime_state, skills, state::AppState};
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use tao::platform::unix::WindowExtUnix;
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -23,6 +25,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
+#[cfg(target_os = "linux")]
+use wry::WebViewBuilderExtUnix;
 use wry::{WebView, WebViewBuilder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +35,7 @@ enum DesktopUserEvent {
     /// A trackpad scroll gesture began or ended. `wheel` events carry no phase,
     /// so without this the page has to guess a release from the deltas going
     /// quiet — and a slow pull that pauses reads exactly like a lifted hand.
+    #[cfg(target_os = "macos")]
     ScrollGesturePhase {
         ended: bool,
     },
@@ -256,7 +261,7 @@ fn run_desktop() -> Result<()> {
     } else {
         info!(
             env = INSTALL_CLI_PATH_ENV,
-            "skipping sniper-cli PATH install unless explicitly requested"
+            "skipping sniper-cli PATH install for this launch"
         );
     }
 
@@ -347,7 +352,17 @@ fn run_desktop() -> Result<()> {
     // WebView2 otherwise stores its profile next to the executable, which may
     // be installed in a directory the user cannot write to.
     let mut web_context = wry::WebContext::new(Some(config.data_dir.join("webview")));
-    let webview_builder = WebViewBuilder::new(&window)
+    // GTK owns the allocation so the webview follows window resize and scale
+    // changes. The raw-window constructor is X11-only and does not auto-resize.
+    #[cfg(target_os = "linux")]
+    let webview_builder = WebViewBuilder::new_gtk(
+        window
+            .default_vbox()
+            .context("the Linux desktop window has no GTK content container")?,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let webview_builder = WebViewBuilder::new(&window);
+    let webview_builder = webview_builder
         .with_web_context(&mut web_context)
         .with_incognito(true)
         .with_devtools(desktop_devtools_enabled())
@@ -404,6 +419,9 @@ fn run_desktop() -> Result<()> {
         }
     };
 
+    // Construction succeeded. The first idle event may now schedule the one-shot
+    // host policy check; a failed WebView never reaches this point.
+    let mut skill_updates = sniper::skill_auto_update::DesktopTask::default();
     let close_state = state.clone();
     let close_data_dir = close_state.config.data_dir.clone();
     let close_runtime_instance_id = close_state.runtime_instance_id;
@@ -422,10 +440,12 @@ fn run_desktop() -> Result<()> {
         let _keep_proxy_task = &proxy_task;
         *control_flow = ControlFlow::Wait;
 
-        let mut teardown_once = |session_persisted: bool| {
+        let mut teardown_once = |session_persisted: bool,
+                                 skill_updates: &mut sniper::skill_auto_update::DesktopTask| {
             if !begin_desktop_teardown(teardown_started.as_ref()) {
                 return;
             }
+            skill_updates.shutdown(&runtime);
             if let Some(ui_task) = ui_task.take() {
                 ui_task.abort();
                 if let Err(error) = runtime.block_on(ui_task) {
@@ -482,10 +502,16 @@ fn run_desktop() -> Result<()> {
         };
 
         match event {
+            Event::MainEventsCleared => {
+                if !close_flush_in_progress && !teardown_started.load(Ordering::Acquire) {
+                    skill_updates.first_idle(&runtime, &close_data_dir);
+                }
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                skill_updates.request_stop();
                 if shutdown_done.load(Ordering::Acquire) {
                     *control_flow = ControlFlow::Exit;
                     return;
@@ -503,6 +529,7 @@ fn run_desktop() -> Result<()> {
                 }
             }
             Event::UserEvent(DesktopUserEvent::ShutdownSignal) => {
+                skill_updates.request_stop();
                 if shutdown_done.load(Ordering::Acquire) {
                     *control_flow = ControlFlow::Exit;
                     return;
@@ -519,6 +546,7 @@ fn run_desktop() -> Result<()> {
                     *control_flow = block_desktop_shutdown(error);
                 }
             }
+            #[cfg(target_os = "macos")]
             Event::UserEvent(DesktopUserEvent::ScrollGesturePhase { ended }) => {
                 let _ = webview.evaluate_script(if ended {
                     "window.__sniperScrollGesture && window.__sniperScrollGesture('ended')"
@@ -542,7 +570,7 @@ fn run_desktop() -> Result<()> {
                 }
                 match persist_desktop_session_state(&runtime, close_state.as_ref()) {
                     Ok(()) => {
-                        teardown_once(true);
+                        teardown_once(true, &mut skill_updates);
                         *control_flow = ControlFlow::Exit;
                     }
                     Err(error) => {
@@ -579,7 +607,7 @@ fn run_desktop() -> Result<()> {
                         "forced desktop teardown will preserve runtime state after failed persistence"
                     );
                 }
-                teardown_once(session_persisted);
+                teardown_once(session_persisted, &mut skill_updates);
             }
             _ => {}
         }
@@ -733,6 +761,7 @@ fn persist_desktop_session_state(
     runtime: &tokio::runtime::Runtime,
     state: &AppState,
 ) -> Result<()> {
+    runtime.block_on(state.stop_recon_jobs())?;
     let relay_result = runtime
         .block_on(proxy::close_live_websocket_relays(
             state,
@@ -1057,12 +1086,9 @@ fn forward_scroll_gesture_phase(proxy: tao::event_loop::EventLoopProxy<DesktopUs
 #[cfg(not(target_os = "macos"))]
 fn forward_scroll_gesture_phase(_proxy: tao::event_loop::EventLoopProxy<DesktopUserEvent>) {}
 
-/// Append a `PATH` export line to `~/.zshrc` (and `~/.bashrc` if present) so
-/// that `sniper-cli` is available from the terminal without requiring root.
-/// If the line already exists the function is a no-op.
-
 fn should_install_cli_path_on_launch(env_value: Option<&str>) -> bool {
-    truthy_env_value(env_value)
+    // Linux PATH setup belongs to the package or an explicit portable install.
+    !cfg!(target_os = "linux") && truthy_env_value(env_value)
 }
 
 fn should_install_skills_on_launch(env_value: Option<&str>) -> bool {
@@ -1454,6 +1480,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn cli_path_install_requires_explicit_launch_opt_in() {
         assert!(!should_install_cli_path_on_launch(None));
         assert!(!should_install_cli_path_on_launch(Some("")));
@@ -1461,6 +1488,21 @@ mod tests {
         assert!(should_install_cli_path_on_launch(Some("1")));
         assert!(should_install_cli_path_on_launch(Some("true")));
         assert!(should_install_cli_path_on_launch(Some("YES")));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_never_installs_cli_path_on_launch() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("1"),
+            Some("true"),
+            Some("YES"),
+        ] {
+            assert!(!should_install_cli_path_on_launch(value));
+        }
     }
 
     #[test]

@@ -7,7 +7,13 @@ use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use rcgen::generate_simple_self_signed;
 use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName};
-use sniper::{config::AppConfig, proxy::serve_proxy, state::AppState, store::ListFilters};
+use sniper::{
+    config::AppConfig,
+    model::{MessageRecord, TransactionRecord, TransactionSummary},
+    proxy::serve_proxy,
+    state::AppState,
+    store::{ListFilters, TransactionStore},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -69,17 +75,24 @@ async fn proxy_mitm_captures_inner_https_requests() {
     assert!(response.contains("200 OK"));
     assert!(response.contains("secure-world"));
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
     let session = state.session().await;
-    let list = session.store.list(&ListFilters::default()).await;
-    assert!(list.iter().any(|record| record.method == "CONNECT"));
-    assert!(list.iter().any(|record| {
-        record.method == "GET"
-            && record.host == format!("localhost:{}", upstream.port)
-            && record.path == "/secure"
-            && record.scheme == "https"
-    }));
+    wait_for_record(
+        &session.store,
+        |record| record.method == "CONNECT",
+        "CONNECT tunnel record",
+    )
+    .await;
+    wait_for_record(
+        &session.store,
+        |record| {
+            record.method == "GET"
+                && record.host == format!("localhost:{}", upstream.port)
+                && record.path == "/secure"
+                && record.scheme == "https"
+        },
+        "inner HTTPS GET record",
+    )
+    .await;
 
     proxy_handle.abort();
     upstream.handle.abort();
@@ -126,14 +139,13 @@ async fn mitm_connect_tls_failure_after_200_records_connect_success_status() {
 
     let mut ignored = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut ignored)).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
     let session = state.session().await;
-    let list = session.store.list(&ListFilters::default()).await;
-    let record = list
-        .iter()
-        .find(|record| record.method == "CONNECT" && record.host == "example.test:443")
-        .expect("CONNECT post-200 TLS failure should be recorded");
+    let record = wait_for_record(
+        &session.store,
+        |record| record.method == "CONNECT" && record.host == "example.test:443",
+        "CONNECT post-200 TLS failure record",
+    )
+    .await;
     assert_eq!(record.status, Some(200));
     let detail = session.store.get(record.id).await.unwrap();
     assert!(detail.notes.iter().any(|note| {
@@ -141,6 +153,56 @@ async fn mitm_connect_tls_failure_after_200_records_connect_success_status() {
     }));
 
     proxy_handle.abort();
+}
+
+async fn wait_for_record(
+    store: &TransactionStore,
+    predicate: impl Fn(&TransactionSummary) -> bool,
+    description: &str,
+) -> TransactionSummary {
+    // Socket completion can precede the journal acknowledgement that publishes
+    // a record. Wait for the observable record instead of assuming disk timing.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let records = store.list(&ListFilters::default()).await;
+            if let Some(record) = records.into_iter().find(&predicate) {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
+}
+
+#[tokio::test]
+async fn record_wait_observes_publication_after_the_old_fixed_delay() {
+    let store = TransactionStore::new();
+    let record = TransactionRecord::tunnel(
+        chrono::Utc::now(),
+        "example.test:443".to_string(),
+        Some(200),
+        0,
+        MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 4096),
+        Vec::new(),
+    );
+    let record_id = record.id;
+    let waiting = wait_for_record(
+        &store,
+        |record| record.id == record_id,
+        "delayed fixture record",
+    );
+    tokio::pin!(waiting);
+
+    // Withhold publication beyond the old 150 ms wait without depending on
+    // thread or filesystem scheduling to reproduce the race.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut waiting)
+            .await
+            .is_err()
+    );
+    store.insert(record).await;
+    assert_eq!(waiting.await.id, record_id);
 }
 
 struct HttpsUpstream {

@@ -43,7 +43,7 @@ function fixture() {
     if (appSource.includes(`function ${name}(`)) functions.push(name);
   }
   const context = loadFunctions(functions, {
-    document, els, displaySettingsPreviewActive: false, displaySettingsReturnFocus: null, activeConfirmDialog: null,
+    document, els, displaySettingsPreviewActive: false, displaySettingsEditedControls: new Set(), displaySettingsReturnFocus: null, activeConfirmDialog: null,
     hydrateDisplaySettingsForm() {}, renderShortcutReference() {}, selectSettingsTab() {},
     applyDisplaySettingsState: () => applied.push("saved"),
     saveDisplaySettingsFromForm: () => writes.push("settings"),
@@ -192,3 +192,22 @@ for (const shiftKey of [false, true]) {
     assert.equal(f.document.activeElement, shiftKey ? last : f.close);
   });
 }
+
+test("composing Escape keeps Settings open until composition has ended", () => {
+  const f = fixture(); f.context.openDisplaySettingsModal();
+  f.context.displaySettingsPreviewActive = true;
+  const input = f.element("INPUT"); f.display.children.push(input); input.focus();
+  const appliedBefore = f.applied.length;
+  const composing = f.key("Escape", input, { isComposing: true });
+  assert.equal(composing.defaultPrevented, false, "the IME keeps its Escape event");
+  assert.equal(f.display.classList.contains("hidden"), false);
+  assert.equal(f.context.displaySettingsPreviewActive, true);
+  assert.equal(f.document.activeElement, input);
+  assert.equal(f.applied.length, appliedBefore); assert.equal(f.writes.length, 0);
+  const ended = f.key("Escape", input, { isComposing: false });
+  assert.equal(ended.defaultPrevented, true);
+  assert.equal(f.display.classList.contains("hidden"), true);
+  assert.equal(f.context.displaySettingsPreviewActive, false);
+  assert.equal(f.document.activeElement, f.opener);
+  assert.equal(f.writes.length, 0);
+});

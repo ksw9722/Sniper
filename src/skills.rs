@@ -2,6 +2,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -26,6 +27,12 @@ pub struct SkillsInstallResult {
     pub installed: Vec<InstalledSkill>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InstallOutcome {
+    Created,
+    Preserved,
+}
+
 /// Install or update the managed skill files into the given root directory.
 pub fn install_skill_folder(root: &Path, name: &str, skill_md: &str) -> Result<PathBuf> {
     let (skill_dir, skill_path) = prepare_skill_folder(root, name)?;
@@ -34,13 +41,58 @@ pub fn install_skill_folder(root: &Path, name: &str, skill_md: &str) -> Result<P
 }
 
 /// Install the managed skill only when the main SKILL.md is not already present.
+/// Requires hard-link support; unsupported filesystems fail without replacing it.
 pub fn install_skill_folder_if_missing(root: &Path, name: &str, skill_md: &str) -> Result<PathBuf> {
+    install_skill_folder_if_missing_with(root, name, skill_md, |temp, destination| {
+        fs::hard_link(temp, destination)
+    })
+    .map(|(path, _)| path)
+}
+
+fn install_skill_folder_if_missing_with(
+    root: &Path,
+    name: &str,
+    skill_md: &str,
+    publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(PathBuf, InstallOutcome)> {
     let (skill_dir, skill_path) = prepare_skill_folder(root, name)?;
     if path_is_occupied(&skill_path)? {
-        return Ok(skill_dir);
+        return Ok((skill_dir, InstallOutcome::Preserved));
     }
-    write_skill_markdown(&skill_dir, &skill_path, skill_md)?;
-    Ok(skill_dir)
+    let tmp_path = skill_dir.join(format!("SKILL.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+    let result = (|| {
+        file.write_all(skill_md.as_bytes())
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
+        drop(file);
+
+        // Link only the complete file, without replacing a competing creator.
+        // Do not fall back to rename or in-place writes on unsupported filesystems.
+        match publish(&tmp_path, &skill_path) {
+            Ok(()) => Ok(InstallOutcome::Created),
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || path_is_occupied(&skill_path)? =>
+            {
+                Ok(InstallOutcome::Preserved)
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to publish {} without replacing it (hard-link support required)",
+                    skill_path.display()
+                )
+            }),
+        }
+    })();
+    // The destination may belong to another installer, including after an error.
+    let _ = fs::remove_file(&tmp_path);
+    result.map(|outcome| (skill_dir, outcome))
 }
 
 fn prepare_skill_folder(root: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
@@ -156,8 +208,9 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
-/// Install both Claude and Codex skills silently.
+/// Install missing Claude and Codex skills silently.
 /// Returns the list of installed skills, or an empty vec if nothing was installed.
+/// Unsupported hard-link publication is skipped, without a replacing fallback.
 pub fn auto_install_all() -> Vec<InstalledSkill> {
     let Some(claude_root) = default_claude_skills_dir() else {
         return Vec::new();
@@ -175,17 +228,24 @@ fn auto_install_all_to(claude_root: PathBuf, codex_root: PathBuf) -> Vec<Install
         return installed;
     }
 
-    if let Ok(path) =
-        install_skill_folder_if_missing(&claude_root, SKILL_NAME, CLAUDE_SKILL_TEMPLATE)
-    {
+    if let Ok((path, InstallOutcome::Created)) = install_skill_folder_if_missing_with(
+        &claude_root,
+        SKILL_NAME,
+        CLAUDE_SKILL_TEMPLATE,
+        |temp, destination| fs::hard_link(temp, destination),
+    ) {
         installed.push(InstalledSkill {
             agent: "claude",
             path: path.display().to_string(),
         });
     }
 
-    if let Ok(path) = install_skill_folder_if_missing(&codex_root, SKILL_NAME, CODEX_SKILL_TEMPLATE)
-    {
+    if let Ok((path, InstallOutcome::Created)) = install_skill_folder_if_missing_with(
+        &codex_root,
+        SKILL_NAME,
+        CODEX_SKILL_TEMPLATE,
+        |temp, destination| fs::hard_link(temp, destination),
+    ) {
         installed.push(InstalledSkill {
             agent: "codex",
             path: path.display().to_string(),
@@ -198,6 +258,272 @@ fn auto_install_all_to(claude_root: PathBuf, codex_root: PathBuf) -> Vec<Install
 #[cfg(test)]
 mod tests {
     use super::{agent_home_dir, auto_install_all_to, install_skill_folder};
+
+    fn assert_no_skill_temps(skill_dir: &std::path::Path) {
+        assert!(!std::fs::read_dir(skill_dir).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("SKILL.") && name.ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn packaged_service_map_guidance_keeps_supplementary_inspection_explicit() {
+        let section = |template: &str| {
+            template
+                .split_once("## Passive Service Map")
+                .unwrap()
+                .1
+                .split_once("## Saved data and session management")
+                .unwrap()
+                .0
+                .lines()
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let guidance = section(super::CODEX_SKILL_TEMPLATE);
+        assert_eq!(guidance, section(super::CLAUDE_SKILL_TEMPLATE));
+        for term in [
+            "`technology_observations`",
+            "`reported_version`",
+            "not verified installed software or a vulnerability judgment",
+            "conflicting versions separately",
+            "`version_status: \"reported\"`",
+            "`not_reported`",
+            "`unsupported_format`",
+            "`non_product_version`",
+            "`reported_version: null`",
+            "extension means unavailable metadata; a present empty",
+            "Neither proves product\nabsence",
+            "defaults to catalog 2",
+            "`--technology-catalog-version 1`",
+            "`technology_catalog_version: 1`",
+            "`X-Sniper-Technology-Catalog-Version`",
+            "marker means legacy v1\ncoverage and triggers a warning",
+            "present marker must match the requested supported catalog",
+            "adds no target traffic, body reads, fallback reads, or automatic retries",
+            "map and evidence reads remain metadata-only",
+            "SERVICE_MAP_BUSY",
+            "SERVICE_MAP_SCOPE_WORK_LIMIT",
+            "SERVICE_MAP_SESSION_CHANGED",
+            "SERVICE_MAP_SCOPE_CHANGED",
+            "SERVICE_MAP_HISTORY_CHANGED",
+            "SERVICE_MAP_BUILD_FAILED",
+            "`retryable:false` and no automatic retry",
+            "wait for the running refresh to finish, then deliberately retry",
+            "smaller `max_records` / `--max-records` window",
+            "simplify scope rules only with explicit authorization",
+            "A failed map is not a complete empty inventory",
+            "Only an explicit Refresh or actual scope/session change can resume reads",
+            "History events, reconnecting, reopening the view, and local filters do not clear",
+            "filters issue zero\nreads",
+            "do not\nprove endpoint-level product/version declarations",
+            "remain separate, explicit reads and never run automatically on recovery",
+            "scope service-map html-generators",
+            "target.service_map.html_generators.get",
+            "target.service_map.link_declarations.get",
+            "target.service_map.socket_peer_matches.get",
+            "never enables capture",
+            "Scope matching uses the original captured host",
+            "Duplicate UUID rows count separately",
+            "undirected observation links",
+            "Socket addresses may reveal",
+            "only response headers, never body files or linked resources",
+            "Show explicitly adds one exact inspection",
+            "eight-entry cap rejects additions without eviction",
+            "overlapping per-inspection totals are never\nsummed",
+            "Validated events for another record UUID preserve body/Link entries",
+            "not original wire ordering",
+            "same exact-row and active-session restrictions apply",
+            "separate\nbounded retained-preview read",
+            "never retry with body\nhydration",
+            "`scan_prefix_bytes`",
+            "`head_closed`",
+            "reported\ngenerator claims",
+            "There is no map\naggregation, automatic body scan, or persistence",
+        ] {
+            assert!(
+                guidance.contains(term),
+                "missing passive service map guidance: {term}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_map_readme_collection_link_matches_integration_heading() {
+        let readme = include_str!("../README.md");
+        let contract = include_str!("../docs/integrations/service-map.md");
+        assert!(readme.contains(
+            "](docs/integrations/service-map.md#session-local-retained-relationship-collection-gui-only)"
+        ));
+        assert!(contract
+            .lines()
+            .any(|line| line == "## Session-local retained relationship collection (GUI only)"));
+        assert!(!readme.contains("#temporary-body-reference-overlay-gui-only"));
+    }
+
+    fn saved_data_guidance(template: &str) -> String {
+        let mut lines = template.lines();
+        assert!(
+            lines.any(|line| line == "## Saved data and session management"),
+            "packaged skill must explain saved-data contracts"
+        );
+        // Windows checkouts may use CRLF; compare Markdown content, not EOLs.
+        lines
+            .take_while(|line| !line.starts_with("## "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn packaged_saved_data_section_accepts_lf_and_crlf() {
+        for newline in ["\n", "\r\n"] {
+            let fixture = [
+                "# Skill",
+                "",
+                "## Saved data and session management",
+                "",
+                "Saved guidance.",
+                "### Details",
+                "Keep this subsection.",
+                "",
+                "## Next section",
+                "Exclude this section.",
+            ]
+            .join(newline);
+            assert_eq!(
+                saved_data_guidance(&fixture),
+                "Saved guidance.\n### Details\nKeep this subsection."
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_saved_data_guidance_stays_in_sync_and_covers_the_contract() {
+        let section = saved_data_guidance(super::CODEX_SKILL_TEMPLATE);
+        assert_eq!(section, saved_data_guidance(super::CLAUDE_SKILL_TEMPLATE));
+        let configuration = section
+            .split_once("### Existing intercept rules and saved labels")
+            .expect("packaged skills must cover existing saved configuration edits")
+            .1;
+        for term in [
+            "capture.intercept_rule.update",
+            "capture.intercept_rule.set_enabled",
+            "label-only `replay.update`",
+            "They do not\nuse `saved.v1` receipts.",
+        ] {
+            assert!(
+                configuration.contains(term),
+                "missing saved configuration guidance: {term}"
+            );
+        }
+        for operation in crate::saved_contract::OPERATIONS {
+            assert!(
+                section.contains(operation),
+                "missing saved operation: {operation}"
+            );
+        }
+        let receipt_code =
+            serde_json::to_string(&crate::saved_operations::SavedOperationCode::SelectionMismatch)
+                .unwrap();
+        assert!(section.contains(&format!("data.receipt.code:{receipt_code}")));
+        for term in [
+            "receipt.outcome",
+            "operation_id",
+            "continuation",
+            "STALE_CONTINUATION",
+            "found:false",
+            "unknown",
+            "--dry-run",
+            "--yes",
+        ] {
+            assert!(section.contains(term), "missing contract guidance: {term}");
+        }
+    }
+
+    #[test]
+    fn packaged_saved_data_examples_validate_without_running_operations() {
+        let mut examples = 0;
+        let mut mutation_examples = 0;
+        for line in saved_data_guidance(super::CODEX_SKILL_TEMPLATE).lines() {
+            if !line.starts_with("sniper-cli ") {
+                continue;
+            }
+            let Some((_, call)) = line.split_once("call saved.v1.") else {
+                continue;
+            };
+            let operation = format!("saved.v1.{}", call.split_whitespace().next().unwrap());
+            let Some((_, quoted)) = line.split_once("--input '") else {
+                panic!("saved-data examples need literal JSON input: {line}");
+            };
+            let raw = quoted.split_once('\'').expect("closed shell JSON quote").0;
+            let input: serde_json::Value = serde_json::from_str(raw).expect("valid example JSON");
+            crate::saved_contract::validate_input(&operation, &input)
+                .unwrap_or_else(|error| panic!("invalid {operation} example: {error}"));
+            if crate::saved_contract::is_write(&operation) {
+                assert!(
+                    line.contains("--dry-run") || line.contains("--yes"),
+                    "mutation examples require a confirmation gate"
+                );
+                if line.contains("--yes") {
+                    assert!(
+                        saved_data_guidance(super::CODEX_SKILL_TEMPLATE)
+                            .contains(&line.replace("--yes", "--dry-run")),
+                        "an apply example must have an identical preview example"
+                    );
+                }
+                mutation_examples += 1;
+            }
+            examples += 1;
+        }
+        assert!(
+            examples >= 3,
+            "keep read, mutation preview, and receipt examples"
+        );
+        assert!(mutation_examples > 0);
+    }
+
+    #[test]
+    fn packaged_skill_maintenance_guidance_stays_in_sync() {
+        fn maintenance(template: &str) -> String {
+            template
+                .lines()
+                .skip_while(|line| *line != "## Skill maintenance")
+                .skip(1)
+                .take_while(|line| !line.starts_with("## "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let section = maintenance(super::CODEX_SKILL_TEMPLATE);
+        assert_eq!(section, maintenance(super::CLAUDE_SKILL_TEMPLATE));
+        for term in [
+            "skills status",
+            "skills update-preview",
+            "skills.enroll",
+            "skills.stage_update",
+            "skills.apply_update",
+            "skills.update_result",
+            "skills.rollback_update",
+            "activated:false",
+            "does not enable automatic updates",
+            "strictly newer semantic version",
+            "canonical lowercase hyphenated UUID",
+            "same original operation ID",
+            "never blindly retry",
+            "agent_reloaded:false",
+            "128 retained operations",
+            "manual reconciliation",
+            "overwrite",
+            "loaded context",
+        ] {
+            assert!(
+                section.contains(term),
+                "missing maintenance guidance: {term}"
+            );
+        }
+    }
 
     #[test]
     fn install_skill_folder_rejects_path_like_names() {
@@ -228,6 +554,283 @@ mod tests {
             });
         assert!(!leaked_temp);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_skill_folder_if_missing_preserves_competing_create() {
+        let root = std::env::temp_dir().join(format!("sniper-skill-race-{}", uuid::Uuid::new_v4()));
+        let (path, outcome) = super::install_skill_folder_if_missing_with(
+            &root,
+            super::SKILL_NAME,
+            "# bundled skill\n",
+            |temp, skill_path| {
+                std::fs::write(skill_path, "# competing skill\n")?;
+                std::fs::hard_link(temp, skill_path)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("SKILL.md")).unwrap(),
+            "# competing skill\n"
+        );
+        assert_eq!(outcome, super::InstallOutcome::Preserved);
+        assert_no_skill_temps(&path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_skill_folder_if_missing_publishes_complete_file() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-skill-complete-{}", uuid::Uuid::new_v4()));
+        let content = "# complete skill\n".repeat(4096);
+        let (path, outcome) = super::install_skill_folder_if_missing_with(
+            &root,
+            super::SKILL_NAME,
+            &content,
+            |temp, skill_path| {
+                assert!(!super::path_is_occupied(skill_path).unwrap());
+                assert_eq!(std::fs::read_to_string(temp).unwrap(), content);
+                std::fs::hard_link(temp, skill_path)?;
+                assert_eq!(std::fs::read_to_string(skill_path).unwrap(), content);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, super::InstallOutcome::Created);
+        assert_eq!(
+            std::fs::read_to_string(path.join("SKILL.md")).unwrap(),
+            content
+        );
+        assert_no_skill_temps(&path);
+        assert_eq!(
+            super::install_skill_folder_if_missing(&root, super::SKILL_NAME, "replacement")
+                .unwrap(),
+            path
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("SKILL.md")).unwrap(),
+            content
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_skill_folder_if_missing_preserves_existing_and_competing_directories() {
+        for racing in [false, true] {
+            let root = std::env::temp_dir()
+                .join(format!("sniper-skill-directory-{}", uuid::Uuid::new_v4()));
+            let skill_path = root.join(super::SKILL_NAME).join("SKILL.md");
+            let create_directory = || {
+                std::fs::create_dir_all(&skill_path).unwrap();
+                std::fs::write(skill_path.join("keep"), "retained").unwrap();
+            };
+            if !racing {
+                create_directory();
+            }
+            let (path, outcome) = super::install_skill_folder_if_missing_with(
+                &root,
+                super::SKILL_NAME,
+                "# bundled skill\n",
+                |temp, destination| {
+                    assert!(racing, "an occupied destination must skip publication");
+                    create_directory();
+                    std::fs::hard_link(temp, destination)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(outcome, super::InstallOutcome::Preserved);
+            assert!(skill_path.is_dir());
+            assert_eq!(
+                std::fs::read_to_string(skill_path.join("keep")).unwrap(),
+                "retained"
+            );
+            assert_no_skill_temps(&path);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_skill_folder_if_missing_preserves_existing_and_competing_symlinks() {
+        for racing in [false, true] {
+            for dangling in [false, true] {
+                let root = std::env::temp_dir()
+                    .join(format!("sniper-skill-link-{}", uuid::Uuid::new_v4()));
+                let skill_dir = root.join(super::SKILL_NAME);
+                let skill_path = skill_dir.join("SKILL.md");
+                let target = root.join("target.md");
+                std::fs::create_dir_all(&skill_dir).unwrap();
+                if !dangling {
+                    std::fs::write(&target, "# custom skill\n").unwrap();
+                }
+                if !racing {
+                    std::os::unix::fs::symlink(&target, &skill_path).unwrap();
+                }
+                let (path, outcome) = super::install_skill_folder_if_missing_with(
+                    &root,
+                    super::SKILL_NAME,
+                    "# bundled skill\n",
+                    |temp, destination| {
+                        assert!(racing, "an occupied destination must skip publication");
+                        std::os::unix::fs::symlink(&target, destination)?;
+                        std::fs::hard_link(temp, destination)
+                    },
+                )
+                .unwrap();
+
+                assert_eq!(outcome, super::InstallOutcome::Preserved);
+                assert!(std::fs::symlink_metadata(&skill_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert_eq!(std::fs::read_link(&skill_path).unwrap(), target);
+                if dangling {
+                    assert!(!target.exists());
+                } else {
+                    assert_eq!(
+                        std::fs::read_to_string(&target).unwrap(),
+                        "# custom skill\n"
+                    );
+                }
+                assert_no_skill_temps(&path);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn install_skill_folder_if_missing_cleans_temp_after_publication_failure() {
+        for kind in [
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("sniper-skill-failed-link-{}", uuid::Uuid::new_v4()));
+            let skill_dir = root.join(super::SKILL_NAME);
+            let error = super::install_skill_folder_if_missing_with(
+                &root,
+                super::SKILL_NAME,
+                "# bundled skill\n",
+                |temp, destination| {
+                    assert_eq!(std::fs::read_to_string(temp).unwrap(), "# bundled skill\n");
+                    assert!(!super::path_is_occupied(destination).unwrap());
+                    Err(std::io::Error::new(kind, "injected publication failure"))
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("hard-link support required"));
+            assert!(!super::path_is_occupied(&skill_dir.join("SKILL.md")).unwrap());
+            assert_no_skill_temps(&skill_dir);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn install_skill_folder_if_missing_preserves_competitor_after_other_publication_error() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-skill-failed-race-{}", uuid::Uuid::new_v4()));
+        let (path, outcome) = super::install_skill_folder_if_missing_with(
+            &root,
+            super::SKILL_NAME,
+            "# bundled skill\n",
+            |_, destination| {
+                std::fs::write(destination, "# competing skill\n")?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected collision",
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, super::InstallOutcome::Preserved);
+        assert_eq!(
+            std::fs::read_to_string(path.join("SKILL.md")).unwrap(),
+            "# competing skill\n"
+        );
+        assert_no_skill_temps(&path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_skill_folder_if_missing_has_one_concurrent_winner() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-skill-winners-{}", uuid::Uuid::new_v4()));
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["# first skill\n", "# second skill\n"]
+                .into_iter()
+                .map(|content| {
+                    let root = &root;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let (_, outcome) = super::install_skill_folder_if_missing_with(
+                            root,
+                            super::SKILL_NAME,
+                            content,
+                            |temp, destination| {
+                                barrier.wait();
+                                std::fs::hard_link(temp, destination)
+                            },
+                        )
+                        .unwrap();
+                        (content, outcome)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, outcome)| *outcome == super::InstallOutcome::Created)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, outcome)| *outcome == super::InstallOutcome::Preserved)
+                .count(),
+            1
+        );
+        let winning_content = results
+            .iter()
+            .find(|(_, outcome)| *outcome == super::InstallOutcome::Created)
+            .unwrap()
+            .0;
+        let skill_dir = root.join(super::SKILL_NAME);
+        assert_eq!(
+            std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(),
+            winning_content
+        );
+        assert_no_skill_temps(&skill_dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_skill_folder_still_replaces_existing_markdown_when_explicit() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-skill-replace-{}", uuid::Uuid::new_v4()));
+        let path = install_skill_folder(&root, super::SKILL_NAME, "# original skill\n").unwrap();
+        assert_eq!(
+            install_skill_folder(&root, super::SKILL_NAME, "# replacement skill\n").unwrap(),
+            path
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("SKILL.md")).unwrap(),
+            "# replacement skill\n"
+        );
+        assert_no_skill_temps(&path);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -271,13 +874,53 @@ mod tests {
 
         let installed = auto_install_all_to(claude_root, codex_root);
 
-        assert_eq!(installed.len(), 2);
+        assert!(installed.is_empty());
         assert_eq!(
             std::fs::read_to_string(&claude_skill).unwrap(),
             "# custom claude skill\n"
         );
         assert_eq!(
             std::fs::read_to_string(&codex_skill).unwrap(),
+            "# custom codex skill\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_install_all_reports_only_newly_created_files() {
+        let root =
+            std::env::temp_dir().join(format!("sniper-skill-count-{}", uuid::Uuid::new_v4()));
+        let claude_root = root.join("claude");
+        let codex_root = root.join("codex");
+        let installed = auto_install_all_to(claude_root.clone(), codex_root.clone());
+        assert_eq!(installed.len(), 2);
+        assert_eq!(installed[0].agent, "claude");
+        assert_eq!(installed[1].agent, "codex");
+        for (skill_root, template) in [
+            (&claude_root, super::CLAUDE_SKILL_TEMPLATE),
+            (&codex_root, super::CODEX_SKILL_TEMPLATE),
+        ] {
+            let path = skill_root.join(super::SKILL_NAME);
+            assert_eq!(
+                std::fs::read_to_string(path.join("SKILL.md")).unwrap(),
+                template
+            );
+            assert_no_skill_temps(&path);
+        }
+        assert!(auto_install_all_to(claude_root.clone(), codex_root.clone()).is_empty());
+
+        std::fs::remove_file(claude_root.join(super::SKILL_NAME).join("SKILL.md")).unwrap();
+        let codex_skill = codex_root.join(super::SKILL_NAME).join("SKILL.md");
+        std::fs::write(&codex_skill, "# custom codex skill\n").unwrap();
+        let installed = auto_install_all_to(claude_root.clone(), codex_root);
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].agent, "claude");
+        assert_eq!(
+            installed[0].path,
+            claude_root.join(super::SKILL_NAME).display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(codex_skill).unwrap(),
             "# custom codex skill\n"
         );
         let _ = std::fs::remove_dir_all(root);

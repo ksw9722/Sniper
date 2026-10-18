@@ -65,6 +65,16 @@ Selection previews intentionally return the complete selected ID set and a
 count/token, not a page of summaries. A very broad filter can therefore have a
 large preview. No deletion is authorized by a list continuation.
 
+The CLI rejects structurally valid read responses that do not match the request:
+explicit-ID previews must return the same UUID set, page limits must match the
+requested or default limit, and continuation pages must respect the requested
+cursor boundary. HTTP next cursors also retain the supplied store generation.
+Pages have unique IDs in their documented order. UUID spelling case and explicit
+selection input order do not change identity. A mismatch returns
+`INVALID_RESPONSE` without presenting the rows as successful data; the CLI does
+not automatically retry the request. These checks validate the response, not a
+snapshot guarantee for a live traversal.
+
 ## Mutations and receipts
 
 Every v1 mutation requires `session_id` and a caller-chosen UUID `operation_id`.
@@ -135,15 +145,37 @@ Session rename accepts already trimmed names of at most 256 UTF-8 bytes with no
 control characters. An ordinary JSON Schema validator alone does not implement
 these annotated checks; the shared runtime validator does.
 
+Input errors are diagnosed before contacting an API. An unreadable, non-regular,
+oversized, or non-UTF-8 file/stdin source gets source-read guidance; malformed
+JSON gets syntax guidance. Valid JSON that violates the operation contract gets
+schema guidance. These remain `INVALID_INPUT`, exit status `2`, and
+`outcome: "not_applied"`; diagnostics do not echo paths or input contents.
+
 The v1 CLI error envelope retains `error.code`, `message`, `hint`, `retryable`,
 and `details`, with `schema_version:"saved.v1"`. `details` includes mutation
 `outcome`, `operation_id`, and `session_id` when parseable. All v1 errors set
 `retryable:false`; transport failure does not authorize destructive retry.
 Errors are typed at their source and never inferred from matching message text.
 The saved-only HTTP client disables both automatic protocol retries and redirects.
-Redirects return `REDIRECT_REFUSED`; the original request's receipt must be checked.
+Redirects return `REDIRECT_REFUSED`. For mutations or receipt lookup, inspect
+the receipt using the original operation ID. Ordinary metadata reads have no
+mutation receipt: inspect the selected API/session context before deliberately
+rerunning the read. A redirect does not authorize following an alternate endpoint
+or automatically retrying a mutation.
 Successful output and typed errors are checked against the original operation ID
 and explicit/pinned session before their outcomes are attributed to the request.
+Applied rename receipts also bind the nested session ID to the receipt's session
+ID. A rename call requires the returned name to equal its original requested
+name, including for a replayed receipt. Receipt lookup validates internal session
+identity but has no requested name to compare; neither path compares historical
+receipts with newer session state.
+A successful receipt response keeps `ok:true` and exit status zero even when the
+mutation outcome is `unknown` or `not_applied`: success describes reading the
+receipt. The CLI also adds a static `warnings` entry for those outcomes and for
+an absent receipt, without changing `data`. An absent receipt does not prove a
+mutation failed. Inspect the original receipt and current saved state; never
+repeat an uncertain mutation automatically or use a new operation ID to bypass
+that uncertainty. Applied receipts and ordinary reads have no outcome warning.
 
 The local API endpoint is `POST /api/saved/v1/call` with body
 `{"operation":"saved.v1.http.list","input":{}}`. It returns the versioned wire

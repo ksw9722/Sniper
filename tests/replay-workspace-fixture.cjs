@@ -15,7 +15,13 @@ const functions = [
   "buildEditableRawRequest", "mergeHeaders", "headerNameEquals", "replayRequestTextsEquivalent",
   "getRepeaterTargetConfig", "getActiveReplayTab", "getReplayTabVisualOrder", "isReplayTabSending", "sessionQueryPath",
   "createReplayTab", "ensureRepeaterTab", "currentSessionId", "workspaceSnapshotMatchesActiveSession",
-  "closeRepeaterTab", "snapshotReplayTabsState", "cloneReplayTabState", "cloneRepeaterHistoryEntry", "restoreReplayTabsState",
+  "closeRepeaterTab", "preserveActiveHttpReplayDraftBeforeNavigation", "preserveActiveHttpReplayDraftBeforeSessionChange",
+  "getRenderedHttpReplayDraftOwner", "isPreservedHttpReplayVersionSource",
+  "canReloadWorkspaceAfterSessionAction", "reconcileSessionsAfterCompletedAction",
+  "canLeaveSessionAfterDraftPreflight", "hasPendingWorkspaceStateSave",
+  "validateManualRepeaterTargetInput", "isLikelyIpv6Literal",
+  "persistReplayTabMetadataEdit",
+  "snapshotReplayTabsState", "cloneReplayTabState", "cloneRepeaterHistoryEntry", "restoreReplayTabsState",
   "scheduleWorkspaceStateSave", "flushQueuedWorkspaceStateSave", "runQueuedWorkspaceStateSaves", "saveWorkspaceState",
   "flushWorkspaceState", "clearBypassableWorkspaceConflict", "isActiveSessionChangedConflict", "isTooManyReplayTabsError",
   "flushWorkspaceStateOnUnload", "requestWorkspaceUnloadPrompt", "workspaceUnloadPayload", "utf8ByteLength",
@@ -39,7 +45,9 @@ function fixture() {
   const document = { activeElement: els.replayRequestHighlight, getElementById: id => id === "replayHttpVersionSelect" ? versionSelect : null };
   const context = loadFunctions(functions, {
     state, els, document, URL, TextEncoder, Blob, Uint8Array,
+    workspacePendingReplayCloses: new Map(), workspaceReplayMetadataEdits: new WeakMap(), MAX_REPLAY_TABS: 512,
     workspaceLoaded: true, workspaceStateGeneration: 0, workspaceExternalLoadGeneration: 0, workspaceExternalAppliedGeneration: 0,
+    renderedHttpReplayDraftOwner: null,
     workspaceSaveConflictPending: false, workspaceSaveConflictLatest: null, workspaceSaveCommittedSnapshot: null,
     workspaceClientId: "ui-client", workspaceSaveVersion: 0, workspaceSaveDirty: false, workspaceSaveTimer: null,
     workspaceSaveLastSnapshot: null, workspaceSaveInFlight: false, workspaceSaveLoopPromise: null,
@@ -65,7 +73,7 @@ function fixture() {
   function syncDom() {
     const tab = context.getActiveReplayTab();
     if (!tab || tab.type === "websocket") return;
-    els.replayRequestHighlight.innerText = tab.requestText;
+    if (els.replayRequestHighlight) els.replayRequestHighlight.innerText = tab.requestText;
     els.replayRequestEditor.value = tab.requestText;
     const target = context.getRepeaterTargetConfig(tab);
     els.replayHostInput.value = target.host; els.replayPortInput.value = target.port; els.replaySchemeSelect.value = target.scheme;
