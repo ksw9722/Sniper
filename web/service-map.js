@@ -2364,6 +2364,14 @@
         origin.technology_observations.forEach((item) => add(item.evidence, productText(item)));
         origin.redirects.forEach((item) => add(item.evidence, `Redirect instruction → ${item.target_origin}`));
         origin.header_links.forEach((item) => add(item.evidence, `${item.relationship === "origin_header" ? "Origin" : "Referer"} header: ${item.source_origin}`));
+        // Each section's own View source reads one of these. The endpoint
+        // samples keep only the newest rows, so a token from an older row was
+        // refused and the button did nothing.
+        array(origin.auth).forEach((item) => add(item.evidence, `${authName(item)} · authentication`));
+        array(origin.server_technologies).forEach((item) => add(item.evidence, `${item.name} · ${item.category === "exposure" ? "exposure" : "server"}`));
+        ["banners", "headers", "cookies"].forEach((kind) => array(origin.unnamed?.[kind]).forEach((signal) => add(signal.evidence, `${signal.value} · unnamed`)));
+        array(state.snapshot?.origins).forEach((page) => array(page.front_technologies)
+          .filter((item) => item.source_origin === origin.origin).forEach((item) => add(item.evidence, `${item.name} · front-end`)));
       }
       return items;
     }

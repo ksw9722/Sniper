@@ -124,6 +124,17 @@ test('a captured row keeps another row\'s evidence open, and its own row clears 
   assert.equal(f.state.evidence, null);
 });
 
+test('View source reads a server or exposure row the endpoint samples no longer hold', async () => {
+  const value = origin();
+  value.server_technologies = [{ product_id: 'spring_actuator', name: 'Spring Boot Actuator', category: 'exposure', signals: ['body'], row_count: 1, evidence: [token(77)] }];
+  const f = fixture(); await f.load(snapshot([value]));
+  f.controller.selectOrigin(A);
+  const reads = f.requests.length;
+  const pending = f.controller.loadEvidence(token(77));
+  assert.equal(f.requests.length, reads + 1, 'the exposure token is read');
+  f.requests.at(-1).resolve(response(evidence(77))); await pending;
+});
+
 test('an origin with more rows than the old 50,000 window still loads', () => {
   const busy = origin(A, [observation('nginx', '1.26.2', 1, { row_count: 60000 })]);
   busy.request_count = 75000;
