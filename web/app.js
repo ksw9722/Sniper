@@ -9752,6 +9752,9 @@ function updateCategoryFilter() {
   if (!els.findingsFilterCategory) return;
   const current = els.findingsFilterCategory.value;
   const extraCats = new Set();
+  // The capped list may no longer contain this category. Keep the active
+  // filter, like built-in categories, rather than silently showing all rows.
+  if (current && !BUILTIN_FINDING_CATEGORIES.has(current)) extraCats.add(current);
   // Remove old custom options
   Array.from(els.findingsFilterCategory.options).forEach((opt) => {
     if (opt.dataset.custom) opt.remove();
