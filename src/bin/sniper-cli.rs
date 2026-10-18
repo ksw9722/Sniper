@@ -7538,7 +7538,7 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 command: HistoryCommand::Search(HistorySearchArgs {
                     value: call_required(operation, input, "value")?,
                     session_id: call_optional(operation, input, "session_id")?,
-                    side: call_optional(operation, input, "side")?.unwrap_or_default(),
+                    side: call_history_search_sides(operation, input)?,
                     case_sensitive: call_bool(operation, input, "case_sensitive")?,
                     max_matches: call_optional_nonzero_usize(operation, input, "max_matches")?,
                     byte_budget: call_optional(operation, input, "byte_budget")?,
@@ -8579,6 +8579,20 @@ fn call_optional_nonzero_usize(
         bail!("field `{field}` for `{operation}` must be greater than zero");
     }
     Ok(value)
+}
+
+/// The `--side` values the command line accepts. Unchecked here, `"body"`
+/// passed a dry run and then failed with 400.
+fn call_history_search_sides(operation: &str, input: &Value) -> Result<Vec<String>> {
+    const SIDES: [&str; 4] = ["url", "request-body", "response-body", "headers"];
+    let sides: Vec<String> = call_optional(operation, input, "side")?.unwrap_or_default();
+    if let Some(side) = sides.iter().find(|side| !SIDES.contains(&side.as_str())) {
+        bail!(
+            "field `side` for `{operation}` must contain only {}; got `{side}`",
+            SIDES.join(", ")
+        );
+    }
+    Ok(sides)
 }
 
 fn call_optional_http_status(operation: &str, input: &Value, field: &str) -> Result<Option<u16>> {
