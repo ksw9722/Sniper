@@ -534,11 +534,14 @@ pub(crate) mod supported {
     /// every file a process creates with the app it came from, so each file a
     /// downloaded Sniper or a terminal it started writes carries
     /// `com.apple.provenance`, and refusing it refused every activation there.
+    /// Opening a file in an app (`open SKILL.md`) adds the time it was last used,
+    /// `com.apple.lastuseddate#PS`, after which preview allowed an update that
+    /// apply then refused.
     // ponytail: only this label. An SELinux host gives every file `security.selinux`
     // and is refused the same way; add it if such hosts are supported. Linux keeps
     // ACLs in attributes (`system.posix_acl_*`), so anything else stays refused.
     #[cfg(target_os = "macos")]
-    const SYSTEM_ATTRIBUTES: &[&[u8]] = &[b"com.apple.provenance"];
+    const SYSTEM_ATTRIBUTES: &[&[u8]] = &[b"com.apple.provenance", b"com.apple.lastuseddate#PS"];
     #[cfg(target_os = "linux")]
     const SYSTEM_ATTRIBUTES: &[&[u8]] = &[];
 
@@ -2837,6 +2840,11 @@ pub(crate) mod supported {
                 only_system_attributes(b"com.apple.provenance\0"),
                 cfg!(target_os = "macos"),
                 "the label macOS attaches by itself, and only on macOS"
+            );
+            assert_eq!(
+                only_system_attributes(b"com.apple.provenance\0com.apple.lastuseddate#PS\0"),
+                cfg!(target_os = "macos"),
+                "and the time an app last opened it"
             );
         }
 
