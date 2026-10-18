@@ -121,7 +121,9 @@ fi
 REQUESTED_DMG_ARCH="${DMG_ARCH:-}"
 BRIDGE_REQUIRES_UNIVERSAL=0
 LEGACY_UPDATER_COMPAT="${LEGACY_UPDATER_COMPAT:-1}"
-if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$LEGACY_UPDATER_COMPAT" != "0" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
+# Ad-hoc builds are what ship (there is no Developer ID), so the legacy
+# updater's need for a universal DMG holds for them too.
+if [[ "$LEGACY_UPDATER_COMPAT" != "0" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
   BRIDGE_REQUIRES_UNIVERSAL=1
   if [[ -n "$REQUESTED_DMG_ARCH" && "$REQUESTED_DMG_ARCH" != "universal" ]]; then
     echo "Sniper releases must use DMG_ARCH=universal while legacy v0.2.4 updater clients may select the latest DMG without arch filtering." >&2
@@ -211,7 +213,7 @@ if [[ "${#DMG_CANDIDATES[@]}" -ne 1 ]]; then
 fi
 
 DMG_PATH="${DMG_CANDIDATES[0]}"
-if [[ "$ALLOW_ADHOC_RELEASE" != "1" && "$LEGACY_UPDATER_COMPAT" != "0" && "$DMG_PATH" != *"-universal.dmg" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
+if [[ "$LEGACY_UPDATER_COMPAT" != "0" && "$DMG_PATH" != *"-universal.dmg" && "${ALLOW_NON_UNIVERSAL_BRIDGE_RELEASE:-0}" != "1" ]]; then
   echo "Sniper legacy updater-compatible releases must upload a universal DMG because v0.2.4 clients are not arch-aware." >&2
   echo "Build/upload a universal DMG, or set LEGACY_UPDATER_COMPAT=0 if this is intentional." >&2
   exit 1
