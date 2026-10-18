@@ -549,6 +549,32 @@ pub(crate) fn strip_transaction_bodies(record: &mut TransactionRecord) {
     }
 }
 
+/// Leaves a record's bodies to disk when its persisted line is current.
+fn keep_located_bodies_on_disk(
+    records: &mut [TransactionRecord],
+    locators: &mut HashMap<Uuid, crate::session::BodyLocator>,
+    replayed_ids: &HashSet<Uuid>,
+) {
+    for id in replayed_ids {
+        locators.remove(id);
+    }
+    for record in records.iter_mut() {
+        if !locators.contains_key(&record.id) {
+            continue;
+        }
+        if transaction_carries_bodies(record) {
+            // It has a locator, so a copy of it was persisted, yet it still
+            // holds its bodies: it came back from an Update entry in the
+            // journal, which means memory is the newer copy. Reading it from
+            // the stale line would serve the pre-update record, and copying
+            // that line on the next persist would discard the update for good.
+            locators.remove(&record.id);
+        } else {
+            strip_transaction_bodies(record);
+        }
+    }
+}
+
 /// The caller holds `inner` through the complete disk read. Mutation callers
 /// propagate failure before invoking their edit closure or appending a journal.
 fn rehydrate_checked(
@@ -1144,24 +1170,7 @@ impl TransactionStore {
         journal_path: PathBuf,
         latest_event_sequence: u64,
     ) -> Self {
-        for id in replayed_ids {
-            locators.remove(id);
-        }
-        for record in records.iter_mut() {
-            if !locators.contains_key(&record.id) {
-                continue;
-            }
-            if transaction_carries_bodies(record) {
-                // It has a locator, so a copy of it was persisted, yet it still
-                // holds its bodies: it came back from an Update entry in the
-                // journal, which means memory is the newer copy. Reading it from
-                // the stale line would serve the pre-update record, and copying
-                // that line on the next persist would discard the update for good.
-                locators.remove(&record.id);
-            } else {
-                strip_transaction_bodies(record);
-            }
-        }
+        keep_located_bodies_on_disk(&mut records, &mut locators, replayed_ids);
         // No cap: captured traffic is kept. Bodies live on disk, so what a record
         // costs resident no longer scales with its response size.
         let store = Self::from_records_with_journal_and_event_sequence(
@@ -1170,6 +1179,33 @@ impl TransactionStore {
             None,
             latest_event_sequence,
         );
+        store
+            .inner
+            .try_write()
+            .expect("new store is not shared yet")
+            .locators = locators;
+        store
+    }
+
+    /// The store of a session read without being activated: bodies are read
+    /// back from disk by their locators, as in a writable store, but there is
+    /// no journal, so it refuses to persist. It used to drop the locators, and
+    /// every body it served was empty: `history get --session-id` showed none,
+    /// and a search reported complete with no match.
+    pub fn from_located_records_read_only(
+        mut records: Vec<TransactionRecord>,
+        mut locators: HashMap<Uuid, crate::session::BodyLocator>,
+        replayed_ids: &HashSet<Uuid>,
+        storage_dir: PathBuf,
+        latest_event_sequence: u64,
+    ) -> Self {
+        keep_located_bodies_on_disk(&mut records, &mut locators, replayed_ids);
+        let mut store = Self::from_records_with_max_entries_and_event_sequence(
+            records,
+            None,
+            latest_event_sequence,
+        );
+        store.storage_dir = Some(storage_dir);
         store
             .inner
             .try_write()

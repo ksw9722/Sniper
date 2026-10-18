@@ -440,9 +440,11 @@ impl SessionContext {
                 transaction_event_sequence,
             )
         } else {
-            TransactionStore::from_records_with_max_entries_and_event_sequence(
+            TransactionStore::from_located_records_read_only(
                 snapshot.transactions,
-                None,
+                snapshot.transaction_locators,
+                &snapshot.replayed_transaction_ids,
+                storage_dir.clone(),
                 transaction_event_sequence,
             )
         });
@@ -5812,6 +5814,43 @@ mod tests {
             .find(|summary| summary.id == active.id())
             .unwrap();
         assert_eq!(summary.websocket_count, 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    // `history get --session-id` and search read a session without activating
+    // it; its store must read bodies back from disk like an active one.
+    #[tokio::test]
+    async fn a_session_read_without_activation_serves_its_bodies() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "sniper-session-read-only-bodies-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (registry, active) = SessionRegistry::load_or_create(&data_dir, 32, 32).unwrap();
+        let empty = MessageRecord::from_headers_and_body(&http::HeaderMap::new(), &[], 1024);
+        let answer =
+            MessageRecord::from_headers_and_body(&http::HeaderMap::new(), b"retained body", 1024);
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".into(),
+            "https".into(),
+            "example.com".into(),
+            "/page".into(),
+            Some(200),
+            1,
+            empty,
+            Some(answer),
+            Vec::new(),
+            None,
+            None,
+        );
+        let id = record.id;
+        active.store.insert(record).await;
+        active.persist().await.unwrap();
+
+        let read = registry.load_context_read_only(active.id()).unwrap();
+        let loaded = read.store.get(id).await.unwrap();
+        assert_eq!(loaded.response.unwrap().body_preview, "retained body");
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
