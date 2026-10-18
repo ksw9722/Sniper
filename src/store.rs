@@ -3014,6 +3014,50 @@ impl TransactionStore {
         Some(self.rehydrate(record, &inner))
     }
 
+    /// Calls `visit` with every retained record and its bodies, oldest first.
+    /// Reading every body back is file I/O far too long to hold a runtime worker
+    /// that proxy tasks share, so it runs on a blocking thread. Also returns how
+    /// many records were skipped because their bodies could not be read; None
+    /// if the walk itself failed.
+    pub async fn visit_records<T: Send + 'static>(
+        &self,
+        mut accumulator: T,
+        visit: impl Fn(&mut T, &TransactionRecord) + Send + 'static,
+    ) -> Option<(T, usize)> {
+        let ids: Vec<Uuid> = {
+            let inner = self.inner.read().await;
+            inner.entries.iter().map(|record| record.id).collect()
+        };
+        let storage_dir = self.storage_dir.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut unreadable = 0;
+            for id in ids {
+                // By ID, not position: a trim meanwhile shifts every later row.
+                let record = {
+                    let inner = inner.blocking_read();
+                    let Some(&index) = inner.by_id.get(&id) else {
+                        continue;
+                    };
+                    let generation = inner.body_generations[index];
+                    if inner.unresolved_body_generations.contains(&generation) {
+                        None
+                    } else {
+                        rehydrate_checked(&inner.entries[index], &inner, storage_dir.as_deref())
+                            .ok()
+                    }
+                };
+                match record {
+                    Some(record) => visit(&mut accumulator, &record),
+                    None => unreadable += 1,
+                }
+            }
+            (accumulator, unreadable)
+        })
+        .await
+        .ok()
+    }
+
     pub async fn snapshot(&self, limit: Option<usize>) -> Vec<TransactionRecord> {
         let inner = self.inner.read().await;
         snapshot_entries(&inner, limit)

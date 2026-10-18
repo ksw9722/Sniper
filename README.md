@@ -179,7 +179,7 @@ Session → Scope → Capture → Replay → Fuzz
 - **Scope** — define target domains/paths, auto-filter traffic, and see the captured hosts and paths beside them
 - **Map** — the Service Map of the captured origins, how they relate, and the APIs they serve, from retained history
 - **Capture** — inspect HTTP, render HTML and image responses in a sandbox, intercept & modify, WebSocket frames, auto-replace
-- **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses, and the management endpoints and backend addresses the Service Map names; each issue is listed once per host, endpoint or value
+- **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses, and the management endpoints and backend addresses the Service Map names; each issue is listed once per host, endpoint or value, and **Rescan** applies the current rules to traffic already captured
 - **Replay** — resend with modifications, override host/port, render the response
 - **Fuzzer** — insert markers, run payload lists
 - **Tools** — decode/encode/hash/JWT in one place
@@ -482,7 +482,9 @@ The `scanner` commands manage the existing passive checks for captured response
 body previews and request/response headers. They do not send traffic, fetch full
 bodies, run probes, rescan saved transactions, or clear findings. Disabling a rule
 only affects later passive processing; configuration edits do not clear existing
-findings. Opening an unloaded legacy session uses normal journal recovery, which
+findings. To apply changed rules to traffic already captured, use **Rescan** in
+Findings: it scans the retained history again and replaces the session's findings.
+Opening an unloaded legacy session uses normal journal recovery, which
 can reconstruct missing saved findings; these commands add no separate rescan.
 
 ```bash

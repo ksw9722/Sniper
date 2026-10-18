@@ -436,6 +436,7 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/findings/count", get(count_findings))
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/clear", post(clear_findings))
+        .route("/api/findings/rescan", post(rescan_findings))
         .route(
             "/api/transactions/upstream-peer-settings",
             get(get_upstream_peer_settings).post(update_upstream_peer_settings),
@@ -4713,6 +4714,114 @@ async fn clear_findings(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Serialize)]
+struct FindingsRescanOutcome {
+    scanned: usize,
+    unreadable: usize,
+    findings: usize,
+}
+
+/// Scans the retained history again with the current rules and replaces what
+/// it found, so a session captured under older rules loses their false
+/// positives. Reading every body back can take a while, so only the swap holds
+/// the session's operation lock; capture, edits and switching carry on.
+async fn rescan_findings(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionWriteQuery>,
+) -> Response {
+    if let Some(response) = expected_active_session_conflict_response(
+        &state,
+        query.expected_active_session_id,
+        query.session_id,
+    ) {
+        return response;
+    }
+    let session = match resolve_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let require_still_active =
+        query.session_id.is_none() || query.expected_active_session_id.is_some();
+    let Some(_rescan_slot) = session.scanner.begin_rescan() else {
+        return (
+            StatusCode::CONFLICT,
+            "Findings are already being rescanned for this session.",
+        )
+            .into_response();
+    };
+    let (config, generation, started_at) = {
+        let _operation_guard =
+            match guard_session_write_operation(&state, &session, require_still_active).await {
+                Ok(guard) => guard,
+                Err(response) => return response,
+            };
+        let config = session.scanner.get_config().await;
+        if !config.enabled {
+            return (
+                StatusCode::CONFLICT,
+                "Passive Scan is off. Turn it on to rescan findings.",
+            )
+                .into_response();
+        }
+        (
+            config,
+            session.scanner.clear_generation(),
+            chrono::Utc::now(),
+        )
+    };
+    let Some((rescan, unreadable)) = session
+        .store
+        .visit_records(crate::scanner::Rescan::new(config), |rescan, record| {
+            rescan.scan(record)
+        })
+        .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let _operation_guard =
+        match guard_session_write_operation(&state, &session, require_still_active).await {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+    // A Clear meanwhile wins, and a session switched away and reopened has a
+    // new context that this one must not overwrite.
+    if session.scanner.clear_generation() != generation
+        || !state.is_current_session_context(&session).await
+    {
+        return (
+            StatusCode::CONFLICT,
+            "The session changed during the rescan. Rescan again.",
+        )
+            .into_response();
+    }
+    let _mutation_guard = session.mutation_guard().await;
+    let (rescanned, scanned) = rescan.finish();
+    let previous = session
+        .scanner
+        .snapshot(Some(state.config.max_entries))
+        .await;
+    // Rows captured during the rescan were scanned as they arrived.
+    let mut findings: Vec<_> = previous
+        .iter()
+        .filter(|finding| finding.found_at >= started_at && !scanned.contains(&finding.record_id))
+        .cloned()
+        .collect();
+    findings.extend(rescanned);
+    session.scanner.replace_all(findings).await;
+    if let Err(error) = session.persist_state_only().await {
+        tracing::warn!(%error, session_id = %session.id(), "failed to persist rescanned findings");
+        session.scanner.replace_all(previous).await;
+        session.schedule_state_persist();
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Json(FindingsRescanOutcome {
+        scanned: scanned.len(),
+        unreadable,
+        findings: session.scanner.count().await,
+    })
+    .into_response()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -18507,6 +18616,91 @@ mod tests {
         assert_eq!(active.scanner.list(Some(10)).await.len(), 1);
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // A session captured under older rules keeps their findings until it is
+    // scanned again; a rescan replaces them with what the current rules find.
+    #[tokio::test]
+    async fn findings_rescan_replaces_stale_findings_with_current_rules() {
+        let (state, path) = test_state("findings-rescan");
+        let session = state.session().await;
+        let mut config = session.scanner.get_config().await;
+        config.enabled = true;
+        session.scanner.update_config(config).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("server", "nginx/1.25.3".parse().unwrap());
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".into(),
+            "https".into(),
+            "example.com".into(),
+            "/".into(),
+            Some(200),
+            1,
+            MessageRecord::from_headers_and_body(&HeaderMap::new(), b"", 4096),
+            Some(MessageRecord::from_headers_and_body(
+                &headers,
+                b"<html></html>",
+                4096,
+            )),
+            vec![],
+            None,
+            None,
+        );
+        let record_id = record.id;
+        session.store.insert(record).await;
+        let stale = ScannerFinding {
+            id: Uuid::new_v4(),
+            record_id,
+            found_at: Utc::now(),
+            rule_id: String::new(),
+            severity: Severity::Medium,
+            category: "cookie".to_string(),
+            title: "Cookie without Secure flag".to_string(),
+            detail: String::new(),
+            evidence: "BIGipServerpool".to_string(),
+            host: "example.com".to_string(),
+            path: "/".to_string(),
+            location: None,
+        };
+        session.scanner.replace_all(vec![stale.clone()]).await;
+        let query = || {
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            })
+        };
+
+        let response = super::rescan_findings(State(state.clone()), query()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome: serde_json::Value = response_json(response).await;
+        assert_eq!(outcome["scanned"], 1);
+        assert_eq!(outcome["unreadable"], 0);
+        let findings = session.scanner.list(None).await;
+        assert!(findings.iter().all(|finding| finding.id != stale.id));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.record_id == record_id && finding.category == "server"));
+        assert_eq!(outcome["findings"], findings.len());
+        // Saved with the session, not only held in memory.
+        let saved = state.sessions.load_context_read_only(session.id()).unwrap();
+        assert_eq!(saved.scanner.list(None).await.len(), findings.len());
+
+        // One at a time, and never with Passive Scan off, which would empty it.
+        let slot = session.scanner.begin_rescan().unwrap();
+        let response = super::rescan_findings(State(state.clone()), query()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        drop(slot);
+        let mut config = session.scanner.get_config().await;
+        config.enabled = false;
+        session.scanner.update_config(config).await;
+        let response = super::rescan_findings(State(state.clone()), query()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(session.scanner.list(None).await.len(), findings.len());
+        drop(saved);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[tokio::test]

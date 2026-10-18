@@ -672,6 +672,7 @@ const els = {
   findingsResSearchInput: document.getElementById("findingsResSearchInput"),
   findingsResSearchMeta: document.getElementById("findingsResSearchMeta"),
   findingsClearButton: document.getElementById("findingsClearButton"),
+  findingsRescanButton: document.getElementById("findingsRescanButton"),
   findingsSettingsButton: document.getElementById("findingsSettingsButton"),
   findingsFilterSeverity: document.getElementById("findingsFilterSeverity"),
   findingsFilterCategory: document.getElementById("findingsFilterCategory"),
@@ -11030,6 +11031,21 @@ function bindFindingsEvents() {
     onClickWithProgress(findingsFuzzerBtn, () => {
       const recordId = els.findingsDetailJump?.dataset.recordId;
       return recordId ? sendFindingToFuzzer(recordId).catch(handleFindingActionError) : undefined;
+    });
+  }
+  if (els.findingsRescanButton) {
+    onClickWithProgress(els.findingsRescanButton, async () => {
+      const sessionId = currentSessionId();
+      try {
+        const response = await fetch(sessionWritePath("/api/findings/rescan", sessionId), { method: "POST" });
+        await requireOkResponse(response, "Failed to rescan findings.");
+        if (sessionId !== currentSessionId()) return;
+        resetFindingsUiState();
+        await loadFindings();
+      } catch (error) {
+        console.error(error);
+        showToast(error?.message || "Failed to rescan findings.", "error");
+      }
     });
   }
   if (els.findingsClearButton) {

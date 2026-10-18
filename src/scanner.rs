@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -317,6 +317,16 @@ pub struct ScannerStore {
     config: RwLock<ScannerConfig>,
     seen: RwLock<HashSet<FindingDedupKey>>,
     clear_generation: AtomicU64,
+    rescanning: AtomicBool,
+}
+
+/// Held while a rescan runs; dropping it lets the next one start.
+pub struct RescanSlot<'a>(&'a AtomicBool);
+
+impl Drop for RescanSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl ScannerStore {
@@ -329,7 +339,13 @@ impl ScannerStore {
             config: RwLock::new(ScannerConfig::default()),
             seen: RwLock::new(HashSet::new()),
             clear_generation: AtomicU64::new(0),
+            rescanning: AtomicBool::new(false),
         }
+    }
+
+    /// One rescan per session at a time.
+    pub fn begin_rescan(&self) -> Option<RescanSlot<'_>> {
+        (!self.rescanning.swap(true, Ordering::AcqRel)).then_some(RescanSlot(&self.rescanning))
     }
 
     /// Push a finding unless the same issue is already listed (see `finding_scope`).
@@ -443,6 +459,7 @@ impl ScannerStore {
             config: RwLock::new(sanitize_scanner_config(config)),
             seen: RwLock::new(seen),
             clear_generation: AtomicU64::new(0),
+            rescanning: AtomicBool::new(false),
         }
     }
 
@@ -520,6 +537,50 @@ const ENDPOINT_INFO_TITLES: &[&str] = &[
     "Swagger/OpenAPI spec exposed",
     "WSDL service definition exposed",
 ];
+
+/// Scans retained records again with the current rules, for a session whose
+/// findings came from older ones. Keeps the first finding of each issue in the
+/// order the records come, oldest first, as live capture keeps the first it sees.
+pub struct Rescan {
+    config: ScannerConfig,
+    seen: HashSet<FindingDedupKey>,
+    findings: Vec<ScannerFinding>,
+    scanned: HashSet<Uuid>,
+}
+
+impl Rescan {
+    pub fn new(config: ScannerConfig) -> Self {
+        Self {
+            config,
+            seen: HashSet::new(),
+            findings: Vec::new(),
+            scanned: HashSet::new(),
+        }
+    }
+
+    pub fn scan(&mut self, record: &TransactionRecord) {
+        self.scanned.insert(record.id);
+        // A rule that panics on one row must not end the rescan; that row just
+        // gets no findings.
+        let Ok(found) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scan_transaction(record, &self.config)
+        })) else {
+            return;
+        };
+        for finding in found {
+            if self.seen.insert(finding_dedup_key(&finding)) {
+                self.findings.push(finding);
+            }
+        }
+    }
+
+    /// The findings newest first, as the store lists them, and the records scanned.
+    pub fn finish(self) -> (Vec<ScannerFinding>, HashSet<Uuid>) {
+        let mut findings = self.findings;
+        findings.reverse();
+        (findings, self.scanned)
+    }
+}
 
 /// Keeps the first of each issue, newest first, as a store built before
 /// findings were grouped by issue may hold one per request.

@@ -287,9 +287,10 @@ before any deliberate retry. An unchanged mutation reports `changed: false`
 without a write.
 
 These commands configure passive regex checks of captured body previews and
-headers only. They do not send traffic, run probes, rescan saved traffic, clear
-findings, or replace arbitrary whole configurations. Rule patterns and descriptions
-can themselves contain sensitive text, so review output before sharing it.
+headers only. They do not send traffic, run probes, rescan saved traffic (the
+app's Findings ▸ Rescan does), clear findings, or replace arbitrary whole
+configurations. Rule patterns and descriptions can themselves contain sensitive
+text, so review output before sharing it.
 
 ## What Codex sees
 
