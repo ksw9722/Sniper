@@ -5,9 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
-const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
-const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
-const app = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8');
+// Windows checkouts end lines in CRLF; the shell match below spans lines.
+const read = (file) => fs.readFileSync(path.join(__dirname, file), 'utf8').replace(/\r\n/g, '\n');
+const html = read('../web/index.html');
+const css = read('../web/styles.css');
+const app = read('../web/app.js');
 const header = html.match(/<header class="target-workspace-header">([^]*?)<\/header>/)?.[1];
 const scopeShell = html.match(/<section class="target-shell hidden" id="targetShell">([^]*?)\n        <\/section>\n/)?.[1];
 const rule = (selector, expectedDefinitions = 1) => {
