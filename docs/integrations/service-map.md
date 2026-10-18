@@ -173,9 +173,12 @@ the history as it read it.
 A measured 240,000-row session took about 0.7 seconds to read, so the server
 keeps the last whole-history map. A poll is answered from it while history is
 unchanged, or while it is younger than four times its build time (at least
-1.2 seconds), and may then show rows removed since. `fresh=true` rebuilds it; the
-GUI sends that on its first read and on Reload. `sniper-cli` keeps the windowed
-read and its `max_records` unless `--all-rows` asks for every row.
+1.2 seconds), and may then show rows removed since. Note and color-tag edits,
+including rollbacks, also change this history identity because they can change
+filtered membership. `fresh=true` bypasses the polling cooldown; an unchanged,
+fully read map can still be reused. The GUI sends that on its first read and on
+Reload. `sniper-cli` keeps the windowed read and its `max_records` unless
+`--all-rows` asks for every row.
 
 ## Reported products and local origin filters
 
@@ -407,17 +410,25 @@ own. Only these anchors count: a bundle holds other libraries' `version:"…"`
 literals too. Many signals name a product without its version; the card then
 shows its name alone.
 
-Script and page bodies are read once per row revision; a script served again at
-the same path with the same size is not read again. A page that is not UTF-8,
-such as an EUC-KR page, is stored as base64 and read all the same: every
-signature is ASCII. One map reads at most 256
-rows from disk and 32 MiB in all, and skips any row larger than 8 MiB; later maps
-read the rest. An asset's technologies go to the page that loaded it (its
-Referer) when that page is in the map, else to the asset's own origin, so a
+Script and page bodies are read once per row revision. A repeated URL and size
+do not prove that two responses contain the same version: each new response is
+read within the budget. Detections are reused only when a SHA-256 hash of the
+bounded scan text and its content kind match; file-name-specific source-map
+suppression is then applied separately. A page that is not UTF-8, such as an
+EUC-KR page, is stored as base64 and read all the same: every
+signature is ASCII. One map reads at most 256 rows, whether resident or on
+disk, and 32 MiB in all. Resident previews are scanned up to an 8 MiB prefix;
+retained serialized rows larger than 8 MiB are skipped. Later maps read rows
+that exceeded the per-map budget. An asset's technologies go to the page that
+loaded it (its Referer) when that page is in the map, else to the asset's own origin, so a
 bundle served from a CDN names the page's framework. A one-origin, in-scope or
 origin-capped map leaves the CDN out but keeps what the page took from it, so
 it names the same front end the whole map does. A page's own stay with the
-page. A row counts once for a product, however many of its signals name it.
+page. Scoped whole-history maps first identify their admitted origins using
+captured host scope and the display filters, with the same chunked locking and
+bounded scope work. Only those origins and assets referring to their pages
+spend body reads, so unrelated pages and CDN traffic cannot starve them. A row
+counts once for a product, however many of its signals name it.
 
 The card leads with what the site is built with (a meta-framework, then a CMS,
 then a framework), then the products its headers declare, then UI kits,

@@ -503,6 +503,8 @@ struct StoreInner {
     // Changes under the metadata mutation lock, before event publication. Pure
     // append, annotations and body-file changes preserve the projected rows.
     service_map_metadata_epoch: Uuid,
+    // Annotations change filtered map membership without changing evidence.
+    service_map_annotation_epoch: Uuid,
     /// Changes only when rows are removed or replaced, which moves the rows a
     /// whole-history map reads by index; updates and appends keep it.
     service_map_structure_epoch: Uuid,
@@ -733,18 +735,21 @@ fn parameter_body(
 #[cfg(test)]
 type ServiceMapBodyReadHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// Libraries already read, by row revision and by asset (origin, path and
-/// size), so each row, and each distinct file, is read once.
+/// Libraries already read by row revision, and detections by bounded body
+/// content and kind. URL and size cannot identify a response across captures.
 #[derive(Default)]
 struct LibraryCaches {
     rows: HashMap<(Uuid, Uuid), Vec<crate::service_map_libraries::Detection>>,
-    assets: HashMap<(String, usize), Vec<crate::service_map_libraries::Detection>>,
+    bodies: HashMap<
+        (crate::service_map_libraries::Kind, [u8; 32]),
+        Vec<crate::service_map_libraries::Detection>,
+    >,
 }
 
 impl LibraryCaches {
     // ponytail: forget everything at a cap rather than track recency.
     fn trim(&mut self) {
-        if self.rows.len() > 100_000 || self.assets.len() > 100_000 {
+        if self.rows.len() > 100_000 || self.bodies.len() > 100_000 {
             *self = Self::default();
         }
     }
@@ -781,14 +786,6 @@ fn library_lookup(
     let index = service_map_body_row_index(inner, &key).ok()?;
     let record = &inner.entries[index];
     let response = record.response.as_ref()?;
-    // ponytail: an asset with the same origin, path and size is taken to be the
-    // same file; a hashed bundle fetched a thousand times is read once. Content
-    // hashing would make it exact.
-    let asset = (format!("{}{}", row.origin, record.path), response.body_size);
-    if let Some(found) = caches.assets.get(&asset).cloned() {
-        caches.rows.insert(row_key, found.clone());
-        return Some(Ok(found));
-    }
     if BodySource::from_text_record(record).is_err() {
         caches.rows.insert(row_key, Vec::new());
         return Some(Ok(Vec::new()));
@@ -825,7 +822,7 @@ fn library_lookup(
     Some(Err(PendingLibrary {
         key,
         kind: body_kind,
-        asset,
+        url: format!("{}{}", row.origin, record.path),
         source,
     }))
 }
@@ -835,6 +832,8 @@ pub(crate) enum ServiceMapStreamError {
     HistoryChanged,
     ScopeWorkLimit,
 }
+
+const SERVICE_MAP_CHUNK: usize = 8_192;
 
 /// Where the rows a whole-history read has yet to fold end, after rows were
 /// removed: at the oldest row of its last chunk that is still retained, found
@@ -855,7 +854,7 @@ fn resume_below(inner: &StoreInner, read: &[(Uuid, Uuid)]) -> Option<usize> {
 /// The last whole-history map, serialized, and the history it was built from.
 struct CachedServiceMap {
     key: String,
-    token: (Uuid, usize),
+    token: (Uuid, Uuid, usize),
     built: std::time::Instant,
     cost: std::time::Duration,
     /// Every script and page body was read; otherwise rebuild for the rest.
@@ -876,7 +875,7 @@ fn merge_libraries(
 struct PendingLibrary {
     key: crate::service_map::EvidenceKey,
     kind: crate::service_map_libraries::Kind,
-    asset: (String, usize),
+    url: String,
     source: LibrarySource,
 }
 
@@ -1001,6 +1000,7 @@ impl StoreInner {
             unresolved_body_generations: HashSet::new(),
             file_generation: Uuid::new_v4(),
             service_map_metadata_epoch: Uuid::new_v4(),
+            service_map_annotation_epoch: Uuid::new_v4(),
             service_map_structure_epoch: Uuid::new_v4(),
             by_id,
             locators: HashMap::new(),
@@ -1727,6 +1727,7 @@ impl TransactionStore {
         item: PendingLibrary,
     ) -> Option<Vec<crate::service_map_libraries::Detection>> {
         use crate::service_map_libraries::{detect, drop_library_source_map, read_body, scan_text};
+        use rsa::sha2::{Digest, Sha256};
         let body = match item.source {
             LibrarySource::Resident(body, encoding) => scan_text(body, encoding)?,
             LibrarySource::Retained(locator, file_generation) => {
@@ -1741,13 +1742,20 @@ impl TransactionStore {
                 read_body(file, locator, item.key.record_id)?
             }
         };
-        let mut found = detect(&body, item.kind);
-        drop_library_source_map(&mut found, &item.asset.0);
-        let mut caches = self.library_caches();
-        caches
+        // Hash only the budgeted scan text, after validating and reading this
+        // row's own body. Repeated content skips detection, never verification.
+        let body_key = (item.kind, Sha256::digest(body.as_bytes()).into());
+        let cached = self.library_caches().bodies.get(&body_key).cloned();
+        let mut found = cached.unwrap_or_else(|| {
+            let found = detect(&body, item.kind);
+            self.library_caches().bodies.insert(body_key, found.clone());
+            found
+        });
+        // This suppression depends on the file name, not just its contents.
+        drop_library_source_map(&mut found, &item.url);
+        self.library_caches()
             .rows
             .insert((item.key.record_id, item.key.revision), found.clone());
-        caches.assets.insert(item.asset, found.clone());
         Some(found)
     }
 
@@ -1761,6 +1769,76 @@ impl TransactionStore {
         self.storage_dir
             .as_ref()
             .and_then(|dir| fs::File::open(dir.join("transactions.ndjson")).ok())
+    }
+
+    /// Discover admissible page origins before charging for bodies. Scripts
+    /// usually follow their page in capture order, so a newest-first fold has
+    /// not seen that page yet. Matching the canonical Referer against scope
+    /// would also lose the captured host spelling used for IDNs and IPv6.
+    fn service_map_scoped_origins(
+        &self,
+        (mut structure, mut next): (Uuid, usize),
+        scope: &mut crate::service_map::BoundedScope,
+        origin_filter: Option<&String>,
+        filters: &ListFilters,
+        advanced_matcher: Option<&AdvancedSearchMatcher>,
+    ) -> Result<HashSet<String>, ServiceMapStreamError> {
+        use crate::service_map::{request_target, MAX_ORIGINS};
+        let mut origins = HashSet::new();
+        let mut read = Vec::new();
+        while next > 0 {
+            let inner = self.inner.blocking_read();
+            if inner.service_map_structure_epoch != structure {
+                next = resume_below(&inner, &read).ok_or(ServiceMapStreamError::HistoryChanged)?;
+                structure = inner.service_map_structure_epoch;
+            }
+            let from = next.saturating_sub(SERVICE_MAP_CHUNK);
+            for index in (from..next).rev() {
+                let record = &inner.entries[index];
+                if record.method == "CONNECT"
+                    || !matches_filters(
+                        &inner.summaries[index],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        filters,
+                        advanced_matcher,
+                        false,
+                    )
+                {
+                    continue;
+                }
+                // These are the same admission checks as row projection and
+                // MapBuilder, without headers, body copies or derived clues.
+                let Some((target, _)) = request_target(record) else {
+                    continue;
+                };
+                if !scope
+                    .contains(&record.host)
+                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?
+                {
+                    continue;
+                }
+                let origin = target.origin().ascii_serialization();
+                if origin_filter.is_some_and(|only| only != &origin) {
+                    continue;
+                }
+                origins.insert(origin);
+                if origins.len() == MAX_ORIGINS {
+                    return Ok(origins);
+                }
+            }
+            read.clear();
+            read.extend(
+                (from..next).map(|index| (inner.entries[index].id, inner.body_generations[index])),
+            );
+            next = from;
+        }
+        Ok(origins)
     }
 
     /// The map over every retained row, newest first. Rows are folded as they
@@ -1786,7 +1864,6 @@ impl TransactionStore {
             evidence_id, library_page, project_record, project_record_for_catalog, BoundedScope,
             MapBuilder, MetadataSnapshot,
         };
-        const CHUNK: usize = 8_192;
         let mut scope = BoundedScope::new(include, exclude)
             .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
         let advanced_matcher = AdvancedSearchMatcher::new(filters);
@@ -1820,6 +1897,17 @@ impl TransactionStore {
             rows: Vec::new(),
             favicons: Default::default(),
         };
+        let scoped_origins = in_scope_only
+            .then(|| {
+                self.service_map_scoped_origins(
+                    (structure, retained),
+                    &mut scope,
+                    only.as_ref(),
+                    filters,
+                    advanced_matcher.as_ref(),
+                )
+            })
+            .transpose()?;
         let mut budget = LibraryBudget::default();
         let mut pending = Vec::new();
         let mut next = retained;
@@ -1833,7 +1921,7 @@ impl TransactionStore {
             }
             let mut caches = self.library_caches();
             caches.trim();
-            let from = next.saturating_sub(CHUNK);
+            let from = next.saturating_sub(SERVICE_MAP_CHUNK);
             for index in (from..next).rev() {
                 let record = &inner.entries[index];
                 meta.considered_rows += 1;
@@ -1891,18 +1979,26 @@ impl TransactionStore {
                         .insert("unsupported_or_oversized_metadata".into());
                     continue;
                 };
-                // A row whose body is still to be read waits with what its URL
-                // named, so the row counts once for each technology. A
-                // one-origin map reads its own rows and the scripts its pages
-                // loaded from elsewhere, not every other origin's.
+                let in_scope = scope
+                    .contains(&row.scope_host)
+                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
+                // Charge only for included origins or assets their pages took
+                // from elsewhere. Excluded pages cannot use a read that would
+                // then be discarded, starving older included pages forever.
                 let page = library_page(&row);
-                let wanted = builder.wants_page(page.as_ref());
-                let elsewhere =
-                    !wanted && only.as_ref().is_some_and(|origin| *origin != row.origin);
-                let lookup = if elsewhere {
-                    None
-                } else {
+                let wanted = builder.wants_page(page.as_ref())
+                    && scoped_origins.as_ref().is_none_or(|origins| {
+                        page.as_ref().is_some_and(|page| origins.contains(page))
+                    });
+                let included = (!in_scope_only || in_scope)
+                    && only.as_ref().is_none_or(|origin| *origin == row.origin)
+                    && scoped_origins
+                        .as_ref()
+                        .is_none_or(|origins| origins.contains(&row.origin));
+                let lookup = if included || wanted {
                     library_lookup(&inner, &mut caches, &row, &mut budget)
+                } else {
+                    None
                 };
                 let waiting = match lookup {
                     Some(Ok(found)) => {
@@ -1918,9 +2014,6 @@ impl TransactionStore {
                     )),
                     None => None,
                 };
-                let in_scope = scope
-                    .contains(&row.scope_host)
-                    .map_err(|_| ServiceMapStreamError::ScopeWorkLimit)?;
                 if builder.add(row, in_scope) || wanted {
                     pending.extend(waiting);
                 }
@@ -1967,7 +2060,7 @@ impl TransactionStore {
     pub(crate) fn store_service_map(
         &self,
         key: String,
-        token: (Uuid, usize),
+        token: (Uuid, Uuid, usize),
         cost: std::time::Duration,
         complete: bool,
         bytes: bytes::Bytes,
@@ -1986,10 +2079,15 @@ impl TransactionStore {
     }
 
     /// What a whole-history map was built from: an update or removal changes
-    /// the epoch, and an append the row count.
-    pub(crate) fn service_map_history_token(&self) -> (Uuid, usize) {
+    /// metadata epoch, an annotation edit its own epoch, and an append the row
+    /// count. Evidence and bounded-map publication ignore annotation-only edits.
+    pub(crate) fn service_map_history_token(&self) -> (Uuid, Uuid, usize) {
         let inner = self.inner.blocking_read();
-        (inner.service_map_metadata_epoch, inner.entries.len())
+        (
+            inner.service_map_metadata_epoch,
+            inner.service_map_annotation_epoch,
+            inner.entries.len(),
+        )
     }
 
     pub(crate) async fn service_map_metadata_epoch_matches(
@@ -3410,6 +3508,9 @@ impl TransactionStore {
         let applied_color_tag = record.color_tag.clone();
         let applied_user_note = record.user_note.clone();
         inner.summaries[index] = CachedSummary::new(summary.clone());
+        if has_annotation_patch {
+            inner.service_map_annotation_epoch = Uuid::new_v4();
+        }
         drop(inner);
         if has_annotation_patch {
             self.publish_transaction_event(summary.clone());
@@ -3491,6 +3592,7 @@ impl TransactionStore {
         record.annotation_revision = next_annotation_revision;
         let summary = record.summary();
         inner.summaries[index] = CachedSummary::new(summary.clone());
+        inner.service_map_annotation_epoch = Uuid::new_v4();
         drop(inner);
         self.publish_transaction_event(summary);
         Ok(true)
