@@ -4775,7 +4775,8 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "hidden_extensions":{"type":["array","null"],"items":{"type":"string","pattern":"^\\.?[A-Za-z0-9]{1,16}$"},"description":"Display filter: hide rows whose path ends in these extensions, such as png or woff2. Omitted, null or empty hides none."},
                 "hide_without_responses":{"type":["boolean","null"],"default":false,"description":"Display filter: hide rows that have no response. Null uses false."},
                 "only_parameterized":{"type":["boolean","null"],"default":false,"description":"Display filter: keep only rows whose URL has a query string. Null uses false."}
-            }
+            },
+            "not":{"required":["all_rows","max_records"],"properties":{"all_rows":{"const":true},"max_records":{"type":"integer"}}}
         })),
         "target.service_map.socket_peer_matches.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","evidence_id"],
@@ -20326,6 +20327,15 @@ mod tests {
         ])
         .is_err());
         assert!(Cli::try_parse_from(["sniper-cli", "scope", "service-map", "--all-rows"]).is_ok());
+        // The schema says so too, so an agent learns it before calling.
+        let forbidden = &super::service_map_input_schema("target.service_map.get").unwrap()["not"];
+        assert_eq!(forbidden["required"], json!(["all_rows", "max_records"]));
+        assert_eq!(forbidden["properties"]["all_rows"]["const"], true);
+        assert!(command_from_operation_input(
+            "target.service_map.get",
+            &json!({"all_rows":true,"max_records":null})
+        )
+        .is_ok());
     }
 
     #[test]
