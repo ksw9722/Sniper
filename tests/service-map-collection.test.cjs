@@ -229,3 +229,23 @@ test('shared display caps are deterministic and source coverage stays separate f
   assert.match(f.els.graphBounds.textContent,/nodes omitted by 24-card cap/);assert.match(f.els.graphBounds.textContent,/inspected links outside displayed cards/);
   assert.match(f.els.overlayStatus.innerHTML,/Complete.*inspection/);assert.equal(f.state.relationLayers.length,3);
 });
+
+for (const mixed of [false, true]) test(`hidden pinned origin keeps accurate ${mixed ? 'mixed collection' : 'peer'} counts and reversible Show`, async () => {
+  const f = fixture(); await f.load(sourceSnapshot());
+  if (mixed) await showBody(f);
+  await showPeer(f); f.controller.selectOrigin(SOURCE); f.els.directRelations.dispatch('click');
+  f.els.search.value = 'unmatched'; f.els.search.dispatch('input'); f.controller.setProductFilter('product', 'nginx');
+  const layers = f.state.relationLayers, reads = f.requests.length;
+  const click = dataset => f.els.panel.dispatch('click', { target: { closest: () => ({ dataset }) } });
+  click({ serviceHide: SOURCE });
+  assert.equal(nodes(f), 1); assert.equal(paths(f).length, 0);
+  assert.doesNotMatch(f.els.canvas.innerHTML, /data-service-origin="https:\/\/source.example.com"/);
+  assert.match(f.els.graphBounds.textContent, new RegExp(`1 / ${mixed ? 2 : 1} known direct neighbors shown`));
+  assert.match(f.els.graphBounds.textContent, /Pinned anchor is hidden/);
+  assert.doesNotMatch(f.els.graphBounds.textContent, /remains visible/);
+  assert.equal(f.state.anchorOrigin, SOURCE); assert.equal(f.state.selectedOrigin, SOURCE); assert.equal(f.state.relationLayers, layers);
+  click({ serviceUnhide: SOURCE });
+  assert.equal(nodes(f), 2); assert.equal(paths(f).length, 1);
+  assert.match(f.els.graphBounds.textContent, /Pinned anchor is outside the search query and remains visible/);
+  assert.doesNotMatch(f.els.graphBounds.textContent, /Pinned anchor is hidden/); assert.equal(f.requests.length, reads);
+});

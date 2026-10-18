@@ -1426,6 +1426,7 @@
     let bodyReferencesAbort = null;
     let peerMatchesAbort = null;
     let htmlGeneratorsAbort = null;
+    let parametersAbort = null;
     let detailRender = null;
     const renderedMarkup = new WeakMap();
     let visible = false;
@@ -2084,8 +2085,7 @@
       abort = null;
       cancelEvidence();
       closeApiDocs();
-      state.parametersRequestId += 1;
-      Object.assign(state, { parameters: null, parametersKey: null, parametersLoading: false, parametersError: "" });
+      cancelParameters();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null,
         inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, expandedEndpointGroups: new Set(), loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
@@ -2094,6 +2094,8 @@
       const item = findOrigin(origin);
       if (!item || endpointIndex !== null && (!Number.isSafeInteger(endpointIndex) || !item.endpoints[endpointIndex])) return;
       const changedOrigin = state.selectedOrigin !== origin;
+      const endpoint = endpointIndex === null ? null : item.endpoints[endpointIndex];
+      if (changedOrigin || state.endpointSelection?.method !== endpoint?.method || state.endpointSelection?.path !== endpoint?.path) cancelParameters();
       state.highlightedRelation = null;
       state.selectedSite = null;
       state.selectedClient = null;
@@ -2102,7 +2104,6 @@
       state.selectedOrigin = origin;
       state.selectionInitialized = true;
       state.endpointIndex = endpointIndex;
-      const endpoint = endpointIndex === null ? null : item.endpoints[endpointIndex];
       // Keep only the exact identity when invalidation clears all displayed data.
       // An array index cannot safely survive scope filtering or history removal.
       state.endpointSelection = endpoint ? { method: endpoint.method, path: endpoint.path } : null;
@@ -2174,20 +2175,33 @@
     }
     // An endpoint's parameters are read as soon as it is opened, not behind a
     // button: each name, where it was sent and a few values, from its newest rows.
+    function cancelParameters() {
+      state.parametersRequestId += 1;
+      parametersAbort?.abort();
+      parametersAbort = null;
+      Object.assign(state, { parameters: null, parametersKey: null, parametersLoading: false, parametersError: "" });
+    }
+    const endpointParametersKey = (originId, endpoint) => JSON.stringify([
+      getSessionId(), state.historyVersion, state.snapshot?.snapshot.generation, originId, endpoint.method, endpoint.path,
+    ]);
     async function loadParameters(originId, endpoint) {
-      const key = JSON.stringify([originId, endpoint.method, endpoint.path]);
+      const key = endpointParametersKey(originId, endpoint);
       if (state.parametersKey === key && (state.parameters || state.parametersLoading)) return;
+      cancelParameters();
       const requestId = ++state.parametersRequestId;
       const sessionId = getSessionId();
+      parametersAbort = new AbortController();
+      const current = () => requestId === state.parametersRequestId && sessionId === getSessionId()
+        && key === endpointParametersKey(originId, endpoint);
       Object.assign(state, { parametersKey: key, parameters: null, parametersLoading: true, parametersError: "" });
       renderDetail();
       try {
         const params = new URLSearchParams({ session_id: sessionId, origin: originId, method: endpoint.method, path: endpoint.path });
-        const response = await request(`/api/target/service-map/parameters?${params}`);
+        const response = await request(`/api/target/service-map/parameters?${params}`, { signal: parametersAbort.signal });
         if (!response.ok) throw new Error("Parameters unavailable");
         const result = await response.json();
-        if (requestId !== state.parametersRequestId || sessionId !== getSessionId()) return;
-        if (result.schema_version !== 1 || result.origin !== originId || result.method !== endpoint.method || result.path !== endpoint.path) throw new Error("Parameters changed");
+        if (!current()) return;
+        if (result.schema_version !== 1 || result.session_id !== sessionId || result.origin !== originId || result.method !== endpoint.method || result.path !== endpoint.path) throw new Error("Parameters changed");
         state.parameters = result.available === true ? {
           rows: count(result.rows), moreRows: result.more_rows === true, omitted: count(result.omitted_parameters), unreadBodies: count(result.unread_bodies),
           items: array(result.parameters).filter((item) => typeof item?.name === "string" && ["query", "form", "json", "multipart"].includes(item.location))
@@ -2195,10 +2209,11 @@
         } : null;
         state.parametersError = result.available === true ? "" : array(result.reasons).includes("inactive_session") ? "Parameters are read from the active session only." : "Parameters unavailable.";
       } catch {
-        if (requestId !== state.parametersRequestId) return;
+        if (!current()) return;
         state.parametersError = "Parameters unavailable.";
       }
       state.parametersLoading = false;
+      parametersAbort = null;
       renderDetail();
     }
     async function refresh({ force = false, retry = false } = {}) {
@@ -2209,6 +2224,7 @@
       // The app polls every 1.2 seconds. A same-source background snapshot must
       // not erase an explicit inspection or continually abort its pending read.
       if (force) {
+        cancelParameters();
         clearOverlay("Temporary body references cleared by Reload. Inspect and show references again when ready.");
         closeApiDocs();
         cancelBodyReferences();
@@ -2284,6 +2300,11 @@
           state.endpointIndex = index < 0 ? null : index;
           if (index < 0) { state.endpointSelection = null; cancelEvidence(); }
         }
+        const endpoint = origin?.endpoints[state.endpointIndex];
+        if (!endpoint || state.parametersKey && state.parametersKey !== endpointParametersKey(origin.origin, endpoint)) cancelParameters();
+        // Reload and history invalidation preserve selection, never the old
+        // retained values. Resume only after a current map verifies the endpoint.
+        if (visible && endpoint && !state.stale && state.parametersKey === null) loadParameters(origin.origin, endpoint);
         if (state.evidenceId && !(state.peerEvidenceBinding ? peerBindingIsCurrent(state.peerEvidenceBinding) : evidenceItems(origin).some((item) => item.id === state.evidenceId))) cancelEvidence();
         reconcileEndpointPages();
         state.loading = false;
@@ -2299,6 +2320,7 @@
         if (failure?.status === 409) {
           cancelEvidence();
           closeApiDocs();
+          cancelParameters();
         }
         // Polling, visibility and event reconnects must not turn a bounded
         // failure into an automatic retry loop, including with older servers.
@@ -2716,7 +2738,8 @@
       const untyped = candidates.filter((origin) => !origin.endpointNode && !typed(origin)).length;
       const stages = originFilterStages(candidates.filter(shown));
       const matchingNeighbors = direct ? stages.matching : [];
-      const origins = direct ? [direct.anchor, ...matchingNeighbors] : stages.matching;
+      const anchorShown = direct && shown(direct.anchor);
+      const origins = direct ? [...(anchorShown ? [direct.anchor] : []), ...matchingNeighbors] : stages.matching;
       const neighborOrder = direct ? stableOrder(state.order, matchingNeighbors) : [];
       const collectionIds = new Set(overlayEdges().flatMap((edge) => [edge.source, edge.target]));
       const allOrder = stableOrder(state.order, origins);
@@ -2769,6 +2792,12 @@
           ? `Selected origin is outside the ${MAX_REFERENCE_CARDS}-reference-card limit; inspector retained.`
           : "Selected origin is outside this filter; inspector retained.";
       if (!origins.length) {
+        if (direct && !anchorShown) {
+          replace(els.canvas, '<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>No visible origins</h3><p>Show hidden origins or change the neighbor filters to see this direct neighborhood.</p></div>');
+          els.graphBounds.textContent = [`0 / ${direct.neighbors.length} known direct neighbors shown`, "Pinned anchor is hidden from the map; direct mode retained.", selectionNotice].filter(Boolean).join(" · ");
+          if (els.graphDiagnostics) els.graphDiagnostics.textContent = "";
+          return;
+        }
         replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${state.loading && !state.snapshot ? "Loading service origins…" : state.error && !state.snapshot ? "Service map unavailable" : state.query || state.scopeOnly || state.productId || state.productVersion ? "No matching origins" : "No retained HTTP origins"}</h3><p>${state.query || state.scopeOnly || state.productId || state.productVersion ? "Change the origin search, product/version filters or In scope only." : "This view uses only HTTP history already retained in this session."}</p></div>`);
         els.graphBounds.textContent = ["0 matching origins", untyped ? `${untyped} with no typed response hidden` : "", stages.queryHidden ? `${stages.queryHidden} hidden by query` : "", stages.productHidden ? `${stages.productHidden} hidden by products/versions` : "", state.anchorOrigin ? "Direct relations will resume after a fresh snapshot verifies the pinned origin." : state.modeNotice, selectionNotice].filter(Boolean).join(" · ");
         return;
@@ -2823,7 +2852,8 @@
         const shownIds = new Set(layout.nodes.map((item) => item.origin));
         const outsideEdges = allEdges.filter((edge) => !shownIds.has(edge.source) || !shownIds.has(edge.target)).length;
         els.graphBounds.textContent = [
-          direct ? `${layout.nodes.length - 1} / ${direct.neighbors.length} known direct neighbors shown` : `${originCount} origins + ${addressCount} recorded address nodes shown`,
+          direct ? `${shownOrigins - Number(anchorShown)} / ${direct.neighbors.length} known direct neighbors shown` : `${originCount} origins + ${addressCount} recorded address nodes shown`,
+          direct && !anchorShown ? "Pinned anchor is hidden from the map; direct mode retained." : "",
           `${layout.edges.length} / ${layout.edgeCount} links between shown cards · ${spokes} undirected observation spokes`,
           state.relationLayers.length ? `${state.relationLayers.length} / ${MAX_RELATION_LAYERS} shown inspections` : "",
           stages.queryHidden ? `${stages.queryHidden} hidden by query` : "",
@@ -2832,8 +2862,8 @@
           omitted ? `${omitted} nodes omitted by ${MAX_CARDS}-card cap` : "",
           layout.edgeCount > MAX_EDGES ? `${layout.edgeCount - MAX_EDGES} links omitted by ${MAX_EDGES}-edge cap` : "",
           outsideEdges ? `${outsideEdges} inspected links outside displayed cards` : "",
-          direct && query && !direct.anchor.origin.toLowerCase().includes(query) ? "Pinned anchor is outside the search query and remains visible." : "",
-          direct && !productMatches(direct.anchor, state.productId, state.productVersion) ? "Pinned anchor remains visible outside product/version filters (context only)." : "",
+          anchorShown && query && !direct.anchor.origin.toLowerCase().includes(query) ? "Pinned anchor is outside the search query and remains visible." : "",
+          anchorShown && !productMatches(direct.anchor, state.productId, state.productVersion) ? "Pinned anchor remains visible outside product/version filters (context only)." : "",
           state.omittedGraphReferences ? `${state.omittedGraphReferences} metadata reference declarations omitted by ${MAX_REFERENCE_CARDS}-reference-card cap` : "",
           selectionNotice, state.modeNotice,
         ].filter(Boolean).join(" · ");
@@ -2857,11 +2887,13 @@
         const availableBodyArrows = overlayEdges().filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)).length;
         const availableMetadataArrows = layout.edgeCount - availableBodyArrows;
         const queryHidden = stages.queryHidden, productHidden = stages.productHidden;
-        const capOmitted = Math.max(0, matchingNeighbors.length - (MAX_CARDS - 1));
+        const shownNeighbors = shownOrigins - Number(anchorShown);
+        const capOmitted = Math.max(0, matchingNeighbors.length - shownNeighbors);
         const incomplete = state.snapshot.snapshot.complete !== true || array(state.snapshot.snapshot.stopped_by).length > 0;
         const outsideQuery = query && !direct.anchor.origin.toLowerCase().includes(query);
         const summary = [
-          `${layout.nodes.length - 1} / ${direct.neighbors.length} known direct neighbors shown`,
+          `${shownNeighbors} / ${direct.neighbors.length} known direct neighbors shown`,
+          !anchorShown ? "Pinned anchor is hidden from the map; direct mode retained." : "",
           `${counts.incoming} incoming / ${counts.outgoing} outgoing links`,
           state.bodyReferenceOverlay ? `${metadataArrows} metadata / ${overlayCount} ${linkOverlay ? "Link" : "body URL"} links` : "",
           state.bodyReferenceOverlay ? `${shownBodyArrows} / ${overlayCount} ${linkOverlay ? "Link" : "body"} arrows shown` : "",
@@ -2871,8 +2903,8 @@
           state.productId || state.productVersion ? `${matchingNeighbors.length} matching neighbors · pinned anchor is context only` : "",
           capOmitted ? `${capOmitted} omitted by ${MAX_CARDS}-card cap` : "",
           layout.edgeCount > MAX_EDGES ? `${layout.edgeCount - MAX_EDGES} arrows omitted by ${MAX_EDGES}-arrow cap` : "",
-          outsideQuery ? "Pinned anchor is outside the search query and remains visible." : "",
-          !productMatches(direct.anchor, state.productId, state.productVersion) ? "Pinned anchor remains visible outside product/version filters (context only)." : "",
+          anchorShown && outsideQuery ? "Pinned anchor is outside the search query and remains visible." : "",
+          anchorShown && !productMatches(direct.anchor, state.productId, state.productVersion) ? "Pinned anchor remains visible outside product/version filters (context only)." : "",
           !direct.anchor.captured ? "Reference-only anchor; no captured rows shown." : "",
           !direct.neighbors.length ? "No direct neighbors appear in loaded metadata; others may exist." : "",
           incomplete ? "Known neighborhood is incomplete; see snapshot bounds above." : "",
@@ -2880,7 +2912,7 @@
         ];
         const diagnostics = [
           `Direct relations · ${direct.neighbors.length} known direct neighbors in loaded metadata${state.bodyReferenceOverlay ? linkOverlay ? " and temporary Link declarations (unique union)" : " and temporary body references (unique union)" : ""}`,
-          `${direct.neighbors.length} loaded neighbors · ${queryHidden} query-hidden · ${productHidden} product/version-hidden · ${matchingNeighbors.length} matching · ${layout.nodes.length - 1} shown · ${capOmitted} omitted by ${MAX_CARDS}-card cap (anchor included). Pinned anchor is context, excluded from matching counts`,
+          `${direct.neighbors.length} loaded neighbors · ${queryHidden} query-hidden · ${productHidden} product/version-hidden · ${matchingNeighbors.length} matching · ${shownNeighbors} shown · ${capOmitted} omitted by ${MAX_CARDS}-card cap (anchor ${anchorShown ? "included" : "hidden"}). Pinned anchor is context, excluded from matching counts`,
           `Non-self distinct typed links: ${counts.incoming} incoming / ${counts.outgoing} outgoing · ${counts.redirect_instruction} redirect / ${counts.origin_header} Origin / ${counts.referer_header} Referer${state.bodyReferenceOverlay ? linkOverlay ? Object.values(LINK_RELATIONS).map((item) => ` / ${counts[item.type] || 0} ${item.type}`).join("") : ` / ${counts.body_url_reference} body_url_reference` : ""}`,
           `${layout.edges.length} / ${layout.edgeCount} arrows between displayed cards (cap ${MAX_EDGES}) · ${direct.edgeCount - layout.edgeCount} links outside displayed cards`,
           ...(state.bodyReferenceOverlay ? [
@@ -3101,14 +3133,15 @@
       return `<section class="service-map-technologies" aria-label="Header-reported technologies"><h4>Header-reported technologies</h4><ul class="service-map-references">${rows}</ul></section>`;
     }
     function parametersMarkup(origin, endpoint) {
-      const current = state.parametersKey === JSON.stringify([origin.origin, endpoint.method, endpoint.path]);
+      const current = state.parametersKey === endpointParametersKey(origin.origin, endpoint);
       const result = current ? state.parameters : null;
       const rows = (n) => `${n} row${n === 1 ? "" : "s"}`;
       // A narrow inspector stacks each parameter: its name and where it was
       // sent, then its values, so long values never squeeze the name.
       const notes = result ? [result.moreRows && `From the newest ${rows(result.rows)}; older rows not read`,
         result.unreadBodies && `${result.unreadBodies} bodies not read (size limit)`, result.omitted && `${result.omitted} more parameters`].filter(Boolean) : [];
-      const body = !current || state.parametersLoading ? '<p class="service-map-muted">Reading parameters…</p>'
+      const body = !current && !state.loading ? '<p class="service-map-muted">Reopen this endpoint or reload the map to read current parameters.</p>'
+        : !current || state.parametersLoading ? '<p class="service-map-muted">Reading parameters…</p>'
         : state.parametersError ? `<p class="service-map-muted">${escape(state.parametersError)}</p>`
         : !result?.items.length ? `<p class="service-map-muted">No parameters in the newest ${rows(result?.rows || 0)}.</p>`
         : `<ul class="service-map-parameters">${result.items.map((item) => `<li><div><span class="service-map-parameter-name">${escape(item.name)}</span><span class="service-map-muted">${item.location} · ${rows(item.rows)}</span></div>${item.examples.length ? `<div class="service-map-parameter-values">${item.examples.map((value) => `<code>${escape(value)}</code>`).join("")}</div>` : ""}</li>`).join("")}</ul>${notes.length ? `<p class="service-map-muted">${notes.join(" · ")}.</p>` : ""}`;
@@ -3276,6 +3309,7 @@
     function selectSite(site) {
       if (!state.siteCards?.has(site)) return;
       cancelEvidence();
+      cancelParameters();
       Object.assign(state, { selectedSite: site, selectedClient: null, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
       render();
     }
@@ -3283,6 +3317,7 @@
     function selectClient(id) {
       if (!clientById(id)) return;
       cancelEvidence();
+      cancelParameters();
       Object.assign(state, { selectedClient: id, selectedSite: null, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
       render();
     }
@@ -3473,6 +3508,7 @@
       state.snapshot = null;
       state.endpointIndex = null;
       cancelEvidence();
+      cancelParameters();
       refresh({ force: true });
     });
     render();
@@ -3484,10 +3520,14 @@
       filterChanged() {
         state.refreshPaused = false;
         clearOverlay("Temporary body references cleared because the Service Map filter changed.");
+        state.requestId += 1;
+        abort?.abort();
+        state.loading = false;
         state.page = 0;
         state.snapshot = null;
         state.endpointIndex = null;
         cancelEvidence();
+        cancelParameters();
         return refresh({ force: true });
       },
       scopeChanged(previous, next) {
@@ -3510,9 +3550,11 @@
         // them here would shut the dialog while traffic flows. A count one row
         // behind is harmless, and Replay reports a row that is gone.
         cancelEvidence();
+        cancelParameters();
         render();
       },
       setVisible(value, view = state.view) {
+        if (!value) cancelParameters();
         if (!value || view !== "service-map") {
           clearOverlay("Temporary body references cleared because the map was hidden.");
           cancelBodyReferences();
@@ -3536,6 +3578,7 @@
         state.stale = true;
         closeApiDocs();
         cancelEvidence();
+        cancelParameters();
         render();
       },
       invalidate() {
@@ -3548,6 +3591,7 @@
         state.endpointIndex = null;
         closeApiDocs();
         cancelEvidence();
+        cancelParameters();
         render();
         return refresh();
       },
