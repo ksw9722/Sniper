@@ -3253,7 +3253,7 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         ),
         op(
             "findings.list", "findings list",
-            "List newest stored finding summaries without detail, evidence or captured bodies. Defaults to 100; limit-only, not cursor pagination. Omitted session_id pins the active session.",
+            "List newest stored finding summaries without detail, evidence or captured bodies. Each issue is stored once: a missing header, CORS policy or cookie flag per host, an exposed endpoint or open redirect per endpoint, a leaked value per value, linked to the first request that showed it. Defaults to 100; limit-only, not cursor pagination. Omitted session_id pins the active session.",
             Read, false, &[], vec![json!({"limit":20})],
         ),
         op(

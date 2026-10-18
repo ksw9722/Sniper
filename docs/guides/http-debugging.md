@@ -627,7 +627,10 @@ when more than one is running.
 - `sniper-cli` covers the operations in `sniper-cli manifest`. The in-scope
   history toggle, the site map and the Tools tab are not among them.
 - Findings come from a passive scan of traffic that already flowed. Nothing
-  crawls or probes a target on its own.
+  crawls or probes a target on its own. Each issue is listed once — a missing
+  header, a CORS policy or a cookie's flags per host, an exposed endpoint or an
+  open redirect per endpoint, a leaked value per value — and links to the first
+  request that showed it, not to every request that repeats it.
 
 When you are done with the throwaway instance, stop it and delete its directory:
 its capture, its root CA and its session files are all under `SNIPER_DATA_DIR`.
