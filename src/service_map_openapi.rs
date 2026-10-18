@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use crate::{service_map_auth::AuthSignal, service_map_parameters::EndpointParameter};
+use crate::{
+    service_map_auth::AuthSignal,
+    service_map_parameters::{body_parameter_location, EndpointParameter},
+};
 
 /// Operations described per origin, the most recently used first.
 pub const MAX_OPERATIONS: usize = 500;
@@ -31,8 +34,12 @@ pub struct Operation {
     pub request_types: BTreeSet<String>,
     pub auth: BTreeSet<AuthSignal>,
     pub parameters: Vec<EndpointParameter>,
-    /// The newest row's transaction ID, to open or send on.
-    pub newest: Option<Uuid>,
+    /// The newest row's capture sequence and transaction ID, to open or
+    /// send on; the sequence picks the newest of merged paths.
+    pub newest: Option<(u64, Uuid)>,
+    /// Native JSON field types, retained before display examples lose their types.
+    /// Missing or empty evidence leaves that field unconstrained.
+    pub json_types: BTreeMap<String, BTreeSet<&'static str>>,
 }
 
 /// A path ending in one of these names a static file, whatever it was answered
@@ -64,55 +71,67 @@ pub fn document(
 ) -> Value {
     let (mut paths, mut schemes) = (Map::new(), Map::new());
     let (mut requests, mut site_only) = (0, 0);
+    let mut grouped: BTreeMap<String, (BTreeSet<&str>, BTreeMap<&str, Vec<&Operation>>)> =
+        BTreeMap::new();
     for ((path, method), operation) in operations {
         requests += operation.requests;
         if !api(path, operation) {
             site_only += 1;
             continue;
         }
-        let (template, path_parameters) = path_template(path);
+        // OAS forbids separate paths that differ only in template names.
+        // Keep all methods and evidence when numeric, UUID or hex IDs coexist.
+        let (variants, methods) = grouped.entry(path_shape(path)).or_default();
+        variants.insert(path);
+        methods.entry(method).or_default().push(operation);
+    }
+    for (variants, methods) in grouped.values() {
+        let (template, path_parameters) = path_template(variants);
         let item = paths.entry(template).or_insert_with(|| json!({}));
         if !path_parameters.is_empty() {
             item["parameters"] = path_parameters.into();
         }
-        let mut value = json!({
-            "responses": responses(operation),
-            "x-sniper-requests": operation.requests,
-        });
-        if let Some(newest) = operation.newest {
-            value["x-sniper-newest-transaction"] = newest.to_string().into();
-        }
-        let query: Vec<Value> = operation
+        for (method, observations) in methods {
+            let operation = merge_operations(observations);
+            let mut value = json!({
+                "responses": responses(&operation),
+                "x-sniper-requests": operation.requests,
+            });
+            if let Some((_, newest)) = operation.newest {
+                value["x-sniper-newest-transaction"] = newest.to_string().into();
+            }
+            let query: Vec<Value> = operation
             .parameters
             .iter()
             .filter(|parameter| parameter.location == "query")
             .map(|parameter| {
-                json!({"name": parameter.name, "in": "query", "schema": schema(&parameter.examples, false)})
+                json!({"name": parameter.name, "in": "query", "schema": schema(&parameter.examples)})
             })
             .collect();
-        if !query.is_empty() {
-            value["parameters"] = query.into();
+            if !query.is_empty() {
+                value["parameters"] = query.into();
+            }
+            if let Some(body) = request_body(&operation) {
+                value["requestBody"] = body;
+            }
+            // Each credential the rows showed is one way in; the rows cannot
+            // tell which ones the server requires.
+            let security: Vec<Value> = operation
+                .auth
+                .iter()
+                .filter_map(|signal| scheme_key(signal, &mut schemes))
+                .map(|key| json!({ key: [] }))
+                .collect();
+            if !security.is_empty() {
+                value["security"] = security.into();
+            }
+            item[*method] = value;
         }
-        if let Some(body) = request_body(operation) {
-            value["requestBody"] = body;
-        }
-        // Each credential the rows showed is one way in; the rows cannot
-        // tell which ones the server requires.
-        let security: Vec<Value> = operation
-            .auth
-            .iter()
-            .filter_map(|signal| scheme_key(signal, &mut schemes))
-            .map(|key| json!({ key: [] }))
-            .collect();
-        if !security.is_empty() {
-            value["security"] = security.into();
-        }
-        item[method.as_str()] = value;
     }
     let mut notes = vec![format!(
         "Observed by Sniper in {requests} captured requests to {origin}. It lists only what \
-         they showed: methods, paths with ID segments as {{number}}, {{uuid}} and {{hex}}, \
-         parameter names with types guessed from their values, response statuses and media \
+         they showed: methods, paths with ID segments as {{number}}, {{uuid}}, {{hex}} or mixed {{id}}, \
+         parameter names with observed JSON types or types guessed from text, response statuses and media \
          types, and the credentials the rows carried. No captured value is included."
     )];
     if site_only > 0 {
@@ -167,21 +186,48 @@ fn api(path: &str, operation: &Operation) -> bool {
         })
 }
 
-/// A template's ID segments named for OpenAPI, a repeated one numbered
-/// (`{number}`, `{number2}`), with a path parameter for each.
-fn path_template(path: &str) -> (String, Vec<Value>) {
+/// The identity of a templated hierarchy, independent of its parameter names.
+fn path_shape(path: &str) -> String {
+    path.split('/')
+        .map(|segment| match segment {
+            "{number}" | "{uuid}" | "{hex}" => "{id}",
+            _ => segment,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Names are specific when all observations agree, otherwise `id`; repeated
+/// names are numbered. Literal braces were escaped before grouping.
+fn path_template(paths: &BTreeSet<&str>) -> (String, Vec<Value>) {
+    let segments: Vec<Vec<_>> = paths.iter().map(|path| path.split('/').collect()).collect();
     let mut counts = BTreeMap::new();
     let mut parameters = Vec::new();
-    let template = path
-        .split('/')
-        .map(|segment| {
-            let schema = match segment {
-                "{number}" => json!({"type": "integer"}),
-                "{uuid}" => json!({"type": "string", "format": "uuid"}),
-                "{hex}" => json!({"type": "string", "pattern": "^[0-9A-Fa-f]+$"}),
-                _ => return segment.to_string(),
+    let template = segments[0]
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let kinds: BTreeSet<_> = segments.iter().map(|parts| parts[index]).collect();
+            let schemas: Vec<_> = kinds
+                .iter()
+                .filter_map(|kind| match *kind {
+                    "{number}" => Some(json!({"type": "integer"})),
+                    "{uuid}" => Some(json!({"type": "string", "format": "uuid"})),
+                    "{hex}" => Some(json!({"type": "string", "pattern": "^[0-9A-Fa-f]+$"})),
+                    _ => None,
+                })
+                .collect();
+            if schemas.is_empty() {
+                return segment.to_string();
+            }
+            let (kind, schema) = if schemas.len() == 1 {
+                (
+                    &segment[1..segment.len() - 1],
+                    schemas.into_iter().next().unwrap(),
+                )
+            } else {
+                ("id", json!({"anyOf": schemas}))
             };
-            let kind = &segment[1..segment.len() - 1];
             let count = counts.entry(kind).and_modify(|n| *n += 1).or_insert(1);
             let name = match *count {
                 1 => kind.to_string(),
@@ -196,9 +242,67 @@ fn path_template(path: &str) -> (String, Vec<Value>) {
     (template, parameters)
 }
 
+fn merge_operations(sources: &[&Operation]) -> Operation {
+    let mut target = Operation::default();
+    let mut parameters: BTreeMap<(&str, &str), (usize, BTreeSet<&str>)> = BTreeMap::new();
+    for source in sources {
+        target.requests += source.requests;
+        target.newest = target.newest.max(source.newest);
+        for (status, types) in &source.responses {
+            target
+                .responses
+                .entry(*status)
+                .or_default()
+                .extend(types.iter().cloned());
+        }
+        target
+            .request_types
+            .extend(source.request_types.iter().cloned());
+        target.auth.extend(source.auth.iter().cloned());
+        for parameter in &source.parameters {
+            if parameter.location == "json" {
+                let types = source
+                    .json_types
+                    .get(&parameter.name)
+                    .cloned()
+                    .unwrap_or_default();
+                target
+                    .json_types
+                    .entry(parameter.name.clone())
+                    .and_modify(|known| {
+                        if known.is_empty() || types.is_empty() {
+                            known.clear();
+                        } else {
+                            known.extend(&types);
+                        }
+                    })
+                    .or_insert(types);
+            }
+            let (rows, examples) = parameters
+                .entry((&parameter.location, &parameter.name))
+                .or_default();
+            *rows += parameter.rows;
+            // Index both names and examples: many colliding variants can have
+            // distinct fields. Repeated vector scans would make merging quadratic.
+            // Keep every retained example for textual type inference.
+            examples.extend(parameter.examples.iter().map(String::as_str));
+        }
+    }
+    target.parameters = parameters
+        .into_iter()
+        .map(|((location, name), (rows, examples))| EndpointParameter {
+            name: name.into(),
+            location: location.into(),
+            rows,
+            examples: examples.into_iter().map(str::to_string).collect(),
+        })
+        .collect();
+    target
+}
+
 /// A type every value seen fits, or a string. A leading zero (`007`) marks a
 /// code rather than a number.
-fn schema(examples: &[String], json_body: bool) -> Value {
+fn schema(examples: &[String]) -> Value {
     let every = |test: &dyn Fn(&str) -> bool| {
         !examples.is_empty() && examples.iter().all(|value| test(value))
     };
@@ -212,14 +316,30 @@ fn schema(examples: &[String], json_body: bool) -> Value {
         "number"
     } else if every(&|value| value == "true" || value == "false") {
         "boolean"
-    } else if json_body && every(&|value| value.starts_with('[')) {
-        "array"
-    } else if json_body && every(&|value| value.starts_with('{')) {
-        "object"
     } else {
         "string"
     };
     json!({ "type": kind })
+}
+
+fn json_schema(types: Option<&BTreeSet<&str>>) -> Value {
+    let Some(types) = types.filter(|types| !types.is_empty()) else {
+        return json!({});
+    };
+    let mut types = types.clone();
+    if types.contains("number") {
+        types.remove("integer");
+    }
+    let mut schema = if types.len() == 1 {
+        json!({"type": types.first().unwrap()})
+    } else {
+        json!({"type": types})
+    };
+    if types.contains("array") {
+        // Element types are not sampled; every observed array must still fit.
+        schema["items"] = json!({});
+    }
+    schema
 }
 
 /// Each request media type, with the form, JSON or multipart fields sent as
@@ -229,21 +349,17 @@ fn request_body(operation: &Operation) -> Option<Value> {
         .request_types
         .iter()
         .map(|media| {
-            let location = if media.contains("x-www-form-urlencoded") {
-                "form"
-            } else if media.contains("json") {
-                "json"
-            } else if media.contains("multipart/form-data") {
-                "multipart"
-            } else {
-                ""
-            };
+            let location = body_parameter_location(media).unwrap_or("");
             let properties: Map<String, Value> = operation
                 .parameters
                 .iter()
                 .filter(|parameter| parameter.location == location)
                 .map(|parameter| {
-                    let schema = schema(&parameter.examples, location == "json");
+                    let schema = if location == "json" {
+                        json_schema(operation.json_types.get(&parameter.name))
+                    } else {
+                        schema(&parameter.examples)
+                    };
                     (parameter.name.clone(), schema)
                 })
                 .collect();
@@ -347,6 +463,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn body_schemas_use_the_same_exact_media_types_as_parameter_extraction() {
+        let operation = Operation {
+            request_types: [
+                "application/json",
+                "application/problem+json",
+                "application/notjson",
+                "application/x-www-form-urlencoded-fake",
+                "multipart/form-data",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            parameters: vec![
+                parameter("json", "json_field", &["42"]),
+                parameter("form", "form_field", &["value"]),
+                parameter("multipart", "file", &[]),
+            ],
+            ..Operation::default()
+        };
+        let body = request_body(&operation).unwrap();
+        let content = &body["content"];
+        assert!(content["application/json"]["schema"]["properties"]
+            .get("json_field")
+            .is_some());
+        assert!(content["application/problem+json"]["schema"]["properties"]
+            .get("json_field")
+            .is_some());
+        assert!(content["multipart/form-data"]["schema"]["properties"]
+            .get("file")
+            .is_some());
+        assert_eq!(content["application/notjson"], json!({}));
+        assert_eq!(content["application/x-www-form-urlencoded-fake"], json!({}));
+    }
+
     fn signal(kind: &'static str, name: Option<&str>) -> AuthSignal {
         AuthSignal {
             kind,
@@ -361,7 +512,8 @@ mod tests {
             "/chats/{number}/posts/{hex}"
         );
         assert_eq!(operation_path("/raw/{x}"), "/raw/%7Bx%7D");
-        let (template, parameters) = path_template("/a/{number}/b/{number}/c/{uuid}");
+        let (template, parameters) =
+            path_template(&BTreeSet::from(["/a/{number}/b/{number}/c/{uuid}"]));
         assert_eq!(template, "/a/{number}/b/{number2}/c/{uuid}");
         assert_eq!(
             parameters,
@@ -375,21 +527,253 @@ mod tests {
 
     #[test]
     fn types_are_guessed_from_values_that_are_then_dropped() {
-        let kind = |values: &[&str], json_body| {
+        let kind = |values: &[&str]| {
             let values: Vec<String> = values.iter().map(|value| value.to_string()).collect();
-            schema(&values, json_body)["type"]
-                .as_str()
-                .unwrap()
-                .to_string()
+            schema(&values)["type"].as_str().unwrap().to_string()
         };
-        assert_eq!(kind(&["1", "-20"], false), "integer");
-        assert_eq!(kind(&["1", "2.5"], false), "number");
-        assert_eq!(kind(&["007"], false), "string");
-        assert_eq!(kind(&["true", "false"], false), "boolean");
-        assert_eq!(kind(&["[\"a\"]"], true), "array");
-        assert_eq!(kind(&["[\"a\"]"], false), "string");
-        assert_eq!(kind(&["inf"], false), "string");
-        assert_eq!(kind(&[], false), "string");
+        assert_eq!(kind(&["1", "-20"]), "integer");
+        assert_eq!(kind(&["1", "2.5"]), "number");
+        assert_eq!(kind(&["007"]), "string");
+        assert_eq!(kind(&["true", "false"]), "boolean");
+        assert_eq!(kind(&["[\"a\"]"]), "string");
+        assert_eq!(kind(&["inf"]), "string");
+        assert_eq!(kind(&[]), "string");
+    }
+
+    fn json_operation(bodies: &[&str]) -> Operation {
+        let mut tally = crate::service_map_parameters::ParameterTally::default();
+        for body in bodies {
+            tally.add_row(None, Some("application/json"), body);
+        }
+        Operation {
+            requests: bodies.len(),
+            request_types: BTreeSet::from(["application/json".into()]),
+            json_types: tally.json_types(),
+            parameters: tally.finish().0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn json_fields_keep_native_types_including_null_and_mixed_observations() {
+        let operation = json_operation(&[
+            r#"{"count":"42","enabled":"false","list_label":"[draft","object_label":"{draft","nothing":null,"actual_count":42,"actual_float":1.5,"actual_bool":false,"actual_array":[1,"a",null],"actual_object":{},"mixed":1}"#,
+            r#"{"mixed":"1"}"#,
+            r#"{"mixed":null}"#,
+            r#"{"mixed":[],"actual_count":1.5}"#,
+        ]);
+        let body = request_body(&operation).unwrap();
+        let properties = &body["content"]["application/json"]["schema"]["properties"];
+        for name in ["count", "enabled", "list_label", "object_label"] {
+            assert_eq!(properties[name], json!({"type": "string"}));
+        }
+        assert_eq!(properties["nothing"], json!({"type": "null"}));
+        assert_eq!(properties["actual_count"], json!({"type": "number"}));
+        assert_eq!(properties["actual_float"], json!({"type": "number"}));
+        assert_eq!(properties["actual_bool"], json!({"type": "boolean"}));
+        assert_eq!(
+            properties["actual_array"],
+            json!({"type": "array", "items": {}})
+        );
+        assert_eq!(properties["actual_object"], json!({"type": "object"}));
+        assert_eq!(
+            properties["mixed"],
+            json!({"type": ["array", "integer", "null", "string"], "items": {}})
+        );
+        assert!(!body.to_string().contains("draft"));
+    }
+
+    #[test]
+    fn unknown_json_types_are_unconstrained_and_text_fields_keep_inference() {
+        let operation = Operation {
+            request_types: BTreeSet::from([
+                "application/json".into(),
+                "application/x-www-form-urlencoded".into(),
+            ]),
+            parameters: vec![
+                parameter("json", "unknown", &["42"]),
+                parameter("form", "count", &["42"]),
+            ],
+            ..Default::default()
+        };
+        let body = request_body(&operation).unwrap();
+        assert_eq!(
+            body["content"]["application/json"]["schema"]["properties"]["unknown"],
+            json!({})
+        );
+        assert_eq!(
+            body["content"]["application/x-www-form-urlencoded"]["schema"]["properties"]["count"],
+            json!({"type": "integer"})
+        );
+        for scalar in ["\"42\"", "42", "false", "null", "[1,false]"] {
+            assert!(request_body(&json_operation(&[scalar])).unwrap()["content"]
+                ["application/json"]
+                .get("schema")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn colliding_templates_merge_methods_counts_responses_auth_and_parameters() {
+        let mut number = json_operation(&[r#"{"value":"42","number_only":1}"#]);
+        number.requests = 3;
+        number.responses = BTreeMap::from([(200, BTreeSet::from(["application/json".into()]))]);
+        number.auth.insert(signal("basic", None));
+        number.parameters.push(parameter("query", "page", &["1"]));
+        let mut uuid = json_operation(&[r#"{"value":42,"uuid_only":null}"#]);
+        uuid.requests = 2;
+        uuid.responses = BTreeMap::from([
+            (200, BTreeSet::from(["application/problem+json".into()])),
+            (404, BTreeSet::new()),
+        ]);
+        uuid.auth.insert(signal("bearer", None));
+        uuid.parameters.push(parameter("query", "page", &["2.5"]));
+        number.newest = Some((9, Uuid::from_u128(9)));
+        uuid.newest = Some((5, Uuid::from_u128(5)));
+        let operations = BTreeMap::from([
+            ((operation_path("/items/42"), "get".into()), number),
+            (
+                (
+                    operation_path("/items/550e8400-e29b-41d4-a716-446655440000"),
+                    "get".into(),
+                ),
+                uuid,
+            ),
+            (
+                (
+                    operation_path("/items/507f1f77bcf86cd799439011"),
+                    "post".into(),
+                ),
+                Operation {
+                    requests: 7,
+                    ..Default::default()
+                },
+            ),
+            (
+                (operation_path("/items/{id}"), "get".into()),
+                Operation {
+                    requests: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                (operation_path("/items/latest"), "get".into()),
+                Operation {
+                    requests: 1,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let document = document("https://api.example.com", &operations, 0);
+        let paths = document["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains_key("/items/%7Bid%7D"));
+        assert!(paths.contains_key("/items/latest"));
+        let item = &paths["/items/{id}"];
+        assert_eq!(
+            item["parameters"][0]["schema"]["anyOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(item["get"]["x-sniper-requests"], 5);
+        assert_eq!(item["post"]["x-sniper-requests"], 7);
+        // The merged operation sends on the newest row of any variant.
+        assert_eq!(
+            item["get"]["x-sniper-newest-transaction"],
+            Uuid::from_u128(9).to_string()
+        );
+        assert!(item["post"].get("x-sniper-newest-transaction").is_none());
+        assert_eq!(
+            item["get"]["responses"]["200"]["content"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(item["get"]["responses"].get("404").is_some());
+        assert_eq!(item["get"]["security"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            item["get"]["parameters"],
+            json!([{"name":"page", "in":"query", "schema":{"type":"number"}}])
+        );
+        let properties =
+            &item["get"]["requestBody"]["content"]["application/json"]["schema"]["properties"];
+        assert_eq!(properties["value"], json!({"type": ["integer", "string"]}));
+        assert!(properties.get("number_only").is_some());
+        assert!(properties.get("uuid_only").is_some());
+        assert!(document["info"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("14 captured requests"));
+        assert!(
+            !document.to_string().contains("operationId"),
+            "no conflicting operation IDs are invented"
+        );
+    }
+
+    #[test]
+    fn mixed_path_positions_get_unique_names_without_merging_literal_hierarchies() {
+        let (path, parameters) = path_template(&BTreeSet::from([
+            "/a/{number}/{number}/{number}",
+            "/a/{uuid}/{number}/{hex}",
+        ]));
+        assert_eq!(path, "/a/{id}/{number}/{id2}");
+        assert_eq!(
+            parameters
+                .iter()
+                .map(|p| p["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["id", "number", "id2"]
+        );
+        assert_ne!(
+            path_shape("/a/{number}/details"),
+            path_shape("/a/details/{uuid}")
+        );
+        assert_ne!(path_shape("/a/{number}"), path_shape("/a/{number}/"));
+    }
+
+    #[test]
+    fn merging_unknown_json_evidence_does_not_invent_a_known_type() {
+        let known = json_operation(&[r#"{"value":42}"#]);
+        let unknown = Operation {
+            parameters: vec![parameter("json", "value", &["false"])],
+            ..Default::default()
+        };
+        let known = merge_operations(&[&known, &unknown]);
+        assert_eq!(json_schema(known.json_types.get("value")), json!({}));
+        let known = merge_operations(&[&known, &json_operation(&[r#"{"value":"str"}"#])]);
+        assert_eq!(json_schema(known.json_types.get("value")), json!({}));
+    }
+
+    #[test]
+    fn merging_many_variants_preserves_distinct_fields_without_a_lossy_cap() {
+        let observations: Vec<_> = (0..MAX_OPERATIONS)
+            .map(|variant| Operation {
+                requests: 1,
+                parameters: (0..crate::service_map_parameters::MAX_PARAMETERS)
+                    .map(|field| {
+                        parameter(
+                            "query",
+                            &format!("field_{variant}_{field}"),
+                            &["1", "2", "3"],
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        let merged = merge_operations(&observations.iter().collect::<Vec<_>>());
+        assert_eq!(merged.requests, MAX_OPERATIONS);
+        assert_eq!(
+            merged.parameters.len(),
+            MAX_OPERATIONS * crate::service_map_parameters::MAX_PARAMETERS
+        );
+        assert!(merged
+            .parameters
+            .iter()
+            .all(|parameter| parameter.rows == 1 && parameter.examples.len() == 3));
     }
 
     #[test]
@@ -409,7 +793,8 @@ mod tests {
                     signal("session_cookie", Some("SID")),
                 ]),
                 parameters: vec![parameter("query", "page", &["2"])],
-                newest: Some(Uuid::from_u128(7)),
+                newest: Some((7, Uuid::from_u128(7))),
+                json_types: BTreeMap::new(),
             },
         );
         operations.insert(
@@ -424,6 +809,7 @@ mod tests {
                 auth: BTreeSet::from([signal("oauth2", None)]),
                 parameters: vec![parameter("json", "name", &["kim-secret-value"])],
                 newest: None,
+                json_types: BTreeMap::from([("name".into(), BTreeSet::from(["string"]))]),
             },
         );
         operations.insert(

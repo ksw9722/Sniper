@@ -2769,7 +2769,7 @@ impl TransactionStore {
                     }
                     let (operation, rows) = found.entry(key).or_default();
                     // Rows are read newest first.
-                    operation.newest.get_or_insert(record.id);
+                    operation.newest.get_or_insert((record.sequence, record.id));
                     operation.requests += 1;
                     if let Some(status) = record.status.filter(|status| (100..600).contains(status))
                     {
@@ -2825,6 +2825,7 @@ impl TransactionStore {
                             body.as_deref().unwrap_or(""),
                         );
                     }
+                    operation.json_types = tally.json_types();
                     operation.parameters = tally.finish().0;
                     (key, operation)
                 })

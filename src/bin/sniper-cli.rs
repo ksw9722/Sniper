@@ -988,7 +988,7 @@ enum ServiceMapCommand {
     Parameters(ServiceMapParametersArgs),
     /// Describe one origin's API as an OpenAPI 3.1 document, from its retained rows.
     #[command(
-        after_help = "Requires the current active session UUID. Reads every retained row of the origin: each method and path template (ID segments as {number}, {uuid} and {hex}), query and form, top-level JSON or multipart body field names from each operation's newest 20 rows with a type guessed from their values, response statuses with media types, and the credentials the rows showed as security schemes. No captured value is included. Operations that only answered with pages or static files, OPTIONS requests and methods OpenAPI cannot hold are left out; at most 500 operations are listed. No target requests, inactive-session loading or automatic reads."
+        after_help = "Requires the current active session UUID. Reads every retained row of the origin: each method and path template (ID segments as {number}, {uuid}, {hex} or mixed {id}), query and form, top-level JSON or multipart body field names from each observed method/path variant's newest 20 rows, with native JSON types preserved and text types guessed from their values, response statuses with media types, and the credentials the rows showed as security schemes. No captured value is included. Operations that only answered with pages or static files, OPTIONS requests and methods OpenAPI cannot hold are left out; at most 500 operations are listed. No target requests, inactive-session loading or automatic reads."
     )]
     Openapi(ServiceMapOpenApiArgs),
     /// List what no rule names across the whole map, most widespread first.
@@ -4002,7 +4002,7 @@ fn service_map_openapi_output_schema() -> Value {
     use sniper::service_map_openapi::MAX_OPERATIONS;
     json!({
         "type":"object",
-        "description":"An OpenAPI 3.1 document of what one origin's retained rows showed (https://spec.openapis.org/oas/v3.1.0). Path templates mark ID segments as {number}, {uuid} and {hex}; parameter and body field types are guessed from captured values, which are not included. Each operation's x-sniper-requests counts the rows it stands for and x-sniper-newest-transaction names the newest of them (open it with capture http get); security lists each credential the rows showed as an alternative, not what the server requires.",
+        "description":"An OpenAPI 3.1 document of what one origin's retained rows showed (https://spec.openapis.org/oas/v3.1.0). Path templates mark ID segments as {number}, {uuid}, {hex} or mixed {id}; equivalent hierarchies combine their observations. JSON fields retain native types including null and mixed types; text field types are guessed from captured values, which are not included. Each operation's x-sniper-requests counts the rows it stands for and x-sniper-newest-transaction names the newest of them (open it with capture http get); security lists each credential the rows showed as an alternative, not what the server requires.",
         "required":["openapi","info","servers","paths"],
         "properties":{
             "openapi":{"type":"string","enum":["3.1.0"]},
@@ -4960,7 +4960,7 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
         op(
             "target.service_map.openapi.get",
             "scope service-map openapi --session-id <uuid> --origin <origin>",
-            "Describe one origin's API as an OpenAPI 3.1 document built from all its retained rows: each method and path template with ID segments as {number}, {uuid} and {hex}, query and body field names with types guessed from their values, response statuses and media types, and the credentials the rows showed as security schemes. No captured value is included; operations that only served pages or static files are left out, and at most 500 are listed. Active session only; an inactive session is refused without loading or activation. No target requests or automatic reads.",
+            "Describe one origin's API as an OpenAPI 3.1 document built from all its retained rows: each method and path template with ID segments as {number}, {uuid}, {hex} or mixed {id}, query and body field names with native JSON types preserved and text types guessed from their values, response statuses and media types, and the credentials the rows showed as security schemes. No captured value is included; operations that only served pages or static files are left out, and at most 500 are listed. Active session only; an inactive session is refused without loading or activation. No target requests or automatic reads.",
             CliSideEffect::Read,
             false,
             &["session_id", "origin"],

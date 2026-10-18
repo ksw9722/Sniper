@@ -1782,6 +1782,30 @@ async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
             Some("application/json"),
             br#"{"q":"bags","limit":5}"#,
         ),
+        request(
+            "POST",
+            "/upload",
+            Some("multipart/form-data; boundary=control"),
+            b"--control\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.txt\"\r\n\r\nSYNTHETIC_PRIVATE_UPLOAD ; name=\"invented\"\r\nContent-Disposition: form-data; name=\"header_fake\"\r\n\r\n--control--\r\n",
+        ),
+        request(
+            "POST",
+            "/upload",
+            Some("multipart/form-data; boundary=\"json-Boundary\""),
+            b"--json-Boundary\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nSYNTHETIC_PRIVATE_UPLOAD\r\n--json-Boundary--\r\n",
+        ),
+        request(
+            "POST",
+            "/suffix-json",
+            Some("application/problem+json; profile=x-www-form-urlencoded"),
+            br#"{"message":"value"}"#,
+        ),
+        request(
+            "POST",
+            "/unsupported",
+            Some("text/plain; profile=application/json"),
+            br#"{"invented":"value"}"#,
+        ),
         request("GET", "/other?x=1", None, b""),
     ] {
         session.store.insert(record).await;
@@ -1845,6 +1869,32 @@ async fn service_map_parameters_list_an_endpoints_query_and_body_fields() {
             ("json".into(), "q".into(), 1, json!(["bags"])),
         ]
     );
+    let upload: Value = read(session_id, origin, "POST", "/upload")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(upload["rows"], 2);
+    assert_eq!(
+        names(&upload),
+        [("multipart".into(), "file".into(), 2, json!([]))]
+    );
+    assert!(!upload.to_string().contains("SYNTHETIC_PRIVATE_UPLOAD"));
+    let suffix: Value = read(session_id, origin, "POST", "/suffix-json")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&suffix),
+        [("json".into(), "message".into(), 1, json!(["value"]))]
+    );
+    let unsupported: Value = read(session_id, origin, "POST", "/unsupported")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(names(&unsupported).is_empty());
     let other: Value = read(Uuid::new_v4(), origin, "GET", "/search")
         .await
         .json()
@@ -1940,7 +1990,7 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
             "api.example.com",
             "/v1/items",
             &[("content-type", "application/json")],
-            br#"{"name":"SYNTHETIC_PRIVATE_NAME","count":5}"#,
+            br#"{"name":"SYNTHETIC_PRIVATE_NAME","count":5,"code":"42","enabled":"false","label":"[draft","object_label":"{draft","nothing":null}"#,
             201,
             Some("application/json; charset=utf-8"),
         ),
@@ -2042,6 +2092,11 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
         json!({"content": {"application/json": {"schema": {"type": "object", "properties": {
             "count": {"type": "integer"},
             "name": {"type": "string"},
+            "code": {"type": "string"},
+            "enabled": {"type": "string"},
+            "label": {"type": "string"},
+            "object_label": {"type": "string"},
+            "nothing": {"type": "null"},
         }}}}})
     );
     assert_eq!(
@@ -2062,6 +2117,52 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
     )
     .await;
     assert_eq!(via_cli, document);
+
+    // A second ID kind must share the hierarchy without replacing either
+    // operation's observations. Read the same result through the CLI too.
+    for (method, status) in [("GET", 202), ("PATCH", 204)] {
+        session
+            .store
+            .insert(row(
+                method,
+                "api.example.com",
+                "/v1/items/550e8400-e29b-41d4-a716-446655440000?page=4",
+                &bearer,
+                b"",
+                status,
+                Some("application/json"),
+            ))
+            .await;
+    }
+    let merged: Value = get(session_id, origin).await.unwrap().json().await.unwrap();
+    let paths = merged["paths"].as_object().unwrap();
+    assert_eq!(
+        paths.keys().collect::<Vec<_>>(),
+        ["/v1/items", "/v1/items/{id}"]
+    );
+    let item = &paths["/v1/items/{id}"];
+    assert_eq!(item["get"]["x-sniper-requests"], 3);
+    assert_eq!(item["patch"]["x-sniper-requests"], 1);
+    for status in ["200", "202", "404"] {
+        assert!(item["get"]["responses"].get(status).is_some());
+    }
+    assert_eq!(
+        item["parameters"][0]["schema"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        read(
+            &dir,
+            &api,
+            "target.service_map.openapi.get",
+            json!({"session_id": session_id, "origin": origin}),
+        )
+        .await,
+        merged
+    );
 
     let inactive = get(Uuid::new_v4(), origin).await.unwrap();
     assert_eq!(inactive.status(), reqwest::StatusCode::CONFLICT);
