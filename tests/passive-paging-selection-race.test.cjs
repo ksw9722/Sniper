@@ -232,6 +232,8 @@ function websocketFixture({ count = 3, pageSize = 3, cap = 10 } = {}) {
     'moveWebsocketSelection', 'selectWebsocketSession', 'loadMoreWebsockets', 'loadWebsockets', 'createWebsocketPagingState',
     'createWebsocketQueryState', 'websocketQuerySignature', 'websocketCursorPagingEnabled', 'websocketAppendAfterId',
     'buildWebsocketsPageUrl', 'jsonArray', 'websocketPagePayload', 'mergeWebsocketAppendPage', 'pruneWebsocketSummaryMutationCache',
+    'isWebsocketSummaryFresher', 'websocketSummaryNumber', 'websocketSummaryTimestamp',
+    'websocketSummaryMatchesCurrentQuery', 'websocketSummarySearchHaystack',
     'syncVisibleWebsocketSelection', 'getSortedWebsocketEntries', 'getVisibleWebsocketSessions', 'clearWebsocketSelectionPreview',
     'normalizeWebsocketLoadLimit', 'loadWebsocketsPageRefresh', 'currentWebsocketRefreshLimit',
     'clearWebsocketLoadedSessionsForPendingQuery',
