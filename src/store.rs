@@ -389,6 +389,9 @@ pub struct RetentionTrimOutcome {
     pub current_count: usize,
     pub protected_count: usize,
     pub event_sequence: u64,
+    /// Bytes the deleted rows still occupy in `transactions.ndjson`, which only
+    /// a snapshot rewrite reclaims. Rows not yet snapshotted count nothing.
+    pub reclaimable_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3824,7 +3827,7 @@ impl TransactionStore {
     ) -> io::Result<RetentionTrimOutcome> {
         const MAX_TOMBSTONE_IDS: usize = 1024;
         let _mutation_guard = self.insert_lock.lock().await;
-        let ids = {
+        let (ids, reclaimable_bytes) = {
             let inner = self.inner.read().await;
             let protected = self.protected_existing_ids(&inner, saved_source_ids);
             let mut remaining = inner.entries.len().saturating_sub(max_entries);
@@ -3855,7 +3858,12 @@ impl TransactionStore {
                     remaining -= count;
                 }
             }
-            ids
+            let bytes = ids
+                .iter()
+                .filter_map(|id| inner.locators.get(id))
+                .map(|locator| u64::from(locator.len))
+                .sum();
+            (ids, bytes)
         };
         if !ids.is_empty() {
             self.delete_ids_locked_with_event(&ids, true).await?;
@@ -3866,6 +3874,7 @@ impl TransactionStore {
             current_count: inner.entries.len(),
             protected_count: self.protected_existing_ids(&inner, saved_source_ids).len(),
             event_sequence: self.latest_event_sequence(),
+            reclaimable_bytes,
         })
     }
 
@@ -7177,6 +7186,29 @@ pub(crate) mod tests {
             assert!(store.retention_compaction_pending());
             store.mark_retention_compacted(second.event_sequence);
             assert!(!store.retention_compaction_pending());
+            drop(store);
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        // The retention worker rewrites the session only when trims free enough
+        // of transactions.ndjson; a row that lives only in the journal frees none.
+        #[tokio::test]
+        async fn retention_trims_report_the_snapshotted_bytes_they_free() {
+            let records = records(3);
+            let ids: Vec<_> = records.iter().map(|record| record.id).collect();
+            let (store, path) = journal_store(records);
+            store
+                .adopt_written_locators(HashMap::from([(
+                    ids[0],
+                    crate::session::BodyLocator {
+                        offset: 0,
+                        len: 700,
+                    },
+                )]))
+                .await;
+            let outcome = store.trim_retention(1, &HashSet::new(), 10).await.unwrap();
+            assert_eq!(outcome.deleted_ids, vec![ids[0], ids[1]]);
+            assert_eq!(outcome.reclaimable_bytes, 700);
             drop(store);
             fs::remove_dir_all(path).unwrap();
         }

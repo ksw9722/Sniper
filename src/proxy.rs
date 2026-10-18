@@ -3719,7 +3719,7 @@ async fn persist_transaction_insert_outcome(
 /// is about 5,000 records at the average record size of a real session. Raising it
 /// makes the expensive snapshot rewrites rarer, at the cost of a slower load and a
 /// longer window of non-journaled state (event log entries) to lose in a crash.
-const TRANSACTION_JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const TRANSACTION_JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Persists only the small components, to state.json. For changes that are not a
 /// captured transaction — an intercept enqueue, a websocket open, a scanner

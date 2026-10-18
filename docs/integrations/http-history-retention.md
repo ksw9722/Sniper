@@ -47,6 +47,12 @@ Saving a policy and finishing cleanup are separate operations. Responses contain
   `workspace_durability_uncertain`, `persistence_error`, or
   `record_identity_conflict`
 
+Rows deleted by a policy change have their disk space reclaimed promptly. Once a
+session is at its target, each captured row deletes an old one; that space is
+reclaimed by the next session rewrite, which 64 MiB of journal or of deleted
+rows triggers, so `disk_cleanup_pending` can stay true while capture continues.
+Deleted rows stay deleted across a restart either way.
+
 A record-identity conflict means legacy rows share a UUID and deleting that ID
 would remove more rows than the excess permits. Cleanup stays pending without
 automatic repair or UUID rewriting.

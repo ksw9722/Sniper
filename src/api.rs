@@ -25360,6 +25360,9 @@ mod tests {
             session.store.insert(record).await;
             history_retention_wait_count(&session, 1).await;
         }
+        // Outwait the compaction interval (one second under test): trims from
+        // captures under an unchanged policy leave the rewrite to journal growth.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert!(session.store.retention_compaction_pending());
         assert_eq!(
             session
@@ -25367,6 +25370,27 @@ mod tests {
                 .compactions_started
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+        // A changed policy still reclaims the space promptly.
+        assert_eq!(
+            history_retention_save(&state, &session, history_retention_policy(2))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while session.store.retention_compaction_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .history_retention
+                .compactions_started
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
         drop(session);
         drop(state);
