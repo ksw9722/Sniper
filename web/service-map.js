@@ -2181,8 +2181,10 @@
       parametersAbort = null;
       Object.assign(state, { parameters: null, parametersKey: null, parametersLoading: false, parametersError: "" });
     }
+    // Not the history version: every captured row moves it, and would reread
+    // an open endpoint's parameters each poll.
     const endpointParametersKey = (originId, endpoint) => JSON.stringify([
-      getSessionId(), state.historyVersion, state.snapshot?.snapshot.generation, originId, endpoint.method, endpoint.path,
+      getSessionId(), state.snapshot?.snapshot.generation, originId, endpoint.method, endpoint.path,
     ]);
     async function loadParameters(originId, endpoint) {
       const key = endpointParametersKey(originId, endpoint);
@@ -3546,11 +3548,12 @@
           (layer) => !recordId || layer.kind === "peer" || !validTechnologyEvidence(layer.source.evidenceId, layer.source.sessionId, layer.source.generation) || layer.source.evidenceId.split(".")[5].toLowerCase() === recordId);
         state.historyVersion += 1;
         state.stale = true;
-        // Open API docs stay: this fires for every captured row, so closing
-        // them here would shut the dialog while traffic flows. A count one row
-        // behind is harmless, and Replay reports a row that is gone.
+        // Open API docs and an open endpoint's parameters stay: this fires for
+        // every captured row, so clearing them here would empty the dialog and
+        // the panel while traffic flows. A count one row behind is harmless,
+        // and Replay reports a row that is gone. Deletion, retention and Clear
+        // go through invalidate(), which does clear them.
         cancelEvidence();
-        cancelParameters();
         render();
       },
       setVisible(value, view = state.view) {

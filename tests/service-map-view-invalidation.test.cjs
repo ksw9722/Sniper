@@ -135,7 +135,6 @@ test('reopening an endpoint reads its newest rows even without a map generation 
 
 const boundaries = {
   'history invalidation': f => f.controller.invalidate(),
-  'history event': f => f.controller.markDirty(),
   Reload: f => f.controller.refresh({ force: true }),
   'Service Map filter': f => { f.setFilter({ search: 'fresh' }); return f.controller.filterChanged(); },
   'scope filter': f => f.els.scope.dispatch('click'),
@@ -199,12 +198,20 @@ test('repeated clicks, same-source polling and local presentation changes preser
   await f.completeParameters(); assert.match(f.els.detail.innerHTML, /current-value/);
 });
 
-test('history changes during a map read defer parameter rereads until a current snapshot arrives', async () => {
+// Every captured row marks the map dirty. The open endpoint keeps its values
+// and its pending read, or the panel would empty and reread each poll.
+test('a captured row keeps an open endpoint\'s parameters and starts no reread', async () => {
   const f = fixture(); await open(f); await f.completeParameters();
   const pending = f.controller.refresh(); f.controller.markDirty();
   f.requests.at(-1).resolve(response(snapshot())); await pending;
-  assert.equal(f.state.stale, true); assert.equal(f.parameterRequests.length, 1); assert.equal(f.state.parameters, null);
-  await f.load(); assert.equal(f.parameterRequests.length, 2);
+  await f.load(); f.controller.markDirty(); await f.load();
+  assert.equal(f.parameterRequests.length, 1); assert.match(f.els.detail.innerHTML, /current-value/);
+});
+test('a captured row leaves a pending parameter read running', async () => {
+  const f = fixture(); await open(f); const pending = f.parameterRequests[0];
+  f.controller.markDirty(); await f.load();
+  assert.equal(pending.options.signal.aborted, false); assert.equal(f.parameterRequests.length, 1);
+  await f.completeParameters(); assert.match(f.els.detail.innerHTML, /current-value/);
 });
 
 test('filter change while hidden still cancels old parameters without starting hidden reads', async () => {
