@@ -17632,11 +17632,13 @@ function clearReplaySendInFlight() {
   setReplaySending(false);
 }
 
-function isReplayTabStillCurrent(tab, tabId, sessionId) {
+function isReplayTabStillCurrent(tab, tabId, sessionId, controller) {
   return Boolean(
     tab
     && state.replayTabs.includes(tab)
     && tab.id === tabId
+    && _replaySendControllers.get(tabId) === controller
+    && !controller.signal.aborted
     && (state.activeSession?.id || null) === sessionId
   );
 }
@@ -17695,159 +17697,149 @@ async function sendReplay() {
   _replaySendControllers.set(sendingTabId, replayController);
   setReplaySending(true);
 
-  let expectedWorkspaceRevision;
+  // Keep ownership until the body is decoded and applied, not just until
+  // fetch resolves headers. Cancel/close may retire it at any await.
   try {
-    expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
-  } catch (error) {
-    if (_replaySendControllers.get(sendingTabId) !== replayController || replayController.signal.aborted) {
+    let expectedWorkspaceRevision;
+    try {
+      expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
+    } catch (error) {
+      if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+      if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+      }
+      handleWorkspaceActionError(error);
       return;
     }
-    _replaySendControllers.delete(sendingTabId);
-    setReplaySending(false);
-    if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
+    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+
+    // Enter sending state after validation so only a valid send clears the response pane.
+    tab.responseRecord = null;
+    tab.notice = "";
+    if (state.activeReplayTabId === sendingTabId) {
+      els.replayFollowRedirectButton?.classList.add("hidden");
+      els.replayResponseMeta.textContent = "";
+      renderReplayResponseView("");
     }
-    handleWorkspaceActionError(error);
-    return;
-  }
-  if (_replaySendControllers.get(sendingTabId) !== replayController || replayController.signal.aborted) {
-    return;
-  }
-  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-    _replaySendControllers.delete(sendingTabId);
-    setReplaySending(false);
-    return;
-  }
 
-  // Enter sending state after validation so only a valid send clears the response pane.
-  tab.responseRecord = null;
-  tab.notice = "";
-  els.replayFollowRedirectButton?.classList.add("hidden");
-  els.replayResponseMeta.textContent = "";
-  renderReplayResponseView("");
-
-  let response;
-  try {
-    const targetPayload = replayTargetOverridePayload(tab, request, target);
-    response = await fetch("/api/replay/send", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        session_id: sendingSessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(sendingSessionId),
-        expected_workspace_revision: expectedWorkspaceRevision,
+    let response, responseRecord, errorPayload;
+    try {
+      const targetPayload = replayTargetOverridePayload(tab, request, target);
+      response = await fetch("/api/replay/send", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          session_id: sendingSessionId,
+          expected_active_session_id: expectedActiveSessionIdForWrite(sendingSessionId),
+          expected_workspace_revision: expectedWorkspaceRevision,
+          request,
+          target: targetPayload,
+          source_transaction_id: tab.sourceTransactionId,
+          http_version: httpVersion,
+        }),
+        signal: replayController.signal,
+      });
+      if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+      if (response.ok) {
+        responseRecord = await response.json();
+      } else {
+        errorPayload = await readReplaySendError(response);
+      }
+    } catch (e) {
+      if (e.name === "AbortError") return; // cancelled
+      if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) return;
+      const notice = e?.message || "Failed to send replay.";
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = null;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+      }
+      recordRepeaterHistory(tab, {
         request,
-        target: targetPayload,
-        source_transaction_id: tab.sourceTransactionId,
-        http_version: httpVersion,
-      }),
-      signal: replayController.signal,
-    });
-  } catch (e) {
-    if (e.name === "AbortError") return; // cancelled
-    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) return;
-    const notice = e?.message || "Failed to send replay.";
+        requestText,
+        responseRecord: null,
+        notice,
+        target,
+      });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      showToast(notice, "error");
+      return;
+    }
+
+    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId, replayController)) {
+      return;
+    }
+
+    if (!response.ok) {
+      if (errorPayload.workspaceConflict) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+        handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
+        return;
+      }
+      const notice = errorPayload.notice;
+      const responseRecord = errorPayload.responseRecord;
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = responseRecord;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+      }
+      recordRepeaterHistory(tab, {
+        request,
+        requestText,
+        responseRecord,
+        notice,
+        target,
+      });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      showToast(notice, "error");
+      if (responseRecord) {
+        scheduleRefresh();
+      }
+      return;
+    }
+
     const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
     if (draftUnchanged) {
-      tab.responseRecord = null;
-      tab.notice = notice;
       applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
+      tab.notice = "";
+      tab.responseRecord = responseRecord;
     }
     recordRepeaterHistory(tab, {
       request,
       requestText,
-      responseRecord: null,
-      notice,
+      responseRecord,
+      notice: "",
       target,
     });
     scheduleWorkspaceStateSave();
+    // Only update response side — don't re-render request to preserve cursor/scroll
     if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
       renderReplayResponseOnly(tab);
       syncReplayToolbar(tab);
+      renderReplayViewTabs();
+    } else if (!draftUnchanged && state.activeReplayTabId === sendingTabId) {
+      syncReplayToolbar(tab);
+      showToast("Replay response was saved to history; current request changed while sending.", "info", 4000);
     }
-    showToast(notice, "error");
-    return;
+    scheduleRefresh();
   } finally {
     if (_replaySendControllers.get(sendingTabId) === replayController) {
       _replaySendControllers.delete(sendingTabId);
       setReplaySending(false);
     }
   }
-
-  if (!state.replayTabs.some((item) => item.id === sendingTabId)) {
-    return;
-  }
-  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-    return;
-  }
-
-  if (!response.ok) {
-    const errorPayload = await readReplaySendError(response);
-    if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-      return;
-    }
-    if (errorPayload.workspaceConflict) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
-      handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
-      return;
-    }
-    const notice = errorPayload.notice;
-    const responseRecord = errorPayload.responseRecord;
-    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-    if (draftUnchanged) {
-      tab.responseRecord = responseRecord;
-      tab.notice = notice;
-      applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
-    }
-    recordRepeaterHistory(tab, {
-      request,
-      requestText,
-      responseRecord,
-      notice,
-      target,
-    });
-    scheduleWorkspaceStateSave();
-    if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
-      renderReplayResponseOnly(tab);
-      syncReplayToolbar(tab);
-    }
-    showToast(notice, "error");
-    if (responseRecord) {
-      scheduleRefresh();
-    }
-    return;
-  }
-
-  const responseRecord = await response.json();
-  if (!isReplayTabStillCurrent(tab, sendingTabId, sendingSessionId)) {
-    return;
-  }
-  const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-  if (draftUnchanged) {
-    applyReplaySentDraftIfUnchanged(tab, request, requestText, target);
-    tab.notice = "";
-    tab.responseRecord = responseRecord;
-  }
-  recordRepeaterHistory(tab, {
-    request,
-    requestText,
-    responseRecord,
-    notice: "",
-    target,
-  });
-  scheduleWorkspaceStateSave();
-  // Only update response side — don't re-render request to preserve cursor/scroll
-  if (draftUnchanged && state.activeReplayTabId === sendingTabId) {
-    renderReplayResponseOnly(tab);
-    syncReplayToolbar(tab);
-    renderReplayViewTabs();
-  } else if (!draftUnchanged && state.activeReplayTabId === sendingTabId) {
-    syncReplayToolbar(tab);
-    showToast("Replay response was saved to history; current request changed while sending.", "info", 4000);
-  }
-  scheduleRefresh();
 }
 
 function isWorkspaceRevisionConflictPayload(payload) {
@@ -18094,7 +18086,8 @@ async function followRedirect() {
 
   // Add updated host
   const newHostPort = isDefaultPortForScheme(newScheme, newPort) ? "" : newPort;
-  newHeaders.unshift({ name: "host", value: joinAuthority(newHost, newHostPort) });
+  const newAuthority = joinAuthority(newHost, newHostPort);
+  newHeaders.unshift({ name: "host", value: newAuthority });
 
   // Add merged cookies
   if (cookieMap.size > 0) {
@@ -18103,7 +18096,7 @@ async function followRedirect() {
 
   const newRequest = {
     scheme: newScheme,
-    host: newHost,
+    host: newAuthority,
     method: newMethod,
     path: newPath,
     headers: newHeaders,
@@ -18136,114 +18129,124 @@ async function followRedirect() {
     renderReplayViewTabs();
   }
 
-  let expectedWorkspaceRevision;
-  try {
-    expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
-  } catch (error) {
-    if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
-    }
-    handleWorkspaceActionError(error);
-    return;
-  }
-
-  // Send the follow request
-  const target = { scheme: newScheme, host: newHost, port: newPort };
   const followingTabId = tab.id;
   const followingSessionId = state.activeSession?.id || null;
   const replayController = new AbortController();
   _replaySendControllers.set(followingTabId, replayController);
   setReplaySending(true);
-  let response;
+
+  // Keep ownership until the body is decoded and applied, not just until
+  // fetch resolves headers. Cancel/close may retire it at any await.
   try {
-    response = await fetch("/api/replay/send", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        session_id: followingSessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
-        expected_workspace_revision: expectedWorkspaceRevision,
-        request: newRequest,
-        target,
-        source_transaction_id: null,
-        http_version: httpVersion,
-      }),
-      signal: replayController.signal,
-    });
-  } catch (e) {
-    if (e.name === "AbortError") return;
-    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-    const notice = e?.message || "Failed to follow redirect.";
+    let expectedWorkspaceRevision;
+    try {
+      expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
+    } catch (error) {
+      if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+      if (error instanceof WorkspaceStateConflictError && !error.commitUncertain) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+      }
+      handleWorkspaceActionError(error);
+      return;
+    }
+
+    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+
+    // Send the follow request
+    const target = { scheme: newScheme, host: newHost, port: newPort };
+    let response, responseRecord, errorPayload;
+    try {
+      response = await fetch("/api/replay/send", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: followingSessionId,
+          expected_active_session_id: expectedActiveSessionIdForWrite(followingSessionId),
+          expected_workspace_revision: expectedWorkspaceRevision,
+          request: newRequest,
+          target: replayTargetOverridePayload(tab, newRequest, target),
+          source_transaction_id: null,
+          http_version: httpVersion,
+        }),
+        signal: replayController.signal,
+      });
+      if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+      if (response.ok) {
+        responseRecord = await response.json();
+      } else {
+        errorPayload = await readReplaySendError(response);
+      }
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+      const notice = e?.message || "Failed to follow redirect.";
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = null;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+      }
+      recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord: null, notice, target });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === followingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      showToast(notice, "error");
+      return;
+    }
+
+    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId, replayController)) return;
+
+    if (!response.ok) {
+      if (errorPayload.workspaceConflict) {
+        restoreReplayTabConflictState(tab, conflictSnapshot);
+        handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
+        return;
+      }
+      const notice = errorPayload.notice;
+      const responseRecord = errorPayload.responseRecord;
+      const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
+      if (draftUnchanged) {
+        tab.responseRecord = responseRecord;
+        tab.notice = notice;
+        applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+      }
+      recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice, target });
+      scheduleWorkspaceStateSave();
+      if (draftUnchanged && state.activeReplayTabId === followingTabId) {
+        renderReplayResponseOnly(tab);
+        syncReplayToolbar(tab);
+      }
+      if (responseRecord) {
+        scheduleRefresh();
+      }
+      return;
+    }
+
     const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
     if (draftUnchanged) {
-      tab.responseRecord = null;
-      tab.notice = notice;
       applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
+      tab.notice = "";
+      tab.responseRecord = responseRecord;
     }
-    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord: null, notice, target });
+    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice: "", target });
     scheduleWorkspaceStateSave();
     if (draftUnchanged && state.activeReplayTabId === followingTabId) {
       renderReplayResponseOnly(tab);
       syncReplayToolbar(tab);
+      renderReplayViewTabs();
+    } else if (!draftUnchanged && state.activeReplayTabId === followingTabId) {
+      syncReplayToolbar(tab);
+      showToast("Redirect response was saved to history; current request changed while sending.", "info", 4000);
     }
-    showToast(notice, "error");
-    return;
+    scheduleRefresh();
   } finally {
     if (_replaySendControllers.get(followingTabId) === replayController) {
       _replaySendControllers.delete(followingTabId);
       setReplaySending(false);
     }
   }
-
-  if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-
-  if (!response.ok) {
-    const errorPayload = await readReplaySendError(response);
-    if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-    if (errorPayload.workspaceConflict) {
-      restoreReplayTabConflictState(tab, conflictSnapshot);
-      handleReplayWorkspaceRevisionConflict(errorPayload.workspaceSnapshot);
-      return;
-    }
-    const notice = errorPayload.notice;
-    const responseRecord = errorPayload.responseRecord;
-    const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-    if (draftUnchanged) {
-      tab.responseRecord = responseRecord;
-      tab.notice = notice;
-      applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
-    }
-    recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice, target });
-    scheduleWorkspaceStateSave();
-    if (draftUnchanged && state.activeReplayTabId === followingTabId) {
-      renderReplayResponseOnly(tab);
-      syncReplayToolbar(tab);
-    }
-    if (responseRecord) {
-      scheduleRefresh();
-    }
-    return;
-  }
-
-  const responseRecord = await response.json();
-  if (!isReplayTabStillCurrent(tab, followingTabId, followingSessionId)) return;
-  const draftUnchanged = replaySentDraftUnchanged(tab, requestText, target);
-  if (draftUnchanged) {
-    applyReplaySentDraftIfUnchanged(tab, newRequest, requestText, target);
-    tab.notice = "";
-    tab.responseRecord = responseRecord;
-  }
-  recordRepeaterHistory(tab, { request: newRequest, requestText, responseRecord, notice: "", target });
-  scheduleWorkspaceStateSave();
-  if (draftUnchanged && state.activeReplayTabId === followingTabId) {
-    renderReplayResponseOnly(tab);
-    syncReplayToolbar(tab);
-    renderReplayViewTabs();
-  } else if (!draftUnchanged && state.activeReplayTabId === followingTabId) {
-    syncReplayToolbar(tab);
-    showToast("Redirect response was saved to history; current request changed while sending.", "info", 4000);
-  }
-  scheduleRefresh();
 }
 
 function openBlankReplayTab() {
@@ -24772,6 +24775,7 @@ function truncateSetupLabel(body, kind = "text") {
 async function wsConnect() {
   const tab = getActiveReplayTab();
   if (!tab || tab.type !== "websocket") return;
+  if (tab.wsStatus === "connecting" || tab.wsStatus === "connected") return;
   const sessionId = state.activeSession?.id || null;
 
   // Sync fields from UI
@@ -24815,30 +24819,38 @@ async function wsConnect() {
   renderWsSetupQueue();
   renderWsFrameList();
 
+  const isCurrentConnection = () => isWsReplayTabAlive(tab, lifecycleToken)
+    && (state.activeSession?.id || null) === sessionId;
   try {
+    // The shared editor may belong to another tab by the time persistence
+    // finishes. Capture the complete connection while this tab owns the UI.
+    const connection = {
+      session_id: sessionId,
+      expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+      id: tab.id,
+      scheme: tab.wsScheme,
+      host: tab.wsHost,
+      port: Number(wsPort),
+      path: wsPath,
+      headers: parseWsHandshakeHeaders(tab),
+    };
     const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
-    const headers = parseWsHandshakeHeaders(tab);
+    if (!isCurrentConnection()) return;
     const resp = await fetch("/api/replay/ws-connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        session_id: sessionId,
-        expected_active_session_id: expectedActiveSessionIdForWrite(sessionId),
+        ...connection,
         expected_workspace_revision: expectedWorkspaceRevision,
-        id: tab.id,
-        scheme: tab.wsScheme,
-        host: tab.wsHost,
-        port: Number(wsPort),
-        path: wsPath,
-        headers,
       }),
     });
-    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+    if (!isCurrentConnection()) {
       await disconnectWsReplayBackend(tab.id, { remove: true, sessionId });
       return;
     }
     if (!resp.ok) {
       const workspaceConflict = await readWorkspaceRevisionConflictPayload(resp);
+      if (!isCurrentConnection()) return;
       if (workspaceConflict) {
         restoreReplayTabConflictState(tab, conflictSnapshot);
         handleReplayWorkspaceRevisionConflict(workspaceConflict);
@@ -24860,7 +24872,7 @@ async function wsConnect() {
     // Auto-send setup queue after connection
     await runSetupQueue(tab, lifecycleToken);
   } catch (e) {
-    if (!isWsReplayTabAlive(tab, lifecycleToken)) {
+    if (!isCurrentConnection()) {
       return;
     }
     if (e instanceof WorkspaceStateConflictError) {
