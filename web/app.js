@@ -24188,21 +24188,39 @@ function syncColorTagFilterUI() {
   });
 }
 
+// The client's copy of src/scope.rs, which decides what the server lists as in
+// scope. It must agree: History drops a row whose update this calls out of
+// scope, and the old copy, without globs, excludes or the root dot, dropped
+// in-scope rows as soon as they were tagged or noted.
 function isInScopeHost(host) {
-  const patterns = state.runtime?.scope_patterns || [];
-  if (!patterns.length) {
-    return true;
-  }
-
   const hostname = normalizeHostForMatching(host);
-  return patterns.some((pattern) => {
-    const normalized = normalizeHostForMatching(pattern);
-    if (normalized.startsWith("*.")) {
-      const suffix = normalized.slice(2);
-      return hostname === suffix || hostname.endsWith(`.${suffix}`);
-    }
-    return hostname === normalized;
-  });
+  const matches = (pattern) => hostMatchesScopePattern(hostname, pattern);
+  const include = state.runtime?.scope_patterns || [];
+  const exclude = state.runtime?.excluded_scope_patterns || [];
+  return (!include.length || include.some(matches)) && !exclude.some(matches);
+}
+
+// `*.example.com` is the domain and anything under it; any other `*` stands for
+// any run of characters; anything else is one exact host.
+function hostMatchesScopePattern(hostname, pattern) {
+  const normalized = normalizeHostForMatching(pattern);
+  if (normalized.startsWith("*.") && !normalized.slice(2).includes("*")) {
+    const suffix = normalized.slice(2);
+    return hostname === suffix || hostname.endsWith(`.${suffix}`);
+  }
+  if (!normalized.includes("*")) return hostname === normalized;
+  const parts = normalized.split("*");
+  const first = parts.shift();
+  const last = parts.pop();
+  if (!hostname.startsWith(first) || !hostname.endsWith(last) || first.length + last.length > hostname.length) return false;
+  let rest = hostname.slice(first.length, hostname.length - last.length);
+  for (const middle of parts) {
+    if (!middle) continue;
+    const at = rest.indexOf(middle);
+    if (at < 0) return false;
+    rest = rest.slice(at + middle.length);
+  }
+  return true;
 }
 
 function normalizeHostForMatching(host) {
@@ -24214,7 +24232,7 @@ function normalizeHostForMatching(host) {
     value = value.slice(2);
   }
   const hostOnly = value.split(/[/?#]/, 1)[0].trim();
-  return hostWithoutPort(hostOnly).toLowerCase();
+  return hostWithoutPort(hostOnly).toLowerCase().replace(/\.$/, "");
 }
 
 function hostWithoutPort(host) {
