@@ -457,7 +457,7 @@ response statuses and media types, and the credentials its rows showed, built
 from every retained row and holding no captured value. Each operation sends its
 newest row to Replay, and the document copies as JSON or opens in Swagger
 Editor (editor.swagger.io, to paste it into). The map has its own tool,
-**Service Map**, after Capture, with **Map** and **APIs** views; **Scope** again
+**Map**, after Capture, with **Service Map** and **APIs** views; **Scope** again
 shows its rules beside the captured hosts and paths on one screen, as before the
 map was added. The CLI keeps `scope service-map`, with `target` as an alias of
 `scope`. An origin whose rows

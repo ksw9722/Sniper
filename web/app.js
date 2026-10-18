@@ -7613,7 +7613,7 @@ async function loadTargetSiteMap(forceScopeSync = false, saveContext = null) {
   const sessionId = currentSessionId();
   const workspaceGeneration = workspaceStateGeneration;
   // The legacy Paths projection is unbounded and carries raw paths. Load it only
-  // for Scope, where it is shown, never for the Service Map tool.
+  // for Scope, where it is shown, never for the Map tool.
   const loadPaths = state.activeTool === "target";
   const [runtimeResponse, siteMapResponse] = await Promise.all([
     fetch(sessionQueryPath("/api/runtime", sessionId)),
@@ -8909,7 +8909,7 @@ function renderToolPanels() {
   }
 
   if (mapVisible) {
-    els.footerMode.textContent = "Service Map active";
+    els.footerMode.textContent = "Map active";
     return;
   }
 
@@ -14886,7 +14886,7 @@ function initializeTargetWorkspace() {
   setActiveTargetView(state.activeTargetView || "service-map");
 }
 
-// The Service Map tool's two views of one map: the graph and its APIs. Scope
+// The Map tool's two views of one map: the graph and its APIs. Scope
 // shows its rules and paths together, with no views to switch.
 function setActiveTargetView(view, { refresh = true } = {}) {
   state.activeTargetView = ["service-map", "apis"].includes(view) ? view : "service-map";

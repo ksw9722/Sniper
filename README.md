@@ -87,7 +87,7 @@ cargo run --bin sniper-desktop
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
 | **Sessions** | Isolated workspaces — each with its own records, scope, and state |
 | **Scope** | Host and wildcard filtering beside the captured hosts and paths |
-| **Service Map** | A passive retained-history map of the captured origins and their relations, and the APIs they serve |
+| **Map** | A passive retained-history Service Map of the captured origins and their relations, and the APIs they serve |
 | **Themes** | 12 themes — 7 dark + 5 light, gold-accent design language |
 | **CLI** | `sniper-cli` — JSON-first automation for scripting |
 | **AI Skills** | Built-in Claude & Codex skill templates using `sniper-cli` |
@@ -172,7 +172,7 @@ Session → Scope → Capture → Replay → Fuzz
 
 - **Session** — isolated workspaces with their own records and state
 - **Scope** — define target domains/paths, auto-filter traffic, and see the captured hosts and paths beside them
-- **Service Map** — the captured origins, how they relate, and the APIs they serve, from retained history
+- **Map** — the Service Map of the captured origins, how they relate, and the APIs they serve, from retained history
 - **Capture** — inspect HTTP, render HTML and image responses in a sandbox, intercept & modify, WebSocket frames, auto-replace
 - **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses
 - **Replay** — resend with modifications, override host/port, render the response
