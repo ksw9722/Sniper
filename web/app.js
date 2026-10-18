@@ -14161,7 +14161,9 @@ function renderReplay(options = {}) {
     // Keep the editor's history on redraw, while refreshing draft-capture state.
     editorOwner: previousOwner?.editorOwner || {},
   };
-  syncReplayToolbar(tab, { force: options.forceToolbarSync });
+  // Async captured-record opens and workspace adoption can change owners without
+  // going through a tab-click handler. Focus only protects this owner's draft.
+  syncReplayToolbar(tab, { force: options.forceToolbarSync || !previousOwner });
   const reqMode = state.replayMessageViews.request;
   if (els.replayRequestCM) {
     // CM path for all modes
