@@ -5850,7 +5850,20 @@ mod tests {
 
         let read = registry.load_context_read_only(active.id()).unwrap();
         let loaded = read.store.get(id).await.unwrap();
-        assert_eq!(loaded.response.unwrap().body_preview, "retained body");
+        assert_eq!(
+            loaded.response.as_ref().unwrap().body_preview,
+            "retained body"
+        );
+
+        // A capture that lands in it is persisted at once; the older row keeps
+        // its body rather than being written back without one.
+        let mut later = loaded.clone();
+        later.id = Uuid::new_v4();
+        read.store.insert(later).await;
+        read.persist().await.unwrap();
+        let reloaded = registry.load_context(active.id()).unwrap();
+        let kept = reloaded.store.get(id).await.unwrap();
+        assert_eq!(kept.response.unwrap().body_preview, "retained body");
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

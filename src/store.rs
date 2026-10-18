@@ -264,6 +264,10 @@ pub struct TransactionStore {
     /// Session directory, so a record whose bodies were dropped can be read back
     /// out of transactions.ndjson. Derived from the journal path.
     storage_dir: Option<PathBuf>,
+    /// `storage_dir` is only where bodies are read back: the store of a session
+    /// read without activation keeps no journal, so persisting it confirms no
+    /// rotation, as a store without a directory never did.
+    read_only_bodies: bool,
     /// Libraries read from retained scripts and pages; see `LibraryCaches`.
     library_versions: Mutex<LibraryCaches>,
     /// The last whole-history map, serialized; see `cached_service_map`.
@@ -1139,6 +1143,7 @@ impl TransactionStore {
             journal_tx: None,
             journal_start_failed: false,
             storage_dir: None,
+            read_only_bodies: false,
             library_versions: Mutex::new(LibraryCaches::default()),
             service_map_result: Mutex::new(None),
             max_entries,
@@ -1189,9 +1194,10 @@ impl TransactionStore {
 
     /// The store of a session read without being activated: bodies are read
     /// back from disk by their locators, as in a writable store, but there is
-    /// no journal, so it refuses to persist. It used to drop the locators, and
-    /// every body it served was empty: `history get --session-id` showed none,
-    /// and a search reported complete with no match.
+    /// no journal. It used to drop the locators, so every body it served was
+    /// empty (`history get --session-id` showed none, and a search reported
+    /// complete with no match), and a capture that landed in it and persisted
+    /// wrote its older rows back without their bodies.
     pub fn from_located_records_read_only(
         mut records: Vec<TransactionRecord>,
         mut locators: HashMap<Uuid, crate::session::BodyLocator>,
@@ -1206,6 +1212,7 @@ impl TransactionStore {
             latest_event_sequence,
         );
         store.storage_dir = Some(storage_dir);
+        store.read_only_bodies = true;
         store
             .inner
             .try_write()
@@ -3246,7 +3253,7 @@ impl TransactionStore {
                 .await?;
                 true
             }
-            None if self.storage_dir.is_some() => {
+            None if self.storage_dir.is_some() && !self.read_only_bodies => {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "transaction journal rotation cannot be confirmed",
@@ -3705,7 +3712,10 @@ impl TransactionStore {
                 "transaction snapshot source file changed before publication",
             ));
         }
-        if self.storage_dir.is_some() && !snapshot.journal_rotation_confirmed {
+        if self.storage_dir.is_some()
+            && !self.read_only_bodies
+            && !snapshot.journal_rotation_confirmed
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transaction snapshot journal boundary is not confirmed",
