@@ -1208,6 +1208,82 @@ mod history_fixture {
         })
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_map_unnamed_preserves_source_snapshot_separately_from_view_limits() {
+        let mock = MockApi::new().await;
+        let operation = "target.service_map.unnamed.get";
+        let schema = output_schema(operation);
+        let map_schema = output_schema("target.service_map.get");
+        assert_eq!(
+            schema["properties"]["snapshot"],
+            map_schema["properties"]["snapshot"]
+        );
+        let session = Uuid::nil().to_string();
+        for (reasons, omitted_rows) in [
+            (json!([]), 0),
+            (json!(["unnamed_signals_per_row_limit"]), 0),
+            (json!(["unnamed_signals_per_origin_limit"]), 0),
+            (json!(["header_value_limit", "origins_limit"]), 3),
+        ] {
+            for count in [0_usize, 2, 16] {
+                let mut payload = map_payload();
+                payload["snapshot"]["complete"] = json!(reasons.as_array().unwrap().is_empty());
+                payload["snapshot"]["stopped_by"] = reasons.clone();
+                payload["snapshot"]["omitted_rows"] = json!(omitted_rows);
+                payload["origins"][0]["unnamed"] = json!({"headers": (0..count).map(|index| json!({
+                    "value":format!("x-synthetic-{index:02}"), "row_count":1,
+                    "evidence":[BODY_REFERENCE_TOKEN]
+                })).collect::<Vec<_>>()});
+                *mock.state.payload.lock().unwrap() = payload.clone();
+                for kind in [None, Some("headers"), Some("cookies")] {
+                    for limit in [1, 100] {
+                        let limit_text = limit.to_string();
+                        let mut args = vec![
+                            "scope",
+                            "service-map",
+                            "unnamed",
+                            "--session-id",
+                            &session,
+                            "--limit",
+                            &limit_text,
+                        ];
+                        let mut input = json!({"session_id":session,"limit":limit});
+                        if let Some(kind) = kind {
+                            args.extend(["--kind", kind]);
+                            input["kind"] = json!(kind);
+                        }
+                        let direct = mock.command(&args).await;
+                        mock.assert_reads(
+                            "/api/target/service-map",
+                            &[("in_scope_only", "false"), ("all_rows", "true")],
+                        );
+                        let called = mock
+                            .command(&["call", operation, "--input", &input.to_string()])
+                            .await;
+                        mock.assert_reads(
+                            "/api/target/service-map",
+                            &[("in_scope_only", "false"), ("all_rows", "true")],
+                        );
+                        assert_eq!(called["data"], direct);
+                        assert_eq!(called["meta"]["session_id"], session);
+                        assert_eq!(direct["snapshot"], payload["snapshot"]);
+                        let available = if kind == Some("cookies") { 0 } else { count };
+                        assert_eq!(direct["distinct_signals"], available);
+                        assert_eq!(direct["omitted_signals"], available.saturating_sub(limit));
+                        assert_eq!(
+                            direct["signals"].as_array().unwrap().len(),
+                            available.min(limit)
+                        );
+                        assert_schema(&direct, &schema);
+                        let mut missing_snapshot = direct.clone();
+                        missing_snapshot.as_object_mut().unwrap().remove("snapshot");
+                        assert!(!super::matches_schema(&missing_snapshot, &schema));
+                    }
+                }
+            }
+        }
+    }
+
     fn evidence_payload(available: bool) -> Value {
         let row = json!({
             "evidence_id":"v1.00000000-0000-0000-0000-000000000000.22222222-2222-2222-2222-222222222222.9007199254740993.33333333-3333-3333-3333-333333333333.00000000-0000-0000-0000-000000000000","record_id":Uuid::nil(),"sequence":"9007199254740993",
