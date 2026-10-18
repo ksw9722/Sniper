@@ -70,11 +70,13 @@
     "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "com.cn", "com.tw", "com.hk", "com.sg", "com.br", "co.in", "co.nz"]);
   function siteKey(origin) {
     let host = "";
-    try { host = new URL(origin).hostname; } catch { return null; }
+    // The DNS root dot is not a label. Normalize only this display key, never
+    // the captured origin, so dotted hosts do not all become one TLD card.
+    try { host = new URL(origin).hostname.replace(/\.$/, ""); } catch { return null; }
     // An address or a single label names one host, not a site.
     if (!host || host.startsWith("[") || /^\d+(?:\.\d+){3}$/.test(host)) return null;
     const labels = host.split(".");
-    if (labels.length < 2) return null;
+    if (labels.length < 2 || labels.some((label) => !label)) return null;
     return labels.slice(labels.length > 2 && TWO_LEVEL_SUFFIXES.has(labels.slice(-2).join(".")) ? -3 : -2).join(".");
   }
   // Two or more origins of one site become one card unless the site is kept
