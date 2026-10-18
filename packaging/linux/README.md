@@ -1,8 +1,8 @@
 # Sniper on Debian 13: x86_64, X11
 
 **Debian 13 (trixie), x86_64, X11 is a supported target from v0.3.1.**
-Use the `v0.3.1` tag for source builds and the CI candidates of that commit.
-There are **no published Linux release assets yet**.
+Its `.deb` and portable `.tar.gz` are published with each release from v0.3.1;
+the `v0.3.1` tag is the source for builds of your own.
 Ubuntu, other Debian versions, other distributions, ARM, musl, native Wayland
 and XWayland are outside this qualification. These Linux checks make no new
 macOS qualification claim.
@@ -29,7 +29,21 @@ matching, provisioned Debian 13 machines; it is not a self-contained Linux app.
 The build manifest records actual ELF dependencies and GLIBC symbol versions.
 A glibc version match alone does not establish another distro's compatibility.
 
-## Get the source or CI artifacts
+## Get the release files, source or CI artifacts
+
+From the [latest release](https://github.com/sm1ee/Sniper/releases/latest),
+download `Sniper-<version>-debian13-x86_64.deb` or the portable
+`Sniper-<version>-debian13-x86_64.tar.gz` with its `.sha256`, and check it
+before following the instructions below:
+
+```sh
+sha256sum -c Sniper-<version>-debian13-x86_64.deb.sha256
+```
+
+The release also carries `-build-manifest.json` (source revision, compiler,
+dependencies and hashes, with its own `.sha256`) and `-runtime-PASS.json`, the
+CI check that installed, removed, reinstalled and purged that exact package in a
+fresh Debian 13. Both name the package by its SHA-256.
 
 For a new source checkout:
 

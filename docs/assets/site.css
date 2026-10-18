@@ -115,6 +115,7 @@ pre { max-width: 100%; overflow-x: auto; padding: 16px 18px; margin: 22px 0; bor
 .download-option .install-note { font-size: .76rem; line-height: 1.7; margin-top: 22px; }
 .release-note { display: flex; justify-content: space-between; gap: 20px; border-block: 1px solid var(--rule); margin-top: 45px; padding-block: 20px; font-size: .8rem; }
 .release-note > span { color: var(--muted); }
+.release-note + .release-note { margin-top: 0; border-top: 0; }
 .docs-section { padding-top: 0; }
 .docs-list { list-style: none; margin: 0; padding: 0; }
 .docs-list li { border-top: 1px solid var(--rule); }

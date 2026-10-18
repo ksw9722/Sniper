@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Lightweight, fast, open-source web proxy for macOS and Windows</strong><br/>
+  <strong>Lightweight, fast, open-source web proxy for macOS, Windows and Linux</strong><br/>
   A modern alternative to heavy proxy platforms — built in Rust, designed for security testing.
 </p>
 
@@ -12,11 +12,16 @@
   <img src="https://img.shields.io/badge/lang-Rust-orange?style=flat-square&logo=rust" alt="Rust" />
   <a href="https://github.com/sm1ee/Sniper/releases/latest"><img src="https://img.shields.io/badge/platform-macOS-blue?style=flat-square&logo=apple" alt="macOS" /></a>
   <a href="https://github.com/sm1ee/Sniper/releases/latest"><img src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square" alt="Windows" /></a>
+  <a href="https://github.com/sm1ee/Sniper/releases/latest"><img src="https://img.shields.io/badge/platform-Debian_13-blue?style=flat-square&logo=debian" alt="Debian 13" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" /></a>
 </p>
 
 <p align="center">
   <img src="web/screenshot.png" width="800" alt="Sniper's HTTP history with synthetic example.com traffic: a tagged POST /v1/cart request and its request and response" />
+</p>
+
+<p align="center">
+  <img src="web/screenshot-map.png" width="800" alt="The Map tool on the same traffic: the clients, the origins they reached with the servers and libraries each one names, and an API origin's endpoints and bearer JWT in the inspector" />
 </p>
 
 <p align="center">
@@ -27,7 +32,7 @@
 
 ## What is Sniper?
 
-Sniper is an **open-source desktop web security proxy** for macOS and Windows. It intercepts, inspects, and modifies HTTP/HTTPS traffic between your browser and the internet — the core workflow for web application security testing, bug bounty hunting, and API debugging.
+Sniper is an **open-source desktop web security proxy** for macOS, Windows and Linux (Debian 13). It intercepts, inspects, and modifies HTTP/HTTPS traffic between your browser and the internet — the core workflow for web application security testing, bug bounty hunting, and API debugging.
 
 If you've used an intercepting proxy before, the workflow will be familiar. Sniper is a **native desktop app** written in Rust with an embedded web UI.
 
@@ -45,11 +50,13 @@ Run the Windows setup executable built by `packaging/windows/make-setup.ps1`, or
 
 ### Linux: Debian 13 x86_64 on X11
 
-**Debian 13 (trixie), x86_64, X11 is supported from v0.3.1.** Build from the
-`v0.3.1` tag or use the CI candidate archive or `.deb` of that commit; there are
-**no published Linux release assets yet**.
+**Debian 13 (trixie), x86_64, X11 is supported from v0.3.1.** Download the
+`.deb` or the portable `.tar.gz` from the
+[latest release](https://github.com/sm1ee/Sniper/releases/latest) and check it
+against its `.sha256`; the release also carries the build manifest and the CI
+runtime check. Or build from the `v0.3.1` tag.
 
-See [Linux source, CI artifacts and installation](packaging/linux/README.md)
+See [Linux installation, source and CI artifacts](packaging/linux/README.md)
 for the qualification boundary, system GTK 3/WebKitGTK 4.1 requirements,
 checksums and installation instructions. Ubuntu, other distributions or Debian
 versions, ARM, native Wayland and XWayland are outside this support claim.
@@ -226,10 +233,6 @@ go to the target and to any other host the page names, and are not recorded in
 HTTP history.
 
 ## Passive Service Map
-
-<p align="center">
-  <img src="web/screenshot-map.png" width="800" alt="The Map tool: the clients, the origins they reached with the servers and libraries each one names, and an API origin's endpoints and bearer JWT in the inspector" />
-</p>
 
 The Map tool's Service Map summarizes origins and method-plus-exact-path endpoints from
 retained capture metadata, with counts, bounded evidence, scope state, header
