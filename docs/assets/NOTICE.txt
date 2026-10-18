@@ -34,3 +34,13 @@ Image SHA-256:
 This is the headless interface shared with the desktop app. The website labels
 it as a development preview; installation links continue to point to published
 releases. The earlier v0.2.12 image is retained for existing direct links.
+
+
+sniper-v0.3.1-preview.jpg and sniper-v0.3.1-map.jpg
+Unmodified screenshots of the real Sniper v0.3.1 web interface, built from
+commit 0d48426, captured on 2026-10-18 in Chromium at 1440x924 CSS pixels
+and device scale 2, then scaled to 2360x1514. The session holds synthetic
+traffic for example.com, example.net and example.org hosts: a local script
+sent it through an isolated instance, and a local mock server answered it.
+No third-party traffic or user data was captured. The earlier images are
+retained for existing direct links.

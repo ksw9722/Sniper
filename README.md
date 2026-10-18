@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="web/screenshot.png" width="800" alt="Sniper proxy UI — HTTP capture, replay, fuzzer" />
+  <img src="web/screenshot.png" width="800" alt="Sniper's HTTP history with synthetic example.com traffic: a tagged POST /v1/cart request and its request and response" />
 </p>
 
 <p align="center">
@@ -226,6 +226,10 @@ go to the target and to any other host the page names, and are not recorded in
 HTTP history.
 
 ## Passive Service Map
+
+<p align="center">
+  <img src="web/screenshot-map.png" width="800" alt="The Map tool: the clients, the origins they reached with the servers and libraries each one names, and an API origin's endpoints and bearer JWT in the inspector" />
+</p>
 
 The Map tool's Service Map summarizes origins and method-plus-exact-path endpoints from
 retained capture metadata, with counts, bounded evidence, scope state, header
