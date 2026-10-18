@@ -476,12 +476,12 @@ fn finding_dedup_key(finding: &ScannerFinding) -> FindingDedupKey {
     }
 }
 
-/// One finding per issue, not per request. A missing header, a cookie's flags
-/// or a CORS policy belong to the host; an open redirect, an exposed document
-/// or endpoint, or a caching policy to one endpoint, with ID segments grouped
-/// as the map groups them; a secret, a token, an address or a version banner
-/// to its own value. Each request used to add a finding, on every path the
-/// host served.
+/// One finding per issue, not per request. A missing header or a cookie's
+/// flags belong to the host; an open redirect, an error page, an exposed
+/// document or endpoint, or a caching policy to one endpoint, with ID segments
+/// grouped as the map groups them; a secret, a token, an address, a version
+/// banner, a CORS policy or a comment to its own value. Each request used to
+/// add a finding, on every path the host served.
 fn finding_scope(finding: &ScannerFinding) -> String {
     let endpoint = || {
         let path = finding.path.split(['?', '#']).next().unwrap_or("");
@@ -494,8 +494,14 @@ fn finding_scope(finding: &ScannerFinding) -> String {
         ("disclosure" | "jwt", _) | ("info", "Email address in response") => {
             finding.evidence.clone()
         }
-        // A host may run more than one stack, one behind each path.
+        // A host may run more than one stack, one behind each path; a CORS
+        // policy may trust more than one origin, and a site may leave more
+        // than one comment.
         ("server", title) if title.ends_with("version disclosure") => finding.evidence.clone(),
+        ("cors", _) => finding.evidence.clone(),
+        ("info", title) if title.starts_with("HTML comment") => finding.evidence.clone(),
+        // A SQL error or a stack trace on `/search` and on `/login` are two leads.
+        ("error", _) => endpoint(),
         ("auth", "Possible open redirect") => endpoint(),
         ("misconfig", title) if title.contains("Cache-Control") => endpoint(),
         ("info", title) if ENDPOINT_INFO_TITLES.contains(&title) => endpoint(),
@@ -2379,14 +2385,33 @@ fn origin_is_same_site(origin: &str, request_scheme: &str, request_host: &str) -
     origin_scheme == scheme && site_of(&origin_host) == site_of(&host)
 }
 
-/// A host's registrable domain: its last two labels, or three under a known
-/// two-level suffix (the map's own, `TWO_LEVEL_SUFFIXES` in
-/// web/service-map.js). An address or a single label is its own site.
+/// A host's registrable domain: its last two labels, or three under a suffix
+/// whose names belong to different owners, a ccTLD's own second level
+/// (`co.kr`, `com.mx`, `co.za`) or an app host that gives each customer a
+/// subdomain (`herokuapp.com`). An address or a single label is its own site.
+// ponytail: a heuristic and a short list, not the public suffix list; a
+// missing shared host reads as one site and hides that host's CORS findings.
 fn site_of(host: &str) -> &str {
-    const TWO_LEVEL_SUFFIXES: &[&str] = &[
-        "co.kr", "or.kr", "go.kr", "ac.kr", "ne.kr", "re.kr", "pe.kr", "co.jp", "ne.jp", "or.jp",
-        "ac.jp", "go.jp", "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
-        "com.cn", "com.tw", "com.hk", "com.sg", "com.br", "co.in", "co.nz",
+    const COUNTRY_SECOND_LEVELS: &[&str] = &[
+        "com", "net", "org", "edu", "gov", "mil", "co", "ac", "or", "ne", "go", "re", "pe", "gob",
+    ];
+    const SHARED_HOSTS: &[&str] = &[
+        "herokuapp.com",
+        "vercel.app",
+        "netlify.app",
+        "github.io",
+        "gitlab.io",
+        "pages.dev",
+        "workers.dev",
+        "web.app",
+        "firebaseapp.com",
+        "appspot.com",
+        "azurewebsites.net",
+        "cloudfront.net",
+        "onrender.com",
+        "fly.dev",
+        "myshopify.com",
+        "blogspot.com",
     ];
     let host = host.trim_end_matches('.');
     if host.starts_with('[') || host.parse::<std::net::Ipv4Addr>().is_ok() {
@@ -2397,10 +2422,15 @@ fn site_of(host: &str) -> &str {
     let Some(two) = starts.next() else {
         return host;
     };
-    if TWO_LEVEL_SUFFIXES.contains(&&host[two..]) {
+    let suffix = &host[two..];
+    let shared = SHARED_HOSTS.contains(&suffix)
+        || suffix
+            .split_once('.')
+            .is_some_and(|(second, top)| top.len() == 2 && COUNTRY_SECOND_LEVELS.contains(&second));
+    if shared {
         return starts.next().map_or(host, |three| &host[three..]);
     }
-    &host[two..]
+    suffix
 }
 
 // ── Rule 6: Server / Version Disclosure ──
@@ -3568,7 +3598,12 @@ fn check_exposures(record: &TransactionRecord, findings: &mut Vec<ScannerFinding
         && !javascript_or_css_response(record, response)
     {
         let html = is_html_page_response(response);
-        for detection in crate::service_map_servers::detect_body(&response.body_preview) {
+        // These pages say what they are at the top, and this runs on every
+        // captured response: the rules' long bounded gaps cost time on
+        // megabytes of text.
+        let body = &response.body_preview;
+        let head = &body[..previous_char_boundary(body, body.len().min(EXPOSURE_BODY_BYTES))];
+        for detection in crate::service_map_servers::detect_body(head) {
             // A page about a project quotes these files in its code blocks; the
             // files themselves are served as text.
             if html && matches!(detection.product_id.as_str(), "git_config" | "dotenv") {
@@ -3597,6 +3632,8 @@ fn check_exposures(record: &TransactionRecord, findings: &mut Vec<ScannerFinding
         }
     }
 }
+
+const EXPOSURE_BODY_BYTES: usize = 64 * 1024;
 
 /// The map's exposures this rule reports, by how much each gives away.
 fn map_exposure_severity(product_id: &str) -> Option<Severity> {
@@ -4143,7 +4180,25 @@ mod tests {
         assert!(!store.push(secret("/b.js", "AKIA-one")).await);
         assert!(store.push(secret("/a.js", "AKIA-two")).await);
 
-        assert_eq!(store.list(None).await.len(), 4);
+        let error = |path: &str| {
+            let mut finding = finding("SQL error in error response");
+            finding.category = "error".to_string();
+            finding.path = path.to_string();
+            finding
+        };
+        assert!(store.push(error("/search?q='")).await);
+        assert!(!store.push(error("/search?q=%27")).await);
+        assert!(store.push(error("/login")).await);
+        let cors = |origin: &str| {
+            let mut finding = finding("CORS: another site allowed with credentials");
+            finding.category = "cors".to_string();
+            finding.evidence = format!("ACAO: {origin}, ACAC: true");
+            finding
+        };
+        assert!(store.push(cors("https://partner.example")).await);
+        assert!(store.push(cors("https://evil.example")).await);
+
+        assert_eq!(store.list(None).await.len(), 8);
     }
 
     #[tokio::test]
@@ -6037,6 +6092,9 @@ mod tests {
 
     #[test]
     fn site_of_keeps_two_level_suffixes_and_addresses_whole() {
+        assert_eq!(site_of("victim.herokuapp.com"), "victim.herokuapp.com");
+        assert_eq!(site_of("shop.example.com.mx"), "example.com.mx");
+        assert_eq!(site_of("a.example.co.za"), "example.co.za");
         assert_eq!(site_of("www.example.com"), "example.com");
         assert_eq!(site_of("example.com."), "example.com");
         assert_eq!(site_of("a.b.example.co.uk"), "example.co.uk");
