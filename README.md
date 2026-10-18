@@ -86,7 +86,7 @@ cargo run --bin sniper-desktop
 | **Fuzzer** | Payload-based request testing with markers |
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
 | **Sessions** | Isolated workspaces — each with its own records, scope, and state |
-| **Scope** | Host and wildcard filtering, site map, and a passive retained-history Service Map (unreleased) |
+| **Target** | What was captured: a passive retained-history Service Map, its APIs and paths, and the scope rules (host and wildcard filtering) |
 | **Themes** | 12 themes — 7 dark + 5 light, gold-accent design language |
 | **CLI** | `sniper-cli` — JSON-first automation for scripting |
 | **AI Skills** | Built-in Claude & Codex skill templates using `sniper-cli` |
@@ -161,7 +161,7 @@ for access across one.
 ## Core workflow
 
 ```
-Session → Scope → Capture → Replay → Fuzz
+Session → Target → Capture → Replay → Fuzz
                     │
           ┌─────────┼─────────┐
       Intercept    HTTP    WebSocket
@@ -170,7 +170,7 @@ Session → Scope → Capture → Replay → Fuzz
 ```
 
 - **Session** — isolated workspaces with their own records and state
-- **Scope** — define target domains/paths, auto-filter traffic
+- **Target** — set the scope (target domains/paths, auto-filter traffic) and see what was captured as a service map, APIs and paths
 - **Capture** — inspect HTTP, render HTML and image responses in a sandbox, intercept & modify, WebSocket frames, auto-replace
 - **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses
 - **Replay** — resend with modifications, override host/port, render the response

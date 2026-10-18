@@ -28,10 +28,14 @@ test('Scope tabs share existing sub-tab styling without Capture handlers', () =>
   assert.match(app, /querySelectorAll\("\.sub-tab\[data-proxy-tab\]"\)/);
 });
 
-test('Scope strip omits the duplicate title and keeps accessible navigation labels', () => {
-  assert.doesNotMatch(header, /<h[1-6]\b[^>]*>\s*Scope\s*<\/h[1-6]>/);
-  assert.match(html, /<button class="main-tab" data-tool="target">Scope<\/button>/);
-  assert.match(header, /role="tablist" aria-label="Scope views"/);
+test('Target strip omits the duplicate title and keeps accessible navigation labels', () => {
+  assert.doesNotMatch(header, /<h[1-6]\b[^>]*>\s*(?:Scope|Target)\s*<\/h[1-6]>/);
+  assert.match(html, /<button class="main-tab" data-tool="target">Target<\/button>/);
+  assert.match(header, /role="tablist" aria-label="Target views"/);
+  // What was captured first, as Burp's Target lists its site map, then the
+  // scope rules that filter it.
+  assert.deepEqual([...header.matchAll(/data-target-view="([^"]+)"[^>]*>([^<]+)</g)].map(match => [match[1], match[2]]),
+    [['service-map', 'Service Map'], ['apis', 'APIs'], ['paths', 'Paths'], ['rules', 'Scope']]);
   assert.match(html, /id="targetRulesPanel" role="tabpanel" aria-labelledby="targetRulesTab"/);
   assert.match(html, /id="targetServiceMapPanel" role="tabpanel" aria-labelledby="targetServiceMapTab"/);
 });

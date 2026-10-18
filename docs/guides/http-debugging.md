@@ -464,7 +464,7 @@ Once decrypted, HTTPS requests appear in history like any other, alongside the
 
 ## Filtering by scope
 
-Scope is the list of hosts you care about. In the UI it is the **Scope** tab,
+Scope is the list of hosts you care about. In the UI it is **Target › Scope**,
 an include list and an exclude list; the **In scope** pill above the HTTP
 history filters the table to it. From the CLI:
 
