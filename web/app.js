@@ -12822,21 +12822,17 @@ function renderIntercepts() {
 
   els.interceptDetailPath.textContent = `${state.selectedInterceptRecord.request.scheme.toUpperCase()} / ${state.selectedInterceptRecord.peer_addr}`;
   els.interceptDetailTitle.textContent = `${state.selectedInterceptRecord.request.method} ${state.selectedInterceptRecord.request.host}`;
+  // Polling refreshes the held record, but the editor owns its draft until the
+  // selection changes. Losing focus (including to search) must not re-seed it.
   if (els.interceptRequestCM) {
-    const cv = getCMView("interceptReq");
-    const isFocused = cv && cv.view.hasFocus;
-    const rawText = buildEditableRawRequest(state.selectedInterceptRecord.request);
-    // Re-seeding rewrites the document, which resets search highlights and the
-    // match-cycling position, so skip it when the text is already identical.
-    const contentDiffers = !cv || cv.getContent() !== rawText;
-    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id || (!isFocused && contentDiffers)) {
-      setInterceptPaneContent("interceptReq", els.interceptRequestCM, rawText, {
+    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id) {
+      setInterceptPaneContent("interceptReq", els.interceptRequestCM, buildEditableRawRequest(state.selectedInterceptRecord.request), {
         mode: "http", readOnly: false,
       });
       state.interceptEditorSeedId = state.selectedInterceptRecord.id;
     }
   } else {
-    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id || document.activeElement !== els.interceptRequestEditor) {
+    if (state.interceptEditorSeedId !== state.selectedInterceptRecord.id) {
       els.interceptRequestEditor.value = buildEditableRawRequest(state.selectedInterceptRecord.request);
       state.interceptEditorSeedId = state.selectedInterceptRecord.id;
     }
@@ -17420,21 +17416,16 @@ function renderResponseIntercepts() {
   if (state.interceptQueueTab === "response") {
     els.interceptDetailPath.textContent = `${rec.scheme.toUpperCase()} / ${rec.method} ${rec.host}${rec.path}`;
     els.interceptDetailTitle.textContent = `${rec.status} Response`;
+    // As with requests, preserve this record's draft and search state on polls.
     if (els.interceptResponseCM) {
-      const cv = getCMView("interceptRes");
-      const isFocused = cv && cv.view.hasFocus;
-      const rawText = buildEditableRawResponse(rec.response);
-      // See the request pane above: avoid a no-op re-seed that would clear the
-      // active search highlights and match position.
-      const contentDiffers = !cv || cv.getContent() !== rawText;
-      if (state.responseInterceptEditorSeedId !== rec.id || (!isFocused && contentDiffers)) {
-        setInterceptPaneContent("interceptRes", els.interceptResponseCM, rawText, {
+      if (state.responseInterceptEditorSeedId !== rec.id) {
+        setInterceptPaneContent("interceptRes", els.interceptResponseCM, buildEditableRawResponse(rec.response), {
           mode: "http", readOnly: false,
         });
         state.responseInterceptEditorSeedId = rec.id;
       }
     } else {
-      if (state.responseInterceptEditorSeedId !== rec.id || document.activeElement !== els.interceptResponseEditor) {
+      if (state.responseInterceptEditorSeedId !== rec.id) {
         els.interceptResponseEditor.value = buildEditableRawResponse(rec.response);
         state.responseInterceptEditorSeedId = rec.id;
       }
