@@ -12086,8 +12086,8 @@ function getSelectedCMText(targetPane) {
   return ranges.join("\n");
 }
 
-async function copyTextToClipboard(text) {
-  if (text == null) {
+async function copyTextToClipboard(text, { isCurrent = () => true } = {}) {
+  if (text == null || !isCurrent()) {
     return;
   }
   const clipboardText = String(text);
@@ -12102,6 +12102,9 @@ async function copyTextToClipboard(text) {
     }
   }
 
+  // The browser's pending write cannot be cancelled, but a rejected write
+  // must not start a fallback after its document or newer copy took ownership.
+  if (!isCurrent()) return;
   const textarea = document.createElement("textarea");
   textarea.value = clipboardText;
   textarea.setAttribute("readonly", "true");
@@ -14888,9 +14891,9 @@ function initializeTargetWorkspace() {
       scheduleUiSettingsSave();
     },
     request: (path, options) => fetch(path, options),
-    copyText: (text, label) => copyTextToClipboard(text)
-      .then(() => showToast(label))
-      .catch(() => showToast("Failed to copy", "error")),
+    copyText: (text, label, isCurrent = () => true) => copyTextToClipboard(text, { isCurrent })
+      .then(() => { if (isCurrent()) showToast(label); })
+      .catch(() => { if (isCurrent()) showToast("Failed to copy", "error"); }),
     sendToReplay: (id) => loadTransactionRecordById(id)
       .then((record) => {
         if (!record) throw new Error("The row could not be loaded.");

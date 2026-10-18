@@ -1434,6 +1434,7 @@
     let peerMatchesAbort = null;
     let htmlGeneratorsAbort = null;
     let parametersAbort = null;
+    let apiDocsCopyId = 0;
     let detailRender = null;
     const renderedMarkup = new WeakMap();
     let visible = false;
@@ -2155,6 +2156,12 @@
       state.apiDocsRequestId += 1;
       state.apiDocs = null;
       renderApiDocs();
+    }
+    function copyApiDocs(label) {
+      const apiDocs = state.apiDocs, sessionId = getSessionId(), copyId = ++apiDocsCopyId;
+      if (!apiDocs?.document) return;
+      const isCurrent = () => state.apiDocs === apiDocs && getSessionId() === sessionId && apiDocsCopyId === copyId;
+      copyText?.(JSON.stringify(apiDocs.document, null, 2), label, isCurrent);
     }
     function renderApiDocs() {
       if (!els.apiDocs) return;
@@ -3466,11 +3473,11 @@
       if (!data) return;
       if (data.apiDocsClose !== undefined) closeApiDocs();
       // The text is already read, so the copy runs within the click.
-      else if (data.apiDocsCopy !== undefined && state.apiDocs?.document) copyText?.(JSON.stringify(state.apiDocs.document, null, 2), "Copied OpenAPI");
+      else if (data.apiDocsCopy !== undefined && state.apiDocs?.document) copyApiDocs("Copied OpenAPI");
       // Swagger Editor cannot fetch the document from this app, so the click
       // copies it to paste there. Nothing is sent to the site.
       else if (data.apiDocsEditor !== undefined && state.apiDocs?.document) {
-        copyText?.(JSON.stringify(state.apiDocs.document, null, 2), "Copied OpenAPI; paste it into Swagger Editor");
+        copyApiDocs("Copied OpenAPI; paste it into Swagger Editor");
         openUrl?.(SWAGGER_EDITOR_URL);
       }
       else if (data.apiDocsReplay) { closeApiDocs(); sendToReplay?.(data.apiDocsReplay); }
