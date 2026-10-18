@@ -1,6 +1,6 @@
 //! Bounded, passive projections of retained HTTP metadata. No body reads, probes,
 //! persistent indexes, or claims about unobserved upstream infrastructure.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,10 @@ const MAX_CLIENT_ORIGINS: usize = 64;
 const MAX_CLIENT_ADDRESSES: usize = 8;
 const MAX_UNNAMED: usize = 16;
 const MAX_UNNAMED_PER_ROW: usize = 16;
+/// Distinct unnamed values or auth names one read tracks per origin and kind
+/// before `finish` keeps the most widespread: a server that names a header or a
+/// cookie afresh on every answer must not grow the read without end.
+const MAX_TRACKED_PER_ORIGIN_KIND: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceOrigin {
@@ -1434,6 +1438,8 @@ pub(crate) struct MapBuilder {
     auth: BTreeMap<(String, &'static str, Option<String>), (usize, Vec<String>)>,
     /// Rows per origin, unnamed signal kind and value.
     unnamed: BTreeMap<(String, &'static str, String), (usize, Vec<String>)>,
+    /// Distinct keys `auth` and `unnamed` hold per origin and kind.
+    tracked: HashMap<(String, &'static str), usize>,
     projected_rows: usize,
     included_rows: usize,
     excluded_rows: usize,
@@ -1441,6 +1447,20 @@ pub(crate) struct MapBuilder {
 }
 
 impl MapBuilder {
+    /// Counts a new key for an origin and kind, or refuses it at the bound.
+    /// Takes the field, not `self`: callers hold an origin borrowed from it.
+    fn track(
+        tracked: &mut HashMap<(String, &'static str), usize>,
+        origin: &str,
+        kind: &'static str,
+    ) -> bool {
+        let count = tracked.entry((origin.to_string(), kind)).or_default();
+        *count < MAX_TRACKED_PER_ORIGIN_KIND && {
+            *count += 1;
+            true
+        }
+    }
+
     pub(crate) fn new(in_scope_only: bool, origin_filter: Option<String>) -> Self {
         Self {
             in_scope_only,
@@ -1453,6 +1473,7 @@ impl MapBuilder {
             clients: BTreeMap::new(),
             auth: BTreeMap::new(),
             unnamed: BTreeMap::new(),
+            tracked: HashMap::new(),
             projected_rows: 0,
             included_rows: 0,
             excluded_rows: 0,
@@ -1592,10 +1613,15 @@ impl MapBuilder {
             sample(&mut endpoint.evidence, &row.evidence_id);
         }
         for (kind, value) in std::mem::take(&mut row.unnamed) {
-            let (rows, evidence) = self
-                .unnamed
-                .entry((row.origin.clone(), kind, value))
-                .or_default();
+            let key = (row.origin.clone(), kind, value);
+            if !self.unnamed.contains_key(&key)
+                && !Self::track(&mut self.tracked, &row.origin, kind)
+            {
+                self.stopped_by
+                    .insert("unnamed_signals_per_origin_limit".into());
+                continue;
+            }
+            let (rows, evidence) = self.unnamed.entry(key).or_default();
             *rows += 1;
             sample(evidence, &row.evidence_id);
         }
@@ -1606,10 +1632,14 @@ impl MapBuilder {
                     kinds.push(signal.kind.into());
                 }
             }
-            let (rows, evidence) = self
-                .auth
-                .entry((row.origin.clone(), signal.kind, signal.name))
-                .or_default();
+            let key = (row.origin.clone(), signal.kind, signal.name);
+            if !self.auth.contains_key(&key)
+                && !Self::track(&mut self.tracked, &row.origin, signal.kind)
+            {
+                self.stopped_by.insert("auth_methods_limit".into());
+                continue;
+            }
+            let (rows, evidence) = self.auth.entry(key).or_default();
             *rows += 1;
             sample(evidence, &row.evidence_id);
         }
@@ -2999,6 +3029,33 @@ mod tests {
                     .all(|signal| signal.row_count == 1 && signal.evidence.len() == 1));
             }
         }
+    }
+
+    #[test]
+    fn a_read_tracks_a_bounded_number_of_names_per_origin_and_kind() {
+        let mut tracked = HashMap::new();
+        for _ in 0..MAX_TRACKED_PER_ORIGIN_KIND {
+            assert!(MapBuilder::track(
+                &mut tracked,
+                "https://a.example.com",
+                "header"
+            ));
+        }
+        assert!(!MapBuilder::track(
+            &mut tracked,
+            "https://a.example.com",
+            "header"
+        ));
+        assert!(MapBuilder::track(
+            &mut tracked,
+            "https://a.example.com",
+            "cookie"
+        ));
+        assert!(MapBuilder::track(
+            &mut tracked,
+            "https://b.example.com",
+            "header"
+        ));
     }
 
     #[tokio::test]
