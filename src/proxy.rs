@@ -1438,7 +1438,9 @@ async fn handle_forwardable_request(
         }
     };
     let proxy_addr = state.get_active_proxy_addr().await;
-    if request_targets_own_listener(&absolute_uri, proxy_addr) {
+    if request_targets_own_listener(&absolute_uri, proxy_addr)
+        || name_resolves_to_own_listener(&session, &absolute_uri, proxy_addr).await
+    {
         return record_http_rejection(
             &state,
             &session,
@@ -1683,18 +1685,22 @@ pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
 }
 
 fn host_belongs_to_this_machine(host: &str, bound_ip: IpAddr) -> bool {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host);
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let Ok(ip) = host.parse::<IpAddr>() else {
-        // A non-IP hostname (other than localhost) is not resolved here; the
-        // realistic self-target cases are IP literals or localhost.
-        return false;
+    // Read the host as the outbound client will. WHATWG's parser, which reqwest
+    // uses, takes `127.1`, `0` and `0x7f.1` for IPv4 addresses and drops a
+    // trailing dot; Rust's own parser takes none of them, so each reached this
+    // listener as another host and the loop below was never caught.
+    let ip = match url::Host::parse(host) {
+        Ok(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
+        Ok(url::Host::Ipv6(ip)) => ip.to_canonical(),
+        Ok(url::Host::Domain(name)) => {
+            return name.trim_end_matches('.') == "localhost";
+        }
+        Err(_) => return false,
     };
+    ip_belongs_to_this_machine(ip, bound_ip)
+}
+
+fn ip_belongs_to_this_machine(ip: IpAddr, bound_ip: IpAddr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
@@ -1705,29 +1711,59 @@ fn host_belongs_to_this_machine(host: &str, bound_ip: IpAddr) -> bool {
     }
 }
 
+fn target_port(uri: &Uri) -> Option<u16> {
+    uri.authority()?.port_u16().or_else(|| {
+        uri.scheme_str()
+            .and_then(|scheme| default_port_for_scheme(scheme).ok())
+    })
+}
+
 /// True when `uri` resolves back to the proxy's own listener, which would make
 /// the proxy forward the request to itself and spin in a tight loop until the
 /// process exhausts sockets. Port must match the listener; only then is the
 /// (potentially costly) host check performed.
 pub(crate) fn request_targets_own_listener(uri: &Uri, proxy_addr: SocketAddr) -> bool {
+    uri.authority().is_some_and(|authority| {
+        target_port(uri) == Some(proxy_addr.port())
+            && host_belongs_to_this_machine(authority.host(), proxy_addr.ip())
+    })
+}
+
+/// A name the request would reach this listener by: `localtest.me` resolves to
+/// 127.0.0.1 for anyone, so any page browsed through Sniper could start the loop
+/// with one fetch. Only a name on the listener's port that goes out directly is
+/// looked up; through a chain, the chain resolves it.
+// ponytail: checks the name once, so DNS that answers differently on the
+// connect (rebinding) still loops; a reqwest resolver that refuses the
+// listener's address would close that.
+async fn name_resolves_to_own_listener(
+    session: &SessionContext,
+    uri: &Uri,
+    proxy_addr: SocketAddr,
+) -> bool {
     let Some(authority) = uri.authority() else {
         return false;
     };
-    let port = match authority.port_u16() {
-        Some(port) => port,
-        None => match uri
-            .scheme_str()
-            .and_then(|scheme| default_port_for_scheme(scheme).ok())
-        {
-            Some(port) => port,
-            None => return false,
-        },
-    };
-    if port != proxy_addr.port() {
+    if target_port(uri) != Some(proxy_addr.port()) {
         return false;
     }
-    host_belongs_to_this_machine(authority.host(), proxy_addr.ip())
+    let Ok(url::Host::Domain(name)) = url::Host::parse(authority.host()) else {
+        return false;
+    };
+    let chain = session.runtime.upstream_proxy().await;
+    if chain.enabled && !chain.bypasses(&name) {
+        return false;
+    }
+    let lookup = tokio::net::lookup_host((name.as_str(), proxy_addr.port()));
+    let Ok(Ok(mut addresses)) = tokio::time::timeout(LOOP_LOOKUP_TIMEOUT, lookup).await else {
+        return false;
+    };
+    let looped = addresses
+        .any(|address| ip_belongs_to_this_machine(address.ip().to_canonical(), proxy_addr.ip()));
+    looped
 }
+
+const LOOP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn resolve_absolute_uri(
     uri: &Uri,
@@ -8860,6 +8896,45 @@ mod tests {
             &"http://93.184.216.34:8080/".parse().unwrap(),
             loopback
         ));
+    }
+
+    #[test]
+    fn own_listener_guard_reads_hosts_as_the_outbound_client_does() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        // reqwest's WHATWG parser reaches 127.0.0.1 through each of these.
+        for target in [
+            "http://127.1:8080/",
+            "http://0:8080/",
+            "http://0x7f.0.0.1:8080/",
+            "http://2130706433:8080/",
+            "http://127.0.0.1.:8080/",
+            "http://localhost.:8080/",
+            "http://LOCALHOST:8080/",
+            "http://[::ffff:127.0.0.1]:8080/",
+        ] {
+            assert!(
+                request_targets_own_listener(&target.parse().unwrap(), loopback),
+                "{target}"
+            );
+        }
+        assert!(!request_targets_own_listener(
+            &"http://127.1:8081/".parse().unwrap(),
+            loopback
+        ));
+    }
+
+    #[tokio::test]
+    async fn own_listener_guard_resolves_names_that_go_out_directly() {
+        let (state, data_dir) = test_proxy_state("sniper-loop-names");
+        let session = state.session().await;
+        let listener: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        // `localhost` stands in for a name such as `localtest.me` and resolves
+        // without a network.
+        let looped: Uri = "http://localhost:8080/".parse().unwrap();
+        assert!(name_resolves_to_own_listener(&session, &looped, listener).await);
+        let other_port: Uri = "http://localhost:8081/".parse().unwrap();
+        assert!(!name_resolves_to_own_listener(&session, &other_port, listener).await);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
