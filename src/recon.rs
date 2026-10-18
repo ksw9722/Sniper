@@ -142,8 +142,12 @@ impl ReconStore {
         }
     }
 
+    /// `limit` is this job's own: the endpoints it may add, as its Discovery
+    /// limits say. Comparing it with the whole inventory left a later job with
+    /// a smaller limit than what earlier jobs had found unable to add any.
     fn merge(
         &self,
+        job: Uuid,
         scope: &ReconScope,
         source: &str,
         findings: Vec<Discovery>,
@@ -151,6 +155,14 @@ impl ReconStore {
     ) -> (usize, bool) {
         let mut snapshot = self.snapshot.lock().unwrap();
         let mut bytes = self.inventory_bytes.load(Ordering::Relaxed);
+        let found_before: usize = snapshot
+            .jobs
+            .iter()
+            .find(|item| item.id == job)
+            .map_or(0, |item| {
+                item.sources.iter().map(|source| source.discovered).sum()
+            });
+        let remaining = limit.saturating_sub(found_before);
         let mut added = 0;
         let mut truncated = false;
         for finding in findings {
@@ -205,7 +217,7 @@ impl ReconStore {
                 }
                 endpoint.last_seen = Utc::now();
             } else {
-                if snapshot.endpoints.len() >= limit.min(MAX_INVENTORY) {
+                if added >= remaining || snapshot.endpoints.len() >= MAX_INVENTORY {
                     truncated = true;
                     continue;
                 }
@@ -453,6 +465,19 @@ fn validate(request: &StartRecon) -> Result<ReconScope, String> {
 }
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
+
+/// Only a missing session is "not found"; one that failed to load from disk
+/// read as a wrong ID to the caller and to anyone reading the logs.
+fn session_load_error(error: anyhow::Error) -> ApiError {
+    if error.to_string().contains("was not found") {
+        return api_error(StatusCode::NOT_FOUND, "Session not found.");
+    }
+    tracing::warn!(%error, "failed to load session for Recon");
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Session could not be loaded.",
+    )
+}
 fn api_error(status: StatusCode, message: &str) -> ApiError {
     (status, Json(serde_json::json!({"error": message})))
 }
@@ -469,7 +494,7 @@ pub async fn list(
     let session = state
         .read_session_context_for_id(query.session_id)
         .await
-        .map_err(|_| api_error(StatusCode::NOT_FOUND, "Session not found."))?;
+        .map_err(session_load_error)?;
     let snapshot = session.recon.snapshot();
     Ok(Json(
         serde_json::json!({"session_id": session.id(), "jobs": snapshot.jobs, "endpoints": snapshot.endpoints}),
@@ -484,7 +509,7 @@ pub async fn start(
     let session = state
         .session_context_for_id(request.session_id)
         .await
-        .map_err(|_| api_error(StatusCode::NOT_FOUND, "Session not found."))?;
+        .map_err(session_load_error)?;
     let operation_lock = state.session_operation_lock(session.id()).await;
     let _operation_guard = operation_lock.lock_owned().await;
     if !state.sessions.contains_session(session.id())
@@ -585,7 +610,7 @@ pub async fn stop(
     let session = state
         .session_context_for_id(query.session_id)
         .await
-        .map_err(|_| api_error(StatusCode::NOT_FOUND, "Session not found."))?;
+        .map_err(session_load_error)?;
     let operation_lock = state.session_operation_lock(session.id()).await;
     let _operation_guard = operation_lock.lock_owned().await;
     if !state.sessions.contains_session(session.id())
@@ -641,7 +666,7 @@ async fn run(
             let (added, truncated) =
                 session
                     .recon
-                    .merge(&scope, source, findings, request.max_endpoints);
+                    .merge(id, &scope, source, findings, request.max_endpoints);
             report.truncated |= truncated;
             session
                 .recon
@@ -750,6 +775,7 @@ async fn crawl(
         successful_responses += 1;
         let status = response.status().as_u16();
         let (added, truncated) = session.recon.merge(
+            id,
             scope,
             "crawler",
             vec![Discovery {
@@ -835,7 +861,7 @@ async fn crawl(
         let (added, truncated) =
             session
                 .recon
-                .merge(scope, "crawler", findings, request.max_endpoints);
+                .merge(id, scope, "crawler", findings, request.max_endpoints);
         report.truncated |= truncated;
         session
             .recon
@@ -898,6 +924,7 @@ mod tests {
             status: None,
         };
         store.merge(
+            Uuid::new_v4(),
             &scope,
             "wayback",
             vec![
@@ -908,6 +935,7 @@ mod tests {
             10,
         );
         store.merge(
+            Uuid::new_v4(),
             &scope,
             "urlscan",
             vec![discovery("https://example.com/a?a=1&b=2", "GET")],
@@ -921,6 +949,36 @@ mod tests {
             .endpoints
             .iter()
             .any(|endpoint| endpoint.evidence.iter().any(|e| e.kind == "live")));
+    }
+
+    #[test]
+    fn a_jobs_endpoint_limit_counts_its_own_finds_not_the_inventory() {
+        let store = ReconStore::from_snapshot(ReconSnapshot::default());
+        let scope = ReconScope::new("https://example.com", false).unwrap();
+        let found = |paths: &[&str]| {
+            paths
+                .iter()
+                .map(|path| Discovery {
+                    url: format!("https://example.com{path}"),
+                    method: "GET".into(),
+                    kind: "history".into(),
+                    location: "fixture".into(),
+                    timestamp: None,
+                    status: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = found(&["/a", "/b", "/c"]);
+        assert_eq!(
+            store.merge(Uuid::new_v4(), &scope, "wayback", first, 10),
+            (3, false)
+        );
+        // A later job with a smaller limit than the inventory still adds its own.
+        let second = found(&["/d", "/e", "/f"]);
+        assert_eq!(
+            store.merge(Uuid::new_v4(), &scope, "wayback", second, 2),
+            (2, true)
+        );
     }
 
     #[test]
@@ -962,6 +1020,7 @@ mod tests {
         let second = registry.load_context(second_id).unwrap();
         let scope = ReconScope::new("https://example.com", false).unwrap();
         first.recon.merge(
+            Uuid::new_v4(),
             &scope,
             "wayback",
             vec![Discovery {
