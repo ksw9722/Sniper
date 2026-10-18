@@ -50,10 +50,25 @@ const STATIC_EXTENSIONS: [&str; 22] = [
 ];
 
 /// The OpenAPI path for a captured path: its ID segments as templates
-/// (`path_group`), and a brace it had escaped so it is not read as one.
+/// (`path_group`), a brace it had escaped so it is not read as one, and no
+/// matrix parameters: `;jsessionid=8F1E…` is a session, not a path.
 pub fn operation_path(path: &str) -> String {
-    let path = path.replace('{', "%7B").replace('}', "%7D");
+    let path = path
+        .split('/')
+        .map(|segment| segment.split(';').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("/")
+        .replace('{', "%7B")
+        .replace('}', "%7D");
     crate::service_map::path_group(&path).unwrap_or(path)
+}
+
+/// Whether a path names a static file, whatever it was answered with.
+pub fn static_path(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or("");
+    file.rsplit_once('.').is_some_and(|(_, extension)| {
+        STATIC_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+    })
 }
 
 /// A content type's media type, without parameters and lowercased.
@@ -68,9 +83,10 @@ pub fn document(
     origin: &str,
     operations: &BTreeMap<(String, String), Operation>,
     omitted: usize,
+    static_requests: usize,
 ) -> Value {
     let (mut paths, mut schemes) = (Map::new(), Map::new());
-    let (mut requests, mut site_only) = (0, 0);
+    let (mut requests, mut site_only) = (static_requests, 0);
     let mut grouped: BTreeMap<String, (BTreeSet<&str>, BTreeMap<&str, Vec<&Operation>>)> =
         BTreeMap::new();
     for ((path, method), operation) in operations {
@@ -134,6 +150,11 @@ pub fn document(
          parameter names with observed JSON types or types guessed from text, response statuses and media \
          types, and the credentials the rows carried. No captured value is included."
     )];
+    if static_requests > 0 {
+        notes.push(format!(
+            "{static_requests} requests for static files (scripts, styles, images, fonts, media) are left out."
+        ));
+    }
     if site_only > 0 {
         notes.push(format!(
             "{site_only} operations that only answered with pages or static files are left out."
@@ -161,10 +182,7 @@ pub fn document(
 /// names a static file, belongs to the site rather than its API. One that
 /// answered with anything else, or with no typed body, is kept.
 fn api(path: &str, operation: &Operation) -> bool {
-    let file = path.rsplit('/').next().unwrap_or("");
-    if file.rsplit_once('.').is_some_and(|(_, extension)| {
-        STATIC_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
-    }) {
+    if static_path(path) {
         return false;
     }
     let mut types = operation.responses.values().flatten().peekable();
@@ -506,6 +524,16 @@ mod tests {
     }
 
     #[test]
+    fn a_matrix_parameter_is_a_value_not_part_of_the_path() {
+        assert_eq!(
+            operation_path("/app/list.do;jsessionid=8F1E0A"),
+            "/app/list.do"
+        );
+        assert_eq!(operation_path("/a;v=1/items/12"), "/a/items/{number}");
+        assert!(static_path("/static/app.JS") && !static_path("/api/items"));
+    }
+
+    #[test]
     fn a_path_names_its_id_segments_and_braces_stay_literal() {
         assert_eq!(
             operation_path("/chats/12/posts/507f1f77bcf86cd799439011"),
@@ -664,7 +692,7 @@ mod tests {
                 },
             ),
         ]);
-        let document = document("https://api.example.com", &operations, 0);
+        let document = document("https://api.example.com", &operations, 0, 0);
         let paths = document["paths"].as_object().unwrap();
         assert_eq!(paths.len(), 3);
         assert!(paths.contains_key("/items/%7Bid%7D"));
@@ -835,7 +863,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let document = document("https://api.example.com", &operations, 2);
+        let document = document("https://api.example.com", &operations, 2, 0);
         assert_eq!(document["openapi"], "3.1.0");
         assert_eq!(
             document["servers"],

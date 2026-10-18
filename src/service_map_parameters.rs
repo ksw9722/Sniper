@@ -149,15 +149,34 @@ pub(crate) struct ParameterTally {
     // Keep parsed JSON types separately from the bounded, unquoted UI examples.
     // A numeric-looking string and a number can have identical display text.
     json_types: BTreeMap<String, BTreeSet<&'static str>>,
+    named_only: bool,
 }
 
 impl ParameterTally {
+    /// For a document that leaves the session (OpenAPI): a query or form
+    /// segment with no `=` is a bare value, and `?eyJhbGciOi…` would make a
+    /// session token a parameter name.
+    pub(crate) fn named_only() -> Self {
+        Self {
+            named_only: true,
+            ..Self::default()
+        }
+    }
+
     /// One row's parameters. A name counts once per row and location.
     pub(crate) fn add_row(&mut self, query: Option<&str>, content_type: Option<&str>, body: &str) {
+        let named_only = self.named_only;
+        let parse = |text: &str| {
+            text.split('&')
+                .filter(|segment| !named_only || segment.contains('='))
+                .flat_map(|segment| url::form_urlencoded::parse(segment.as_bytes()))
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>()
+        };
         let mut pairs: Vec<(&'static str, String, Option<String>)> = Vec::new();
         if let Some(query) = query.filter(|query| !query.is_empty()) {
-            for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
-                pairs.push(("query", name.into_owned(), Some(value.into_owned())));
+            for (name, value) in parse(query) {
+                pairs.push(("query", name, Some(value)));
             }
         }
         let content_type = content_type.unwrap_or("");
@@ -169,8 +188,8 @@ impl ParameterTally {
         let body = &body[..end];
         if !body.is_empty() {
             if location == Some("form") {
-                for (name, value) in url::form_urlencoded::parse(body.as_bytes()) {
-                    pairs.push(("form", name.into_owned(), Some(value.into_owned())));
+                for (name, value) in parse(body) {
+                    pairs.push(("form", name, Some(value)));
                 }
             } else if location == Some("json") {
                 if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(body) {
@@ -424,6 +443,25 @@ fn multipart_header_name(headers: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_document_leaves_bare_values_out_of_the_parameter_names() {
+        let names = |mut tally: ParameterTally| {
+            tally.add_row(Some("eyJhbGciOiJub25lIn0&page=2&debug"), None, "");
+            tally
+                .finish()
+                .0
+                .into_iter()
+                .map(|parameter| parameter.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(ParameterTally::named_only()), ["page"]);
+        assert_eq!(
+            names(ParameterTally::default()).len(),
+            3,
+            "the panel still lists them"
+        );
+    }
 
     #[test]
     fn rows_add_up_by_name_and_location_with_a_few_values() {

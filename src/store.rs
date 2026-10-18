@@ -2824,7 +2824,7 @@ impl TransactionStore {
         origin: &str,
     ) -> Option<serde_json::Value> {
         use crate::service_map_openapi::{
-            document, media_type, operation_path, Operation, MAX_OPERATIONS,
+            document, media_type, operation_path, static_path, Operation, MAX_OPERATIONS,
             MAX_ROWS_PER_OPERATION, METHODS,
         };
         use crate::service_map_parameters::{ParameterTally, MAX_TOTAL_BODY_BYTES};
@@ -2836,6 +2836,7 @@ impl TransactionStore {
             let mut found: std::collections::BTreeMap<(String, String), (Operation, Vec<_>)> =
                 Default::default();
             let mut omitted = std::collections::BTreeSet::new();
+            let mut static_requests = 0;
             let mut held = 0;
             // ponytail: one read-locked pass over the history; read it in
             // chunks as the map does if exporting a huge session stalls capture.
@@ -2858,6 +2859,12 @@ impl TransactionStore {
                                     == Some(origin.as_str())
                             })
                     {
+                        continue;
+                    }
+                    // Never in the document, so never taking an API's place
+                    // under the cap: 500 images used to leave it empty.
+                    if static_path(path) {
+                        static_requests += 1;
                         continue;
                     }
                     let key = (operation_path(path), method);
@@ -2908,7 +2915,7 @@ impl TransactionStore {
             let operations = found
                 .into_iter()
                 .map(|(key, (mut operation, rows))| {
-                    let mut tally = ParameterTally::default();
+                    let mut tally = ParameterTally::named_only();
                     for mut row in rows {
                         let body = parameter_body(
                             &inner,
@@ -2928,7 +2935,7 @@ impl TransactionStore {
                     (key, operation)
                 })
                 .collect();
-            document(&origin, &operations, omitted.len())
+            document(&origin, &operations, omitted.len(), static_requests)
         });
         task.await.ok()
     }

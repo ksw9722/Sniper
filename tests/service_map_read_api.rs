@@ -2153,10 +2153,12 @@ async fn service_map_openapi_describes_an_origins_api_without_its_values() {
         document["components"]["securitySchemes"],
         json!({"bearer": {"type": "http", "scheme": "bearer"}})
     );
-    assert!(document["info"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("2 operations that only answered with pages or static files are left out"));
+    let notes = document["info"]["description"].as_str().unwrap();
+    assert!(
+        notes.contains("1 operations that only answered with pages or static files are left out")
+    );
+    // The font never reaches the operation cap: static files are counted apart.
+    assert!(notes.contains("1 requests for static files"));
     assert!(!document.to_string().contains("SYNTHETIC_PRIVATE"));
 
     let via_cli = read(
