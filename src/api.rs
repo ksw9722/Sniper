@@ -1010,6 +1010,26 @@ fn websocket_list_filters(
     }
 }
 
+/// A search regex the store could not compile would match every row (or none,
+/// negated) instead of failing, so refuse it before it is used.
+fn validate_advanced_regex(
+    search: Option<&str>,
+    regex: bool,
+    case_sensitive: bool,
+) -> std::result::Result<(), String> {
+    let Some(term) = search
+        .map(str::trim)
+        .filter(|term| regex && !term.is_empty())
+    else {
+        return Ok(());
+    };
+    RegexBuilder::new(term)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("invalid advanced_search regex: {error}"))
+}
+
 fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(), String> {
     validate_optional_limit(query.limit)?;
     validate_sort_direction(query.sort_direction.as_deref())?;
@@ -1028,16 +1048,11 @@ fn validate_transaction_query(query: &TransactionQuery) -> std::result::Result<(
         validate_since(value).ok_or_else(|| format!("invalid since filter: {value}"))?;
     }
 
-    if query.advanced_regex.unwrap_or(false) {
-        if let Some(term) = query.advanced_search.as_deref().map(str::trim) {
-            if !term.is_empty() {
-                RegexBuilder::new(term)
-                    .case_insensitive(!query.advanced_case_sensitive.unwrap_or(false))
-                    .build()
-                    .map_err(|error| format!("invalid advanced_search regex: {error}"))?;
-            }
-        }
-    }
+    validate_advanced_regex(
+        query.advanced_search.as_deref(),
+        query.advanced_regex.unwrap_or(false),
+        query.advanced_case_sensitive.unwrap_or(false),
+    )?;
 
     Ok(())
 }
@@ -5436,6 +5451,9 @@ fn service_map_row_filters(query: &ServiceMapQuery) -> ListFilters {
         advanced_regex: query.advanced_regex,
         advanced_case_sensitive: query.advanced_case_sensitive,
         advanced_negative: query.advanced_negative,
+        // History's search always reads headers; a term only a header holds
+        // hid the row on the map while History listed it.
+        search_headers: true,
         ..ListFilters::default()
     }
 }
@@ -5548,6 +5566,13 @@ async fn get_target_service_map_impl(
         Ok(selection) => selection,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    if let Err(message) = validate_advanced_regex(
+        query.advanced_search.as_deref(),
+        query.advanced_regex,
+        query.advanced_case_sensitive,
+    ) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     let row_filters = service_map_row_filters(&query);
     let (all_rows, fresh) = (query.all_rows, query.fresh);
     let cache_query = ServiceMapQuery {

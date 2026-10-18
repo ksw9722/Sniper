@@ -1725,6 +1725,20 @@ async fn service_map_display_filter_hides_rows_through_api_and_cli_as_history_do
     assert_eq!(origins(&cli_mime), origins(&filtered));
     assert_eq!(cli_mime["snapshot"]["filtered_rows"], 1);
 
+    // The search reads headers, as History's does: only the API's response
+    // carries this header.
+    let searched = get("&advanced_search=allow-credentials").await;
+    assert!(origins(&searched).contains(&"https://api.example.com".to_string()));
+    assert!(!origins(&searched).contains(&cdn));
+    let invalid = client
+        .get(format!(
+            "{api}/api/target/service-map?session_id={session_id}&advanced_search=(a)%5C1&advanced_regex=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
     server.abort();
     drop(session);
     drop(state);
