@@ -1278,9 +1278,14 @@ fn recover_missing_scanner_findings(
         if covered_records.contains(&record.id) {
             continue;
         }
-        for finding in scan_transaction(record, config) {
-            recovered.push(finding);
-        }
+        // A rule that panics on one recovered row must not keep the session
+        // from loading at every start; that row just gets no findings.
+        let Ok(found) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scan_transaction(record, config)
+        })) else {
+            continue;
+        };
+        recovered.extend(found);
     }
     recovered.extend(findings);
     recovered.truncate(max_entries);
