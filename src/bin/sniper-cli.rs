@@ -2139,6 +2139,7 @@ struct SequenceRunsArgs {
 #[derive(Serialize)]
 struct ResponseInterceptForwardPayload {
     response: EditableResponse,
+    edited: bool,
 }
 
 #[derive(Deserialize)]
@@ -2715,6 +2716,10 @@ struct SequenceCreateInput {
 #[derive(Serialize)]
 struct InterceptForwardPayload {
     request: EditableRequest,
+    /// Whether the forwarded request differs from the held one. The server keeps
+    /// the original and marks the row modified only when told: without this an
+    /// edit from a file replaced the captured request with no trace.
+    edited: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -12503,12 +12508,26 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
             let detail_path =
                 session_query_path(&format!("/api/intercepts/{}", args.id), read_session_id);
             let intercept: InterceptRecord = api.get_json(&detail_path).await?;
-            let request = if args.request_file.is_some() || args.stdin {
-                read_raw_request_input(args.request_file, args.stdin, Some(&intercept.request))?
-                    .0
-                    .request
+            let (request, edited) = if args.request_file.is_some() || args.stdin {
+                let parsed = read_raw_request_input(
+                    args.request_file,
+                    args.stdin,
+                    Some(&intercept.request),
+                )?
+                .0
+                .request;
+                // The held request as its raw text parses back: parsing normalises
+                // headers, so an unchanged file must not count as an edit.
+                let held = parse_editable_raw_request_with_version(
+                    &build_editable_raw_request(&intercept.request),
+                    Some(&intercept.request),
+                )
+                .map(|held| held.request)
+                .unwrap_or_else(|_| intercept.request.clone());
+                let edited = parsed != held && parsed != intercept.request;
+                (parsed, edited)
             } else {
-                intercept.request
+                (intercept.request, false)
             };
             let session_id = read_session_id;
             let action_path = session_query_path_with_expected_active(
@@ -12516,7 +12535,7 @@ async fn handle_intercept(api: ApiClient, command: InterceptCommand) -> Result<(
                 read_session_id,
                 expected_active_session_id,
             );
-            api.post_status(&action_path, &InterceptForwardPayload { request })
+            api.post_status(&action_path, &InterceptForwardPayload { request, edited })
                 .await?;
             print_json(&InterceptActionResult {
                 ok: true,
@@ -12687,15 +12706,21 @@ async fn handle_response_intercept(
                 read_session_id,
             );
             let item: ResponseInterceptRecord = api.get_json(&detail_path).await?;
-            let response = if args.response_file.is_some() || args.stdin {
-                read_raw_response_input(
+            let (response, edited) = if args.response_file.is_some() || args.stdin {
+                let parsed = read_raw_response_input(
                     args.response_file,
                     args.stdin,
                     Some(&item.response),
                     &item.method,
-                )?
+                )?;
+                // ponytail: compared as parsed, so a file that only re-spells the
+                // held response may still read as an edit; that keeps the
+                // original either way.
+                let edited =
+                    serde_json::to_value(&parsed).ok() != serde_json::to_value(&item.response).ok();
+                (parsed, edited)
             } else {
-                item.response
+                (item.response, false)
             };
             let session_id = read_session_id;
             let action_path = session_query_path_with_expected_active(
@@ -12703,8 +12728,11 @@ async fn handle_response_intercept(
                 read_session_id,
                 expected_active_session_id,
             );
-            api.post_status(&action_path, &ResponseInterceptForwardPayload { response })
-                .await?;
+            api.post_status(
+                &action_path,
+                &ResponseInterceptForwardPayload { response, edited },
+            )
+            .await?;
             print_json(&InterceptActionResult {
                 ok: true,
                 action: "forward",
