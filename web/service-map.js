@@ -2171,7 +2171,29 @@
       const schemes = document.components?.securitySchemes || {};
       const schemeText = (scheme) => scheme?.type === "http" ? `HTTP ${scheme.scheme}${scheme.bearerFormat ? ` (${scheme.bearerFormat})` : ""}`
         : `${{ cookie: "Cookie", query: "Query parameter" }[scheme?.in] || "Header"} ${scheme?.name || ""}`;
-      const typeOf = (schema) => [schema?.type, schema?.format].filter(Boolean).join(" · ") || "any";
+      const typeOf = (schema) => {
+        const labels = new Set();
+        let remaining = 32;
+        const visit = (value, depth) => {
+          remaining -= 1;
+          if (depth > 4) { labels.add("…"); return; }
+          const types = Array.isArray(value?.type);
+          const label = types ? "" : [value?.type, value?.format].filter((part) => typeof part === "string" && part)
+            .map((part) => part.length > 80 ? `${part.slice(0, 79)}…` : part).join(" · ");
+          if (label) { labels.add(label); return; }
+          const variants = types ? value.type : value?.anyOf;
+          if (!Array.isArray(variants) || !variants.length) { labels.add("any"); return; }
+          // Mixed path identifiers carry anyOf; JSON fields can have type arrays.
+          // Bound even malformed nested schemas without changing Copy or Replay.
+          for (const variant of variants) {
+            if (!remaining) { labels.add("…"); break; }
+            const branch = types ? (typeof variant === "string" && variant ? { type: variant, format: value.format } : null) : variant;
+            visit(branch, depth + 1);
+          }
+        };
+        visit(schema, 0);
+        return [...labels].join(" | ");
+      };
       const table = (head, rows) => rows.length ? `<table class="service-map-api-docs-table"><thead><tr>${head.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</tbody></table>` : "";
       const operations = Object.entries(document.paths).flatMap(([path, item]) => API_DOC_METHODS.filter((method) => item?.[method]).map((method) => ({ path, method, item, operation: item[method] })));
       const operationMarkup = ({ path, method, item, operation }) => {
