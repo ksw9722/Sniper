@@ -550,6 +550,35 @@ fn leaf_expiration(root_expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Result
         .context("failed to convert leaf certificate expiration timestamp")
 }
 
+/// A server leaf for `name`, valid from today until `expires_at`. It names its
+/// issuer's key (Authority Key Identifier), taken from the root's own Subject
+/// Key Identifier: Python 3.13+ verifies in strict mode by default and refused
+/// every leaf without one ("Missing Authority Key Identifier").
+fn leaf_params(
+    name: &str,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<CertificateParams> {
+    let mut params = CertificateParams::new(vec![name.to_string()])?;
+    params.not_before = rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
+    params.not_after = rcgen::date_time_ymd(
+        expires_at.year(),
+        expires_at.month() as u8,
+        expires_at.day() as u8,
+    );
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::OrganizationName, "Sniper");
+    distinguished_name.push(DnType::CommonName, name);
+    params.distinguished_name = distinguished_name;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.use_authority_key_identifier_extension = true;
+    Ok(params)
+}
+
 fn build_special_host_tls_config(
     issuer_certificate: &Certificate,
     issuer_key: &KeyPair,
@@ -559,23 +588,7 @@ fn build_special_host_tls_config(
     let now = Utc::now();
     let leaf_expires_at = leaf_expiration(root_expires_at, now)?;
 
-    let mut params = CertificateParams::new(vec![SPECIAL_HOST.to_string()])?;
-    params.not_before = rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
-    params.not_after = rcgen::date_time_ymd(
-        leaf_expires_at.year(),
-        leaf_expires_at.month() as u8,
-        leaf_expires_at.day() as u8,
-    );
-
-    let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::OrganizationName, "Sniper");
-    distinguished_name.push(DnType::CommonName, SPECIAL_HOST);
-    params.distinguished_name = distinguished_name;
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyEncipherment,
-    ];
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let params = leaf_params(SPECIAL_HOST, now, leaf_expires_at)?;
 
     let leaf_key = KeyPair::generate().context("failed to generate special host key pair")?;
     let leaf_certificate = params
@@ -634,23 +647,7 @@ fn build_signed_host_tls_config(
     let now = Utc::now();
     let leaf_expires_at = leaf_expiration(root_expires_at, now)?;
 
-    let mut params = CertificateParams::new(vec![host.to_string()])?;
-    params.not_before = rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
-    params.not_after = rcgen::date_time_ymd(
-        leaf_expires_at.year(),
-        leaf_expires_at.month() as u8,
-        leaf_expires_at.day() as u8,
-    );
-
-    let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::OrganizationName, "Sniper");
-    distinguished_name.push(DnType::CommonName, host);
-    params.distinguished_name = distinguished_name;
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyEncipherment,
-    ];
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let params = leaf_params(host, now, leaf_expires_at)?;
 
     let leaf_key = KeyPair::generate().context("failed to generate host MITM key pair")?;
     let leaf_certificate = params
@@ -679,7 +676,8 @@ fn build_signed_host_tls_config(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        certificate_files, default_data_dir, normalize_certificate_host, CertificateAuthority,
+        certificate_files, default_data_dir, leaf_params, normalize_certificate_host,
+        CertificateAuthority, CertificateParams, KeyPair, Utc,
     };
     use std::{
         ffi::OsString,
@@ -725,6 +723,45 @@ mod tests {
         let _data_dir_guard = EnvVarGuard::set("SNIPER_DATA_DIR", "");
 
         assert!(!default_data_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn leaves_name_their_issuers_key_as_strict_clients_require() {
+        use x509_parser::extensions::ParsedExtension;
+        let data_dir = temp_data_dir();
+        CertificateAuthority::load_or_create(&data_dir).expect("certificate should load");
+        let files = certificate_files(&data_dir);
+        let root_pem = fs::read_to_string(&files.cert_pem_path).unwrap();
+        let root_key =
+            KeyPair::from_pem(&fs::read_to_string(&files.key_pem_path).unwrap()).unwrap();
+        let issuer = CertificateParams::from_ca_cert_pem(&root_pem)
+            .unwrap()
+            .self_signed(&root_key)
+            .unwrap();
+        let now = Utc::now();
+        let leaf = leaf_params("a.example.com", now, now + chrono::Duration::days(1))
+            .unwrap()
+            .signed_by(&KeyPair::generate().unwrap(), &issuer, &root_key)
+            .unwrap();
+        let identifier = |der: &[u8], authority: bool| {
+            let (_, certificate) = x509_parser::parse_x509_certificate(der).unwrap();
+            certificate.extensions().iter().find_map(|extension| {
+                match extension.parsed_extension() {
+                    ParsedExtension::AuthorityKeyIdentifier(key) if authority => {
+                        key.key_identifier.as_ref().map(|id| id.0.to_vec())
+                    }
+                    ParsedExtension::SubjectKeyIdentifier(key) if !authority => {
+                        Some(key.0.to_vec())
+                    }
+                    _ => None,
+                }
+            })
+        };
+        let root_der = fs::read(&files.cert_der_path).unwrap();
+        let root_key_id = identifier(&root_der, false).expect("the root names its key");
+        assert_eq!(identifier(leaf.der(), true), Some(root_key_id));
+
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     #[test]
