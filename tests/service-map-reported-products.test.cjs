@@ -135,6 +135,17 @@ test('View source reads a server or exposure row the endpoint samples no longer 
   f.requests.at(-1).resolve(response(evidence(77))); await pending;
 });
 
+test('the product filter takes a front-end product and a pre-release version it lists', async () => {
+  const page = origin(A);
+  page.front_technologies = [{ product_id: 'react', name: 'React', category: 'framework', version: '19.0.0-rc1', source_origin: A, row_count: 1, evidence: [token(5)] }];
+  const f = fixture(); await f.load(snapshot([page, origin(B, [observation('php', '8.3', 2)], 1, 2)]));
+  f.filter('product', 'react');
+  assert.equal(f.state.productId, 'react');
+  f.filter('version', 'reported:19.0.0-rc1');
+  assert.equal(f.state.productVersion, 'reported:19.0.0-rc1');
+  assert.match(f.els.productFilters.innerHTML, /React/);
+});
+
 test('an origin with more rows than the old 50,000 window still loads', () => {
   const busy = origin(A, [observation('nginx', '1.26.2', 1, { row_count: 60000 })]);
   busy.request_count = 75000;
@@ -319,7 +330,7 @@ for (const kind of ['body', 'link', 'html', 'peer']) test(`same-snapshot poll pr
 
 test('invalid local choices cannot create arbitrary products or oversized version options', async () => {
   const f = fixture(); await f.load();
-  for (const [kind, value] of [['product', '<script>'], ['version', 'reported:<script>'], ['version', 'reported:' + '1'.repeat(33)], ['version', 'semver:>=1']]) f.filter(kind, value);
+  for (const [kind, value] of [['product', '<script>'], ['version', 'reported:<script>'], ['version', 'reported:' + '1'.repeat(41)], ['version', 'semver:>=1']]) f.filter(kind, value);
   assert.equal(f.state.productId, ''); assert.equal(f.state.productVersion, ''); assert.equal(f.requests.length, 1);
 });
 

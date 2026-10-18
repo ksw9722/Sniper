@@ -1613,11 +1613,14 @@
       if (!["product", "version", "clear"].includes(kind)) return;
       if (kind === "clear") { state.productId = ""; state.productVersion = ""; }
       else if (kind === "product") {
-        if (value && !TECHNOLOGY_CATALOG_V2.has(value)) return;
+        // Any product the list offers: front-end and server products as well as
+        // the header catalog's. Choosing one of those used to change nothing.
+        if (value && !(typeof value === "string" && /^[a-z0-9_]{1,40}$/.test(value))) return;
         state.productId = value || "";
       } else {
+        // Versions as the map reports them, `3.6.0-rc1` included.
         if (value && !PRODUCT_VERSION_OPTIONS.some(([key]) => key === value)
-          && !(typeof value === "string" && value.length <= 41 && /^reported:[0-9]+(?:\.[0-9]+)*$/.test(value))) return;
+          && !(typeof value === "string" && /^reported:[0-9][0-9A-Za-z.+-]{0,39}$/.test(value))) return;
         state.productVersion = value || "";
       }
       // Product filters change membership, never source identity or pending
@@ -1635,7 +1638,7 @@
         ...[...versions].sort().map((version) => [`reported:${version}`, `Reported: ${version}`])]);
       const unavailableProduct = !!state.productId && !products.has(state.productId);
       const unavailableVersion = !!state.productVersion && !(state.snapshot?.origins || []).some((origin) => productMatches(origin, state.productId, state.productVersion));
-      if (state.productId) products.set(state.productId, TECHNOLOGY_CATALOG_V2.get(state.productId)[0]);
+      if (state.productId) products.set(state.productId, products.get(state.productId) ?? TECHNOLOGY_CATALOG_V2.get(state.productId)?.[0] ?? state.productId);
       if (state.productVersion.startsWith("reported:") && !options.has(state.productVersion)) options.set(state.productVersion, `Reported: ${state.productVersion.slice(9)} (unavailable)`);
       replace(productFilterContainer, `<div class="service-map-product-filter-controls"><label>Product (exact)<select data-service-product-filter="product" data-service-focus="products:product" aria-describedby="serviceMapProductHelp"><option value="">All products</option>${[...products].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([id, name]) => `<option value="${escape(id)}" ${state.productId === id ? "selected" : ""}>${escape(name)}${unavailableProduct && state.productId === id ? " (unavailable)" : ""}</option>`).join("")}</select></label><label>Version/status (exact)<select data-service-product-filter="version" data-service-focus="products:version" title="${escape(options.get(state.productVersion))}" aria-describedby="serviceMapProductHelp">${[...options].map(([id, name]) => `<option value="${escape(id)}" ${state.productVersion === id ? "selected" : ""}>${escape(name)}</option>`).join("")}</select></label><button class="secondary-action" type="button" data-service-product-filter-clear="true" data-service-focus="products:clear" ${!state.productId && !state.productVersion ? "disabled" : ""}>Clear</button></div><p id="serviceMapProductHelp" class="service-map-muted">Loaded response-header declarations only. Product and version/status match the same product. Versions are literal and unverified. Options are independent of origin search.</p>${unavailableProduct || unavailableVersion ? '<p class="service-map-filter-notice" role="status">Selected product/version is unavailable in the loaded snapshot. Filters retained; zero matching origins.</p>' : ""}`);
       productFilterContainer.parentElement?.classList.toggle("has-filter", !!state.productId || !!state.productVersion);
