@@ -678,11 +678,21 @@ async fn local_api_write_guard(request: Request, next: Next) -> Response {
             )
                 .into_response();
         }
-        if !matches!(
+        let read = matches!(
             *request.method(),
             Method::GET | Method::HEAD | Method::OPTIONS
-        ) && !is_allowed_browser_write(request.headers(), request.uri())
-        {
+        );
+        // Another site's page cannot see the answer, but each read still costs
+        // a history search or a whole map build, and a page could send them
+        // without end while the map's single slot refused the UI.
+        if read && request_has_cross_site_fetch_metadata(request.headers()) {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-site reads of the local Sniper API are blocked",
+            )
+                .into_response();
+        }
+        if !read && !is_allowed_browser_write(request.headers(), request.uri()) {
             return (
                 StatusCode::FORBIDDEN,
                 "cross-origin writes to the local Sniper API are blocked",
@@ -10390,6 +10400,34 @@ mod tests {
             );
         }
 
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    // A read costs work even when the page cannot see the answer: a whole map
+    // build, a history search. Another site's page gets neither.
+    #[tokio::test]
+    async fn another_sites_page_cannot_read_the_api() {
+        let (_state, data_dir, addr, server) = serve_for_test("sniper-api-cross-site-read").await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let read = |site: &'static str| {
+            client
+                .get(format!("http://{addr}/api/runtime"))
+                .header("sec-fetch-site", site)
+                .send()
+        };
+        assert_eq!(
+            read("cross-site").await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            read("same-origin").await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            read("none").await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
         server.abort();
         let _ = std::fs::remove_dir_all(data_dir);
     }
