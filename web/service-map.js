@@ -3576,9 +3576,16 @@
         // every captured row, so clearing them here would empty the dialog and
         // the panel while traffic flows. A count one row behind is harmless,
         // and Replay reports a row that is gone. Deletion, retention and Clear
-        // go through invalidate(), which does clear them.
-        cancelEvidence();
-        render();
+        // go through invalidate(), which does clear them. The evidence read
+        // stays too unless this is its row, or no source could be inspected
+        // while traffic flowed; peer matches count other rows, so any row
+        // can change them.
+        const evidenceRecord = state.peerEvidenceBinding ? null : String(state.evidenceId || "").split(".")[5]?.toLowerCase();
+        if (recordId && evidenceRecord && evidenceRecord !== recordId) cancelPeerMatches();
+        else cancelEvidence();
+        // Hidden, it is drawn again when shown; redrawing it for every row cost
+        // the whole map's layout while the user worked elsewhere.
+        if (visible) render();
       },
       setVisible(value, view = state.view) {
         if (!value) cancelParameters();

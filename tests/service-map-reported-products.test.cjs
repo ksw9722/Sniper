@@ -114,6 +114,16 @@ const cards = f => [...f.els.canvas.innerHTML.matchAll(/data-service-origin="([^
 const rows = element => [...element.innerHTML.matchAll(/data-service-endpoint="(\d+)"/g)].map(m => Number(m[1]));
 const plain = value => JSON.parse(JSON.stringify(value));
 
+test('a captured row keeps another row\'s evidence open, and its own row clears it', async () => {
+  const f = fixture(); await f.load(); await f.verify(0);
+  assert.ok(f.state.evidence);
+  const captured = id => ({ data: JSON.stringify({ id }) });
+  f.controller.markDirty(captured('99999999-9999-4999-8999-999999999999'));
+  assert.ok(f.state.evidence, 'an unrelated row leaves the inspected source alone');
+  f.controller.markDirty(captured(RECORD.toUpperCase()));
+  assert.equal(f.state.evidence, null);
+});
+
 test('an origin with more rows than the old 50,000 window still loads', () => {
   const busy = origin(A, [observation('nginx', '1.26.2', 1, { row_count: 60000 })]);
   busy.request_count = 75000;
