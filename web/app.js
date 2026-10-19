@@ -2784,19 +2784,7 @@ function bindEvents() {
   }
   // WS Handshake search
   if (els.wsHandshakeSearchInput) {
-    els.wsHandshakeSearchInput.addEventListener("input", () => {
-      // CM path
-      const cv = getCMView("wsHandshake");
-      if (cv) {
-        const query = (els.wsHandshakeSearchInput.value || "").trim();
-        const result = cv.applySearch(query);
-        if (els.wsHandshakeSearchMeta) {
-          els.wsHandshakeSearchMeta.innerHTML = buildSearchMeta(cv.view.state.doc.lines, "raw", result.matchCount);
-        }
-        return;
-      }
-      updateWsHandshakeSearch();
-    });
+    els.wsHandshakeSearchInput.addEventListener("input", updateWsHandshakeSearch);
     initSearchHitNavigation(els.wsHandshakeSearchMeta, () => {
       const resBtn = document.getElementById("wsHandshakeResBtn");
       return resBtn?.classList.contains("active") ? els.websocketResponseView : els.websocketRequestView;
@@ -13119,12 +13107,6 @@ function renderWebsocketSessions(options = {}) {
     // Hide legacy views
     if (els.websocketRequestView) els.websocketRequestView.classList.add("hidden");
     if (els.websocketResponseView) els.websocketResponseView.classList.add("hidden");
-    // Apply handshake search via CM
-    const query = (els.wsHandshakeSearchInput?.value || "").trim();
-    if (query) {
-      const cv = getCMView("wsHandshake");
-      if (cv) cv.applySearch(query);
-    }
   } else {
     // Legacy fallback
     const savedReqFocus = window._saveCodeViewFocus?.(els.websocketRequestView);
