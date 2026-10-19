@@ -705,7 +705,7 @@ test('in-contract direct neighbors remain available beyond the global 100 and pa
   assert.match(boundsText(f), /100-reference-card limit/);
 });
 
-test('direct arrows include only anchor-incident metadata, count distinct type/directions and exclude self links', async () => {
+test('direct arrows include only anchor-incident metadata, count distinct types, draw one arrow per direction and exclude self links', async () => {
   const f = fixture(), a = origin(originA), b = origin(originB), c = origin('https://third.example.com');
   a.redirects = [redirect(originB, '/one'), redirect(originB, '/two'), redirect(originA)];
   b.redirects = [redirect(c.origin)];
@@ -714,17 +714,19 @@ test('direct arrows include only anchor-incident metadata, count distinct type/d
   await f.load(snapshot([a, b, c])); pin(f, originA);
   assert.match(boundsText(f), /2 known direct neighbors/);
   assert.match(boundsText(f), /Non-self distinct typed links: 1 incoming \/ 3 outgoing · 1 redirect \/ 1 Origin \/ 2 Referer/);
-  assert.match(boundsText(f), /4 \/ 4 arrows between displayed cards \(cap 40\)/);
+  // The redirects, Origin and Referer from A to B share one arrow.
+  assert.match(boundsText(f), /2 \/ 2 arrows between displayed cards \(cap 40\)/);
   assert.doesNotMatch(f.els.canvas.innerHTML, /api.example.com → https:\/\/third.example.com/);
   assert.match(f.els.detail.innerHTML, /api.example.com\/one/);
   assert.match(f.els.detail.innerHTML, /api.example.com\/two/);
 });
 
-test('direct arrow cap reports visible-card eligible links separately from off-card links', async () => {
+test('direct arrow cap reports visible-card eligible arrows separately from off-card arrows', async () => {
   const f = fixture(), app = origin(originA), peers = Array.from({ length: 30 }, (_, i) => origin(`https://peer${i}.example.com`));
-  peers.forEach(peer => { peer.header_links = [header(originA), header(originA, 'referer_header')]; app.redirects.push(redirect(peer.origin)); });
+  // Each peer and the anchor point at each other: two arrows a peer.
+  peers.forEach(peer => { peer.header_links = [header(originA), header(originA, 'referer_header')]; peer.redirects = [redirect(originA)]; app.redirects.push(redirect(peer.origin)); });
   await f.load(snapshot([app, ...peers])); pin(f, originA);
-  assert.match(boundsText(f), /40 \/ 69 arrows between displayed cards \(cap 40\) · 21 links outside displayed cards/);
+  assert.match(boundsText(f), /40 \/ 46 arrows between displayed cards \(cap 40\) · 14 arrows outside displayed cards/);
   assert.equal((f.els.canvas.innerHTML.match(/marker-end=/g) || []).length, 40);
 });
 
@@ -946,10 +948,10 @@ test('direct primary summary stays compact while native disclosure retains all c
 
 test('primary direct summary keeps meaningful omissions visible without opening details', async () => {
   const f = fixture(), app = origin(originA), peers = Array.from({ length: 30 }, (_, i) => origin(`https://peer${String(i).padStart(2, '0')}.example.com`));
-  peers.forEach(peer => { peer.header_links = [header(originA), header(originA, 'referer_header')]; app.redirects.push(redirect(peer.origin)); });
+  peers.forEach(peer => { peer.header_links = [header(originA), header(originA, 'referer_header')]; peer.redirects = [redirect(originA)]; app.redirects.push(redirect(peer.origin)); });
   await f.load(snapshot([app, ...peers])); pin(f, originA);
   assert.match(f.els.graphBounds.textContent, /7 omitted by 24-card cap/);
-  assert.match(f.els.graphBounds.textContent, /29 arrows omitted by 40-arrow cap/);
+  assert.match(f.els.graphBounds.textContent, /6 arrows omitted by 40-arrow cap/);
   f.els.search.value = 'peer2'; f.els.search.dispatch('input');
   assert.match(f.els.graphBounds.textContent, /20 hidden by query/);
   assert.match(f.els.graphBounds.textContent, /Pinned anchor is outside the search query/);
@@ -1467,23 +1469,23 @@ test('100 body origins retain the source and prioritize 23 reference cards with 
   assert.equal(f.requests.length, 3);
 });
 
-test('body, Origin, Referer and redirect arrows keep unique types and bounded distinct curves under 40 arrows', async () => {
+test('body arrows keep their type and metadata arrows merge per direction, with bounded distinct curves under 40 arrows', async () => {
   const f = fixture(), source = origin(originA), peers = Array.from({ length: 23 }, (_, i) => origin(`https://peer${String(i).padStart(2, '0')}.example.com`));
   peers.forEach(peer => { peer.header_links = [header(originA), header(originA, 'referer_header')]; source.redirects.push(redirect(peer.origin)); });
   await f.load(snapshot([source, ...peers])); await inspectSource(f);
   await resolveBodyReferences(f, bodyReferences({ references: bodyTargets(peers.map(item => item.origin)), candidates_scanned: 23 })); clickOverlay(f);
   assert.match(boundsText(f), /23 known direct neighbors/);
   assert.match(boundsText(f), /69 metadata \/ 23 body URL links/);
-  assert.match(boundsText(f), /40 \/ 92 arrows/);
-  assert.match(boundsText(f), /52 arrows omitted by 40-arrow cap/);
-  const arrows = [...f.els.canvas.innerHTML.matchAll(/<path class="service-map-edge ([^"]*)" data-relationship="([^"]+)" d="([^"]+)"[^>]*><title>([^<]+)<\/title>/g)];
+  assert.match(boundsText(f), /40 \/ 46 arrows/);
+  assert.match(boundsText(f), /6 arrows omitted by 40-arrow cap/);
+  const arrows = [...f.els.canvas.innerHTML.matchAll(/<path class="service-map-edge ([^"]*)" data-relationship="([^"]+)"(?: style="[^"]*")? d="([^"]+)"[^>]*><title>([^<]+)<\/title>/g)];
   assert.equal(arrows.length, 40);
   assert.equal(arrows.filter(item => item[2] === 'body_url_reference').length, 23);
   f.els.search.value = 'peer00'; f.els.search.dispatch('input');
-  const pair = [...f.els.canvas.innerHTML.matchAll(/<path class="service-map-edge ([^"]*)" data-relationship="([^"]+)" d="([^"]+)"[^>]*><title>([^<]+)<\/title>/g)];
-  assert.equal(pair.length, 4);
-  assert.equal(new Set(pair.map(item => item[3])).size, 4, 'same directed pair has distinct bounded curves');
-  assert.equal(new Set(pair.map(item => item[2])).size, 4);
+  const pair = [...f.els.canvas.innerHTML.matchAll(/<path class="service-map-edge ([^"]*)" data-relationship="([^"]+)"(?: style="[^"]*")? d="([^"]+)"[^>]*><title>([^<]+)<\/title>/g)];
+  assert.equal(pair.length, 2, 'the body arrow, and one arrow for the redirect, Origin and Referer');
+  assert.equal(new Set(pair.map(item => item[3])).size, 2, 'same directed pair has distinct bounded curves');
+  assert.equal(new Set(pair.map(item => item[2])).size, 2);
   f.controller.selectOrigin(peers[0].origin);
   assert.match(f.els.detail.innerHTML, /2 sampled HTTP rows/);
   const reads = f.requests.length; clickOverlay(f, 'clear');
@@ -1534,7 +1536,7 @@ test('manual Clear preserves native inspector disclosure, focus and nested scrol
   assert.equal(f.requests.length, 3);
 });
 
-test('opposite-direction metadata and body links use seven bounded, non-overpainting attachment offsets', () => {
+test('opposite-direction metadata and body links use bounded, non-overpainting attachment offsets', () => {
   const a = origin(originA), b = origin(originB);
   a.redirects = [redirect(originB)]; b.redirects = [redirect(originA)];
   a.header_links = [header(originB), header(originB, 'referer_header')];
@@ -1542,15 +1544,16 @@ test('opposite-direction metadata and body links use seven bounded, non-overpain
   const data = map.normalizeSnapshot(snapshot([a, b]), 'session-one');
   const layout = map.graphLayout(data.origins, [originA, originB], new Map(), originA,
     [{ source: originA, target: originB, relationship: 'body_url_reference', label: 'Literal body URL reference' }]);
-  assert.equal(layout.edges.length, 7);
+  // Each direction's metadata is one arrow; the inspected body link keeps its own.
+  assert.equal(layout.edges.length, 3);
   const offsets = layout.edges.map(edge => {
     const source = layout.nodes.find(node => node.origin === edge.source);
     return Number(edge.path.match(/^M [-\d.]+ ([-\d.]+)/)[1]) - source.y - map.GRAPH_GEOMETRY.cardHeight / 2;
   });
-  assert.equal(new Set(offsets).size, 7);
+  assert.equal(new Set(offsets).size, 3);
   assert.ok(offsets.every(value => Math.abs(value) <= map.GRAPH_GEOMETRY.cardHeight * 0.3 + 0.001));
-  assert.equal(layout.edges.filter(edge => edge.source === originA).length, 4);
-  assert.equal(layout.edges.filter(edge => edge.source === originB).length, 3);
+  assert.equal(layout.edges.filter(edge => edge.source === originA).length, 2);
+  assert.equal(layout.edges.filter(edge => edge.source === originB).length, 1);
 });
 
 test('overlay direct star keeps the pinned source opposite every incoming and outgoing neighbor', async () => {
@@ -1611,8 +1614,8 @@ test('reciprocal metadata curves and direct relations remain unclipped without b
   b.header_links = [header(c.origin), header(c.origin, 'referer_header'), header(b.origin)];
   c.header_links = [header(b.origin), header(b.origin, 'referer_header')];
   const data = map.normalizeSnapshot(snapshot([a, b, c]), 'session-one');
-  // The overview draws one arrow per direction; Direct relations one per relationship.
-  for (const [anchor, arrows] of [[null, 3], [b.origin, 7]]) {
+  // The overview and Direct relations both draw one arrow per direction.
+  for (const [anchor, arrows] of [[null, 3], [b.origin, 3]]) {
     const layout = map.graphLayout(data.origins, [a.origin, b.origin, c.origin], new Map(), anchor);
     assert.equal(layout.edges.length, arrows); assert.equal(layout.edgeCount, arrows);
     assert.equal(layout.edges.filter(edge => edge.source !== a.origin).length, arrows - 1);

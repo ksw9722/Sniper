@@ -1235,7 +1235,7 @@
     };
     // The explicit overlay gets the first arrow slots. Metadata remains distinct
     // even when the same pair also occurs in a retained response body.
-    const declaredEdges = [...bodyEdges, ...visibleOrigins.flatMap((origin) => [
+    const declaredEdges = [...bodyEdges.map((edge) => ({ ...edge, inspected: true })), ...visibleOrigins.flatMap((origin) => [
       ...origin.redirects.map((redirect) => ({ source: origin.origin, target: redirect.target_origin, relationship: "redirect_instruction", label: "Redirect instruction", kind: "redirect", count: Math.max(1, count(redirect.request_count)) })),
       ...origin.header_links.flatMap((link) => headerEdge(origin, link)),
     ])];
@@ -1245,12 +1245,15 @@
     for (const edge of declaredEdges) {
       // The overview draws one arrow per direction: whatever one card has to
       // another (a redirect, Origin and Referer, an inspection) shares it, drawn
-      // as the first of them, its title naming them all. Direct relations keeps
-      // each relationship's own arrow, the typed view it is for. Redirects to
-      // several paths of one origin share an arrow and their rows, as do the
-      // links of one site's origins; inspected body and Link references count
-      // no rows.
-      const key = JSON.stringify(anchor ? [edge.source, edge.target, edge.relationship] : [edge.source, edge.target]);
+      // as the first of them, its title naming them all. Direct relations does
+      // the same for what the metadata says, so a page that called its API
+      // through redirects, Origin and Referer is one arrow, not three; only an
+      // inspection the operator ran keeps each type's own arrow there, the typed
+      // view it is for. Redirects to several paths of one origin share an arrow
+      // and their rows, as do the links of one site's origins; inspected body and
+      // Link references count no rows.
+      const key = JSON.stringify(!anchor ? [edge.source, edge.target]
+        : edge.inspected ? [edge.source, edge.target, edge.relationship] : [edge.source, edge.target, "metadata"]);
       if (edge.source === edge.target || !visibleIds.has(edge.source) || !visibleIds.has(edge.target)
         || anchor && edge.source !== anchor && edge.target !== anchor) continue;
       if (seen.has(key)) {
@@ -1870,12 +1873,15 @@
       if (state.neighborhoodSnapshot === state.snapshot && state.neighborhoodAnchor === state.anchorOrigin && state.neighborhoodOverlay === state.relationLayers) return state.neighborhood;
       const anchor = findOrigin(state.anchorOrigin);
       if (!anchor) return null;
-      const ids = new Set(), seen = new Set();
+      // Links are typed; arrows are what graphLayout draws: one per direction
+      // for the metadata, one per type for an inspection.
+      const ids = new Set(), seen = new Set(), metadataArrows = new Set(), inspectedArrows = new Set();
       const counts = { incoming: 0, outgoing: 0, redirect_instruction: 0, origin_header: 0, referer_header: 0, body_url_reference: 0 };
       for (const relation of metadataRelations(state.snapshot.origins)) {
         const { sourceOrigin, targetOrigin, relationship } = relation;
         if (sourceOrigin === targetOrigin || sourceOrigin !== anchor.origin && targetOrigin !== anchor.origin) continue;
         ids.add(sourceOrigin === anchor.origin ? targetOrigin : sourceOrigin);
+        metadataArrows.add(JSON.stringify([sourceOrigin, targetOrigin]));
         const key = JSON.stringify([sourceOrigin, targetOrigin, relationship]);
         if (seen.has(key)) continue;
         seen.add(key);
@@ -1888,6 +1894,7 @@
         const neighbor = edge.source === anchor.origin ? edge.target : edge.source;
         ids.add(neighbor); bodyIds.add(neighbor);
         const key = JSON.stringify([edge.source, edge.target, edge.relationship]);
+        inspectedArrows.add(key);
         if (seen.has(key)) continue;
         seen.add(key);
         if (!edge.undirected) counts[edge.source === anchor.origin ? "outgoing" : "incoming"] += 1;
@@ -1899,7 +1906,8 @@
       const neighbors = [...ids].sort().map((id) => byOrigin.get(id) || referenceOrigin(id));
       state.neighborhoodSnapshot = state.snapshot; state.neighborhoodAnchor = state.anchorOrigin;
       state.neighborhoodOverlay = state.relationLayers;
-      state.neighborhood = { anchor, neighbors, counts, bodyIds, edgeCount: seen.size };
+      state.neighborhood = { anchor, neighbors, counts, bodyIds, edgeCount: seen.size,
+        metadataArrowCount: metadataArrows.size, arrowCount: metadataArrows.size + inspectedArrows.size };
       return state.neighborhood;
     }
     function setMapMode(direct) {
@@ -3110,10 +3118,10 @@
           `Direct relations · ${direct.neighbors.length} known direct neighbors in loaded metadata${state.bodyReferenceOverlay ? linkOverlay ? " and temporary Link declarations (unique union)" : " and temporary body references (unique union)" : ""}`,
           `${direct.neighbors.length} loaded neighbors · ${queryHidden} query-hidden · ${productHidden} product/version-hidden · ${matchingNeighbors.length} matching · ${shownNeighbors} shown · ${capOmitted} omitted by ${MAX_CARDS}-card cap (anchor ${anchorShown ? "included" : "hidden"}). Pinned anchor is context, excluded from matching counts`,
           `Non-self distinct typed links: ${counts.incoming} incoming / ${counts.outgoing} outgoing · ${counts.redirect_instruction} redirect / ${counts.origin_header} Origin / ${counts.referer_header} Referer${state.bodyReferenceOverlay ? linkOverlay ? Object.values(LINK_RELATIONS).map((item) => ` / ${counts[item.type] || 0} ${item.type}`).join("") : ` / ${counts.body_url_reference} body_url_reference` : ""}`,
-          `${layout.edges.length} / ${layout.edgeCount} arrows between displayed cards (cap ${MAX_EDGES}) · ${direct.edgeCount - layout.edgeCount} links outside displayed cards`,
+          `${layout.edges.length} / ${layout.edgeCount} arrows between displayed cards (cap ${MAX_EDGES}) · ${direct.arrowCount - layout.edgeCount} arrows outside displayed cards`,
           ...(state.bodyReferenceOverlay ? [
             `${overlayName} typed arrows: ${shownBodyArrows} / ${overlayCount} shown · ${overlayCount - availableBodyArrows} outside displayed cards · ${availableBodyArrows - shownBodyArrows} omitted by arrow cap`,
-            `Metadata typed arrows: ${shownMetadataArrows} / ${metadataArrows} shown · ${metadataArrows - availableMetadataArrows} outside displayed cards · ${availableMetadataArrows - shownMetadataArrows} omitted by arrow cap`,
+            `Metadata arrows: ${shownMetadataArrows} / ${direct.metadataArrowCount} shown · ${direct.metadataArrowCount - availableMetadataArrows} outside displayed cards · ${availableMetadataArrows - shownMetadataArrows} omitted by arrow cap`,
             `${linkOverlay ? "Link" : "Body"} targets and arrows take priority within the same 24-card and 40-arrow limits.`,
           ] : []),
           "Links count distinct origin pairs and relationship types, not requests, URL occurrences or redirect paths. Incoming and outgoing are relative to the pinned anchor; self-links are excluded.",

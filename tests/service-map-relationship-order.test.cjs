@@ -754,7 +754,8 @@ test('one arrow per direction carries every relationship between two cards', () 
   assert.deepEqual([...layout.edges[0].relationships], ['redirect_instruction', 'referer_header', 'origin_header']);
   assert.equal(layout.edges[0].relationship, 'redirect_instruction', 'drawn as the first of them');
   const pinned = map.graphLayout([a, b], [app, api], new Map(), app);
-  assert.equal(pinned.edges.length, 3, 'Direct relations keeps each relationship apart');
+  assert.equal(pinned.edges.length, 1, 'Direct relations merges them too');
+  assert.deepEqual([...pinned.edges[0].relationships], ['redirect_instruction', 'referer_header', 'origin_header']);
 });
 
 test('clients lead the map in their own column and point at the cards where it starts', async () => {

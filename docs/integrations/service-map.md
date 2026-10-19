@@ -305,11 +305,13 @@ search/product filters; the anchor is not counted as a filter match.
 The anchor is included before the 24-card display cap. Local origin search
 filters its neighbors while keeping the anchor visible; the view labels an
 anchor outside the search. Counts distinguish all unique loaded neighbors,
-query-hidden neighbors, card-cap omissions, and typed arrows among displayed
-cards. Multiple captured redirect paths can share one typed origin-to-origin
-arrow; their exact paths remain separate in the inspector. The compact summary
-keeps nonzero omissions visible; Details exposes complete typed-link counts,
-direction definitions, and display limits.
+query-hidden neighbors, card-cap omissions, and arrows among displayed cards.
+What the metadata says about one direction between two cards — redirects, Origin
+and Referer, however many rows said it — is one arrow, as in All origins; its
+tooltip names each relationship, and the redirects' exact paths remain separate
+in the inspector. An explicitly shown inspection keeps one arrow per type. The
+compact summary keeps nonzero omissions visible; Details exposes complete
+typed-link counts, direction definitions, and display limits.
 
 Neighborhood discovery uses the full bounded metadata response, independently
 of the All origins view's reference-card cap. It cannot recover metadata omitted
@@ -381,7 +383,8 @@ draw, rank or weigh a link: a link made only of hidden kinds is not drawn, and a
 link with other rows is drawn for those rows only. The map draws one arrow per
 direction between two cards: a redirect, Origin and Referer links and a shown
 inspection share it, drawn as the first of them, and its tooltip names them all.
-Direct relations keeps one arrow per relationship, the typed view it is for.
+Direct relations does the same for the metadata; only an explicitly shown
+inspection keeps one arrow per type there.
 The arrow takes the colour of its first shown kind in the order of the table
 above: API calls a muted blue, half transparent so that many of them do not
 flood the map; page navigations, frames and other requests grey; scripts and
