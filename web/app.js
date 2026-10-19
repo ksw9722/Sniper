@@ -27957,7 +27957,11 @@ function curlHttpVersionFlag(httpVersion) {
 }
 
 function urlNeedsPathAsIs(url) {
-  return /(?:^|\/)\.\.?(?=\/|\?|$)/.test(rawPathFromUrlString(url || "") || "");
+  const target = rawPathFromUrlString(url || "") || "";
+  // Retain existing flag decisions and also protect encoded dot segments:
+  // modern curl removes them unless --path-as-is is set.
+  return /(?:^|\/)\.\.?(?=\/|\?|$)/.test(target)
+    || /(?:^|\/)(?:\.|%2e){1,2}(?=\/|$)/i.test(target.split("?", 1)[0]);
 }
 
 function replayRequestToFormat(format, tab = getActiveReplayTab()) {
