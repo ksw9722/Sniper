@@ -83,6 +83,7 @@ function tabFixture() {
     "setActiveProxyTab", "sanitizeActiveProxyTab", "renderProxyPanels", "selectSettingsTab",
     "openDisplaySettingsModal", "closeDisplaySettingsModal", "isModalVisible", "restoreModalFocus",
   ], {
+    compareLoadGeneration: 0,
     document, els, state,
     IMPLEMENTED_PROXY_TABS: new Set(captureTabs.map(tab => tab.dataset.proxyTab)),
     scheduleUiSettingsSave: delay => saved.push(delay),

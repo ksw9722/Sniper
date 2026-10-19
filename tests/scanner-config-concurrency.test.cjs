@@ -59,7 +59,7 @@ function fixture() {
   ], {
     els, URLSearchParams, sessionId: "session-a", scannerConfigCache: null,
     scannerConfigStateGeneration: 0, scannerConfigLoadGeneration: 0, scannerConfigSavePending: null,
-    scannerSettingsSessionId: null, scannerSettingsBaseline: null, scannerSettingsGeneration: 0, scannerSettingsSavePending: null, scannerQuickTogglePending: null,
+    compareLoadGeneration: 0, scannerSettingsSessionId: null, scannerSettingsBaseline: null, scannerSettingsGeneration: 0, scannerSettingsSavePending: null, scannerQuickTogglePending: null,
     BUILTIN_RULE_LABELS: { jwt: "JWT Analysis", header: "Security Headers" },
     generateUuid: () => `fixture-${++uuid}`,
     escapeHtml: value => String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;"),

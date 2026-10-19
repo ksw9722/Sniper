@@ -9263,6 +9263,7 @@ document.addEventListener("click", () => closeSessionContextMenu());
 document.addEventListener("contextmenu", () => closeSessionContextMenu());
 
 function showConfirmDialog(message, onConfirm, { title = "Confirm", confirmLabel = "Delete" } = {}) {
+  compareLoadGeneration += 1;
   activeConfirmDialog?.close();
   const returnFocus = document.activeElement;
   const backdrop = document.createElement("div");
@@ -10547,6 +10548,7 @@ async function saveScannerConfig(config, sessionId, expectedConfigToken) {
 async function openScannerSettings() {
   const sessionId = currentSessionId();
   if (scannerSettingsBaseline && scannerSettingsSessionId === sessionId) return;
+  compareLoadGeneration += 1;
   const stateGeneration = scannerConfigStateGeneration;
   const generation = ++scannerSettingsGeneration;
   const isCurrent = () => generation === scannerSettingsGeneration
@@ -11102,12 +11104,6 @@ function bindFindingsEvents() {
 
   // Arrow key navigation
   document.addEventListener("keydown", (e) => {
-    // Skip if scanner settings modal is open
-    if (els.scannerSettingsBackdrop && !els.scannerSettingsBackdrop.classList.contains("hidden")) {
-      if (e.key === "Escape") { e.preventDefault(); closeScannerSettings(); }
-      if (e.key === "Enter" && !e.target.matches("input, textarea, select")) { e.preventDefault(); saveScannerSettingsFromModal(); }
-      return;
-    }
     // Only handle when findings tab is active and owns unmodified arrow keys
     if (state.activeTool !== "proxy" || state.activeProxyTab !== "findings") return;
     if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
@@ -20163,6 +20159,7 @@ function selectSettingsTab(name) {
 
 function openDisplaySettingsModal() {
   if (isModalVisible(els.displaySettingsModal)) return;
+  compareLoadGeneration += 1;
   displaySettingsReturnFocus = document.activeElement;
   hydrateDisplaySettingsForm();
   applyDisplaySettingsState();
@@ -20462,6 +20459,7 @@ function closeDisplaySettingsModal() {
 // state.filterModalTarget says which.
 function openFilterModal(target) {
   if (isModalVisible(els.filterModal)) return;
+  compareLoadGeneration += 1;
   state.filterModalTarget = target === "serviceMap" ? "serviceMap" : "history";
   const forMap = state.filterModalTarget === "serviceMap";
   const title = document.getElementById?.("filterModalTitle");
@@ -20533,6 +20531,14 @@ function getActiveModalAction() {
   if (isModalVisible(els.curlImportModal)) {
     return {
       close: closeCurlImportModal,
+      apply: null,
+    };
+  }
+
+  if (isModalVisible(els.scannerSettingsBackdrop)) {
+    return {
+      modal: els.scannerSettingsBackdrop,
+      close: closeScannerSettings,
       apply: null,
     };
   }
@@ -26296,6 +26302,8 @@ let compareBaseSessionId = null;
 let compareActiveTab = "request";
 let compareBaseRecord = null;
 let compareTargetRecord = null;
+// Other dialog openers advance this too: closing a newer dialog must not
+// revive a comparison that was still loading when it opened.
 let compareLoadGeneration = 0;
 let compareReturnFocus = null;
 
@@ -28457,6 +28465,7 @@ function decodeAnsiCStringEscape(input, index) {
 }
 
 function openCurlImportModal() {
+  compareLoadGeneration += 1;
   const modal = document.getElementById("curlImportModal");
   document.getElementById("curlImportInput").value = "";
   modal.classList.remove("hidden");
