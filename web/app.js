@@ -28065,6 +28065,7 @@ function parseCurlCommand(text) {
   const bodyParts = [];
   let bodyProvided = false;
   let needsDefaultFormContentType = false;
+  let needsDefaultJsonHeaders = false;
   const curlOptionsWithValue = new Set([
     "--abstract-unix-socket",
     "--cacert",
@@ -28154,8 +28155,7 @@ function parseCurlCommand(text) {
     }
     const error = addBodyPart("--json", raw, { defaultContentType: false });
     if (error) return error;
-    ensureHeader("Content-Type", "application/json");
-    ensureHeader("Accept", "application/json");
+    needsDefaultJsonHeaders = true;
     return "";
   };
   for (var t = 0; t < tokens.length; t++) {
@@ -28163,19 +28163,20 @@ function parseCurlCommand(text) {
     if (tok === "-X" || tok === "--request") {
       const value = requireOptionValue(tok);
       if (value.error) return value;
-      method = value.value.toUpperCase();
+      method = value.value;
       methodExplicit = true;
     }
     else if (tok.startsWith("-X") && tok.length > 2) {
-      method = tok.slice(2).toUpperCase() || "GET";
+      method = tok.slice(2);
       methodExplicit = true;
     }
     else if (tok.startsWith("--request=")) {
-      method = tok.slice("--request=".length).toUpperCase() || "GET";
+      method = tok.slice("--request=".length);
+      if (!method) return { error: "cURL --request requires a value." };
       methodExplicit = true;
     }
     else if (tok === "-I" || tok === "--head") {
-      method = "HEAD";
+      if (!methodExplicit) method = "HEAD";
       methodExplicit = true;
     }
     else if (tok === "-G" || tok === "--get") {
@@ -28335,6 +28336,12 @@ function parseCurlCommand(text) {
     port = parsed.port || defaultHttpPortForScheme(scheme);
     path = pathAsIs ? rawPathFromUrlString(url) : `${parsed.pathname || "/"}${parsed.search || ""}`;
   } catch (_) { return null; }
+  // JSON defaults must wait until all explicit headers have been read, so
+  // a later -H overrides them just as it does when it precedes --json.
+  if (needsDefaultJsonHeaders) {
+    ensureHeader("Content-Type", "application/json");
+    ensureHeader("Accept", "application/json");
+  }
   if (needsDefaultFormContentType && !getMode) {
     ensureHeader("Content-Type", "application/x-www-form-urlencoded");
   }
