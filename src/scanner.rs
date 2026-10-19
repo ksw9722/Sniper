@@ -630,9 +630,11 @@ fn is_binary_body(msg: &MessageRecord) -> bool {
 /// almost always false positives — the token pattern coincidentally appears within
 /// base64-encoded binary data.
 fn is_embedded_in_base64(body: &str, m: &regex::Match) -> bool {
+    is_span_embedded_in_base64(body, m.start(), m.end())
+}
+
+fn is_span_embedded_in_base64(body: &str, start: usize, end: usize) -> bool {
     let bytes = body.as_bytes();
-    let start = m.start();
-    let end = m.end();
 
     // Count continuous base64 chars before the match
     let pre = (0..start)
@@ -1861,15 +1863,31 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
 
     for &(pattern, label, ref severity) in PATTERNS {
         if let Ok(re) = Regex::new(pattern) {
+            if label == "Password in response" {
+                if let Some(span) = password_response_match(body, script, &re) {
+                    let mut finding = make_finding(
+                        record,
+                        severity.clone(),
+                        "disclosure",
+                        format!("{label} detected in response"),
+                        format!("{label} found in response body. This may expose sensitive information to clients."),
+                        truncate_evidence(&body[span.clone()], 80),
+                    );
+                    let line = response.headers.len()
+                        + 3
+                        + body[..span.start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count();
+                    finding.location = Some(location_for_line(record, "response", line));
+                    findings.push(finding);
+                }
+                continue;
+            }
             for captures in re.captures_iter(body) {
                 let Some(m) = captures.get(0) else {
                     continue;
                 };
-                if label == "Password in response"
-                    && !password_candidate_looks_like_secret(&captures, script)
-                {
-                    continue;
-                }
                 if is_generic_secret_label(label)
                     && !generic_secret_candidate_looks_like_secret(&captures)
                 {
@@ -2081,17 +2099,90 @@ fn token_mixes_cases_and_digits(token: &str) -> bool {
         && body.bytes().any(|byte| byte.is_ascii_lowercase())
 }
 
+// Keep the old accepted candidates as a compatibility floor. Completing a
+// quoted prefix can expose a suffix rejected by existing heuristics; that must
+// improve evidence, not silently remove an already reported finding.
+fn password_response_match(
+    body: &str,
+    script: bool,
+    legacy: &Regex,
+) -> Option<std::ops::Range<usize>> {
+    let legacy_match = legacy.captures_iter(body).find_map(|captures| {
+        let m = captures.get(0)?;
+        if !password_candidate_looks_like_secret(&captures, script)
+            || is_embedded_in_base64(body, &m)
+        {
+            return None;
+        }
+        let end = captures
+            .get(1)
+            .or(captures.get(2))
+            .and_then(|value| password_quoted_end(body, value.start() - 1))
+            .unwrap_or(m.end());
+        Some(m.start()..end)
+    });
+
+    // Discover keys independently: a rejected or malformed earlier literal
+    // must not consume a later key. Only quoted candidates are supplemented;
+    // the unquoted signature and its filtering remain on the legacy path.
+    let heads = Regex::new(r#"(?i)(?:\b|[_-])(?:password|passwd|pwd)\b\s*["']?\s*[:=]\s*["']"#)
+        .expect("valid password key pattern");
+    for head in heads.find_iter(body) {
+        if legacy_match
+            .as_ref()
+            .is_some_and(|span| head.start() >= span.start)
+        {
+            break;
+        }
+        let Some(end) = password_quoted_end(body, head.end() - 1) else {
+            continue;
+        };
+        let value = &body[head.end()..end - 1];
+        // Preserve the regex's four raw Unicode scalars, then the existing
+        // heuristic's eight raw UTF-8 bytes. Do not decode any escape spelling.
+        if value.chars().take(4).count() == 4
+            && password_value_looks_like_secret(value, true, script)
+            && !is_span_embedded_in_base64(body, head.start(), end)
+        {
+            return Some(head.start()..end);
+        }
+    }
+    legacy_match
+}
+
+// ASCII quote/backslash offsets are always UTF-8 boundaries. Each discovered
+// opening quote follows ':'/'='/whitespace and is therefore unescaped. For
+// either quote kind its next closing quote is no later than the next opener of
+// that kind, so scans (including rejected/unterminated candidates) total O(n),
+// rather than repeatedly scanning an unclosed suffix. No source is decoded.
+fn password_quoted_end(body: &str, opening: usize) -> Option<usize> {
+    let quote = body.as_bytes()[opening];
+    let mut escaped = false;
+    for (offset, &byte) in body.as_bytes()[opening + 1..].iter().enumerate() {
+        if byte == quote && !escaped {
+            return Some(opening + offset + 2);
+        }
+        escaped = byte == b'\\' && !escaped;
+    }
+    None
+}
+
 fn password_candidate_looks_like_secret(captures: &regex::Captures<'_>, script: bool) -> bool {
     let Some(value) = captured_secret_value(captures) else {
         return false;
     };
+    let quoted = captures.get(1).or(captures.get(2)).is_some();
+    password_value_looks_like_secret(value, quoted, script)
+}
+
+fn password_value_looks_like_secret(value: &str, quoted: bool, script: bool) -> bool {
+    let value = value.trim();
     if value.len() < 8 {
         return false;
     }
     // Code, not a value: in a script anything unquoted (`e.password,text:…`);
     // anywhere an unquoted flag, comparison or call (`!0`, `==e.type`, `f(x)`),
     // or a quote closing a string before a concatenation (`"pw: "+e.pw`).
-    let quoted = captures.get(1).or(captures.get(2)).is_some();
     if value.starts_with('+')
         || (!quoted && (script || value.starts_with(['!', '=']) || value.contains('(')))
     {
@@ -8214,6 +8305,288 @@ mod tests {
             r#"<script>if("password"===e.type||x)</script>"#,
         );
         assert!(!page.contains(&password), "a comparison in a page's script");
+    }
+
+    fn password_match_for_test(body: &str, script: bool, corrected: bool) -> Option<String> {
+        let legacy = Regex::new(r#"(?i)(?:\b|[_-])(?:password|passwd|pwd)\b\s*["']?\s*[:=]\s*(?:"([^"]{4,})"|'([^']{4,})'|([^\s"'<>{}]{4,}))"#).unwrap();
+        if corrected {
+            password_response_match(body, script, &legacy).map(|span| body[span].to_string())
+        } else {
+            legacy.captures_iter(body).find_map(|captures| {
+                let m = captures.get(0)?;
+                (password_candidate_looks_like_secret(&captures, script)
+                    && !is_embedded_in_base64(body, &m))
+                .then(|| m.as_str().to_string())
+            })
+        }
+    }
+
+    #[test]
+    fn password_quotes_recover_matching_escapes_and_preserve_opposite_quotes() {
+        for (body, legacy_found) in [
+            (r#"password:"Ab12\"Cd34""#, false),
+            (r#"password:'Ab12\'Cd34'"#, false),
+            (r#"password:"Ab12'Cd34""#, true),
+            (r#"password:'Ab12"Cd34'"#, true),
+            (r#"password:"Ab12\\Cd34""#, true),
+            (r#"password:"\u0041b12Cd34""#, true),
+            (r#"password:"\u5BC6\u78BCAb12Cd34""#, true),
+            (r#"password:"Enter\npasscode""#, true),
+            (r#"password:"Ab12🔐Cd34""#, true),
+        ] {
+            assert_eq!(
+                password_match_for_test(body, true, false).is_some(),
+                legacy_found,
+                "{body}"
+            );
+            assert_eq!(
+                password_match_for_test(body, true, true).as_deref(),
+                Some(body),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_quotes_respect_odd_and_even_backslash_runs() {
+        for quote in ['"', '\''] {
+            for count in 0..=8 {
+                let slashes = "\\".repeat(count);
+                let body = format!("password:{quote}Ab12Cd34{slashes}{quote}Ef56Gh78{quote}");
+                let expected = if count % 2 == 0 {
+                    format!("password:{quote}Ab12Cd34{slashes}{quote}")
+                } else {
+                    body.clone()
+                };
+                assert!(password_match_for_test(&body, true, false).is_some());
+                assert_eq!(password_match_for_test(&body, true, true), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn password_quotes_preserve_legacy_acceptance_when_complete_suffix_is_rejected() {
+        for suffix in [
+            " human label",
+            "password",
+            "passwd",
+            "://host",
+            "密碼",
+            "placeholder",
+        ] {
+            let body = format!(r#"password:"Ab12Cd34\"{suffix}""#);
+            assert!(
+                password_match_for_test(&body, true, false).is_some(),
+                "{body}"
+            );
+            assert!(
+                !password_value_looks_like_secret(&body[10..body.len() - 1], true, true),
+                "{body}"
+            );
+            assert_eq!(password_match_for_test(&body, true, true), Some(body));
+        }
+        // Extending evidence must not add a new base64 veto to a legacy hit.
+        let body = format!(
+            r#"{}_password:"Ab12Cd34\"Ef56Gh78"{}"#,
+            "A".repeat(21),
+            "B".repeat(21)
+        );
+        assert!(password_match_for_test(&body, true, false).is_some());
+        assert_eq!(
+            password_match_for_test(&body, true, true).as_deref(),
+            Some(r#"_password:"Ab12Cd34\"Ef56Gh78""#)
+        );
+        // Newly recognized candidates still use the complete-span base64 guard.
+        let body = format!(
+            r#"{}_password:"Ab12\"Cd34"{};password:"Ef56Gh78""#,
+            "A".repeat(21),
+            "B".repeat(21)
+        );
+        assert_eq!(
+            password_match_for_test(&body, true, true).as_deref(),
+            Some(r#"password:"Ef56Gh78""#)
+        );
+    }
+
+    #[test]
+    fn password_quotes_keep_raw_scalar_and_byte_floors() {
+        for (body, accepted) in [
+            (r#"password:"Ab12Cd3""#, false),
+            (r#"password:"Ab12Cd34""#, true),
+            (r#"password:"Ab1\"Cd2""#, true),
+            (r#"password:"Ab1\"Cd23""#, true),
+            (r#"password:"🔐🌙✨""#, false),
+            (r#"password:"🔐🌙✨🗝""#, true),
+            (r#"password:"密碼Ab12Cd34""#, false),
+        ] {
+            assert_eq!(
+                password_match_for_test(body, true, true).is_some(),
+                accepted,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_quotes_find_later_candidates_independently() {
+        for rejected in [
+            "password:\"Enter passcode\";\n",
+            "password:\"unterminated\n",
+            "password:'unterminated\\\n",
+        ] {
+            let body = format!("{rejected}password:\"Ab12\\\"Cd34\";");
+            assert_eq!(password_match_for_test(&body, true, false), None, "{body}");
+            assert_eq!(
+                password_match_for_test(&body, true, true).as_deref(),
+                Some(r#"password:"Ab12\"Cd34""#),
+                "{body}"
+            );
+        }
+        let body = "password:\"unterminated\npassword:\"Ef56Gh78\";";
+        assert_eq!(password_match_for_test(body, true, false), None);
+        assert_eq!(
+            password_match_for_test(body, true, true).as_deref(),
+            Some(r#"password:"Ef56Gh78""#)
+        );
+        let body = r#"password:"Ab12\"Cd34";password:"Ef56Gh78""#;
+        assert_eq!(
+            password_match_for_test(body, true, false).as_deref(),
+            Some(r#"password:"Ef56Gh78""#)
+        );
+        assert_eq!(
+            password_match_for_test(body, true, true).as_deref(),
+            Some(r#"password:"Ab12\"Cd34""#)
+        );
+    }
+
+    #[test]
+    fn password_quotes_do_not_invent_closing_delimiters() {
+        for body in [
+            "password:\"Ab12Cd34",
+            "password:'Ab12Cd34\\",
+            r#"password:"Ab1\"Cd2"#,
+        ] {
+            assert_eq!(password_match_for_test(body, true, false), None);
+            assert_eq!(password_match_for_test(body, true, true), None);
+        }
+        // A legacy accepted prefix in malformed input is retained verbatim.
+        let body = r#"password:"Ab12Cd34\""#;
+        assert_eq!(password_quoted_end(body, 9), None);
+        assert_eq!(
+            password_match_for_test(body, true, false).as_deref(),
+            Some(body)
+        );
+        assert_eq!(
+            password_match_for_test(body, true, true).as_deref(),
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn password_quotes_leave_unquoted_behavior_unchanged() {
+        for script in [false, true] {
+            for body in [
+                "db_password=Rj62Zk91Mn",
+                "password=Ab12Cd3",
+                "password=state.passcode",
+                "password=!0;password=Ab12Cd34",
+                "password=f(Ab12Cd34)",
+                "password=Enter passcode;pwd=Ef56Gh78",
+            ] {
+                assert_eq!(
+                    password_match_for_test(body, script, true),
+                    password_match_for_test(body, script, false),
+                    "{body}, script={script}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn password_quotes_keep_ui_shaped_values_and_one_finding() {
+        for value in ["#login-pw", "login_form_2", "required|min:8", "string(64)"] {
+            for context in ["labels", "credentials"] {
+                let body =
+                    format!(r#"const {context}={{password:"{value}"}};password:"Ef56Gh78";"#);
+                let expected = format!(r#"password:"{value}""#);
+                assert_eq!(
+                    password_match_for_test(&body, true, false),
+                    Some(expected.clone())
+                );
+                assert_eq!(password_match_for_test(&body, true, true), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn password_quotes_handle_many_malformed_heads_and_large_values() {
+        let body = format!(
+            "{}password:\"Ab12\\\"Cd34\"",
+            "password:\"unterminated\n".repeat(10_000)
+        );
+        assert_eq!(
+            password_match_for_test(&body, true, true).as_deref(),
+            Some(r#"password:"Ab12\"Cd34""#)
+        );
+        let body = format!(
+            "{}password:'Ab12\\'Cd34'",
+            "pwd:\"Enter passcode\npwd:'Enter passcode\n".repeat(10_000)
+        );
+        assert_eq!(
+            password_match_for_test(&body, true, true).as_deref(),
+            Some("password:'Ab12\\'Cd34'")
+        );
+        let body = format!(r#"password:"Ab12\"{}""#, "🔐".repeat(64 * 1024));
+        assert_eq!(password_match_for_test(&body, true, false), None);
+        assert_eq!(password_match_for_test(&body, true, true), Some(body));
+    }
+
+    #[test]
+    fn password_quotes_use_exact_raw_evidence_and_accepted_body_location() {
+        let evidence = r#"password:"Ab12\"Cd34""#;
+        let body =
+            format!("🔐 introductory text\nconst cfg={{{evidence}}};\npassword:\"Ef56Gh78\";");
+        let mut record = make_record(vec![], vec![("x-copy", evidence)], &body, 200);
+        record.response.as_mut().unwrap().content_type = Some("application/javascript".into());
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+        let passwords: Vec<_> = findings
+            .iter()
+            .filter(|f| f.title == "Password in response detected in response")
+            .collect();
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(passwords[0].evidence, evidence);
+        assert_eq!(passwords[0].severity, Severity::High);
+        assert_eq!(passwords[0].category, "disclosure");
+        assert_eq!(
+            passwords[0].location,
+            Some(location_for_line(&record, "response", 5))
+        );
+    }
+
+    #[test]
+    fn password_quotes_preserve_display_truncation_and_provider_findings() {
+        let raw = format!(r#"password:"Ab12\"{}""#, "🔐".repeat(30));
+        let body = format!("{raw};const token='ghp_{}';", "Ab12".repeat(9));
+        let mut record = make_record(vec![], vec![], &body, 200);
+        record.response.as_mut().unwrap().content_type = Some("application/javascript".into());
+        let findings = scan_transaction(&record, &ScannerConfig::default());
+        let passwords: Vec<_> = findings
+            .iter()
+            .filter(|f| f.title == "Password in response detected in response")
+            .collect();
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(passwords[0].evidence, truncate_evidence(&raw, 80));
+        assert!(passwords[0].evidence.ends_with("..."));
+        assert_eq!(
+            findings
+                .iter()
+                .filter(
+                    |f| f.title == "GitHub Personal Access Token detected in response"
+                        && f.severity == Severity::High
+                )
+                .count(),
+            1
+        );
     }
 
     #[test]
