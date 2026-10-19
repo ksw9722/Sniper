@@ -101,3 +101,28 @@ test('explicit empty GET bodies retain their existing Fetch warning', () => {
   assert.equal(c.replayRequestToFormat('fetch', tab(raw)), '');
   assert.match(toasts.at(-1)[0], /GET or HEAD requests with a body/);
 });
+
+// cURL's documented empty-field representation is Name;, whereas Name:
+// suppresses a field. Inspect arguments only; never execute the output.
+// https://curl.se/docs/manpage.html#-H
+for (const surface of ['history', 'replay']) {
+  test(`${surface} cURL export round-trips empty and repeated header fields`, () => {
+    const headers = [
+      { name: 'X-Empty', value: '' }, { name: 'X-Note', value: "café's note" },
+      { name: 'x-empty', value: '' }, { name: 'Content-Type', value: '' },
+    ];
+    const raw = 'POST /ordinary HTTP/1.1\nHost: example.com\n'
+      + headers.map(h => `${h.name}: ${h.value}`).join('\n') + '\n\nhello 文\r\n';
+    const record = { kind: 'http', method: 'POST', scheme: 'https', host: 'example.com', path: '/ordinary', http_version: 'HTTP/1.1',
+      request: { headers, body_preview: 'hello 文\r\n', body_encoding: 'utf8', body_size: 11, preview_truncated: false } };
+    const command = surface === 'history' ? c.recordToFormat(record, 'curl') : c.replayRequestToFormat('curl', tab(raw));
+    const words = Array.from(c.splitShellWords(command));
+    const headerArgs = words.flatMap((word, index) => word === '-H' ? [words[index + 1]] : []);
+    assert.deepEqual(headerArgs, ['X-Empty;', "X-Note: café's note", 'x-empty;', 'Content-Type;']);
+    const imported = c.parseCurlCommand(command);
+    assert.ok(imported && !imported.error, imported?.error);
+    assert.deepEqual(Array.from(imported.headers).filter(h => h.name.toLowerCase() !== 'host').map(h => [h.name, h.value]), headers.map(h => [h.name, h.value]));
+    assert.equal(imported.body, 'hello 文\r\n');
+    assert.equal(c.parseEditableRawRequest(imported.requestText, { scheme: 'https' }).body, imported.body);
+  });
+}

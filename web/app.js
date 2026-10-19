@@ -27938,7 +27938,8 @@ function requestToCurl(parsed) {
   if (versionFlag) parts.push(versionFlag);
   if (urlNeedsPathAsIs(parsed.url)) parts.push("--path-as-is");
   for (const h of exportableHeaders(parsed.headers, parsed.url)) {
-    parts.push(`-H ${shellQuote(`${h.name}: ${h.value}`)}`);
+    // cURL uses a semicolon for an empty field; a colon suppresses the field.
+    parts.push(`-H ${shellQuote(h.value ? `${h.name}: ${h.value}` : `${h.name};`)}`);
   }
   if (parsed.bodyProvided || parsed.body.length > 0) {
     parts.push(`--data-raw ${shellQuote(parsed.body)}`);
@@ -28163,11 +28164,16 @@ function parseCurlCommand(text) {
   const addHeader = (rawHeader, flag = "-H") => {
     const hVal = String(rawHeader || "");
     const ci = hVal.indexOf(":");
-    if (ci <= 0) return `cURL ${flag} requires a header in Name: Value form.`;
-    const name = hVal.slice(0, ci).trim();
+    const emptyField = ci < 0 && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+;$/.test(hVal);
+    if (!emptyField && ci <= 0) return `cURL ${flag} requires a header in Name: Value or Name; form.`;
+    const name = (emptyField ? hVal.slice(0, -1) : hVal.slice(0, ci)).trim();
     if (!name) return `cURL ${flag} requires a header name.`;
+    const value = emptyField ? "" : hVal.slice(ci + 1).trim();
+    if (!emptyField && !value) {
+      return "cURL header suppression is not supported. Use Name; to import an empty header value.";
+    }
     if (headerNameEquals({ name }, "content-length")) return "";
-    headers.push({ name, value: hVal.slice(ci + 1).trim() });
+    headers.push({ name, value });
     return "";
   };
   const addBodyPart = (flag, value, options = {}) => {

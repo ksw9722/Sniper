@@ -171,3 +171,35 @@ test('ordinary quoting, empty values, URL/body separation and malformed feedback
     assert.equal(f.toasts.at(-1)[1], 'error');
   }
 });
+
+for (const option of ["-H 'X-Empty;'", "-H'X-Empty;'", "--header 'X-Empty;'", "--header='X-Empty;'"]) {
+  test(`documented empty header form survives Import callback (${option})`, () => {
+    const f = fixture(); f.c.openCurlImportModal();
+    f.importText(`curl https://example.com/synthetic ${option} -H 'X-Note: first' -H 'x-empty;' --json '{}' -H 'Content-Type;'`);
+    assert.equal(f.state.replayTabs.length, 1, f.toasts.at(-1)?.[0]);
+    const request = f.state.replayTabs[0].baseRequest;
+    assert.deepEqual(headers(request, 'x-empty'), ['', '']);
+    assert.deepEqual(headers(request, 'x-note'), ['first']);
+    assert.deepEqual(headers(request, 'content-type'), ['']);
+    assert.deepEqual(headers(request, 'accept'), ['application/json']);
+    assert.match(f.state.replayTabs[0].requestText, /X-Empty: \nX-Note: first\nx-empty: /);
+    assert.equal(f.modal.classList.contains('hidden'), true);
+  });
+}
+
+test('unsupported colon-only header suppression stays explicit without creating a tab', () => {
+  const f = fixture(); f.c.openCurlImportModal();
+  for (const option of ["-H 'X-Empty:'", "-H 'Accept: '", "--header='Content-Type:'", "-H 'Host:'"]) {
+    f.importText(`curl https://example.com/synthetic --json '{}' ${option}`);
+    assert.equal(f.state.replayTabs.length, 0);
+    assert.equal(f.modal.classList.contains('hidden'), false);
+    assert.match(f.toasts.at(-1)?.[0] || '', /header suppression.*not supported/i);
+  }
+});
+
+test('empty-field support does not accept malformed or file-backed header arguments', () => {
+  const f = fixture();
+  for (const value of [';', 'missing header;', 'X-Empty;extra;', '@fixture.txt', 'missing colon']) {
+    assert.ok(f.c.parseCurlCommand(`curl https://example.com/synthetic -H '${value}'`).error);
+  }
+});
