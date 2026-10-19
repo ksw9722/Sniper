@@ -4931,6 +4931,11 @@ fn format_size(bytes: usize) -> String {
         index += 1;
     }
     let precision = if size >= 10.0 || index == 0 { 0 } else { 1 };
+    // The UI uses toFixed, which rounds positive ties up. Rust's formatter
+    // rounds ties to even, so round first to keep displayed-size queries equal.
+    // One-decimal values are below 10 GB, making size * 10 exact for byte counts.
+    let factor = if precision == 0 { 1.0 } else { 10.0 };
+    let size = (size * factor).round() / factor;
     format!("{size:.precision$} {}", units[index])
 }
 
@@ -5050,6 +5055,55 @@ pub(crate) mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn history_size_format_matches_ui_rounding_and_unit_boundaries() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (512, "512 B"),
+            (1023, "1023 B"),
+            (1024, "1.0 KB"),
+            (1279, "1.2 KB"),
+            (1280, "1.3 KB"),
+            (1281, "1.3 KB"),
+            (10239, "10.0 KB"),
+            (10240, "10 KB"),
+            (10751, "10 KB"),
+            (10752, "11 KB"),
+            (10753, "11 KB"),
+            (1048575, "1024 KB"),
+            (1048576, "1.0 MB"),
+            (1310720, "1.3 MB"),
+            (11010048, "11 MB"),
+            (1073741824, "1.0 GB"),
+            (1342177280, "1.3 GB"),
+        ] {
+            assert_eq!(format_size(bytes), expected, "{bytes} bytes");
+        }
+    }
+
+    #[test]
+    fn history_size_search_matches_displayed_half_unit_values() {
+        for (bytes, displayed) in [(1280, "1.3 KB"), (10752, "11 KB"), (512, "512 B")] {
+            let mut summary = test_record("example.com").summary();
+            summary.request_bytes = bytes;
+            summary.response_bytes = 0;
+            let cached = CachedSummary::new(summary);
+            assert!(matches_filters(
+                &cached,
+                Some(&displayed.to_ascii_lowercase()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &ListFilters::default(),
+                None,
+                false,
+            ));
+        }
     }
 
     #[test]
