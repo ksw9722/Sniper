@@ -209,6 +209,16 @@ also records a fix in v1.0.922.1 for onboarding reappearing after profile change
 or restarts. Check the installed version and the exact screen before attributing
 a repeated prompt to profile deletion.
 
+“Sniper profile” identifies the dedicated directory here; Sniper does not set the
+name displayed in Aside's profile menu. Aside's native changelog also documents
+custom profile names, but its CLI guide does not document creating or naming a
+local browser profile. Chromium's
+[`--profile-directory` switch](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/chrome/common/chrome_switches.h)
+selects a child directory, not a display name. Changing it to `Sniper` could select
+a different, empty profile instead of the saved one, and does not establish that
+Aside's first-run screen can be skipped. Sniper therefore keeps the existing
+directory selection and does not manufacture browser setup or account state.
+
 Distinguish a site's login from Aside's own account or its CLI sign-in.
 Its [account commands](https://docs.aside.com/help/developers) include
 `aside account list` and `aside account status`; account recovery is in Aside
