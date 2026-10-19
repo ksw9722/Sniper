@@ -1493,7 +1493,7 @@ impl TransactionStore {
             .host
             .as_ref()
             .map(|value| value.to_ascii_lowercase());
-        let since_dt = filters.since.as_deref().and_then(parse_since);
+        let since_dt = filters.since.as_deref().and_then(parse_history_since);
         let status_pred = filters
             .status
             .map(StatusPredicate::Exact)
@@ -4434,7 +4434,19 @@ fn parse_status_range(input: &str) -> Option<StatusPredicate> {
     None
 }
 
+pub(crate) fn parse_history_since(input: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // History queries have always required positive relative durations.
+    parse_since_with_minimum(input, 1)
+}
+
 fn parse_since(input: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_since_with_minimum(input, 0)
+}
+
+fn parse_since_with_minimum(
+    input: &str,
+    minimum_relative_amount: i64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let trimmed = input.trim();
     // Relative: "1h", "30m", "2d", "7d"
     for (unit, seconds_per_unit) in [('h', 3600_i64), ('m', 60), ('d', 86400), ('s', 1)] {
@@ -4443,6 +4455,9 @@ fn parse_since(input: &str) -> Option<chrono::DateTime<chrono::Utc>> {
                 return None;
             }
             let amount: i64 = rest.parse().ok()?;
+            if amount < minimum_relative_amount {
+                return None;
+            }
             let duration = chrono::Duration::try_seconds(amount.checked_mul(seconds_per_unit)?)?;
             return chrono::Utc::now().checked_sub_signed(duration);
         }
@@ -5035,6 +5050,60 @@ pub(crate) mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn history_since_parser_rejects_nonpositive_and_unusable_cutoffs() {
+        for since in [
+            "+1h",
+            "9223372036854775807h",
+            "9223372036854775807s",
+            "999999999d",
+            "-1h",
+            "0s",
+            "00m",
+            "000h",
+            "0d",
+            "1.5h",
+            "2026-02-30",
+            " ",
+        ] {
+            assert!(parse_history_since(since).is_none(), "{since}");
+        }
+    }
+
+    #[test]
+    fn history_since_parser_retains_cutoffs_for_valid_inputs() {
+        let old = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut summary = test_record("example.com").summary();
+        summary.started_at = old;
+        let cached = CachedSummary::new(summary);
+        for since in ["1h", "30m", "2d", "60s", " 1h ", "01h", "2026-01-01"] {
+            let cutoff = parse_history_since(since).expect(since);
+            assert!(!matches_filters(
+                &cached,
+                None,
+                None,
+                None,
+                None,
+                Some(&cutoff),
+                None,
+                None,
+                &ListFilters::default(),
+                None,
+                false,
+            ));
+        }
+        let midnight = parse_history_since("2026-01-01").unwrap();
+        assert_eq!(parse_history_since("2026-01-01T00:00:00Z"), Some(midnight));
+        assert_eq!(
+            parse_history_since("2026-01-01T05:30:00+05:30"),
+            Some(midnight)
+        );
+        // Keep the pre-existing parser contract for callers outside history reads.
+        assert!(parse_since("0s").is_some());
     }
 
     mod service_map_body_tests {

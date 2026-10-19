@@ -1175,25 +1175,9 @@ fn validate_status_range(input: &str) -> Option<()> {
 }
 
 fn validate_since(input: &str) -> Option<()> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    for suffix in ['h', 'm', 'd', 's'] {
-        if let Some(value) = trimmed.strip_suffix(suffix) {
-            return value
-                .parse::<i64>()
-                .ok()
-                .filter(|value| *value > 0)
-                .map(|_| ());
-        }
-    }
-    if chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_ok() {
-        return Some(());
-    }
-    chrono::DateTime::parse_from_rfc3339(trimmed)
-        .ok()
-        .map(|_| ())
+    // A syntactically valid duration can still overflow the cutoff date. Use
+    // the listing parser so an accepted filter cannot silently become None.
+    crate::store::parse_history_since(input).map(|_| ())
 }
 
 pub(crate) fn validate_editable_request(
@@ -10811,6 +10795,53 @@ mod tests {
             super::normalize_sort_direction(Some(" ASC ")).as_deref(),
             Some("asc")
         );
+    }
+
+    #[test]
+    fn history_since_query_rejects_unusable_cutoffs() {
+        for since in [
+            "+1h",
+            "9223372036854775807h",
+            "9223372036854775807s",
+            "999999999d",
+            "-1h",
+            "0m",
+            "00s",
+            "1.5h",
+            "2026-02-30",
+            " ",
+        ] {
+            let query = TransactionQuery {
+                since: Some(since.into()),
+                ..TransactionQuery::default()
+            };
+            assert!(validate_transaction_query(&query).is_err(), "{since}");
+        }
+    }
+
+    #[test]
+    fn history_since_query_accepts_existing_date_and_duration_forms() {
+        for since in [
+            "1h",
+            "30m",
+            "2d",
+            "60s",
+            " 1h ",
+            "01h",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T05:30:00+05:30",
+        ] {
+            let query = TransactionQuery {
+                since: Some(since.into()),
+                ..TransactionQuery::default()
+            };
+            assert!(validate_transaction_query(&query).is_ok(), "{since}");
+            assert!(
+                crate::store::parse_history_since(since).is_some(),
+                "{since}"
+            );
+        }
     }
 
     #[test]
