@@ -2050,6 +2050,7 @@ function bindEvents() {
 
   // Fuzzer layout resizers
   initFuzzerResizers();
+  initFuzzerSetupControls();
 
   // Fuzzer results shell (for keyboard navigation + focus)
   const fuzzerResultsShell = els.fuzzerResultsBody.closest(".history-table-shell");
@@ -15222,6 +15223,7 @@ function renderFuzzer() {
     els.resetFuzzerButton.disabled = !!state.fuzzerRunning;
   }
 
+  if (typeof renderFuzzerSetup === "function") renderFuzzerSetup();
   const attackRecord = normalizeFuzzerAttackRecord(state.fuzzerAttackRecord);
   state.fuzzerAttackRecord = attackRecord;
   if (attackRecord?.id) {
@@ -15763,7 +15765,279 @@ async function saveTargetScope(options = {}) {
   return true;
 }
 
+function fuzzerRequestTextForAction() {
+  const editor = getCMView("fuzzerReq");
+  const visible = editor ? editor.getContent() : els.fuzzerRequestEditor?.value;
+  const saved = String(state.fuzzerRequestText || "");
+  // CodeMirror normalizes line breaks. Preserve the untouched source bytes when
+  // its displayed document still matches that source (notably multipart CRLF).
+  if (visible == null || String(visible) === saved.replace(/\r\n?/g, "\n")) return saved;
+  return String(visible);
+}
+
+function parseFuzzerRequestTemplate(text, fallback = state.fuzzerBaseRequest || createDefaultEditableRequest()) {
+  const raw = String(text || "");
+  const boundary = /\r?\n\r?\n/.exec(raw);
+  const { body } = splitRawHttpMessage(raw);
+  const bodyLength = editableRequestBodyLength(body, fallback?.body_encoding === "base64" ? "base64" : "utf8");
+  const headEnd = boundary ? boundary.index : raw.length;
+  // The engine always recalculates Content-Length after expansion. Normalize
+  // only this derived field before using the shared parser, independent of the
+  // Replay editor preference. Other framing validation remains unchanged.
+  const originalHead = raw.slice(0, headEnd);
+  const lengths = [...originalHead.matchAll(/^[ \t]*content-length[ \t]*:[ \t]*([^\r\n]*)/gmi)].map((match) => match[1].trim());
+  if (lengths.some((value) => !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)))
+    || lengths.some((value) => Number(value) !== Number(lengths[0]))) {
+    throw new Error("Invalid or conflicting Content-Length headers in the request template.");
+  }
+  const head = originalHead.replace(/^([ \t]*content-length[ \t]*:[ \t]*)[^\r\n]*/gmi, (_line, prefix) => `${prefix}${bodyLength}`);
+  return parseEditableRawRequest(head + raw.slice(headEnd), fallback);
+}
+
+function fuzzerSetupNode(id) {
+  return document.getElementById(id);
+}
+
+function fuzzerSetupError(error) {
+  const notice = fuzzerSetupNode("fuzzerPreflightNotice");
+  if (notice) notice.textContent = error?.message || String(error || "Unable to update Fuzzer setup.");
+  showToast(error?.message || "Unable to update Fuzzer setup.", "error", 4000);
+}
+
+function fuzzerPayloadCount(text) {
+  if (!text) return 0;
+  let count = 1;
+  for (let index = 0; index < text.length; index++) {
+    if (text[index] === "\r" || text[index] === "\n") {
+      count++;
+      if (text[index] === "\r" && text[index + 1] === "\n") index++;
+    }
+  }
+  return count - (/[\r\n]$/.test(text) ? 1 : 0);
+}
+
+function fuzzerPayloadTextWithinLimits(text, payloads) {
+  if (new TextEncoder().encode(text).length > 4 * 1024 * 1024) {
+    throw new Error("Payload editor text, including line separators, cannot exceed 4 MiB.");
+  }
+  if (fuzzerPayloadCount(text) > 5000) throw new Error("Fuzzer payload count cannot exceed 5000.");
+  payloads = payloads || splitFuzzerPayloadLines(text);
+  const check = SniperFuzzerWorkflow.validatePayloads(payloads);
+  if (!check.valid) throw new Error(check.errors.join(" "));
+  return payloads;
+}
+
+function fuzzerSetupPreflight(raw = fuzzerRequestTextForAction()) {
+  if (!raw.trim()) throw new Error("Choose a captured request or paste a raw HTTP request to begin.");
+  if (new TextEncoder().encode(raw).length > 2 * 1024 * 1024) throw new Error("Request editor text cannot exceed 2 MiB.");
+  const template = parseFuzzerRequestTemplate(raw);
+  const payloadText = state.fuzzerPayloadsText || "";
+  if (new TextEncoder().encode(payloadText).length > 4 * 1024 * 1024) throw new Error("Payload editor text, including line separators, cannot exceed 4 MiB.");
+  if (fuzzerPayloadCount(payloadText) > 5000) throw new Error("Fuzzer payload count cannot exceed 5000.");
+  const payloads = splitFuzzerPayloadLines(payloadText);
+  const target = activeFuzzerTargetForRequest(raw);
+  const httpVersion = replayHttpVersionFromText(raw) || template.http_version || undefined;
+  return { ...SniperFuzzerWorkflow.preflight(template, payloads, { target, httpVersion }), template, payloads, target, httpVersion };
+}
+
+function renderFuzzerSetup() {
+  if (typeof SniperFuzzerWorkflow === "undefined" || !fuzzerSetupNode("fuzzerPreflightSummary")) return;
+  const raw = fuzzerRequestTextForAction();
+  const select = fuzzerSetupNode("fuzzerCandidateSelect");
+  let candidates = [];
+  let model = null;
+  let error = "";
+  let candidateKey = `${currentSessionId()}|${raw}|${state.fuzzerBaseRequest?.body_encoding}|${state.fuzzerBaseRequest?.preview_truncated}`;
+  try {
+    if (new TextEncoder().encode(raw).length > 2 * 1024 * 1024) throw new Error("Request editor text cannot exceed 2 MiB.");
+    const template = parseFuzzerRequestTemplate(raw);
+    candidates = SniperFuzzerWorkflow.candidates(raw, { bodyEncoding: template.body_encoding, previewTruncated: template.preview_truncated });
+    model = fuzzerSetupPreflight(raw);
+  } catch (failure) {
+    error = failure?.message || "Review the request template.";
+  }
+  if (select && select._fuzzerCandidateKey !== candidateKey) {
+    select.innerHTML = '<option value="">Choose a query/form value</option>' + candidates.map((candidate, index) =>
+      `<option value="${index}">${escapeHtml(candidate.label)}</option>`).join("");
+    select._fuzzerCandidateKey = candidateKey;
+    select._fuzzerRaw = raw;
+    select._fuzzerCandidates = candidates;
+  }
+  const busy = !!state.fuzzerRunning;
+  for (const id of ["fuzzerMarkSelectionButton", "fuzzerMarkCandidateButton", "fuzzerImportPayloadButton", "fuzzerApplyPresetButton", "fuzzerGenerateRangeButton"]) {
+    const button = fuzzerSetupNode(id);
+    if (button) button.disabled = busy;
+  }
+  const undo = state._fuzzerMarkerUndo;
+  const undoButton = fuzzerSetupNode("fuzzerUndoMarkerButton");
+  if (undoButton) undoButton.disabled = busy || !undo || undo.after !== raw || undo.sessionId !== currentSessionId() || undo.runToken !== state.fuzzerRunToken;
+  const summary = fuzzerSetupNode("fuzzerPreflightSummary");
+  const notice = fuzzerSetupNode("fuzzerPreflightNotice");
+  const samples = fuzzerSetupNode("fuzzerPreviewSamples");
+  if (!model) {
+    summary.textContent = `${fuzzerPayloadCount(state.fuzzerPayloadsText || "")} payload(s) prepared`;
+    notice.textContent = error;
+    if (samples) samples.textContent = "Add a valid template and payloads to see expanded samples.";
+    return;
+  }
+  const destination = typeof model.effectiveTarget === "string" ? model.effectiveTarget : JSON.stringify(model.effectiveTarget);
+  summary.textContent = `${model.payloadCount} payload(s) → ${model.requestCount} planned request(s) · ${model.markerCount} marker(s) · Target: ${destination || "not available"} · ${model.httpVersion || "Automatic HTTP version"}`;
+  notice.textContent = [...(model.errors || []), ...(model.warnings || []), busy ? "Running sequentially. Results appear after completion; this run cannot be cancelled here." : "All markers receive the same payload. The server validates every expanded request before sending."].join(" ");
+  if (samples) {
+    samples.innerHTML = (model.samples || []).map((sample) => {
+      const text = buildEditableRawRequest(sample.request);
+      const preview = text.slice(0, 16384);
+      return `<details class="fuzzer-request-sample"><summary>Template-expanded sample ${sample.index + 1} · ${escapeHtml(sample.effectiveTarget || destination || "")}${text.length > preview.length ? " (display truncated)" : ""}</summary><pre>${escapeHtml(preview)}</pre></details>`;
+    }).join("") || (model.samplesOmitted ? "Samples omitted because the expanded requests exceed the local preview budget." : "Samples appear after adding at least one payload and one marker.");
+  }
+}
+
+function scheduleFuzzerSetupRender() {
+  clearTimeout(state._fuzzerSetupRenderTimer);
+  state._fuzzerSetupRenderTimer = setTimeout(() => {
+    state._fuzzerSetupRenderTimer = null;
+    renderFuzzerSetup();
+  }, 120);
+}
+
+function fuzzerRawOffsetForEditorOffset(raw, offset) {
+  let visibleOffset = 0;
+  for (let index = 0; index < raw.length; index++) {
+    if (visibleOffset === offset) return index;
+    if (raw[index] === "\r" && raw[index + 1] === "\n") index++;
+    visibleOffset++;
+  }
+  if (visibleOffset === offset) return raw.length;
+  throw new Error("The selection changed. Select a value again.");
+}
+
+function markFuzzerPosition(start, end, expectedRaw = fuzzerRequestTextForAction()) {
+  if (state.fuzzerRunning) throw new Error("Wait for the current run to finish before changing positions.");
+  const raw = fuzzerRequestTextForAction();
+  if (raw !== expectedRaw) throw new Error("The request changed. Choose the value again.");
+  const template = parseFuzzerRequestTemplate(raw);
+  const boundary = /\r?\n\r?\n/.exec(raw);
+  const bodyStart = boundary ? boundary.index + boundary[0].length : raw.length;
+  if (end > bodyStart && (template.body_encoding === "base64" || template.preview_truncated)) {
+    throw new Error("Body positions require a complete UTF-8 request body. Header and query positions remain available.");
+  }
+  const next = SniperFuzzerWorkflow.replaceSelection(raw, start, end);
+  state._fuzzerMarkerUndo = { before: raw, after: next, sessionId: currentSessionId(), runToken: state.fuzzerRunToken };
+  updateFuzzerRequestText(next, { userEdit: true });
+  scheduleWorkspaceStateSave();
+  renderFuzzer();
+  const editor = getCMView("fuzzerReq");
+  if (editor?.view) {
+    const anchor = next.slice(0, start).replace(/\r\n?/g, "\n").length;
+    editor.view.dispatch({ selection: { anchor, head: anchor + "$payload$".length }, scrollIntoView: true });
+    editor.view.focus();
+  }
+}
+
+function markFuzzerEditorSelection() {
+  const raw = fuzzerRequestTextForAction();
+  const editor = getCMView("fuzzerReq");
+  const selection = editor?.view?.state?.selection?.main;
+  if (selection) {
+    if (selection.empty || selection.from === selection.to) throw new Error("Select the value in the request editor first.");
+    markFuzzerPosition(fuzzerRawOffsetForEditorOffset(raw, selection.from), fuzzerRawOffsetForEditorOffset(raw, selection.to), raw);
+  } else {
+    const input = els.fuzzerRequestEditor;
+    if (!input || input.selectionStart === input.selectionEnd) throw new Error("Select the value in the request editor first.");
+    markFuzzerPosition(input.selectionStart, input.selectionEnd, raw);
+  }
+}
+
+function undoFuzzerMarker() {
+  const undo = state._fuzzerMarkerUndo;
+  if (state.fuzzerRunning || !undo || undo.after !== fuzzerRequestTextForAction() || undo.sessionId !== currentSessionId() || undo.runToken !== state.fuzzerRunToken) {
+    throw new Error("The request changed after that position was added. Use the editor's undo instead.");
+  }
+  state._fuzzerMarkerUndo = null;
+  updateFuzzerRequestText(undo.before, { userEdit: true });
+  scheduleWorkspaceStateSave();
+  renderFuzzer();
+}
+
+function applyFuzzerPayloadList(payloads, mode = "append") {
+  if (state.fuzzerRunning) throw new Error("Wait for the current run to finish before loading payloads.");
+  const incoming = SniperFuzzerWorkflow.validatePayloads(payloads);
+  if (!incoming.valid) throw new Error(incoming.errors.join(" "));
+  const existing = mode === "replace" || !state.fuzzerPayloadsText ? [] : fuzzerPayloadTextWithinLimits(state.fuzzerPayloadsText);
+  if (existing.length + payloads.length > 5000) throw new Error("Fuzzer payload count cannot exceed 5000.");
+  const next = [...existing, ...payloads];
+  const text = SniperFuzzerWorkflow.payloadText(next);
+  fuzzerPayloadTextWithinLimits(text, next);
+  updateFuzzerPayloadsText(text, { userEdit: true });
+  scheduleWorkspaceStateSave();
+  renderFuzzer();
+}
+
+async function importFuzzerPayloadFile(file, mode = "append") {
+  if (!file) return;
+  if (file.size > 4 * 1024 * 1024) throw new Error("Payload files cannot exceed 4 MiB.");
+  const generation = (state._fuzzerFileGeneration || 0) + 1;
+  state._fuzzerFileGeneration = generation;
+  const sessionId = currentSessionId();
+  const draftVersion = state.fuzzerDraftVersion || 0;
+  const runToken = state.fuzzerRunToken;
+  const ownsImport = () => state._fuzzerFileGeneration === generation && currentSessionId() === sessionId
+    && (state.fuzzerDraftVersion || 0) === draftVersion && state.fuzzerRunToken === runToken && !state.fuzzerRunning;
+  try {
+    const bytes = await file.arrayBuffer();
+    if (!ownsImport()) return false;
+    if (bytes.byteLength > 4 * 1024 * 1024) throw new Error("Payload files cannot exceed 4 MiB.");
+    // Fatal UTF-8 decoding rejects binary/invalid input rather than silently
+    // changing bytes. A BOM is preserved as a literal payload character.
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch (_error) {
+      throw new Error("Use a valid UTF-8 text file; invalid bytes were not imported.");
+    }
+    const payloads = fuzzerPayloadTextWithinLimits(text);
+    if (!payloads.length) throw new Error("The selected file contains no payloads.");
+    applyFuzzerPayloadList(payloads, mode);
+    return true;
+  } catch (error) {
+    if (!ownsImport()) return false;
+    throw error;
+  }
+}
+
+function initFuzzerSetupControls() {
+  const bind = (id, callback) => fuzzerSetupNode(id)?.addEventListener("click", () => {
+    try { callback(); } catch (error) { fuzzerSetupError(error); }
+  });
+  bind("fuzzerMarkSelectionButton", markFuzzerEditorSelection);
+  bind("fuzzerUndoMarkerButton", undoFuzzerMarker);
+  bind("fuzzerMarkCandidateButton", () => {
+    const select = fuzzerSetupNode("fuzzerCandidateSelect");
+    const candidate = select?.value !== "" ? select?._fuzzerCandidates?.[Number(select.value)] : null;
+    if (!candidate) throw new Error("Choose a query or form value first.");
+    markFuzzerPosition(candidate.start, candidate.end, select._fuzzerRaw);
+  });
+  bind("fuzzerImportPayloadButton", () => fuzzerSetupNode("fuzzerPayloadFile")?.click());
+  fuzzerSetupNode("fuzzerPayloadFile")?.addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    const mode = fuzzerSetupNode("fuzzerPayloadImportMode")?.value || "append";
+    event.target.value = "";
+    importFuzzerPayloadFile(file, mode).catch(fuzzerSetupError);
+  });
+  bind("fuzzerApplyPresetButton", () => {
+    const preset = SniperFuzzerWorkflow.presets.find((item) => item.id === fuzzerSetupNode("fuzzerPayloadPreset")?.value);
+    if (!preset) throw new Error("Choose a payload preset first.");
+    applyFuzzerPayloadList([...preset.payloads], fuzzerSetupNode("fuzzerPayloadImportMode")?.value || "append");
+  });
+  bind("fuzzerGenerateRangeButton", () => applyFuzzerPayloadList(SniperFuzzerWorkflow.numericRange(
+    fuzzerSetupNode("fuzzerRangeStart")?.value,
+    fuzzerSetupNode("fuzzerRangeEnd")?.value,
+    fuzzerSetupNode("fuzzerRangeStep")?.value,
+  ), fuzzerSetupNode("fuzzerPayloadImportMode")?.value || "append"));
+}
+
 async function openFuzzerFromReplay() {
+  if (state.fuzzerRunning) throw new Error("Wait for the current Fuzzer run to finish before replacing its request.");
   const tab = getActiveReplayTab();
   if (!tab || tab.type === "websocket") {
     throw new Error("Select an HTTP Replay tab before sending to Fuzzer.");
@@ -15777,7 +16051,7 @@ async function openFuzzerFromReplay() {
   state.fuzzerTargetRequestText = state.fuzzerTarget ? fuzzerTargetAuthorityFromRequestText(tab.requestText) : null;
   state.fuzzerNotice = "";
   state.fuzzerRequestText = tab.requestText;
-  state.fuzzerPayloadsText = "";
+  state.fuzzerDraftVersion = (state.fuzzerDraftVersion || 0) + 1;
   clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
@@ -15796,6 +16070,7 @@ async function openFuzzerFromSelection() {
 }
 
 function openFuzzerFromRecord(record) {
+  if (state.fuzzerRunning) throw new Error("Wait for the current Fuzzer run to finish before replacing its request.");
   if (record.kind === "tunnel") {
     throw new Error("Tunnel records cannot be sent to Fuzzer.");
   }
@@ -15810,7 +16085,7 @@ function openFuzzerFromRecord(record) {
     ? buildTruncatedBodyNotice(record, "Fuzzer")
     : "";
   state.fuzzerRequestText = buildEditableRawRequest(request);
-  state.fuzzerPayloadsText = "";
+  state.fuzzerDraftVersion = (state.fuzzerDraftVersion || 0) + 1;
   clearFuzzerAttackRecord();
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
@@ -15993,6 +16268,7 @@ function updateFuzzerRequestText(text, { userEdit = false } = {}) {
   if (state.fuzzerRequestText !== normalized) {
     state.fuzzerRequestText = normalized;
     if (userEdit) markFuzzerDraftChanged();
+    if (typeof scheduleFuzzerSetupRender === "function") scheduleFuzzerSetupRender();
   }
 }
 
@@ -16001,6 +16277,7 @@ function updateFuzzerPayloadsText(text, { userEdit = false } = {}) {
   if (state.fuzzerPayloadsText !== normalized) {
     state.fuzzerPayloadsText = normalized;
     if (userEdit) markFuzzerDraftChanged();
+    if (typeof scheduleFuzzerSetupRender === "function") scheduleFuzzerSetupRender();
   }
 }
 
@@ -16022,7 +16299,8 @@ function invalidateFuzzerRun() {
 
 function fuzzerRequestAuthorityFromText(requestText, fallbackRequest = state.fuzzerBaseRequest || createDefaultEditableRequest()) {
   try {
-    const request = parseEditableRawRequest(
+    const parser = typeof parseFuzzerRequestTemplate === "function" ? parseFuzzerRequestTemplate : parseEditableRawRequest;
+    const request = parser(
       requestText,
       fallbackRequest || createDefaultEditableRequest(),
     );
@@ -16120,9 +16398,7 @@ async function runFuzzerAttack() {
       body_encoding: "utf8",
       preview_truncated: false,
     };
-    const fuzzerReqText = getCMView("fuzzerReq")
-      ? getCMView("fuzzerReq").getContent()
-      : (els.fuzzerRequestEditor ? els.fuzzerRequestEditor.value : "");
+    const fuzzerReqText = fuzzerRequestTextForAction();
     if (!fuzzerReqText.trim()) {
       clearFuzzerAttackRecord();
       state.fuzzerNotice = "Request template is empty. Paste a raw HTTP request with $payload$ markers, or send one from HTTP History (Command+I).";
@@ -16133,7 +16409,7 @@ async function runFuzzerAttack() {
 
     let template;
     try {
-      template = parseEditableRawRequest(fuzzerReqText, fallback);
+      template = parseFuzzerRequestTemplate(fuzzerReqText, fallback);
     } catch (parseErr) {
       clearFuzzerAttackRecord();
       state.fuzzerNotice = parseErr.message || "Failed to parse the request template.";
@@ -16143,7 +16419,10 @@ async function runFuzzerAttack() {
     }
 
     const payloadsText = els.fuzzerPayloadsEditor.value;
-    const payloads = splitFuzzerPayloadLines(payloadsText);
+    const payloads = fuzzerPayloadTextWithinLimits(payloadsText);
+    if (new TextEncoder().encode(fuzzerReqText).length > 2 * 1024 * 1024) throw new Error("Request editor text cannot exceed 2 MiB.");
+    const setupCheck = SniperFuzzerWorkflow.preflight(template, payloads, {});
+    if (!setupCheck.valid) throw new Error(setupCheck.errors.join(" "));
 
     if (payloads.length === 0) {
       clearFuzzerAttackRecord();
@@ -16155,7 +16434,18 @@ async function runFuzzerAttack() {
 
     const target = activeFuzzerTargetForRequest(fuzzerReqText);
     const httpVersion = replayHttpVersionFromText(fuzzerReqText) || undefined;
+    const sourceTransactionId = state.fuzzerSourceTransactionId;
     const expectedWorkspaceRevision = await flushWorkspaceStateForReplayAction();
+    if (!isCurrentFuzzerRun(runToken, sessionId)) return;
+    if ((state.fuzzerDraftVersion || 0) !== draftVersion
+      || fuzzerRequestTextForAction() !== fuzzerReqText
+      || els.fuzzerPayloadsEditor.value !== payloadsText
+      || state.fuzzerSourceTransactionId !== sourceTransactionId
+      || JSON.stringify(activeFuzzerTargetForRequest(fuzzerReqText)) !== JSON.stringify(target)) {
+      state.fuzzerNotice = "The draft changed while preparing the run. Review it and click Start again; no requests were sent.";
+      renderFuzzer();
+      return;
+    }
     const response = await fetch("/api/fuzzer/attacks", {
       method: "POST",
       headers: {
@@ -16167,7 +16457,7 @@ async function runFuzzerAttack() {
         expected_workspace_revision: expectedWorkspaceRevision,
         template,
         payloads,
-        source_transaction_id: state.fuzzerSourceTransactionId,
+        source_transaction_id: sourceTransactionId,
         http_version: httpVersion,
         target,
       }),
