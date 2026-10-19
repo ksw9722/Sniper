@@ -14991,7 +14991,7 @@ function renderTarget() {
               >
                 <div class="target-host-copy">
                   <div class="target-host-title">${escapeHtml(hostName)}</div>
-                  <div class="target-path-meta">${requestCount} request(s) · ${paths.length} path(s) · ${escapeHtml(schemes.join(", ") || "http")}</div>
+                  <div class="target-path-meta">${requestCount} captured request(s) · ${paths.length} path(s) · ${escapeHtml(schemes.join(", ") || "http")}</div>
                 </div>
                 <div class="target-host-actions">
                   <span class="detail-chip ${host.in_scope ? "ok" : "none"}">${host.in_scope ? "In scope" : "Out of scope"}</span>
@@ -15002,12 +15002,19 @@ function renderTarget() {
                 ${paths.map((path) => {
                   const methods = Array.isArray(path.methods) ? path.methods.map(String) : [];
                   const noteCount = Number.isFinite(Number(path.note_count)) ? Number(path.note_count) : 0;
+                  // Older servers omit provenance: their paths are all captured.
+                  const captured = path.captured !== false;
+                  const discovered = path.discovered === true;
+                  const reconSources = Array.isArray(path.recon_sources) ? path.recon_sources.map(String) : [];
+                  const reconKinds = Array.isArray(path.recon_kinds) ? path.recon_kinds.map(String) : [];
+                  const provenance = captured ? (discovered ? "Captured + Recon" : "Captured") : "Recon discovery · not captured";
                   return `
                     <div class="target-path-item">
                       <div class="target-path-title">${escapeHtml(path.path || "/")}</div>
                       <div class="target-path-meta">
-                        ${escapeHtml(methods.join(", "))} · ${escapeHtml(formatStatus(path.status))} · ${escapeHtml(formatTimestamp(path.last_seen))}${path.is_websocket ? " · websocket" : ""}${noteCount ? ` · ${noteCount} note(s)` : ""}
+                        ${escapeHtml(provenance)} · ${escapeHtml(methods.join(", "))}${captured ? ` · ${escapeHtml(formatStatus(path.status))}` : ""} · ${captured ? "Last captured" : "Last discovered"}: ${escapeHtml(formatTimestamp(path.last_seen))}${path.is_websocket ? " · websocket" : ""}${noteCount ? ` · ${noteCount} note(s)` : ""}
                       </div>
+                      ${discovered ? `<div class="target-path-meta">Recon: ${escapeHtml(reconSources.join(", ") || "unknown source")}${reconKinds.length ? ` · ${escapeHtml(reconKinds.join(", "))}` : ""}</div>` : ""}
                     </div>
                   `;
                 }).join("")}
@@ -15016,7 +15023,7 @@ function renderTarget() {
           `;
         })
         .join("")
-    : "<p class=\"empty-copy\">No captured targets yet. Send traffic through the proxy to build a site map.</p>";
+    : "<p class=\"empty-copy\">No targets yet. Capture proxy traffic or run Recon to build a site map.</p>";
 
   const hostButtons = Array.from(targetTree.querySelectorAll(".target-host-toggle"));
   hostButtons.forEach((button) => {
