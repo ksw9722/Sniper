@@ -243,6 +243,29 @@ do not establish an account-free first-run guarantee or a supported offline/skip
 launch mode; those remain unverified. Using an external agent or a local model is
 not evidence that browser onboarding can be skipped.
 
+**A named ego Space is a supported alternative context after setup.** Ego's
+[native API](https://github.com/citrolabs/ego-lite/blob/main/docs/native-bindings-api.md)
+provides `ego.listProfiles()` and `ego.createTaskSpace(name, profileId)` to create
+a named agent Space using an existing regular profile. It does not document a
+profile-create or profile-rename API. `ego.completeTaskSpace()` preserves the
+Space for the user; `ego.closeTaskSpace()` removes it. The
+[changelog](https://lite.ego.app/changelog) documents restoration of preserved
+task Spaces after completion (0.4.6.12), pinned Space/session restoration
+(0.5.0.28, with fixes in 0.5.0.32), and restoration of every saved Space
+(0.6.0.12). Check the installed version and session settings before relying on it.
+
+This can provide a visible context named `Sniper`, but does not name the browser
+profile or select the startup Space. `ego.useTaskSpace(id)` only selects a context
+for the current CLI invocation. Names can be duplicated; use a verified numeric
+Space ID and profile ID rather than the first name match. Completion changes the
+Space to user ownership, and the
+[current helper implementation](https://github.com/citrolabs/ego-lite/blob/main/package/ego-browser/src/helpers.ts)
+refuses to reuse a user-owned Space by name without an explicit claim. Do not
+take it over automatically. CLI availability before onboarding, automatic
+pinning, and default-visible-Space selection are unverified. Sniper does not run
+Space setup on **Open browser**; an unavailable CLI does not trigger a different
+profile, account-state edits, or data migration.
+
 Only one browser process may own a user data directory at a time. Sniper reuses a
 running owner with matching settings and refuses incompatible settings instead
 of forcing its lock or silently starting a clean profile. Quit the browser fully
