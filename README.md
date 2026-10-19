@@ -249,7 +249,9 @@ filter's conditions (MIME type, status class, hidden extensions and the rest),
 kept apart from History's. By default it hides images, styles and fonts, so a
 page's static CDN and its arrows drop out. `sniper-cli scope service-map` takes
 the same conditions as `--mime-types`, `--status-classes`, `--hidden-extensions`,
-`--hide-without-responses` and `--only-parameterized`.
+`--hide-without-responses` and `--only-parameterized`. The latter keeps only
+requests whose URL has a query string; JSON, form and multipart body fields do not
+match that filter.
 
 Each row's User-Agent names the client that sent it (a browser, an app's
 WebView, an app, a tool, a library or a crawler), and the map's first column

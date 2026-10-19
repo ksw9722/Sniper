@@ -1637,7 +1637,8 @@
             <h3>Request type</h3>
             <label class="settings-toggle"><input id="filterInScopeOnly" type="checkbox" /><span>Show only in-scope items</span></label>
             <label class="settings-toggle"><input id="filterHideWithoutResponses" type="checkbox" /><span>Hide items without responses</span></label>
-            <label class="settings-toggle"><input id="filterOnlyParameterized" type="checkbox" /><span>Show only parameterized requests</span></label>
+            <label class="settings-toggle"><input id="filterOnlyParameterized" type="checkbox" aria-describedby="filterOnlyParameterizedHelp" /><span>Show only requests with query parameters</span></label>
+            <small id="filterOnlyParameterizedHelp">Matches a ? in the URL, including an empty query. JSON, form and multipart body fields do not affect this filter.</small>
             <label class="settings-toggle"><input id="filterOnlyNotes" type="checkbox" /><span>Show only items with notes</span></label>
           </section>
 

@@ -11582,7 +11582,7 @@ function renderHistory(options = {}) {
   if (state.method) summary.push(`method: ${state.method}`);
   if (state.filterSettings.inScopeOnly) summary.push("scope only");
   if (state.filterSettings.hideWithoutResponses) summary.push("responses only");
-  if (state.filterSettings.onlyParameterized) summary.push("parameterized only");
+  if (state.filterSettings.onlyParameterized) summary.push("query parameters only");
   if (state.filterSettings.onlyNotes) summary.push("notes only");
   if (state.filterSettings.searchTerm) summary.push(`advanced: ${state.filterSettings.searchTerm}`);
   if (state.filterSettings.colorTags?.size) summary.push(`color: ${[...state.filterSettings.colorTags].join(", ")}`);
@@ -21752,7 +21752,7 @@ function serviceMapFilterSummary() {
   const statusOff = Object.entries(SERVICE_MAP_FILTER_STATUS_LABELS).filter(([key]) => !filters.status[key]).map(([, label]) => label);
   if (statusOff.length) parts.push(`no ${statusOff.join(", ")}`);
   if (filters.hideWithoutResponses) parts.push("responses only");
-  if (filters.onlyParameterized) parts.push("parameterized only");
+  if (filters.onlyParameterized) parts.push("query parameters only");
   if (filters.onlyNotes) parts.push("notes only");
   if (filters.port) parts.push(`port ${filters.port}`);
   if (filters.searchTerm) parts.push(`${filters.negativeSearch ? "without" : "with"} "${filters.searchTerm}"`);

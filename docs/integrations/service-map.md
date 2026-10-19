@@ -291,10 +291,15 @@ origins. A session change resets the mode and evidence immediately.
 The map has its own display filter, as Burp keeps one for its site map. **Filter**
 on the map toolbar opens the same dialog as HTTP history's filter, editing the
 map's settings: MIME type, status class, hidden extensions, rows with responses
-only, parameterized rows only, rows with notes only, port and advanced search.
+only, rows with URL query parameters only, rows with notes only, port and advanced search.
 Scope stays on the map's own **In scope** toggle beside it, as in History, and colour tags stay with
 History. The two filters are saved apart in UI settings; changing one never
 changes the other.
+
+**Show only requests with query parameters** matches a `?` in the captured URL,
+including an empty query. JSON, form and multipart body fields do not affect this
+filter. Those fields remain available in the endpoint parameter inspector after
+turning the filter off. The CLI/API flag remains `only_parameterized`.
 
 The default hides `png,ico,css,woff,woff2,ttf,svg,jpg,jpeg,gif`, as History's does,
 so a page's image and style CDN drops out of the map with its rows. Each condition

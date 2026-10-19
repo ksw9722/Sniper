@@ -1194,7 +1194,7 @@ struct ServiceMapFilterArgs {
     /// Hide rows that have no response.
     #[arg(long)]
     hide_without_responses: bool,
-    /// Keep only rows whose URL has a query string.
+    /// Keep only rows whose URL has a query string; body fields do not match.
     #[arg(long)]
     only_parameterized: bool,
 }
@@ -5094,7 +5094,7 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "status_classes":{"type":["array","null"],"items":{"type":"string","enum":SERVICE_MAP_STATUS_CLASSES},"description":"Display filter: keep only rows in these status classes. Omitted, null or empty keeps every class."},
                 "hidden_extensions":{"type":["array","null"],"items":{"type":"string","pattern":"^\\.?[A-Za-z0-9]{1,16}$"},"description":"Display filter: hide rows whose path ends in these extensions, such as png or woff2. Omitted, null or empty hides none."},
                 "hide_without_responses":{"type":["boolean","null"],"default":false,"description":"Display filter: hide rows that have no response. Null uses false."},
-                "only_parameterized":{"type":["boolean","null"],"default":false,"description":"Display filter: keep only rows whose URL has a query string. Null uses false."}
+                "only_parameterized":{"type":["boolean","null"],"default":false,"description":"Display filter: keep only rows whose URL has a query string; body fields do not match. Null uses false."}
             },
             "not":{"required":["all_rows","max_records"],"properties":{"all_rows":{"const":true},"max_records":{"type":"integer"}}}
         })),

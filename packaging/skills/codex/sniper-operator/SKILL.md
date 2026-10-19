@@ -47,7 +47,9 @@ without a path, query, credentials, or fragment. Optional `mime_types`,
 `status_classes`, `hidden_extensions`, `hide_without_responses` and
 `only_parameterized` hide rows exactly as the HTTP history filter does, for
 example `hidden_extensions: ["png","css","woff2"]` to drop static CDNs;
-`snapshot.filtered_rows` counts them. Omitted, they hide nothing; the GUI's saved
+`snapshot.filtered_rows` counts them. `only_parameterized` keeps rows whose URL
+has a query string; JSON, form and multipart body fields do not match it.
+Omitted, they hide nothing; the GUI's saved
 map filter never applies to these reads. Each `header_links[]` entry counts its
 rows in `request_count` and sorts them in `request_kinds` (`api`, `navigation`,
 `frame`, `script`, `static`, `other`, from `Sec-Fetch-Dest`, else the response
