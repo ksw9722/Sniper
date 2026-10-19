@@ -101,7 +101,8 @@ wrong, so Sniper can open a browser that needs neither. **Open browser** in the 
 bar does it from the UI (an empty history offers the same button). Its arrow lists
 every browser, marks the one that opens by default, and has **Make default** to
 change it. Two boxes there apply to that one opening only: **Let an
-agent drive it** (`--agent`) and **Throwaway profile** (`--fresh`). From the CLI:
+agent drive it** (`--agent`) and **Throwaway profile (discard logins on quit)**
+(`--fresh`, off by default). From the CLI:
 
 ```bash
 ./target/release/sniper-cli --api http://127.0.0.1:18901 --output compact \
@@ -163,13 +164,66 @@ see the request first). What the browser is given:
   between sessions and your everyday profile is untouched. `--fresh` uses a
   throwaway profile that is deleted when the browser quits. Closing the last window
   is not quitting on macOS. If Sniper exits first, the next launch removes the
-  profile once its browser is gone.
+  throwaway profile once its browser is gone. Persistent profiles are not swept.
 - **A DevTools port only when asked** (`--agent`). For Chromium-family browsers
   that is what the flag opens, and it is off unless you turn it on: the port lets
   any other local process drive a browser holding your logged-in sessions. For
   BrowserOS neo the flag turns on its own server, which is off otherwise. ego and
   Aside have no port, so `--agent` changes nothing there; their `control` is always
   returned.
+
+#### Keep logins between launches
+
+The default already reuses one **Sniper-owned user data directory per browser**:
+`<SNIPER_DATA_DIR>/browser-profiles/aside`, `…/ego`, and the equivalent directory
+for each other browser. Keep the same Sniper data directory and leave **Throwaway
+profile** unchecked (omit `--fresh` in the CLI). A saved browser preference only
+chooses which browser opens; it does not import an account or change profile mode.
+For example, these both use their existing saved Sniper profiles:
+
+```bash
+sniper-cli capture browser open --browser aside --yes
+sniper-cli capture browser open --browser ego --yes
+```
+
+A browser opened normally from Applications uses its everyday profile. Opening
+it through Sniper uses the separate profile above, so an existing everyday login
+does not automatically appear there. Sign in yourself in the Sniper-opened window;
+later launches reuse its on-disk site data. Sniper does not copy cookies, passwords,
+or account tokens from another profile. A site can still expire or revoke a login,
+and clearing cookies/site data or using incognito can require another sign-in.
+Chromium documents both the
+[`--user-data-dir` mechanism and the profile path shown by `chrome://version`](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/user_data_dir.md).
+Compare that path between launches if a site repeatedly asks to sign in; sharing
+cookie files or other credential contents is not needed to diagnose a path change.
+
+For **Aside**, distinguish a site's login from Aside's own account or its CLI
+sign-in. Its [account commands](https://docs.aside.com/help/developers) include
+`aside account list` and `aside account status`; account recovery is in Aside
+Settings > Account. The separately authenticated CLI keeps its credential file at
+`~/.aside/cli/auth.json` by default, or the explicitly configured
+`ASIDE_CLI_AUTH_PATH`. Sniper does not configure, copy, or reset that file.
+Changing the browser profile cannot repair CLI credential storage. Keep other
+Aside instances quit while driving Sniper's one, as explained below.
+
+For **ego**, keep using the exact `control.server_name` returned by Sniper on
+**every** `ego-browser` call. Omitting it targets the everyday instance rather than
+this profile. [Ego's Spaces](https://lite.ego.app/document/en/docs/space) are task
+contexts inside a browser process, not a replacement for the user data directory;
+its documentation describes reusing the browser's login environment. This does
+not guarantee that a particular site's session will never expire.
+
+Only one browser process may own a user data directory at a time. Sniper reuses a
+running owner with matching settings and refuses incompatible settings instead
+of forcing its lock or silently starting a clean profile. Quit the browser fully
+before changing launch settings; closing its last macOS window may leave it running.
+For a one-off clean test, `--fresh` leaves the saved profile intact and removes only
+the throwaway profile after its browser quits. To deliberately reset saved site
+logins, use that Sniper-opened browser's own clear-site-data controls (this signs
+you out); Sniper has no automatic saved-profile reset or migration step. Aside's
+[privacy settings](https://docs.aside.com/help/privacy) distinguish browser site
+data from its password vault. Neither should be reset merely to troubleshoot a
+repeated prompt.
 
 #### Two ways to drive it
 

@@ -17116,7 +17116,7 @@ function mountBrowserLaunchers(root = document) {
   root.querySelectorAll("[data-browser-launcher]:not(.browser-launcher)").forEach((host) => {
     host.classList.add("browser-launcher");
     host.innerHTML = `
-      <button class="browser-launch-main" type="button" title="Open a browser that already sends its traffic through Sniper and trusts its certificate">Open browser</button>
+      <button class="browser-launch-main" type="button" title="Open a browser through Sniper using its saved Sniper profile">Open browser</button>
       <button class="browser-launch-caret" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Choose a browser">&#9662;</button>
     `;
     const [main, caret] = host.children;
@@ -17255,7 +17255,8 @@ function renderBrowserMenu(catalog) {
     ${rows.join("")}
     <div class="context-menu-divider"></div>
     <label class="browser-menu-option"><input type="checkbox" data-option="agent" ${wasChecked("agent")}> Let an agent drive it</label>
-    <label class="browser-menu-option"><input type="checkbox" data-option="fresh" ${wasChecked("fresh")}> Throwaway profile</label>
+    <label class="browser-menu-option"><input type="checkbox" data-option="fresh" ${wasChecked("fresh")}> Throwaway profile (discard logins on quit)</label>
+    <div class="browser-menu-hint">By default, reuse this browser's saved Sniper profile. Sign in there once; your everyday browser profile is separate. Sites can still expire logins.</div>
   `;
   element.onclick = async (event) => {
     const prefer = event.target.closest("[data-prefer]");
