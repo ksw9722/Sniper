@@ -2724,7 +2724,9 @@ impl ApiClient {
             Some(body) => request.json(&body).send().await,
             None => request.send().await,
         }
-        .with_context(|| format!("failed to {} {}", method, path))?;
+        .map_err(|error| {
+            api_request_error(error, &method, format!("failed to {} {}", method, path))
+        })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -2743,14 +2745,28 @@ impl ApiClient {
             bail!("request to {} failed ({}): {}", path, status, detail);
         }
 
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("failed to decode JSON response from {}", path))
+        response.json::<T>().await.map_err(|error| {
+            api_request_error(
+                error,
+                &method,
+                format!("failed to decode JSON response from {}", path),
+            )
+        })
     }
 
     fn url(&self, path: &str) -> Url {
         api_url(&self.base_url, path).expect("API base URL should be normalized")
+    }
+}
+
+fn api_request_error(error: reqwest::Error, method: &Method, message: String) -> anyhow::Error {
+    let error = anyhow::Error::new(error);
+    if method == Method::GET {
+        // Valid query text must not turn a transport or decode failure into an
+        // input error merely by containing words like "invalid".
+        error.context(ReadRequestError { message })
+    } else {
+        error.context(message)
     }
 }
 
@@ -17390,6 +17406,19 @@ impl fmt::Display for ReadHttpStatusError {
 impl std::error::Error for ReadHttpStatusError {}
 
 #[derive(Debug)]
+struct ReadRequestError {
+    message: String,
+}
+
+impl fmt::Display for ReadRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReadRequestError {}
+
+#[derive(Debug)]
 struct SessionMetadataHttpStatusError {
     status: StatusCode,
 }
@@ -17947,6 +17976,15 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
             retryable: status >= 500,
             details: json!({ "status": status }),
             exit_code: if status < 500 { 5 } else { 6 },
+        }
+    } else if let Some(read) = error.downcast_ref::<ReadRequestError>() {
+        CliErrorPayload {
+            code: "CLI_ERROR",
+            message: read.to_string(),
+            hint: None,
+            retryable: false,
+            details: json!({}),
+            exit_code: 1,
         }
     } else if message.contains("requires --dry-run or --yes") {
         CliErrorPayload {
@@ -22443,6 +22481,46 @@ mod tests {
                 assert!(payload.hint.unwrap().contains("partially applied"));
             }
         }
+    }
+
+    #[test]
+    fn read_request_errors_keep_their_context_without_using_query_words_as_error_kinds() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let message = "failed to GET /api/transactions-search?value=invalid";
+        for method in [
+            reqwest::Method::GET,
+            reqwest::Method::POST,
+            reqwest::Method::PATCH,
+            reqwest::Method::DELETE,
+        ] {
+            // A builder error supplies a reqwest source without making a request.
+            let source = client.get("://").build().unwrap_err();
+            let legacy =
+                anyhow::Error::new(client.get("://").build().unwrap_err()).context(message);
+            let expected_chain = format!("{legacy:#}");
+            let error = super::api_request_error(source, &method, message.to_owned());
+            assert_eq!(error.to_string(), message);
+            assert_eq!(format!("{error:#}"), expected_chain);
+            assert!(error.downcast_ref::<reqwest::Error>().is_some());
+            assert_eq!(
+                error.downcast_ref::<super::ReadRequestError>().is_some(),
+                method == reqwest::Method::GET
+            );
+            if method == reqwest::Method::GET {
+                let error = error.context("requires --dry-run or --yes");
+                let payload = cli_error_payload("capture.http.search", &error);
+                assert_eq!(payload.code, "CLI_ERROR");
+                assert_eq!(payload.exit_code, 1);
+                assert_eq!(payload.message, message);
+                assert!(!payload.retryable);
+                assert_eq!(payload.details, json!({}));
+                assert!(payload.hint.is_none());
+            }
+        }
+
+        let invalid = cli_error_payload("capture.http.search", &anyhow::anyhow!("invalid input"));
+        assert_eq!(invalid.code, "INVALID_INPUT");
+        assert_eq!(invalid.exit_code, 2);
     }
 
     #[test]
