@@ -224,6 +224,14 @@ this profile. [Ego's Spaces](https://lite.ego.app/document/en/docs/space) are ta
 contexts inside a browser process, not a replacement for the user data directory;
 its documentation describes reusing the browser's login environment. This does
 not guarantee that a particular site's session will never expire.
+The [ego quick start](https://lite.ego.app/document/en/docs/quick-start) requires
+finishing first-run onboarding before the agent workflow; the
+[vendor installation reference](https://github.com/citrolabs/ego-lite/blob/main/skills/ego-browser/references/install.md)
+says this registers `ego-browser`. Website login reuse does not establish whether
+an ego account is required by a particular first-run version. The reviewed docs
+do not establish an account-free first-run guarantee or a supported offline/skip
+launch mode; those remain unverified. Using an external agent or a local model is
+not evidence that browser onboarding can be skipped.
 
 Only one browser process may own a user data directory at a time. Sniper reuses a
 running owner with matching settings and refuses incompatible settings instead
