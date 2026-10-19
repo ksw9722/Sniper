@@ -1414,7 +1414,7 @@
     const request = (path, options) => sendRequest(path, { ...options, redirect: "error" });
     const productFilterContainer = els.productFilters || els.panel.querySelector?.("#serviceMapProductFilters");
     const state = {
-      sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectedClient: null, selectionInitialized: false,
+      sessionId: null, snapshot: null, order: [], selectedOrigin: null, selectedClient: null, selectedSite: null, selectionInitialized: false,
       query: "", scopeOnly: false, view: "service-map", detailTab: "apis", endpointIndex: null, endpointSelection: null,
       endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null,
       expandedEndpointGroups: new Set(), loading: false, backgroundLoading: false, error: "", refreshPaused: false, requestId: 0, evidenceRequestId: 0, evidence: null,
@@ -1673,6 +1673,13 @@
     }
     function selectedOrigin() {
       return findOrigin(state.selectedOrigin);
+    }
+    function siteDetails(site) {
+      if (!site) return null;
+      // A site's inspector, like an origin's, belongs to the loaded snapshot.
+      // Searching can ungroup or hide its card without removing its members.
+      const members = graphOrigins().filter((origin) => !origin.endpointNode && siteKey(origin.origin) === site);
+      return members.length ? { site, members } : null;
     }
     const layerKey = (layer) => `${layer.kind}:${layer.source.evidenceId}`;
     const layerReferences = (layer) => layer.kind === "body" ? layer.scan.references : layer.kind === "link" ? layer.scan.observations : [];
@@ -2097,7 +2104,7 @@
       cancelEvidence();
       closeApiDocs();
       cancelParameters();
-      Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null,
+      Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null, selectedSite: null,
         inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, expandedEndpointGroups: new Set(), loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
     }
@@ -2843,7 +2850,7 @@
         els.focusSelection.disabled = !selected || selected.origin === state.anchorOrigin;
         els.focusSelection.title = selected ? `Pin ${selected.origin} without changing its inspector` : "Select an origin to pin it";
       }
-      const selectionNotice = !selected || layout.nodes.some((node) => node.origin === grouped.card(selected.origin)) ? ""
+      const originSelectionNotice = !selected || layout.nodes.some((node) => node.origin === grouped.card(selected.origin)) ? ""
         : !shown(selected) ? "Selected origin is hidden from the map; inspector retained."
         : direct && !direct.neighbors.some((origin) => origin.origin === selected.origin) ? "Selected origin is outside this direct neighborhood; inspector retained."
         : origins.some((origin) => origin.origin === selected.origin)
@@ -2851,6 +2858,8 @@
         : !direct && !graphOrigins().some((origin) => origin.origin === selected.origin) && (!query || selected.origin.toLowerCase().includes(query))
           ? `Selected origin is outside the ${MAX_REFERENCE_CARDS}-reference-card limit; inspector retained.`
           : "Selected origin is outside this filter; inspector retained.";
+      const selectionNotice = state.selectedSite && siteDetails(state.selectedSite) && !layout.nodes.some((node) => node.site === state.selectedSite)
+        ? "Selected site has no grouped card in this view; inspector retained." : originSelectionNotice;
       if (!origins.length) {
         if (direct && !anchorShown) {
           replace(els.canvas, '<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>No visible origins</h3><p>Show hidden origins or change the neighbor filters to see this direct neighborhood.</p></div>');
@@ -3284,7 +3293,7 @@
     }
     function siteDetailMarkup(site) {
       const inScope = site.members.filter((member) => member.in_scope).length;
-      return `<header class="service-map-detail-header"><div><h3 title="${escape(site.site)}">*.${escape(site.site)}</h3><p>${site.members.length} origins grouped by site</p></div><span class="detail-chip ${inScope ? "ok" : "none"}">${inScope === site.members.length ? "In scope" : inScope ? "Partly in scope" : "Out of scope"}</span></header><div class="service-map-detail-body"><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-site-expand="${escape(site.site)}" data-service-focus="site:expand">Show origins separately</button><button class="secondary-action" type="button" data-service-hide="${escape(site.site)}" data-service-focus="site:hide">Hide site from map</button></div><h4>Origins</h4><div class="service-map-evidence-list">${site.members.map((member) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(member.origin)}" data-service-focus="site-member:${escape(member.origin)}"><span>${escape(member.origin)}<br>${member.captured === false ? "Referenced only in this snapshot" : `${member.endpoints.length} API paths · ${count(member.request_count).toLocaleString()} sampled rows`}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
+      return `<header class="service-map-detail-header"><div><h3 title="${escape(site.site)}">*.${escape(site.site)}</h3><p>${site.members.length} loaded origin${site.members.length === 1 ? "" : "s"} in this site</p></div><span class="detail-chip ${inScope ? "ok" : "none"}">${inScope === site.members.length ? "In scope" : inScope ? "Partly in scope" : "Out of scope"}</span></header><div class="service-map-detail-body"><div class="service-map-overlay-actions"><button class="secondary-action" type="button" data-service-site-expand="${escape(site.site)}" data-service-focus="site:expand">Show origins separately</button><button class="secondary-action" type="button" data-service-hide="${escape(site.site)}" data-service-focus="site:hide">Hide site from map</button></div><h4>Origins</h4><div class="service-map-evidence-list">${site.members.map((member) => `<button class="service-map-evidence-button" type="button" data-service-origin="${escape(member.origin)}" data-service-focus="site-member:${escape(member.origin)}"><span>${escape(member.origin)}<br>${member.captured === false ? "Referenced only in this snapshot" : `${member.endpoints.length} API paths · ${count(member.request_count).toLocaleString()} sampled rows`}</span><span>Inspect ›</span></button>`).join("")}</div></div>`;
     }
     // Hide or show an origin, and group its site again once shown separately.
     function originActionsMarkup(origin) {
@@ -3300,9 +3309,11 @@
       const client = state.selectedClient ? clientById(state.selectedClient) : null;
       if (client) { replaceDetail(clientDetailMarkup(client)); return; }
       state.selectedClient = null;
-      const site = state.selectedSite ? state.siteCards?.get(state.selectedSite) : null;
+      const site = siteDetails(state.selectedSite);
       if (site) { replaceDetail(siteDetailMarkup(site)); return; }
-      state.selectedSite = null;
+      // Invalidation drops data before its replacement arrives. Only a current
+      // snapshot can establish that the selected site's members disappeared.
+      if (state.snapshot) state.selectedSite = null;
       const origin = selectedOrigin();
       if (!origin) { replaceDetail('<div class="service-map-empty"><h3>Select an origin</h3><p>Choose a card to inspect its API paths and retained evidence.</p></div>'); return; }
       if (origin.peerInspectionOnly) {
@@ -3384,9 +3395,10 @@
     // Showing a site's origins separately selects the first of them, so the
     // inspector stays on what was being looked at.
     function expandSite(site) {
-      const first = state.siteCards?.get(site)?.members[0]?.origin;
+      const first = siteDetails(site)?.members[0]?.origin;
+      if (!first) return;
       saveSiteDisplay({ expandedSites: [...new Set([...siteDisplay().expandedSites, site])] });
-      if (first) selectOrigin(first);
+      selectOrigin(first);
     }
     function handleClick(event) {
       const hit = event.target.closest?.("[data-service-edge]");
