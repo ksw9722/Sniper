@@ -20490,9 +20490,11 @@ function isModalVisible(modal) {
 }
 
 function restoreModalFocus(previous, fallback = document.querySelector(".main-tab.active")) {
-  const target = previous?.isConnected && !previous.disabled && previous.tabIndex >= 0
-    && previous.getClientRects().length && window.getComputedStyle(previous).visibility !== "hidden"
-    ? previous : fallback;
+  const canFocus = (target) => target?.isConnected && !target.disabled && target.tabIndex >= 0
+    && target.getClientRects().length && window.getComputedStyle(target).visibility !== "hidden";
+  let target = [previous, fallback].find(canFocus);
+  // Navigation can hide the supplied region while the dialog is loading.
+  if (!target) target = [document.querySelector(".main-tab.active")].find(canFocus);
   target?.focus({ preventScroll: true });
 }
 

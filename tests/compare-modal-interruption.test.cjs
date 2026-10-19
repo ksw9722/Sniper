@@ -76,6 +76,8 @@ function fixture() {
   }
   for (const id of ["opener", "mainTab", "openDisplaySettingsButton", "openFilterSettingsButton"]) new Element(id, "BUTTON", document.body);
   new Element("trafficRegion", "SECTION", document.body).tabIndex = 0;
+  for (const id of ["colorTagFilter", "filterBar", "historyWorkbenchResizer", "lowerWorkbench", "interceptPanel", "websocketPanel",
+    "matchReplacePanel", "findingsPanel", "oastPanel", "proxySettingsPanel", "proxySubPlaceholder", "footerMode"]) new Element(id, "DIV", document.body);
   for (const [id, parent] of [
     ["closeDisplaySettingsButton", "displaySettingsModal"], ["closeFilterModalButton", "filterModal"],
     ["scannerSettingsClose", "scannerSettingsBackdrop"], ["scannerSettingsCancel", "scannerSettingsBackdrop"],
@@ -93,7 +95,7 @@ function fixture() {
   const context = loadFunctions([
     "openCompareModal", "closeCompareModal", "getActiveModalAction", "isModalVisible", "restoreModalFocus", "trapModalFocus", "isEditableTarget",
     "openDisplaySettingsModal", "closeDisplaySettingsModal", "closeCertificateModal", "openFilterModal", "closeFilterModal", "showConfirmDialog",
-    "openCurlImportModal", "closeCurlImportModal", "openScannerSettings", "closeScannerSettings",
+    "openCurlImportModal", "closeCurlImportModal", "openScannerSettings", "closeScannerSettings", "renderProxyPanels",
   ], {
     document, els: nodes, HTMLElement: Element, Element,
     window: { getComputedStyle: node => ({ visibility: node.visibility }), getSelection: () => null },
@@ -101,6 +103,7 @@ function fixture() {
     compareBaseId: "base", compareBaseSessionId: "session-a", compareLoadGeneration: 0,
     compareBaseRecord: null, compareTargetRecord: null, compareActiveTab: "request", compareReturnFocus: null,
     currentSessionId: () => "session-a", transactionPath: id => id,
+    proxyTabs: [], sanitizeActiveProxyTab: value => value, loadFindings() {},
     activeConfirmDialog: null, displaySettingsPreviewActive: false, displaySettingsReturnFocus: null, filterSettingsReturnFocus: null,
     displaySettingsEditedControls: new Set(), filterSettingsEditedControls: new Set(),
     hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {}, selectSettingsTab() {}, hydrateFilterForm() {},
@@ -259,3 +262,19 @@ for (const dialog of ["settings", "filter", "confirm", "curl", "scanner"]) {
     assert.equal(f.document.activeElement, f.nodes.opener);
   });
 }
+
+
+test("Compare closing after navigation skips both a hidden invoker and the now-hidden history region", async () => {
+  const f = fixture(), loading = f.context.openCompareModal("target");
+  // The context menu closes after Compare is requested. Navigation can still
+  // hide HTTP history while the two record reads are pending.
+  f.nodes.opener.classList.add("hidden");
+  f.context.state.activeProxyTab = "findings";
+  f.context.renderProxyPanels();
+  assert.equal(f.nodes.trafficRegion.getClientRects().length, 0);
+  f.resolvePair(); await loading;
+  assert.equal(f.hidden(), false);
+  f.key("Escape");
+  assert.equal(f.hidden(), true);
+  assert.equal(f.document.activeElement, f.nodes.mainTab);
+});
