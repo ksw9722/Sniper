@@ -258,7 +258,10 @@ text, so review output before sharing it.
 `templates` manages the Nuclei template library. `templates list` and
 `templates get` read it; `templates passive set-enabled` turns templates on for
 passive checks of in-scope captured traffic, which never send requests;
-`templates library download` contacts GitHub, so ask before running it. See
+`templates library download` contacts GitHub, so ask before running it.
+`templates scan start` sends the selected templates' requests to targets in
+Scope: run `templates scan preview` first, and ask before starting it with
+`--yes`; `templates scan get` follows it. See
 [the template contract](nuclei-templates.md).
 
 ## What the agent sees

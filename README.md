@@ -87,7 +87,7 @@ cargo run --bin sniper-desktop
 | **Browsers** | One click opens Chrome, Edge, Brave, Chromium, ego, Aside or BrowserOS neo already wired to the proxy and CA, and hands an AI agent the way to drive it |
 | **Capture** | HTTP history, WebSocket sessions, intercept queue, match & replace rules |
 | **Findings** | Passive vulnerability scanner — sensitive data, CORS, missing headers, JWT issues |
-| **Templates** | Nuclei community templates: download or import a release, turn templates on, and they check in-scope captured traffic without sending anything |
+| **Templates** | Nuclei community templates: turned-on templates check in-scope captured traffic without sending anything, and Template Scan sends the ones you pick to targets you name |
 | **Replay** | Modify and resend any captured request |
 | **Fuzzer** | Payload-based request testing with markers |
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
@@ -181,7 +181,7 @@ Session → Scope → Capture → Replay → Fuzz
 - **Map** — the Service Map of the captured origins, how they relate, and the APIs they serve, from retained history
 - **Capture** — inspect HTTP, render HTML and image responses in a sandbox, intercept & modify, WebSocket frames, auto-replace
 - **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses, and the management endpoints and backend addresses the Service Map names; each issue is listed once per host, endpoint or value, and **Rescan** applies the current rules to traffic already captured
-- **Templates** — the Nuclei community templates: download or import a release, and the templates you turn on check captured traffic of in-scope hosts
+- **Templates** — the Nuclei community templates: download or import a release; the templates you turn on check captured traffic of in-scope hosts, and **Template Scan** sends the ones you pick to targets in Scope, on demand, keeping only what matched
 - **Replay** — resend with modifications, override host/port, render the response
 - **Fuzzer** — insert markers, run payload lists
 - **Tools** — decode/encode/hash/JWT in one place
@@ -328,16 +328,28 @@ and their findings appear in Findings under `nuclei`. With no Scope includes,
 templates check nothing. Of release v10.5.0's 11,698 HTTP templates, 2,084 can
 run this way.
 
+**Template Scan** sends templates when you ask: pick them with the list filter
+or one by one, name targets whose hosts are in Scope, preview what it will send,
+confirm, and start. The target supplies scheme, host and port — a template only
+adds a path — and redirects are followed only while they stay in Scope. Templates
+tagged intrusive, default-login, bruteforce and the like, or sending PUT, DELETE
+or PATCH, are left out unless you allow each risk; `dos` templates never run. A
+scan is paced and bounded, stops when asked, and keeps in HTTP history only the
+exchanges a template matched; their findings appear under `nuclei`. Of the same
+release, 6,429 templates can be sent this way.
+
 Templates are data. Code, JavaScript, headless, network, DNS and the other
 non-HTTP templates are listed and never run, and a template that needs anything
 outside the supported subset is shown as unsupported with the reason, never run
-in part. Active scans that send a template's requests are not in this release.
+in part.
 
 ```bash
 sniper-cli templates library status
 sniper-cli templates library download --yes
 sniper-cli templates list --support passive --search wordpress
 sniper-cli templates passive set-enabled --enabled true --tag waf --yes
+sniper-cli templates scan preview --target https://app.example.com --severity critical
+sniper-cli templates scan start --target https://app.example.com --severity critical --yes
 ```
 
 See [the template contract](docs/integrations/nuclei-templates.md) for what runs

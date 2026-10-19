@@ -1234,6 +1234,8 @@ function bindEvents() {
     templatesController = window.SniperTemplates.createController({
       root: els.templatesShell,
       getScopeIncludeCount: () => (state.runtime?.scope_patterns || []).length,
+      getSessionId: currentSessionId,
+      openRecord: jumpToTransaction,
     });
   }
   window.addEventListener("resize", resetLayoutTextareas);
@@ -2886,6 +2888,7 @@ async function _applySettings(response) {
   syncHttpCapturePill();
   state.activeSession = state.settings.active_session;
   if (typeof reconController !== "undefined") reconController?.syncSession();
+  if (typeof templatesController !== "undefined") templatesController?.syncSession();
   state.oastTokenClearPending = false;
   // Sync intercept scope pill with server state
   const interceptScopePill = document.getElementById("interceptInScopeToggle");
@@ -3136,6 +3139,7 @@ async function loadSessions({ reloadOnActiveChange = false, preserveWorkspaceOwn
   state.sessions = sessions;
   state.activeSession = nextActiveSession;
   if (typeof reconController !== "undefined") reconController?.syncSession();
+  if (typeof templatesController !== "undefined") templatesController?.syncSession();
   renderDashboard();
 }
 
@@ -10335,7 +10339,9 @@ function jumpToTransaction(recordId) {
   const hadRenderedDetail = Boolean(state.selectedRecord?.id);
   state.selectedId = recordId;
   state.selectedRecord = null;
-  renderProxyPanels();
+  // Called from other tools too (Templates' scan results), so the main panel
+  // switches as well, not only Capture's tabs.
+  renderToolPanels();
   scheduleHistoryDetailLoading(recordId, "Loading selected transaction...", {
     immediate: !hadRenderedDetail,
   });

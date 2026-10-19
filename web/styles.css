@@ -8071,16 +8071,20 @@ button.utility-button.replay-tab-add {
   background: var(--shell);
 }
 .templates-shell .panel-card { min-width: 0; min-height: 0; }
-.templates-library { overflow: auto; }
+/* The library and the scan form share the left column, which scrolls as one. */
+.templates-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; overflow: auto; }
+.templates-side .panel-card { flex: 0 0 auto; }
 /* The card is taller than its form; keep the rows at their own height. */
 .templates-library .recon-form { align-content: start; }
 .templates-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.templates-shell input:not([type="checkbox"]):not([type="file"]), .templates-shell select {
+.templates-shell input:not([type="checkbox"]):not([type="file"]), .templates-shell select, .templates-shell textarea {
   min-width: 0; width: 100%; min-height: var(--control-h);
   border: 1px solid var(--line-strong); border-radius: 5px;
   background: var(--panel-code); color: var(--text); padding: 5px 8px;
 }
-.templates-shell input:focus-visible, .templates-shell select:focus-visible, .templates-shell button:focus-visible {
+.templates-shell textarea { resize: vertical; font-family: var(--mono); }
+.templates-shell input:focus-visible, .templates-shell select:focus-visible, .templates-shell button:focus-visible,
+.templates-shell textarea:focus-visible, .templates-shell summary:focus-visible {
   outline: 2px solid var(--info); outline-offset: 2px;
 }
 .templates-table th:first-child { width: 44px; }
@@ -8094,7 +8098,7 @@ button.utility-button.replay-tab-add {
 }
 @media (max-width: 760px) {
   .templates-shell { display: flex; flex-direction: column; overflow: auto; }
-  .templates-library { flex: 0 0 auto; overflow: visible; }
+  .templates-side { flex: 0 0 auto; overflow: visible; }
   .templates-list { flex: 0 0 650px; }
 }
 .recon-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }

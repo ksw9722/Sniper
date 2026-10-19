@@ -1634,6 +1634,7 @@
         </section>
 
         <section class="templates-shell hidden" id="templatesShell" aria-labelledby="templatesTitle">
+          <div class="templates-side">
           <section class="panel-card templates-library">
             <header class="panel-toolbar">
               <div><p class="placeholder-kicker">Nuclei templates</p><h2 id="templatesTitle">Templates</h2></div>
@@ -1653,6 +1654,53 @@
               <p class="recon-notice hidden" id="templatesNotice" role="status"></p>
             </div>
           </section>
+          <section class="panel-card templates-scan" aria-labelledby="templatesScanTitle">
+            <header class="panel-toolbar">
+              <div><p class="placeholder-kicker">Template Scan</p><h2 id="templatesScanTitle">Send templates</h2></div>
+            </header>
+            <div class="recon-form">
+              <label class="recon-field" for="templatesScanTargets">Targets
+                <textarea id="templatesScanTargets" rows="3" placeholder="https://app.example.com" autocomplete="off" spellcheck="false"></textarea>
+              </label>
+              <label class="recon-field" for="templatesScanSelection">Templates
+                <select id="templatesScanSelection">
+                  <option value="filter">What the list filter shows</option>
+                  <option value="selected">The selected template</option>
+                </select>
+              </label>
+              <details class="recon-limits">
+                <summary>Risks and limits</summary>
+                <fieldset class="recon-sources" id="templatesScanRisks">
+                  <legend>Also send templates marked</legend>
+                    <label class="recon-check"><input type="checkbox" data-risk="intrusive" /> intrusive</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="default-login" /> default-login</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="bruteforce" /> bruteforce</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="token-spray" /> token-spray</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="credential-stuffing" /> credential-stuffing</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="fuzz" /> fuzz</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="fuzzing" /> fuzzing</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="dast" /> dast</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="osint" /> osint</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="method:put" /> method:put</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="method:delete" /> method:delete</label>
+                    <label class="recon-check"><input type="checkbox" data-risk="method:patch" /> method:patch</label>
+                </fieldset>
+                <div class="recon-limit-fields">
+                  <label class="recon-field" for="templatesScanRate">Requests a second<input id="templatesScanRate" type="number" min="1" max="50" value="10" /></label>
+                  <label class="recon-field" for="templatesScanConcurrency">Templates at once<input id="templatesScanConcurrency" type="number" min="1" max="8" value="4" /></label>
+                  <label class="recon-field" for="templatesScanMaxRequests">Request limit<input id="templatesScanMaxRequests" type="number" min="1" max="50000" value="10000" /></label>
+                </div>
+                <label class="recon-check"><input id="templatesScanMatchReplace" type="checkbox" /> Apply Match &amp; Replace rules</label>
+              </details>
+              <p class="recon-help">Every target's host must be in Scope, and redirects are followed only while they stay in it. Only exchanges a template matched are kept in HTTP history; their findings appear in Capture ▸ Findings under <strong>nuclei</strong>. Scan only targets you are authorized to test.</p>
+              <div class="templates-actions"><button class="secondary-action" id="templatesScanPreview" type="button">Preview</button></div>
+              <label class="recon-check recon-history-consent"><input id="templatesScanConsent" type="checkbox" disabled /> <span id="templatesScanConsentText">Preview the scan to see what it sends.</span></label>
+              <div class="templates-actions"><button class="primary-action" id="templatesScanStart" type="button" disabled>Start scan</button></div>
+              <p class="recon-notice hidden" id="templatesScanNotice" role="status" aria-live="polite"></p>
+            </div>
+            <div class="recon-jobs" id="templatesScanJobs"></div>
+          </section>
+          </div>
           <section class="panel-card recon-inventory templates-list">
             <header class="panel-toolbar recon-inventory-toolbar">
               <div class="recon-search-controls">
@@ -1667,6 +1715,7 @@
                 </select>
                 <select id="templatesSupport" aria-label="What Sniper can run">
                   <option value="passive" selected>Runs on captured traffic</option>
+                  <option value="active">Can be scanned</option>
                   <option value="">All templates</option>
                   <option value="unsupported">Cannot run</option>
                 </select>

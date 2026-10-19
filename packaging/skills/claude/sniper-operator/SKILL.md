@@ -491,6 +491,10 @@ sniper-cli --output compact templates get --id <template-id>
 sniper-cli templates passive set-enabled --enabled true --id <template-id> --dry-run
 sniper-cli templates passive set-enabled --enabled true --id <template-id> --yes
 sniper-cli templates library download --dry-run
+sniper-cli --output compact templates scan preview --target <origin> --severity high,critical
+sniper-cli templates scan start --target <origin> --severity high,critical --yes
+sniper-cli --output compact templates scan get --id <scan-id>
+sniper-cli templates scan stop --id <scan-id> --yes
 printf "%s" "$OAST_TOKEN" | sniper-cli capture oast configure --provider custom --url https://oast.example --token-stdin --yes
 sniper-cli skills install --claude --dry-run
 sniper-cli skills install --claude --yes
@@ -586,3 +590,4 @@ or API I/O and cannot establish eligibility. For these four operations, canonica
 - Do not switch sessions silently before changing scope, Replay state, or queued-request decisions.
 - Use `capture http get`, `replay list`, or `capture web-socket get` before making assumptions about stored request state.
 - `templates library download` contacts GitHub; ask the user before running it with `--yes`. Turned-on templates only check captured traffic of in-scope hosts and never send requests; findings appear under category `nuclei`.
+- `templates scan start` sends requests to the targets. Run `templates scan preview` first, show the user what it will send, and start it with `--yes` only when they agree; never add `--allow-risk` on your own. Its findings are `nuclei:<template-id>`, and only matched exchanges join HTTP history.

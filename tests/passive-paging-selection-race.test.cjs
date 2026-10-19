@@ -53,7 +53,7 @@ function historyFixture({ size = 5, start = 0, total = size + 1, cursor = false 
       return request.promise;
     },
     updateHistorySelection: noop, scrollSelectedHistoryRowIntoView: noop, scheduleHistoryDetailLoading: noop,
-    setActiveTool: noop, setActiveProxyTab: noop, renderProxyPanels: noop, focusHistoryRecord: noop,
+    setActiveTool: noop, setActiveProxyTab: noop, renderProxyPanels: noop, renderToolPanels: noop, focusHistoryRecord: noop,
     renderEmptyDetail: noop, prepareHistoryItem: noop, invalidateVisibleEntriesCache: noop,
     adjustHistoryScrollAfterHeadTrim: noop, renderHistory: noop,
     async loadTransactionDetail(id) {

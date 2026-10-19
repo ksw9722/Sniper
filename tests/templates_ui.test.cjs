@@ -36,6 +36,43 @@ test("support labels name the passive kind or the first reason it cannot run", (
   assert.equal(templates.supportLabel({ passive_supported: true, passive: "global" }), "Every response");
   assert.equal(templates.supportLabel({ passive_supported: true, passive: "base_url_get" }), "Captured GET");
   assert.equal(templates.supportLabel({ passive_supported: false, reasons: ["protocol:dns", "x"] }), "No: protocol:dns");
+  assert.equal(templates.supportLabel({ passive_supported: true, passive: "base_url_get", active_supported: true }), "Captured GET · Scan");
+  assert.equal(templates.supportLabel({ active_supported: true, reasons: ["randomness"] }), "Scan");
+});
+
+test("a scan request names its targets, its selection and whether it only counts", () => {
+  const values = { targets: " https://app.example.com\nhttp://api.example.com:8080/v1 ", selection: "filter",
+    risks: ["intrusive", "made-up"], rate: "5", concurrency: "2", maxRequests: "500", applyMatchReplace: false };
+  assert.deepEqual(templates.scanRequest(values, { search: " wordpress ", severity: "high" }, null, "s-1", true), {
+    session_id: "s-1",
+    targets: ["https://app.example.com", "http://api.example.com:8080/v1"],
+    allow_risks: ["intrusive"],
+    rate: 5, concurrency: 2, max_requests: 500, apply_match_replace: false,
+    filter: { search: "wordpress", severity: "high" },
+    preview: true,
+  });
+  const one = templates.scanRequest({ ...values, selection: "selected" }, {}, "git-config", "s-1", false);
+  assert.deepEqual(one.ids, ["git-config"]);
+  assert.equal(one.acknowledged, true);
+  assert.equal(one.filter, undefined);
+  assert.throws(() => templates.scanRequest({ ...values, selection: "selected" }, {}, null, "s-1", true), /Select a template/);
+  assert.throws(() => templates.scanRequest(values, {}, null, null, true), /session/);
+  assert.throws(() => templates.scanRequest({ ...values, rate: "51" }, {}, null, "s-1", true), /from 1 to 50/);
+  for (const bad of ["", "app.example.com", "https://app.example.com/?q=1", "https://user:pw@app.example.com", "ftp://app.example.com"]) {
+    assert.throws(() => templates.parseTargets(bad), Error, bad);
+  }
+  assert.throws(() => templates.parseTargets(Array.from({ length: 21 }, (_, i) => `https://h${i}.example.com`).join(" ")), /at most 20/);
+});
+
+test("previews and jobs read as what was or will be sent", () => {
+  assert.equal(
+    templates.previewLine({ requests: 1200, templates: 300, targets: ["https://app.example.com"], max_requests: 10000, excluded_by_risk: { intrusive: 4 } }),
+    "Send 1,200 requests from 300 templates to https://app.example.com, at most 10,000 counting redirects. Left out by risk: intrusive 4.",
+  );
+  assert.equal(
+    templates.jobLine({ status: "running", sent: 10, planned: 20, matched: 1, failed: 2, blocked: 0 }),
+    "running · 10 of 20 sent · 1 matched · 2 failed",
+  );
 });
 
 test("template text is never written as markup", () => {
@@ -55,7 +92,15 @@ test("the Templates tool is registered where the UI and the server keep their to
   assert.match(settings, /const ACTIVE_TOOL_OPTIONS: &\[&str\] = &\[[^\]]*"templates"/);
   for (const id of ["Status", "Progress", "Consent", "Download", "Check", "Import", "ImportFile", "Notice", "ScopeNote",
     "Search", "Severity", "Support", "EnabledOnly", "EnableShown", "DisableShown", "Meta", "Rows", "Detail",
-    "PageMeta", "Previous", "Next"]) {
+    "PageMeta", "Previous", "Next", "ScanTargets", "ScanSelection", "ScanRisks", "ScanRate", "ScanConcurrency",
+    "ScanMaxRequests", "ScanMatchReplace", "ScanPreview", "ScanConsent", "ScanConsentText", "ScanStart", "ScanNotice",
+    "ScanJobs"]) {
     assert.match(html, new RegExp(`id="templates${id}"`), id);
   }
+  // Each risk the server allows has its box, and dos has none.
+  const boxes = [...html.matchAll(/data-risk="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(boxes, templates.RISKS);
+  assert.ok(!boxes.includes("dos"));
+  assert.match(app, /getSessionId: currentSessionId,\s*openRecord: jumpToTransaction/);
+  assert.equal((app.match(/templatesController\?\.syncSession\(\)/g) || []).length, 2);
 });

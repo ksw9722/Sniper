@@ -1,6 +1,8 @@
-"""Verify passive Nuclei templates against an isolated Sniper and a loopback
-upstream: import a synthetic release, enable templates, capture in scope,
-restart, and rescan after disabling. Nothing leaves this machine.
+"""Verify Nuclei templates against an isolated Sniper and a loopback upstream:
+import a synthetic release, enable passive templates, capture in scope,
+restart, and rescan after disabling; then run a Template Scan, check it sent
+only to its target, kept only matches, survives a rescan, and is marked
+interrupted when Sniper stops mid-scan. Nothing leaves this machine.
 
 Run: python tests/template_smoke.py [directory containing sniper]
 """
@@ -62,6 +64,18 @@ http:
         words: ['APP_KEY=']
 """
 
+SLOW = """id: example-slow
+info:
+  name: Example Slow
+  severity: info
+http:
+  - method: GET
+    path: ['{{BaseURL}}/slow-a', '{{BaseURL}}/slow-b']
+    matchers:
+      - type: status
+        status: [200]
+"""
+
 DNS = """id: example-dns
 info:
   name: Example DNS
@@ -75,7 +89,7 @@ def release():
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as archive:
         for path, text in [("http/detect.yaml", DETECT), ("http/global.yaml", GLOBAL),
-                           ("http/active.yaml", ACTIVE), ("dns/dns.yaml", DNS)]:
+                           ("http/active.yaml", ACTIVE), ("http/slow.yaml", SLOW), ("dns/dns.yaml", DNS)]:
             body = text.encode()
             info = tarfile.TarInfo("example-templates-1.0/" + path)
             info.size = len(body)
@@ -96,12 +110,17 @@ def eventually(operation, timeout=30):
 def main():
     binaries = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release").resolve()
 
+    seen = []
+
     class Upstream(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
         def do_GET(self):
-            body = b"<html><title>Example Server 1.2</title></html>"
+            seen.append((self.path, self.headers.get("Host")))
+            if self.path.startswith("/slow"):
+                time.sleep(30)
+            body = b"APP_KEY=base64:example" if self.path == "/.env" else b"<html><title>Example Server 1.2</title></html>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("X-Example", "yes")
@@ -169,8 +188,9 @@ def main():
         assert status["templates"] == 0, status
         call("/api/templates/library/import", raw=release(), content_type="application/gzip", expect=202)
         status = eventually(lambda: (s := call("/api/templates/library"))["state"] == "idle"
-                            and s["templates"] == 4 and s)
+                            and s["templates"] == 5 and s)
         assert status["passive_supported"] == 2, status
+        assert status["active_supported"] == 3, status
         assert status["library"]["source"] == "import" and not status["library"]["verified"], status
         listed = call("/api/templates?support=passive")
         assert sorted(item["id"] for item in listed["items"]) == ["example-detect", "example-global"], listed
@@ -202,7 +222,7 @@ def main():
         runtime = start()
         ui = "http://" + runtime["ui_addr"]
         status = eventually(lambda: (s := call("/api/templates/library"))["state"] == "idle" and s)
-        assert status["templates"] == 4 and status["passive_enabled"] == 2, status
+        assert status["templates"] == 5 and status["passive_enabled"] == 2, status
         assert template_findings(), "template findings did not survive a restart"
 
         call("/api/templates/passive", {"ids": ["example-global"], "enabled": False})
@@ -212,6 +232,50 @@ def main():
                      if item.get("rule_id", "").startswith("nuclei-passive:")]
         assert remaining == ["nuclei-passive:example-detect"], remaining
         print("Import, passive capture, restart and rescan after disabling passed.", flush=True)
+
+        # Template Scan: the target is the upstream's origin, in Scope.
+        session = next(item["id"] for item in call("/api/sessions") if item["active"])
+        origin = target.rstrip("/")
+        scan = {"session_id": session, "targets": [origin], "ids": ["example-active", "example-detect"]}
+        preview = call("/api/templates/scans", dict(scan, preview=True))
+        assert preview["templates"] == 2 and preview["requests"] == 2, preview
+        before = len(seen)
+        job = call("/api/templates/scans", dict(scan, acknowledged=True))
+        query = f"?session_id={session}"
+        job = eventually(lambda: (j := call(f"/api/templates/scans/{job['id']}{query}"))["status"] != "running" and j)
+        assert job["status"] == "completed" and job["sent"] == 2 and job["matched"] == 2, job
+        host = f"127.0.0.1:{upstream.server_port}"
+        assert sorted(seen[before:]) == [("/", host), ("/.env", host)], seen[before:]
+        scanned = {item["rule_id"] for item in call("/api/findings?limit=1000")
+                   if item.get("rule_id", "").startswith("nuclei:")}
+        assert scanned == {"nuclei:example-active", "nuclei:example-detect"}, scanned
+        kept = [result["record_id"] for result in job["results"]]
+        for record_id in kept:
+            record = call(f"/api/transactions/{record_id}")
+            assert "Sent by Template Scan." in record["notes"], record["notes"]
+        call("/api/findings/rescan", {})
+        after = {item["rule_id"] for item in call("/api/findings?limit=1000")
+                 if item.get("rule_id", "").startswith("nuclei:")}
+        assert after == scanned, after
+        print(json.dumps({"scanned": sorted(scanned), "requests": seen[before:]}), flush=True)
+
+        # A crash mid-scan leaves the job interrupted, not running: kill
+        # Sniper once the started job has been saved.
+        slow = call("/api/templates/scans", {"session_id": session, "targets": [origin],
+                                             "ids": ["example-slow"], "acknowledged": True})
+        eventually(lambda: any(path.startswith("/slow") for path, _ in seen))
+        time.sleep(1.5)
+        process.kill()
+        process.wait(timeout=10)
+        runtime = start()
+        ui = "http://" + runtime["ui_addr"]
+        eventually(lambda: call("/api/templates/library")["state"] == "idle")
+        jobs = {item["id"]: item["status"] for item in call(f"/api/templates/scans{query}")["jobs"]}
+        assert jobs == {job["id"]: "completed", slow["id"]: "interrupted"}, jobs
+        survived = {item["rule_id"] for item in call("/api/findings?limit=1000")
+                    if item.get("rule_id", "").startswith("nuclei:")}
+        assert survived == scanned, survived
+        print("Template Scan, rescan and interruption by a restart passed.", flush=True)
     finally:
         if process is not None and process.poll() is None:
             stop()
