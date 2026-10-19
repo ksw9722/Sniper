@@ -60,7 +60,7 @@ function editorFixture() {
     CM_SEARCH_DECORATION_LIMIT: 5000,
     CM_DEFAULT_SEARCH_CLASSES: { hit: "tok-search-hit", active: "tok-search-active" },
     cmProgrammaticViews: new WeakSet(), sniperCMTheme: [], httpDecoPlugin: [], hexDecoPlugin: [],
-    diffDecoPlugin: [], payloadDecoPlugin: [], TextDecoder,
+    diffDecoPlugin: [], payloadDecoPlugin: [], encodedPreviewPlugin: [], TextDecoder,
     renderReplayEmptyResponse() {}, renderReplayResponseView() {}, renderWsReplay() {},
     refreshReplayTabLabel() {}, canNavigateReplayHistory: () => false,
     renderReplayRequestHighlight() {}, flushWorkspaceState: async () => {},

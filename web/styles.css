@@ -7833,3 +7833,46 @@ button.utility-button.replay-tab-add {
   .templates-list { flex: 0 0 650px; }
 }
 .recon-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+/* Inert, view-owned decoding previews share the active theme. The button stays
+   in the tab order without reserving a new toolbar row in every traffic pane. */
+.encoded-preview-trigger {
+  position: absolute;
+  right: 18px;
+  top: 5px;
+  z-index: 2;
+  padding: 2px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--panel-elevated);
+  color: var(--text-soft);
+  font: 11px var(--sans);
+  cursor: pointer;
+  opacity: 0;
+}
+.cm-editor:hover .encoded-preview-trigger,
+.cm-editor:focus-within .encoded-preview-trigger { opacity: 1; }
+.encoded-preview-trigger:focus-visible { outline: 2px solid var(--point); outline-offset: 2px; }
+.encoded-preview-tooltip {
+  position: fixed;
+  z-index: 1200;
+  max-width: min(480px, calc(100vw - 16px));
+  max-height: min(320px, calc(100vh - 16px));
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  font: 12px/1.45 var(--sans);
+  user-select: text;
+}
+.encoded-preview-title { color: var(--text-soft); font-weight: 600; }
+.encoded-preview-label { margin-top: 8px; color: var(--point); font-size: 11px; }
+.encoded-preview-tooltip pre {
+  margin: 3px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.5 var(--mono);
+}

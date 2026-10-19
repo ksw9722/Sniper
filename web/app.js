@@ -29390,6 +29390,256 @@ function buildSearchDecorations(doc, query, activeIndex = -1, classes = CM_DEFAU
   };
 }
 
+// Passive decoding is deliberately separate from Decoder tools: never transform
+// the document, fetch a target, or retain decoded traffic outside this view.
+const ENCODED_PREVIEW_INPUT_LIMIT = 4096;
+const ENCODED_PREVIEW_OUTPUT_LIMIT = 2048;
+const ENCODED_PREVIEW_LAYER_LIMIT = 3;
+let encodedPreviewId = 0;
+
+function decodePreviewLayer(value) {
+  if (!value || value.length > ENCODED_PREVIEW_INPUT_LIMIT) return null;
+  let text, encoding;
+  try {
+    if (/%[0-9a-f]{2}/i.test(value)) {
+      // A literal + is ambiguous outside a form field; never change it to space.
+      text = decodeURIComponent(value);
+      encoding = "URL percent encoding";
+    } else {
+      // Require a complete, canonical token. Do not guess at hashes, arbitrary
+      // hex, broken padding, binary bodies or a suffix of an oversized value.
+      if (value.length < 8 || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(value)
+        || /[+\/]/.test(value) && /[-_]/.test(value)) return null;
+      const bare = value.replace(/=+$/, "");
+      if (bare.length % 4 === 1 || value.includes("=") && value.length % 4 !== 0) return null;
+      const standard = bare.replace(/-/g, "+").replace(/_/g, "/");
+      const bytes = atob(standard + "=".repeat((4 - standard.length % 4) % 4));
+      if (btoa(bytes).replace(/=+$/, "") !== standard) return null;
+      text = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes, c => c.charCodeAt(0)));
+      encoding = /[-_]/.test(value) ? "Base64URL" : "Base64";
+    }
+  } catch {
+    return null;
+  }
+  if (text === value || !text.trim() || text.length > ENCODED_PREVIEW_OUTPUT_LIMIT
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(text)) return null;
+  return { encoding, text };
+}
+
+function decodePreviewLayers(value) {
+  const layers = [];
+  for (let i = 0; i < ENCODED_PREVIEW_LAYER_LIMIT; i += 1) {
+    const layer = decodePreviewLayer(value);
+    if (!layer) break;
+    layers.push(layer);
+    value = layer.text;
+  }
+  return layers;
+}
+
+function encodedPreviewAt(doc, position) {
+  if (!Number.isInteger(position) || position < 0 || position >= doc.length) return null;
+  const start = Math.max(0, position - ENCODED_PREVIEW_INPUT_LIMIT - 1);
+  const end = Math.min(doc.length, position + ENCODED_PREVIEW_INPUT_LIMIT + 2);
+  const text = doc.sliceString(start, end), local = position - start;
+  for (const kind of ["url", "base64"]) {
+    const atom = kind === "url" ? /[^\s"'<>\\\[\]{}(),;:=&?#]/ : /[A-Za-z0-9+/_-]/;
+    let point = local;
+    // '=' is only part of a Base64 token when it is trailing padding.
+    if (kind === "base64" && text[point] === "=") {
+      while (point > 0 && text[point] === "=" && local - point < 2) point -= 1;
+    }
+    if (!atom.test(text[point] || "")) continue;
+    let from = point, to = point + 1;
+    while (from > 0 && atom.test(text[from - 1])) from -= 1;
+    while (to < text.length && atom.test(text[to])) to += 1;
+    if (kind === "base64") while (to < text.length && text[to] === "=") to += 1;
+    if (local < from || local >= to || to - from > ENCODED_PREVIEW_INPUT_LIMIT
+      || from === 0 && start > 0 || to === text.length && end < doc.length) continue;
+    const value = text.slice(from, to);
+    if (kind === "url" && !/%[0-9a-f]{2}/i.test(value)) continue;
+    // A malformed percent escape must not be reinterpreted as a Base64 suffix.
+    if (kind === "base64" && (text[from - 1] === "%" || text[to] === "%")) continue;
+    const layers = decodePreviewLayers(value);
+    if (layers.length) return { from: start + from, to: start + to, layers };
+  }
+  return null;
+}
+
+class EncodedPreviewController {
+  constructor(view) {
+    this.view = view;
+    this.document = view.dom.ownerDocument;
+    this.window = this.document.defaultView;
+    this.timer = null;
+    this.position = null;
+    this.tooltip = null;
+    this.destroyed = false;
+    this.generation = 0;
+    this.button = this.document.createElement("button");
+    this.button.type = "button";
+    this.button.className = "encoded-preview-trigger";
+    this.button.textContent = "Decode";
+    this.button.title = "Preview encoded value at cursor or selection";
+    this.button.setAttribute("aria-label", this.button.title);
+    this.button.addEventListener("click", () => this.showAtSelection());
+    view.dom.appendChild(this.button);
+    view.sniperDecodedPreview = this;
+    this.onMove = event => this.pointerMove(event);
+    this.onLeave = event => { if (!view.dom.contains(event.relatedTarget)) this.scheduleHide(); };
+    this.onFocusOut = event => { if (!view.dom.contains(event.relatedTarget)) this.hide(); };
+    this.onDismiss = event => {
+      if (event.type === "keydown" && event.key !== "Escape") return;
+      if (this.tooltip?.contains(event.target) && event.type !== "keydown") return;
+      if (event.type === "keydown" && this.tooltip) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      this.hide();
+    };
+    view.dom.addEventListener("mousemove", this.onMove);
+    view.dom.addEventListener("mouseleave", this.onLeave);
+    view.dom.addEventListener("focusout", this.onFocusOut);
+  }
+
+  listen(active) {
+    if (this.listening === active) return;
+    this.listening = active;
+    const method = active ? "addEventListener" : "removeEventListener";
+    for (const type of ["pointerdown", "keydown", "scroll"]) this.document[method](type, this.onDismiss, true);
+    this.window[method]("blur", this.onDismiss);
+    this.window[method]("resize", this.onDismiss);
+  }
+
+  scheduleHide() {
+    const generation = this.generation;
+    if (this.leaveTimer == null) this.leaveTimer = this.window.setTimeout(() => {
+      if (generation === this.generation) this.hide();
+    }, 150);
+  }
+
+  pointerMove(event) {
+    if (this.leaveTimer != null) this.window.clearTimeout(this.leaveTimer);
+    this.leaveTimer = null;
+    if (this.tooltip?.contains(event.target) || event.target === this.button) return;
+    const { view } = this;
+    if (event.buttons || !view.contentDOM.contains(event.target) || !view.state.selection.main.empty) {
+      this.hide();
+      return;
+    }
+    const position = view.posAtCoords({ x: event.clientX, y: event.clientY });
+    if (position === null || position >= view.state.doc.length) { this.scheduleHide(); return; }
+    const a = view.coordsAtPos(position), b = view.coordsAtPos(position + 1);
+    // posAtCoords can return the end of a line when hovering blank space.
+    if (!a || !b || a.top !== b.top || event.clientX < Math.min(a.left, b.left) - 2
+      || event.clientX > Math.max(a.right, b.right) + 2) { this.scheduleHide(); return; }
+    if (this.position === position || this.result && position >= this.result.from && position < this.result.to) return;
+    this.hide();
+    this.position = position;
+    const doc = view.state.doc, generation = this.generation;
+    this.listen(true);
+    this.timer = this.window.setTimeout(() => {
+      if (generation !== this.generation) return;
+      this.timer = null;
+      if (this.destroyed || view.state.doc !== doc || !view.dom.isConnected || !view.dom.getClientRects().length) {
+        this.hide();
+        return;
+      }
+      const result = encodedPreviewAt(doc, position);
+      if (result) this.show(result, false);
+      else this.listen(false);
+    }, 300);
+  }
+
+  showAtSelection() {
+    this.hide();
+    const { doc, selection } = this.view.state;
+    const range = selection.main;
+    let result = null;
+    if (!range.empty && range.to - range.from <= ENCODED_PREVIEW_INPUT_LIMIT) {
+      const layers = decodePreviewLayers(doc.sliceString(range.from, range.to));
+      if (layers.length) result = { from: range.from, to: range.to, layers };
+    } else if (range.empty) {
+      result = encodedPreviewAt(doc, range.head);
+      if (!result && range.head > 0) result = encodedPreviewAt(doc, range.head - 1);
+    }
+    this.show(result || { from: range.head, to: range.head, layers: [] }, true);
+  }
+
+  show(result, keyboard) {
+    if (this.destroyed || !this.view.dom.isConnected || !this.view.dom.getClientRects().length) return;
+    const anchor = this.view.coordsAtPos(result.from) || this.button.getBoundingClientRect();
+    const tooltip = this.document.createElement("div");
+    tooltip.className = "encoded-preview-tooltip";
+    tooltip.id = `encoded-preview-${++encodedPreviewId}`;
+    tooltip.setAttribute("role", "tooltip");
+    if (keyboard) tooltip.setAttribute("aria-live", "polite");
+    const title = this.document.createElement("div");
+    title.className = "encoded-preview-title";
+    title.textContent = "Decoded preview · Esc to close";
+    tooltip.appendChild(title);
+    for (const layer of result.layers) {
+      const label = this.document.createElement("div");
+      label.className = "encoded-preview-label";
+      label.textContent = layer.encoding;
+      const value = this.document.createElement("pre");
+      value.textContent = layer.text;
+      tooltip.appendChild(label);
+      tooltip.appendChild(value);
+    }
+    if (!result.layers.length) {
+      const note = this.document.createElement("div");
+      note.textContent = "No supported encoded text at the cursor or selection.";
+      tooltip.appendChild(note);
+    }
+    this.result = result;
+    this.tooltip = tooltip;
+    this.view.dom.appendChild(tooltip);
+    this.described = keyboard ? this.button : this.view.contentDOM;
+    this.oldDescription = this.described.getAttribute("aria-describedby");
+    this.described.setAttribute("aria-describedby", [this.oldDescription, tooltip.id].filter(Boolean).join(" "));
+    const box = tooltip.getBoundingClientRect();
+    const width = this.document.documentElement.clientWidth, height = this.document.documentElement.clientHeight;
+    tooltip.style.left = `${Math.max(8, Math.min(anchor.left, width - box.width - 8))}px`;
+    tooltip.style.top = `${Math.max(8, Math.min(anchor.bottom + 6, height - box.height - 8))}px`;
+    this.listen(true);
+  }
+
+  hide() {
+    this.generation += 1;
+    if (this.leaveTimer != null) this.window.clearTimeout(this.leaveTimer);
+    this.leaveTimer = null;
+    if (this.timer !== null) this.window.clearTimeout(this.timer);
+    this.timer = null;
+    this.position = null;
+    this.result = null;
+    this.tooltip?.remove();
+    this.tooltip = null;
+    if (this.described) {
+      if (this.oldDescription === null) this.described.removeAttribute("aria-describedby");
+      else this.described.setAttribute("aria-describedby", this.oldDescription);
+      this.described = null;
+    }
+    this.listen(false);
+  }
+
+  update(update) {
+    if (update.docChanged || update.selectionSet || update.viewportChanged || update.geometryChanged) this.hide();
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.hide();
+    this.view.dom.removeEventListener("mousemove", this.onMove);
+    this.view.dom.removeEventListener("mouseleave", this.onLeave);
+    this.view.dom.removeEventListener("focusout", this.onFocusOut);
+    this.button.remove();
+    delete this.view.sniperDecodedPreview;
+  }
+}
+
+const encodedPreviewPlugin = CM.ViewPlugin.fromClass(EncodedPreviewController);
+
 function createBaseExtensions(options = {}) {
   const exts = [
     sniperCMTheme,
@@ -29425,7 +29675,7 @@ function createBaseExtensions(options = {}) {
   if (options.placeholder) {
     exts.push(CM.placeholder(options.placeholder));
   }
-  if (options.httpHighlight) exts.push(httpDecoPlugin);
+  if (options.httpHighlight) exts.push(httpDecoPlugin, encodedPreviewPlugin);
   if (options.hexHighlight) {
     exts.push(hexDecoPlugin);
     // Match non-CM hex font exactly
@@ -29542,6 +29792,8 @@ class SniperCodeView {
 
   setContent(text) {
     const { view } = this;
+    // Even an identical replacement can belong to a newer selected record.
+    view.sniperDecodedPreview?.hide();
     const nextText = text || "";
     if (view.state.doc.toString() === nextText.replace(/\r\n?/g, "\n")) {
       return;
@@ -29558,6 +29810,7 @@ class SniperCodeView {
 
   setContentPreservingSelection(text) {
     const { view } = this;
+    view.sniperDecodedPreview?.hide();
     const nextText = text || "";
     if (view.state.doc.toString() === nextText.replace(/\r\n?/g, "\n")) {
       return;
