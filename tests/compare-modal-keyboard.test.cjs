@@ -1,5 +1,6 @@
 // Synthetic Compare keyboard checks only. Production event callbacks run with
-// inert navigation/action callbacks; no app bootstrap, server, or captured data.
+// the real read-only caret initializer and inert navigation/action callbacks.
+// No app bootstrap, server, or captured data.
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const vm = require("node:vm");
@@ -12,13 +13,21 @@ function deferred() {
 }
 
 function fixture() {
-  const document = { activeElement: null }, actions = [], pending = [], rendered = [];
+  const document = { activeElement: null, readyState: "loading" }, actions = [], pending = [], rendered = [];
+  const listeners = new Map();
+  document.addEventListener = (type, callback) => {
+    if (!listeners.has(type)) listeners.set(type, []);
+    listeners.get(type).push(callback);
+  };
   class HTMLElement {
     constructor(tagName = "DIV") {
       this.tagName = tagName;
       this.disabled = false;
       this.tabIndex = 0;
       this.children = [];
+      this.parentElement = null;
+      this.dataset = {};
+      this.attributes = new Map();
       this.isContentEditable = false;
       this.isConnected = true;
       this.handlers = new Map();
@@ -28,12 +37,34 @@ function fixture() {
         contains: name => classes.has(name),
       };
     }
-    focus() { document.activeElement = this; }
+    focus() { if (!this.disabled && this.getClientRects().length) document.activeElement = this; }
     addEventListener(type, callback) { this.handlers.set(type, callback); }
     click() { this.handlers.get("click")?.({ target: this }); }
-    getClientRects() { return [1]; }
-    closest() { return null; }
-    querySelectorAll() { return this.children; }
+    getClientRects() {
+      return this.isConnected && !this.classList.contains("hidden")
+        && (!this.parentElement || this.parentElement.getClientRects().length) ? [1] : [];
+    }
+    getAttribute(name) { return this.attributes.get(name); }
+    setAttribute(name, value) {
+      this.attributes.set(name, value);
+      if (name === "contenteditable") this.isContentEditable = value === "true";
+    }
+    closest(selector) {
+      if (selector.includes(".simple-code-view") && this.classList.contains("simple-code-view")) return this;
+      if (selector === ".code-line" && this.classList.contains("code-line")) return this;
+      if (selector.includes("contenteditable") && this.isContentEditable) return this;
+      return this.parentElement?.closest(selector) || null;
+    }
+    querySelectorAll(selector) {
+      if (selector === ".code-line") return this.children.filter(child => child.classList.contains("code-line"));
+      return this.children;
+    }
+    querySelector(selector) {
+      return selector === ".code-line.line-focus"
+        ? this.children.find(child => child.classList.contains("line-focus")) || null : null;
+    }
+    contains(node) { return node === this || this.children.some(child => child.contains(node)); }
+    scrollIntoView() {}
   }
   const els = {};
   for (const name of ["displaySettingsModal", "filterModal", "curlImportModal", "compareModal"]) {
@@ -42,16 +73,29 @@ function fixture() {
   }
   const requestTab = new HTMLElement("BUTTON"), responseTab = new HTMLElement("BUTTON");
   const diff = new HTMLElement("PRE"), close = new HTMLElement("BUTTON");
+  diff.classList.add("simple-code-view");
+  for (const text of ["--- base", "+++ target"]) {
+    const line = new HTMLElement("SPAN");
+    line.classList.add("code-line");
+    line.textContent = text;
+    line.parentElement = diff;
+    diff.children.push(line);
+  }
   requestTab.dataset = { compareTab: "request" };
   responseTab.dataset = { compareTab: "response" };
   els.compareModal.id = "compareModal";
   els.compareModal.children = [requestTab, responseTab, diff, close];
+  for (const child of els.compareModal.children) child.parentElement = els.compareModal;
   els.trafficRegion = new HTMLElement();
   const opener = new HTMLElement("BUTTON");
   document.querySelector = () => els.trafficRegion;
-  document.querySelectorAll = () => [requestTab, responseTab];
+  document.querySelectorAll = selector => {
+    if (selector === "[data-compare-tab]") return [requestTab, responseTab];
+    if (selector === ".code-view[tabindex], .simple-code-view[tabindex]") return [diff];
+    assert.fail(`Unexpected selector: ${selector}`);
+  };
   document.getElementById = id => ({ compareModal: els.compareModal, closeCompareButton: close })[id] || null;
-  document.activeElement = diff;
+  document.activeElement = opener;
   const state = { activeTool: "proxy", activeProxyTab: "http-history", selectedId: "target" };
   const action = name => () => { actions.push(name); return Promise.resolve(); };
   const context = loadFunctions([
@@ -62,11 +106,14 @@ function fixture() {
     compareBaseId: "base", compareBaseSessionId: "session-a", compareLoadGeneration: 0,
     compareBaseRecord: null, compareTargetRecord: null, compareActiveTab: "request", compareReturnFocus: null,
     currentSessionId: () => "session-a", transactionPath: id => id,
-    window: { getComputedStyle: () => ({ visibility: "visible" }) },
+    window: { getComputedStyle: () => ({ visibility: "visible" }), getSelection: () => null },
     closeDisplaySettingsModal: action("settings close"), closeFilterModal: action("filter close"),
     closeCertificateModal: action("certificate close"), closeCurlImportModal: action("curl close"),
     saveDisplaySettingsFromForm: action("settings apply"), applyFilterSettings: action("filter apply"),
     moveHistorySelection: action("history selection"),
+    HTTP_COLOR_TAG_ORDER: ["red", "orange", "yellow", "green", "blue", "purple"],
+    getHistoryItem: () => ({ id: "target" }), invalidateVisibleEntriesCache() {}, renderHistory() {},
+    updateAnnotations: action("update annotation"),
     openReplayFromSelection: action("send to Replay"), openFuzzerFromSelection: action("send to Fuzzer"),
     handleSendActionError: error => { throw error; },
     fetch(path) {
@@ -76,7 +123,12 @@ function fixture() {
     },
   });
   context.renderCompareModal = () => rendered.push([context.compareBaseRecord.id, context.compareTargetRecord.id]);
-  document.addEventListener = (type, callback) => { assert.equal(type, "keydown"); context.keydown = callback; };
+  const caretStart = appSource.indexOf("(function initCodeViewLineNav() {");
+  const caretEnd = appSource.indexOf("\n\n// ─── CodeMirror 6 Integration", caretStart);
+  assert.ok(caretStart >= 0 && caretEnd > caretStart, "Missing production read-only caret initializer");
+  // This top-level initializer registers before bindEvents' main dispatcher.
+  // It makes the real diff contenteditable and owns its line-navigation keys.
+  vm.runInContext(appSource.slice(caretStart, caretEnd), context);
   const start = appSource.indexOf('  document.addEventListener("keydown", (event) => {\n    const activeModalAction');
   const end = appSource.indexOf('\n\n  document.addEventListener("copy",', start);
   assert.ok(start >= 0 && end > start, "Missing production keyboard registration");
@@ -85,12 +137,17 @@ function fixture() {
   const compareEnd = appSource.indexOf('\n  document.getElementById("closeCurlImportButton")', compareStart);
   assert.ok(compareStart >= 0 && compareEnd > compareStart);
   vm.runInContext(appSource.slice(compareStart, compareEnd), context);
+  document.readyState = "interactive";
+  for (const callback of listeners.get("DOMContentLoaded") || []) callback();
+  assert.equal(diff.isContentEditable, true);
+  assert.equal(diff.getAttribute("data-readonly-editable"), "1");
   function key(key, target = document.activeElement, options = {}) {
     const event = {
       key, target, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false,
       defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...options,
     };
-    context.keydown(event);
+    target?.focus?.();
+    for (const callback of listeners.get("keydown") || []) callback(event);
     if (!event.defaultPrevented && target?.tagName === "BUTTON" && ["Enter", " "].includes(key)) target.click();
     return event;
   }
@@ -102,11 +159,20 @@ function fixture() {
 }
 
 for (const key of ["ArrowUp", "ArrowDown"]) {
-  test(`Compare ${key} leaves the underlying history selection alone`, () => {
+  test(`focused Compare diff keeps ${key} within existing read-only line navigation`, () => {
     const f = fixture();
     f.els.compareModal.classList.remove("hidden");
-    assert.equal(f.key(key).defaultPrevented, false, "Native diff scrolling should remain available");
+    assert.equal(f.key(key, f.diff).defaultPrevented, true, "The existing line handler owns the arrow");
+    assert.equal(f.diff.children[0].classList.contains("line-focus"), true);
     assert.deepEqual(f.actions, []);
+  });
+
+  test(`Compare blocks background history ${key} when focus remains outside the dialog`, () => {
+    const f = fixture();
+    f.els.compareModal.classList.remove("hidden");
+    const event = f.key(key, f.els.trafficRegion);
+    assert.deepEqual(f.actions, []);
+    assert.equal(event.defaultPrevented, false);
   });
 }
 
@@ -141,7 +207,7 @@ for (const shiftKey of [false, true]) {
   });
 }
 
-for (const shortcut of ["r", "i"]) {
+for (const shortcut of ["r", "i", "1"]) {
   for (const modifier of ["ctrlKey", "metaKey"]) {
     test(`Compare does not route ${modifier}+${shortcut} to the underlying transaction`, () => {
       const f = fixture();
@@ -173,7 +239,7 @@ test("Escape from a visible comparison cancels pending replacement; a later comp
 
 test("closed Compare leaves ordinary history navigation available", () => {
   const f = fixture();
-  assert.equal(f.key("ArrowDown").defaultPrevented, true);
+  assert.equal(f.key("ArrowDown", f.els.trafficRegion).defaultPrevented, true);
   assert.deepEqual(f.actions, ["history selection"]);
 });
 
@@ -187,9 +253,9 @@ test("Compare opens with focus inside and Escape restores its invoker", async ()
   assert.equal(f.document.activeElement, f.close);
   f.key("Escape");
   assert.equal(f.document.activeElement, f.opener);
-  f.diff.focus();
+  f.els.trafficRegion.focus();
   f.context.closeCompareModal();
-  assert.equal(f.document.activeElement, f.diff, "Closing an already hidden modal must not steal focus");
+  assert.equal(f.document.activeElement, f.els.trafficRegion, "Closing an already hidden modal must not steal focus");
 });
 
 test("Compare falls back to the history region when its menu invoker is detached", async () => {
@@ -312,7 +378,7 @@ for (const options of [{ isComposing: true }, { defaultPrevented: true }]) {
   test(`a pending initial comparison survives Escape when ${Object.keys(options)[0]}`, async () => {
     const f = fixture();
     const load = f.context.openCompareModal("target");
-    f.key("Escape", f.diff, options);
+    f.key("Escape", f.opener, options);
     f.resolvePair(0, "target");
     await load;
     assert.equal(f.els.compareModal.classList.contains("hidden"), false);

@@ -26343,7 +26343,7 @@ async function openCompareModal(targetId) {
   if (generation !== compareLoadGeneration || currentSessionId() !== sessionId) return;
   if (!baseRes || !targetRes) return;
   const modal = document.getElementById("compareModal");
-  // Opening another dialog while records load supersedes this pending reveal.
+  // A currently open dialog takes precedence over a delayed Compare reveal.
   const activeModal = getActiveModalAction();
   if (activeModal && activeModal.modal !== modal) return;
   const wasVisible = isModalVisible(modal);
