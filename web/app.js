@@ -16216,12 +16216,13 @@ function renderFuzzerSetup() {
     return;
   }
   const destination = typeof model.effectiveTarget === "string" ? model.effectiveTarget : JSON.stringify(model.effectiveTarget);
-  summary.textContent = `${model.payloadCount} payload${model.payloadCount === 1 ? "" : "s"} → ${model.requestCount} planned request${model.requestCount === 1 ? "" : "s"} · ${model.markerCount} position${model.markerCount === 1 ? "" : "s"}${model.markerCount > 1 ? " (shared payload)" : ""} · ${destination || "Target unavailable"} · ${model.httpVersion || "Automatic HTTP"}`;
+  const authorityMayChange = (model.warnings || []).some((message) => /^(Host markers|Header-name markers)/.test(message));
+  summary.textContent = `${model.payloadCount} payload${model.payloadCount === 1 ? "" : "s"} → ${model.requestCount} planned request${model.requestCount === 1 ? "" : "s"} · ${model.markerCount} position${model.markerCount === 1 ? "" : "s"}${model.markerCount > 1 ? " (shared payload)" : ""} · ${authorityMayChange ? "Template target: " : ""}${destination || "Target unavailable"} · ${model.httpVersion || "Automatic HTTP"}`;
   const errors = (model.errors || []).filter((message) => !["Request template is missing $payload$ markers.", "Fuzzer needs at least one payload."].includes(message));
   notice.textContent = busy ? "Running… Results appear when finished."
     : errors[0] || (!model.markerCount ? "Select a value to replace." : !model.payloadCount ? "Add payloads." : "");
-  if (!notice.textContent && (model.warnings || []).some((message) => message.startsWith("Host markers"))) {
-    notice.textContent = "Target changes with payloads. Check Preview.";
+  if (!notice.textContent && authorityMayChange) {
+    notice.textContent = "Request authority or framing may change. Check Preview.";
   }
   if (previewNotes) previewNotes.textContent = (model.warnings || []).join(" ");
   if (samples) {

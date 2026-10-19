@@ -233,3 +233,15 @@ test('value action waits for a chosen value and is disabled again while running'
   f.state.fuzzerRunning = true; f.c.renderFuzzerSetup();
   assert.equal(nodes.fuzzerMarkCandidateButton.disabled, true);
 });
+
+for (const rawHeader of ['$payload$: new.example.com', 'Host: $payload$']) test(`authority-changing ${rawHeader} keeps a visible warning beside the template target`, () => {
+  const f = fixture(), nodes = setupNodes(f);
+  f.state.fuzzerBaseRequest = { ...f.state.fuzzerBaseRequest, host: 'old.example.com', body: '' };
+  f.state.fuzzerRequestText = `GET / HTTP/1.1\r\n${rawHeader}\r\n\r\n`;
+  f.state.fuzzerPayloadsText = rawHeader.startsWith('$payload$') ? 'Host' : 'new.example.com';
+  f.c.activeFuzzerTargetForRequest = () => null;
+  f.c.renderFuzzerSetup();
+  assert.match(nodes.fuzzerPreflightSummary.textContent, /Template target:/);
+  assert.equal(nodes.fuzzerPreflightNotice.textContent, 'Request authority or framing may change. Check Preview.');
+  assert.match(nodes.fuzzerPreviewSamples.innerHTML, /https:\/\/new\.example\.com:443/);
+});
