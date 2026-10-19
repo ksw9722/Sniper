@@ -483,6 +483,12 @@ sniper-cli capture auto-replace list
 sniper-cli capture auto-replace set --file rules.json --dry-run
 sniper-cli capture auto-replace set --file rules.json --yes
 sniper-cli capture oast configure --provider custom --url https://oast.example --token-stdin --dry-run
+sniper-cli --output compact templates library status
+sniper-cli --output compact templates list --support passive --search <text>
+sniper-cli --output compact templates get --id <template-id>
+sniper-cli templates passive set-enabled --enabled true --id <template-id> --dry-run
+sniper-cli templates passive set-enabled --enabled true --id <template-id> --yes
+sniper-cli templates library download --dry-run
 printf "%s" "$OAST_TOKEN" | sniper-cli capture oast configure --provider custom --url https://oast.example --token-stdin --yes
 sniper-cli skills install --codex --dry-run
 sniper-cli skills install --codex --yes
@@ -577,3 +583,4 @@ or API I/O and cannot establish eligibility. For these four operations, canonica
 - If `sniper-cli` is missing from `PATH`, say so briefly instead of falling back to GUI scraping.
 - Do not switch sessions silently before changing scope, Replay state, or queued-request decisions.
 - Use `capture http get`, `replay list`, or `capture web-socket get` before making assumptions about stored request state.
+- `templates library download` contacts GitHub; ask the user before running it with `--yes`. Turned-on templates only check captured traffic of in-scope hosts and never send requests; findings appear under category `nuclei`.

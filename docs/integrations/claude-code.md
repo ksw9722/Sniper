@@ -255,6 +255,12 @@ app's Findings ▸ Rescan does), clear findings, or replace arbitrary whole
 configurations. Rule patterns and descriptions can themselves contain sensitive
 text, so review output before sharing it.
 
+`templates` manages the Nuclei template library. `templates list` and
+`templates get` read it; `templates passive set-enabled` turns templates on for
+passive checks of in-scope captured traffic, which never send requests;
+`templates library download` contacts GitHub, so ask before running it. See
+[the template contract](nuclei-templates.md).
+
 ## What the agent sees
 
 `findings list` omits detail and evidence. `findings get` includes stored detail and

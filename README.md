@@ -87,6 +87,7 @@ cargo run --bin sniper-desktop
 | **Browsers** | One click opens Chrome, Edge, Brave, Chromium, ego, Aside or BrowserOS neo already wired to the proxy and CA, and hands an AI agent the way to drive it |
 | **Capture** | HTTP history, WebSocket sessions, intercept queue, match & replace rules |
 | **Findings** | Passive vulnerability scanner — sensitive data, CORS, missing headers, JWT issues |
+| **Templates** | Nuclei community templates: download or import a release, turn templates on, and they check in-scope captured traffic without sending anything |
 | **Replay** | Modify and resend any captured request |
 | **Fuzzer** | Payload-based request testing with markers |
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
@@ -180,6 +181,7 @@ Session → Scope → Capture → Replay → Fuzz
 - **Map** — the Service Map of the captured origins, how they relate, and the APIs they serve, from retained history
 - **Capture** — inspect HTTP, render HTML and image responses in a sandbox, intercept & modify, WebSocket frames, auto-replace
 - **Findings** — passive scanner detects sensitive data leaks, CORS misconfig, missing security headers, JWT weaknesses, and the management endpoints and backend addresses the Service Map names; each issue is listed once per host, endpoint or value, and **Rescan** applies the current rules to traffic already captured
+- **Templates** — the Nuclei community templates: download or import a release, and the templates you turn on check captured traffic of in-scope hosts
 - **Replay** — resend with modifications, override host/port, render the response
 - **Fuzzer** — insert markers, run payload lists
 - **Tools** — decode/encode/hash/JWT in one place
@@ -306,6 +308,38 @@ An exact evidence read adds it only with `--include-socket-peer`. A socket peer
 may be a proxy, CDN or shared endpoint and does not establish origin ownership.
 Observations persist in session files, exports and full-record JSON; Off does not
 erase them. See [the observed socket peer contract](docs/integrations/observed-socket-peer.md).
+
+## Nuclei templates
+
+The **Templates** tool brings the community detection templates of
+[projectdiscovery/nuclei-templates](https://github.com/projectdiscovery/nuclei-templates)
+(MIT license) into Sniper. Download the latest release — the archive must match
+the checksum the release publishes — or import a release `.tar.gz` where GitHub
+is unreachable. The library is shared by every session.
+
+Sniper implements a subset of the template language itself; it does not run or
+need the `nuclei` program. Templates that can judge a response without sending
+anything — global matchers, and single `GET {{BaseURL}}` templates — run on
+captured traffic: while Passive Scan is on, every response from a host that
+matches a Scope include pattern is checked against the templates you turn on,
+and their findings appear in Findings under `nuclei`. With no Scope includes,
+templates check nothing. Of release v10.5.0's 11,698 HTTP templates, 2,084 can
+run this way.
+
+Templates are data. Code, JavaScript, headless, network, DNS and the other
+non-HTTP templates are listed and never run, and a template that needs anything
+outside the supported subset is shown as unsupported with the reason, never run
+in part. Active scans that send a template's requests are not in this release.
+
+```bash
+sniper-cli templates library status
+sniper-cli templates library download --yes
+sniper-cli templates list --support passive --search wordpress
+sniper-cli templates passive set-enabled --enabled true --tag waf --yes
+```
+
+See [the template contract](docs/integrations/nuclei-templates.md) for what runs
+and where, the supported subset, the API and the CLI.
 
 ## CLI
 
