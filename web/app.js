@@ -16271,9 +16271,10 @@ function applyFuzzerPayloadList(payloads, mode = "append") {
 
 async function importFuzzerPayloadFile(file, mode = "append") {
   if (!file) return;
-  if (file.size > 4 * 1024 * 1024) throw new Error("Payload files cannot exceed 4 MiB.");
+  // Even a rejected replacement selection supersedes an older pending read.
   const generation = (state._fuzzerFileGeneration || 0) + 1;
   state._fuzzerFileGeneration = generation;
+  if (file.size > 4 * 1024 * 1024) throw new Error("Payload files cannot exceed 4 MiB.");
   const sessionId = currentSessionId();
   const draftVersion = state.fuzzerDraftVersion || 0;
   const runToken = state.fuzzerRunToken;

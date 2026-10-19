@@ -182,3 +182,13 @@ test('render enables exact candidates and recomputes safety when source flags ch
   f.c.renderFuzzerSetup();
   assert.equal(nodes.fuzzerCandidateSelect.disabled, true);
 });
+
+for (const outcome of ['success', 'error']) test(`rejected oversized replacement invalidates an earlier pending file ${outcome}`, async () => {
+  const f = fixture(), old = deferred();
+  const pending = f.c.importFuzzerPayloadFile({ size: 1, arrayBuffer: () => old.promise }, 'replace');
+  await assert.rejects(f.c.importFuzzerPayloadFile({ size: 4194305, arrayBuffer: () => { throw new Error('Must not read'); } }, 'replace'), /4 MiB/);
+  if (outcome === 'success') old.resolve(new Uint8Array([97])); else old.reject(new Error('old file read failed'));
+  assert.equal(await pending, false);
+  assert.equal(f.state.fuzzerPayloadsText, 'x');
+  assert.equal(f.saves, 0);
+});
