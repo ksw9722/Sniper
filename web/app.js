@@ -14911,12 +14911,22 @@ function initializeTargetWorkspace() {
     copyText: (text, label, isCurrent = () => true) => copyTextToClipboard(text, { isCurrent })
       .then(() => { if (isCurrent()) showToast(label); })
       .catch(() => { if (isCurrent()) showToast("Failed to copy", "error"); }),
-    sendToReplay: (id) => loadTransactionRecordById(id)
-      .then((record) => {
-        if (!record) throw new Error("The row could not be loaded.");
-        openTransactionRecordInReplay(record);
-      })
-      .catch((error) => showToast(error?.message || "Failed to open Replay", "error")),
+    sendToReplay: (id, isCurrent = () => true) => {
+      const sessionId = currentSessionId(), generation = workspaceStateGeneration;
+      // Dialog openers already invalidate pending Compare reveals. Share that
+      // intent token so opening and closing Settings cannot revive this send.
+      const dialogGeneration = compareLoadGeneration;
+      const ownsAction = () => isCurrent() && state.activeTool === "map"
+        && dialogGeneration === compareLoadGeneration
+        && sessionId === currentSessionId() && generation === workspaceStateGeneration;
+      return loadTransactionRecordById(id, sessionId)
+        .then((record) => {
+          if (!ownsAction()) return;
+          if (record?.id !== id) throw new Error("The row could not be loaded.");
+          openTransactionRecordInReplay(record);
+        })
+        .catch((error) => { if (ownsAction()) showToast(error?.message || "Failed to open Replay", "error"); });
+    },
     // The desktop app hands an external page to the default browser.
     openUrl: (url) => window.open(url, "_blank", "noopener,noreferrer"),
   });

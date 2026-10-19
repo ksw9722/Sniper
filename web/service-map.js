@@ -1435,6 +1435,7 @@
     let htmlGeneratorsAbort = null;
     let parametersAbort = null;
     let apiDocsCopyId = 0;
+    let replayActionId = 0;
     let apiDocsReturnFocus = null;
     let detailRender = null;
     const renderedMarkup = new WeakMap();
@@ -1625,6 +1626,7 @@
           && !(typeof value === "string" && /^reported:[0-9][0-9A-Za-z.+-]{0,39}$/.test(value))) return;
         state.productVersion = value || "";
       }
+      replayActionId += 1;
       // Product filters change membership, never source identity or pending
       // reads. Retain exact catalog anchors and the independent inspector page.
       if (state.snapshot) reconcileEndpointPages();
@@ -2098,6 +2100,7 @@
       state.evidenceId = null;
     }
     function reset() {
+      replayActionId += 1;
       clearOverlay("Temporary body references cleared because the session changed.");
       state.requestId += 1;
       abort?.abort();
@@ -2112,6 +2115,7 @@
     function selectOrigin(origin, endpointIndex = null) {
       const item = findOrigin(origin);
       if (!item || endpointIndex !== null && (!Number.isSafeInteger(endpointIndex) || !item.endpoints[endpointIndex])) return;
+      replayActionId += 1;
       const changedOrigin = state.selectedOrigin !== origin;
       const endpoint = endpointIndex === null ? null : item.endpoints[endpointIndex];
       if (changedOrigin || state.endpointSelection?.method !== endpoint?.method || state.endpointSelection?.path !== endpoint?.path) cancelParameters();
@@ -2145,21 +2149,23 @@
     async function openApiDocs(originId) {
       if (!els.apiDocs) return;
       onApiDocsOpen?.();
+      replayActionId += 1;
+      const sessionId = getSessionId();
       const opening = !state.apiDocs;
       if (opening) apiDocsReturnFocus = doc?.activeElement;
       const requestId = ++state.apiDocsRequestId;
-      state.apiDocs = { origin: originId, document: null, error: "" };
+      state.apiDocs = { origin: originId, sessionId, document: null, error: "" };
       renderApiDocs(opening);
       try {
-        const response = await request(`/api/target/service-map/openapi?${new URLSearchParams({ session_id: getSessionId(), origin: originId })}`);
+        const response = await request(`/api/target/service-map/openapi?${new URLSearchParams({ session_id: sessionId, origin: originId })}`);
         if (!response.ok) throw new Error(response.status === 409 ? "API docs are read from the active session only." : "API docs unavailable.");
         const document = await response.json();
-        if (requestId !== state.apiDocsRequestId) return;
+        if (requestId !== state.apiDocsRequestId || sessionId !== getSessionId()) return;
         if (document?.openapi !== "3.1.0" || document.servers?.[0]?.url !== originId || typeof document.paths !== "object" || !document.paths) throw new Error("API docs unavailable.");
-        state.apiDocs = { origin: originId, document, error: "" };
+        state.apiDocs = { origin: originId, sessionId, document, error: "" };
       } catch (error) {
-        if (requestId !== state.apiDocsRequestId) return;
-        state.apiDocs = { origin: originId, document: null, error: error.message || "API docs unavailable." };
+        if (requestId !== state.apiDocsRequestId || sessionId !== getSessionId()) return;
+        state.apiDocs = { origin: originId, sessionId, document: null, error: error.message || "API docs unavailable." };
       }
       renderApiDocs();
     }
@@ -2167,6 +2173,7 @@
       return !!doc?.activeElement && els.apiDocs?.contains(doc.activeElement) && isActiveModal(els.apiDocs);
     }
     function closeApiDocs(returnFocus = true) {
+      if (state.apiDocs) replayActionId += 1;
       // A pointer press on the non-focusable backdrop can leave body focused
       // before its click dismisses the dialog.
       const restore = returnFocus && state.apiDocs && isActiveModal(els.apiDocs)
@@ -2176,6 +2183,19 @@
       renderApiDocs();
       if (restore) restoreFocus?.(apiDocsReturnFocus);
       apiDocsReturnFocus = null;
+    }
+    function sendApiDocsToReplay(id) {
+      const apiDocs = state.apiDocs;
+      if (!visible || !apiDocs?.document || apiDocs.sessionId !== getSessionId()
+        || !TRANSACTION_ID.test(id) || !Object.values(apiDocs.document.paths).some((path) =>
+          API_DOC_METHODS.some((method) => path?.[method]?.["x-sniper-newest-transaction"] === id))) return;
+      // Sending deliberately closes the document. Capture a separate action
+      // owner afterward so that close permits this read, while newer intent
+      // (including leaving and returning to Map) cannot revive it.
+      closeApiDocs();
+      const actionId = replayActionId;
+      const isCurrent = () => actionId === replayActionId && visible && apiDocs.sessionId === getSessionId();
+      sendToReplay?.(id, isCurrent);
     }
     function copyApiDocs(label) {
       const apiDocs = state.apiDocs, sessionId = getSessionId(), copyId = ++apiDocsCopyId;
@@ -2289,6 +2309,7 @@
       // The app polls every 1.2 seconds. A same-source background snapshot must
       // not erase an explicit inspection or continually abort its pending read.
       if (force) {
+        replayActionId += 1;
         cancelParameters();
         clearOverlay("Temporary body references cleared by Reload. Inspect and show references again when ready.");
         closeApiDocs();
@@ -2562,6 +2583,7 @@
     }
     function setRelationshipKind(kind) {
       if (!["body", "link"].includes(kind) || kind === state.relationshipKind) return false;
+      replayActionId += 1;
       cancelBodyReferences();
       state.relationshipKind = kind;
       renderDetail();
@@ -3056,6 +3078,7 @@
     }
     function setEndpointFilter(kind, value) {
       if (!["method", "path", "clear"].includes(kind)) return;
+      replayActionId += 1;
       if (kind === "clear") { state.endpointMethod = ""; state.endpointPath = ""; }
       else state[kind === "method" ? "endpointMethod" : "endpointPath"] = String(value || "");
       state.page = 0;
@@ -3395,6 +3418,7 @@
     // A site card selects the site; its inspector lists the origins it holds.
     function selectSite(site) {
       if (!state.siteCards?.has(site)) return;
+      replayActionId += 1;
       cancelEvidence();
       cancelParameters();
       Object.assign(state, { selectedSite: site, selectedClient: null, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
@@ -3403,6 +3427,7 @@
     // A client card selects the client; its inspector lists where it sent rows.
     function selectClient(id) {
       if (!clientById(id)) return;
+      replayActionId += 1;
       cancelEvidence();
       cancelParameters();
       Object.assign(state, { selectedClient: id, selectedSite: null, selectedOrigin: null, endpointIndex: null, endpointSelection: null, highlightedRelation: null, selectionInitialized: true });
@@ -3417,6 +3442,7 @@
       selectOrigin(first);
     }
     function handleClick(event) {
+      replayActionId += 1;
       const hit = event.target.closest?.("[data-service-edge]");
       if (hit?.dataset?.serviceEdge !== undefined && els.panel.contains(hit)) return selectEdge(currentLayout?.edges[Number(hit.dataset.serviceEdge)]);
       const button = event.target.closest("button");
@@ -3490,6 +3516,7 @@
       const tab = event.target.closest('[role="tab"][data-service-detail-tab]');
       if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
+      replayActionId += 1;
       state.detailTab = event.key === "Home" ? "apis" : event.key === "End" ? "evidence" : state.detailTab === "apis" ? "evidence" : "apis";
       renderDetail();
       const next = [...els.detail.querySelectorAll('[role="tab"][data-service-detail-tab]')].find((button) => button.dataset.serviceDetailTab === state.detailTab);
@@ -3508,7 +3535,7 @@
         copyApiDocs("Copied OpenAPI; paste it into Swagger Editor");
         openUrl?.(SWAGGER_EDITOR_URL);
       }
-      else if (data.apiDocsReplay) { closeApiDocs(); sendToReplay?.(data.apiDocsReplay); }
+      else if (data.apiDocsReplay) sendApiDocsToReplay(data.apiDocsReplay);
     });
     els.apiDocs?.addEventListener("keydown", (event) => {
       if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || !isActiveModal(els.apiDocs)) return;
@@ -3591,7 +3618,7 @@
     els.allOrigins?.addEventListener("click", () => setMapMode(false));
     els.directRelations?.addEventListener("click", () => setMapMode(true));
     els.focusSelection?.addEventListener("click", focusSelection);
-    els.search.addEventListener("input", () => { state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
+    els.search.addEventListener("input", () => { replayActionId += 1; state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
     els.scope.addEventListener("click", () => {
       state.scopeOnly = !state.scopeOnly;
       els.scope.classList.toggle("active", state.scopeOnly);
@@ -3656,6 +3683,7 @@
         if (visible) render();
       },
       setVisible(value, view = state.view) {
+        if (!value || view !== state.view) replayActionId += 1;
         if (!value) cancelParameters();
         if (!value || view !== "service-map") {
           clearOverlay("Temporary body references cleared because the map was hidden.");
@@ -3671,6 +3699,7 @@
       },
       setViewChange(callback) { onViewChange = callback; },
       disconnect() {
+        replayActionId += 1;
         clearOverlay("Temporary body references cleared because the session event connection was lost.");
         state.requestId += 1;
         state.historyVersion += 1;
@@ -3684,6 +3713,7 @@
         render();
       },
       invalidate() {
+        replayActionId += 1;
         clearOverlay("Temporary body references cleared because history or scope was invalidated.");
         state.requestId += 1;
         state.historyVersion += 1;
