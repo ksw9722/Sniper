@@ -7301,6 +7301,9 @@ async function loadOlderWebsocketFrames() {
     }
     const detail = await response.json();
     if (!isCurrent()) return;
+    if (!detail || typeof detail !== "object" || Array.isArray(detail) || detail.id !== id) {
+      throw new Error("Failed to load older WebSocket frames.");
+    }
     const incomingFrames = normalizeWebsocketFrames(detail.frames)
       .filter((frame) => frame.index < firstLoadedFrameIndex);
     const current = state.selectedWebsocketRecord;

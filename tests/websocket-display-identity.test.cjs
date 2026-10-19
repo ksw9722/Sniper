@@ -55,6 +55,7 @@ function fixture() {
     "clearWebsocketSelectionPreview", "applySelectedWebsocketSummary", "syncVisibleWebsocketSelection",
     "selectedWebsocketDetailMeetsRefreshTarget", "mergeWebsocketDetailRefreshTarget", "scheduleSelectedWebsocketDetailRefresh",
     "adjustWebsocketPagingAfterLocalRemoval", "isKnownCount", "websocketLoadedWindowCanHideSelection",
+    "loadOlderWebsocketFrames", "newestWebsocketFrameIndexes",
   ], {
     els, URLSearchParams, HTTP_HISTORY_PAGE_SIZE: 250, WEBSOCKET_PAGE_SIZE: 100, DEFAULT_HISTORY_COLUMN_ORDER: [],
     createDefaultHistoryColumnWidths: () => ({}), createDefaultWsColumnWidths: () => ({}), DETAIL_LOADING_DELAY_MS: 180,
@@ -69,10 +70,11 @@ function fixture() {
     window: { setTimeout(callback) { const id = ++timerId; timers.set(id, callback); return id; }, clearTimeout(id) { timers.delete(id); } },
     fetch(url, options) {
       assert.equal(options, undefined, "only passive GETs are allowed");
-      assert.match(url, /^\/api\/websockets\/fixture-[abc]\?frame_limit=2&session_id=fixture-session-[ab]$/);
+      assert.match(url, /^\/api\/websockets\/fixture-[abc]\?frame_limit=2&(?:before_index=\d+&)?session_id=fixture-session-[ab]$/);
       const request = { url, ...deferred() }; requests.push(request); return request.promise;
     },
     console: { ...console, error: error => errors.push(error) }, renderWebsocketSessionTable() {},
+    showToast: message => errors.push(message),
     updateCodePaneCM(_key, pane, text) { pane.textContent = text; }, updateWsHandshakeLineNumbers() {}, updateWsHandshakeSearch() {},
     prettyJsonText: text => text, highlightBodyLine: text => text.replaceAll("<", "&lt;"),
     scheduleUiSettingsSave() {}, clearWebsocketQueryBackfill() {}, clearFilteredWebsocketReload() {}, clearWebsocketSearchReload() {},
@@ -95,6 +97,9 @@ function fixture() {
   c.hideFrameDetail(); c.renderWebsocketSessions();
   const click = id => els.websocketTableBody.dispatch("click", { target: rows.get(id) });
   const clickFrame = index => els.websocketFramesBody.dispatch("click", { target: frameRows.get(index) });
+  const clickOlder = () => els.websocketFramesBody.dispatch("click", { target: {
+    closest: selector => selector === "[data-ws-load-older-frames]" ? {} : null,
+  } });
   const succeed = (index, value) => requests[index].resolve({ ok: true, json: async () => value });
   const view = () => JSON.stringify({ selected: state.selectedWebsocketId, record: state.selectedWebsocketRecord,
     error: state.selectedWebsocketDetailError, frame: state.selectedFrameIdx, handshake: els.websocketHandshakeCM.textContent,
@@ -109,7 +114,7 @@ function fixture() {
     vm.runInContext(appSource.slice(resetStart, resetEnd) + "renderWebsocketSessions(); hideFrameDetail();", c);
     state.activeSession = { id: sessionId }; state.websocketSessions = [record("fixture-a"), record("fixture-b")];
   };
-  return { c, state, els, requests, errors, timers, click, clickFrame, succeed, view, reset };
+  return { c, state, els, requests, errors, timers, click, clickFrame, clickOlder, succeed, view, reset };
 }
 
 for (const [label, payload] of [["null", null], ["empty object", {}], ["array", []], ["wrong ID", record("fixture-b")]]) {
@@ -292,5 +297,28 @@ for (const failure of ["network", "HTTP", "JSON"]) {
     f.succeed(2, record("fixture-c")); await tick();
     assert.equal(f.state.selectedWebsocketRecord.id, "fixture-c");
     assert.equal(f.c._websocketDetailLoadingTimer, null);
+  });
+}
+
+for (const [label, payload] of [["null", null], ["empty object", {}], ["array", []],
+  ["wrong ID", record("fixture-b", { frames: [frame(0, "Unrelated frame"), frame(1, "Unrelated frame")] })]]) {
+  test(`${label} older-frame detail preserves the current frame window and remains retryable`, async () => {
+    const f = fixture();
+    const saved = record("fixture-a", { frames: [frame(2), frame(3)], frame_count: 4, retained_frame_count: 4, last_frame_index: 3 });
+    f.state.websocketSessions[0] = saved; f.click("fixture-a"); f.succeed(0, saved); await tick(); f.clickFrame(3);
+    assert.equal(f.state.selectedWebsocketRecord.older_frames_exhausted, false);
+    const beforeBody = f.els.frameDetailBody.innerHTML;
+    f.clickOlder(); assert.equal(f.requests.length, 2); assert.match(f.requests[1].url, /before_index=2/);
+    f.succeed(1, payload); await tick();
+    assert.deepEqual(Array.from(f.state.selectedWebsocketRecord.frames, frame => frame.index), [2, 3]);
+    assert.equal(f.state.selectedWebsocketRecord.older_frames_loading, false);
+    assert.equal(f.state.selectedWebsocketRecord.older_frames_exhausted, false);
+    assert.equal(f.state.selectedFrameIdx, 3); assert.equal(f.els.frameDetailBody.innerHTML, beforeBody);
+    assert.equal(f.els.frameDetailPanel.classList.contains("hidden"), false);
+    assert.ok(f.errors.length > 0, "a malformed page must report a read failure");
+    f.clickOlder(); assert.equal(f.requests.length, 3, "the older page must remain retryable");
+    f.succeed(2, record("fixture-a")); await tick();
+    assert.deepEqual(Array.from(f.state.selectedWebsocketRecord.frames, frame => frame.index), [0, 1, 2, 3]);
+    assert.equal(f.state.selectedFrameIdx, 3); assert.equal(f.els.frameDetailBody.innerHTML, beforeBody);
   });
 }
