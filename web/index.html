@@ -1393,7 +1393,7 @@
               </div>
             </section>
             <section class="panel-card" id="targetPathsPanel" aria-labelledby="targetPathsTitle">
-              <header class="panel-toolbar"><div><p class="placeholder-kicker">Site map</p><h2 id="targetPathsTitle">Captured hosts and paths</h2></div></header>
+              <header class="panel-toolbar"><div><p class="placeholder-kicker">Site map</p><h2 id="targetPathsTitle">Captured and discovered hosts and paths</h2></div></header>
               <div class="target-tree" id="targetTree"></div>
             </section>
           </section>
@@ -1470,12 +1470,13 @@
                 <label class="recon-check"><input id="reconScanConsent" type="checkbox" /><span id="reconScanConsentText">Allow a new urlscan.io scan of this URL with the selected visibility.</span></label>
               </div>
               <details class="recon-limits">
-                <summary>Discovery limits</summary>
+                <summary>Optional discovery budgets</summary>
+                <p class="recon-help">0 means no configured limit. Large collections use more memory and disk space; use Stop to cancel.</p>
                 <div class="recon-limit-fields">
-                  <label class="recon-field" for="reconMaxRequests">Crawler requests<input id="reconMaxRequests" type="number" min="1" max="1000" value="100" required /></label>
-                  <label class="recon-field" for="reconMaxDepth">Crawl depth<input id="reconMaxDepth" type="number" min="0" max="10" value="3" required /></label>
-                  <label class="recon-field" for="reconMaxEndpoints">Endpoints<input id="reconMaxEndpoints" type="number" min="1" max="5000" value="5000" required /></label>
-                  <label class="recon-field" for="reconMaxPages">History pages per source<input id="reconMaxPages" type="number" min="1" max="20" value="5" required /></label>
+                  <label class="recon-field" for="reconMaxRequests">Crawler requests<input id="reconMaxRequests" type="number" min="0" step="1" value="0" /></label>
+                  <label class="recon-field" for="reconMaxDepth">Crawl depth<input id="reconMaxDepth" type="number" min="0" step="1" value="0" /></label>
+                  <label class="recon-field" for="reconMaxEndpoints">Endpoints<input id="reconMaxEndpoints" type="number" min="0" step="1" value="0" /></label>
+                  <label class="recon-field" for="reconMaxPages">History pages per source<input id="reconMaxPages" type="number" min="0" step="1" value="0" /></label>
                 </div>
               </details>
               <p class="recon-notice hidden" id="reconActionStatus" role="status" aria-live="polite"></p>
