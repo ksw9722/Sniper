@@ -44,11 +44,12 @@ The shared CodeMirror HTTP text view enables previews in:
 - HTTP Intercept request and response
 - Findings request and response detail
 - Fuzzer request and captured-result request/response detail
-- WebSocket HTTP handshake text
+- WebSocket History HTTP handshake text
 
 Hex, diff and rendered-response views are excluded. WebSocket frame viewers,
-legacy plain-text/textarea fallbacks, Map/Recon custom views, and Decoder tool
-inputs are not covered by this feature.
+WebSocket Replay's handshake-header textarea, legacy plain-text/textarea
+fallbacks, Map/Recon custom views, and Decoder tool inputs are not covered
+by this feature.
 
 Decoded strings are inserted using `textContent`, never HTML. The feature does
 not edit the source, add undo entries, alter captured bytes, send requests,
