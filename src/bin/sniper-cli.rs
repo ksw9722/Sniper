@@ -497,6 +497,74 @@ enum TemplatesCommand {
         #[command(subcommand)]
         command: TemplatesPassiveCommand,
     },
+    /// Send templates to targets you name, when you ask: Template Scan.
+    Scan {
+        #[command(subcommand)]
+        command: TemplatesScanCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TemplatesScanCommand {
+    /// Count the templates and requests a scan would send; sends nothing.
+    Preview(TemplatesScanArgs),
+    /// Send each selected template's requests to each target.
+    Start(TemplatesScanArgs),
+    /// The session's scans, newest first, without their results.
+    List(TemplatesScanSessionArgs),
+    /// One scan with its results and its latest requests.
+    Get(TemplatesScanIdArgs),
+    /// Stop the running scan.
+    Stop(TemplatesScanIdArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct TemplatesScanArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// An http(s) origin, optionally with a path; repeat for up to 20. Its
+    /// host must be in Scope.
+    #[arg(long = "target", required = true)]
+    targets: Vec<String>,
+    /// A template id; repeat for several. Not with a filter.
+    #[arg(long = "id")]
+    ids: Vec<String>,
+    #[command(flatten)]
+    filter: TemplatesFilterArgs,
+    /// A risk to allow by name: intrusive, default-login, bruteforce,
+    /// token-spray, credential-stuffing, fuzz, fuzzing, dast, osint,
+    /// method:put, method:delete or method:patch. Repeat for several;
+    /// templates with any other risk are left out, and dos never runs.
+    #[arg(long = "allow-risk")]
+    allow_risks: Vec<String>,
+    /// Requests a second across the scan.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=50))]
+    rate: u64,
+    /// Templates in flight at once.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=8))]
+    concurrency: u64,
+    /// The most requests the scan sends, redirects included.
+    #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..=50_000))]
+    max_requests: u64,
+    /// Apply this session's Match & Replace rules to the requests; one a rule
+    /// would send elsewhere is not sent.
+    #[arg(long)]
+    apply_match_replace: bool,
+}
+
+#[derive(Args, Debug)]
+struct TemplatesScanSessionArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+}
+
+#[derive(Args, Debug)]
+struct TemplatesScanIdArgs {
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Scan id, as `templates scan list` shows it.
+    #[arg(long)]
+    id: Uuid,
 }
 
 #[derive(Subcommand, Debug)]
@@ -589,6 +657,13 @@ impl TemplatesCommand {
             Self::List(_) => "templates.list",
             Self::Get(_) => "templates.get",
             Self::Passive { .. } => "templates.passive.set_enabled",
+            Self::Scan { command } => match command {
+                TemplatesScanCommand::Preview(_) => "templates.scan.preview",
+                TemplatesScanCommand::Start(_) => "templates.scan.start",
+                TemplatesScanCommand::List(_) => "templates.scan.list",
+                TemplatesScanCommand::Get(_) => "templates.scan.get",
+                TemplatesScanCommand::Stop(_) => "templates.scan.stop",
+            },
         }
     }
 }
@@ -655,6 +730,56 @@ fn templates_passive_body(args: &TemplatesPassiveArgs) -> Result<Value> {
     })
 }
 
+/// A scan request: exactly one of ids or a filter, as the server takes it.
+/// A preview sends nothing; a start carries the operator's acknowledgment,
+/// which `--yes` gave.
+fn templates_scan_body(
+    args: &TemplatesScanArgs,
+    session_id: Option<Uuid>,
+    preview: bool,
+) -> Result<Value> {
+    let filter = templates_filter_json(&args.filter);
+    if args.ids.is_empty() == filter.is_empty() {
+        bail!("give template ids or a filter (--search, --severity, --tag); exactly one");
+    }
+    if let Some(id) = args.ids.iter().find(|id| !valid_template_id(id)) {
+        bail!("`{id}` is not a template id");
+    }
+    let mut body = json!({
+        "session_id": session_id,
+        "targets": args.targets,
+        "allow_risks": args.allow_risks,
+        "rate": args.rate,
+        "concurrency": args.concurrency,
+        "max_requests": args.max_requests,
+        "apply_match_replace": args.apply_match_replace,
+    });
+    if args.ids.is_empty() {
+        body["filter"] = Value::Object(filter);
+    } else {
+        body["ids"] = json!(args.ids);
+    }
+    body[if preview { "preview" } else { "acknowledged" }] = json!(true);
+    Ok(body)
+}
+
+fn templates_scan_input(args: &TemplatesScanArgs) -> Value {
+    let mut input = templates_filter_json(&args.filter);
+    for (key, value) in [
+        ("session_id", json!(args.session_id)),
+        ("targets", json!(args.targets)),
+        ("ids", json!(args.ids)),
+        ("allow_risks", json!(args.allow_risks)),
+        ("rate", json!(args.rate)),
+        ("concurrency", json!(args.concurrency)),
+        ("max_requests", json!(args.max_requests)),
+        ("apply_match_replace", json!(args.apply_match_replace)),
+    ] {
+        input.insert(key.into(), value);
+    }
+    Value::Object(input)
+}
+
 fn templates_input_preview(command: &TemplatesCommand) -> Value {
     match command {
         TemplatesCommand::Library {
@@ -680,6 +805,15 @@ fn templates_input_preview(command: &TemplatesCommand) -> Value {
             input.insert("all".into(), json!(args.all));
             Value::Object(input)
         }
+        TemplatesCommand::Scan { command } => match command {
+            TemplatesScanCommand::Preview(args) | TemplatesScanCommand::Start(args) => {
+                templates_scan_input(args)
+            }
+            TemplatesScanCommand::List(args) => json!({ "session_id": args.session_id }),
+            TemplatesScanCommand::Get(args) | TemplatesScanCommand::Stop(args) => {
+                json!({ "session_id": args.session_id, "id": args.id })
+            }
+        },
     }
 }
 
@@ -712,6 +846,36 @@ fn templates_api_preview(command: &TemplatesCommand) -> Value {
             "/api/templates/passive",
             templates_passive_body(args).ok(),
         ),
+        TemplatesCommand::Scan { command } => match command {
+            TemplatesScanCommand::Preview(args) => api_preview(
+                "POST",
+                "/api/templates/scans",
+                templates_scan_body(args, args.session_id, true).ok(),
+            ),
+            TemplatesScanCommand::Start(args) => api_preview(
+                "POST",
+                "/api/templates/scans",
+                templates_scan_body(args, args.session_id, false).ok(),
+            ),
+            TemplatesScanCommand::List(args) => api_preview(
+                "GET",
+                session_query_path("/api/templates/scans", args.session_id),
+                None,
+            ),
+            TemplatesScanCommand::Get(args) => api_preview(
+                "GET",
+                session_query_path(
+                    &format!("/api/templates/scans/{}", args.id),
+                    args.session_id,
+                ),
+                None,
+            ),
+            TemplatesScanCommand::Stop(args) => api_preview(
+                "POST",
+                format!("/api/templates/scans/{}/stop", args.id),
+                Some(json!({ "session_id": args.session_id })),
+            ),
+        },
     }
 }
 
@@ -3624,6 +3788,51 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             vec![json!({"ids":["tech-detect"],"enabled":true}), json!({"tag":"waf","enabled":false})],
         ),
         op(
+            "templates.scan.preview",
+            "templates scan preview --target <url>",
+            "Count what a Template Scan would send: the templates selected by ids or a filter that can run actively, the requests they make before any redirect, and the templates left out by risk. Checks every target is an http(s) origin in a non-empty Scope include list and not Sniper itself. Sends nothing.",
+            Read,
+            false,
+            &["targets"],
+            vec![json!({"targets":["https://app.example.com"],"severity":"high,critical"}), json!({"targets":["https://app.example.com"],"ids":["git-config"]})],
+        ),
+        op(
+            "templates.scan.start",
+            "templates scan start --target <url>",
+            "Send each selected template's requests to each target, paced and bounded, and keep in HTTP history only the exchanges a template matched; their findings appear under category nuclei as nuclei:<template-id>. Redirects are followed only while they stay in Scope. Templates with risk tags or PUT, DELETE or PATCH are left out unless allowed; dos never runs. Returns once the scan starts; read it with templates scan get.",
+            Write,
+            true,
+            &["targets"],
+            vec![json!({"targets":["https://app.example.com"],"severity":"high,critical","rate":5})],
+        ),
+        op(
+            "templates.scan.list",
+            "templates scan list",
+            "List the session's Template Scan jobs, newest first: status, targets, counts of planned, sent, failed, blocked and matched requests, warnings. Results and the request log are left out; templates scan get has them.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "templates.scan.get",
+            "templates scan get --id <uuid>",
+            "Read one Template Scan job with its results (each naming the matched history record) and its latest 200 requests with status, time and errors.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
+            "templates.scan.stop",
+            "templates scan stop --id <uuid>",
+            "Stop the session's running Template Scan. Requests in flight are dropped; matches already stored stay.",
+            Write,
+            true,
+            &["id"],
+            vec![json!({"id":"22222222-2222-2222-2222-222222222222"})],
+        ),
+        op(
             "capture.http.list",
             "capture http list",
             "List captured HTTP transactions.",
@@ -5471,6 +5680,32 @@ fn templates_input_schema(operation: &str) -> Option<Value> {
             "type":"object","additionalProperties":false,"required":["id"],
             "properties":{"id":{"type":"string","minLength":1,"maxLength":200,"pattern":"^([a-zA-Z0-9]+[-_])*[a-zA-Z0-9]+$","description":"Template id."}}
         }),
+        "templates.scan.preview" | "templates.scan.start" => {
+            let mut properties = filter;
+            properties["session_id"] = legacy_uuid_input_schema(
+                true,
+                "The session to scan in; omitted or null selects the active session.",
+            );
+            properties["targets"] = json!({"type":"array","minItems":1,"maxItems":20,"items":{"type":"string","minLength":1,"maxLength":2048},"description":"http(s) origins, optionally with a path, without credentials, query or fragment; each host must be in a non-empty Scope include list."});
+            properties["ids"] = json!({"type":["array","null"],"items":{"type":"string","pattern":"^([a-zA-Z0-9]+[-_])*[a-zA-Z0-9]+$"},"maxItems":30000,"description":"Template ids. Exactly one of ids or a filter (search, severity, tag)."});
+            properties["allow_risks"] = json!({"type":["array","null"],"items":{"type":"string","enum":["intrusive","default-login","bruteforce","token-spray","credential-stuffing","fuzz","fuzzing","dast","osint","method:put","method:delete","method:patch"]},"description":"Risks to allow by name; templates with any other risk are left out. dos never runs."});
+            properties["rate"] = json!({"type":["integer","null"],"minimum":1,"maximum":50,"default":10,"description":"Requests a second across the scan. Null uses 10."});
+            properties["concurrency"] = json!({"type":["integer","null"],"minimum":1,"maximum":8,"default":4,"description":"Templates in flight at once. Null uses 4."});
+            properties["max_requests"] = json!({"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"The most requests the scan sends, redirects included. Null uses 10000."});
+            properties["apply_match_replace"] = json!({"type":["boolean","null"],"default":false,"description":"Apply the session's Match & Replace rules; a request a rule would send elsewhere is not sent."});
+            json!({"type":"object","additionalProperties":false,"required":["targets"],"properties":properties})
+        }
+        "templates.scan.list" => json!({
+            "type":"object","additionalProperties":false,"required":[],
+            "properties":{"session_id":legacy_uuid_input_schema(true, "Omitted or null selects the active session.")}
+        }),
+        "templates.scan.get" | "templates.scan.stop" => json!({
+            "type":"object","additionalProperties":false,"required":["id"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(true, "Omitted or null selects the active session."),
+                "id":legacy_uuid_input_schema(false, "Scan id.")
+            }
+        }),
         "templates.passive.set_enabled" => {
             let mut properties = filter;
             properties["enabled"] = json!({"type":"boolean","description":"Turn the selected templates on (true) or off (false)."});
@@ -6251,6 +6486,21 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         ],
         "templates.get" => &["id"],
         "templates.passive.set_enabled" => &["enabled", "ids", "search", "severity", "tag", "all"],
+        "templates.scan.preview" | "templates.scan.start" => &[
+            "session_id",
+            "targets",
+            "ids",
+            "search",
+            "severity",
+            "tag",
+            "allow_risks",
+            "rate",
+            "concurrency",
+            "max_requests",
+            "apply_match_replace",
+        ],
+        "templates.scan.list" => &["session_id"],
+        "templates.scan.get" | "templates.scan.stop" => &["session_id", "id"],
         "capture.browser.list" => &[],
         "capture.browser.open" => &["browser", "url", "fresh", "agent"],
         "capture.browser.prefer" => &["browser"],
@@ -7599,6 +7849,7 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
         "templates.library.check" | "templates.library.download" => notes.push("Contacts GitHub through the environment's proxy: the latest-release API, then for a download the release's checksums file and source .tar.gz. A download that does not match the published SHA-256 is not installed. Dry-run contacts nothing."),
         "templates.library.import" => notes.push("Reads the local .tar.gz and uploads it to the running Sniper, which installs it; nothing contacts GitHub. Dry-run reads nothing."),
         "templates.passive.set_enabled" => notes.push("Enabled passive templates judge captured responses whose host is in a non-empty Scope include list while Passive Scan is on, and never send requests. Run findings rescan to apply a change to stored history."),
+        "templates.scan.start" => notes.push("Sends the templates' requests to the targets once it runs. Dry-run contacts nothing; templates scan preview asks Sniper what would be sent and still sends nothing to a target."),
         _ => {}
     }
     notes
@@ -8058,6 +8309,56 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 command: TemplatesCommand::Passive {
                     command: TemplatesPassiveCommand::SetEnabled(args),
                 },
+            }
+        }
+        "templates.scan.preview" | "templates.scan.start" => {
+            let bounded = |field: &str, default: u64, max: u64| -> Result<u64> {
+                let value = call_optional::<u64>(operation, input, field)?.unwrap_or(default);
+                if !(1..=max).contains(&value) {
+                    bail!("invalid field `{field}` for `{operation}`; expected 1 to {max}");
+                }
+                Ok(value)
+            };
+            let args = TemplatesScanArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                targets: call_required(operation, input, "targets")?,
+                ids: call_optional(operation, input, "ids")?.unwrap_or_default(),
+                filter: call_templates_filter(operation, input)?,
+                allow_risks: call_optional(operation, input, "allow_risks")?.unwrap_or_default(),
+                rate: bounded("rate", 10, 50)?,
+                concurrency: bounded("concurrency", 4, 8)?,
+                max_requests: bounded("max_requests", 10_000, 50_000)?,
+                apply_match_replace: call_bool(operation, input, "apply_match_replace")?,
+            };
+            templates_scan_body(&args, None, true)?;
+            let command = if operation == "templates.scan.preview" {
+                TemplatesScanCommand::Preview(args)
+            } else {
+                TemplatesScanCommand::Start(args)
+            };
+            Command::Templates {
+                command: TemplatesCommand::Scan { command },
+            }
+        }
+        "templates.scan.list" => Command::Templates {
+            command: TemplatesCommand::Scan {
+                command: TemplatesScanCommand::List(TemplatesScanSessionArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                }),
+            },
+        },
+        "templates.scan.get" | "templates.scan.stop" => {
+            let args = TemplatesScanIdArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                id: call_required(operation, input, "id")?,
+            };
+            let command = if operation == "templates.scan.get" {
+                TemplatesScanCommand::Get(args)
+            } else {
+                TemplatesScanCommand::Stop(args)
+            };
+            Command::Templates {
+                command: TemplatesCommand::Scan { command },
             }
         }
         "findings.list" => Command::Findings {
@@ -9951,6 +10252,52 @@ async fn handle_templates(api: ApiClient, command: TemplatesCommand) -> Result<(
             let body = templates_passive_body(&args)?;
             let saved: Value = api.post_json("/api/templates/passive", &body).await?;
             print_json(&saved)
+        }
+        TemplatesCommand::Scan { command } => {
+            let explicit = match &command {
+                TemplatesScanCommand::Preview(args) | TemplatesScanCommand::Start(args) => {
+                    args.session_id
+                }
+                TemplatesScanCommand::List(args) => args.session_id,
+                TemplatesScanCommand::Get(args) | TemplatesScanCommand::Stop(args) => {
+                    args.session_id
+                }
+            };
+            let session_id = resolve_session_id_arg(&api, explicit)
+                .await?
+                .ok_or_else(|| anyhow!("no session; pass --session-id"))?;
+            let result: Value = match command {
+                TemplatesScanCommand::Preview(args) => {
+                    let body = templates_scan_body(&args, Some(session_id), true)?;
+                    api.post_json("/api/templates/scans", &body).await?
+                }
+                TemplatesScanCommand::Start(args) => {
+                    let body = templates_scan_body(&args, Some(session_id), false)?;
+                    api.post_json("/api/templates/scans", &body).await?
+                }
+                TemplatesScanCommand::List(_) => {
+                    api.get_json(&session_query_path(
+                        "/api/templates/scans",
+                        Some(session_id),
+                    ))
+                    .await?
+                }
+                TemplatesScanCommand::Get(args) => {
+                    api.get_json(&session_query_path(
+                        &format!("/api/templates/scans/{}", args.id),
+                        Some(session_id),
+                    ))
+                    .await?
+                }
+                TemplatesScanCommand::Stop(args) => {
+                    api.post_json(
+                        &format!("/api/templates/scans/{}/stop", args.id),
+                        &json!({ "session_id": session_id }),
+                    )
+                    .await?
+                }
+            };
+            print_json(&result)
         }
     }
 }
@@ -20903,6 +21250,75 @@ mod tests {
         assert!(super::dry_run_notes(&download)
             .iter()
             .any(|note| note.contains("Contacts GitHub")));
+    }
+
+    // A scan names its targets and exactly one selection; starting one is a
+    // confirmed write, and the body the server gets carries that confirmation.
+    #[test]
+    fn template_scans_need_targets_one_selection_and_confirmation() {
+        let scan = |operation: &str, input: Value| command_from_operation_input(operation, &input);
+        let target = json!(["https://app.example.com"]);
+        assert!(scan("templates.scan.start", json!({"ids":["git-config"]})).is_err());
+        assert!(scan("templates.scan.start", json!({"targets":target})).is_err());
+        assert!(scan(
+            "templates.scan.start",
+            json!({"targets":target,"ids":["git-config"],"tag":"cve"})
+        )
+        .is_err());
+        assert!(scan(
+            "templates.scan.start",
+            json!({"targets":target,"ids":["git-config"],"rate":51})
+        )
+        .is_err());
+        let start = scan(
+            "templates.scan.start",
+            json!({"targets":target,"severity":"high","allow_risks":["intrusive"]}),
+        )
+        .unwrap();
+        assert!(start.requires_confirmation());
+        assert_eq!(
+            super::command_api_preview(&start).unwrap()["body"],
+            json!({
+                "session_id":null,"targets":["https://app.example.com"],"allow_risks":["intrusive"],
+                "rate":10,"concurrency":4,"max_requests":10000,"apply_match_replace":false,
+                "filter":{"severity":"high"},"acknowledged":true
+            })
+        );
+        let preview = scan(
+            "templates.scan.preview",
+            json!({"targets":target,"ids":["git-config"]}),
+        )
+        .unwrap();
+        assert!(!preview.requires_confirmation());
+        assert_eq!(
+            super::command_api_preview(&preview).unwrap()["body"]["preview"],
+            json!(true)
+        );
+        let id = "22222222-2222-2222-2222-222222222222";
+        let stop = scan("templates.scan.stop", json!({"id":id})).unwrap();
+        assert!(stop.requires_confirmation());
+        assert_eq!(
+            super::command_api_preview(&stop).unwrap()["path"],
+            format!("/api/templates/scans/{id}/stop")
+        );
+        let direct = Cli::try_parse_from([
+            "sniper-cli",
+            "templates",
+            "scan",
+            "start",
+            "--target",
+            "https://app.example.com",
+            "--id",
+            "git-config",
+            "--allow-risk",
+            "method:put",
+        ])
+        .unwrap()
+        .command;
+        assert_eq!(direct.operation_name(), "templates.scan.start");
+        assert!(
+            Cli::try_parse_from(["sniper-cli", "templates", "scan", "start", "--id", "x"]).is_err()
+        );
     }
 
     // The desktop map reads every retained row; the CLI can too, without a
