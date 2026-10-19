@@ -70,6 +70,12 @@ function utf8StringToByteString(value) {
   return CryptoJS.enc.Latin1.stringify(CryptoJS.enc.Utf8.parse(value));
 }
 
+function parseDecoderTime(input) {
+  // Unix output may be negative or fractional; leave all other date syntax alone.
+  var unix = /^[+-]?\d+(?:\.\d+)?$/.exec(input);
+  return new Date(unix && unix[0] === input ? 1000 * Number(input) : input);
+}
+
 var hasher = {
   ipcalc : new ipCalc(),
   tab : tabs.encode,
@@ -518,12 +524,7 @@ var hasher = {
       tab : tabs.time,
       title: "Unixtime",
       calculate: function (input) {
-        var date;
-        if (/[^\d]/.test(input)) {
-          date = new Date(input);
-        } else {
-          date = new Date(1000*parseInt(input));
-        }
+        var date = parseDecoderTime(input);
         if (!isNaN(date.getTime())) {
           return date.getTime()/1000;
         }
@@ -535,12 +536,7 @@ var hasher = {
       tab : tabs.time,
       title: "Local time",
       calculate: function (input) {
-        var date;
-        if (/[^\d]/.test(input)) {
-          date = new Date(input);
-        } else {
-          date = new Date(1000*parseInt(input));
-        }
+        var date = parseDecoderTime(input);
         if (!isNaN(date.getTime())) {
           return date.toLocaleString();
         }
@@ -552,12 +548,7 @@ var hasher = {
       tab : tabs.time,
       title: "DATETIME (local)",
       calculate: function (input) {
-        var ddd;
-        if (/[^\d]/.test(input)) {
-          ddd = new Date(input);
-        } else {
-          ddd = new Date(1000*parseInt(input));
-        }
+        var ddd = parseDecoderTime(input);
         if (!isNaN(ddd.getTime())) {
           var y = ddd.getFullYear();
           var m = ddd.getMonth() + 1;
@@ -582,12 +573,7 @@ var hasher = {
       tab : tabs.time,
       title: "DATETIME (UTC)",
       calculate: function (input) {
-        var ddd;
-        if (/[^\d]/.test(input)) {
-          ddd = new Date(input);
-        } else {
-          ddd = new Date(1000*parseInt(input));
-        }
+        var ddd = parseDecoderTime(input);
         if (!isNaN(ddd.getTime())) {
           var y = ddd.getUTCFullYear();
           var m = ddd.getUTCMonth() + 1;
@@ -612,12 +598,7 @@ var hasher = {
       tab : tabs.time,
       title: "RFC-1123",
       calculate: function (input) {
-        var date;
-        if (/[^\d]/.test(input)) {
-          date = new Date(input);
-        } else {
-          date = new Date(1000*parseInt(input));
-        }
+        var date = parseDecoderTime(input);
         if (!isNaN(date.getTime())) {
           return date.toUTCString();
         }
@@ -629,12 +610,7 @@ var hasher = {
       tab : tabs.time,
       title: "ISO 8601",
       calculate: function (input) {
-        var date;
-        if (/[^\d]/.test(input)) {
-          date = new Date(input);
-        } else {
-          date = new Date(1000*parseInt(input));
-        }
+        var date = parseDecoderTime(input);
         if (!isNaN(date.getTime())) {
           return date.toISOString();
         }
