@@ -1958,24 +1958,8 @@ function bindEvents() {
             return sendRecordToSequence(record);
           })
           .catch(handleSendActionError);
-      } else if (action.startsWith("copy-response-")) {
-        loadMenuTargetRecord(target)
-          .then((record) => {
-            if (!record) throw new Error("Selected transaction could not be loaded.");
-            return copyResponseContentForRecord(record, action.replace("copy-", ""));
-          })
-          .catch(handleClipboardActionError);
-      }
-      else if (action.startsWith("copy-as-")) {
-        const fmt = action.replace("copy-as-", "");
-        loadMenuTargetRecord(target)
-          .then((record) => {
-            if (!record) throw new Error("Selected transaction could not be loaded.");
-            const text = recordToFormat(record, fmt);
-            if (!text) return null;
-            return copyTextToClipboard(text).then(() => showToast(`Copied as ${fmt}`));
-          })
-          .catch(handleClipboardActionError);
+      } else if (action.startsWith("copy-response-") || action.startsWith("copy-as-")) {
+        copyMenuTargetRecord(target, action);
       }
     });
   }
@@ -5025,6 +5009,7 @@ async function cleanupWsReplayTabsBeforeStateReset(options = {}) {
 
 function resetSessionScopedUiState() {
   workspaceStateGeneration += 1;
+  state._recordClipboardSessionGeneration = (state._recordClipboardSessionGeneration || 0) + 1;
   if (typeof reconController !== "undefined") reconController?.reset();
   state.historyRetentionSettings = null;
   state.upstreamPeerSettings = null;
@@ -5971,6 +5956,7 @@ function createTransactionRecordMenuTarget(id, sessionId = currentSessionId()) {
     record: state.selectedRecord?.id === id ? state.selectedRecord : null,
     loadPromise: null,
     loadError: null,
+    clipboardSessionGeneration: state._recordClipboardSessionGeneration || 0,
   };
   if (!target.record) {
     target.loadPromise = loadTransactionRecordById(id, sessionId)
@@ -6006,20 +5992,51 @@ function transactionUrlFromSource(source) {
   return buildUrlFromTarget(scheme, host, "", path);
 }
 
+function createRecordClipboardOwner(sessionId = currentSessionId(), generation = state._recordClipboardSessionGeneration || 0) {
+  // Choosing another row or hydrating the same workspace does not abandon an
+  // explicit copy. A session reset does, even after switching away and back.
+  return () => sessionId === currentSessionId()
+    && generation === (state._recordClipboardSessionGeneration || 0);
+}
+
+async function copyMenuTargetRecord(target, action) {
+  if (!target?.id) return;
+  const isCurrent = createRecordClipboardOwner(target.sessionId, target.clipboardSessionGeneration);
+  if (!isCurrent()) return;
+  try {
+    const record = await loadMenuTargetRecord(target);
+    if (!isCurrent()) return;
+    if (!record) throw new Error("Selected transaction could not be loaded.");
+    if (action.startsWith("copy-response-")) {
+      await copyResponseContentForRecord(record, action.replace("copy-", ""), { isCurrent });
+      return;
+    }
+    const format = action.replace("copy-as-", "");
+    const text = recordToFormat(record, format);
+    if (!text) return;
+    await copyTextToClipboard(text, { isCurrent });
+    if (isCurrent()) showToast(`Copied as ${format}`);
+  } catch (error) {
+    if (isCurrent()) handleClipboardActionError(error);
+  }
+}
+
 function copyMenuTargetUrl(target) {
   if (!target?.id || target.sessionId !== currentSessionId()) {
     showToast("The selected session changed. Open the menu again.", "error");
     return;
   }
+  const isCurrent = createRecordClipboardOwner(target.sessionId, target.clipboardSessionGeneration);
+  if (!isCurrent()) return;
   const source = target.record || getHistoryItem(target.id);
   const url = transactionUrlFromSource(source);
   if (!url) {
     showToast("Selected transaction could not be loaded.", "error");
     return;
   }
-  copyTextToClipboard(url)
-    .then(() => showToast("Copied URL"))
-    .catch(() => showToast("Failed to copy", "error"));
+  copyTextToClipboard(url, { isCurrent })
+    .then(() => { if (isCurrent()) showToast("Copied URL"); })
+    .catch(() => { if (isCurrent()) showToast("Failed to copy", "error"); });
 }
 
 async function loadIntercepts(preserveSelection = true) {
@@ -27381,15 +27398,7 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
     } else if (action === "copy-url") {
       copyMenuTargetUrl(target);
     } else if (action?.startsWith("copy-as-")) {
-      const format = action.replace("copy-as-", "");
-      loadTargetRecord()
-        .then((record) => {
-          if (!record) throw new Error("Selected transaction could not be loaded.");
-          const text = recordToFormat(record, format);
-          if (!text) return null;
-          return copyTextToClipboard(text).then(() => showToast(`Copied as ${format}`));
-        })
-        .catch(handleClipboardActionError);
+      copyMenuTargetRecord(target, action);
     } else if (action === "compare-set-base") {
       setCompareBase(targetId);
     } else if (action === "compare-with-base") {
@@ -27910,8 +27919,8 @@ function copyResponseContent(format) {
   copyResponseContentForRecord(record, format);
 }
 
-function copyResponseContentForRecord(record, format) {
-  if (!record?.response) return;
+function copyResponseContentForRecord(record, format, { isCurrent = () => true } = {}) {
+  if (!record?.response || !isCurrent()) return;
   let text = "";
   if (format === "response-headers") {
     text = `${buildRawResponseHead(record).replace(/\n/g, "\r\n")}\r\n`;
@@ -27932,9 +27941,9 @@ function copyResponseContentForRecord(record, format) {
       : format === "response-body"
         ? "Copied body"
         : "Copied raw response";
-  return copyTextToClipboard(text)
-    .then(() => showToast(label))
-    .catch(() => showToast("Failed to copy", "error"));
+  return copyTextToClipboard(text, { isCurrent })
+    .then(() => { if (isCurrent()) showToast(label); })
+    .catch(() => { if (isCurrent()) showToast("Failed to copy", "error"); });
 }
 
 // Synchronous version using already-loaded selectedRecord (preserves user gesture for clipboard)
