@@ -8,7 +8,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const raw = 'POST /items?id=one&id=two%2Fthree HTTP/1.0\r\nHost: example.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\na=1';
 const parserNames = ['parseFuzzerRequestTemplate', 'parseEditableRawRequest', 'splitRawHttpMessage', 'editableRequestBodyLength', 'decodedBase64Length', 'parseReplayHttpVersionToken', 'normalizeReplayHttpVersion', 'headerValue', 'headerNameEquals', 'normalizedHeaders', 'validateRawHttpBodyFraming', 'buildEditableRawRequest', 'mergeHeaders', 'httpRequestAuthoritiesEquivalent', 'normalizeHttpRequestAuthority', 'createDefaultEditableRequest'];
-const names = [...parserNames, 'renderFuzzerSetup', 'fuzzerSetupNode', 'escapeHtml', 'fuzzerRequestTextForAction', 'fuzzerRawOffsetForEditorOffset', 'splitFuzzerPayloadLines', 'fuzzerPayloadCount', 'fuzzerPayloadTextWithinLimits', 'fuzzerSetupPreflight', 'markFuzzerPosition', 'markFuzzerEditorSelection', 'undoFuzzerMarker', 'applyFuzzerPayloadList', 'importFuzzerPayloadFile', 'updateFuzzerRequestText', 'updateFuzzerPayloadsText', 'markFuzzerDraftChanged', 'invalidateFuzzerRun', 'openFuzzerFromRecord', 'openFuzzerFromReplay', 'runFuzzerAttack', 'isCurrentFuzzerRun', 'replayHttpVersionFromText'];
+const names = [...parserNames, 'renderFuzzerSetup', 'fuzzerSetupNode', 'escapeHtml', 'initFuzzerSetupControls', 'fuzzerRequestTextForAction', 'fuzzerRawOffsetForEditorOffset', 'splitFuzzerPayloadLines', 'fuzzerPayloadCount', 'fuzzerPayloadTextWithinLimits', 'fuzzerSetupPreflight', 'markFuzzerPosition', 'markFuzzerEditorSelection', 'undoFuzzerMarker', 'applyFuzzerPayloadList', 'importFuzzerPayloadFile', 'updateFuzzerRequestText', 'updateFuzzerPayloadsText', 'markFuzzerDraftChanged', 'invalidateFuzzerRun', 'openFuzzerFromRecord', 'openFuzzerFromReplay', 'runFuzzerAttack', 'isCurrentFuzzerRun', 'replayHttpVersionFromText'];
 function fixture() {
   const state = { activeSession: { id: 'session-a' }, fuzzerBaseRequest: { scheme: 'https', host: 'example.com', method: 'POST', path: '/items', body: 'a=1', body_encoding: 'utf8', preview_truncated: false }, fuzzerRequestText: raw, fuzzerPayloadsText: 'x', fuzzerDraftVersion: 0, fuzzerRunToken: 0, fuzzerRunning: false, fuzzerSourceTransactionId: 'source-a' };
   const els = { fuzzerPayloadsEditor: { value: 'x' } };
@@ -173,7 +173,7 @@ test('render enables exact candidates and recomputes safety when source flags ch
   f.c.renderFuzzerSetup();
   assert.equal(nodes.fuzzerCandidateSelect.disabled, false);
   assert.equal(nodes.fuzzerCandidateSelect._fuzzerCandidates.length, 3);
-  assert.match(nodes.fuzzerPreflightSummary.textContent, /1 payload\(s\).*1 planned request\(s\).*0 marker\(s\)/);
+  assert.match(nodes.fuzzerPreflightSummary.textContent, /1 payload.*1 planned request.*0 positions/);
   f.state.fuzzerBaseRequest.preview_truncated = true;
   f.c.renderFuzzerSetup();
   assert.equal(nodes.fuzzerCandidateSelect._fuzzerCandidates.length, 2);
@@ -191,4 +191,45 @@ for (const outcome of ['success', 'error']) test(`rejected oversized replacement
   assert.equal(await pending, false);
   assert.equal(f.state.fuzzerPayloadsText, 'x');
   assert.equal(f.saves, 0);
+});
+
+function setupNodes(f) {
+  const ids = ['fuzzerPreflightSummary', 'fuzzerPreflightNotice', 'fuzzerPreviewSamples', 'fuzzerPreviewNotes', 'fuzzerCandidateSelect', 'fuzzerMarkCandidateButton'];
+  const nodes = Object.fromEntries(ids.map(id => [id, { value: '', textContent: '', innerHTML: '', disabled: true, listeners: {},
+    addEventListener(name, callback) { this.listeners[name] = callback; } }]));
+  f.c.document.getElementById = id => nodes[id] || null;
+  return nodes;
+}
+test('ready setup keeps target, count and protocol visible with details off the main action path', () => {
+  const f = fixture(), nodes = setupNodes(f);
+  f.state.fuzzerRequestText = raw.replace('one', '$payload$');
+  f.c.renderFuzzerSetup();
+  assert.match(nodes.fuzzerPreflightSummary.textContent, /1 payload → 1 planned request.*1 position.*127\.0\.0\.1:8443.*HTTP\/1\.0/);
+  assert.equal(nodes.fuzzerPreflightNotice.textContent, '');
+  assert.match(nodes.fuzzerPreviewNotes.textContent, /Runtime request rewriting/);
+  f.state.fuzzerRequestText = raw.replace('one', '$payload$').replace('two%2Fthree', '$payload$');
+  f.c.renderFuzzerSetup();
+  assert.match(nodes.fuzzerPreflightSummary.textContent, /2 positions \(shared payload\)/);
+});
+test('empty setup gives one actionable next step; running state remains honest', () => {
+  const f = fixture(), nodes = setupNodes(f);
+  f.state.fuzzerRequestText = ''; f.state.fuzzerPayloadsText = '';
+  f.c.renderFuzzerSetup();
+  assert.equal(nodes.fuzzerPreflightNotice.textContent, 'Send a request from History or Replay.');
+  f.state.fuzzerRequestText = raw; f.c.renderFuzzerSetup();
+  assert.equal(nodes.fuzzerPreflightNotice.textContent, 'Select a value to replace.');
+  f.state.fuzzerRequestText = raw.replace('one', '$payload$'); f.c.renderFuzzerSetup();
+  assert.equal(nodes.fuzzerPreflightNotice.textContent, 'Add payloads.');
+  f.state.fuzzerPayloadsText = 'x'; f.state.fuzzerRunning = true; f.c.renderFuzzerSetup();
+  assert.equal(nodes.fuzzerPreflightNotice.textContent, 'Running… Results appear when finished.');
+});
+test('value action waits for a chosen value and is disabled again while running', () => {
+  const f = fixture(), nodes = setupNodes(f);
+  f.c.initFuzzerSetupControls(); f.c.renderFuzzerSetup();
+  assert.equal(nodes.fuzzerMarkCandidateButton.disabled, true);
+  nodes.fuzzerCandidateSelect.value = '0';
+  nodes.fuzzerCandidateSelect.listeners.change({ target: nodes.fuzzerCandidateSelect });
+  assert.equal(nodes.fuzzerMarkCandidateButton.disabled, false);
+  f.state.fuzzerRunning = true; f.c.renderFuzzerSetup();
+  assert.equal(nodes.fuzzerMarkCandidateButton.disabled, true);
 });

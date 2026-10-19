@@ -1194,22 +1194,23 @@
         <section class="fuzzer-shell hidden" id="fuzzerShell">
           <header class="panel-toolbar replay-header fuzzer-workflow-header">
             <div class="fuzzer-header-row">
-              <div>
-                <p class="fuzzer-help">Send a captured request to Fuzzer, mark positions, load payloads, then review and run.</p>
-                <p class="fuzzer-help">Each payload replaces every <code>$payload$</code> marker in one request. Requests run sequentially; the server returns results when the run finishes.</p>
-              </div>
+              <h2>Fuzzer</h2>
               <div class="toolbar-actions">
                 <button class="secondary-action" id="resetFuzzerButton" type="button">Reset</button>
                 <button class="primary-action" id="startFuzzerButton" type="button" aria-describedby="fuzzerPreflightSummary fuzzerPreflightNotice">Start</button>
               </div>
             </div>
             <section class="fuzzer-preflight" aria-label="Review before running">
-              <div id="fuzzerPreflightSummary" class="fuzzer-preflight-summary" role="status" aria-live="polite">Choose a captured request and add payloads to review the target and exact request count.</div>
+              <div id="fuzzerPreflightSummary" class="fuzzer-preflight-summary" role="status" aria-live="polite">No request selected.</div>
               <p id="fuzzerPreflightNotice" class="fuzzer-help" role="status" aria-live="polite"></p>
               <details class="fuzzer-disclosure fuzzer-preview-disclosure">
-                <summary>Preview template-expanded requests</summary>
-                <p class="fuzzer-help">Limits: 128 markers; 4 MiB expanded-request budget per payload. Editor request text: 2 MiB.</p>
-                <div id="fuzzerPreviewSamples" class="fuzzer-disclosure-body fuzzer-preview-samples">Request samples will appear here before you start.</div>
+                <summary>Preview &amp; details</summary>
+                <div class="fuzzer-disclosure-body">
+                  <p class="fuzzer-help">Each payload replaces every <code>$payload$</code> marker in one request. Requests run sequentially; results arrive after completion. This run cannot be cancelled here.</p>
+                  <p class="fuzzer-help" id="fuzzerPreviewNotes"></p>
+                  <p class="fuzzer-help">Limits: 128 markers; 4 MiB expanded-request budget per payload. Editor request text: 2 MiB.</p>
+                  <div id="fuzzerPreviewSamples" class="fuzzer-preview-samples">Add a request and payloads to preview.</div>
+                </div>
               </details>
             </section>
           </header>
@@ -1219,25 +1220,19 @@
             <div class="fuzzer-top-row">
               <section class="panel-card fuzzer-template-card">
                 <header class="panel-toolbar">
-                  <h2 id="fuzzerRequestHeading">1. Mark request positions</h2>
+                  <h2 id="fuzzerRequestHeading">1. Request</h2>
                   <div class="toolbar-actions">
-                    <button class="secondary-action" id="fuzzerMarkSelectionButton" type="button" aria-describedby="fuzzerMarkerHelp">Mark selection</button>
+                    <button class="secondary-action" id="fuzzerMarkSelectionButton" type="button" title="Replace selected request text with $payload$">Mark selection</button>
                     <button class="secondary-action" id="fuzzerUndoMarkerButton" type="button" disabled>Undo marker</button>
                   </div>
                 </header>
-                <details class="fuzzer-disclosure fuzzer-control-disclosure">
-                  <summary>Find query or form values</summary>
-                  <div class="fuzzer-disclosure-body">
-                    <p class="fuzzer-help" id="fuzzerMarkerHelp">Select request text and choose Mark selection, or mark a detected query or form value. You can also type <code>$payload$</code> directly.</p>
-                    <div class="fuzzer-control-row">
-                      <label class="compact-field fuzzer-field-grow" for="fuzzerCandidateSelect">
-                        <span>Query or form value</span>
-                        <select id="fuzzerCandidateSelect" disabled><option value="">No candidate values</option></select>
-                      </label>
-                      <button class="secondary-action" id="fuzzerMarkCandidateButton" type="button" disabled>Mark value</button>
-                    </div>
-                  </div>
-                </details>
+                <div class="fuzzer-control-row fuzzer-quick-controls">
+                  <label class="compact-field fuzzer-field-grow" for="fuzzerCandidateSelect">
+                    <span>Value</span>
+                    <select id="fuzzerCandidateSelect" disabled><option value="">Select text in the request</option></select>
+                  </label>
+                  <button class="secondary-action" id="fuzzerMarkCandidateButton" type="button" disabled>Mark value</button>
+                </div>
                 <div class="editor-panel" role="group" aria-labelledby="fuzzerRequestHeading">
                   <div id="fuzzerRequestCM" class="cm-container" style="height:100%"></div>
                 </div>
@@ -1245,12 +1240,15 @@
               <div class="fuzzer-col-resizer" id="fuzzerColResizer"></div>
               <section class="panel-card fuzzer-payloads-card">
                 <header class="panel-toolbar">
-                  <h2><label for="fuzzerPayloadsEditor">2. Load payloads</label></h2>
+                  <h2><label for="fuzzerPayloadsEditor">2. Payloads</label></h2>
+                  <div class="toolbar-actions">
+                    <input id="fuzzerPayloadFile" type="file" accept=".txt,text/plain" hidden aria-label="Payload text file" />
+                    <button class="secondary-action" id="fuzzerImportPayloadButton" type="button" aria-controls="fuzzerPayloadFile">Import file</button>
+                  </div>
                 </header>
                 <details class="fuzzer-disclosure fuzzer-control-disclosure">
-                  <summary>Import, preset or number range</summary>
+                  <summary>More payload options</summary>
                   <div class="fuzzer-disclosure-body">
-                    <p class="fuzzer-help">Limits: 5,000 payloads; 64 KiB each; 4 MiB total payload bytes. Editor text and files: 4 MiB, including line separators. Import uses UTF-8; a BOM is kept literally. CRLF and CR are treated as line breaks, just like pasted text.</p>
                     <div class="fuzzer-control-row">
                       <label class="compact-field fuzzer-field-grow" for="fuzzerPayloadImportMode">
                         <span>Add payloads</span>
@@ -1259,8 +1257,6 @@
                           <option value="replace">Replace list</option>
                         </select>
                       </label>
-                      <input id="fuzzerPayloadFile" type="file" accept=".txt,text/plain" hidden aria-label="Payload text file" />
-                      <button class="secondary-action" id="fuzzerImportPayloadButton" type="button" aria-controls="fuzzerPayloadFile">Import text file</button>
                     </div>
                     <div class="fuzzer-control-row">
                       <label class="compact-field fuzzer-field-grow" for="fuzzerPayloadPreset">
@@ -1281,12 +1277,13 @@
                       </div>
                       <button class="secondary-action" id="fuzzerGenerateRangeButton" type="button">Generate range</button>
                     </fieldset>
+                    <p class="fuzzer-help" id="fuzzerPayloadHelp">One payload per line. Spaces are preserved. Blank lines are empty payloads; a final line break is ignored.</p>
+                    <p class="fuzzer-help">Limits: 5,000 payloads; 64 KiB each; 4 MiB total payload bytes. Editor text and files: 4 MiB, including line separators. Import uses UTF-8; a BOM is kept literally. CRLF and CR are treated as line breaks, just like pasted text.</p>
                   </div>
                 </details>
                 <div class="editor-panel">
-                  <textarea id="fuzzerPayloadsEditor" class="request-editor" spellcheck="false" placeholder="One payload per line" aria-describedby="fuzzerPayloadHelp"></textarea>
+                  <textarea id="fuzzerPayloadsEditor" class="request-editor" spellcheck="false" placeholder="Paste payloads, one per line" aria-describedby="fuzzerPayloadHelp"></textarea>
                 </div>
-                <p class="fuzzer-help fuzzer-editor-help" id="fuzzerPayloadHelp">One payload per line. Spaces are preserved. Blank lines are empty payloads; a final line break is ignored.</p>
               </section>
             </div>
             <!-- Horizontal resizer between top row and results -->
@@ -1295,8 +1292,8 @@
             <section class="panel-card fuzzer-results-card" style="display:flex;flex-direction:column;min-height:0">
               <header class="panel-toolbar">
                 <div>
-                  <h2>3. Triage run results</h2>
-                  <p class="inline-copy" id="fuzzerMeta">No fuzz run has been started yet.</p>
+                  <h2>3. Results</h2>
+                  <p class="inline-copy" id="fuzzerMeta">No results yet.</p>
                 </div>
                 <div class="toolbar-actions">
                   <button class="secondary-action" id="fuzzerCompareBaseButton" type="button" disabled title="Use the selected result as the comparison baseline">Set compare base</button>

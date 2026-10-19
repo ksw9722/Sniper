@@ -59,10 +59,10 @@ test('payload controls declare append default, exact presets and accessible file
 
 test('preflight exposes replace-all and sequential semantics without fake run progress', () => {
   assert.match(fuzzer, /Each payload replaces every <code>\$payload\$<\/code> marker in one request/);
-  assert.match(fuzzer, /Requests run sequentially; the server returns results when the run finishes/);
+  assert.match(fuzzer, /Requests run sequentially; results arrive after completion/);
   for (const id of ['fuzzerPreflightSummary', 'fuzzerPreflightNotice']) assert.equal(byId(id).attrs.role, 'status');
   assert.equal(byId('fuzzerPreviewSamples').tag, 'div');
-  assert.match(fuzzer, /<details[^>]*fuzzer-preview-disclosure[^>]*>\s*<summary>Preview template-expanded requests<\/summary>[\s\S]*?<div id="fuzzerPreviewSamples"/);
+  assert.match(fuzzer, /<details[^>]*fuzzer-preview-disclosure[^>]*>\s*<summary>Preview &amp; details<\/summary>[\s\S]*?<div id="fuzzerPreviewSamples"/);
   assert.doesNotMatch(fuzzer, /<progress\b|fuzzerStop|>Stop<|live progress/i);
 });
 
@@ -96,4 +96,19 @@ test('helper script has an embedded API route and is loaded before app initializ
   const api = fs.readFileSync(path.join(__dirname, '../src/api.rs'), 'utf8');
   assert.match(api, /\.route\("\/fuzzer-workflow\.js", get\(fuzzer_workflow_js\)\)/);
   assert.match(api, /include_str!\("\.\.\/web\/fuzzer-workflow\.js"\)/);
+});
+
+function disclosureDepthAt(id) {
+  const prefix = fuzzer.slice(0, fuzzer.indexOf(`id="${id}"`));
+  return [...prefix.matchAll(/<details\b[^>]*>|<\/details>/g)].reduce((depth, [tag]) => depth + (tag.startsWith('</') ? -1 : 1), 0);
+}
+test('common value and file actions are immediate while advanced options and explanations stay collapsed', () => {
+  for (const id of ['fuzzerCandidateSelect', 'fuzzerMarkCandidateButton', 'fuzzerMarkSelectionButton', 'fuzzerImportPayloadButton', 'startFuzzerButton']) {
+    assert.equal(disclosureDepthAt(id), 0, `${id} should not require opening a disclosure`);
+  }
+  for (const id of ['fuzzerPayloadImportMode', 'fuzzerPayloadPreset', 'fuzzerRangeStart', 'fuzzerPreviewNotes', 'fuzzerPayloadHelp']) {
+    assert.equal(disclosureDepthAt(id), 1, `${id} should remain in a closed disclosure`);
+  }
+  assert.doesNotMatch(fuzzer, /Send a captured request to Fuzzer, mark positions, load payloads/);
+  assert.match(fuzzer, /placeholder="Paste payloads, one per line"/);
 });

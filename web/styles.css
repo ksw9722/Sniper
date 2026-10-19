@@ -3413,6 +3413,12 @@ body.pane-resizing-y {
   min-width: 0;
 }
 
+.fuzzer-quick-controls {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
 .fuzzer-field-grow {
   flex: 1 1 140px;
   min-width: 0;

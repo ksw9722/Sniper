@@ -11,10 +11,10 @@
 ## 빠른 사용 순서
 
 1. HTTP History에서 요청을 선택하고 `Send to Fuzzer`를 누릅니다. HTTP Replay에서도 보낼 수 있습니다. 다른 요청을 가져와도 준비한 payload 목록은 유지됩니다.
-2. 요청의 값을 선택하고 `Mark selection`을 누릅니다. `Find query or form values`에서 현재 요청의 query/form 값을 골라 `Mark value`를 눌러도 됩니다. 같은 이름의 파라미터는 개별 항목으로 표시되며 인코딩은 그대로 유지됩니다. `Undo marker`는 그 뒤 요청을 수정하지 않았을 때 마지막 표시를 되돌립니다.
+2. 요청의 값을 선택하고 `Mark selection`을 누릅니다. 요청 위의 `Value`에서 현재 요청의 query/form 값을 골라 `Mark value`를 눌러도 됩니다. 같은 이름의 파라미터는 개별 항목으로 표시되며 인코딩은 그대로 유지됩니다. `Undo marker`는 그 뒤 요청을 수정하지 않았을 때 마지막 표시를 되돌립니다.
 3. Payload를 한 줄씩 붙여 넣거나 UTF-8 텍스트 파일, 작은 경계값 preset, 정수 범위를 사용합니다. 기본은 기존 목록에 추가입니다. `Replace list`는 기존 목록을 바꿉니다.
 4. 상단에서 실제 연결 대상, HTTP 버전, marker 수, `N payloads → N planned requests`를 확인합니다. 여러 marker가 있어도 각 요청에는 같은 payload가 모두 들어갑니다. 위치별 조합 실행은 하지 않습니다.
-5. `Preview template-expanded requests`를 열어 최대 3개 샘플을 확인합니다. Content-Length는 본문 길이에 맞춰 재계산됩니다. 샘플은 템플릿 확장 미리보기이며 실행 시 Match/Replace 등으로 실제 전송 내용이 달라질 수 있습니다. 큰 샘플은 생략되거나 표시가 잘렸다는 안내가 나옵니다.
+5. `Preview & details`를 열어 최대 3개 샘플을 확인합니다. Content-Length는 본문 길이에 맞춰 재계산됩니다. 샘플은 템플릿 확장 미리보기이며 실행 시 Match/Replace 등으로 실제 전송 내용이 달라질 수 있습니다. 큰 샘플은 생략되거나 표시가 잘렸다는 안내가 나옵니다.
 6. 본인 소유 또는 테스트 허가를 받은 대상인지 확인한 뒤 `Start`를 누릅니다. 현재 엔진은 순차 실행 후 결과를 반환합니다. 실행 중 취소나 실시간 진행률 기능은 없습니다.
 7. 결과의 상태 코드 그룹, 본문 크기, 소요 시간으로 필터링하고 정렬합니다. 크기는 응답 본문 bytes입니다. 결과를 선택해 요청/응답을 확인하고, `Set compare base` 후 다른 결과의 `Compare selected`로 기존 비교 화면을 엽니다.
 

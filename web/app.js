@@ -15248,8 +15248,8 @@ function renderFuzzer() {
     state.fuzzerAttackRecordId = attackRecord.id;
   }
   if (!attackRecord) {
-    els.fuzzerMeta.textContent = state.fuzzerNotice || "No fuzz run has been started yet.";
-    renderEmptyFuzzerResults(state.fuzzerNotice || "Use $payload$ markers in the request template, then click Start.");
+    els.fuzzerMeta.textContent = state.fuzzerNotice || "No results yet.";
+    renderEmptyFuzzerResults(state.fuzzerNotice || "Results appear here after running.");
     return;
   }
 
@@ -16187,7 +16187,7 @@ function renderFuzzerSetup() {
     error = failure?.message || "Review the request template.";
   }
   if (select && select._fuzzerCandidateKey !== candidateKey) {
-    select.innerHTML = '<option value="">Choose a query/form value</option>' + candidates.map((candidate, index) =>
+    select.innerHTML = `<option value="">${candidates.length ? "Choose a value" : "Select text in the request"}</option>` + candidates.map((candidate, index) =>
       `<option value="${index}">${escapeHtml(candidate.label)}</option>`).join("");
     select._fuzzerCandidateKey = candidateKey;
     select._fuzzerRaw = raw;
@@ -16199,21 +16199,31 @@ function renderFuzzerSetup() {
     const button = fuzzerSetupNode(id);
     if (button) button.disabled = busy;
   }
+  const markCandidate = fuzzerSetupNode("fuzzerMarkCandidateButton");
+  if (markCandidate) markCandidate.disabled = busy || !select?.value || candidates.length === 0;
   const undo = state._fuzzerMarkerUndo;
   const undoButton = fuzzerSetupNode("fuzzerUndoMarkerButton");
   if (undoButton) undoButton.disabled = busy || !undo || undo.after !== raw || undo.sessionId !== currentSessionId() || undo.runToken !== state.fuzzerRunToken;
   const summary = fuzzerSetupNode("fuzzerPreflightSummary");
   const notice = fuzzerSetupNode("fuzzerPreflightNotice");
   const samples = fuzzerSetupNode("fuzzerPreviewSamples");
+  const previewNotes = fuzzerSetupNode("fuzzerPreviewNotes");
   if (!model) {
-    summary.textContent = `${fuzzerPayloadCount(state.fuzzerPayloadsText || "")} payload(s) prepared`;
-    notice.textContent = error;
-    if (samples) samples.textContent = "Add a valid template and payloads to see expanded samples.";
+    summary.textContent = raw.trim() ? `${fuzzerPayloadCount(state.fuzzerPayloadsText || "")} payloads` : "No request selected.";
+    notice.textContent = raw.trim() ? error : "Send a request from History or Replay.";
+    if (previewNotes) previewNotes.textContent = "";
+    if (samples) samples.textContent = "Add a valid request and payloads to preview.";
     return;
   }
   const destination = typeof model.effectiveTarget === "string" ? model.effectiveTarget : JSON.stringify(model.effectiveTarget);
-  summary.textContent = `${model.payloadCount} payload(s) → ${model.requestCount} planned request(s) · ${model.markerCount} marker(s) · Target: ${destination || "not available"} · ${model.httpVersion || "Automatic HTTP version"}`;
-  notice.textContent = [...(model.errors || []), ...(model.warnings || []), busy ? "Running sequentially. Results appear after completion; this run cannot be cancelled here." : "All markers receive the same payload. The server validates every expanded request before sending."].join(" ");
+  summary.textContent = `${model.payloadCount} payload${model.payloadCount === 1 ? "" : "s"} → ${model.requestCount} planned request${model.requestCount === 1 ? "" : "s"} · ${model.markerCount} position${model.markerCount === 1 ? "" : "s"}${model.markerCount > 1 ? " (shared payload)" : ""} · ${destination || "Target unavailable"} · ${model.httpVersion || "Automatic HTTP"}`;
+  const errors = (model.errors || []).filter((message) => !["Request template is missing $payload$ markers.", "Fuzzer needs at least one payload."].includes(message));
+  notice.textContent = busy ? "Running… Results appear when finished."
+    : errors[0] || (!model.markerCount ? "Select a value to replace." : !model.payloadCount ? "Add payloads." : "");
+  if (!notice.textContent && (model.warnings || []).some((message) => message.startsWith("Host markers"))) {
+    notice.textContent = "Target changes with payloads. Check Preview.";
+  }
+  if (previewNotes) previewNotes.textContent = (model.warnings || []).join(" ");
   if (samples) {
     samples.innerHTML = (model.samples || []).map((sample) => {
       const text = buildEditableRawRequest(sample.request);
@@ -16343,6 +16353,10 @@ function initFuzzerSetupControls() {
   });
   bind("fuzzerMarkSelectionButton", markFuzzerEditorSelection);
   bind("fuzzerUndoMarkerButton", undoFuzzerMarker);
+  fuzzerSetupNode("fuzzerCandidateSelect")?.addEventListener("change", (event) => {
+    const button = fuzzerSetupNode("fuzzerMarkCandidateButton");
+    if (button) button.disabled = !!state.fuzzerRunning || !event.target.value;
+  });
   bind("fuzzerMarkCandidateButton", () => {
     const select = fuzzerSetupNode("fuzzerCandidateSelect");
     const candidate = select?.value !== "" ? select?._fuzzerCandidates?.[Number(select.value)] : null;
