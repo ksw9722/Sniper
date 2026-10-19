@@ -55,6 +55,8 @@ jobs:
           cargo build --locked --release --bins
       - name: Verify raw HTTP targets against isolated local origins
         run: python3 -B tests/raw_request_target_smoke.py target/release
+      - name: Verify Recon discovery and sitemap against isolated local origins
+        run: python3 -B tests/recon_discovery_smoke.py target/release
       - name: Record exact inputs and build candidate artifacts
         id: package
         run: |

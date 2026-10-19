@@ -3,10 +3,10 @@ const assert = require("node:assert/strict");
 const recon = require("../web/recon.js");
 
 function values(overrides = {}) {
-  return { target: "https://example.com/start#section", crawler: true, maxRequests: "100", maxDepth: "3", maxEndpoints: "5000", maxPages: "5", ...overrides };
+  return { target: "https://example.com/start#section", crawler: true, maxRequests: "0", maxDepth: "0", maxEndpoints: "0", maxPages: "0", ...overrides };
 }
 
-test("the default request is scoped, bounded and does not submit a browser scan", () => {
+test("the default request is scoped, unbudgeted and does not submit a browser scan", () => {
   const body = recon.buildJobRequest(values(), "session-a");
   assert.equal(body.session_id, "session-a");
   assert.equal(body.target_url, "https://example.com/start");
@@ -15,7 +15,18 @@ test("the default request is scoped, bounded and does not submit a browser scan"
   assert.equal(body.history_acknowledged, false);
   assert.equal(body.scan_acknowledged, false);
   assert.equal(body.scan_visibility, "private");
-  assert.equal(body.max_requests, 100);
+  for (const field of ["max_requests", "max_depth", "max_endpoints", "max_pages"]) assert.equal(body[field], 0);
+});
+
+test("discovery budget inputs default to zero without maximum attributes", () => {
+  const markup = require("node:fs").readFileSync(require("node:path").join(__dirname, "../web/index.html"), "utf8");
+  for (const id of ["reconMaxRequests", "reconMaxDepth", "reconMaxEndpoints", "reconMaxPages"]) {
+    const input = markup.match(new RegExp(`<input[^>]*id="${id}"[^>]*>`))?.[0];
+    assert.ok(input, id);
+    assert.match(input, /min="0"/);
+    assert.match(input, /value="0"/);
+    assert.doesNotMatch(input, /\bmax=/);
+  }
 });
 
 test("targets require an explicit HTTP(S) URL and reject embedded credentials", () => {
@@ -52,13 +63,14 @@ test("new urlscan scans require independent acknowledgment and valid visibility"
   }
 });
 
-test("client limits match backend bounds and never silently clamp", () => {
-  for (const [field, min, max] of [["maxRequests", 1, 1000], ["maxDepth", 0, 10], ["maxEndpoints", 1, 5000], ["maxPages", 1, 20]]) {
-    for (const value of [min - 1, max + 1, 1.5, "", "NaN", "Infinity"]) {
+test("optional budgets accept zero and values above former ceilings without silently clamping", () => {
+  for (const field of ["maxRequests", "maxDepth", "maxEndpoints", "maxPages"]) {
+    for (const value of [-1, 1.5, "NaN", "Infinity", Number.MAX_SAFE_INTEGER + 1]) {
       assert.throws(() => recon.buildJobRequest(values({ [field]: value }), "session-a"));
     }
-    assert.doesNotThrow(() => recon.buildJobRequest(values({ [field]: min }), "session-a"));
-    assert.doesNotThrow(() => recon.buildJobRequest(values({ [field]: max }), "session-a"));
+    for (const value of [0, "", undefined, 50_000, Number.MAX_SAFE_INTEGER]) {
+      assert.doesNotThrow(() => recon.buildJobRequest(values({ [field]: value }), "session-a"));
+    }
   }
 });
 
@@ -148,7 +160,7 @@ function controllerFixture() {
   node("Form").reset = () => {
     for (const item of nodes.values()) { item.value = ""; item.checked = false; }
     node("Crawler").checked = true;
-    for (const [key, value] of Object.entries({ MaxRequests: "100", MaxDepth: "3", MaxEndpoints: "5000", MaxPages: "5", ScanVisibility: "private" })) node(key).value = value;
+    for (const [key, value] of Object.entries({ MaxRequests: "0", MaxDepth: "0", MaxEndpoints: "0", MaxPages: "0", ScanVisibility: "private" })) node(key).value = value;
   };
   const endpoint = (path, method = "GET") => ({ url: `https://example.com/${path}`, method, raw_urls: [`/${path}`, "<img src=x onerror=alert(1)>"], evidence: [{ source: "crawler", kind: "candidate", location: "https://example.com/app.js" }] });
   const snapshots = {
@@ -453,6 +465,20 @@ test("controller renders bounded pages, search and text-only provenance", async 
   f.controller.dispose();
 });
 
+test("controller keeps and searches endpoints beyond the old 5,000 display cap", async () => {
+  const f = controllerFixture(); await settled();
+  f.snapshots.a.endpoints = Array.from({ length: 5_101 }, (_, i) => ({
+    url: `https://example.com/large/${i}`, method: "GET", raw_urls: [], evidence: [],
+  }));
+  await f.controller.refresh();
+  assert.match(f.node("InventoryMeta").textContent, /^5,101 endpoints in this session$/);
+  f.node("Search").value = "/large/5100"; f.node("Search").emit("input");
+  assert.equal(f.node("Endpoints").childNodes.length, 1);
+  assert.match(f.node("Endpoints").textContent, /large\/5100/);
+  assert.doesNotMatch(f.node("InventoryMeta").textContent, /cap|partial/);
+  f.controller.dispose();
+});
+
 test("successful start and stop use pinned sessions and retain inventory", async () => {
   const f = controllerFixture(); await settled();
   f.node("Target").value = "https://example.com/";
@@ -470,22 +496,22 @@ test("successful start and stop use pinned sessions and retain inventory", async
   f.controller.dispose();
 });
 
-test("completed sources retain partial extraction warnings and accurate counts", async () => {
+test("completed sources retain optional budget warnings and accurate counts", async () => {
   const f = controllerFixture(); await settled();
   f.snapshots.a.endpoints = f.snapshots.a.endpoints.slice(0, 1);
   f.snapshots.a.jobs = [{ id: "bounded-job", status: "completed", target_url: "https://example.com/tags", sources: [{
     source: "crawler", status: "completed", requests: 3, discovered: 1, truncated: true,
-    warnings: ["A static document extraction limit was reached; more evidence may exist.", "Collection was bounded; more evidence may exist."],
+    warnings: ["Crawler request budget reached.", "Collection is partial; more evidence may exist."],
   }] }];
   await f.controller.refresh();
   assert.match(f.node("Jobs").textContent, /completed.*3 requests.*1 discovered.*LIMIT REACHED \/ PARTIAL/);
-  assert.match(f.node("Jobs").textContent, /static document extraction limit/);
+  assert.match(f.node("Jobs").textContent, /request budget reached/);
   assert.match(f.node("InventoryMeta").textContent, /^1 endpoints in this session$/);
   assert.equal(descendants(f.node("Jobs")).some(item => item.dataset.stopJob), false);
   f.snapshots.a.jobs[0].sources[0] = { source: "crawler", status: "completed", requests: 4, discovered: 2, truncated: false, warnings: [] };
   await f.controller.refresh();
   assert.match(f.node("Jobs").textContent, /4 requests.*2 discovered/);
-  assert.doesNotMatch(f.node("Jobs").textContent, /LIMIT REACHED|extraction limit/);
+  assert.doesNotMatch(f.node("Jobs").textContent, /LIMIT REACHED|request budget/);
   f.controller.dispose();
 });
 

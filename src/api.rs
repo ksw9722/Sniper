@@ -6316,7 +6316,48 @@ async fn get_target_site_map(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let records = session.store.site_map_records().await;
+    let hosts = target_site_map_hosts(
+        session.store.site_map_records().await,
+        session.recon.site_map_endpoints(),
+    );
+
+    let mut site_map = Vec::with_capacity(hosts.len());
+    for (_, host) in hosts {
+        let mut paths = host
+            .paths
+            .into_iter()
+            .map(|(_, path)| TargetPathNode {
+                path: path.path,
+                methods: path.methods,
+                last_seen: path.last_seen,
+                status: path.status,
+                note_count: path.note_count,
+                is_websocket: path.is_websocket,
+                captured: path.captured,
+                discovered: path.recon_last_seen.is_some(),
+                recon_sources: path.recon_sources,
+                recon_kinds: path.recon_kinds,
+                recon_last_seen: path.recon_last_seen,
+            })
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| std::cmp::Reverse(path.last_seen));
+
+        site_map.push(TargetHostNode {
+            host: host.host.clone(),
+            schemes: host.schemes,
+            request_count: host.request_count,
+            in_scope: session.runtime.is_in_scope(&host.host).await,
+            paths,
+        });
+    }
+
+    Json(site_map).into_response()
+}
+
+fn target_site_map_hosts(
+    records: Vec<crate::store::SiteMapRecord>,
+    recon_endpoints: Vec<crate::target::ReconSiteMapEndpoint>,
+) -> IndexMap<String, TargetHostAccumulator> {
     let mut hosts = IndexMap::<String, TargetHostAccumulator>::new();
 
     for record in records {
@@ -6342,6 +6383,10 @@ async fn get_target_site_map(
                 status: record.status,
                 note_count: 0,
                 is_websocket: record.is_websocket,
+                captured: true,
+                recon_sources: Vec::new(),
+                recon_kinds: Vec::new(),
+                recon_last_seen: None,
             });
         push_unique(&mut path.methods, record.method.clone());
         if record.started_at > path.last_seen {
@@ -6352,32 +6397,106 @@ async fn get_target_site_map(
         path.is_websocket = path.is_websocket || record.is_websocket;
     }
 
-    let mut site_map = Vec::with_capacity(hosts.len());
-    for (_, host) in hosts {
-        let mut paths = host
-            .paths
-            .into_iter()
-            .map(|(_, path)| TargetPathNode {
-                path: path.path,
-                methods: path.methods,
-                last_seen: path.last_seen,
-                status: path.status,
-                note_count: path.note_count,
-                is_websocket: path.is_websocket,
-            })
-            .collect::<Vec<_>>();
-        paths.sort_by_key(|path| std::cmp::Reverse(path.last_seen));
-
-        site_map.push(TargetHostNode {
-            host: host.host.clone(),
-            schemes: host.schemes,
-            request_count: host.request_count,
-            in_scope: session.runtime.is_in_scope(&host.host).await,
-            paths,
-        });
+    // Recon normalizes URL authorities (including default ports and hostname
+    // case), while capture retains the original Host spelling. Reuse matching
+    // captured buckets without regrouping or rewriting existing traffic.
+    let mut captured_aliases = IndexMap::<(String, String), Vec<String>>::new();
+    for host in hosts.values() {
+        for scheme in &host.schemes {
+            let Ok(url) = url::Url::parse(&format!("{scheme}://{}/", host.host)) else {
+                continue;
+            };
+            let authority = url[url::Position::BeforeHost..url::Position::AfterPort].to_string();
+            captured_aliases
+                .entry((scheme.clone(), authority))
+                .or_default()
+                .push(host.host.clone());
+        }
     }
 
-    Json(site_map).into_response()
+    for endpoint in recon_endpoints {
+        if endpoint.url.trim() != endpoint.url || endpoint.url.chars().any(char::is_control) {
+            continue;
+        }
+        let Ok(url) = url::Url::parse(&endpoint.url) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https" | "ws" | "wss")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            continue;
+        }
+        let authority = url[url::Position::BeforeHost..url::Position::AfterPort].to_string();
+        let path_and_query = url[url::Position::BeforePath..url::Position::AfterQuery].to_string();
+        let aliases = captured_aliases.get(&(url.scheme().to_string(), authority.clone()));
+        let existing_path_host = hosts
+            .get(&authority)
+            .filter(|host| host.paths.contains_key(&path_and_query))
+            .map(|host| host.host.clone())
+            .or_else(|| {
+                aliases.and_then(|aliases| {
+                    aliases
+                        .iter()
+                        .find(|key| hosts[*key].paths.contains_key(&path_and_query))
+                        .cloned()
+                })
+            });
+        let host_key = existing_path_host.unwrap_or_else(|| {
+            if hosts.contains_key(&authority) {
+                authority.clone()
+            } else {
+                aliases
+                    .and_then(|aliases| aliases.first())
+                    .cloned()
+                    .unwrap_or(authority)
+            }
+        });
+        let host = hosts
+            .entry(host_key.clone())
+            .or_insert_with(|| TargetHostAccumulator {
+                host: host_key,
+                schemes: Vec::new(),
+                request_count: 0,
+                paths: IndexMap::new(),
+            });
+        push_unique(&mut host.schemes, url.scheme().to_string());
+        let path =
+            host.paths
+                .entry(path_and_query.clone())
+                .or_insert_with(|| TargetPathAccumulator {
+                    path: path_and_query,
+                    methods: Vec::new(),
+                    last_seen: endpoint.last_seen,
+                    status: None,
+                    note_count: 0,
+                    is_websocket: false,
+                    captured: false,
+                    recon_sources: Vec::new(),
+                    recon_kinds: Vec::new(),
+                    recon_last_seen: None,
+                });
+        if Method::from_bytes(endpoint.method.as_bytes()).is_ok() {
+            push_unique(&mut path.methods, endpoint.method);
+        }
+        // Discovery timestamps and historical status codes never replace the
+        // captured response. A discovery-only path has no response to display.
+        if !path.captured {
+            path.last_seen = path.last_seen.max(endpoint.last_seen);
+        }
+        path.recon_last_seen = Some(
+            path.recon_last_seen
+                .map_or(endpoint.last_seen, |seen| seen.max(endpoint.last_seen)),
+        );
+        for source in endpoint.sources {
+            push_unique(&mut path.recon_sources, source);
+        }
+        for kind in endpoint.kinds {
+            push_unique(&mut path.recon_kinds, kind);
+        }
+    }
+    hosts
 }
 
 async fn list_transactions(
@@ -9063,6 +9182,10 @@ struct TargetPathAccumulator {
     status: Option<u16>,
     note_count: usize,
     is_websocket: bool,
+    captured: bool,
+    recon_sources: Vec<String>,
+    recon_kinds: Vec<String>,
+    recon_last_seen: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
@@ -17554,6 +17677,403 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    fn site_map_recon_endpoint(
+        url: &str,
+        method: &str,
+        last_seen: chrono::DateTime<Utc>,
+        source: &str,
+        kind: &str,
+    ) -> crate::recon::ReconEndpoint {
+        crate::recon::ReconEndpoint {
+            url: url.into(),
+            method: method.into(),
+            raw_urls: vec![url.into()],
+            evidence: vec![crate::recon::ReconEvidence {
+                source: source.into(),
+                kind: kind.into(),
+                location: "synthetic fixture".into(),
+                timestamp: Some("20000101000000".into()),
+                status: Some(404),
+            }],
+            first_seen: last_seen,
+            last_seen,
+        }
+    }
+
+    #[test]
+    fn target_site_map_merges_recon_without_overwriting_capture_metadata() {
+        let captured_at = Utc::now();
+        let discovered_at = captured_at + chrono::Duration::hours(1);
+        let records = vec![crate::store::SiteMapRecord {
+            started_at: captured_at,
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "example.com:8443".into(),
+            path: "/shared?item=one".into(),
+            status: Some(204),
+            note_count: 2,
+            is_websocket: true,
+        }];
+        let recon = crate::recon::ReconStore::from_snapshot(crate::recon::ReconSnapshot {
+            endpoints: vec![
+                site_map_recon_endpoint(
+                    "https://example.com:8443/shared?item=one",
+                    "GET",
+                    discovered_at,
+                    "wayback",
+                    "history",
+                ),
+                site_map_recon_endpoint(
+                    "https://example.com:8443/shared?item=one",
+                    "POST",
+                    discovered_at,
+                    "static",
+                    "candidate",
+                ),
+                site_map_recon_endpoint(
+                    "https://example.com:8443/discovered",
+                    "GET",
+                    discovered_at,
+                    "wayback",
+                    "history",
+                ),
+            ],
+            ..Default::default()
+        });
+        let hosts = super::target_site_map_hosts(records, recon.site_map_endpoints());
+        let host = &hosts["example.com:8443"];
+        assert_eq!(host.request_count, 1);
+        assert_eq!(host.schemes, ["https"]);
+        assert_eq!(host.paths.len(), 2);
+        let shared = &host.paths["/shared?item=one"];
+        assert!(shared.captured);
+        assert_eq!(shared.status, Some(204));
+        assert_eq!(shared.last_seen, captured_at);
+        assert_eq!(shared.recon_last_seen, Some(discovered_at));
+        assert_eq!(shared.note_count, 2);
+        assert!(shared.is_websocket);
+        assert_eq!(shared.methods, ["GET", "POST"]);
+        assert_eq!(shared.recon_sources, ["wayback", "static"]);
+        assert_eq!(shared.recon_kinds, ["history", "candidate"]);
+        let discovered = &host.paths["/discovered"];
+        assert!(!discovered.captured);
+        assert_eq!(
+            discovered.status, None,
+            "historical 404 is not a captured response"
+        );
+        assert_eq!(discovered.last_seen, discovered_at);
+        assert_eq!(discovered.recon_last_seen, Some(discovered_at));
+        assert_eq!(discovered.note_count, 0);
+        assert!(!discovered.is_websocket);
+    }
+
+    #[test]
+    fn target_site_map_recon_preserves_queries_ports_and_rejects_unsafe_urls() {
+        let now = Utc::now();
+        let urls = [
+            "https://example.com:8443/search?q=one&v=%2F#fragment",
+            "https://example.com:8443/search?q=two",
+            "https://example.com:8444/search?q=one&v=%2F",
+            "http://example.com:8443/search?q=two",
+            "https://[::1]:8443/ipv6?x=1",
+            "wss://example.com:8443/socket?token=example",
+            "ws://example.com:8443/socket?token=example",
+            "not an absolute URL",
+            "/relative",
+            "file:///tmp/local",
+            "javascript:alert(1)",
+            "https://user:password@example.com/secret",
+            "https://user@example.com/secret",
+            "https://:password@example.com/secret",
+            "https://example.com:invalid/",
+            " https://example.com/whitespace",
+            "https://example.com/control\n",
+        ];
+        let recon = crate::recon::ReconStore::from_snapshot(crate::recon::ReconSnapshot {
+            endpoints: urls
+                .into_iter()
+                .map(|url| site_map_recon_endpoint(url, "GET", now, "static", "candidate"))
+                .collect(),
+            ..Default::default()
+        });
+        let hosts = super::target_site_map_hosts(Vec::new(), recon.site_map_endpoints());
+        assert_eq!(hosts.len(), 3);
+        let host = &hosts["example.com:8443"];
+        assert_eq!(host.request_count, 0);
+        assert_eq!(host.schemes, ["https", "http", "wss", "ws"]);
+        assert_eq!(host.paths.len(), 3);
+        let socket = &host.paths["/socket?token=example"];
+        assert!(!socket.captured);
+        assert!(
+            !socket.is_websocket,
+            "passive evidence is not a captured connection"
+        );
+        assert_eq!(socket.status, None);
+        assert!(host.paths.contains_key("/search?q=one&v=%2F"));
+        assert!(host.paths.contains_key("/search?q=two"));
+        assert_eq!(host.paths["/search?q=two"].methods, ["GET"]);
+        assert_eq!(host.paths["/search?q=two"].recon_sources, ["static"]);
+        assert!(hosts["example.com:8444"]
+            .paths
+            .contains_key("/search?q=one&v=%2F"));
+        assert!(hosts["[::1]:8443"].paths.contains_key("/ipv6?x=1"));
+    }
+
+    #[test]
+    fn target_site_map_recon_reuses_capture_default_port_and_case_aliases() {
+        let now = Utc::now();
+        let records = [
+            ("https", "EXAMPLE.COM:443", "/secure"),
+            ("http", "example.com:80", "/plain"),
+        ]
+        .into_iter()
+        .map(|(scheme, host, path)| crate::store::SiteMapRecord {
+            started_at: now,
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host: host.into(),
+            path: path.into(),
+            status: Some(200),
+            note_count: 0,
+            is_websocket: false,
+        })
+        .collect();
+        let recon = crate::recon::ReconStore::from_snapshot(crate::recon::ReconSnapshot {
+            endpoints: vec![
+                site_map_recon_endpoint(
+                    "https://example.com/secure",
+                    "GET",
+                    now,
+                    "wayback",
+                    "history",
+                ),
+                site_map_recon_endpoint(
+                    "http://example.com/plain",
+                    "GET",
+                    now,
+                    "wayback",
+                    "history",
+                ),
+                site_map_recon_endpoint(
+                    "https://example.com/new",
+                    "GET",
+                    now,
+                    "static",
+                    "candidate",
+                ),
+            ],
+            ..Default::default()
+        });
+        let hosts = super::target_site_map_hosts(records, recon.site_map_endpoints());
+        assert_eq!(hosts.len(), 2, "legacy capture buckets remain intact");
+        let secure = &hosts["EXAMPLE.COM:443"];
+        assert_eq!(secure.request_count, 1);
+        assert!(secure.paths["/secure"].captured);
+        assert_eq!(secure.paths["/secure"].recon_sources, ["wayback"]);
+        assert!(!secure.paths["/new"].captured);
+        assert_eq!(
+            hosts["example.com:80"].paths["/plain"].recon_sources,
+            ["wayback"]
+        );
+    }
+
+    #[test]
+    fn target_site_map_recon_includes_inventory_beyond_old_global_limit() {
+        let now = Utc::now();
+        let endpoints = (0..5_100)
+            .map(|index| {
+                site_map_recon_endpoint(
+                    &format!("https://example.com/path/{index}"),
+                    "GET",
+                    now,
+                    "wayback",
+                    "history",
+                )
+            })
+            .collect();
+        let recon = crate::recon::ReconStore::from_snapshot(crate::recon::ReconSnapshot {
+            endpoints,
+            ..Default::default()
+        });
+        let hosts = super::target_site_map_hosts(Vec::new(), recon.site_map_endpoints());
+        assert_eq!(hosts["example.com"].paths.len(), 5_100);
+        assert_eq!(hosts["example.com"].request_count, 0);
+        assert!(hosts["example.com"].paths.contains_key("/path/5099"));
+    }
+
+    #[tokio::test]
+    async fn target_site_map_recon_survives_restart_and_pinned_session_lifecycle() {
+        let (state, data_dir) = test_state("target-recon-lifecycle");
+        let config = state.config.clone();
+        let active = state.session().await;
+        let active_id = active.id();
+        let inactive_metadata = state
+            .sessions
+            .create_session(Some("Recon fixture".into()))
+            .unwrap();
+        let inactive = state.sessions.load_context(inactive_metadata.id).unwrap();
+        let now = Utc::now();
+        active
+            .store
+            .insert(TransactionRecord::http(
+                now,
+                "GET".into(),
+                "https".into(),
+                "example.com".into(),
+                "/captured".into(),
+                Some(204),
+                1,
+                MessageRecord::from_headers_and_body(&HeaderMap::new(), &[], 0),
+                None,
+                Vec::new(),
+                None,
+                None,
+            ))
+            .await;
+        active.persist().await.unwrap();
+        inactive
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                scope_patterns: Some(vec!["inactive.example.com".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        inactive.persist().await.unwrap();
+        let active_state_path = active.storage_dir().join("state.json");
+        let inactive_state_path = inactive.storage_dir().join("state.json");
+        drop(active);
+        drop(inactive);
+        drop(state);
+        for (path, url) in [
+            (
+                &active_state_path,
+                "https://example.com/discovered?active=1",
+            ),
+            (
+                &inactive_state_path,
+                "https://inactive.example.com:8443/only?inactive=1",
+            ),
+        ] {
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            saved["recon"] = serde_json::to_value(crate::recon::ReconSnapshot {
+                endpoints: vec![site_map_recon_endpoint(
+                    url, "GET", now, "wayback", "history",
+                )],
+                jobs: vec![crate::recon::ReconJob {
+                    id: Uuid::new_v4(),
+                    target_url: url.into(),
+                    status: "running".into(),
+                    started_at: now,
+                    finished_at: None,
+                    sources: Vec::new(),
+                    error: None,
+                }],
+            })
+            .unwrap();
+            std::fs::write(path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        }
+        let state = Arc::new(AppState::new(config.clone()).unwrap());
+        let inactive_bytes = std::fs::read(&inactive_state_path).unwrap();
+        let active_map: Vec<crate::target::TargetHostNode> = response_json(
+            get_target_site_map(
+                State(state.clone()),
+                Query(super::TargetSiteMapQuery { session_id: None }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(active_map.len(), 1);
+        assert_eq!(active_map[0].host, "example.com");
+        assert_eq!(active_map[0].request_count, 1);
+        assert_eq!(active_map[0].paths.len(), 2);
+        assert!(active_map[0]
+            .paths
+            .iter()
+            .any(|path| path.captured && !path.discovered));
+        assert!(active_map[0]
+            .paths
+            .iter()
+            .any(|path| !path.captured && path.discovered && path.status.is_none()));
+        let inactive_map: Vec<crate::target::TargetHostNode> = response_json(
+            get_target_site_map(
+                State(state.clone()),
+                Query(super::TargetSiteMapQuery {
+                    session_id: Some(inactive_metadata.id),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(inactive_map.len(), 1);
+        assert_eq!(inactive_map[0].host, "inactive.example.com:8443");
+        assert!(inactive_map[0].in_scope);
+        assert_eq!(inactive_map[0].request_count, 0);
+        assert_eq!(inactive_map[0].paths[0].path, "/only?inactive=1");
+        assert!(!inactive_map[0].paths[0].captured);
+        assert!(inactive_map[0].paths[0].discovered);
+        assert_eq!(
+            std::fs::read(&inactive_state_path).unwrap(),
+            inactive_bytes,
+            "reading inventory must not persist or start discovery"
+        );
+        assert_eq!(state.session().await.id(), active_id);
+        assert_eq!(state.session().await.store.len().await, 1);
+        assert_eq!(
+            state.session().await.recon.snapshot().jobs[0].status,
+            "interrupted"
+        );
+        state.activate_session(inactive_metadata.id).await.unwrap();
+        let inactive = state.session().await;
+        assert_eq!(inactive.store.len().await, 0);
+        assert!(!inactive.recon.is_running());
+        inactive
+            .runtime
+            .update(RuntimeSettingsUpdate {
+                scope_patterns: Some(vec!["other.example.com".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        inactive.persist().await.unwrap();
+        drop(inactive);
+        drop(state);
+        let state = Arc::new(AppState::new(config).unwrap());
+        let map: Vec<crate::target::TargetHostNode> = response_json(
+            get_target_site_map(
+                State(state.clone()),
+                Query(super::TargetSiteMapQuery { session_id: None }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(map.len(), 1);
+        assert!(!map[0].in_scope);
+        assert_eq!(
+            map[0].paths.len(),
+            1,
+            "scope changes do not erase inventory"
+        );
+        assert_eq!(map[0].paths[0].recon_sources, ["wayback"]);
+        state.activate_session(active_id).await.unwrap();
+        state.delete_session(inactive_metadata.id).await.unwrap();
+        assert_eq!(
+            get_target_site_map(
+                State(state.clone()),
+                Query(super::TargetSiteMapQuery {
+                    session_id: Some(inactive_metadata.id),
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(state.session().await.recon.snapshot().endpoints.len(), 1);
         drop(state);
         let _ = std::fs::remove_dir_all(data_dir);
     }
