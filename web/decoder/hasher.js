@@ -718,7 +718,7 @@ var hasher = {
       tab : tabs.string,
       title: "Hex to ASCII",
       calculate: function (input) {
-        if (/[^0-9a-f]/i.test(input)) {
+        if (input.length % 2 !== 0 || /[^0-9a-f]/i.test(input)) {
           return "NaN";
         }
         try {
@@ -749,7 +749,7 @@ var hasher = {
       tab : tabs.string,
       title: "Hex to UTF-8",
       calculate: function (input) {
-        if (/[^0-9a-f]/i.test(input)) {
+        if (input.length % 2 !== 0 || /[^0-9a-f]/i.test(input)) {
           return "NaN";
         }
         try {
@@ -780,7 +780,7 @@ var hasher = {
       tab : tabs.string,
       title: "Hex to UTF-16",
       calculate: function (input) {
-        if (/[^0-9a-f]/i.test(input)) {
+        if (input.length % 4 !== 0 || /[^0-9a-f]/i.test(input)) {
           return "NaN";
         }
         try {
