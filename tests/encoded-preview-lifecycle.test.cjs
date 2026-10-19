@@ -162,3 +162,26 @@ test("keyboard preview scroll keys stay on the Decode button and never move the 
   f.controller.hide();
   assert.equal(f.controller.button.fire("keydown", { key: "ArrowDown" }).defaultPrevented, false);
 });
+
+
+test("nearest-caret coordinates cover both halves of a token and its final document character", () => {
+  const f = fixture();
+  for (let pos = 0; pos < f.view.state.doc.length; pos += 1) {
+    for (const offset of [1, 3, 5, 7]) {
+      f.controller.hide(); f.hover(pos, { clientX: pos * 8 + offset }); f.run(300);
+      assert.ok(visible(f), `character ${pos}, horizontal offset ${offset}`);
+    }
+  }
+  for (const point of [{ clientX: -5 }, { clientX: 999 }, { clientY: 0 }, { clientY: 50 }]) {
+    f.controller.hide(); f.hover(2, point); f.run(); assert.equal(visible(f), null);
+  }
+});
+
+test("visual wrapping uses the previous side of the ending caret", () => {
+  const f = fixture();
+  f.view.coordsAtPos = (pos, side) => {
+    const wrap = pos === 4 && side !== -1;
+    return { left: wrap ? 0 : pos * 8, right: wrap ? 0 : pos * 8, top: wrap ? 30 : 10, bottom: wrap ? 46 : 26 };
+  };
+  f.hover(3, { clientX: 31 }); f.run(300); assert.ok(visible(f));
+});

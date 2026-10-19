@@ -29466,6 +29466,20 @@ function encodedPreviewAt(doc, position) {
   return null;
 }
 
+function encodedPreviewPointerPosition(view, event) {
+  const nearest = view.posAtCoords({ x: event.clientX, y: event.clientY });
+  if (nearest === null) return null;
+  // CodeMirror returns the nearest caret, not the character under the pointer.
+  // Check both sides, including the last character and visual wrap boundaries.
+  for (const position of [nearest, nearest - 1]) {
+    if (position < 0 || position >= view.state.doc.length) continue;
+    const a = view.coordsAtPos(position, 1), b = view.coordsAtPos(position + 1, -1);
+    if (a && b && a.top === b.top && event.clientY >= a.top && event.clientY <= a.bottom
+      && event.clientX >= Math.min(a.left, b.left) && event.clientX <= Math.max(a.right, b.right)) return position;
+  }
+  return null;
+}
+
 class EncodedPreviewController {
   constructor(view) {
     this.view = view;
@@ -29539,12 +29553,8 @@ class EncodedPreviewController {
       this.hide();
       return;
     }
-    const position = view.posAtCoords({ x: event.clientX, y: event.clientY });
-    if (position === null || position >= view.state.doc.length) { this.scheduleHide(); return; }
-    const a = view.coordsAtPos(position), b = view.coordsAtPos(position + 1);
-    // posAtCoords can return the end of a line when hovering blank space.
-    if (!a || !b || a.top !== b.top || event.clientX < Math.min(a.left, b.left) - 2
-      || event.clientX > Math.max(a.right, b.right) + 2) { this.scheduleHide(); return; }
+    const position = encodedPreviewPointerPosition(view, event);
+    if (position === null) { this.scheduleHide(); return; }
     if (this.position === position || this.result && position >= this.result.from && position < this.result.to) return;
     this.hide();
     this.position = position;
@@ -29580,7 +29590,8 @@ class EncodedPreviewController {
 
   show(result, keyboard) {
     if (this.destroyed || !this.view.dom.isConnected || !this.view.dom.getClientRects().length) return;
-    const anchor = this.view.coordsAtPos(result.from) || this.button.getBoundingClientRect();
+    const anchor = this.view.coordsAtPos(keyboard ? result.from : this.position ?? result.from)
+      || this.button.getBoundingClientRect();
     const tooltip = this.document.createElement("div");
     tooltip.className = "encoded-preview-tooltip";
     tooltip.id = `encoded-preview-${++encodedPreviewId}`;

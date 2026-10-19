@@ -60,7 +60,7 @@ function fixture(text = "hello%20world", selection = 1) {
     dom, contentDOM,
     state: CM.EditorState.create({ doc: text, selection: typeof selection === "number" ? { anchor: selection } : selection,
       extensions: [CM.history(), context.plugin] }),
-    posAtCoords: ({ x }) => Math.floor(x / 8),
+    posAtCoords: ({ x }) => Math.round(x / 8),
     coordsAtPos: pos => ({ left: pos * 8, right: pos * 8, top: 10, bottom: 26 }),
     dispatch(spec) {
       const transaction = this.state.update(spec);
