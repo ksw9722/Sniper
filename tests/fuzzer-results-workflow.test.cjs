@@ -15,7 +15,7 @@ function node(id) {
     addEventListener(type, fn) { listeners.set(type, fn); },
     dispatch(type, event = {}) { return listeners.get(type)?.({ target: this, preventDefault() {}, ...event }); },
     classList: { add: x => classes.add(x), remove: x => classes.delete(x), contains: x => classes.has(x) },
-    setAttribute() {}, focus() {}, closest: () => null, querySelector: () => null,
+    attributes: {}, setAttribute(name, value) { this.attributes[name] = value; }, setCustomValidity(message) { this.validationMessage = message; }, focus() {}, closest: () => null, querySelector: () => null,
   };
 }
 const result = (index, status = 200, bytes = index, duration = index) => ({ index, payload: `synthetic-${index}`,
@@ -253,4 +253,38 @@ for (const boundary of ['request-bytes', 'payload-text-bytes', 'payload-count'])
   assert.equal(f.confirmations.length, 0);
   assert.equal(draft(f.state), before);
   assert.match(f.els.fuzzerSavedRunNotice.textContent, /editor limits/);
+});
+
+for (const [id, value] of [['fuzzerResultMinBytes', '-1'], ['fuzzerResultMaxBytes', '1.5'], ['fuzzerResultMinMs', 'Infinity'], ['fuzzerResultMaxMs', 'oops'], ['fuzzerResultMaxBytes', '9007199254740992']]) {
+  test(`invalid result filter ${id}=${value} is visible and cannot silently broaden results`, () => {
+    const f = fixture(); f.setFilter(id, value);
+    assert.deepEqual(indexes(f), []);
+    assert.match(f.els.fuzzerResultFilterCount.textContent, /Invalid filters/);
+    assert.equal(f.els[id].attributes['aria-invalid'], 'true');
+    assert.ok(f.els[id].validationMessage);
+    f.setFilter(id, '');
+    assert.deepEqual(indexes(f), [0, 1]);
+    assert.equal(f.els[id].attributes['aria-invalid'], 'false');
+    assert.equal(f.els[id].validationMessage, '');
+  });
+}
+for (const [min, max] of [['fuzzerResultMinBytes', 'fuzzerResultMaxBytes'], ['fuzzerResultMinMs', 'fuzzerResultMaxMs']]) test(`reversed ${min} range is reported and corrected without stale errors`, () => {
+  const f = fixture(); f.setFilter(min, '20'); f.setFilter(max, '10');
+  assert.deepEqual(indexes(f), []);
+  assert.match(f.els.fuzzerResultFilterCount.textContent, /cannot exceed/);
+  assert.equal(f.els[min].attributes['aria-invalid'], 'true');
+  assert.equal(f.els[max].attributes['aria-invalid'], 'true');
+  f.setFilter(min, '0'); f.setFilter(max, '10');
+  assert.deepEqual(indexes(f), [0, 1]);
+  assert.equal(f.els[min].attributes['aria-invalid'], 'false');
+  assert.equal(f.els[max].attributes['aria-invalid'], 'false');
+});
+test('browser badInput is not treated as an empty filter and clears after correction', () => {
+  const f = fixture(); f.els.fuzzerResultMaxBytes.validity = { badInput: true };
+  f.setFilter('fuzzerResultMaxBytes', '');
+  assert.deepEqual(indexes(f), []);
+  assert.match(f.els.fuzzerResultFilterCount.textContent, /Invalid filters/);
+  f.els.fuzzerResultMaxBytes.validity = { badInput: false };
+  f.setFilter('fuzzerResultMaxBytes', '1');
+  assert.deepEqual(indexes(f), [0, 1]);
 });

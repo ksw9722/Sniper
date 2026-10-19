@@ -15267,7 +15267,7 @@ function fuzzerResultsWorkflowState() {
     state.fuzzerResultsWorkflow = {
       sessionId, status: "all", minBytes: "", maxBytes: "", minMs: "", maxMs: "",
       sort: "index", direction: "asc", runs: [], selectedRunId: "", listGeneration: 0,
-      readGeneration: 0, listBusy: false, readBusy: false, notice: "Refresh to list retained runs in this session.",
+      readGeneration: 0, listBusy: false, readBusy: false, invalidInputs: {}, notice: "Refresh to list retained runs in this session.",
       compareGeneration: null,
     };
   }
@@ -15280,8 +15280,29 @@ function fuzzerResultMetric(value) {
   return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
 }
 
+function fuzzerResultFilterValidation(view = fuzzerResultsWorkflowState()) {
+  const errors = {};
+  const labels = { minBytes: "Minimum bytes", maxBytes: "Maximum bytes", minMs: "Minimum duration", maxMs: "Maximum duration" };
+  for (const [field, label] of Object.entries(labels)) {
+    const raw = String(view[field] || "").trim();
+    const value = Number(raw);
+    if (view.invalidInputs?.[field] || (raw && (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER
+      || (field.endsWith("Bytes") && !Number.isInteger(value))))) {
+      errors[field] = `${label} must be a non-negative ${field.endsWith("Bytes") ? "whole number" : "number"} within the safe numeric range.`;
+    }
+  }
+  for (const [min, max, label] of [["minBytes", "maxBytes", "bytes"], ["minMs", "maxMs", "duration"]]) {
+    if (!errors[min] && !errors[max] && String(view[min] || "").trim() && String(view[max] || "").trim()
+      && Number(view[min]) > Number(view[max])) {
+      errors[min] = errors[max] = `Minimum ${label} cannot exceed maximum ${label}.`;
+    }
+  }
+  return { valid: !Object.keys(errors).length, errors, message: [...new Set(Object.values(errors))].join(" ") };
+}
+
 function visibleFuzzerResults() {
   const view = fuzzerResultsWorkflowState();
+  if (!fuzzerResultFilterValidation(view).valid) return [];
   const minBytes = fuzzerResultMetric(view.minBytes), maxBytes = fuzzerResultMetric(view.maxBytes);
   const minMs = fuzzerResultMetric(view.minMs), maxMs = fuzzerResultMetric(view.maxMs);
   const inRange = (value, min, max) => (min == null && max == null)
@@ -15317,7 +15338,10 @@ function initFuzzerResultsWorkflow() {
   for (const [id, field] of Object.entries(fields)) {
     const input = els[id];
     input?.addEventListener(["status", "sort", "direction"].includes(field) ? "change" : "input", () => {
-      fuzzerResultsWorkflowState()[field] = input.value;
+      const workflow = fuzzerResultsWorkflowState();
+      workflow[field] = input.value;
+      workflow.invalidInputs ||= {};
+      workflow.invalidInputs[field] = !!(input.validity?.badInput || input.validity?.stepMismatch);
       const shell = fuzzerResultsShell();
       if (shell) shell.scrollTop = 0;
       renderFuzzerResultsVirtual();
@@ -15347,15 +15371,24 @@ function fuzzerSelectedTransactionId() {
 
 function renderFuzzerResultsWorkflow() {
   const workflow = fuzzerResultsWorkflowState();
+  const validation = fuzzerResultFilterValidation(workflow);
   const fields = {
     fuzzerResultStatus: "status", fuzzerResultMinBytes: "minBytes", fuzzerResultMaxBytes: "maxBytes",
     fuzzerResultMinMs: "minMs", fuzzerResultMaxMs: "maxMs", fuzzerResultSort: "sort", fuzzerResultDirection: "direction",
   };
   for (const [id, field] of Object.entries(fields)) {
-    if (els[id] && els[id].value !== workflow[field]) els[id].value = workflow[field];
+    const input = els[id];
+    if (!input) continue;
+    if (input.value !== workflow[field] || (!workflow.invalidInputs?.[field] && input.validity?.badInput)) input.value = workflow[field];
+    if (["minBytes", "maxBytes", "minMs", "maxMs"].includes(field)) {
+      input.setAttribute("aria-invalid", validation.errors[field] ? "true" : "false");
+      input.setCustomValidity?.(validation.errors[field] || "");
+    }
   }
   if (els.fuzzerResultFilterCount) {
-    els.fuzzerResultFilterCount.textContent = `${visibleFuzzerResults().length} of ${jsonArray(state.fuzzerAttackRecord?.results).length} results`;
+    els.fuzzerResultFilterCount.textContent = validation.valid
+      ? `${visibleFuzzerResults().length} of ${jsonArray(state.fuzzerAttackRecord?.results).length} results`
+      : `Invalid filters: ${validation.message}`;
   }
   const transactionId = fuzzerSelectedTransactionId();
   if (els.fuzzerCompareBaseButton) els.fuzzerCompareBaseButton.disabled = !transactionId;
@@ -15571,8 +15604,10 @@ function renderFuzzerResultsVirtual() {
     return;
   }
   if (!results.length) {
-    renderEmptyFuzzerResults(jsonArray(state.fuzzerAttackRecord?.results).length
-      ? "No results match these filters." : "No fuzzer results are available for this run.");
+    const validation = fuzzerResultFilterValidation();
+    renderEmptyFuzzerResults(!validation.valid ? `Fix the result filters. ${validation.message}`
+      : jsonArray(state.fuzzerAttackRecord?.results).length
+        ? "No results match these filters." : "No fuzzer results are available for this run.");
     return;
   }
   const shell = fuzzerResultsShell();

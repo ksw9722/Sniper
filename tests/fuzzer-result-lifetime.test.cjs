@@ -50,7 +50,7 @@ function fixture() {
   vm.runInNewContext(`Object.assign(state, {${appSource.slice(appSource.indexOf('  fuzzerBaseRequest: null,'), appSource.indexOf('  oastTokenClearPending:'))}})`, { state });
   let saves = 0;
   const c = loadFunctions([
-    'fuzzerResultsWorkflowState', 'fuzzerResultMetric', 'visibleFuzzerResults', 'renderFuzzerResultsWorkflow',
+    'fuzzerResultsWorkflowState', 'fuzzerResultMetric', 'fuzzerResultFilterValidation', 'visibleFuzzerResults', 'renderFuzzerResultsWorkflow',
     'fuzzerSelectedTransactionId', 'cancelPendingFuzzerComparison',
     'currentSessionId', 'sessionQueryPath', 'transactionPath', 'jsonArray', 'escapeHtml', 'formatStatus', 'formatSize',
     'renderFuzzer', 'fuzzerSelectionKeyForResult', 'fuzzerSelectedResultIndex', 'fuzzerResultsShell',
