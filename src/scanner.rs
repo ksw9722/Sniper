@@ -1441,15 +1441,6 @@ fn check_cookie_flags(record: &TransactionRecord, findings: &mut Vec<ScannerFind
         if !cookie_requires_security_flags(cookie_name, cookie_value) {
             continue;
         }
-        // An ad or analytics service's own cookie, named by the map's cookie
-        // rules (`everest_session_v2` is Adobe Advertising's), is read by its
-        // script on purpose; it is not the target's session.
-        if crate::service_map_servers::detect_header("set-cookie", &header.value)
-            .iter()
-            .any(|detection| detection.category == crate::service_map_libraries::ANALYTICS)
-        {
-            continue;
-        }
         let attributes = cookie_attribute_names(&header.value);
 
         if !attributes.contains("httponly") {
@@ -1517,10 +1508,22 @@ fn cookie_requires_security_flags(name: &str, value: &str) -> bool {
 }
 
 fn cookie_looks_auth_sensitive(name: &str, value: &str) -> bool {
-    if is_auth_cookie_name(name) {
-        return true;
+    let value = value.trim().trim_matches('"');
+    if value.is_empty() || value.eq_ignore_ascii_case("null") {
+        return false;
     }
-    looks_like_jwt(&normalize_jwt_token_candidate(value))
+    if !is_auth_cookie_name(name) && !looks_like_jwt(&normalize_jwt_token_candidate(value)) {
+        return false;
+    }
+    // Use the same known analytics-cookie exclusion for cache checks as for
+    // cookie flags. Their session identifiers do not authenticate this user.
+    if crate::service_map_servers::detect_header("set-cookie", &format!("{name}={value}"))
+        .iter()
+        .any(|detection| detection.category == crate::service_map_libraries::ANALYTICS)
+    {
+        return false;
+    }
+    true
 }
 
 fn set_cookie_is_deletion(value: &str) -> bool {
@@ -3068,20 +3071,35 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
         ));
     }
 
-    // Sensitive data in Cache-Control: public
+    // A directive name is significant, not a substring inside an extension
+    // or a quoted field-name list. Multiple field lines form one policy.
     if has_auth {
-        if let Some(cc) = header_value("cache-control") {
-            let cc_lower = cc.to_ascii_lowercase();
-            if cc_lower.contains("public") && !cc_lower.contains("no-store") {
-                findings.push(make_finding(
-                    record,
-                    Severity::Medium,
-                    "misconfig",
-                    "Cache-Control: public on authenticated response",
-                    "Authenticated response has Cache-Control: public, allowing caching of potentially sensitive data.",
-                    format!("Cache-Control: {cc}"),
-                ));
-            }
+        let cache_control: Vec<_> = response
+            .headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("cache-control"))
+            .map(|header| header.value.as_str())
+            .collect();
+        let directives: Vec<_> = cache_control
+            .iter()
+            .flat_map(|value| header_list_members(value))
+            .map(str::trim)
+            .collect();
+        if directives
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("public"))
+            && !directives.iter().any(|value| {
+                value.eq_ignore_ascii_case("no-store") || value.eq_ignore_ascii_case("private")
+            })
+        {
+            findings.push(make_finding(
+                record,
+                Severity::Medium,
+                "misconfig",
+                "Cache-Control: public on authenticated response",
+                "Authenticated response has Cache-Control: public, allowing caching of potentially sensitive data.",
+                format!("Cache-Control: {}", cache_control.join(", ")),
+            ));
         }
     }
 }
@@ -3341,7 +3359,8 @@ fn check_info_disclosure(record: &TransactionRecord, findings: &mut Vec<ScannerF
     }
 
     // HTML comments with sensitive keywords
-    if let Ok(comment_re) = Regex::new(r"<!--[\s\S]{0,500}?-->") {
+    if response_can_contain_html_comments(record, response) {
+        let comment_re = Regex::new(r"<!--[\s\S]{0,500}?-->").unwrap();
         for m in comment_re.find_iter(body) {
             let comment = m.as_str().to_ascii_lowercase();
             if let Some(keyword) = sensitive_html_comment_keyword(&comment) {
@@ -3615,6 +3634,24 @@ fn push_source_map_header_finding(
     }
 }
 
+fn response_can_contain_html_comments(
+    record: &TransactionRecord,
+    response: &MessageRecord,
+) -> bool {
+    if let Some(content_type) = response
+        .header_value("content-type")
+        .or(response.content_type.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        let essence = content_type.split(';').next().unwrap_or("").trim();
+        // An HTML error page can be served at a .js path; conversely a MIME
+        // parameter containing "text/html" does not make JSON into HTML.
+        return essence.eq_ignore_ascii_case("text/html")
+            || essence.eq_ignore_ascii_case("application/xhtml+xml");
+    }
+    !javascript_or_css_response(record, response) && is_html_page_response(response)
+}
+
 fn sensitive_html_comment_keyword(comment_lower: &str) -> Option<&'static str> {
     const SENSITIVE_KEYWORDS: &[&str] = &[
         "password",
@@ -3628,7 +3665,7 @@ fn sensitive_html_comment_keyword(comment_lower: &str) -> Option<&'static str> {
         "debug",
     ];
     for keyword in SENSITIVE_KEYWORDS {
-        if comment_lower.contains(keyword) {
+        if contains_comment_keyword(comment_lower, keyword) {
             return Some(*keyword);
         }
     }
@@ -3637,13 +3674,41 @@ fn sensitive_html_comment_keyword(comment_lower: &str) -> Option<&'static str> {
         &["todo", "fixme", "hack", "bug", "temporary", "remove before"];
     DEV_NOTE_KEYWORDS
         .iter()
-        .find(|keyword| comment_lower.contains(**keyword))
+        .find(|keyword| contains_comment_keyword(comment_lower, keyword))
         .copied()
         .filter(|_| {
             ["auth", "login", "session", "role", "permission", "prod"]
                 .iter()
-                .any(|context| comment_lower.contains(context))
+                .any(|context| contains_comment_keyword(comment_lower, context))
         })
+}
+
+fn contains_comment_keyword(comment: &str, keyword: &str) -> bool {
+    let aliases: &[&str] = match keyword {
+        "password" => &["password", "passwords"],
+        "secret" => &["secret", "secrets"],
+        "credential" => &["credential", "credentials"],
+        "token" => &["token", "tokens"],
+        "auth" => &["auth", "authentication", "authorization"],
+        "role" => &["role", "roles"],
+        "permission" => &["permission", "permissions"],
+        "prod" => &["prod", "production"],
+        _ => &[keyword],
+    };
+    aliases.iter().any(|keyword| {
+        comment.match_indices(keyword).any(|(index, _)| {
+            // Underscores delimit names such as access_token or db_password.
+            let is_word = |ch: char| ch.is_alphanumeric();
+            comment[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !is_word(ch))
+                && comment[index + keyword.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !is_word(ch))
+        })
+    })
 }
 
 // ── Exposures the Service Map names ──
@@ -3857,22 +3922,54 @@ fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFindi
         }
     }
 
-    // WWW-Authenticate header reveals auth scheme
-    if let Some(response) = &record.response {
-        if let Some(www_auth) = response.header_value("www-authenticate") {
-            let wa_lower = www_auth.to_ascii_lowercase();
-            if wa_lower.contains("basic") && record.scheme == "http" {
+    if record.scheme == "http" {
+        if let Some(response) = &record.response {
+            for header in &response.headers {
+                if !header.name.eq_ignore_ascii_case("www-authenticate")
+                    || !header_list_members(&header.value).iter().any(|member| {
+                        let (scheme, rest) = member
+                            .split_once(char::is_whitespace)
+                            .unwrap_or((member, ""));
+                        scheme.eq_ignore_ascii_case("basic") && !rest.trim_start().starts_with('=')
+                    })
+                {
+                    continue;
+                }
                 findings.push(make_finding(
                     record,
                     Severity::Medium,
                     "auth",
                     "Server requests Basic auth over HTTP",
                     "WWW-Authenticate header requests Basic authentication over unencrypted HTTP.",
-                    format!("WWW-Authenticate: {www_auth}"),
+                    format!("WWW-Authenticate: {}", header.value),
                 ));
+                break;
             }
         }
     }
+}
+
+/// Commas in quoted header parameters belong to that value, not to a new
+/// challenge or directive (for example Digest realm="basic, account").
+fn header_list_members(value: &str) -> Vec<&str> {
+    let mut members = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            members.push(value[start..index].trim());
+            start = index + 1;
+        }
+    }
+    members.push(value[start..].trim());
+    members
 }
 
 fn is_external_redirect_location(location: &str, request_scheme: &str, request_host: &str) -> bool {
@@ -7709,5 +7806,327 @@ mod tests {
             !findings.iter().any(|finding| finding.category == "cookie"),
             "a load balancer's cookie is not a session token"
         );
+    }
+
+    fn findings_for_rule(record: &TransactionRecord, rule_id: &str) -> Vec<ScannerFinding> {
+        let mut config = ScannerConfig::default();
+        for &(id, _) in BUILTIN_RULES {
+            config.rules.insert(id.to_string(), id == rule_id);
+        }
+        scan_transaction(record, &config)
+    }
+
+    #[test]
+    fn comment_keywords_require_word_boundaries_in_html() {
+        for comment in [
+            "tokenization component",
+            "secretary contact section",
+            "internalization notes",
+            "debugger display label",
+            "TODO: update product badge",
+            "FIXME: repair author biography",
+        ] {
+            let body = format!("<html><!-- {comment} --></html>");
+            let record = make_record(vec![], vec![], &body, 200);
+            assert!(findings_for_rule(&record, "info").is_empty(), "{comment}");
+        }
+        for comment in [
+            "TODO: remove admin password check",
+            "internal: /admin/recovery",
+            "api_key: Ab19Cd28Ef37Gh46Ij55",
+            "FIXME: auth bypass remains enabled",
+            "token = Ab19Cd28Ef37Gh46Ij55",
+            "access_token = Ab19Cd28Ef37Gh46Ij55",
+            "client_secret = Ab19Cd28Ef37Gh46Ij55",
+            "db_password = Ab19Cd28Ef37Gh46Ij55",
+            "credentials for recovery",
+            "TODO: verify authorization rules",
+            "TODO: remove before production",
+        ] {
+            let body = format!("<html><!-- {comment} --></html>");
+            let record = make_record(vec![], vec![], &body, 200);
+            let found = findings_for_rule(&record, "info");
+            assert!(
+                found
+                    .iter()
+                    .any(|finding| finding.title.starts_with("HTML comment contains")),
+                "{comment}"
+            );
+        }
+    }
+
+    #[test]
+    fn html_comment_markers_in_non_html_content_are_not_comments() {
+        for content_type in [
+            "application/javascript",
+            "text/css",
+            "application/json",
+            "text/plain",
+            "application/json; profile=\"text/html\"",
+        ] {
+            let mut record = make_record(
+                vec![],
+                vec![("content-type", content_type)],
+                r#"const template = "<!-- password field -->";"#,
+                200,
+            );
+            record.response.as_mut().unwrap().content_type = Some(content_type.into());
+            assert!(
+                findings_for_rule(&record, "info").is_empty(),
+                "{content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn html_comments_follow_mime_essence_before_path_or_parameters() {
+        for content_type in [
+            "text/html",
+            "application/xhtml+xml",
+            "text/html; note=\"javascript\"",
+        ] {
+            let mut record = make_record(
+                vec![],
+                vec![("content-type", content_type)],
+                "<html><!-- credentials for recovery --></html>",
+                200,
+            );
+            record.path = "/bundle.js".into();
+            let findings = findings_for_rule(&record, "info");
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.title.starts_with("HTML comment contains")),
+                "{content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_auth_challenge_requires_an_actual_scheme_not_parameter_copy() {
+        for challenge in [
+            r#"Digest realm="basic account", nonce="abc123""#,
+            r#"Bearer error_description="basic authentication is disabled""#,
+            r#"Digest realm="member, Basic account", nonce="abc123""#,
+            r#"Digest realm="member\", Basic account", nonce="abc123""#,
+            r#"Digest realm="member", basic=enabled"#,
+            r#"Digest realm="member", basic = enabled"#,
+            "Digest realm=member, basic\t=enabled",
+            r#"NotBasic realm="member""#,
+        ] {
+            let mut record = make_record(vec![], vec![("www-authenticate", challenge)], "", 401);
+            record.scheme = "http".into();
+            assert!(findings_for_rule(&record, "auth").is_empty(), "{challenge}");
+        }
+        for challenge in [
+            r#"Basic realm="member""#,
+            r#"bAsIc realm="member""#,
+            "Basic\trealm=member",
+            r#"Digest realm="member\\", Basic realm="fallback""#,
+            r#"Digest realm="member, account", nonce="abc123", Basic realm="fallback""#,
+        ] {
+            let mut record = make_record(vec![], vec![("www-authenticate", challenge)], "", 401);
+            record.scheme = "http".into();
+            assert!(
+                findings_for_rule(&record, "auth")
+                    .iter()
+                    .any(|finding| finding.title == "Server requests Basic auth over HTTP"),
+                "{challenge}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_auth_challenge_checks_multiple_fields_and_transport() {
+        let mut record = make_record(
+            vec![],
+            vec![
+                ("www-authenticate", r#"Bearer realm="member""#),
+                ("www-authenticate", r#"Basic realm="fallback""#),
+            ],
+            "",
+            401,
+        );
+        assert!(
+            findings_for_rule(&record, "auth").is_empty(),
+            "HTTPS is not cleartext"
+        );
+        record.scheme = "http".into();
+        let findings = findings_for_rule(&record, "auth");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "Server requests Basic auth over HTTP");
+        assert!(findings[0].evidence.contains("fallback"));
+    }
+
+    #[test]
+    fn cache_public_requires_exact_directives_and_honors_restrictions() {
+        for cache_control in [
+            "x-public-cache=enabled, max-age=60",
+            "private=\"x-public-id\", max-age=60",
+            "public, no-store",
+            "public, private",
+            "public=false, max-age=60",
+        ] {
+            let record = make_record(
+                vec![("cookie", "session=Ab19Cd28Ef37Gh46")],
+                vec![("cache-control", cache_control)],
+                r#"{"private":true}"#,
+                200,
+            );
+            assert!(
+                findings_for_rule(&record, "misconfig").is_empty(),
+                "{cache_control}"
+            );
+        }
+        for cache_control in [
+            "public, max-age=60",
+            "PUBLIC, MAX-AGE=60",
+            "public, x-no-store=disabled",
+            "public, private=\"x-no-store, x-public-id\"",
+        ] {
+            let record = make_record(
+                vec![("cookie", "session=Ab19Cd28Ef37Gh46")],
+                vec![("cache-control", cache_control)],
+                r#"{"private":true}"#,
+                200,
+            );
+            assert!(
+                findings_for_rule(&record, "misconfig")
+                    .iter()
+                    .any(|finding| finding.title
+                        == "Cache-Control: public on authenticated response"),
+                "{cache_control}"
+            );
+        }
+        let record = make_record(
+            vec![("cookie", "session=Ab19Cd28Ef37Gh46")],
+            vec![("cache-control", "public"), ("cache-control", "no-store")],
+            r#"{"private":true}"#,
+            200,
+        );
+        assert!(
+            findings_for_rule(&record, "misconfig").is_empty(),
+            "multiple Cache-Control fields share restrictions"
+        );
+    }
+
+    #[test]
+    fn cache_auth_context_excludes_empty_and_known_analytics_cookies() {
+        for cookie in [
+            "session=",
+            "session=null",
+            "session=\"\"",
+            "everest_session_v2=Ab19Cd28Ef37Gh46",
+        ] {
+            let record = make_record(vec![("cookie", cookie)], vec![], r#"{"ok":true}"#, 200);
+            assert!(
+                findings_for_rule(&record, "misconfig").is_empty(),
+                "{cookie}"
+            );
+            let record = make_record(vec![], vec![("set-cookie", cookie)], r#"{"ok":true}"#, 200);
+            assert!(
+                findings_for_rule(&record, "misconfig").is_empty(),
+                "Set-Cookie: {cookie}"
+            );
+        }
+        for cookie in [
+            "session=Ab19Cd28Ef37Gh46",
+            "session=Ab19Cd28Ef37Gh46; everest_session_v2=Ab19Cd28Ef37Gh46",
+        ] {
+            let record = make_record(vec![("cookie", cookie)], vec![], r#"{"private":true}"#, 200);
+            assert!(
+                findings_for_rule(&record, "misconfig")
+                    .iter()
+                    .any(|finding| finding.title
+                        == "Missing Cache-Control on authenticated response"),
+                "{cookie}"
+            );
+        }
+    }
+    #[test]
+    fn mixed_cookie_and_cache_fields_keep_real_auth_context() {
+        let record = make_record(
+            vec![],
+            vec![
+                ("set-cookie", "everest_session_v2=Ab19Cd28Ef37Gh46"),
+                ("set-cookie", "session=Ab19Cd28Ef37Gh46"),
+            ],
+            r#"{"private":true}"#,
+            200,
+        );
+        assert!(findings_for_rule(&record, "misconfig")
+            .iter()
+            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+        let record = make_record(
+            vec![("cookie", "session=Ab19Cd28Ef37Gh46")],
+            vec![("cache-control", "public"), ("cache-control", "private")],
+            r#"{"private":true}"#,
+            200,
+        );
+        assert!(findings_for_rule(&record, "misconfig").is_empty());
+    }
+
+    #[test]
+    fn comment_context_preserves_sniffed_html_and_metadata_xhtml() {
+        let mut record = make_record(
+            vec![],
+            vec![],
+            "<html><!-- internal route /admin --></html>",
+            200,
+        );
+        record.response.as_mut().unwrap().content_type = None;
+        assert!(findings_for_rule(&record, "info")
+            .iter()
+            .any(|finding| finding.title.starts_with("HTML comment contains")));
+        record.response.as_mut().unwrap().content_type = Some("application/xhtml+xml".into());
+        assert!(findings_for_rule(&record, "info")
+            .iter()
+            .any(|finding| finding.title.starts_with("HTML comment contains")));
+        let record = make_record(
+            vec![(
+                "cookie",
+                "everest_session_v2=Ab19Cd28Ef37Gh46; session=Ab19Cd28Ef37Gh46",
+            )],
+            vec![],
+            r#"{"private":true}"#,
+            200,
+        );
+        assert!(findings_for_rule(&record, "misconfig")
+            .iter()
+            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+    }
+
+    #[test]
+    fn refined_rules_keep_rescan_filtering_and_issue_deduplication() {
+        let mut config = ScannerConfig::default();
+        for &(id, _) in BUILTIN_RULES {
+            config.rules.insert(id.to_string(), id == "auth");
+        }
+        let mut benign = make_record(
+            vec![],
+            vec![("www-authenticate", r#"Digest realm="basic account""#)],
+            "",
+            401,
+        );
+        benign.scheme = "http".into();
+        let mut positive = make_record(
+            vec![],
+            vec![("www-authenticate", r#"Basic realm="member""#)],
+            "",
+            401,
+        );
+        positive.scheme = "http".into();
+        let mut repeated = positive.clone();
+        repeated.id = Uuid::new_v4();
+        repeated.path = "/another".into();
+        let mut rescan = Rescan::new(config);
+        rescan.scan(&benign);
+        rescan.scan(&positive);
+        rescan.scan(&repeated);
+        let (findings, scanned) = rescan.finish();
+        assert_eq!(scanned.len(), 3);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].record_id, positive.id);
+        assert_eq!(findings[0].title, "Server requests Basic auth over HTTP");
     }
 }
