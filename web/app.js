@@ -1197,6 +1197,8 @@ function setActiveTool(tool, options = {}) {
   const next = sanitizeActiveTool(tool);
   if (next !== state.activeTool) {
     closeScannerSettings(false);
+    // Returning to Fuzzer must not revive reads started before navigation.
+    state._fuzzerNavigationGeneration = (state._fuzzerNavigationGeneration || 0) + 1;
     state._fuzzerImportGeneration = (state._fuzzerImportGeneration || 0) + 1;
   }
   state.activeTool = next;
@@ -15414,13 +15416,16 @@ async function compareSelectedFuzzerResult() {
   const transactionId = fuzzerSelectedTransactionId();
   if (!transactionId || !compareBaseId || compareBaseId === transactionId || compareBaseSessionId !== currentSessionId()) return;
   const workflow = fuzzerResultsWorkflowState();
-  const pending = openCompareModal(transactionId);
+  const navigationGeneration = state._fuzzerNavigationGeneration || 0;
+  const ownsOrigin = () => workflow === state.fuzzerResultsWorkflow
+    && navigationGeneration === (state._fuzzerNavigationGeneration || 0);
+  const pending = openCompareModal(transactionId, ownsOrigin);
   const generation = compareLoadGeneration;
   workflow.compareGeneration = generation;
   try {
     await pending;
   } catch (error) {
-    if (workflow === state.fuzzerResultsWorkflow && generation === compareLoadGeneration) {
+    if (ownsOrigin() && generation === compareLoadGeneration) {
       showToast(error?.message || "Failed to load comparison.", "error", 4000);
     }
   } finally {
@@ -15431,10 +15436,12 @@ async function compareSelectedFuzzerResult() {
 function fuzzerSavedReadOwner(workflow, generation, field) {
   const sessionId = currentSessionId();
   const attackGeneration = _fuzzerAttackLoadGeneration;
+  const navigationGeneration = state._fuzzerNavigationGeneration || 0;
   const draftVersion = state.fuzzerDraftVersion || 0;
   const runToken = state.fuzzerRunToken || 0;
   return () => workflow === state.fuzzerResultsWorkflow && workflow[field] === generation
     && currentSessionId() === sessionId && _fuzzerAttackLoadGeneration === attackGeneration
+    && navigationGeneration === (state._fuzzerNavigationGeneration || 0)
     && (state.fuzzerDraftVersion || 0) === draftVersion && (state.fuzzerRunToken || 0) === runToken;
 }
 
@@ -21891,7 +21898,11 @@ function applyUiSettingsSnapshot(snapshot, { mergeFilterDraft = false } = {}) {
     monoFont: snapshot?.display_settings?.mono_font,
     renderResources: snapshot?.display_settings?.render_resources,
   });
-  state.activeTool = sanitizeActiveTool(snapshot?.active_tool);
+  const activeTool = sanitizeActiveTool(snapshot?.active_tool);
+  if (activeTool !== state.activeTool) {
+    state._fuzzerNavigationGeneration = (state._fuzzerNavigationGeneration || 0) + 1;
+  }
+  state.activeTool = activeTool;
   state.activeProxyTab = sanitizeActiveProxyTab(snapshot?.active_proxy_tab);
   state.historyColumnWidths = sanitizeHistoryColumnWidths(snapshot?.history_column_widths);
   state.historyColumnOrder = sanitizeHistoryColumnOrder(snapshot?.history_column_order);
@@ -27141,7 +27152,7 @@ async function setCompareBase(transactionId) {
   if (btn) btn.textContent = sequence == null ? "Compare with base" : `Compare with #${sequence}`;
 }
 
-async function openCompareModal(targetId) {
+async function openCompareModal(targetId, ownsOrigin = () => true) {
   const generation = ++compareLoadGeneration;
   const baseId = compareBaseId;
   if (!baseId || baseId === targetId) return;
@@ -27155,7 +27166,7 @@ async function openCompareModal(targetId) {
     fetch(transactionPath(targetId, sessionId)).then((r) => r.ok ? r.json() : null),
   ]);
   // A dismissed or superseded comparison must not reopen from a late response.
-  if (generation !== compareLoadGeneration || currentSessionId() !== sessionId) return;
+  if (generation !== compareLoadGeneration || currentSessionId() !== sessionId || !ownsOrigin()) return;
   if (!baseRes || !targetRes) return;
   const modal = document.getElementById("compareModal");
   // A currently open dialog takes precedence over a delayed Compare reveal.

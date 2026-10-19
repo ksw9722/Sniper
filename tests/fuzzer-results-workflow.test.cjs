@@ -49,12 +49,13 @@ function fixture() {
     'normalizeFuzzerAttackRecord', 'setFuzzerAttackRecord', 'clearFuzzerAttackRecord', 'showFuzzerResultDetail', 'hideFuzzerDetailPanel',
     'clearFuzzerResponsePane', 'invalidateFuzzerRun', 'resetFuzzer', 'updateFuzzerRequestText', 'updateFuzzerPayloadsText', 'markFuzzerDraftChanged',
     'requireOkResponse', 'readApiErrorMessage', 'cloneEditableRequest', 'buildEditableRawRequest', 'normalizedHeaders', 'mergeHeaders', 'headerNameEquals',
-    'setCompareBase', 'openCompareModal', 'splitFuzzerPayloadLines',
+    'setCompareBase', 'openCompareModal', 'closeCompareModal', 'splitFuzzerPayloadLines', 'setActiveTool',
   ], { state, els, TextEncoder, document: { getElementById: id => els[id], activeElement: null },
     _fuzzerAttackLoadGeneration: 0, _fuzzerDetailGeneration: 0,
     compareBaseId: null, compareBaseSessionId: null, compareLoadGeneration: 0,
     compareBaseRecord: null, compareTargetRecord: null, compareActiveTab: 'request', compareReturnFocus: null,
     measuredFuzzerResultRowHeight: 30, FUZZER_RESULT_ROW_HEIGHT: 30, FUZZER_RESULT_BUFFER_ROWS: 1,
+    sanitizeActiveTool: value => value, closeScannerSettings() {}, scheduleUiSettingsSave() {},
     getCMView: () => null, renderFuzzerRequestHighlight() {}, renderFuzzerDetailPanes() {}, syncFuzzerResponsePreview() {},
     updateCodePaneCM: (key, _, value) => panes.set(key, value), scheduleWorkspaceStateSave: () => saves++,
     showConfirmDialog: (message, confirm, options) => confirmations.push({ message, confirm, options }),
@@ -287,4 +288,123 @@ test('browser badInput is not treated as an empty filter and clears after correc
   f.els.fuzzerResultMaxBytes.validity = { badInput: false };
   f.setFilter('fuzzerResultMaxBytes', '1');
   assert.deepEqual(indexes(f), [0, 1]);
+});
+
+// Navigation is an ownership boundary even when the user returns to Fuzzer.
+for (const action of ['view', 'reuse', 'refresh']) for (const bounce of [false, true]) {
+  test(`delayed ${action} ignores tool navigation${bounce ? ' and return' : ''}`, async () => {
+    const f = fixture(); f.state.activeTool = 'fuzzer'; f.pick('run-b');
+    const pending = action === 'refresh' ? f.c.refreshFuzzerSavedRuns() : f.c.readFuzzerSavedRun(action);
+    const request = f.requests.at(-1), before = draft(f.state);
+    f.c.setActiveTool('replay'); if (bounce) f.c.setActiveTool('fuzzer');
+    request.resolve(response(action === 'refresh' ? [{ id: 'run-b' }] : run('run-b'))); await pending;
+    assert.equal(f.confirmations.length, 0); assert.equal(draft(f.state), before);
+    assert.equal(f.state.fuzzerAttackRecordId, 'run-a');
+    assert.equal(f.c.fuzzerResultsWorkflowState().runs.length, 0);
+    assert.equal(f.c.fuzzerResultsWorkflowState().readBusy, false);
+    assert.equal(f.c.fuzzerResultsWorkflowState().listBusy, false);
+  });
+}
+for (const outcome of ['success', 'failure']) for (const boundary of ['leave', 'return', 'session', 'cancel', 'reselect']) {
+  test(`pending Fuzzer Compare ${outcome} is ignored after ${boundary}`, async () => {
+    const f = fixture(); f.state.activeTool = 'fuzzer';
+    f.select(0).resolve(response({ id: 'tx-0' })); await tick(); await f.c.useFuzzerComparisonBase();
+    f.select(1).resolve(response({ id: 'tx-1' })); await tick();
+    const pending = f.c.compareSelectedFuzzerResult(), requests = f.requests.slice(-2);
+    if (boundary === 'leave' || boundary === 'return') {
+      f.c.setActiveTool('replay'); if (boundary === 'return') f.c.setActiveTool('fuzzer');
+    }
+    if (boundary === 'session') { f.resetSession('session-b'); f.resetSession('session-a'); }
+    if (boundary === 'cancel') f.c.closeCompareModal();
+    if (boundary === 'reselect') { f.select(0); f.select(1); }
+    if (outcome === 'success') {
+      requests[0].resolve(response({ id: 'tx-0' })); requests[1].resolve(response({ id: 'tx-1' }));
+    } else { requests[0].reject(new Error('Stale compare error.')); requests[1].resolve(response({ id: 'tx-1' })); }
+    await pending;
+    assert.equal(f.compares, 0); assert.equal(f.els.compareModal.classList.contains('hidden'), true);
+    assert.deepEqual(f.toasts, []);
+  });
+}
+test('repeated Compare keeps only latest read, and intentional cross-tool comparison still works', async () => {
+  const f = fixture(); f.state.activeTool = 'fuzzer';
+  f.select(0).resolve(response({ id: 'tx-0' })); await tick(); await f.c.useFuzzerComparisonBase();
+  f.select(1).resolve(response({ id: 'tx-1' })); await tick();
+  const first = f.c.compareSelectedFuzzerResult(), old = f.requests.slice(-2);
+  const second = f.c.compareSelectedFuzzerResult(), latest = f.requests.slice(-2);
+  latest[0].resolve(response({ id: 'tx-0' })); latest[1].resolve(response({ id: 'tx-1' })); await second;
+  old[0].resolve(response({ id: 'tx-0' })); old[1].resolve(response({ id: 'tx-1' })); await first;
+  assert.equal(f.compares, 1);
+  f.c.setActiveTool('replay');
+  const direct = f.c.openCompareModal('tx-2'), cross = f.requests.slice(-2);
+  cross[0].resolve(response({ id: 'tx-0' })); cross[1].resolve(response({ id: 'tx-2' })); await direct;
+  assert.equal(f.compares, 2);
+});
+test('Reuse confirmation cannot replace draft after leaving and returning', async () => {
+  const f = fixture(); f.state.activeTool = 'fuzzer'; f.pick('run-b');
+  const pending = f.reuse(); f.requests.at(-1).resolve(response(run('run-b'))); await pending;
+  const before = draft(f.state); f.c.setActiveTool('replay'); f.c.setActiveTool('fuzzer');
+  f.confirmations[0].confirm(); assert.equal(draft(f.state), before);
+});
+
+for (const action of ['view', 'reuse', 'refresh']) for (const outcome of ['success', 'failure']) {
+  test(`delayed ${action} JSON ${outcome} is ignored after leaving and returning`, async () => {
+    const f = fixture(); f.state.activeTool = 'fuzzer'; f.pick('run-b');
+    const pending = action === 'refresh' ? f.c.refreshFuzzerSavedRuns() : f.c.readFuzzerSavedRun(action);
+    const body = deferred(); f.requests.at(-1).resolve({ ok: true, status: 200, json: () => body.promise }); await tick();
+    const before = draft(f.state); f.c.setActiveTool('replay'); f.c.setActiveTool('fuzzer');
+    if (outcome === 'failure') body.reject(new Error('Stale saved run body.'));
+    else body.resolve(action === 'refresh' ? [{ id: 'run-b' }] : run('run-b'));
+    await pending;
+    assert.equal(f.confirmations.length, 0); assert.equal(draft(f.state), before);
+    assert.equal(f.state.fuzzerAttackRecordId, 'run-a');
+    assert.equal(f.c.fuzzerResultsWorkflowState().runs.length, 0);
+    assert.doesNotMatch(f.els.fuzzerSavedRunNotice.textContent, /Stale/);
+  });
+}
+
+function wireSettingsSnapshot(f) {
+  // Appearance/layout work is inert; navigation uses the full production function.
+  const source = appSource.match(/^function applyUiSettingsSnapshot\([^]*?^\}/m)[0];
+  for (const name of ['updateUiSettingsServerRevision', 'sanitizeDisplaySettings', 'sanitizeActiveProxyTab',
+    'sanitizeHistoryColumnWidths', 'sanitizeHistoryColumnOrder', 'sanitizeHttpQuery', 'sanitizeHttpMethod',
+    'sanitizeHttpSortKey', 'sanitizeHttpSortDirection', 'sanitizeHttpFilterSettings', 'sanitizeWorkbenchHeight',
+    'sanitizeWorkbenchPaneWidths', 'sanitizeWebsocketPaneWidth', 'sanitizeServiceMapDetailWidth', 'applyServiceMapDetailWidth',
+    'sanitizeWebsocketQuery', 'sanitizeWebsocketSortKey', 'sanitizeWebsocketSortDirection', 'sanitizeWebsocketStackHeight',
+    'sanitizeWsReplayLeftWidth', 'sanitizeWsReplayFrameDetailHeight', 'hydrateFilterForm', 'syncColorTagFilterUI',
+    'syncHttpInScopePill', 'syncHttpCapturePill', 'hydrateDisplaySettingsForm', 'previewDisplaySettingsFromForm',
+    'applyDisplaySettingsState', 'renderHistoryHeader', 'applyHistoryColumnWidths', 'applyWsColumnWidths',
+    'updateWebsocketSortIndicators', 'applySavedWorkbenchPaneWidths', 'applySavedWebsocketPaneWidth',
+    'applySavedWebsocketStackHeight', 'applySavedWsReplayLayout', 'applyWorkbenchStackHeight']) f.c[name] = value => value;
+  f.c.isModalVisible = () => false;
+  f.c.displaySettingsReady = false; f.c.displaySettingsPreviewActive = false;
+  vm.runInContext(source, f.c);
+}
+for (const action of ['view', 'reuse', 'refresh', 'compare']) for (const bounce of [false, true]) {
+  test(`settings-snapshot navigation fences ${action}${bounce ? ' after return' : ''}`, async () => {
+    const f = fixture(); f.state.activeTool = 'fuzzer'; wireSettingsSnapshot(f);
+    let pending, requests;
+    if (action === 'compare') {
+      f.select(0).resolve(response({ id: 'tx-0' })); await tick(); await f.c.useFuzzerComparisonBase();
+      f.select(1).resolve(response({ id: 'tx-1' })); await tick();
+      pending = f.c.compareSelectedFuzzerResult(); requests = f.requests.slice(-2);
+    } else {
+      f.pick('run-b'); pending = action === 'refresh' ? f.c.refreshFuzzerSavedRuns() : f.c.readFuzzerSavedRun(action);
+      requests = [f.requests.at(-1)];
+    }
+    f.c.applyUiSettingsSnapshot({ active_tool: 'replay' });
+    if (bounce) f.c.applyUiSettingsSnapshot({ active_tool: 'fuzzer' });
+    if (action === 'compare') {
+      requests[0].resolve(response({ id: 'tx-0' })); requests[1].resolve(response({ id: 'tx-1' }));
+    } else requests[0].resolve(response(action === 'refresh' ? [{ id: 'run-b' }] : run('run-b')));
+    await pending;
+    assert.equal(f.confirmations.length, 0); assert.equal(f.compares, 0);
+    assert.equal(f.state.fuzzerAttackRecordId, 'run-a');
+    assert.equal(f.c.fuzzerResultsWorkflowState().runs.length, 0);
+  });
+}
+test('same-tool settings snapshot preserves an intentional pending Reuse', async () => {
+  const f = fixture(); f.state.activeTool = 'fuzzer'; wireSettingsSnapshot(f); f.pick('run-b');
+  const pending = f.reuse(); f.c.applyUiSettingsSnapshot({ active_tool: 'fuzzer' });
+  f.requests.at(-1).resolve(response(run('run-b'))); await pending;
+  assert.equal(f.confirmations.length, 1);
 });
