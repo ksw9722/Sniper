@@ -564,6 +564,8 @@ const state = {
 let _historyPagingGeneration = 0;
 let _historyDetailGeneration = 0;
 let _historyDetailLoadingTimer = null;
+let _fuzzerAttackLoadGeneration = 0;
+let _fuzzerDetailGeneration = 0;
 let _websocketLoadGeneration = 0;
 let _websocketDetailGeneration = 0;
 let _eventLogLoadGeneration = 0;
@@ -15313,6 +15315,7 @@ function normalizeFuzzerAttackRecord(record) {
 }
 
 function setFuzzerAttackRecord(record) {
+  _fuzzerAttackLoadGeneration += 1;
   const attackRecord = normalizeFuzzerAttackRecord(record);
   state.fuzzerAttackRecord = attackRecord;
   state.fuzzerAttackRecordId = typeof attackRecord?.id === "string" && attackRecord.id
@@ -15322,8 +15325,7 @@ function setFuzzerAttackRecord(record) {
 }
 
 function clearFuzzerAttackRecord() {
-  state.fuzzerAttackRecord = null;
-  state.fuzzerAttackRecordId = null;
+  setFuzzerAttackRecord(null);
 }
 
 function fuzzerWorkspaceAttackRecordId(fuzzerWS, legacyRecord = null) {
@@ -15335,10 +15337,14 @@ function fuzzerWorkspaceAttackRecordId(fuzzerWS, legacyRecord = null) {
 
 async function hydrateFuzzerAttackRecordById(recordId, sessionId) {
   if (!recordId) return;
+  // IDs alone cannot distinguish an earlier visit to the same saved run.
+  const generation = ++_fuzzerAttackLoadGeneration;
   const expectedSessionId = sessionId || currentSessionId();
+  const ownsLoad = () => generation === _fuzzerAttackLoadGeneration
+    && state.fuzzerAttackRecordId === recordId && currentSessionId() === expectedSessionId;
   try {
     const response = await fetch(sessionQueryPath(`/api/fuzzer/attacks/${encodeURIComponent(recordId)}`, expectedSessionId));
-    if (state.fuzzerAttackRecordId !== recordId || currentSessionId() !== expectedSessionId) {
+    if (!ownsLoad()) {
       return;
     }
     if (response.status === 404) {
@@ -15352,7 +15358,7 @@ async function hydrateFuzzerAttackRecordById(recordId, sessionId) {
     }
     await requireOkResponse(response, "Failed to load saved fuzzer run.");
     const detail = await response.json();
-    if (state.fuzzerAttackRecordId !== recordId || currentSessionId() !== expectedSessionId) {
+    if (!ownsLoad()) {
       return;
     }
     const attackRecord = setFuzzerAttackRecord(detail);
@@ -15364,7 +15370,7 @@ async function hydrateFuzzerAttackRecordById(recordId, sessionId) {
     }
     renderFuzzer();
   } catch (error) {
-    if (state.fuzzerAttackRecordId !== recordId || currentSessionId() !== expectedSessionId) {
+    if (!ownsLoad()) {
       return;
     }
     console.error(error);
@@ -15406,6 +15412,13 @@ function redrawResponsePreviews() {
 /** Show request/response detail for a fuzzer result. */
 async function showFuzzerResultDetail(transactionId, selectionKey = `tx:${transactionId}`) {
   if (!transactionId || !els.fuzzerDetailPanel) return;
+  // Returning to the same row must not revive its older response or error.
+  const generation = ++_fuzzerDetailGeneration;
+  const sessionId = currentSessionId();
+  const attackRecordId = state.fuzzerAttackRecordId;
+  const ownsSelection = () => generation === _fuzzerDetailGeneration
+    && sessionId === currentSessionId() && attackRecordId === state.fuzzerAttackRecordId
+    && state._selectedFuzzerResultKey === selectionKey;
 
   els.fuzzerDetailPanel.classList.remove("hidden");
   const detailResizer = document.getElementById("fuzzerDetailResizer");
@@ -15416,25 +15429,23 @@ async function showFuzzerResultDetail(transactionId, selectionKey = `tx:${transa
   clearFuzzerResponsePane();
 
   try {
-    const sessionId = currentSessionId();
     const resp = await fetch(transactionPath(transactionId, sessionId));
-    if (sessionId !== currentSessionId()) return;
+    if (!ownsSelection()) return;
     if (!resp.ok) {
-      if (state._selectedFuzzerResultKey !== selectionKey) return;
       updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, `Failed to load transaction: ${resp.status}`, { mode: "http" });
       clearFuzzerResponsePane();
       if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
       return;
     }
     const record = await resp.json();
-    if (state._selectedFuzzerResultKey !== selectionKey || sessionId !== currentSessionId()) return;
+    if (!ownsSelection()) return;
 
     // Store for mode switching
     state._fuzzerDetailRecord = record;
 
     renderFuzzerDetailPanes(record);
   } catch (err) {
-    if (state._selectedFuzzerResultKey !== selectionKey) return;
+    if (!ownsSelection()) return;
     updateCodePaneCM("fuzzerDetailReq", els.fuzzerDetailReqCM, `Error: ${err.message}`, { mode: "http" });
     clearFuzzerResponsePane();
     if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
@@ -15499,6 +15510,7 @@ function renderFuzzerDetailPanes(record) {
 }
 
 function hideFuzzerDetailPanel() {
+  _fuzzerDetailGeneration += 1;
   if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.add("hidden");
   const dr = document.getElementById("fuzzerDetailResizer");
   if (dr) dr.classList.add("hidden");
