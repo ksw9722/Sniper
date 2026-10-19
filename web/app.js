@@ -551,6 +551,7 @@ const state = {
   fuzzerRunning: false,
   fuzzerDraftVersion: 0,
   fuzzerRunToken: 0,
+  fuzzerResultsWorkflow: null,
   oastTokenClearPending: false,
   _cachedVisibleEntries: null,
   _cachedVisibleEntriesKey: "",
@@ -920,6 +921,21 @@ const els = {
   fuzzerRequestEditor: document.getElementById("fuzzerRequestEditor"),
   fuzzerPayloadsEditor: document.getElementById("fuzzerPayloadsEditor"),
   fuzzerMeta: document.getElementById("fuzzerMeta"),
+  fuzzerResultStatus: document.getElementById("fuzzerResultStatus"),
+  fuzzerResultMinBytes: document.getElementById("fuzzerResultMinBytes"),
+  fuzzerResultMaxBytes: document.getElementById("fuzzerResultMaxBytes"),
+  fuzzerResultMinMs: document.getElementById("fuzzerResultMinMs"),
+  fuzzerResultMaxMs: document.getElementById("fuzzerResultMaxMs"),
+  fuzzerResultSort: document.getElementById("fuzzerResultSort"),
+  fuzzerResultDirection: document.getElementById("fuzzerResultDirection"),
+  fuzzerResultFilterCount: document.getElementById("fuzzerResultFilterCount"),
+  fuzzerCompareBaseButton: document.getElementById("fuzzerCompareBaseButton"),
+  fuzzerCompareButton: document.getElementById("fuzzerCompareButton"),
+  fuzzerSavedRunSelect: document.getElementById("fuzzerSavedRunSelect"),
+  fuzzerRefreshRunsButton: document.getElementById("fuzzerRefreshRunsButton"),
+  fuzzerViewRunButton: document.getElementById("fuzzerViewRunButton"),
+  fuzzerReuseRunButton: document.getElementById("fuzzerReuseRunButton"),
+  fuzzerSavedRunNotice: document.getElementById("fuzzerSavedRunNotice"),
   fuzzerResultsBody: document.getElementById("fuzzerResultsBody"),
   fuzzerDetailPanel: document.getElementById("fuzzerDetailPanel"),
   fuzzerDetailReqCM: document.getElementById("fuzzerDetailReqCM"),
@@ -2051,6 +2067,7 @@ function bindEvents() {
   // Fuzzer layout resizers
   initFuzzerResizers();
   initFuzzerSetupControls();
+  initFuzzerResultsWorkflow();
 
   // Fuzzer results shell (for keyboard navigation + focus)
   const fuzzerResultsShell = els.fuzzerResultsBody.closest(".history-table-shell");
@@ -2078,7 +2095,7 @@ function bindEvents() {
     fuzzerResultsShell.addEventListener("keydown", (e) => {
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
       e.preventDefault();
-      const totalCount = jsonArray(state.fuzzerAttackRecord?.results).length;
+      const totalCount = visibleFuzzerResults().length;
       if (!totalCount) return;
       const selectedIndex = fuzzerSelectedResultIndex();
       const fallbackIndex = e.key === "ArrowDown" ? 0 : totalCount - 1;
@@ -15188,6 +15205,7 @@ function renderTarget() {
 }
 
 function renderFuzzer() {
+  renderFuzzerResultsWorkflow();
   if (els.fuzzerRequestCM) {
     // CM path
     const cv = getCMView("fuzzerReq");
@@ -15243,6 +15261,272 @@ function renderFuzzer() {
   renderFuzzerResultsVirtual();
 }
 
+function fuzzerResultsWorkflowState() {
+  const sessionId = currentSessionId();
+  if (!state.fuzzerResultsWorkflow || state.fuzzerResultsWorkflow.sessionId !== sessionId) {
+    state.fuzzerResultsWorkflow = {
+      sessionId, status: "all", minBytes: "", maxBytes: "", minMs: "", maxMs: "",
+      sort: "index", direction: "asc", runs: [], selectedRunId: "", listGeneration: 0,
+      readGeneration: 0, listBusy: false, readBusy: false, notice: "Refresh to list retained runs in this session.",
+      compareGeneration: null,
+    };
+  }
+  return state.fuzzerResultsWorkflow;
+}
+
+function fuzzerResultMetric(value) {
+  if (value == null || String(value).trim() === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+}
+
+function visibleFuzzerResults() {
+  const view = fuzzerResultsWorkflowState();
+  const minBytes = fuzzerResultMetric(view.minBytes), maxBytes = fuzzerResultMetric(view.maxBytes);
+  const minMs = fuzzerResultMetric(view.minMs), maxMs = fuzzerResultMetric(view.maxMs);
+  const inRange = (value, min, max) => (min == null && max == null)
+    || (value != null && (min == null || value >= min) && (max == null || value <= max));
+  const entries = jsonArray(state.fuzzerAttackRecord?.results).map((result, sourceIndex) => ({ result, sourceIndex }));
+  const filtered = entries.filter(({ result }) => {
+    const status = fuzzerResultMetric(result.status);
+    if (view.status === "error" && status != null && status > 0) return false;
+    if (/^[2-5]xx$/.test(view.status) && Math.floor((status || 0) / 100) !== Number(view.status[0])) return false;
+    return inRange(fuzzerResultMetric(result.response_bytes), minBytes, maxBytes)
+      && inRange(fuzzerResultMetric(result.duration_ms), minMs, maxMs);
+  });
+  const valueFor = ({ result, sourceIndex }) => {
+    if (view.sort === "status") return fuzzerResultMetric(result.status);
+    if (view.sort === "bytes") return fuzzerResultMetric(result.response_bytes);
+    if (view.sort === "duration") return fuzzerResultMetric(result.duration_ms);
+    return fuzzerResultMetric(result.index) ?? sourceIndex;
+  };
+  filtered.sort((a, b) => {
+    const left = valueFor(a), right = valueFor(b);
+    // Unknown metrics remain at the end in either direction; ties keep run order.
+    if (left == null || right == null) return left == right ? a.sourceIndex - b.sourceIndex : left == null ? 1 : -1;
+    return (left - right) * (view.direction === "desc" ? -1 : 1) || a.sourceIndex - b.sourceIndex;
+  });
+  return filtered;
+}
+
+function initFuzzerResultsWorkflow() {
+  const fields = {
+    fuzzerResultStatus: "status", fuzzerResultMinBytes: "minBytes", fuzzerResultMaxBytes: "maxBytes",
+    fuzzerResultMinMs: "minMs", fuzzerResultMaxMs: "maxMs", fuzzerResultSort: "sort", fuzzerResultDirection: "direction",
+  };
+  for (const [id, field] of Object.entries(fields)) {
+    const input = els[id];
+    input?.addEventListener(["status", "sort", "direction"].includes(field) ? "change" : "input", () => {
+      fuzzerResultsWorkflowState()[field] = input.value;
+      const shell = fuzzerResultsShell();
+      if (shell) shell.scrollTop = 0;
+      renderFuzzerResultsVirtual();
+      renderFuzzerResultsWorkflow();
+    });
+  }
+  els.fuzzerSavedRunSelect?.addEventListener("change", () => {
+    const workflow = fuzzerResultsWorkflowState();
+    workflow.selectedRunId = els.fuzzerSavedRunSelect.value;
+    workflow.readGeneration += 1;
+    workflow.readBusy = false;
+    workflow.notice = "View keeps the current draft. Reuse asks before replacing it.";
+    renderFuzzerResultsWorkflow();
+  });
+  els.fuzzerRefreshRunsButton?.addEventListener("click", () => refreshFuzzerSavedRuns());
+  els.fuzzerViewRunButton?.addEventListener("click", () => readFuzzerSavedRun("view"));
+  els.fuzzerReuseRunButton?.addEventListener("click", () => readFuzzerSavedRun("reuse"));
+  els.fuzzerCompareBaseButton?.addEventListener("click", () => useFuzzerComparisonBase());
+  els.fuzzerCompareButton?.addEventListener("click", () => compareSelectedFuzzerResult());
+}
+
+function fuzzerSelectedTransactionId() {
+  const entry = visibleFuzzerResults()[fuzzerSelectedResultIndex()];
+  const transactionId = entry?.result?.transaction_id;
+  return transactionId && state._fuzzerDetailRecord?.id === transactionId ? transactionId : null;
+}
+
+function renderFuzzerResultsWorkflow() {
+  const workflow = fuzzerResultsWorkflowState();
+  const fields = {
+    fuzzerResultStatus: "status", fuzzerResultMinBytes: "minBytes", fuzzerResultMaxBytes: "maxBytes",
+    fuzzerResultMinMs: "minMs", fuzzerResultMaxMs: "maxMs", fuzzerResultSort: "sort", fuzzerResultDirection: "direction",
+  };
+  for (const [id, field] of Object.entries(fields)) {
+    if (els[id] && els[id].value !== workflow[field]) els[id].value = workflow[field];
+  }
+  if (els.fuzzerResultFilterCount) {
+    els.fuzzerResultFilterCount.textContent = `${visibleFuzzerResults().length} of ${jsonArray(state.fuzzerAttackRecord?.results).length} results`;
+  }
+  const transactionId = fuzzerSelectedTransactionId();
+  if (els.fuzzerCompareBaseButton) els.fuzzerCompareBaseButton.disabled = !transactionId;
+  if (els.fuzzerCompareButton) {
+    els.fuzzerCompareButton.disabled = !transactionId || !compareBaseId
+      || compareBaseSessionId !== currentSessionId() || compareBaseId === transactionId;
+  }
+  if (els.fuzzerSavedRunSelect) {
+    const options = '<option value="">Choose a retained run</option>' + workflow.runs.map((run) => {
+      const label = `${run.started_at || "Saved run"} · ${run.host || ""}${run.path || ""} · ${run.payload_count ?? run.result_count ?? 0} payload(s) · ${run.status || "completed"}`;
+      return `<option value="${escapeHtml(run.id)}">${escapeHtml(label)}</option>`;
+    }).join("");
+    if (els.fuzzerSavedRunSelect.innerHTML !== options) els.fuzzerSavedRunSelect.innerHTML = options;
+    els.fuzzerSavedRunSelect.value = workflow.selectedRunId;
+  }
+  if (els.fuzzerRefreshRunsButton) els.fuzzerRefreshRunsButton.disabled = workflow.listBusy;
+  const unavailable = !workflow.selectedRunId || workflow.readBusy || !!state.fuzzerRunning;
+  if (els.fuzzerViewRunButton) els.fuzzerViewRunButton.disabled = unavailable;
+  if (els.fuzzerReuseRunButton) els.fuzzerReuseRunButton.disabled = unavailable;
+  if (els.fuzzerSavedRunNotice) els.fuzzerSavedRunNotice.textContent = workflow.notice;
+}
+
+function cancelPendingFuzzerComparison() {
+  const workflow = state.fuzzerResultsWorkflow;
+  if (workflow?.compareGeneration != null) {
+    if (workflow.compareGeneration === compareLoadGeneration) compareLoadGeneration += 1;
+    workflow.compareGeneration = null;
+  }
+}
+
+async function useFuzzerComparisonBase() {
+  const transactionId = fuzzerSelectedTransactionId();
+  if (!transactionId) return;
+  await setCompareBase(transactionId);
+  renderFuzzerResultsWorkflow();
+}
+
+async function compareSelectedFuzzerResult() {
+  const transactionId = fuzzerSelectedTransactionId();
+  if (!transactionId || !compareBaseId || compareBaseId === transactionId || compareBaseSessionId !== currentSessionId()) return;
+  const workflow = fuzzerResultsWorkflowState();
+  const pending = openCompareModal(transactionId);
+  const generation = compareLoadGeneration;
+  workflow.compareGeneration = generation;
+  try {
+    await pending;
+  } catch (error) {
+    if (workflow === state.fuzzerResultsWorkflow && generation === compareLoadGeneration) {
+      showToast(error?.message || "Failed to load comparison.", "error", 4000);
+    }
+  } finally {
+    if (workflow.compareGeneration === generation) workflow.compareGeneration = null;
+  }
+}
+
+function fuzzerSavedReadOwner(workflow, generation, field) {
+  const sessionId = currentSessionId();
+  const attackGeneration = _fuzzerAttackLoadGeneration;
+  const draftVersion = state.fuzzerDraftVersion || 0;
+  const runToken = state.fuzzerRunToken || 0;
+  return () => workflow === state.fuzzerResultsWorkflow && workflow[field] === generation
+    && currentSessionId() === sessionId && _fuzzerAttackLoadGeneration === attackGeneration
+    && (state.fuzzerDraftVersion || 0) === draftVersion && (state.fuzzerRunToken || 0) === runToken;
+}
+
+async function refreshFuzzerSavedRuns() {
+  const workflow = fuzzerResultsWorkflowState();
+  if (!workflow.sessionId) return;
+  const generation = ++workflow.listGeneration;
+  const ownsRead = fuzzerSavedReadOwner(workflow, generation, "listGeneration");
+  workflow.listBusy = true;
+  const loadingNotice = "Loading retained runs...";
+  workflow.notice = loadingNotice;
+  renderFuzzerResultsWorkflow();
+  try {
+    const response = await fetch(sessionQueryPath("/api/fuzzer/attacks", workflow.sessionId));
+    if (!ownsRead()) return;
+    await requireOkResponse(response, "Failed to list saved fuzzer runs.");
+    const runs = await response.json();
+    if (!ownsRead()) return;
+    workflow.runs = jsonArray(runs).filter((run) => typeof run?.id === "string" && run.id);
+    if (!workflow.runs.some((run) => run.id === workflow.selectedRunId)) {
+      workflow.selectedRunId = "";
+      workflow.readGeneration += 1;
+      workflow.readBusy = false;
+    }
+    workflow.notice = workflow.runs.length
+      ? `${workflow.runs.length} retained run(s). View keeps the current draft; Reuse asks before replacing it.`
+      : "No retained fuzzer runs are available in this session.";
+  } catch (error) {
+    if (ownsRead()) workflow.notice = error?.message || "Failed to list saved fuzzer runs.";
+  } finally {
+    if (workflow === state.fuzzerResultsWorkflow && workflow.listGeneration === generation) {
+      workflow.listBusy = false;
+      if (workflow.notice === loadingNotice) workflow.notice = "";
+      renderFuzzerResultsWorkflow();
+    }
+  }
+}
+
+async function readFuzzerSavedRun(action) {
+  const workflow = fuzzerResultsWorkflowState();
+  const recordId = workflow.selectedRunId;
+  if (!recordId || !workflow.sessionId || state.fuzzerRunning || !["view", "reuse"].includes(action)) return;
+  // A picker load supersedes workspace hydration without changing the draft or
+  // discarding the currently displayed results before the replacement is ready.
+  _fuzzerAttackLoadGeneration += 1;
+  const generation = ++workflow.readGeneration;
+  const ownsRead = fuzzerSavedReadOwner(workflow, generation, "readGeneration");
+  const ownsSelection = () => ownsRead() && workflow.selectedRunId === recordId;
+  workflow.readBusy = true;
+  const loadingNotice = "Loading saved run...";
+  workflow.notice = loadingNotice;
+  renderFuzzerResultsWorkflow();
+  try {
+    const response = await fetch(sessionQueryPath(`/api/fuzzer/attacks/${encodeURIComponent(recordId)}`, workflow.sessionId));
+    if (!ownsSelection()) return;
+    if (response.status === 404) {
+      workflow.notice = "This saved run is no longer available. Refresh the retained-run list.";
+      return;
+    }
+    await requireOkResponse(response, "Failed to load saved fuzzer run.");
+    const record = normalizeFuzzerAttackRecord(await response.json());
+    if (!ownsSelection()) return;
+    if (!record || record.id !== recordId) throw new Error("Saved-run response did not match the selected run.");
+    if (action === "view") {
+      setFuzzerAttackRecord(record);
+      workflow.notice = "Viewing retained results. Your request, payloads and target are unchanged.";
+      scheduleWorkspaceStateSave();
+      renderFuzzer();
+    } else {
+      if (!record.template || typeof record.template !== "object") throw new Error("This run has no reusable request template.");
+      if (record.results.some((result) => /[\r\n]/.test(String(result.payload ?? "")))) {
+        throw new Error("A saved payload contains a line break and cannot be restored into the one-payload-per-line editor.");
+      }
+      workflow.notice = "Reuse requires confirmation. Original source and transport overrides are not retained.";
+      showConfirmDialog(
+        "Replace the current request and payload draft with this retained run?\n\nThe request is reconstructed from its saved template; original raw formatting, source transaction and target override are unavailable. Any current source and target override will be cleared. A saved template HTTP version is kept when present; otherwise the draft uses HTTP/1.1. The original separate HTTP-version override cannot be recovered. Review the destination and HTTP version before starting. Reuse does not send requests.",
+        () => {
+          if (!ownsSelection()) return;
+          const template = cloneEditableRequest(record.template);
+          if (record.template.http_version) template.http_version = record.template.http_version;
+          invalidateFuzzerRun();
+          state.fuzzerDraftVersion = (state.fuzzerDraftVersion || 0) + 1;
+          state.fuzzerBaseRequest = template;
+          state.fuzzerRequestText = buildEditableRawRequest(template);
+          const payloads = record.results.map((result) => String(result.payload ?? ""));
+          state.fuzzerPayloadsText = payloads.join("\n") + (payloads.at(-1) === "" ? "\n" : "");
+          state.fuzzerSourceTransactionId = null;
+          state.fuzzerTarget = null;
+          state.fuzzerTargetRequestText = null;
+          clearFuzzerAttackRecord();
+          state.fuzzerNotice = "Reused saved template and result payloads. Source and target overrides were cleared; review the destination and HTTP version before starting.";
+          workflow.notice = "Saved run reused as a new draft. No requests were sent.";
+          scheduleWorkspaceStateSave();
+          renderFuzzer();
+        },
+        { title: "Reuse saved fuzzer run?", confirmLabel: "Replace draft" },
+      );
+    }
+  } catch (error) {
+    if (ownsSelection()) workflow.notice = error?.message || "Failed to load saved fuzzer run.";
+  } finally {
+    if (workflow === state.fuzzerResultsWorkflow && workflow.readGeneration === generation) {
+      workflow.readBusy = false;
+      if (workflow.notice === loadingNotice) workflow.notice = "";
+      renderFuzzerResultsWorkflow();
+    }
+  }
+}
+
 function fuzzerSelectionKeyForResult(result, rowIndex) {
   const txId = String(result?.transaction_id || "");
   return txId ? `tx:${txId}` : `row:${rowIndex}`;
@@ -15250,18 +15534,8 @@ function fuzzerSelectionKeyForResult(result, rowIndex) {
 
 function fuzzerSelectedResultIndex() {
   const selectionKey = String(state._selectedFuzzerResultKey || "");
-  if (!selectionKey) {
-    return -1;
-  }
-  if (selectionKey.startsWith("row:")) {
-    const rowIndex = Number(selectionKey.slice(4));
-    return Number.isFinite(rowIndex) ? rowIndex : -1;
-  }
-  if (selectionKey.startsWith("tx:")) {
-    const txId = selectionKey.slice(3);
-    return jsonArray(state.fuzzerAttackRecord?.results).findIndex((result) => result?.transaction_id === txId);
-  }
-  return -1;
+  return selectionKey ? visibleFuzzerResults().findIndex(({ result, sourceIndex }) =>
+    fuzzerSelectionKeyForResult(result, sourceIndex) === selectionKey) : -1;
 }
 
 function fuzzerResultsShell() {
@@ -15282,21 +15556,29 @@ function renderEmptyFuzzerResults(message) {
   }
   state._selectedFuzzerResultKey = null;
   hideFuzzerDetailPanel();
+  renderFuzzerResultsWorkflow();
 }
 
 function renderFuzzerResultsVirtual() {
-  const results = jsonArray(state.fuzzerAttackRecord?.results);
+  const results = visibleFuzzerResults();
   if (!els.fuzzerResultsBody) {
     return;
   }
   if (!results.length) {
-    renderEmptyFuzzerResults("No fuzzer results are available for this run.");
+    renderEmptyFuzzerResults(jsonArray(state.fuzzerAttackRecord?.results).length
+      ? "No results match these filters." : "No fuzzer results are available for this run.");
     return;
   }
   const shell = fuzzerResultsShell();
   if (!shell) {
     return;
   }
+
+  if (state._selectedFuzzerResultKey && fuzzerSelectedResultIndex() < 0) {
+    state._selectedFuzzerResultKey = null;
+    hideFuzzerDetailPanel();
+  }
+  renderFuzzerResultsWorkflow();
 
   const rowHeight = measuredFuzzerResultRowHeight || FUZZER_RESULT_ROW_HEIGHT;
   const viewportHeight = shell.clientHeight || rowHeight;
@@ -15314,12 +15596,12 @@ function renderFuzzerResultsVirtual() {
 
   const rows = [];
   for (let rowIndex = startIdx; rowIndex < endIdx; rowIndex++) {
-    const result = results[rowIndex];
-    const resultIndex = Number.isFinite(Number(result.index)) ? Number(result.index) : rowIndex;
-    const selectionKey = fuzzerSelectionKeyForResult(result, rowIndex);
+    const { result, sourceIndex } = results[rowIndex];
+    const resultIndex = Number.isFinite(Number(result.index)) ? Number(result.index) : sourceIndex;
+    const selectionKey = fuzzerSelectionKeyForResult(result, sourceIndex);
     const selectedClass = state._selectedFuzzerResultKey === selectionKey ? " fuzzer-result-selected" : "";
     rows.push(`
-      <tr class="fuzzer-result-row${selectedClass}" data-transaction-id="${escapeHtml(result.transaction_id || "")}" data-result-index="${resultIndex}" data-row-index="${rowIndex}">
+      <tr class="fuzzer-result-row${selectedClass}" data-transaction-id="${escapeHtml(result.transaction_id || "")}" data-result-index="${resultIndex}" data-row-index="${rowIndex}" data-source-index="${sourceIndex}">
         <td>${resultIndex + 1}</td>
         <td class="cell-url">${escapeHtml(result.payload)}</td>
         <td>${escapeHtml(formatStatus(result.status))}</td>
@@ -15354,13 +15636,14 @@ function scrollFuzzerResultToIndex(rowIndex) {
 }
 
 function selectFuzzerResultIndex(rowIndex, options = {}) {
-  const results = jsonArray(state.fuzzerAttackRecord?.results);
+  const results = visibleFuzzerResults();
   if (rowIndex < 0 || rowIndex >= results.length) {
     return;
   }
-  const result = results[rowIndex];
+  const { result, sourceIndex } = results[rowIndex];
+  cancelPendingFuzzerComparison();
   const txId = String(result?.transaction_id || "");
-  const selectionKey = fuzzerSelectionKeyForResult(result, rowIndex);
+  const selectionKey = fuzzerSelectionKeyForResult(result, sourceIndex);
   state._selectedFuzzerResultKey = selectionKey;
 
   if (options.scroll !== false) {
@@ -15372,6 +15655,7 @@ function selectFuzzerResultIndex(rowIndex, options = {}) {
   if (txId) {
     showFuzzerResultDetail(txId, selectionKey).catch((err) => console.error(err));
   } else {
+    _fuzzerDetailGeneration += 1;
     state._fuzzerDetailRecord = null;
     if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.remove("hidden");
     const detailResizer = document.getElementById("fuzzerDetailResizer");
@@ -15380,6 +15664,7 @@ function selectFuzzerResultIndex(rowIndex, options = {}) {
     clearFuzzerResponsePane();
     if (els.fuzzerDetailResponseMeta) els.fuzzerDetailResponseMeta.textContent = "";
   }
+  renderFuzzerResultsWorkflow();
 }
 
 function selectFuzzerRow(row) {
@@ -15402,6 +15687,8 @@ function normalizeFuzzerAttackRecord(record) {
 
 function setFuzzerAttackRecord(record) {
   _fuzzerAttackLoadGeneration += 1;
+  state._selectedFuzzerResultKey = null;
+  hideFuzzerDetailPanel();
   const attackRecord = normalizeFuzzerAttackRecord(record);
   state.fuzzerAttackRecord = attackRecord;
   state.fuzzerAttackRecordId = typeof attackRecord?.id === "string" && attackRecord.id
@@ -15528,6 +15815,7 @@ async function showFuzzerResultDetail(transactionId, selectionKey = `tx:${transa
 
     // Store for mode switching
     state._fuzzerDetailRecord = record;
+    renderFuzzerResultsWorkflow();
 
     renderFuzzerDetailPanes(record);
   } catch (err) {
@@ -15596,6 +15884,7 @@ function renderFuzzerDetailPanes(record) {
 }
 
 function hideFuzzerDetailPanel() {
+  cancelPendingFuzzerComparison();
   _fuzzerDetailGeneration += 1;
   if (els.fuzzerDetailPanel) els.fuzzerDetailPanel.classList.add("hidden");
   const dr = document.getElementById("fuzzerDetailResizer");

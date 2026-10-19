@@ -132,6 +132,7 @@ for (const duration_ms of [null, 0, 1250]) {
       status: null, duration_ms, response_bytes: 0, note: null });
     const body = node();
     const c = fixture(["renderFuzzerResultsVirtual", "jsonArray", "fuzzerSelectionKeyForResult"], {
+      visibleFuzzerResults: () => [{ result, sourceIndex: 0 }], renderFuzzerResultsWorkflow() {},
       els: { fuzzerResultsBody: body }, state: { fuzzerAttackRecord: { results: [result] } },
       fuzzerResultsShell: () => ({ clientHeight: 100, scrollTop: 0 }),
       measuredFuzzerResultRowHeight: 27, FUZZER_RESULT_ROW_HEIGHT: 27, FUZZER_RESULT_BUFFER_ROWS: 0,

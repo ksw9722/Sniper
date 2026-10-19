@@ -50,6 +50,8 @@ function fixture() {
   vm.runInNewContext(`Object.assign(state, {${appSource.slice(appSource.indexOf('  fuzzerBaseRequest: null,'), appSource.indexOf('  oastTokenClearPending:'))}})`, { state });
   let saves = 0;
   const c = loadFunctions([
+    'fuzzerResultsWorkflowState', 'fuzzerResultMetric', 'visibleFuzzerResults', 'renderFuzzerResultsWorkflow',
+    'fuzzerSelectedTransactionId', 'cancelPendingFuzzerComparison',
     'currentSessionId', 'sessionQueryPath', 'transactionPath', 'jsonArray', 'escapeHtml', 'formatStatus', 'formatSize',
     'renderFuzzer', 'fuzzerSelectionKeyForResult', 'fuzzerSelectedResultIndex', 'fuzzerResultsShell',
     'renderEmptyFuzzerResults', 'renderFuzzerResultsVirtual', 'scrollFuzzerResultToIndex', 'selectFuzzerResultIndex',
@@ -61,6 +63,7 @@ function fixture() {
     'resetFuzzer', 'invalidateFuzzerRun', 'updateFuzzerRequestText', 'markFuzzerDraftChanged',
     'requireOkResponse', 'readApiErrorMessage', 'setActiveTool', 'renderToolPanels',
   ], {
+    compareBaseId: null, compareBaseSessionId: null, compareLoadGeneration: 0,
     state, els, document, mainTabs: [], _fuzzerDetailViewModes: { request: 'raw', response: 'raw' },
     FUZZER_RESULT_ROW_HEIGHT: 30, FUZZER_RESULT_BUFFER_ROWS: 5, measuredFuzzerResultRowHeight: 30,
     console: { error: (...args) => logs.push(args) },
@@ -178,7 +181,8 @@ test('current read errors stay visible and a later selection clears their pendin
 });
 test('selection tracks transaction identity when rendering order changes', async () => {
   const f = fixture(); f.click(0).resolve(response(record())); await tick();
-  f.state.fuzzerAttackRecord.results.reverse(); f.c.renderFuzzerResultsVirtual();
+  f.c.fuzzerResultsWorkflowState().sort = "index";
+  f.c.fuzzerResultsWorkflowState().direction = "desc"; f.c.renderFuzzerResultsVirtual();
   assert.equal(f.c.fuzzerSelectedResultIndex(), 2); assertCurrent(f);
   f.key('ArrowUp'); assert.equal(f.state._selectedFuzzerResultKey, 'tx:saved-tx-b');
 });
