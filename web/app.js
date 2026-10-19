@@ -485,6 +485,12 @@ const state = {
   responseIntercepts: [],
   interceptRules: [],
   interceptQueueTab: "request",
+  interceptLoadGeneration: 0,
+  interceptAcceptedLoadGeneration: 0,
+  interceptDetailGeneration: 0,
+  responseInterceptLoadGeneration: 0,
+  responseInterceptAcceptedLoadGeneration: 0,
+  responseInterceptDetailGeneration: 0,
   selectedInterceptId: null,
   selectedInterceptRecord: null,
   selectedResponseInterceptId: null,
@@ -5053,6 +5059,11 @@ function resetSessionScopedUiState() {
   invalidateVisibleEntriesCache();
   state.intercepts = [];
   state.responseIntercepts = [];
+  // Invalidate reads even when the operator returns to the same session ID.
+  state.interceptAcceptedLoadGeneration = state.interceptLoadGeneration = (state.interceptLoadGeneration || 0) + 1;
+  state.responseInterceptAcceptedLoadGeneration = state.responseInterceptLoadGeneration = (state.responseInterceptLoadGeneration || 0) + 1;
+  state.interceptDetailGeneration = (state.interceptDetailGeneration || 0) + 1;
+  state.responseInterceptDetailGeneration = (state.responseInterceptDetailGeneration || 0) + 1;
   state.interceptRules = [];
   state.selectedInterceptId = null;
   state.selectedInterceptRecord = null;
@@ -6041,12 +6052,23 @@ function copyMenuTargetUrl(target) {
 
 async function loadIntercepts(preserveSelection = true) {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath("/api/intercepts", sessionId));
-  await requireOkResponse(response, "Failed to load intercepted requests.");
-  const intercepts = jsonArray(await response.json());
-  if (sessionId !== currentSessionId()) {
+  const generation = state.interceptLoadGeneration = (state.interceptLoadGeneration || 0) + 1;
+  const isCurrent = () => sessionId === currentSessionId()
+    && generation >= (state.interceptAcceptedLoadGeneration || 0);
+  let intercepts;
+  try {
+    const response = await fetch(sessionQueryPath("/api/intercepts", sessionId));
+    if (!isCurrent()) return;
+    await requireOkResponse(response, "Failed to load intercepted requests.");
+    intercepts = jsonArray(await response.json());
+  } catch (error) {
+    if (isCurrent()) throw error;
     return;
   }
+  if (!isCurrent()) return;
+  // A pending or failed newer poll need not block a usable snapshot, but an
+  // older snapshot must never resurrect a queue after a newer one was accepted.
+  state.interceptAcceptedLoadGeneration = generation;
   state.intercepts = intercepts;
 
   const visibleIntercepts = getVisibleRequestInterceptSummaries();
@@ -6072,22 +6094,25 @@ async function loadIntercepts(preserveSelection = true) {
 
 async function loadInterceptDetail(id) {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath(`/api/intercepts/${id}`, sessionId));
-  if (sessionId !== currentSessionId() || state.selectedInterceptId !== id) {
-    return;
-  }
-  if (!response.ok) {
-    state.selectedInterceptRecord = null;
-    renderIntercepts();
-    return;
-  }
+  const generation = state.interceptDetailGeneration = (state.interceptDetailGeneration || 0) + 1;
+  const isCurrent = () => sessionId === currentSessionId()
+    && state.selectedInterceptId === id && state.interceptDetailGeneration === generation;
+  try {
+    const response = await fetch(sessionQueryPath(`/api/intercepts/${id}`, sessionId));
+    if (!isCurrent()) return;
+    if (!response.ok) {
+      state.selectedInterceptRecord = null;
+      renderIntercepts();
+      return;
+    }
 
-  const record = await response.json();
-  if (sessionId !== currentSessionId() || state.selectedInterceptId !== id) {
-    return;
+    const record = await response.json();
+    if (!isCurrent()) return;
+    state.selectedInterceptRecord = record;
+    renderIntercepts();
+  } catch (error) {
+    if (isCurrent()) throw error;
   }
-  state.selectedInterceptRecord = record;
-  renderIntercepts();
 }
 
 /* ─── Intercept Rules ─── */
@@ -12943,8 +12968,13 @@ function renderIntercepts() {
 
   if (!state.selectedInterceptRecord) {
     state.interceptEditorSeedId = null;
-    els.interceptDetailPath.textContent = "Intercept";
-    els.interceptDetailTitle.textContent = "No request selected";
+    if (state.interceptQueueTab === "request") {
+      els.interceptDetailPath.textContent = "Intercept";
+      els.interceptDetailTitle.textContent = "No request selected";
+      els.interceptMeta.textContent = state.runtime?.intercept_enabled
+        ? "Intercept is on. New requests will queue here."
+        : "Intercept is off. Toggle it on to pause requests before forwarding.";
+    }
     if (els.interceptRequestCM) {
       setInterceptPaneContent("interceptReq", els.interceptRequestCM, "", {
         mode: "http", readOnly: false,
@@ -12954,16 +12984,20 @@ function renderIntercepts() {
       els.interceptRequestEditor.value = "";
       renderInterceptRequestHighlight("");
     }
-    els.interceptMeta.textContent = state.runtime?.intercept_enabled
-      ? "Intercept is on. New requests will queue here."
-      : "Intercept is off. Toggle it on to pause requests before forwarding.";
     els.forwardInterceptButton.disabled = true;
     els.dropInterceptButton.disabled = true;
     return;
   }
 
-  els.interceptDetailPath.textContent = `${state.selectedInterceptRecord.request.scheme.toUpperCase()} / ${state.selectedInterceptRecord.peer_addr}`;
-  els.interceptDetailTitle.textContent = `${state.selectedInterceptRecord.request.method} ${state.selectedInterceptRecord.request.host}`;
+  if (state.interceptQueueTab === "request") {
+    els.interceptDetailPath.textContent = `${state.selectedInterceptRecord.request.scheme.toUpperCase()} / ${state.selectedInterceptRecord.peer_addr}`;
+    els.interceptDetailTitle.textContent = `${state.selectedInterceptRecord.request.method} ${state.selectedInterceptRecord.request.host}`;
+    els.interceptMeta.textContent = [
+      state.selectedInterceptRecord.is_websocket ? "WebSocket upgrade" : "HTTP request",
+      `queued at ${formatTimestamp(state.selectedInterceptRecord.started_at)}`,
+      state.selectedInterceptRecord.request.preview_truncated ? "captured request body is preview-truncated" : "body captured in memory",
+    ].join(" · ");
+  }
   // Polling refreshes the held record, but the editor owns its draft until the
   // selection changes. Losing focus (including to search) must not re-seed it.
   if (els.interceptRequestCM) {
@@ -12980,11 +13014,6 @@ function renderIntercepts() {
     }
     renderInterceptRequestHighlight(els.interceptRequestEditor.value);
   }
-  els.interceptMeta.textContent = [
-    state.selectedInterceptRecord.is_websocket ? "WebSocket upgrade" : "HTTP request",
-    `queued at ${formatTimestamp(state.selectedInterceptRecord.started_at)}`,
-    state.selectedInterceptRecord.request.preview_truncated ? "captured request body is preview-truncated" : "body captured in memory",
-  ].join(" · ");
   els.forwardInterceptButton.disabled = false;
   els.dropInterceptButton.disabled = false;
 }
@@ -17399,12 +17428,23 @@ async function dropSelectedIntercept() {
 
 async function loadResponseIntercepts(preserveSelection = true) {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath("/api/response-intercepts", sessionId));
-  await requireOkResponse(response, "Failed to load intercepted responses.");
-  const responseIntercepts = jsonArray(await response.json());
-  if (sessionId !== currentSessionId()) {
+  const generation = state.responseInterceptLoadGeneration = (state.responseInterceptLoadGeneration || 0) + 1;
+  const isCurrent = () => sessionId === currentSessionId()
+    && generation >= (state.responseInterceptAcceptedLoadGeneration || 0);
+  let responseIntercepts;
+  try {
+    const response = await fetch(sessionQueryPath("/api/response-intercepts", sessionId));
+    if (!isCurrent()) return;
+    await requireOkResponse(response, "Failed to load intercepted responses.");
+    responseIntercepts = jsonArray(await response.json());
+  } catch (error) {
+    if (isCurrent()) throw error;
     return;
   }
+  if (!isCurrent()) return;
+  // A pending or failed newer poll need not block a usable snapshot, but an
+  // older snapshot must never resurrect a queue after a newer one was accepted.
+  state.responseInterceptAcceptedLoadGeneration = generation;
   state.responseIntercepts = responseIntercepts;
 
   const visibleResponseIntercepts = getVisibleResponseInterceptSummaries();
@@ -17430,22 +17470,25 @@ async function loadResponseIntercepts(preserveSelection = true) {
 
 async function loadResponseInterceptDetail(id) {
   const sessionId = currentSessionId();
-  const response = await fetch(sessionQueryPath(`/api/response-intercepts/${id}`, sessionId));
-  if (sessionId !== currentSessionId() || state.selectedResponseInterceptId !== id) {
-    return;
-  }
-  if (!response.ok) {
-    state.selectedResponseInterceptRecord = null;
-    renderResponseIntercepts();
-    return;
-  }
+  const generation = state.responseInterceptDetailGeneration = (state.responseInterceptDetailGeneration || 0) + 1;
+  const isCurrent = () => sessionId === currentSessionId()
+    && state.selectedResponseInterceptId === id && state.responseInterceptDetailGeneration === generation;
+  try {
+    const response = await fetch(sessionQueryPath(`/api/response-intercepts/${id}`, sessionId));
+    if (!isCurrent()) return;
+    if (!response.ok) {
+      state.selectedResponseInterceptRecord = null;
+      renderResponseIntercepts();
+      return;
+    }
 
-  const record = await response.json();
-  if (sessionId !== currentSessionId() || state.selectedResponseInterceptId !== id) {
-    return;
+    const record = await response.json();
+    if (!isCurrent()) return;
+    state.selectedResponseInterceptRecord = record;
+    renderResponseIntercepts();
+  } catch (error) {
+    if (isCurrent()) throw error;
   }
-  state.selectedResponseInterceptRecord = record;
-  renderResponseIntercepts();
 }
 
 function buildEditableRawResponse(resp) {
@@ -17557,18 +17600,18 @@ function renderResponseIntercepts() {
 
   if (!state.selectedResponseInterceptRecord) {
     state.responseInterceptEditorSeedId = null;
+    if (els.interceptResponseCM) {
+      setInterceptPaneContent("interceptRes", els.interceptResponseCM, "", {
+        mode: "http", readOnly: false,
+        placeholder: "Intercepted response will appear here...",
+      });
+    } else {
+      els.interceptResponseEditor.value = "";
+      renderInterceptResponseHighlight("");
+    }
     if (state.interceptQueueTab === "response") {
       els.interceptDetailPath.textContent = "Response Intercept";
       els.interceptDetailTitle.textContent = "No response selected";
-      if (els.interceptResponseCM) {
-        setInterceptPaneContent("interceptRes", els.interceptResponseCM, "", {
-          mode: "http", readOnly: false,
-          placeholder: "Intercepted response will appear here...",
-        });
-      } else {
-        els.interceptResponseEditor.value = "";
-        renderInterceptResponseHighlight("");
-      }
       els.interceptMeta.textContent = state.runtime?.intercept_enabled
         ? "Intercept is on. Matched responses will queue here."
         : "Intercept is off. Toggle it on to pause responses before forwarding.";
