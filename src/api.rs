@@ -18703,6 +18703,12 @@ mod tests {
         session.scanner.update_config(config).await;
         let mut headers = HeaderMap::new();
         headers.insert("server", "nginx/1.25.3".parse().unwrap());
+        headers.insert(
+            "set-cookie",
+            "JSESSIONID=synthetic-session; Path=/; Secure; HttpOnly"
+                .parse()
+                .unwrap(),
+        );
         let record = TransactionRecord::http(
             Utc::now(),
             "GET".into(),
@@ -18737,7 +18743,17 @@ mod tests {
             path: "/".to_string(),
             location: None,
         };
-        session.scanner.replace_all(vec![stale.clone()]).await;
+        let mut legacy_cache = stale.clone();
+        legacy_cache.id = Uuid::new_v4();
+        legacy_cache.severity = Severity::Low;
+        legacy_cache.category = "misconfig".into();
+        legacy_cache.title = "Missing Cache-Control on authenticated response".into();
+        legacy_cache.detail = "Response to an authenticated request lacks Cache-Control header. Sensitive data may be cached by browsers or proxies.".into();
+        legacy_cache.evidence.clear();
+        session
+            .scanner
+            .replace_all(vec![stale.clone(), legacy_cache.clone()])
+            .await;
         let query = || {
             Query(super::SessionWriteQuery {
                 session_id: None,
@@ -18759,6 +18775,23 @@ mod tests {
         // Saved with the session, not only held in memory.
         let saved = state.sessions.load_context_read_only(session.id()).unwrap();
         assert_eq!(saved.scanner.list(None).await.len(), findings.len());
+        for store in [&session.scanner, &saved.scanner] {
+            let snapshot = store.snapshot(None).await;
+            assert!(snapshot.iter().all(|finding| {
+                finding.id != legacy_cache.id && finding.title != legacy_cache.title
+            }));
+            let cache = snapshot
+                .iter()
+                .find(|finding| {
+                    finding.title
+                        == "Missing Cache-Control with session or authorization indicators"
+                })
+                .expect("Rescan replaces the legacy cache claim in memory and on disk");
+            assert_eq!(cache.record_id, record_id);
+            assert_eq!(cache.severity, Severity::Low);
+            assert_eq!(cache.detail, "An Authorization header or session-like cookie was observed. This does not establish an authenticated user. The response lacks Cache-Control, so any sensitive content may be cached by browsers or proxies.");
+            assert!(cache.evidence.is_empty());
+        }
 
         // One at a time, and never with Passive Scan off, which would empty it.
         let slot = session.scanner.begin_rescan().unwrap();

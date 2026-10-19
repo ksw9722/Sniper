@@ -3182,8 +3182,9 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
         findings.push(finding);
     }
 
-    // Cache-Control missing on authenticated responses. Browsers send cookies
-    // with every image, style and script too, whose public caching is right.
+    // Session or authorization indicators need not mean an authenticated user.
+    // Browsers send cookies with images, styles and scripts too, whose public
+    // caching is right.
     let has_auth = has_authenticated_cache_context(record, response)
         && !matches!(
             crate::service_map::request_kind(record),
@@ -3194,8 +3195,8 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
             record,
             Severity::Low,
             "misconfig",
-            "Missing Cache-Control on authenticated response",
-            "Response to an authenticated request lacks Cache-Control header. Sensitive data may be cached by browsers or proxies.",
+            "Missing Cache-Control with session or authorization indicators",
+            "An Authorization header or session-like cookie was observed. This does not establish an authenticated user. The response lacks Cache-Control, so any sensitive content may be cached by browsers or proxies.",
             "",
         ));
     }
@@ -3225,8 +3226,8 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
                 record,
                 Severity::Medium,
                 "misconfig",
-                "Cache-Control: public on authenticated response",
-                "Authenticated response has Cache-Control: public, allowing caching of potentially sensitive data.",
+                "Cache-Control: public with session or authorization indicators",
+                "An Authorization header or session-like cookie was observed. This does not establish an authenticated user. Cache-Control: public may allow shared caching of any sensitive content in this response.",
                 format!("Cache-Control: {}", cache_control.join(", ")),
             ));
         }
@@ -6244,6 +6245,156 @@ mod tests {
     }
 
     #[test]
+    fn cache_context_wording_qualifies_observed_indicators() {
+        for (request_headers, session_headers) in [
+            (
+                vec![],
+                vec![(
+                    "Set-Cookie",
+                    "JSESSIONID=synthetic-session; Path=/; Secure; HttpOnly",
+                )],
+            ),
+            (vec![("Cookie", "JSESSIONID=synthetic-session")], vec![]),
+            (
+                vec![("Authorization", "Bearer synthetic-credential")],
+                vec![],
+            ),
+        ] {
+            for public in [false, true] {
+                let mut response_headers = vec![("Content-Type", "text/html")];
+                response_headers.extend(session_headers.clone());
+                if public {
+                    response_headers.push(("Cache-Control", "public, max-age=60"));
+                }
+                let cache_header_line = response_headers.len() + 1;
+                let record = make_record(
+                    request_headers.clone(),
+                    response_headers,
+                    "<html>Example content</html>",
+                    200,
+                );
+                let findings = findings_for_rule(&record, "misconfig");
+                assert_eq!(findings.len(), 1);
+                let finding = &findings[0];
+                let (title, detail, severity, evidence, section, line) = if public {
+                    (
+                        "Cache-Control: public with session or authorization indicators",
+                        "An Authorization header or session-like cookie was observed. This does not establish an authenticated user. Cache-Control: public may allow shared caching of any sensitive content in this response.",
+                        Severity::Medium,
+                        "Cache-Control: public, max-age=60",
+                        "header",
+                        Some(cache_header_line),
+                    )
+                } else {
+                    (
+                        "Missing Cache-Control with session or authorization indicators",
+                        "An Authorization header or session-like cookie was observed. This does not establish an authenticated user. The response lacks Cache-Control, so any sensitive content may be cached by browsers or proxies.",
+                        Severity::Low,
+                        "",
+                        "headers",
+                        None,
+                    )
+                };
+                assert_eq!(finding.title, title);
+                assert_eq!(finding.detail, detail);
+                assert_eq!(finding.severity, severity);
+                assert_eq!(finding.category, "misconfig");
+                assert!(finding.rule_id.is_empty());
+                assert_eq!(finding.evidence, evidence);
+                assert_eq!(
+                    finding.location,
+                    Some(FindingLocation {
+                        side: "response".into(),
+                        section: section.into(),
+                        line,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_context_wording_preserves_no_indicator_controls() {
+        for (request_headers, session_headers) in [
+            (vec![], vec![]),
+            (vec![("Authorization", " ")], vec![]),
+            (
+                vec![("Cookie", "csrf_token=synthetic-token; theme=dark")],
+                vec![],
+            ),
+            (
+                vec![],
+                vec![("Set-Cookie", "JSESSIONID=deleted; Max-Age=0; Path=/")],
+            ),
+            (
+                vec![("Cookie", "everest_session_v2=synthetic-session")],
+                vec![],
+            ),
+        ] {
+            for public in [false, true] {
+                let mut response_headers = vec![("Content-Type", "text/html")];
+                response_headers.extend(session_headers.clone());
+                if public {
+                    response_headers.push(("Cache-Control", "public, max-age=60"));
+                }
+                let record = make_record(
+                    request_headers.clone(),
+                    response_headers,
+                    "<html>Example content</html>",
+                    200,
+                );
+                assert!(findings_for_rule(&record, "misconfig").is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_context_title_change_keeps_endpoint_scope_and_legacy_until_rescan() {
+        for (response_headers, legacy_title) in [
+            (vec![], "Missing Cache-Control on authenticated response"),
+            (
+                vec![("Cache-Control", "public, max-age=60")],
+                "Cache-Control: public on authenticated response",
+            ),
+        ] {
+            let record = make_record(
+                vec![("Authorization", "Bearer synthetic-credential")],
+                response_headers,
+                "<html>Example content</html>",
+                200,
+            );
+            let current = findings_for_rule(&record, "misconfig").remove(0);
+            let mut legacy = current.clone();
+            legacy.id = Uuid::new_v4();
+            legacy.title = legacy_title.into();
+            assert_eq!(finding_scope(&current), "/test");
+            assert_eq!(finding_scope(&legacy), finding_scope(&current));
+            assert_ne!(finding_dedup_key(&legacy), finding_dedup_key(&current));
+            let mut same_endpoint = current.clone();
+            same_endpoint.path = "/test?view=next".into();
+            assert_eq!(
+                finding_dedup_key(&current),
+                finding_dedup_key(&same_endpoint)
+            );
+            let mut different_endpoint = current.clone();
+            different_endpoint.path = "/another".into();
+            assert_ne!(
+                finding_dedup_key(&current),
+                finding_dedup_key(&different_endpoint)
+            );
+
+            // A title change does not migrate saved findings: live capture can
+            // coexist with the legacy title until an explicit successful Rescan.
+            let store = ScannerStore::from_findings(10, vec![legacy]);
+            assert!(store.push(current.clone()).await);
+            assert!(!store.push(same_endpoint).await);
+            assert_eq!(store.count().await, 2);
+            let restored = ScannerStore::from_findings(10, store.snapshot(None).await);
+            assert_eq!(restored.count().await, 2);
+        }
+    }
+
+    #[test]
     fn cache_control_check_treats_auth_cookies_as_authenticated() {
         let record = make_record(
             vec![("cookie", "session=abc123; theme=dark")],
@@ -6253,9 +6404,8 @@ mod tests {
         );
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+        assert!(findings.iter().any(|finding| finding.title
+            == "Missing Cache-Control with session or authorization indicators"));
     }
 
     #[test]
@@ -6268,9 +6418,8 @@ mod tests {
         );
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+        assert!(findings.iter().any(|finding| finding.title
+            == "Missing Cache-Control with session or authorization indicators"));
     }
 
     #[test]
@@ -6290,7 +6439,7 @@ mod tests {
         assert!(
             findings
                 .iter()
-                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+                .any(|finding| finding.title == "Missing Cache-Control with session or authorization indicators"),
             "JWT-valued cookies should establish authenticated cache-control context even with generic names"
         );
     }
@@ -6313,9 +6462,8 @@ mod tests {
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
         assert!(
-            findings
-                .iter()
-                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+            findings.iter().any(|finding| finding.title
+                == "Missing Cache-Control with session or authorization indicators"),
             "JWT-valued Set-Cookie headers should establish authenticated cache-control context"
         );
     }
@@ -6333,9 +6481,8 @@ mod tests {
         );
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
-        assert!(findings
-            .iter()
-            .any(|finding| finding.title == "Cache-Control: public on authenticated response"));
+        assert!(findings.iter().any(|finding| finding.title
+            == "Cache-Control: public with session or authorization indicators"));
     }
 
     #[test]
@@ -6349,9 +6496,8 @@ mod tests {
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
         assert!(
-            !findings
-                .iter()
-                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+            !findings.iter().any(|finding| finding.title
+                == "Missing Cache-Control with session or authorization indicators"),
             "CSRF-only cookies do not establish an authenticated response context"
         );
     }
@@ -6373,9 +6519,8 @@ mod tests {
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
         assert!(
-            !findings
-                .iter()
-                .any(|finding| finding.title == "Missing Cache-Control on authenticated response"),
+            !findings.iter().any(|finding| finding.title
+                == "Missing Cache-Control with session or authorization indicators"),
             "deleting an auth cookie should not establish an authenticated response context"
         );
     }
@@ -7930,7 +8075,10 @@ mod tests {
             }
             scan_transaction(&record, &ScannerConfig::default())
                 .iter()
-                .any(|finding| finding.title == "Missing Cache-Control on authenticated response")
+                .any(|finding| {
+                    finding.title
+                        == "Missing Cache-Control with session or authorization indicators"
+                })
         };
 
         assert!(missing("empty", "application/json"));
@@ -8185,7 +8333,7 @@ mod tests {
                 findings_for_rule(&record, "misconfig")
                     .iter()
                     .any(|finding| finding.title
-                        == "Cache-Control: public on authenticated response"),
+                        == "Cache-Control: public with session or authorization indicators"),
                 "{cache_control}"
             );
         }
@@ -8229,7 +8377,7 @@ mod tests {
                 findings_for_rule(&record, "misconfig")
                     .iter()
                     .any(|finding| finding.title
-                        == "Missing Cache-Control on authenticated response"),
+                        == "Missing Cache-Control with session or authorization indicators"),
                 "{cookie}"
             );
         }
@@ -8247,7 +8395,8 @@ mod tests {
         );
         assert!(findings_for_rule(&record, "misconfig")
             .iter()
-            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+            .any(|finding| finding.title
+                == "Missing Cache-Control with session or authorization indicators"));
         let record = make_record(
             vec![("cookie", "session=Ab19Cd28Ef37Gh46")],
             vec![("cache-control", "public"), ("cache-control", "private")],
@@ -8705,7 +8854,8 @@ mod tests {
         );
         assert!(findings_for_rule(&record, "misconfig")
             .iter()
-            .any(|finding| finding.title == "Missing Cache-Control on authenticated response"));
+            .any(|finding| finding.title
+                == "Missing Cache-Control with session or authorization indicators"));
     }
 
     #[test]
