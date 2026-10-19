@@ -2849,8 +2849,11 @@
       const collectionIds = new Set(overlayEdges().flatMap((edge) => [edge.source, edge.target]));
       const allOrder = stableOrder(state.order, origins);
       const sourceIds = new Set(state.relationLayers.map((layer) => layer.source.origin));
+      // Overview ordering needs membership only; rescanning every origin for
+      // every ID made redraws quadratic even when no address nodes were shown.
+      const endpointNodeIds = direct ? null : new Set(origins.filter((item) => item.endpointNode).map((item) => item.origin));
       const order = direct ? [direct.anchor.origin, ...neighborOrder.filter((id) => direct.bodyIds.has(id)), ...neighborOrder.filter((id) => !direct.bodyIds.has(id))]
-        : [...allOrder.filter((id) => origins.find((item) => item.origin === id)?.endpointNode), ...allOrder.filter((id) => sourceIds.has(id)), ...allOrder.filter((id) => collectionIds.has(id) && !sourceIds.has(id) && !origins.find((item) => item.origin === id)?.endpointNode), ...allOrder.filter((id) => !collectionIds.has(id))];
+        : [...allOrder.filter((id) => endpointNodeIds.has(id)), ...allOrder.filter((id) => sourceIds.has(id)), ...allOrder.filter((id) => collectionIds.has(id) && !sourceIds.has(id) && !endpointNodeIds.has(id)), ...allOrder.filter((id) => !collectionIds.has(id))];
       const filterKey = JSON.stringify([query, state.productId, state.productVersion, state.scopeOnly, state.sessionId, state.anchorOrigin, hiddenLinkKinds(), display]);
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
       const textSize = doc?.documentElement && typeof root.getComputedStyle === "function"
