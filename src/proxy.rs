@@ -3623,17 +3623,25 @@ async fn store_record_and_scan_unconditionally(
 ) {
     let insert_outcome =
         insert_transaction_quiet(session, record.clone(), "captured transaction").await;
-    scan_record_for_session(session, record);
+    scan_record_for_session(state, session, record);
     persist_transaction_insert_outcome(state, session, insert_outcome).await;
 }
 
-fn scan_record_for_session(session: &Arc<SessionContext>, record: TransactionRecord) {
+fn scan_record_for_session(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    record: TransactionRecord,
+) {
     let scanner = session.scanner.clone();
     let scan_generation = scanner.clear_generation();
     let scan_session = Arc::clone(session);
+    let templates = Arc::clone(&state.templates);
     spawn_tracked_proxy_task(session.id(), PROXY_WORK_CAPTURE_TASK, async move {
         let config = scanner.get_config().await;
-        let findings = crate::scanner::scan_transaction(&record, &config);
+        let mut findings = crate::scanner::scan_transaction(&record, &config);
+        if config.enabled {
+            findings.extend(passive_template_findings(&templates, &scan_session, record).await);
+        }
         let mut accepted_findings = false;
         for finding in findings {
             accepted_findings |= scanner.push_if_generation(finding, scan_generation).await;
@@ -3646,6 +3654,33 @@ fn scan_record_for_session(session: &Arc<SessionContext>, record: TransactionRec
             persist_session_state_quiet(&scan_session);
         }
     });
+}
+
+/// The findings of the Nuclei templates the operator turned on, for a record
+/// in scope. They run on the blocking pool; when a burst already fills it,
+/// the record skips them rather than wait inside a proxy task, which would
+/// hold the session busy. Rescan covers what was skipped.
+async fn passive_template_findings(
+    templates: &crate::templates::library::TemplateLibrary,
+    session: &SessionContext,
+    record: TransactionRecord,
+) -> Vec<crate::scanner::ScannerFinding> {
+    let Some(set) = templates.passive_set() else {
+        return Vec::new();
+    };
+    let (include, exclude) = session.runtime.scope_lists().await;
+    if !crate::templates::passive_applies(&record, &include, &exclude) {
+        return Vec::new();
+    }
+    let Some(permit) = templates.try_passive_permit() else {
+        return Vec::new();
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::templates::passive_findings(&set, &record)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 async fn insert_transaction_quiet(
@@ -4225,7 +4260,7 @@ impl StreamedRecordContext {
             {
                 let mut scan_record = record;
                 scan_record.id = record_id;
-                scan_record_for_session(&self.session, scan_record);
+                scan_record_for_session(&self.state, &self.session, scan_record);
                 forget_persist_context_if_clean(self.session.id(), self.persist_generation);
                 return;
             }

@@ -3413,7 +3413,7 @@ fn tighten_private_dir(_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn create_private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -3423,7 +3423,7 @@ fn create_private_file(path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn create_private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<fs::File> {
     fs::File::create(path)
 }
 
@@ -4727,7 +4727,7 @@ fn persist_session_snapshot(
     write_json(&snapshot_path(&storage_dir), snapshot)
 }
 
-fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     write_json_with_commit_status(path, value).map_err(|failure| failure.error)
 }
 

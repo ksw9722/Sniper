@@ -365,6 +365,28 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/api/recon", get(crate::recon::list))
         .route("/api/recon/jobs", post(crate::recon::start))
         .route("/api/recon/jobs/:id/stop", post(crate::recon::stop))
+        .route(
+            "/api/templates/library",
+            get(crate::templates::library::get_status),
+        )
+        .route(
+            "/api/templates/library/check",
+            post(crate::templates::library::check_latest),
+        )
+        .route(
+            "/api/templates/library/download",
+            post(crate::templates::library::start_download),
+        )
+        .route(
+            "/api/templates/library/import",
+            post(crate::templates::library::start_import),
+        )
+        .route(
+            "/api/templates/passive",
+            post(crate::templates::library::set_passive),
+        )
+        .route("/api/templates", get(crate::templates::library::list))
+        .route("/api/templates/:id", get(crate::templates::library::get))
         .route("/service-map.js", get(service_map_js))
         .route("/product-icons.js", get(product_icons_js))
         .route("/codemirror.js", get(codemirror_js))
@@ -4771,11 +4793,24 @@ async fn rescan_findings(
             chrono::Utc::now(),
         )
     };
+    // Disabling a noisy template and rescanning is how its findings go away.
+    let rescan_templates = match state.templates.passive_set() {
+        Some(set) => {
+            let (include, exclude) = session.runtime.scope_lists().await;
+            Some(crate::scanner::RescanTemplates {
+                set,
+                include,
+                exclude,
+            })
+        }
+        None => None,
+    };
     let Some((rescan, unreadable)) = session
         .store
-        .visit_records(crate::scanner::Rescan::new(config), |rescan, record| {
-            rescan.scan(record)
-        })
+        .visit_records(
+            crate::scanner::Rescan::new(config).with_templates(rescan_templates),
+            |rescan, record| rescan.scan(record),
+        )
         .await
     else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -18698,6 +18733,104 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(session.scanner.list(None).await.len(), findings.len());
         drop(saved);
+        drop(session);
+        drop(state);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    // Passive Nuclei templates the operator enabled judge in-scope history on
+    // Rescan, and nothing when no scope is set.
+    #[tokio::test]
+    async fn findings_rescan_runs_enabled_passive_templates_in_scope() {
+        use std::io::Write as _;
+        let (state, path) = test_state("findings-rescan-templates");
+        for _ in 0..200 {
+            if state.templates.status().state != crate::templates::library::TaskState::Loading {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let template = "id: example-detect\ninfo:\n  name: Example Detect\n  severity: low\nhttp:\n  - method: GET\n    path: ['{{BaseURL}}']\n    matchers:\n      - type: word\n        words: ['Example Server']\n";
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(template.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "release/http/detect.yaml", template.as_bytes())
+            .unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&builder.into_inner().unwrap()).unwrap();
+        state
+            .templates
+            .import_blocking(
+                &gzip.finish().unwrap(),
+                crate::templates::library::Source::Import,
+            )
+            .unwrap();
+        state
+            .templates
+            .set_passive(&["example-detect".into()], true)
+            .unwrap();
+
+        let session = state.session().await;
+        let mut config = session.scanner.get_config().await;
+        config.enabled = true;
+        session.scanner.update_config(config).await;
+        let record = TransactionRecord::http(
+            Utc::now(),
+            "GET".into(),
+            "https".into(),
+            "app.example.com".into(),
+            "/".into(),
+            Some(200),
+            1,
+            MessageRecord::from_headers_and_body(&HeaderMap::new(), b"", 4096),
+            Some(MessageRecord::from_headers_and_body(
+                &HeaderMap::new(),
+                b"<html>Example Server</html>",
+                4096,
+            )),
+            vec![],
+            None,
+            None,
+        );
+        session.store.insert(record).await;
+        let query = || {
+            Query(super::SessionWriteQuery {
+                session_id: None,
+                expected_active_session_id: None,
+            })
+        };
+        let template_findings = |findings: Vec<crate::scanner::FindingSummary>| {
+            findings
+                .into_iter()
+                .filter(|finding| finding.rule_id == "nuclei-passive:example-detect")
+                .count()
+        };
+
+        // No scope set: a template nobody pointed anywhere judges nothing.
+        let response = super::rescan_findings(State(state.clone()), query()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(template_findings(session.scanner.list(None).await), 0);
+
+        session
+            .runtime
+            .update(crate::runtime::RuntimeSettingsUpdate {
+                scope_patterns: Some(vec!["*.example.com".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let response = super::rescan_findings(State(state.clone()), query()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let findings = session.scanner.list(None).await;
+        assert_eq!(template_findings(findings.clone()), 1);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id.starts_with("nuclei-passive:"))
+            .unwrap();
+        assert_eq!(finding.category, "nuclei");
+        assert_eq!(finding.title, "Example Detect");
         drop(session);
         drop(state);
         let _ = std::fs::remove_dir_all(path);

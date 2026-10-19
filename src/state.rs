@@ -95,6 +95,8 @@ pub struct AppState {
     pub certificates: Arc<CertificateAuthority>,
     pub startup: Arc<StartupSettingsStore>,
     pub ui_settings: Arc<AppUiSettingsStore>,
+    /// The Nuclei template library, shared by every session.
+    pub templates: Arc<crate::templates::library::TemplateLibrary>,
     pub sessions: Arc<SessionRegistry>,
     /// Durable receipts for explicitly identified saved-data mutations.
     pub saved_operations: Arc<SavedOperationLedger>,
@@ -184,6 +186,7 @@ impl AppState {
             config.proxy_addr,
         )?);
         let ui_settings = Arc::new(AppUiSettingsStore::load_or_create(&config.data_dir)?);
+        let templates = crate::templates::library::TemplateLibrary::load(&config.data_dir);
         let (sessions, active_session) = SessionRegistry::load_or_create_with_transaction_limit(
             &config.data_dir,
             config.max_entries,
@@ -201,6 +204,7 @@ impl AppState {
             certificates,
             startup,
             ui_settings,
+            templates,
             sessions: Arc::new(sessions),
             saved_operations,
             proxy_online: Arc::new(AtomicBool::new(false)),
@@ -2719,7 +2723,7 @@ fn app_release_http_client(error_context: &'static str) -> Result<reqwest::Clien
     builder.build().context(error_context)
 }
 
-fn release_proxy_env_targets_loopback() -> bool {
+pub(crate) fn release_proxy_env_targets_loopback() -> bool {
     ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
         .iter()
         .filter_map(|key| env::var(key).ok())

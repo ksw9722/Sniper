@@ -546,6 +546,15 @@ pub struct Rescan {
     seen: HashSet<FindingDedupKey>,
     findings: Vec<ScannerFinding>,
     scanned: HashSet<Uuid>,
+    templates: Option<RescanTemplates>,
+}
+
+/// The passive Nuclei templates a rescan runs, with the scope they apply to,
+/// read once when it starts.
+pub struct RescanTemplates {
+    pub set: std::sync::Arc<crate::templates::engine::PassiveSet>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 impl Rescan {
@@ -555,18 +564,33 @@ impl Rescan {
             seen: HashSet::new(),
             findings: Vec::new(),
             scanned: HashSet::new(),
+            templates: None,
         }
+    }
+
+    pub fn with_templates(mut self, templates: Option<RescanTemplates>) -> Self {
+        self.templates = templates;
+        self
     }
 
     pub fn scan(&mut self, record: &TransactionRecord) {
         self.scanned.insert(record.id);
         // A rule that panics on one row must not end the rescan; that row just
         // gets no findings.
-        let Ok(found) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(mut found) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             scan_transaction(record, &self.config)
         })) else {
             return;
         };
+        if let Some(templates) = self.templates.as_ref().filter(|_| self.config.enabled) {
+            if crate::templates::passive_applies(record, &templates.include, &templates.exclude) {
+                if let Ok(more) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::templates::passive_findings(&templates.set, record)
+                })) {
+                    found.extend(more);
+                }
+            }
+        }
         for finding in found {
             if self.seen.insert(finding_dedup_key(&finding)) {
                 self.findings.push(finding);
@@ -802,7 +826,7 @@ fn make_finding(
     }
 }
 
-fn infer_finding_location(
+pub(crate) fn infer_finding_location(
     record: &TransactionRecord,
     finding: &ScannerFinding,
 ) -> Option<FindingLocation> {

@@ -265,63 +265,6 @@ const EXTRACTOR_KEYS: &[&str] = &[
     "case-insensitive",
 ];
 
-/// Functions Sniper evaluates on responses. Everything that only exists to
-/// build a request is in REQUEST_FUNCTIONS.
-pub const RESPONSE_FUNCTIONS: &[&str] = &[
-    "base64",
-    "base64_decode",
-    "compare_versions",
-    "concat",
-    "contains",
-    "contains_all",
-    "contains_any",
-    "ends_with",
-    "equals_any",
-    "hex_decode",
-    "hex_encode",
-    "html_escape",
-    "html_unescape",
-    "join",
-    "len",
-    "line_ends_with",
-    "line_starts_with",
-    "regex",
-    "regex_all",
-    "regex_any",
-    "replace",
-    "replace_regex",
-    "reverse",
-    "sha256",
-    "starts_with",
-    "to_lower",
-    "to_number",
-    "to_string",
-    "to_upper",
-    "tolower",
-    "toupper",
-    "trim",
-    "trim_left",
-    "trim_prefix",
-    "trim_right",
-    "trim_space",
-    "trim_suffix",
-    "url_decode",
-    "url_encode",
-];
-
-/// Functions active scans add for building requests.
-pub const REQUEST_FUNCTIONS: &[&str] = &[
-    "md5",
-    "rand_base",
-    "rand_char",
-    "rand_int",
-    "rand_text_alpha",
-    "rand_text_alphanumeric",
-    "rand_text_numeric",
-    "sha1",
-    "unix_time",
-];
-
 /// Tags whose templates change data, guess credentials, attack availability
 /// or reach third parties. An active scan excludes them unless each is named.
 pub const RISK_TAGS: &[&str] = &[
@@ -600,17 +543,17 @@ fn check_expression(
     };
     let (functions, variables) = dsl::names(&tokens);
     for function in functions {
-        let known_response = RESPONSE_FUNCTIONS.contains(&function.as_str());
-        let known_request = REQUEST_FUNCTIONS.contains(&function.as_str());
-        if !known_response {
-            if known_request {
+        match dsl::function_kind(&function) {
+            Some(dsl::FuncKind::Pure) => {}
+            // A random value is one the template sent; a captured response
+            // cannot contain it.
+            Some(dsl::FuncKind::Random) => {
                 out.passive_reasons.insert("randomness".into());
-            } else {
-                out.passive_reasons.insert(format!("fn:{function}"));
             }
-        }
-        if !known_response && !known_request {
-            out.active_reasons.insert(format!("fn:{function}"));
+            None => {
+                out.passive_reasons.insert(format!("fn:{function}"));
+                out.active_reasons.insert(format!("fn:{function}"));
+            }
         }
         out.functions.insert(function);
     }
@@ -937,6 +880,8 @@ mod tests {
         let mut parse_errors: BTreeMap<&str, usize> = BTreeMap::new();
         let mut protocols: BTreeMap<&str, usize> = BTreeMap::new();
         let mut rows: Vec<(String, Classification, String)> = Vec::new();
+        let mut compiled = Vec::new();
+        let mut compile_errors: BTreeMap<String, usize> = BTreeMap::new();
         for entry in archive.entries().unwrap() {
             let mut entry = entry.unwrap();
             if !entry.header().entry_type().is_file() {
@@ -965,6 +910,12 @@ mod tests {
                 Ok(parsed) => {
                     let classified = classify(&parsed);
                     *protocols.entry(classified.protocol).or_default() += 1;
+                    if classified.passive_supported() {
+                        match super::super::engine::compile_passive(&parsed, &classified) {
+                            Ok(template) => compiled.push(std::sync::Arc::new(template)),
+                            Err(error) => *compile_errors.entry(error.0).or_default() += 1,
+                        }
+                    }
                     rows.push((relative, classified, parsed.info.severity));
                 }
                 Err(error) => *parse_errors.entry(error.code).or_default() += 1,
@@ -1008,6 +959,14 @@ mod tests {
             }
         }
         println!("passive blockers {passive_blockers:?}");
+        let built = std::time::Instant::now();
+        let compiled_count = compiled.len();
+        let set = super::super::engine::PassiveSet::new(compiled);
+        println!(
+            "passive engine: {compiled_count} compiled, errors {compile_errors:?}; set built in {:?}, {} always evaluated",
+            built.elapsed(),
+            set.always_evaluated()
+        );
 
         let active_ok = http.iter().filter(|(_, c, _)| c.active_supported()).count();
         let active_safe = http
@@ -1077,8 +1036,7 @@ mod tests {
         functions.sort_by(|a, b| b.1.cmp(&a.1));
         println!("dsl functions (templates using):");
         for (function, count) in functions {
-            let known =
-                RESPONSE_FUNCTIONS.contains(&function) || REQUEST_FUNCTIONS.contains(&function);
+            let known = dsl::function_kind(function).is_some();
             println!(
                 "  {function:<28} {count:>5} {}",
                 if known { "" } else { "UNSUPPORTED" }
