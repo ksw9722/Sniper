@@ -126,7 +126,8 @@ impl ReconStore {
             .endpoints
             .iter()
             .map(|endpoint| {
-                let mut sources: Vec<_> = endpoint.evidence.iter().map(|e| e.source.clone()).collect();
+                let mut sources: Vec<_> =
+                    endpoint.evidence.iter().map(|e| e.source.clone()).collect();
                 sources.sort_unstable();
                 sources.dedup();
                 let mut kinds: Vec<_> = endpoint.evidence.iter().map(|e| e.kind.clone()).collect();
@@ -659,10 +660,14 @@ async fn run(
                 _ => recon_sources::wayback(&provider, &scope.target, request.include_subdomains,
                     request.max_pages, request.max_endpoints, &cancel).await,
             };
-            let (added, truncated) =
-                session
-                    .recon
-                    .merge_with_cancel(id, &scope, source, findings, request.max_endpoints, Some(&cancel));
+            let (added, truncated) = session.recon.merge_with_cancel(
+                id,
+                &scope,
+                source,
+                findings,
+                request.max_endpoints,
+                Some(&cancel),
+            );
             report.truncated |= truncated;
             session
                 .recon
@@ -752,7 +757,9 @@ async fn crawl(
         }
         if request.max_requests != 0 && report.requests >= request.max_requests {
             report.truncated = true;
-            report.warnings.push("Crawler request budget reached.".into());
+            report
+                .warnings
+                .push("Crawler request budget reached.".into());
             break;
         }
         report.requests += 1;
@@ -835,11 +842,11 @@ async fn crawl(
                 continue;
             }
         };
-        let (findings, clipped) = recon_sources::extract_document_cancellable(&url, &content_type, &body, cancel);
+        let (findings, clipped) =
+            recon_sources::extract_document_cancellable(&url, &content_type, &body, cancel);
         if clipped {
             report.truncated = true;
-            let warning =
-                "Static document extraction was partial; more evidence may exist.";
+            let warning = "Static document extraction was partial; more evidence may exist.";
             if !report.warnings.iter().any(|item| item == warning) {
                 report.warnings.push(warning.into());
             }
@@ -869,10 +876,14 @@ async fn crawl(
                 queue.push_back((next, depth.saturating_add(1), 0));
             }
         }
-        let (added, truncated) =
-            session
-                .recon
-                .merge_with_cancel(id, scope, "crawler", findings, request.max_endpoints, Some(cancel));
+        let (added, truncated) = session.recon.merge_with_cancel(
+            id,
+            scope,
+            "crawler",
+            findings,
+            request.max_endpoints,
+            Some(cancel),
+        );
         report.truncated |= truncated;
         session
             .recon
@@ -927,8 +938,17 @@ mod tests {
         let mut request: StartRecon = serde_json::from_value(serde_json::json!({
             "session_id": Uuid::new_v4(), "target_url": "https://example.com/",
             "sources": ["crawler"]
-        })).unwrap();
-        assert_eq!((request.max_requests, request.max_depth, request.max_endpoints, request.max_pages), (0, 0, 0, 0));
+        }))
+        .unwrap();
+        assert_eq!(
+            (
+                request.max_requests,
+                request.max_depth,
+                request.max_endpoints,
+                request.max_pages
+            ),
+            (0, 0, 0, 0)
+        );
         assert!(validate(&request).is_ok());
         request.max_requests = 10_000;
         request.max_depth = 100;
@@ -942,25 +962,38 @@ mod tests {
     fn inventory_preserves_large_collections_long_urls_and_all_evidence() {
         let store = ReconStore::from_snapshot(ReconSnapshot::default());
         let scope = ReconScope::new("https://example.com", false).unwrap();
-        let findings: Vec<_> = (0..5_100).map(|index| Discovery {
-            url: format!("https://example.com/{index}/{}", "a".repeat(if index == 0 { 20_000 } else { 0 })),
-            method: "GET".into(),
-            kind: "history".into(),
-            location: "x".repeat(1_800),
-            timestamp: Some("t".repeat(100)),
-            status: None,
-        }).collect();
+        let findings: Vec<_> = (0..5_100)
+            .map(|index| Discovery {
+                url: format!(
+                    "https://example.com/{index}/{}",
+                    "a".repeat(if index == 0 { 20_000 } else { 0 })
+                ),
+                method: "GET".into(),
+                kind: "history".into(),
+                location: "x".repeat(1_800),
+                timestamp: Some("t".repeat(100)),
+                status: None,
+            })
+            .collect();
         let long_url = findings[0].url.clone();
-        assert_eq!(store.merge(Uuid::new_v4(), &scope, "wayback", findings, 0), (5_100, false));
-        let variants = (0..30).map(|index| Discovery {
-            url: format!("{long_url}#fragment-{index}"),
-            method: "GET".into(),
-            kind: "history".into(),
-            location: format!("{index}{}", "x".repeat(2_000)),
-            timestamp: Some("t".repeat(100)),
-            status: None,
-        }).collect();
-        assert_eq!(store.merge(Uuid::new_v4(), &scope, "urlscan", variants, 0), (0, false));
+        assert_eq!(
+            store.merge(Uuid::new_v4(), &scope, "wayback", findings, 0),
+            (5_100, false)
+        );
+        let variants = (0..30)
+            .map(|index| Discovery {
+                url: format!("{long_url}#fragment-{index}"),
+                method: "GET".into(),
+                kind: "history".into(),
+                location: format!("{index}{}", "x".repeat(2_000)),
+                timestamp: Some("t".repeat(100)),
+                status: None,
+            })
+            .collect();
+        assert_eq!(
+            store.merge(Uuid::new_v4(), &scope, "urlscan", variants, 0),
+            (0, false)
+        );
         let snapshot = store.snapshot();
         assert_eq!(snapshot.endpoints.len(), 5_100);
         assert!(serde_json::to_vec(&snapshot.endpoints).unwrap().len() > 8 * 1024 * 1024);
@@ -972,11 +1005,27 @@ mod tests {
         assert_eq!(endpoint.evidence[0].timestamp.as_ref().unwrap().len(), 100);
         let restored = ReconStore::from_snapshot(snapshot);
         assert_eq!(restored.site_map_endpoints().len(), 5_100);
-        assert_eq!(restored.site_map_endpoints()[0].sources, vec!["urlscan", "wayback"]);
-        assert_eq!(restored.merge(Uuid::new_v4(), &scope, "wayback", vec![Discovery {
-            url: long_url, method: "GET".into(), kind: "history".into(),
-            location: "after restart".into(), timestamp: None, status: None,
-        }], 0), (0, false));
+        assert_eq!(
+            restored.site_map_endpoints()[0].sources,
+            vec!["urlscan", "wayback"]
+        );
+        assert_eq!(
+            restored.merge(
+                Uuid::new_v4(),
+                &scope,
+                "wayback",
+                vec![Discovery {
+                    url: long_url,
+                    method: "GET".into(),
+                    kind: "history".into(),
+                    location: "after restart".into(),
+                    timestamp: None,
+                    status: None,
+                }],
+                0
+            ),
+            (0, false)
+        );
         assert_eq!(restored.snapshot().endpoints[0].evidence.len(), 32);
     }
 
@@ -1054,10 +1103,24 @@ mod tests {
     fn cancelled_collection_does_not_merge_pending_findings() {
         let store = ReconStore::from_snapshot(ReconSnapshot::default());
         let scope = ReconScope::new("https://example.com", false).unwrap();
-        assert_eq!(store.merge_with_cancel(Uuid::new_v4(), &scope, "wayback", vec![Discovery {
-            url: "https://example.com/pending".into(), method: "GET".into(),
-            kind: "history".into(), location: "fixture".into(), timestamp: None, status: None,
-        }], 0, Some(&AtomicBool::new(true))), (0, true));
+        assert_eq!(
+            store.merge_with_cancel(
+                Uuid::new_v4(),
+                &scope,
+                "wayback",
+                vec![Discovery {
+                    url: "https://example.com/pending".into(),
+                    method: "GET".into(),
+                    kind: "history".into(),
+                    location: "fixture".into(),
+                    timestamp: None,
+                    status: None,
+                }],
+                0,
+                Some(&AtomicBool::new(true))
+            ),
+            (0, true)
+        );
         assert!(store.snapshot().endpoints.is_empty());
     }
 
@@ -1331,15 +1394,27 @@ mod tests {
     #[tokio::test]
     async fn crawl_extracts_links_beyond_former_token_and_body_caps() {
         for body in [
-            format!("{}<a href='/late-link'>link</a>", "<span></span>".repeat(10_001)),
-            format!("{}<a href='/late-link'>link</a>", "😀".repeat(2 * 1024 * 1024 / 4 + 1)),
+            format!(
+                "{}<a href='/late-link'>link</a>",
+                "<span></span>".repeat(10_001)
+            ),
+            format!(
+                "{}<a href='/late-link'>link</a>",
+                "😀".repeat(2 * 1024 * 1024 / 4 + 1)
+            ),
         ] {
             let (report, snapshot, paths) = crawl_static_fixture("text/html", &body, "/tags").await;
             assert!(!report.truncated);
-            assert!(snapshot.endpoints.iter().any(|endpoint| endpoint.url.ends_with("/late-link")));
+            assert!(snapshot
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.url.ends_with("/late-link")));
             assert!(paths.contains(&"/late-link".into()));
             assert_eq!(report.requests, 4);
-            assert!(!report.warnings.iter().any(|warning| warning.contains("extraction limit")));
+            assert!(!report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("extraction limit")));
         }
     }
 
@@ -1348,7 +1423,11 @@ mod tests {
         use axum::{routing::get, Router};
         let router = Router::new().fallback(get(|uri: axum::http::Uri| async move {
             let body = match uri.path().trim_start_matches('/').parse::<usize>() {
-                Ok(depth) if depth < 12 => format!("<a href='/{}'>next</a><a href='/0#again'>cycle</a><a href='/{}'>duplicate</a>", depth + 1, depth + 1),
+                Ok(depth) if depth < 12 => format!(
+                    "<a href='/{}'>next</a><a href='/0#again'>cycle</a><a href='/{}'>duplicate</a>",
+                    depth + 1,
+                    depth + 1
+                ),
                 _ => String::new(),
             };
             ([(axum::http::header::CONTENT_TYPE, "text/html")], body)
@@ -1362,22 +1441,61 @@ mod tests {
             "session_id": session.id(), "target_url": format!("http://{address}/0"), "sources": ["crawler"]
         })).unwrap();
         let scope = validate(&request).unwrap();
-        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();
-        let report = crawl(&session, Uuid::new_v4(), &request, &scope, &client, &AtomicBool::new(false)).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let report = crawl(
+            &session,
+            Uuid::new_v4(),
+            &request,
+            &scope,
+            &client,
+            &AtomicBool::new(false),
+        )
+        .await;
         assert!(!report.truncated);
         assert_eq!(report.requests, 15);
-        assert!(session.recon.snapshot().endpoints.iter().any(|endpoint| endpoint.url.ends_with("/12")));
+        assert!(session
+            .recon
+            .snapshot()
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.url.ends_with("/12")));
         request.max_depth = 1;
-        let report = crawl(&session, Uuid::new_v4(), &request, &scope, &client, &AtomicBool::new(false)).await;
+        let report = crawl(
+            &session,
+            Uuid::new_v4(),
+            &request,
+            &scope,
+            &client,
+            &AtomicBool::new(false),
+        )
+        .await;
         assert!(report.truncated);
         assert_eq!(report.requests, 4);
-        assert!(report.warnings.iter().any(|warning| warning.contains("depth budget")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("depth budget")));
         request.max_depth = 0;
         request.max_requests = 2;
-        let report = crawl(&session, Uuid::new_v4(), &request, &scope, &client, &AtomicBool::new(false)).await;
+        let report = crawl(
+            &session,
+            Uuid::new_v4(),
+            &request,
+            &scope,
+            &client,
+            &AtomicBool::new(false),
+        )
+        .await;
         assert!(report.truncated);
         assert_eq!(report.requests, 2);
-        assert!(report.warnings.iter().any(|warning| warning.contains("request budget")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("request budget")));
         server.abort();
         let _ = server.await;
     }
@@ -1397,9 +1515,13 @@ mod tests {
         let first = state.session().await;
         for _ in 0..25 {
             first.recon.snapshot.lock().unwrap().jobs.push(ReconJob {
-                id: Uuid::new_v4(), target_url: "https://example.com/".into(),
-                status: "completed".into(), started_at: Utc::now(), finished_at: Some(Utc::now()),
-                sources: Vec::new(), error: None,
+                id: Uuid::new_v4(),
+                target_url: "https://example.com/".into(),
+                status: "completed".into(),
+                started_at: Utc::now(),
+                finished_at: Some(Utc::now()),
+                sources: Vec::new(),
+                error: None,
             });
         }
         let second = state

@@ -204,10 +204,7 @@ fn sort_cursor(value: &Value) -> Option<String> {
     let mut parts = Vec::new();
     for value in values {
         let part = match value {
-            Value::String(value)
-                if !value.is_empty()
-                    && !value.contains([',', '\r', '\n']) =>
-            {
+            Value::String(value) if !value.is_empty() && !value.contains([',', '\r', '\n']) => {
                 value.clone()
             }
             Value::Number(value) => value.to_string(),
@@ -694,10 +691,7 @@ fn parse_cdx_filtered(
             continue;
         }
         if row.len() == 1 {
-            if let Some(cursor) = row[0]
-                .as_str()
-                .filter(|s| !s.is_empty())
-            {
+            if let Some(cursor) = row[0].as_str().filter(|s| !s.is_empty()) {
                 resume = Some(cursor.to_string());
             }
             continue;
@@ -1009,10 +1003,7 @@ fn entity_decode(value: &str) -> String {
 
 fn resolve(base: &Url, literal: &str) -> Option<String> {
     let literal = literal.trim();
-    if literal.is_empty()
-        || literal.starts_with('#')
-        || literal.chars().any(char::is_control)
-    {
+    if literal.is_empty() || literal.starts_with('#') || literal.chars().any(char::is_control) {
         return None;
     }
     // Absolute observations retain spelling, encoding and duplicate query
@@ -1632,7 +1623,12 @@ mod tests {
 
     #[test]
     fn urlscan_pagination_obeys_exhaustion_signals_and_preserves_long_cursors() {
-        assert!(!urlscan_has_more(&json!({"has_more": false}), 100, 100, 100));
+        assert!(!urlscan_has_more(
+            &json!({"has_more": false}),
+            100,
+            100,
+            100
+        ));
         assert!(!urlscan_has_more(&json!({"has_more": true}), 0, 100, 100));
         assert!(urlscan_has_more(&json!({"has_more": true}), 1, 1, 100));
         assert!(urlscan_has_more(&json!({"total": 101}), 100, 100, 100));
@@ -1877,10 +1873,7 @@ mod tests {
             assert!(found[0].url.ends_with("/late"), "{path}");
             assert!(!clipped, "{path}");
         }
-        let inline = format!(
-            "<script>{}'/late'</script>",
-            "'not-a-url';".repeat(10_001)
-        );
+        let inline = format!("<script>{}'/late'</script>", "'not-a-url';".repeat(10_001));
         let (found, clipped) = extract_document(&base(), "text/html", &inline);
         assert_eq!(found.len(), 1);
         assert!(!clipped);
@@ -2039,12 +2032,8 @@ mod tests {
             assert!(clipped, "{path}");
         }
         cancel.store(false, Ordering::Relaxed);
-        let (found, clipped) = extract_document_cancellable(
-            &base(),
-            "text/html",
-            "<a href='/link'>",
-            &cancel,
-        );
+        let (found, clipped) =
+            extract_document_cancellable(&base(), "text/html", "<a href='/link'>", &cancel);
         assert_eq!(found.len(), 1);
         assert!(!clipped);
     }
@@ -2314,9 +2303,7 @@ mod tests {
                     let _ = connection.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await;
                     let header = format!("{:x}\r\n", 2 * 1024 * 1024 + 1);
                     let _ = connection.write_all(header.as_bytes()).await;
-                    let _ = connection
-                        .write_all(&vec![b'x'; 2 * 1024 * 1024 + 1])
-                        .await;
+                    let _ = connection.write_all(&vec![b'x'; 2 * 1024 * 1024 + 1]).await;
                     let _ = connection.write_all(b"\r\n0\r\n\r\n").await;
                 } else {
                     let headers = format!(
@@ -2324,9 +2311,7 @@ mod tests {
                         2 * 1024 * 1024 + 1
                     );
                     let _ = connection.write_all(headers.as_bytes()).await;
-                    let _ = connection
-                        .write_all(&vec![b'x'; 2 * 1024 * 1024 + 1])
-                        .await;
+                    let _ = connection.write_all(&vec![b'x'; 2 * 1024 * 1024 + 1]).await;
                 }
             });
             let client = Client::builder()

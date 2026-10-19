@@ -6462,21 +6462,21 @@ fn target_site_map_hosts(
                 paths: IndexMap::new(),
             });
         push_unique(&mut host.schemes, url.scheme().to_string());
-        let path = host
-            .paths
-            .entry(path_and_query.clone())
-            .or_insert_with(|| TargetPathAccumulator {
-                path: path_and_query,
-                methods: Vec::new(),
-                last_seen: endpoint.last_seen,
-                status: None,
-                note_count: 0,
-                is_websocket: false,
-                captured: false,
-                recon_sources: Vec::new(),
-                recon_kinds: Vec::new(),
-                recon_last_seen: None,
-            });
+        let path =
+            host.paths
+                .entry(path_and_query.clone())
+                .or_insert_with(|| TargetPathAccumulator {
+                    path: path_and_query,
+                    methods: Vec::new(),
+                    last_seen: endpoint.last_seen,
+                    status: None,
+                    note_count: 0,
+                    is_websocket: false,
+                    captured: false,
+                    recon_sources: Vec::new(),
+                    recon_kinds: Vec::new(),
+                    recon_last_seen: None,
+                });
         if Method::from_bytes(endpoint.method.as_bytes()).is_ok() {
             push_unique(&mut path.methods, endpoint.method);
         }
@@ -17821,7 +17821,10 @@ mod tests {
         assert!(secure.paths["/secure"].captured);
         assert_eq!(secure.paths["/secure"].recon_sources, ["wayback"]);
         assert!(!secure.paths["/new"].captured);
-        assert_eq!(hosts["example.com:80"].paths["/plain"].recon_sources, ["wayback"]);
+        assert_eq!(
+            hosts["example.com:80"].paths["/plain"].recon_sources,
+            ["wayback"]
+        );
     }
 
     #[test]
@@ -17893,7 +17896,10 @@ mod tests {
         drop(inactive);
         drop(state);
         for (path, url) in [
-            (&active_state_path, "https://example.com/discovered?active=1"),
+            (
+                &active_state_path,
+                "https://example.com/discovered?active=1",
+            ),
             (
                 &inactive_state_path,
                 "https://inactive.example.com:8443/only?inactive=1",
@@ -17902,7 +17908,9 @@ mod tests {
             let mut saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             saved["recon"] = serde_json::to_value(crate::recon::ReconSnapshot {
-                endpoints: vec![site_map_recon_endpoint(url, "GET", now, "wayback", "history")],
+                endpoints: vec![site_map_recon_endpoint(
+                    url, "GET", now, "wayback", "history",
+                )],
                 jobs: vec![crate::recon::ReconJob {
                     id: Uuid::new_v4(),
                     target_url: url.into(),
@@ -17992,7 +18000,11 @@ mod tests {
         .await;
         assert_eq!(map.len(), 1);
         assert!(!map[0].in_scope);
-        assert_eq!(map[0].paths.len(), 1, "scope changes do not erase inventory");
+        assert_eq!(
+            map[0].paths.len(),
+            1,
+            "scope changes do not erase inventory"
+        );
         assert_eq!(map[0].paths[0].recon_sources, ["wayback"]);
         state.activate_session(active_id).await.unwrap();
         state.delete_session(inactive_metadata.id).await.unwrap();
