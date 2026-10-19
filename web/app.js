@@ -14905,6 +14905,9 @@ function initializeTargetWorkspace() {
       scheduleUiSettingsSave();
     },
     request: (path, options) => fetch(path, options),
+    onApiDocsOpen: () => { compareLoadGeneration += 1; },
+    isActiveModal: (modal) => getActiveModalAction()?.modal === modal,
+    restoreFocus: (previous) => restoreModalFocus(previous, document.querySelector("[data-target-view].active")),
     copyText: (text, label, isCurrent = () => true) => copyTextToClipboard(text, { isCurrent })
       .then(() => { if (isCurrent()) showToast(label); })
       .catch(() => { if (isCurrent()) showToast("Failed to copy", "error"); }),
@@ -20509,7 +20512,7 @@ function restoreModalFocus(previous, fallback = document.querySelector(".main-ta
 }
 
 function trapModalFocus(event, modal) {
-  const controls = Array.from(modal.querySelectorAll("button, [href], input, select, textarea, [tabindex]"))
+  const controls = Array.from(modal.querySelectorAll("button, [href], input, select, textarea, summary, [tabindex]"))
     .filter((control) => !control.disabled && control.tabIndex >= 0 && control.getClientRects().length
       && window.getComputedStyle(control).visibility !== "hidden");
   const first = controls[0], last = controls[controls.length - 1];
@@ -20554,6 +20557,11 @@ function getActiveModalAction() {
       close: closeScannerSettings,
       apply: null,
     };
+  }
+
+  if (typeof targetServiceMapController !== "undefined") {
+    const apiDocs = targetServiceMapController?.getApiDocsModalAction?.();
+    if (apiDocs) return apiDocs;
   }
 
   if (isModalVisible(els.compareModal)) {

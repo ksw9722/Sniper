@@ -1391,7 +1391,7 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, sendToReplay = null, openUrl = null, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, sendToReplay = null, openUrl = null, onApiDocsOpen = null, isActiveModal = () => true, restoreFocus = null, document: doc = root.document }) {
     // Request kinds whose links are not drawn. The app keeps them in UI
     // settings; without it they live for this controller only.
     let localHiddenLinkKinds = [...DEFAULT_HIDDEN_LINK_KINDS];
@@ -1435,6 +1435,7 @@
     let htmlGeneratorsAbort = null;
     let parametersAbort = null;
     let apiDocsCopyId = 0;
+    let apiDocsReturnFocus = null;
     let detailRender = null;
     const renderedMarkup = new WeakMap();
     let visible = false;
@@ -2143,9 +2144,12 @@
     const TRANSACTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     async function openApiDocs(originId) {
       if (!els.apiDocs) return;
+      onApiDocsOpen?.();
+      const opening = !state.apiDocs;
+      if (opening) apiDocsReturnFocus = doc?.activeElement;
       const requestId = ++state.apiDocsRequestId;
       state.apiDocs = { origin: originId, document: null, error: "" };
-      renderApiDocs();
+      renderApiDocs(opening);
       try {
         const response = await request(`/api/target/service-map/openapi?${new URLSearchParams({ session_id: getSessionId(), origin: originId })}`);
         if (!response.ok) throw new Error(response.status === 409 ? "API docs are read from the active session only." : "API docs unavailable.");
@@ -2159,10 +2163,19 @@
       }
       renderApiDocs();
     }
-    function closeApiDocs() {
+    function apiDocsOwnsFocus() {
+      return !!doc?.activeElement && els.apiDocs?.contains(doc.activeElement) && isActiveModal(els.apiDocs);
+    }
+    function closeApiDocs(returnFocus = true) {
+      // A pointer press on the non-focusable backdrop can leave body focused
+      // before its click dismisses the dialog.
+      const restore = returnFocus && state.apiDocs && isActiveModal(els.apiDocs)
+        && (apiDocsOwnsFocus() || !!doc?.body && doc.activeElement === doc.body);
       state.apiDocsRequestId += 1;
       state.apiDocs = null;
       renderApiDocs();
+      if (restore) restoreFocus?.(apiDocsReturnFocus);
+      apiDocsReturnFocus = null;
     }
     function copyApiDocs(label) {
       const apiDocs = state.apiDocs, sessionId = getSessionId(), copyId = ++apiDocsCopyId;
@@ -2170,11 +2183,14 @@
       const isCurrent = () => state.apiDocs === apiDocs && getSessionId() === sessionId && apiDocsCopyId === copyId;
       copyText?.(JSON.stringify(apiDocs.document, null, 2), label, isCurrent);
     }
-    function renderApiDocs() {
+    function renderApiDocs(opening = false) {
       if (!els.apiDocs) return;
       els.apiDocs.classList.toggle("hidden", !state.apiDocs);
+      // Replacing the loading markup detaches its focused Close button. Keep
+      // that focus inside, but do not take it back from a newer dialog.
+      const focus = state.apiDocs && isActiveModal(els.apiDocs) && (opening || apiDocsOwnsFocus());
       replace(els.apiDocs, state.apiDocs ? apiDocsMarkup(state.apiDocs) : "");
-      if (state.apiDocs) els.apiDocs.querySelector?.("[data-api-docs-close]")?.focus();
+      if (focus) els.apiDocs.querySelector?.("[data-api-docs-close]")?.focus();
     }
     function apiDocsMarkup({ origin, document, error }) {
       const body = error ? `<p class="service-map-filter-notice" role="status">${escape(error)}</p>`
@@ -3495,7 +3511,7 @@
       else if (data.apiDocsReplay) { closeApiDocs(); sendToReplay?.(data.apiDocsReplay); }
     });
     els.apiDocs?.addEventListener("keydown", (event) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || !isActiveModal(els.apiDocs)) return;
       event.preventDefault?.();
       closeApiDocs();
     });
@@ -3647,7 +3663,7 @@
           cancelHtmlGenerators();
           cancelPeerMatches();
         }
-        if (!value || view !== state.view) closeApiDocs();
+        if (!value || view !== state.view) closeApiDocs(false);
         visible = value;
         state.view = view;
         if (state.sessionId !== getSessionId()) reset();
@@ -3681,6 +3697,8 @@
         render();
         return refresh();
       },
+      getApiDocsModalAction: () => state.apiDocs && visible && els.apiDocs?.getClientRects().length
+        ? { modal: els.apiDocs, close: closeApiDocs, apply: null } : null,
       // State access makes offline lifecycle tests use the same real controller.
       getState: () => state,
     };

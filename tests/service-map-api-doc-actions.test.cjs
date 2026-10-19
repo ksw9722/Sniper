@@ -17,6 +17,7 @@ function node() {
   const handlers = new Map(), classes = new Set();
   return { value: '', disabled: false, dataset: {}, textContent: '', innerHTML: '', scrollTop: 0, scrollLeft: 0,
     classList: { toggle(name, on) { if (on) classes.add(name); else classes.delete(name); }, contains: name => classes.has(name) },
+    getClientRects: () => classes.has('hidden') ? [] : [1],
     setAttribute() {}, contains: () => true, querySelectorAll: () => [], querySelector: () => null,
     addEventListener(name, handler) { handlers.set(name, handler); },
     dispatch(name, event = {}) { return handlers.get(name)?.({ target: this, ...event }); } };
@@ -38,12 +39,12 @@ function fixture({ modern = true, fallbackResult = true } = {}) {
     execCommand(command) { assert.equal(command, 'copy'); assert.equal(attached.size, 1); fallback.push([...attached][0].value); return fallbackResult; },
   };
   const window = { open(...args) { opened.push(args); return null; } };
-  const context = loadFunctions(['copyTextToClipboard', 'initializeTargetWorkspace'], {
+  const context = loadFunctions(['copyTextToClipboard', 'initializeTargetWorkspace', 'getActiveModalAction', 'isModalVisible'], {
     document, window, URL, URLSearchParams, AbortController,
     navigator: modern ? { clipboard: { writeText(text) { const write = { text, ...deferred() }; writes.push(write); return write.promise; } } } : {},
     currentSessionId: () => session, targetServiceMapEventStreamReady: () => true,
     serviceMapFilterQuery: () => ({}), serviceMapFilterSummary: () => null,
-    state: {}, scheduleUiSettingsSave() {}, setActiveTargetView() {},
+    state: {}, els: {}, activeConfirmDialog: null, compareLoadGeneration: 0, scheduleUiSettingsSave() {}, setActiveTargetView() {},
     showToast: (...args) => toasts.push(args),
     fetch(url, options) { const read = { url, options, ...deferred() }; requests.push(read); return read.promise; },
   });
