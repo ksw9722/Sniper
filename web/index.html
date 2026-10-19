@@ -17,6 +17,7 @@
           <button class="main-tab active" data-tool="proxy">Capture</button>
           <button class="main-tab" data-tool="map">Map</button>
           <button class="main-tab" data-tool="recon">Recon</button>
+          <button class="main-tab" data-tool="templates">Templates</button>
           <button class="main-tab" data-tool="replay">Replay</button>
           <button class="main-tab" data-tool="fuzzer">Fuzzer</button>
           <button class="main-tab" data-tool="sequence">Sequence</button>
@@ -1511,6 +1512,67 @@
           </section>
         </section>
 
+        <section class="templates-shell hidden" id="templatesShell" aria-labelledby="templatesTitle">
+          <section class="panel-card templates-library">
+            <header class="panel-toolbar">
+              <div><p class="placeholder-kicker">Nuclei templates</p><h2 id="templatesTitle">Templates</h2></div>
+            </header>
+            <div class="recon-form">
+              <p class="recon-help" id="templatesStatus">Loading the template library…</p>
+              <p class="recon-notice hidden" id="templatesProgress" role="status"></p>
+              <label class="recon-check recon-history-consent"><input id="templatesConsent" type="checkbox" /> <span>Download the latest release from github.com/projectdiscovery/nuclei-templates (MIT license). GitHub sees this computer's address. The archive must match the checksum the release publishes. Templates are data: code, JavaScript and headless templates are listed but never run.</span></label>
+              <div class="templates-actions">
+                <button class="primary-action" id="templatesDownload" type="button" disabled>Download latest</button>
+                <button class="secondary-action" id="templatesCheck" type="button">Check for updates</button>
+                <button class="secondary-action" id="templatesImport" type="button">Import .tar.gz</button>
+                <input class="hidden" id="templatesImportFile" type="file" accept=".gz,.tgz,application/gzip" />
+              </div>
+              <p class="recon-help">Templates that send nothing run on captured traffic: while Passive Scan is on, every response from a host in Scope is checked against the templates turned on here. Their findings appear in Capture ▸ Findings under <strong>nuclei</strong>.</p>
+              <p class="recon-notice recon-warning hidden" id="templatesScopeNote">Templates are on, but Scope has no include patterns, so they check nothing. Add the hosts you test in Scope.</p>
+              <p class="recon-notice hidden" id="templatesNotice" role="status"></p>
+            </div>
+          </section>
+          <section class="panel-card recon-inventory templates-list">
+            <header class="panel-toolbar recon-inventory-toolbar">
+              <div class="recon-search-controls">
+                <input id="templatesSearch" type="search" placeholder="Search id, name, tag or CVE" aria-label="Search templates" />
+                <select id="templatesSeverity" aria-label="Severity">
+                  <option value="">All severities</option>
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                  <option value="info">Info</option>
+                </select>
+                <select id="templatesSupport" aria-label="What Sniper can run">
+                  <option value="passive" selected>Runs on captured traffic</option>
+                  <option value="">All templates</option>
+                  <option value="unsupported">Cannot run</option>
+                </select>
+              </div>
+              <label class="recon-check"><input id="templatesEnabledOnly" type="checkbox" /> On only</label>
+              <div class="toolbar-actions">
+                <button class="secondary-action" id="templatesEnableShown" type="button">Turn on shown</button>
+                <button class="secondary-action" id="templatesDisableShown" type="button">Turn off shown</button>
+              </div>
+              <span class="recon-help" id="templatesMeta"></span>
+            </header>
+            <div class="recon-results">
+              <div class="recon-table-scroll">
+                <table class="recon-table templates-table">
+                  <thead><tr><th>On</th><th>Severity</th><th>Template</th><th>Runs</th><th>Tags</th></tr></thead>
+                  <tbody id="templatesRows"></tbody>
+                </table>
+              </div>
+              <aside class="recon-detail" id="templatesDetail" aria-label="Template details"></aside>
+            </div>
+            <footer class="recon-pagination">
+              <span id="templatesPageMeta"></span>
+              <div class="toolbar-actions"><button class="secondary-action" id="templatesPrevious" type="button" disabled>Previous</button><button class="secondary-action" id="templatesNext" type="button" disabled>Next</button></div>
+            </footer>
+          </section>
+        </section>
+
         <section class="logger-shell hidden" id="loggerShell">
           <section class="panel-card">
             <header class="panel-toolbar">
@@ -1941,6 +2003,7 @@
     <script src="/product-icons.js" defer></script>
     <script src="/service-map.js" defer></script>
     <script src="/recon.js" defer></script>
+    <script src="/templates.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>

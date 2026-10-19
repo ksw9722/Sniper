@@ -362,6 +362,7 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/decoder/*path", get(decoder_asset))
         .route("/app.js", get(app_js))
         .route("/recon.js", get(recon_js))
+        .route("/templates.js", get(templates_js))
         .route("/api/recon", get(crate::recon::list))
         .route("/api/recon/jobs", post(crate::recon::start))
         .route("/api/recon/jobs/:id/stop", post(crate::recon::stop))
@@ -8916,6 +8917,13 @@ async fn recon_js() -> Response {
     asset_response(
         "application/javascript; charset=utf-8",
         include_str!("../web/recon.js"),
+    )
+}
+
+async fn templates_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/templates.js"),
     )
 }
 

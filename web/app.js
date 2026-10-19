@@ -203,7 +203,7 @@ const FUZZER_RESULT_BUFFER_ROWS = 30;
 const FINDINGS_ROW_HEIGHT = 27;
 let measuredFindingsRowHeight = FINDINGS_ROW_HEIGHT;
 const FINDINGS_BUFFER_ROWS = 20;
-const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "map", "fuzzer", "sequence", "replay", "recon", "tools", "logger"]);
+const IMPLEMENTED_TOOLS = new Set(["dashboard", "target", "proxy", "map", "fuzzer", "sequence", "replay", "recon", "templates", "tools", "logger"]);
 const IMPLEMENTED_PROXY_TABS = new Set(["intercept", "http-history", "websockets-history", "replace", "findings", "oast", "proxy-settings"]);
 const DECODER_SCRIPT_SOURCES = [
   "/decoder/lib/jquery-1.7.2.min.js",
@@ -595,6 +595,7 @@ let _interceptToggleInFlight = false;
 
 const els = {
   reconShell: document.getElementById("reconShell"),
+  templatesShell: document.getElementById("templatesShell"),
   dashboardShell: document.getElementById("dashboardShell"),
   dashboardCurrentSessionName: document.getElementById("dashboardCurrentSessionName"),
   dashboardCurrentSessionStatus: document.getElementById("dashboardCurrentSessionStatus"),
@@ -968,6 +969,7 @@ let sortHeaders = Array.from(document.querySelectorAll(".sort-header"));
 let historyColumnHandles = Array.from(document.querySelectorAll(".column-resize-handle"));
 
 let reconController = null;
+let templatesController = null;
 let targetServiceMapController = null;
 let targetServiceMapEventStreamReady = () => false;
 let refreshTimer = null;
@@ -1187,6 +1189,12 @@ function bindEvents() {
       root: els.reconShell,
       getSessionId: currentSessionId,
       getSessionGeneration: () => workspaceStateGeneration,
+    });
+  }
+  if (window.SniperTemplates && els.templatesShell) {
+    templatesController = window.SniperTemplates.createController({
+      root: els.templatesShell,
+      getScopeIncludeCount: () => (state.runtime?.scope_patterns || []).length,
     });
   }
   window.addEventListener("resize", resetLayoutTextareas);
@@ -8850,6 +8858,7 @@ function renderToolPanels() {
   const mapVisible = state.activeTool === "map";
   const loggerVisible = state.activeTool === "logger";
   const reconVisible = state.activeTool === "recon";
+  const templatesVisible = state.activeTool === "templates";
   els.dashboardShell.classList.toggle("hidden", !dashboardVisible);
   els.proxyShell.classList.toggle("hidden", !proxyVisible);
   els.replayShell.classList.toggle("hidden", !replayVisible);
@@ -8861,6 +8870,8 @@ function renderToolPanels() {
   els.loggerShell.classList.toggle("hidden", !loggerVisible);
   els.reconShell?.classList.toggle("hidden", !reconVisible);
   if (typeof reconController !== "undefined") reconController?.setVisible(reconVisible);
+  els.templatesShell?.classList.toggle("hidden", !templatesVisible);
+  if (typeof templatesController !== "undefined") templatesController?.setVisible(templatesVisible);
 
   if (dashboardVisible) {
     renderDashboard();
