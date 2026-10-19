@@ -422,6 +422,7 @@ const state = {
   selectedId: null,
   selectedRecord: null,
   loadingDetailId: null,
+  historyDetailError: "",
   historyPaging: createHistoryPagingState(),
   historyListError: "",
   historyDirty: false,
@@ -5796,61 +5797,71 @@ async function loadTransactionDetail(id) {
   const generation = ++_historyDetailGeneration;
   const sessionId = currentSessionId();
   const reconcileRetention = state._historyRetentionReconcile === true;
-  while (true) {
-    const annotationGeneration = state._historyDetailAnnotationGeneration || 0;
-    const response = await fetch(transactionPath(id, sessionId));
-    if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
-      return null;
-    }
-    if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
-    if (!response.ok) {
-      if (response.status === 404) {
-        if (reconcileRetention) {
-          applyConfirmedHistoryRemoval([id], sessionId);
-          return null;
-        }
-        const index = state.items.findIndex((item) => item.id === id);
-        let nextSelectedId = null;
-        if (index >= 0) {
-          state.items.splice(index, 1);
-          nextSelectedId = state.items[Math.min(index, state.items.length - 1)]?.id ?? null;
-          state._itemsVersion += 1;
-          adjustHistoryPagingAfterLocalRemoval(1);
-          precomputeItemIndexes();
-          invalidateVisibleEntriesCache();
-          refreshHistoryPagingCursorFromItems();
-          renderHistory();
-        }
-        if (state.selectedId === id) {
-          await selectHistoryTransaction(nextSelectedId, { scroll: true });
-        }
-      } else if (state.selectedId === id) {
-        state.selectedId = null;
-        updateHistorySelection(null);
-        renderEmptyDetail();
+  try {
+    while (true) {
+      const annotationGeneration = state._historyDetailAnnotationGeneration || 0;
+      const response = await fetch(transactionPath(id, sessionId));
+      if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
+        return null;
       }
-      return null;
-    }
+      if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
+      if (!response.ok) {
+        if (response.status === 404) {
+          if (reconcileRetention) {
+            applyConfirmedHistoryRemoval([id], sessionId);
+            return null;
+          }
+          const index = state.items.findIndex((item) => item.id === id);
+          let nextSelectedId = null;
+          if (index >= 0) {
+            state.items.splice(index, 1);
+            nextSelectedId = state.items[Math.min(index, state.items.length - 1)]?.id ?? null;
+            state._itemsVersion += 1;
+            adjustHistoryPagingAfterLocalRemoval(1);
+            precomputeItemIndexes();
+            invalidateVisibleEntriesCache();
+            refreshHistoryPagingCursorFromItems();
+            renderHistory();
+          }
+          if (state.selectedId === id) {
+            await selectHistoryTransaction(nextSelectedId, { scroll: true });
+          }
+        } else if (state.selectedId === id) {
+          renderEmptyDetail("Failed to load selected transaction. Select the row again to retry.");
+        }
+        return null;
+      }
 
-    const record = await response.json();
-    if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
-      return null;
-    }
-    // A successful save can finish after this read captured its annotations. The
-    // pending overlay is gone by then, and a summary only has a truncated note.
-    // Read again under the same selection owner rather than display stale text.
-    if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
-    const pending = state._pendingAnnotations?.get(id);
-    if (pending?.sessionId === sessionId) {
-      for (const key of ["user_note", "color_tag"]) {
-        if (pending.payload?.[key] !== undefined) record[key] = pending.payload[key];
+      const record = await response.json();
+      if (generation !== _historyDetailGeneration || state.selectedId !== id || sessionId !== currentSessionId()) {
+        return null;
       }
+      if (record?.id !== id) {
+        throw new Error("Selected transaction detail did not match the requested record.");
+      }
+      // A successful save can finish after this read captured its annotations. The
+      // pending overlay is gone by then, and a summary only has a truncated note.
+      // Read again under the same selection owner rather than display stale text.
+      if (annotationGeneration !== (state._historyDetailAnnotationGeneration || 0)) continue;
+      const pending = state._pendingAnnotations?.get(id);
+      if (pending?.sessionId === sessionId) {
+        for (const key of ["user_note", "color_tag"]) {
+          if (pending.payload?.[key] !== undefined) record[key] = pending.payload[key];
+        }
+      }
+      state.loadingDetailId = null;
+      observeAnnotationRevision(record);
+      state.selectedRecord = record;
+      renderDetail(state.selectedRecord);
+      return record;
     }
-    state.loadingDetailId = null;
-    observeAnnotationRevision(record);
-    state.selectedRecord = record;
-    renderDetail(state.selectedRecord);
-    return record;
+  } catch (_error) {
+    // A failed read owns the placeholder only while its selection and session
+    // are current; a late rejection must not erase a newer row or retry.
+    if (generation === _historyDetailGeneration && state.selectedId === id && sessionId === currentSessionId()) {
+      renderEmptyDetail("Failed to load selected transaction. Select the row again to retry.");
+    }
+    return null;
   }
 }
 
@@ -12207,6 +12218,7 @@ function renderDetail(record, options = {}) {
   if (!els.detailTitle) return;
   cancelHistoryDetailLoading();
   state.loadingDetailId = null;
+  state.historyDetailError = "";
   if (!options.preserveOriginalToggles) {
     state.showOriginal.request = false;
     state.showOriginal.response = false;
@@ -12261,10 +12273,11 @@ function renderDetail(record, options = {}) {
   renderMessagePanes();
 }
 
-function renderEmptyDetail() {
+function renderEmptyDetail(errorMessage = "") {
   cancelHistoryDetailLoading();
   state.selectedRecord = null;
   state.loadingDetailId = null;
+  state.historyDetailError = errorMessage;
   els.detailTitle.textContent = "Inspector";
   els.detailTags.innerHTML = "";
   els.protocolStrip.innerHTML = renderProtocolStrip({ current: "HTTP/1", supportsHttp2: false });
@@ -12272,10 +12285,10 @@ function renderEmptyDetail() {
   els.requestHeaderCount.textContent = "0";
   els.responseHeaderCount.textContent = "0";
   els.summaryList.innerHTML = renderSummaryRows([
-    { label: "Status", value: "Select a transaction to inspect it." },
+    { label: "Status", value: errorMessage || "Select a transaction to inspect it." },
   ]);
-  els.requestHeadersBody.innerHTML = "<p class=\"empty-copy\">Select a transaction from HTTP.</p>";
-  els.responseHeadersBody.innerHTML = "<p class=\"empty-copy\">No response selected.</p>";
+  els.requestHeadersBody.innerHTML = `<p class="empty-copy">${escapeHtml(errorMessage || "Select a transaction from HTTP.")}</p>`;
+  els.responseHeadersBody.innerHTML = `<p class="empty-copy">${escapeHtml(errorMessage || "No response selected.")}</p>`;
   els.notesCard.innerHTML = "<p>No anomalies were recorded for this transaction.</p>";
   renderViewTabs();
   renderMessagePanes();
@@ -12284,6 +12297,7 @@ function renderEmptyDetail() {
 function renderLoadingDetail(message = "Loading selected transaction...") {
   state.selectedRecord = null;
   state.loadingDetailId = state.selectedId;
+  state.historyDetailError = "";
   els.detailTitle.textContent = "Inspector";
   els.detailTags.innerHTML = "";
   els.protocolStrip.innerHTML = renderProtocolStrip({ current: "HTTP/1", supportsHttp2: false });
@@ -12319,10 +12333,10 @@ function renderMessagePanes() {
     : record;
   const requestText = requestRecord
     ? buildMessagePresentation("request", requestRecord)
-    : (detailLoading ? "Loading selected transaction..." : "Select a transaction from HTTP.");
+    : (state.historyDetailError || (detailLoading ? "Loading selected transaction..." : "Select a transaction from HTTP."));
   const responseText = responseRecord
     ? buildMessagePresentation("response", responseRecord)
-    : (detailLoading ? "Loading response details." : "No response selected.");
+    : (state.historyDetailError || (detailLoading ? "Loading response details." : "No response selected."));
 
   const reqMode = state.messageViews.request;
   const resMode = state.messageViews.response;
@@ -12381,7 +12395,7 @@ function renderMessagePanes() {
           key: `${responseRecord.id}:${state.showOriginal.response}`,
           url: recordPageUrl(responseRecord),
         }
-      : { note: detailLoading ? "Loading response details." : "No response selected." },
+      : { note: state.historyDetailError || (detailLoading ? "Loading response details." : "No response selected.") },
   );
 }
 
