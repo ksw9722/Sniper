@@ -27749,7 +27749,13 @@ function parseRequestForExport(rawText, scheme, host, port) {
   // Normalize header lines only: multipart and signed text bodies need their
   // original CRLF bytes, even when the editor uses LF for the request head.
   const lines = String(rawText || "").split("\n");
-  const [startLine = "GET / HTTP/1.1", ...rest] = lines.map((line) => line.replace(/\r$/, ""));
+  const normalizedLines = lines.map((line) => line.replace(/\r$/, ""));
+  // A final split item after one newline terminates the head; only a second
+  // newline supplies a blank separator and an explicitly empty body.
+  if (normalizedLines.length > 1 && normalizedLines.at(-1) === "") {
+    normalizedLines.pop();
+  }
+  const [startLine = "GET / HTTP/1.1", ...rest] = normalizedLines;
   const match = startLine.match(/^([A-Za-z0-9!#$%&'*+.^_`|~-]+)\s+(\S+)(?:\s+(HTTP\/[0-9.]+))?$/);
   if (!match) return null;
   const method = match[1];
