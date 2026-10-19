@@ -1032,6 +1032,7 @@ let displaySettingsPreviewActive = false;
 let displaySettingsReturnFocus = null;
 const cliPathState = createCliPathState();
 let filterSettingsReturnFocus = null;
+let curlImportReturnFocus = null;
 const filterSettingsEditedControls = new Set();
 let activeConfirmDialog = null;
 
@@ -20555,6 +20556,7 @@ function getActiveModalAction() {
 
   if (isModalVisible(els.curlImportModal)) {
     return {
+      modal: els.curlImportModal,
       close: closeCurlImportModal,
       apply: null,
     };
@@ -28496,15 +28498,21 @@ function decodeAnsiCStringEscape(input, index) {
 }
 
 function openCurlImportModal() {
-  compareLoadGeneration += 1;
   const modal = document.getElementById("curlImportModal");
+  if (isModalVisible(modal)) return;
+  compareLoadGeneration += 1;
+  curlImportReturnFocus = document.activeElement;
   document.getElementById("curlImportInput").value = "";
   modal.classList.remove("hidden");
   document.getElementById("curlImportInput").focus();
 }
 
 function closeCurlImportModal() {
-  document.getElementById("curlImportModal").classList.add("hidden");
+  const modal = document.getElementById("curlImportModal");
+  const restoreFocus = isModalVisible(modal) && getActiveModalAction()?.modal === modal;
+  modal.classList.add("hidden");
+  if (restoreFocus) restoreModalFocus(curlImportReturnFocus);
+  curlImportReturnFocus = null;
 }
 
 function applyCurlImport() {
