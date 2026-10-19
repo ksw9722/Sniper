@@ -9461,7 +9461,7 @@ async function loadFindings() {
     try {
       const countPromise = fetchFindingsCount(sessionId).catch(() => null);
       const response = await fetch(sessionQueryPath(`/api/findings?limit=${FINDINGS_LIST_LIMIT}`, sessionId));
-      if (!response.ok) return;
+      if (!response.ok) return false;
       const findings = jsonArray(await response.json());
       const fullCount = await countPromise;
       if (
@@ -9479,7 +9479,13 @@ async function loadFindings() {
       renderFindings();
       if (badgeAccepted) updateFindingsBadge();
     } catch (error) {
+      if (
+        sessionId !== currentSessionId()
+        || stateGeneration !== findingsStateGeneration
+        || loadGeneration !== findingsLoadGeneration
+      ) return;
       console.error("Failed to load findings:", error);
+      return false;
     } finally {
       if (
         findingsLoadPromise === loadPromise
@@ -11123,7 +11129,15 @@ function bindFindingsEvents() {
         await requireOkResponse(response, "Failed to rescan findings.");
         if (!isCurrent()) return;
         resetFindingsUiState();
-        await loadFindings();
+        const refreshGeneration = findingsStateGeneration;
+        const refreshed = await loadFindings();
+        if (
+          refreshed === false
+          && sessionId === currentSessionId()
+          && refreshGeneration === findingsStateGeneration
+        ) {
+          showToast("Rescan completed, but findings could not be refreshed. Reopen the Findings tab to retry.", "error");
+        }
       } catch (error) {
         if (!isCurrent()) return;
         console.error(error);

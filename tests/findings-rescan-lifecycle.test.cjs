@@ -297,12 +297,13 @@ test("an orphaned older count cannot finish a newer Rescan or replace its eventu
   await f.acknowledge(); const oldCount = f.requests.at(-2), oldList = f.requests.at(-1);
   oldList.resolve({ ok: false }); await first;
   assert.equal(button.disabled, false);
+  assert.deepEqual(f.toasts, [[refreshFailureMessage, "error"]]);
   const newer = f.click(), newerRequest = f.requests.at(-1); f.fire(180);
   const before = f.snapshot(); oldCount.resolve(response({ count: 99 })); await tick();
   assert.equal(f.snapshot(), before); assert.equal(button.disabled, true);
-  assert.equal(button.classList.contains("is-working-shown"), true); assert.equal(f.toasts.length, 0);
+  assert.equal(button.classList.contains("is-working-shown"), true); assert.equal(f.toasts.length, 1);
   newerRequest.reject(new Error("Synthetic newest rescan failure")); await newer;
-  assert.deepEqual(f.toasts, [["Synthetic newest rescan failure", "error"]]); assert.equal(button.disabled, false);
+  assert.deepEqual(f.toasts, [[refreshFailureMessage, "error"], ["Synthetic newest rescan failure", "error"]]); assert.equal(button.disabled, false);
   assert.equal(f.timers.size, 0);
 });
 
@@ -325,4 +326,70 @@ test("same-owner structured Rescan error retains its server feedback and precise
   await pending;
   assert.deepEqual(f.toasts, [["Synthetic conflicting owner (owner_session_id session-b)", "error"]]);
   assert.equal(f.snapshot(), before); assert.equal(f.els.findingsRescanButton.disabled, false);
+});
+
+const refreshFailureMessage = "Rescan completed, but findings could not be refreshed. Reopen the Findings tab to retry.";
+async function failList(request, outcome) {
+  if (outcome === "HTTP error") request.resolve({ ok: false });
+  else if (outcome === "fetch rejection") request.reject(new Error("Synthetic findings refresh failure"));
+  else request.resolve({ ok: true, json: async () => { throw new Error("Synthetic findings decode failure"); } });
+  await tick();
+}
+for (const outcome of ["HTTP error", "fetch rejection", "JSON rejection"]) {
+  test(`current Rescan refresh ${outcome} reports a read failure and releases the button without waiting for count`, async () => {
+    const f = fixture(), pending = f.click(); await f.acknowledge();
+    const pair = f.requests.slice(-2), joined = f.c.loadFindings();
+    assert.equal(f.requests.length, 3, "coalesced refreshes share the same read pair");
+    f.fire(180); await failList(pair[1], outcome); await pending;
+    assert.equal(await joined, false, "callers can distinguish list failure from a real empty list");
+    assert.deepEqual(f.toasts, [[refreshFailureMessage, "error"]]);
+    assert.equal(f.els.findingsRescanButton.disabled, false); assert.equal(f.timers.size, 0);
+    assert.deepEqual(Array.from(f.c.findingsData), []);
+    const before = f.snapshot(); pair[0].resolve(response({ count: 99 })); await tick();
+    assert.equal(f.snapshot(), before); assert.equal(f.toasts.length, 1);
+    const retry = f.click(), retryRequest = f.requests.at(-1);
+    await f.acknowledge(retryRequest); await f.finishList("retried"); await retry;
+    assert.deepEqual(Array.from(f.c.findingsData, item => item.id), ["retried"]);
+    assert.equal(f.toasts.length, 1, "successful retry does not add a failure notice");
+    assert.equal(f.els.findingsRescanButton.disabled, false);
+  });
+}
+for (const transition of ["session reset", "A→B→A", "Clear callback"]) {
+  for (const outcome of ["HTTP error", "fetch rejection", "JSON rejection"]) {
+    test(`obsolete Rescan refresh ${outcome} stays silent after ${transition}`, async () => {
+      const f = fixture(), pending = f.click(); await f.acknowledge();
+      const pair = f.requests.slice(-2); let body;
+      if (outcome === "JSON rejection") {
+        body = deferred(); pair[1].resolve({ ok: true, json: () => body.promise }); await tick();
+      }
+      await replace(f, transition); const before = f.snapshot();
+      if (body) body.reject(new Error("Synthetic obsolete refresh decode failure"));
+      else await failList(pair[1], outcome);
+      await pending; pair[0].resolve(response({ count: 99 })); await tick();
+      assert.equal(f.snapshot(), before); assert.equal(f.toasts.length, 0);
+      assert.equal(f.errors.length, 0, "invalidated list failures must not leak feedback");
+      assert.equal(f.els.findingsRescanButton.disabled, false); assert.equal(f.timers.size, 0);
+    });
+  }
+}
+for (const countResult of ["zero", "HTTP error", "fetch rejection", "JSON rejection"]) {
+  test(`valid empty Rescan list remains successful with ${countResult} count`, async () => {
+    const f = fixture(), pending = f.click(); await f.acknowledge();
+    const pair = f.requests.slice(-2), joined = f.c.loadFindings();
+    if (countResult === "zero") pair[0].resolve(response({ count: 0 }));
+    else await failList(pair[0], countResult);
+    pair[1].resolve(response([])); await pending;
+    assert.notEqual(await joined, false); assert.equal(f.toasts.length, 0); assert.equal(f.errors.length, 0);
+    assert.deepEqual(Array.from(f.c.findingsData), []); assert.equal(f.c.findingsBadgeCount, 0);
+    assert.match(f.els.findingsBody.innerHTML, /No findings yet/); assert.equal(f.els.findingsRescanButton.disabled, false);
+  });
+}
+
+test("a successful nonempty Rescan refresh uses list length when only its count read fails", async () => {
+  const f = fixture(), pending = f.click(); await f.acknowledge();
+  const pair = f.requests.slice(-2); pair[0].reject(new Error("Synthetic count failure"));
+  pair[1].resolve(response([finding("fresh")])); await pending;
+  assert.equal(f.c.findingsBadgeCount, 1); assert.equal(f.els.findingsBadge.textContent, "1");
+  assert.deepEqual(Array.from(f.state._findingsEntries, item => item.id), ["fresh"]);
+  assert.equal(f.toasts.length, 0); assert.equal(f.errors.length, 0);
 });
