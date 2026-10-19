@@ -6,13 +6,13 @@ const vm = require("node:vm");
 const { appSource, loadFunctions } = require("./frontend-test-helpers.cjs");
 
 function deferred() {
-  let resolve;
-  const promise = new Promise(done => { resolve = done; });
-  return { promise, resolve };
+  let resolve, reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function fixture() {
-  const nodes = {}, listeners = new Map(), pending = [], rendered = [], actions = [];
+  const nodes = {}, listeners = new Map(), pending = [], rendered = [], actions = [], errors = [];
   const document = { activeElement: null, readyState: "loading" };
   class Element {
     constructor(id, tagName = "DIV", parent = null) {
@@ -77,6 +77,7 @@ function fixture() {
   }
   for (const id of ["opener", "mainTab", "openDisplaySettingsButton", "openFilterSettingsButton"]) new Element(id, "BUTTON", document.body);
   new Element("trafficRegion", "SECTION", nodes.proxyShell).tabIndex = 0;
+  new Element("findingsSettingsButton", "BUTTON", nodes.proxyShell);
   for (const id of ["colorTagFilter", "filterBar", "historyWorkbenchResizer", "lowerWorkbench", "interceptPanel", "websocketPanel",
     "matchReplacePanel", "findingsPanel", "oastPanel", "proxySettingsPanel", "proxySubPlaceholder", "footerMode"]) new Element(id, "DIV", document.body);
   for (const [id, parent] of [
@@ -85,6 +86,7 @@ function fixture() {
     ["scannerSettingsSave", "scannerSettingsBackdrop"], ["closeCompareButton", "compareModal"],
   ]) new Element(id, "BUTTON", nodes[parent]);
   new Element("scannerBuiltinRules", "DIV", nodes.scannerSettingsBackdrop);
+  new Element("findingsFilterSearch", "INPUT", nodes.proxyShell).tabIndex = 0;
   new Element("curlImportInput", "TEXTAREA", nodes.curlImportModal).tabIndex = 0;
   const request = new Element("request", "BUTTON", nodes.compareModal), response = new Element("response", "BUTTON", nodes.compareModal);
   request.dataset.compareTab = "request"; response.dataset.compareTab = "response";
@@ -97,9 +99,10 @@ function fixture() {
     "openCompareModal", "closeCompareModal", "getActiveModalAction", "isModalVisible", "restoreModalFocus", "trapModalFocus", "isEditableTarget",
     "openDisplaySettingsModal", "closeDisplaySettingsModal", "closeCertificateModal", "openFilterModal", "closeFilterModal", "showConfirmDialog",
     "openCurlImportModal", "closeCurlImportModal", "openScannerSettings", "closeScannerSettings", "renderProxyPanels", "setActiveTool", "setActiveProxyTab", "renderToolPanels",
-    "resetScannerConfigUiState", "scannerConfigContextIsCurrent",
+    "resetScannerConfigUiState", "scannerConfigContextIsCurrent", "onClickWithProgress", "withButtonProgress",
   ], {
-    document, els: nodes, HTMLElement: Element, Element,
+    setTimeout: () => 1, clearTimeout() {}, BUTTON_PROGRESS_DELAY_MS: 10,
+    document, els: nodes, HTMLElement: Element, Element, console: { error: error => errors.push(error) },
     window: { getComputedStyle: node => ({ visibility: node.visibility }), getSelection: () => null },
     state: { activeTool: "proxy", activeProxyTab: "http-history", selectedId: "target" },
     compareBaseId: "base", compareBaseSessionId: "session-a", compareLoadGeneration: 0,
@@ -112,7 +115,7 @@ function fixture() {
     hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {}, selectSettingsTab() {}, hydrateFilterForm() {},
     saveDisplaySettingsFromForm: action("settings apply"), applyFilterSettings: action("filter apply"),
     scannerSettingsBaseline: null, scannerSettingsSessionId: null, scannerSettingsGeneration: 0,
-    scannerSettingsSavePending: null, scannerConfigStateGeneration: 0, scannerConfigLoadGeneration: 0, scannerConfigCache: null, scannerConfigSavePending: null, scannerQuickTogglePending: null,
+    scannerSettingsSavePending: null, scannerSettingsReturnFocus: null, scannerConfigStateGeneration: 0, scannerConfigLoadGeneration: 0, scannerConfigCache: null, scannerConfigSavePending: null, scannerQuickTogglePending: null,
     scannerConfigSnapshot: config => config, loadScannerConfig: () => scannerLoad.promise, BUILTIN_RULE_LABELS: {}, renderCustomRulesEditor() {},
     saveScannerSettingsFromModal: action("scanner save"), showToast: action("toast"), escapeHtml: text => text,
     findingsArrowNav: action("findings"), moveHistorySelection: action("history"),
@@ -121,9 +124,6 @@ function fixture() {
   });
   context.currentSessionId = () => context.sessionId;
   context.renderCompareModal = () => rendered.push(context.compareTargetRecord.id);
-  nodes.scannerSettingsClose.addEventListener("click", context.closeScannerSettings);
-  nodes.scannerSettingsCancel.addEventListener("click", context.closeScannerSettings);
-  nodes.scannerSettingsSave.addEventListener("click", context.saveScannerSettingsFromModal);
   function register(startMarker, endMarker) {
     const start = appSource.indexOf(startMarker), end = appSource.indexOf(endMarker, start);
     assert.ok(start >= 0 && end > start, startMarker);
@@ -135,6 +135,7 @@ function fixture() {
   const findingsEnd = appSource.indexOf("\n\n  // Findings detail search", findingsStart);
   assert.ok(findingsStart >= 0 && findingsEnd > findingsStart);
   vm.runInContext(appSource.slice(findingsStart, findingsEnd), context);
+  register("  // Scanner settings modal\n", "\n\n  initFindingsResizer();");
   register('  document.addEventListener("keydown", (event) => {\n    const activeModalAction', '\n\n  document.addEventListener("copy",');
   for (const handler of listeners.get("DOMContentLoaded") || []) handler();
   assert.equal(nodes.compareDiffView.getAttribute("data-readonly-editable"), "1");
@@ -144,6 +145,8 @@ function fixture() {
     target?.focus?.();
     for (const handler of listeners.get("keydown") || []) handler(event);
     if (!event.defaultPrevented && target?.tagName === "BUTTON" && ["Enter", " "].includes(key)) target.click();
+    if (!event.defaultPrevented && target?.tagName === "INPUT" && key.length === 1
+      && !event.ctrlKey && !event.metaKey && !event.altKey) target.value = (target.value || "") + key;
     return event;
   }
   function resolvePair(offset = 0, target = "target") {
@@ -159,10 +162,9 @@ function fixture() {
       const opening = context.openScannerSettings();
       scannerLoad.resolve({ rules: {}, custom_rules: [] });
       await opening;
-      nodes.scannerSettingsClose.focus();
     }
   }
-  return { context, nodes, document, key, pending, rendered, actions, resolvePair, openDialog, scannerLoad,
+  return { context, nodes, document, key, pending, rendered, actions, errors, resolvePair, openDialog, scannerLoad,
     hidden: () => nodes.compareModal.classList.contains("hidden") };
 }
 
@@ -373,3 +375,107 @@ for (const dialog of ["settings", "filter", "confirm", "curl"]) {
     assert.equal(f.document.activeElement, focus);
   });
 }
+
+for (const dialog of ["settings", "filter", "confirm", "curl"]) {
+  for (const dismissal of ["Escape", "close"]) {
+    test(`scanner configuration arriving after newer ${dialog} is ${dismissal}-closed stays cancelled`, async () => {
+      const f = fixture(), scanner = f.context.openScannerSettings();
+      await f.openDialog(dialog);
+      if (dismissal === "Escape") f.key("Escape");
+      else ({ settings: f.context.closeDisplaySettingsModal, filter: f.context.closeFilterModal,
+        confirm: () => f.context.activeConfirmDialog.close(), curl: f.context.closeCurlImportModal })[dialog]();
+      f.nodes.mainTab.focus();
+      f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await scanner;
+      assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+      assert.equal(f.context.scannerSettingsBaseline, null);
+      assert.equal(f.context.getActiveModalAction(), null);
+      assert.equal(f.document.activeElement, f.nodes.mainTab);
+      await f.context.openScannerSettings();
+      assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), false, "a fresh scanner request still opens");
+    });
+  }
+}
+
+test("Escape before scanner configuration arrives cancels its pending reveal", async () => {
+  const f = fixture(), scanner = f.context.openScannerSettings();
+  f.key("Escape");
+  f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await scanner;
+  assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+  assert.equal(f.context.scannerSettingsBaseline, null);
+  assert.equal(f.document.activeElement, f.nodes.opener);
+});
+
+for (const dialog of ["settings", "filter", "confirm", "curl"]) {
+  test(`scanner failure arriving after newer ${dialog} is dismissed stays silent`, async () => {
+    const f = fixture(), scanner = f.context.openScannerSettings();
+    await f.openDialog(dialog); f.key("Escape");
+    f.scannerLoad.reject(new Error("Synthetic old configuration read")); await scanner;
+    assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+    assert.deepEqual(f.actions, []);
+    assert.deepEqual(f.errors, []);
+  });
+}
+
+const scannerTick = () => new Promise(resolve => setImmediate(resolve));
+
+test("scanner async reveal moves focus away from background Findings search", async () => {
+  const f = fixture(); f.nodes.findingsSettingsButton.focus(); f.nodes.findingsSettingsButton.click();
+  assert.equal(f.nodes.findingsSettingsButton.disabled, true, "the real progress wrapper runs");
+  f.nodes.findingsFilterSearch.focus();
+  f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await scannerTick();
+  assert.equal(f.nodes.findingsSettingsButton.disabled, false);
+  assert.equal(f.document.activeElement, f.nodes.scannerSettingsClose);
+  assert.equal(f.context.getActiveModalAction()?.modal, f.nodes.scannerSettingsBackdrop);
+});
+
+for (const dismissal of ["Escape", "Cancel", "Close", "backdrop"]) {
+  test(`scanner ${dismissal} restores its invoker after asynchronous opening`, async () => {
+    const f = fixture(); f.nodes.findingsSettingsButton.focus(); f.nodes.findingsSettingsButton.click();
+    f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await scannerTick();
+    assert.equal(f.document.activeElement, f.nodes.scannerSettingsClose);
+    if (dismissal === "Escape") f.key("Escape");
+    if (dismissal === "Cancel") f.nodes.scannerSettingsCancel.click();
+    if (dismissal === "Close") f.nodes.scannerSettingsClose.click();
+    if (dismissal === "backdrop") { f.document.body.focus(); f.nodes.scannerSettingsBackdrop.click(); }
+    assert.equal(f.document.activeElement, f.nodes.findingsSettingsButton);
+    assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+    assert.deepEqual(f.actions, []);
+  });
+}
+
+for (const unavailable of ["hidden", "disabled", "detached"]) {
+  test(`scanner dismissal falls back when its original invoker is ${unavailable}`, async () => {
+    const f = fixture(); f.nodes.opener.focus(); await f.openDialog("scanner");
+    if (unavailable === "hidden") f.nodes.opener.classList.add("hidden");
+    if (unavailable === "disabled") f.nodes.opener.disabled = true;
+    if (unavailable === "detached") f.nodes.opener.remove();
+    f.key("Escape"); assert.equal(f.document.activeElement, f.nodes.findingsSettingsButton);
+  });
+}
+
+test("closing scanner below a confirmation preserves the newer focus", async () => {
+  const f = fixture(); await f.openDialog("scanner"); f.context.showConfirmDialog("Synthetic", () => {});
+  const focused = f.document.activeElement;
+  f.context.closeScannerSettings(); assert.equal(f.document.activeElement, focused);
+});
+
+test("scanner dismissal during workspace navigation does not reclaim the new focus", async () => {
+  const f = fixture(); await f.openDialog("scanner"); f.nodes.mainTab.focus();
+  f.context.setActiveTool("replay");
+  assert.equal(f.document.activeElement, f.nodes.mainTab);
+});
+
+test("typing after scanner reveal cannot edit the background Findings search", async () => {
+  const f = fixture(); f.nodes.findingsSettingsButton.focus(); f.nodes.findingsSettingsButton.click();
+  f.nodes.findingsFilterSearch.value = "before"; f.nodes.findingsFilterSearch.focus();
+  f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await scannerTick();
+  f.key("x");
+  assert.equal(f.nodes.findingsFilterSearch.value, "before");
+  assert.equal(f.document.activeElement, f.nodes.scannerSettingsClose);
+});
+
+test("scanner Close uses the active main tab when neither original focus nor its gear is available", async () => {
+  const f = fixture(); await f.openDialog("scanner");
+  f.nodes.opener.remove(); f.nodes.findingsSettingsButton.disabled = true;
+  f.key("Escape"); assert.equal(f.document.activeElement, f.nodes.mainTab);
+});

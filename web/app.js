@@ -1170,7 +1170,7 @@ function resetLayoutTextareas() {
 
 function setActiveTool(tool, options = {}) {
   const next = sanitizeActiveTool(tool);
-  if (next !== state.activeTool) closeScannerSettings();
+  if (next !== state.activeTool) closeScannerSettings(false);
   state.activeTool = next;
   if (options.persist !== false) {
     scheduleUiSettingsSave(options.delay);
@@ -1180,7 +1180,7 @@ function setActiveTool(tool, options = {}) {
 
 function setActiveProxyTab(tab, options = {}) {
   const next = sanitizeActiveProxyTab(tab);
-  if (next !== state.activeProxyTab) closeScannerSettings();
+  if (next !== state.activeProxyTab) closeScannerSettings(false);
   state.activeProxyTab = next;
   if (options.persist !== false) {
     scheduleUiSettingsSave(options.delay);
@@ -9382,6 +9382,7 @@ let scannerConfigSavePending = null;
 let scannerSettingsSessionId = null;
 let scannerSettingsBaseline = null;
 let scannerSettingsGeneration = 0;
+let scannerSettingsReturnFocus = null;
 let scannerSettingsSavePending = null;
 let scannerQuickTogglePending = null;
 let findingsSortKey = "found_at";
@@ -10449,7 +10450,7 @@ function resetScannerConfigUiState() {
   scannerConfigCache = null;
   scannerConfigSavePending = null;
   scannerQuickTogglePending = null;
-  closeScannerSettings();
+  closeScannerSettings(false);
   if (els.scannerQuickToggle) els.scannerQuickToggle.disabled = false;
 }
 
@@ -10555,17 +10556,19 @@ async function openScannerSettings() {
   const proxyTab = state.activeProxyTab;
   const sessionId = currentSessionId();
   if (scannerSettingsBaseline && scannerSettingsSessionId === sessionId) return;
-  compareLoadGeneration += 1;
+  const dialogGeneration = ++compareLoadGeneration;
+  const returnFocus = document.activeElement;
   const stateGeneration = scannerConfigStateGeneration;
   const generation = ++scannerSettingsGeneration;
   const isCurrent = () => generation === scannerSettingsGeneration
+    && dialogGeneration === compareLoadGeneration
     && scannerConfigContextIsCurrent(sessionId, stateGeneration)
     && state.activeTool === "proxy" && state.activeProxyTab === proxyTab
     && els.proxyShell.getClientRects().length;
   try {
     const config = await loadScannerConfig(sessionId);
     // The editor belongs to the Capture view that requested it, and must not
-    // appear underneath a newer dialog after its configuration arrives.
+    // reappear after a newer dialog is opened and dismissed while it loads.
     if (!config || !isCurrent() || getActiveModalAction()) return;
     scannerSettingsSessionId = sessionId;
     // The editor's read version must not follow later cache refreshes or toggles.
@@ -10582,7 +10585,9 @@ async function openScannerSettings() {
       .join("");
 
     renderCustomRulesEditor(config.custom_rules);
+    scannerSettingsReturnFocus = returnFocus;
     els.scannerSettingsBackdrop.classList.remove("hidden");
+    els.scannerSettingsClose.focus();
   } catch (error) {
     if (!isCurrent()) return;
     console.error(error);
@@ -10667,7 +10672,10 @@ function collectScannerConfig() {
   };
 }
 
-function closeScannerSettings() {
+function closeScannerSettings(returnFocus = true) {
+  // Navigation/reset callers must not return focus to a soon-hidden control.
+  const restoreFocus = returnFocus && isModalVisible(els.scannerSettingsBackdrop)
+    && getActiveModalAction()?.modal === els.scannerSettingsBackdrop;
   scannerSettingsGeneration += 1;
   scannerSettingsSessionId = null;
   scannerSettingsBaseline = null;
@@ -10675,6 +10683,8 @@ function closeScannerSettings() {
   if (els.scannerSettingsBackdrop) {
     els.scannerSettingsBackdrop.classList.add("hidden");
   }
+  if (restoreFocus) restoreModalFocus(scannerSettingsReturnFocus, els.findingsSettingsButton);
+  scannerSettingsReturnFocus = null;
 }
 
 async function saveScannerSettingsFromModal() {
