@@ -1259,7 +1259,7 @@ fn analyze_jwt(
             Severity::Medium,
             "jwt",
             "JWT without expiration",
-            format!("JWT token in {source} has no 'exp' claim. Tokens without expiration never expire and can be reused indefinitely if stolen."),
+            format!("JWT token in {source} has no 'exp' claim, so it does not declare an expiration time. Server-side session expiry, revocation, or other validation may still limit its lifetime; this capture does not establish indefinite reuse."),
             truncate_evidence(token, 120),
         ));
     }
@@ -1304,8 +1304,10 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
     }
 
     // Redirects too: an apex that only redirects to `www` still needs HSTS, or
-    // the first visit to it can be downgraded.
+    // the first visit to it can be downgraded. RFC 6797 excludes IP literals
+    // from HSTS hosts; their missing header is not an actionable HSTS finding.
     if record.scheme.eq_ignore_ascii_case("https")
+        && !host_is_ip_literal(&record.host)
         && matches!(record.status, Some(200..=399))
         && !header_value("strict-transport-security").is_some_and(valid_hsts_header_value)
     {
@@ -1360,6 +1362,16 @@ fn check_security_headers(record: &TransactionRecord, findings: &mut Vec<Scanner
             "",
         ));
     }
+}
+
+fn host_is_ip_literal(host: &str) -> bool {
+    // Stored hosts can also retain an authority's explicit port.
+    host.parse::<std::net::IpAddr>().is_ok()
+        || host.parse::<std::net::SocketAddr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .is_some_and(|value| value.parse::<std::net::Ipv6Addr>().is_ok())
 }
 
 fn valid_hsts_header_value(value: &str) -> bool {
@@ -2438,7 +2450,7 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
                 Severity::Low,
                 "cors",
                 "CORS: another site allowed with credentials",
-                format!("The response let {origin}, another site, read it with credentials. One answer cannot tell an allowlist from a server that reflects any origin: replay the request with an Origin the server cannot expect, and the finding stands if that origin comes back with credentials allowed."),
+                format!("Response headers allow credentialed CORS access for {origin}, another site, if the browser's other checks pass. This capture does not establish that credentials were sent, sensitive data was returned, or another site actually read the response. One answer cannot distinguish an intentional allowlist from unrestricted origin reflection."),
                 format!("ACAO: {origin}, ACAC: true"),
             ));
         }
@@ -2776,22 +2788,116 @@ fn check_error_messages(record: &TransactionRecord, findings: &mut Vec<ScannerFi
     ];
 
     for &(pattern, label, ref severity) in ERROR_PATTERNS {
-        if body_lower.contains(pattern) {
-            if error_pattern_is_too_generic(pattern, &body_lower) {
-                continue;
+        let matched = match pattern {
+            "ora-" => {
+                oracle_error_code_match(&body_lower).map(|(index, length)| (index, length, None))
             }
-            let evidence_start = body_lower.find(pattern).unwrap_or(0);
-            let evidence = evidence_window(body, evidence_start, pattern.len(), 20, 60);
-            findings.push(make_finding(
+            "error occurred while processing request" => coldfusion_error_phrase_match(&body_lower)
+                .map(|(index, marker_start, marker_len)| {
+                    (index, pattern.len(), Some((marker_start, marker_len)))
+                }),
+            _ => body_lower
+                .find(pattern)
+                .filter(|_| !error_pattern_is_too_generic(pattern, &body_lower))
+                .map(|index| (index, pattern.len(), None)),
+        };
+        if let Some((evidence_start, evidence_len, corroborator)) = matched {
+            let evidence = error_match_evidence(body, evidence_start, evidence_len, corroborator);
+            let mut finding = make_finding(
                 record,
                 severity.clone(),
                 "error",
                 format!("{label} in error response"),
                 format!("HTTP {status} response contains {label}. Detailed error messages help attackers understand the backend stack."),
-                truncate_evidence(evidence, 120),
-            ));
+                evidence,
+            );
+            if pattern == "ora-" || corroborator.is_some() {
+                // Searching the excerpt again can jump to an earlier repeated
+                // prefix or a lookalike that failed the contextual predicate.
+                let offset = corroborator.map_or(evidence_start, |(start, _)| start);
+                let line = response.headers.len()
+                    + 3
+                    + body[..offset].bytes().filter(|byte| *byte == b'\n').count();
+                finding.location = Some(location_for_line(record, "response", line));
+            }
+            findings.push(finding);
             break; // One finding per response is enough
         }
+    }
+}
+
+fn oracle_error_code_match(body_lower: &str) -> Option<(usize, usize)> {
+    // Oracle's displayed ORA code is five digits. Bare prefixes also occur in
+    // ordinary words such as "flora-guide"; an excerpt must use the qualifying
+    // occurrence, not an earlier prefix that failed these checks.
+    body_lower.match_indices("ora-").find_map(|(index, _)| {
+        let end = index + 9;
+        let digits = body_lower.as_bytes().get(index + 4..end)?;
+        let before = body_lower[..index].chars().next_back();
+        let after = body_lower.get(end..)?.chars().next();
+        (digits.iter().all(u8::is_ascii_digit)
+            && before.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+            && after.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_'))
+        .then_some((index, 9))
+    })
+}
+
+fn coldfusion_error_phrase_match(body_lower: &str) -> Option<(usize, usize, usize)> {
+    const PHRASE: &str = "error occurred while processing request";
+    // The heading is generic. Return its offset plus the corroborator's offset
+    // and length so the bounded excerpt can display both pieces of evidence.
+    body_lower.match_indices(PHRASE).find_map(|(index, _)| {
+        let context_start = previous_char_boundary(body_lower, index.saturating_sub(512));
+        let context_end = next_char_boundary(
+            body_lower,
+            (index + PHRASE.len() + 512).min(body_lower.len()),
+        );
+        let context = &body_lower[context_start..context_end];
+        [
+            "coldfusion.runtime.",
+            "coldfusion.tagext.",
+            "coldfusion.filter.",
+            "coldfusion.sql.",
+            "coldfusion.compiler.",
+            "check the coldfusion documentation",
+            "enable robust exception information",
+        ]
+        .iter()
+        .find_map(|marker| {
+            context.match_indices(marker).find_map(|(start, _)| {
+                let marker_start = context_start + start;
+                // A cropped window must not invent a boundary inside a word.
+                body_lower[..marker_start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+                    .then_some((index, marker_start, marker.len()))
+            })
+        })
+    })
+}
+
+fn error_match_evidence(
+    body: &str,
+    match_start: usize,
+    match_len: usize,
+    corroborator: Option<(usize, usize)>,
+) -> String {
+    if let Some((marker_start, marker_len)) = corroborator {
+        // A generic heading alone cannot explain vendor attribution. Keep both
+        // matches visible even when their local context is too far apart for
+        // one excerpt. Put the real marker excerpt on its own first line so
+        // finding-location lookup can still locate the corroborating text.
+        truncate_evidence(
+            &format!(
+                "{}\n{}",
+                evidence_window(body, marker_start, marker_len, 0, 32),
+                &body[match_start..match_start + match_len],
+            ),
+            120,
+        )
+    } else {
+        truncate_evidence(evidence_window(body, match_start, match_len, 20, 60), 120)
     }
 }
 
@@ -8528,5 +8634,283 @@ mod tests {
                 value: "Origin".into(),
             });
         assert_eq!(findings_for_rule(&record, "cors").len(), 1);
+    }
+    #[test]
+    fn oracle_errors_require_a_complete_numeric_code_token() {
+        for body in [
+            "The flora-guide page was not found.",
+            "flora-00942 guide unavailable",
+            "ORA-",
+            "ORA-code",
+            "ORA-0094",
+            "ORA-942: abbreviated code",
+            "ORA-009420",
+            "ORA-00942x",
+            "error_ORA-00942",
+            "ORA-00942_suffix",
+            "éORA-00942",
+            "ORA-00942é",
+            "ORA-１２３４５",
+        ] {
+            let record = make_record(vec![], vec![], body, 404);
+            assert!(findings_for_rule(&record, "error").is_empty(), "{body}");
+        }
+        for body in [
+            "ORA-00942: table or view does not exist",
+            "ora-01017: invalid username/password; logon denied",
+            "[ORA-00600] internal error code",
+            "ORA-06502: PL/SQL: numeric or value error\nORA-06512: at line 1",
+            "ORA-00942",
+        ] {
+            let record = make_record(vec![], vec![], body, 500);
+            let found = findings_for_rule(&record, "error");
+            assert_eq!(found.len(), 1, "{body}");
+            assert_eq!(
+                found[0].title,
+                "Oracle DB error disclosure in error response"
+            );
+            assert_eq!(found[0].severity, Severity::Medium);
+        }
+        let record = make_record(vec![], vec![], "ORA-00942", 200);
+        assert!(findings_for_rule(&record, "error").is_empty());
+    }
+
+    #[test]
+    fn oracle_error_evidence_uses_the_qualifying_occurrence() {
+        let body = format!(
+            "flora-guide ORA-short {}\nORA-00942: table or view does not exist",
+            "가".repeat(80)
+        );
+        let record = make_record(vec![], vec![], &body, 500);
+        let found = findings_for_rule(&record, "error");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].evidence.contains("ORA-00942"));
+        assert!(!found[0].evidence.contains("flora-guide"));
+        assert!(!found[0].evidence.contains("ORA-short"));
+        assert_eq!(found[0].location.as_ref().unwrap().line, Some(4));
+
+        let body = format!(
+            "flora-00942: table or view does not exist\n{}\nORA-00942: table or view does not exist",
+            "가".repeat(80)
+        );
+        let record = make_record(vec![], vec![], &body, 500);
+        let found = findings_for_rule(&record, "error");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].evidence.contains("ORA-00942"));
+        let location = found[0].location.as_ref().unwrap();
+        assert_eq!(location.side, "response");
+        assert_eq!(location.section, "body");
+        assert_eq!(location.line, Some(5), "skip the identical code in a word");
+    }
+
+    #[test]
+    fn coldfusion_heading_needs_local_diagnostic_context() {
+        const HEADING: &str = "Error Occurred While Processing Request";
+        for body in [
+            HEADING.to_string(),
+            format!(r#"{{"message":"{HEADING}","retry":true}}"#),
+            format!("{HEADING}. ColdFusion guide is unavailable."),
+            format!("{HEADING}. notcoldfusion.runtime.Example"),
+            format!(
+                "{HEADING} {} coldfusion.runtime.TemplateNotFoundException",
+                "x".repeat(1100)
+            ),
+        ] {
+            let record = make_record(vec![], vec![], &body, 500);
+            assert!(findings_for_rule(&record, "error").is_empty(), "{body}");
+        }
+        let embedded_marker = "coldfusion.runtime.Example";
+        let body = format!(
+            "not{embedded_marker}{}{HEADING}",
+            " ".repeat(512 - embedded_marker.len())
+        );
+        let record = make_record(vec![], vec![], &body, 500);
+        assert!(findings_for_rule(&record, "error").is_empty());
+        for marker in [
+            "coldfusion.runtime.TemplateNotFoundException",
+            "coldfusion.tagext.sql.QueryTag",
+            "coldfusion.filter.FormValidationException",
+            "coldfusion.sql.QueryTable",
+            "coldfusion.compiler.ParseException",
+            "Check the ColdFusion documentation to verify the syntax.",
+            "Enable Robust Exception Information to provide greater detail.",
+        ] {
+            let body = format!("{HEADING}\n{marker}");
+            let record = make_record(vec![], vec![], &body, 500);
+            let found = findings_for_rule(&record, "error");
+            assert_eq!(found.len(), 1, "{marker}");
+            assert_eq!(found[0].title, "ColdFusion error in error response");
+            assert_eq!(found[0].severity, Severity::Medium);
+        }
+        let body = format!("{HEADING}\ncoldfusion.filter.FormValidationException");
+        let record = make_record(vec![], vec![], &body, 200);
+        assert!(findings_for_rule(&record, "error").is_empty());
+    }
+
+    #[test]
+    fn coldfusion_error_evidence_uses_the_corroborated_occurrence() {
+        let body = format!(
+            "FIRST Error Occurred While Processing Request {}\nError Occurred While Processing Request\ncoldfusion.runtime.TemplateNotFoundException",
+            "가".repeat(400)
+        );
+        let record = make_record(vec![], vec![], &body, 500);
+        let found = findings_for_rule(&record, "error");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].evidence.contains("coldfusion.runtime."));
+        assert!(!found[0].evidence.contains("FIRST"));
+        let location = found[0].location.as_ref().unwrap();
+        assert_eq!(location.side, "response");
+        assert_eq!(location.section, "body");
+        assert_eq!(location.line, Some(5), "locate the later vendor diagnostic");
+        let duplicate_marker = "coldfusion.runtime.TemplateNotFoundException";
+        let body = format!(
+            "{duplicate_marker}\n{}\nError Occurred While Processing Request\n{duplicate_marker}",
+            "가".repeat(400)
+        );
+        let record = make_record(vec![], vec![], &body, 500);
+        let found = findings_for_rule(&record, "error");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].location.as_ref().unwrap().line,
+            Some(6),
+            "skip an identical unassociated marker"
+        );
+        for body in [
+            format!("Error Occurred While Processing Request {} coldfusion.runtime.TemplateNotFoundException", "가".repeat(66)),
+            format!("coldfusion.runtime.TemplateNotFoundException {} Error Occurred While Processing Request", "가".repeat(66)),
+        ] {
+            let record = make_record(vec![], vec![], &body, 500);
+            let found = findings_for_rule(&record, "error");
+            assert_eq!(found.len(), 1);
+            assert!(found[0].evidence.contains("Error Occurred While Processing Request"));
+            assert!(found[0].evidence.contains("coldfusion.runtime."));
+            assert!(found[0].evidence.len() <= 123);
+            assert!(found[0].evidence.lines().next().unwrap().contains("coldfusion.runtime."));
+            let location = found[0].location.as_ref().unwrap();
+            assert_eq!(location.side, "response");
+            assert_eq!(location.section, "body");
+            assert_eq!(location.line, Some(3));
+        }
+    }
+
+    #[test]
+    fn hsts_missing_header_excludes_only_parsed_ip_literals() {
+        for host in [
+            "192.0.2.1",
+            "127.0.0.1",
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "[::1]",
+            "192.0.2.1:443",
+            "192.0.2.1:8443",
+            "[2001:db8::1]:8443",
+            "[::1]:443",
+        ] {
+            let mut record = make_record(
+                vec![("sec-fetch-dest", "document")],
+                vec![],
+                "<html></html>",
+                200,
+            );
+            record.host = host.into();
+            let found = findings_for_rule(&record, "header");
+            assert!(
+                !found
+                    .iter()
+                    .any(|f| f.title == "Missing Strict-Transport-Security"),
+                "{host}"
+            );
+            assert!(
+                found
+                    .iter()
+                    .any(|f| f.title == "Missing Content-Security-Policy"),
+                "other header rules remain active for {host}"
+            );
+        }
+        for host in [
+            "example.com",
+            "localhost",
+            "192.0.2.1.example.com",
+            "[example.com]",
+            "[192.0.2.1]",
+            "example.com:443",
+            "192.0.2.1.example.com:8443",
+            "192.0.2.1:",
+            "192.0.2.1:invalid",
+            "192.0.2.1:65536",
+            "[2001:db8::1]:invalid",
+            "[2001:db8::1]:65536",
+            "[192.0.2.1]:443",
+            "[2001:db8::1]suffix:443",
+        ] {
+            let mut record = make_record(
+                vec![("sec-fetch-dest", "document")],
+                vec![],
+                "<html></html>",
+                200,
+            );
+            record.host = host.into();
+            let found = findings_for_rule(&record, "header");
+            assert!(
+                found
+                    .iter()
+                    .any(|f| f.title == "Missing Strict-Transport-Security"),
+                "{host}"
+            );
+        }
+        for (host, expected) in [
+            ("example.com", true),
+            ("example.com:8443", true),
+            ("192.0.2.1", false),
+            ("192.0.2.1:443", false),
+            ("[2001:db8::1]:8443", false),
+        ] {
+            let mut record = make_record(
+                vec![("sec-fetch-dest", "document")],
+                vec![("location", "https://example.com/")],
+                "",
+                301,
+            );
+            record.host = host.into();
+            assert_eq!(
+                findings_for_rule(&record, "header")
+                    .iter()
+                    .any(|f| f.title == "Missing Strict-Transport-Security"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn jwt_and_cors_details_distinguish_observation_from_proven_impact() {
+        let token = jwt_token(
+            serde_json::json!({"alg": "HS256", "typ": "JWT"}),
+            serde_json::json!({"sub": "synthetic"}),
+        );
+        let authorization = format!("Bearer {token}");
+        let record = make_record(vec![("authorization", &authorization)], vec![], "", 200);
+        let found = findings_for_rule(&record, "jwt");
+        let jwt = found
+            .iter()
+            .find(|f| f.title == "JWT without expiration")
+            .unwrap();
+        assert_eq!(jwt.severity, Severity::Medium);
+        assert!(jwt.detail.contains("Server-side session expiry"));
+        assert!(jwt.detail.contains("does not establish indefinite reuse"));
+        assert!(!jwt.detail.contains("never expire"));
+
+        let record = cors_value_fixture("https://example.com", "true");
+        let found = findings_for_rule(&record, "cors");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].title,
+            "CORS: another site allowed with credentials"
+        );
+        assert_eq!(found[0].severity, Severity::Low);
+        assert!(found[0]
+            .detail
+            .contains("does not establish that credentials were sent"));
+        assert!(found[0].detail.contains("intentional allowlist"));
+        assert!(!found[0].detail.contains("read it with credentials"));
     }
 }
