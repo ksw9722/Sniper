@@ -12,7 +12,11 @@ regex rules remain under the user's existing configuration.
 
 All ten built-in families default to enabled in `BUILTIN_RULES` and
 `default_rule_toggles` in `src/scanner.rs`. This is the repository default, not a
-claim about any running session's configuration.
+claim about any running session's configuration. This inventory covers the
+built-in scanner on this baseline only. Later upstream changes add a separate
+passive Nuclei Templates engine/category and Rescan integration; those templates
+and the user's enabled-template configuration are not covered by this review.
+No templates were downloaded, enabled, or executed here.
 
 | Family | Checks | Existing precision guards | Review result |
 | --- | --- | --- | --- |
@@ -85,3 +89,62 @@ state are outside this change.
 - Primary standards describe browser/server behavior, but synthetic unit tests
   do not qualify all browser versions, intermediary quirks, malformed headers,
   or real-world false-positive rates.
+
+### Next deterministic case: CORS header values
+
+`check_cors` currently treats `Access-Control-Allow-Credentials: True` as
+credentialed access through `eq_ignore_ascii_case`. The [Fetch credentials
+matrix](https://fetch.spec.whatwg.org/#cors-protocol-and-credentials) explicitly
+requires the lowercase value `true`. This bounded issue is distinct from the
+intentional-allowlist question. A separate CORS patch should pair valid values
+with wrong-case values, duplicate fields, and invalid serialized origins;
+retain valid null-origin and cross-site credentialed policy observations.
+This follow-up is documented, not changed by the present patch.
+
+### CSP scope
+
+The CSP patch models modern CSP3 header-delivered script source restrictions.
+It does not parse HTML meta policies or sandbox restrictions, evaluate nonce
+quality, or emulate historical browser versions. It reports source-policy
+observations, not a demonstration that a script can execute in every document
+context. No browser execution or target probing is part of qualification.
+
+## Applying the rule changes
+
+New captures use the updated built-in rules after rebuilding/running the
+updated application. Findings already stored in a session are not silently
+rewritten by this patch. The existing user-triggered **Rescan** action
+reevaluates retained local history using current rules. Use that action when
+reviewing whether old false positives disappear; absence of an automatic
+change to old rows does not mean the new predicates failed. No automatic clear,
+rescan, template change, or user-data mutation is introduced here.
+
+## Qualification of the built-in patches
+
+- Final focused native command: `cargo test --offline --release --lib scanner::tests -- --test-threads=1`.
+- Result: **199 passed, 0 failed**. Includes 16 added tests, each using synthetic
+  records, with paired benign/suspicious controls and existing-rule regressions.
+- The reviewed source SHA-256 is `7577f3749c8b10267c71550fbe224dd36950c94e586f674290d490becfb4127c`.
+- The qualified test-binary SHA-256 is `38bac6b3ab766c8d340ece0c078e521352e158a4291e8d9a67d5eb310b114c98`.
+- Findings UI, Rescan lifecycle, and scanner configuration regressions:
+  **277 in-memory Node tests passed**. No live runtime or socket was used.
+- Separate independent reviews approved the simple filters and CSP semantics;
+  review suggestions became additional controls before the final native run.
+- Formatting and diff whitespace checks passed. This is focused source/test
+  qualification, not a full-project suite, browser execution, package, release,
+  or validation of the later upstream Nuclei engine.
+
+### Boundedness check
+
+New header/CSP parsing is iterative and linear in retained header text/source
+lists, with no recursive parsing or newly added regex compilation. Comment
+matching retains the existing 500-character regex window and captured body
+preview boundary; token-boundary matching adds only a fixed set of aliases.
+No capture/body/header size setting is changed. This does not add a new global
+header-byte limit.
+
+A standalone Rust control compiled the exact new parser helpers and checked a
+524,294-byte header (16,385 quoted members), 688,147 bytes of repeated CSP
+directives, and 16,384 enforced policies. All assertions passed in approximately
+8 ms on this executor. This is a bounded synthetic smoke check, not a throughput
+benchmark or a claim about real traffic latency.

@@ -3021,34 +3021,45 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
             .any(|h| h.name.eq_ignore_ascii_case(name))
     };
 
-    let header_value = |name: &str| -> Option<String> {
+    // All enforced policies apply independently. A permissive policy cannot
+    // override a restrictive one, and report-only headers impose no limit.
+    let policies: Vec<_> = response
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("content-security-policy"))
+        .flat_map(|header| header.value.split(','))
+        .map(CspScriptPolicy::parse)
+        .collect();
+    let csp_evidence = || {
         response
             .headers
             .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(name))
-            .map(|h| h.value.clone())
+            .filter(|header| header.name.eq_ignore_ascii_case("content-security-policy"))
+            .map(|header| header.value.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-
-    // CSP with unsafe-inline or unsafe-eval
-    if let Some(csp) = header_value("content-security-policy") {
-        if csp_script_sources_have_actionable_unsafe_inline(&csp) {
+    if !policies.is_empty() {
+        if csp_policies_allow(&policies, CspScriptContext::Element)
+            || csp_policies_allow(&policies, CspScriptContext::Attribute)
+        {
             findings.push(make_finding(
                 record,
                 Severity::Medium,
                 "misconfig",
                 "CSP allows unsafe-inline",
                 "Content-Security-Policy contains 'unsafe-inline', which undermines XSS protection by allowing inline scripts.",
-                truncate_evidence(&csp, 120),
+                truncate_evidence(&csp_evidence(), 120),
             ));
         }
-        if csp_script_sources_contain(&csp, "'unsafe-eval'") {
+        if csp_policies_allow(&policies, CspScriptContext::Eval) {
             findings.push(make_finding(
                 record,
                 Severity::Medium,
                 "misconfig",
                 "CSP allows unsafe-eval",
                 "Content-Security-Policy contains 'unsafe-eval', which allows eval() and similar dynamic code execution.",
-                truncate_evidence(&csp, 120),
+                truncate_evidence(&csp_evidence(), 120),
             ));
         }
     }
@@ -3104,87 +3115,80 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
     }
 }
 
-fn csp_script_sources_contain(csp: &str, token: &str) -> bool {
-    let token = token.to_ascii_lowercase();
-    let mut default_sources: Option<Vec<String>> = None;
-    let mut has_script_directive = false;
-    let mut matched_script_directive = false;
+#[derive(Clone, Copy)]
+enum CspScriptContext {
+    Element,
+    Attribute,
+    Eval,
+}
 
-    for directive in csp.split(';') {
-        let mut parts = directive.split_whitespace();
-        let Some(name) = parts.next() else {
-            continue;
-        };
-        let name = name.to_ascii_lowercase();
-        let sources = parts.map(str::to_ascii_lowercase).collect::<Vec<String>>();
-        if name == "default-src" {
-            default_sources = Some(sources);
-            continue;
+#[derive(Default)]
+struct CspScriptPolicy {
+    default: Option<Vec<String>>,
+    script: Option<Vec<String>>,
+    element: Option<Vec<String>>,
+    attribute: Option<Vec<String>>,
+}
+
+impl CspScriptPolicy {
+    fn parse(policy: &str) -> Self {
+        let mut parsed = Self::default();
+        for directive in policy.split(';') {
+            // CSP parsing discards non-ASCII directives rather than allowing
+            // Unicode whitespace to create a browser-inert source restriction.
+            if !directive.is_ascii() {
+                continue;
+            }
+            let mut parts = directive.split_ascii_whitespace();
+            let Some(name) = parts.next() else {
+                continue;
+            };
+            let slot = match name.to_ascii_lowercase().as_str() {
+                "default-src" => &mut parsed.default,
+                "script-src" => &mut parsed.script,
+                "script-src-elem" => &mut parsed.element,
+                "script-src-attr" => &mut parsed.attribute,
+                _ => continue,
+            };
+            // Browsers ignore a repeated directive after its first occurrence.
+            if slot.is_none() {
+                *slot = Some(parts.map(str::to_ascii_lowercase).collect());
+            }
         }
-        if matches!(
-            name.as_str(),
-            "script-src" | "script-src-elem" | "script-src-attr"
-        ) {
-            has_script_directive = true;
-            matched_script_directive |= sources.iter().any(|source| source == &token);
-        }
+        parsed
     }
 
-    if has_script_directive {
-        matched_script_directive
-    } else {
-        default_sources
-            .as_deref()
-            .is_some_and(|sources| sources.iter().any(|source| source == &token))
+    fn sources(&self, context: CspScriptContext) -> Option<&[String]> {
+        let script = self.script.as_deref().or(self.default.as_deref());
+        match context {
+            CspScriptContext::Element => self.element.as_deref().or(script),
+            CspScriptContext::Attribute => self.attribute.as_deref().or(script),
+            // script-src-elem/attr do not govern eval(), even when present.
+            CspScriptContext::Eval => script,
+        }
     }
 }
 
-fn csp_script_sources_have_actionable_unsafe_inline(csp: &str) -> bool {
-    let mut default_sources: Option<Vec<String>> = None;
-    let mut script_sources: Option<Vec<String>> = None;
-    let mut script_elem_sources: Option<Vec<String>> = None;
-    let mut script_attr_sources: Option<Vec<String>> = None;
-
-    for directive in csp.split(';') {
-        let mut parts = directive.split_whitespace();
-        let Some(name) = parts.next() else {
-            continue;
+fn csp_policies_allow(policies: &[CspScriptPolicy], context: CspScriptContext) -> bool {
+    let mut explicitly_allowed = false;
+    for policy in policies {
+        let Some(sources) = policy.sources(context) else {
+            continue; // This policy does not constrain this script context.
         };
-        let name = name.to_ascii_lowercase();
-        let sources = parts.map(str::to_ascii_lowercase).collect::<Vec<String>>();
-        if name == "default-src" {
-            default_sources = Some(sources);
-            continue;
+        let allowed = match context {
+            CspScriptContext::Eval => csp_sources_contain(sources, "'unsafe-eval'"),
+            CspScriptContext::Element | CspScriptContext::Attribute => {
+                csp_sources_contain(sources, "'unsafe-inline'")
+                    && !csp_sources_have_nonce_or_hash(sources)
+                    && !csp_sources_contain(sources, "'strict-dynamic'")
+            }
+        };
+        if !allowed {
+            return false;
         }
-        match name.as_str() {
-            "script-src" => script_sources = Some(sources),
-            "script-src-elem" => script_elem_sources = Some(sources),
-            "script-src-attr" => script_attr_sources = Some(sources),
-            _ => {}
-        }
+        explicitly_allowed = true;
     }
-
-    let effective_script = script_sources.as_deref().or(default_sources.as_deref());
-    let effective_elem = script_elem_sources
-        .as_deref()
-        .or(script_sources.as_deref())
-        .or(default_sources.as_deref());
-    let effective_attr = script_attr_sources
-        .as_deref()
-        .or(script_sources.as_deref())
-        .or(default_sources.as_deref());
-
-    for sources in [effective_script, effective_elem, effective_attr]
-        .into_iter()
-        .flatten()
-    {
-        if csp_sources_contain(sources, "'unsafe-inline'")
-            && !csp_sources_have_nonce_or_hash(sources)
-        {
-            return true;
-        }
-    }
-    false
+    explicitly_allowed
 }
 
 fn csp_sources_contain(sources: &[String], token: &str) -> bool {
@@ -3193,11 +3197,19 @@ fn csp_sources_contain(sources: &[String], token: &str) -> bool {
 
 fn csp_sources_have_nonce_or_hash(sources: &[String]) -> bool {
     sources.iter().any(|source| {
-        let source = source.trim_matches('\'');
-        source.starts_with("nonce-")
-            || source.starts_with("sha256-")
-            || source.starts_with("sha384-")
-            || source.starts_with("sha512-")
+        let Some(source) = source.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+            return false;
+        };
+        let Some((kind, value)) = source.split_once('-') else {
+            return false;
+        };
+        let unpadded = value.trim_end_matches('=');
+        matches!(kind, "nonce" | "sha256" | "sha384" | "sha512")
+            && !unpadded.is_empty()
+            && value.len() - unpadded.len() <= 2
+            && unpadded.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_')
+            })
     })
 }
 
@@ -8066,6 +8078,181 @@ mod tests {
         assert!(findings_for_rule(&record, "misconfig").is_empty());
     }
 
+    fn csp_titles(headers: Vec<(&str, &str)>) -> Vec<String> {
+        let record = make_record(vec![], headers, "<html></html>", 200);
+        findings_for_rule(&record, "misconfig")
+            .into_iter()
+            .map(|finding| finding.title)
+            .collect()
+    }
+
+    #[test]
+    fn csp_eval_uses_script_default_fallback_not_element_or_attribute() {
+        for policy in [
+            "script-src 'self'; script-src-elem 'unsafe-eval'",
+            "default-src 'self'; script-src-attr 'unsafe-eval'",
+            "script-src-elem 'unsafe-eval'",
+        ] {
+            assert!(
+                !csp_titles(vec![("content-security-policy", policy)])
+                    .contains(&"CSP allows unsafe-eval".into()),
+                "{policy}"
+            );
+        }
+        for policy in [
+            "script-src 'unsafe-eval'; script-src-elem 'none'",
+            "default-src 'unsafe-eval'; script-src-attr 'none'",
+            "script-src 'unsafe-eval'; default-src 'none'",
+        ] {
+            assert!(
+                csp_titles(vec![("content-security-policy", policy)])
+                    .contains(&"CSP allows unsafe-eval".into()),
+                "{policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn csp_inline_uses_only_effective_element_and_attribute_sources() {
+        for policy in [
+            "script-src 'unsafe-inline'; script-src-elem 'self'; script-src-attr 'none'",
+            "default-src 'unsafe-inline'; script-src-elem 'self'; script-src-attr 'none'",
+        ] {
+            assert!(
+                csp_titles(vec![("content-security-policy", policy)]).is_empty(),
+                "{policy}"
+            );
+        }
+        for policy in [
+            "script-src 'unsafe-inline'; script-src-elem 'self'",
+            "default-src 'unsafe-inline'; script-src-attr 'none'",
+            "script-src-elem 'unsafe-inline'; script-src-attr 'none'",
+            "script-src-elem 'none'; script-src-attr 'unsafe-inline'",
+            "script-src 'nonce-abc123'; script-src-attr 'unsafe-inline'",
+        ] {
+            assert!(
+                csp_titles(vec![("content-security-policy", policy)])
+                    .contains(&"CSP allows unsafe-inline".into()),
+                "{policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn csp_first_duplicate_directive_wins_in_both_orders() {
+        for directive in [
+            "default-src",
+            "script-src",
+            "script-src-elem",
+            "script-src-attr",
+        ] {
+            let safe_first =
+                format!("{directive} 'none'; {directive} 'unsafe-inline' 'unsafe-eval'");
+            assert!(
+                csp_titles(vec![("content-security-policy", &safe_first)]).is_empty(),
+                "{safe_first}"
+            );
+            let empty_first = format!("{directive}; {directive} 'unsafe-inline' 'unsafe-eval'");
+            assert!(
+                csp_titles(vec![("content-security-policy", &empty_first)]).is_empty(),
+                "{empty_first}"
+            );
+            let unsafe_first =
+                format!("{directive} 'unsafe-inline' 'unsafe-eval'; {directive} 'none'");
+            assert!(
+                csp_titles(vec![("content-security-policy", &unsafe_first)])
+                    .contains(&"CSP allows unsafe-inline".into()),
+                "{unsafe_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn csp_intersects_multiple_enforced_headers_and_comma_policies() {
+        let permissive = "script-src 'unsafe-inline' 'unsafe-eval'";
+        let restrictive = "script-src 'none'";
+        for headers in [
+            vec![
+                ("content-security-policy", permissive),
+                ("content-security-policy", restrictive),
+            ],
+            vec![
+                ("content-security-policy", restrictive),
+                ("content-security-policy", permissive),
+            ],
+            vec![(
+                "content-security-policy",
+                "script-src 'unsafe-inline' 'unsafe-eval', script-src 'none'",
+            )],
+            vec![
+                (
+                    "content-security-policy",
+                    "script-src-elem 'unsafe-inline'; script-src-attr 'none'",
+                ),
+                (
+                    "content-security-policy",
+                    "script-src-elem 'none'; script-src-attr 'unsafe-inline'",
+                ),
+            ],
+        ] {
+            assert!(csp_titles(headers.clone()).is_empty(), "{headers:?}");
+        }
+        for headers in [
+            vec![
+                ("content-security-policy", permissive),
+                ("content-security-policy", permissive),
+            ],
+            vec![
+                ("content-security-policy", permissive),
+                ("content-security-policy", "img-src 'none'"),
+            ],
+            vec![
+                ("content-security-policy", permissive),
+                ("content-security-policy-report-only", restrictive),
+            ],
+        ] {
+            let titles = csp_titles(headers.clone());
+            assert!(
+                titles.contains(&"CSP allows unsafe-inline".into()),
+                "{headers:?}"
+            );
+            assert!(
+                titles.contains(&"CSP allows unsafe-eval".into()),
+                "{headers:?}"
+            );
+        }
+        assert!(csp_titles(vec![("content-security-policy-report-only", permissive)]).is_empty());
+    }
+
+    #[test]
+    fn csp_inline_overrides_require_valid_source_syntax() {
+        for source in ["'nonce-abc123'", "'sha256-abc123'", "'strict-dynamic'"] {
+            let policy = format!("script-src 'unsafe-inline' {source}");
+            assert!(
+                csp_titles(vec![("content-security-policy", &policy)]).is_empty(),
+                "{policy}"
+            );
+        }
+        for source in [
+            "nonce-abc123",
+            "'nonce-'",
+            "'sha256-'",
+            "'nonce-???'",
+            "'nonce-abc==='",
+            "'sha256-ab=c'",
+        ] {
+            let policy = format!("script-src 'unsafe-inline' {source}");
+            assert!(
+                csp_titles(vec![("content-security-policy", &policy)])
+                    .contains(&"CSP allows unsafe-inline".into()),
+                "{policy}"
+            );
+        }
+        let policy = "script-src 'unsafe-inline'; script-src 'none'";
+        assert!(csp_titles(vec![("content-security-policy", policy)])
+            .contains(&"CSP allows unsafe-inline".into()));
+    }
+
     #[test]
     fn comment_context_preserves_sniffed_html_and_metadata_xhtml() {
         let mut record = make_record(
@@ -8128,5 +8315,37 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].record_id, positive.id);
         assert_eq!(findings[0].title, "Server requests Basic auth over HTTP");
+    }
+
+    #[test]
+    fn csp_empty_or_non_ascii_first_directives_follow_browser_parsing() {
+        for directive in [
+            "default-src",
+            "script-src",
+            "script-src-elem",
+            "script-src-attr",
+        ] {
+            let policy = format!("{directive}; {directive} 'unsafe-inline' 'unsafe-eval'");
+            assert!(
+                csp_titles(vec![("content-security-policy", &policy)]).is_empty(),
+                "{policy}"
+            );
+        }
+        for directive in ["default-src", "script-src"] {
+            for policy in [
+                format!("{directive} 'unsafe-inline' 'unsafe-eval'; {directive} 'none'"),
+                format!("{directive} 'none'; {directive} 'unsafe-inline' 'unsafe-eval'"),
+            ] {
+                let titles = csp_titles(vec![("content-security-policy", &policy)]);
+                assert!(
+                    titles.contains(&"CSP allows unsafe-inline".into()),
+                    "{policy}"
+                );
+                assert!(
+                    titles.contains(&"CSP allows unsafe-eval".into()),
+                    "{policy}"
+                );
+            }
+        }
     }
 }
