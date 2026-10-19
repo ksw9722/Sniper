@@ -72,8 +72,21 @@ function utf8StringToByteString(value) {
 
 function parseDecoderTime(input) {
   // Unix output may be negative or fractional; leave all other date syntax alone.
-  var unix = /^[+-]?\d+(?:\.\d+)?$/.exec(input);
-  return new Date(unix && unix[0] === input ? 1000 * Number(input) : input);
+  var unix = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(input);
+  if (!unix || unix[0] !== input) {
+    return new Date(input);
+  }
+
+  var seconds = Number(unix[2]);
+  var fraction = unix[3] || "";
+  // Check Date's range before truncating sub-millisecond digits toward zero.
+  if (seconds > 8640000000000 || (seconds === 8640000000000 && /[1-9]/.test(fraction))) {
+    return new Date(NaN);
+  }
+  // Both terms and their sum are exact integers within Date's safe-integer range.
+  // Multiplying decimal seconds directly can turn 1.001 into 1000.9999999999999.
+  var milliseconds = seconds * 1000 + Number((fraction + "000").slice(0, 3));
+  return new Date(unix[1] === "-" ? -milliseconds : milliseconds);
 }
 
 var hasher = {
