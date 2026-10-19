@@ -44,14 +44,17 @@ const functions = [
   "hostHeaderDiffersFromUrl", "httpRequestAuthoritiesEquivalent", "normalizeHttpRequestAuthority",
   "fetchExportBlockedReason", "requestFormatExportBlockedReason", "copyTextToClipboard", "handleClipboardActionError",
   "copyResponseContentForRecord", "copyMenuTargetUrl", "transactionUrlFromSource",
+  "openInterceptContextMenu", "closeInterceptContextMenu", "runInterceptMenuAction",
+  "loadInterceptForMenu", "interceptRecordAsTransactionShape",
 ];
 function fixture(surface, { cached = false, fallbackResult = true } = {}) {
   const requests = [], writes = [], fallback = [], toasts = [], errors = [], attached = new Set();
-  const els = Object.fromEntries(["contextMenu", "requestView", "responseView", "requestViewCM", "responseViewCM"].map(name => [name, element()]));
+  const els = Object.fromEntries(["contextMenu", "interceptContextMenu", "requestView", "responseView", "requestViewCM", "responseViewCM"].map(name => [name, element()]));
   const pane = element(), document = element();
-  const actions = new Map(["curl", "python", "fetch", "powershell"].map(format => [`copy-as-${format}`, element({ action: `copy-as-${format}` })]));
+  const actions = new Map(["curl", "python", "fetch", "powershell"].map(format => [`copy-as-${format}`, element({ action: `copy-as-${format}`, interceptAction: `copy-as-${format}` })]));
   actions.set("copy-url", element({ action: "copy-url" }));
   els.contextMenu.querySelectorAll = selector => selector === ".context-menu-item" ? [...actions.values()] : [];
+  els.interceptContextMenu.querySelectorAll = selector => selector === "[data-intercept-action]" ? [...actions.values()] : [];
   document.getElementById = id => id === "paneContextMenu" ? pane : null;
   document.body = { appendChild: node => attached.add(node) };
   document.createElement = tag => {
@@ -75,9 +78,10 @@ function fixture(surface, { cached = false, fallbackResult = true } = {}) {
     navigator: { clipboard: { writeText(text) { const write = { text, ...deferred() }; writes.push(write); return write.promise; } } },
     console: { error: error => errors.push(error) }, showToast: (...args) => toasts.push(args),
     getHistoryItem: id => record(id), renderContextMenuNotes() {}, loadUserNote() {},
+    async requireOkResponse(result) { if (!result.ok) throw new Error("Synthetic read failure"); },
     fetch(url, options) {
       assert.equal(options, undefined);
-      assert.match(url, /^\/api\/transactions\/[ab]\?session_id=session-[ab]$/);
+      assert.match(url, /^\/api\/(?:transactions|intercepts)\/[ab]\?session_id=session-[ab]$/);
       const request = { url, ...deferred() }; requests.push(request); return request.promise;
     },
   });
@@ -87,7 +91,9 @@ function fixture(surface, { cached = false, fallbackResult = true } = {}) {
     vm.runInContext(appSource.slice(start, end), context);
   }
   bind("let contextMenuTargetId = null;", "function openContextMenu(");
-  bind('els.contextMenu.querySelectorAll(".context-menu-item").forEach', "/* ─── WS Frame context menu ─── */");
+  bind("let interceptContextMenuTargetId = null;", "function openInterceptContextMenu(");
+  if (surface === "intercept") bind('els.interceptContextMenu?.querySelectorAll("[data-intercept-action]")', "decorateContextMenuShortcuts();");
+  if (surface !== "intercept") bind('els.contextMenu.querySelectorAll(".context-menu-item").forEach', "/* ─── WS Frame context menu ─── */");
   bind('  // Pane context menu (right-click on Request/Response code-view)', '\n  els.sendReplayButton.addEventListener');
   // Exercise the real reset prefix, not a test-written owner invalidation.
   const resetStart = appSource.indexOf("function resetSessionScopedUiState() {");
@@ -95,16 +101,21 @@ function fixture(surface, { cached = false, fallbackResult = true } = {}) {
   assert.ok(resetStart >= 0 && resetEnd > resetStart);
   vm.runInContext(`${appSource.slice(resetStart, resetEnd)}\n}`, context);
   function open(id = "a") {
-    if (surface === "history") context.openContextMenu(20, 20, id);
+    if (surface === "intercept") context.openInterceptContextMenu(20, 20, id);
+    else if (surface === "history") context.openContextMenu(20, 20, id);
     else { state.selectedId = id; els.requestView.dispatch("contextmenu", { clientX: 20, clientY: 20 }); }
   }
   function click(action = "copy-as-curl") {
-    if (surface === "history") actions.get(action).dispatch("click");
+    if (surface === "history" || surface === "intercept") actions.get(action).dispatch("click");
     else pane.dispatch("click", { target: { closest: () => ({ dataset: { paneAction: action } }) } });
   }
   function setSession(id) { state.activeSession = { id }; context.resetSessionScopedUiState(); state.selectedRecord = null; }
   function navigate() { state.selectedId = "b"; state.selectedRecord = record("b"); state.activeTool = "target"; }
-  function close() { if (surface === "history") context.closeContextMenu(); else document.dispatch("click"); }
+  function close() {
+    if (surface === "intercept") context.closeInterceptContextMenu();
+    else if (surface === "history") context.closeContextMenu();
+    else document.dispatch("click");
+  }
   return { context, state, requests, writes, fallback, toasts, errors, attached, open, click, setSession, navigate, close };
 }
 const response = value => ({ ok: true, json: async () => value });
@@ -233,4 +244,70 @@ for (const [format, label] of [["headers", "Copied headers"], ["body", "Copied b
       if (stage === "read") assert.deepEqual(f.writes, []);
     });
   }
+}
+
+// Held-request menu checks invoke only copy-format actions. No forward, drop,
+// send, editor, interception configuration, or other mutation callback is used.
+function heldRecord(id = "a") {
+  const source = record(id);
+  return { id, request: { method: source.method, scheme: source.scheme, host: source.host, path: source.path,
+    headers: source.request.headers, body: source.request.body_preview, body_encoding: "utf8" } };
+}
+async function pendingHeldRead(f, stage) {
+  f.open(); f.click();
+  assert.equal(f.requests[0].url, "/api/intercepts/a?session_id=session-a");
+  const pending = stage === "fetch" ? f.requests[0] : deferred();
+  if (stage === "JSON") { f.requests[0].resolve({ ok: true, json: () => pending.promise }); await tick(); }
+  return {
+    succeed: () => pending.resolve(stage === "fetch" ? response(heldRecord()) : heldRecord()),
+    fail: () => pending.reject(new Error("Synthetic read failure")),
+  };
+}
+for (const stage of ["fetch", "JSON"]) {
+  test(`held request: explicit copy preserves its target through ${stage} and navigation`, async () => {
+    const f = fixture("intercept"); const pending = await pendingHeldRead(f, stage); f.navigate();
+    pending.succeed(); await tick();
+    assert.equal(f.writes.length, 1); assert.match(f.writes[0].text, /https:\/\/example\.com\/a/);
+    assert.match(f.writes[0].text, /request-a/); assert.doesNotMatch(f.writes[0].text, /request-b/);
+    f.writes[0].resolve(); await tick(); assert.deepEqual(f.toasts, [["Copied as curl"]]);
+  });
+  for (const roundTrip of [false, true]) for (const outcome of ["success", "failure"]) {
+    test(`held request: cancels ${stage} ${outcome} after session change (round trip ${roundTrip})`, async () => {
+      const f = fixture("intercept"); const pending = await pendingHeldRead(f, stage);
+      f.setSession("session-b"); if (roundTrip) f.setSession("session-a");
+      if (outcome === "success") pending.succeed(); else pending.fail(); await tick();
+      assert.deepEqual(f.writes, []); assert.deepEqual(f.toasts, []); assert.deepEqual(f.errors, []);
+    });
+  }
+}
+for (const roundTrip of [false, true]) for (const outcome of ["success", "failure"]) {
+  test(`held request: late clipboard ${outcome} stays silent after session change (round trip ${roundTrip})`, async () => {
+    const f = fixture("intercept"); const pending = await pendingHeldRead(f, "fetch");
+    pending.succeed(); await tick(); assert.equal(f.writes.length, 1);
+    f.setSession("session-b"); if (roundTrip) f.setSession("session-a");
+    if (outcome === "success") f.writes[0].resolve(); else f.writes[0].reject(new Error("Synthetic clipboard denial"));
+    await tick(); assert.deepEqual(f.fallback, []); assert.deepEqual(f.toasts, []);
+  });
+}
+for (const format of ["curl", "python", "fetch", "powershell"]) {
+  test(`held request: production ${format} action keeps its captured format`, async () => {
+    const f = fixture("intercept"); f.open(); f.click(`copy-as-${format}`); f.navigate();
+    f.requests[0].resolve(response(heldRecord())); await tick();
+    assert.equal(f.writes[0].text, f.context.recordToFormat(record(), format));
+    f.writes[0].resolve(); await tick(); assert.deepEqual(f.toasts, [[`Copied as ${format}`]]);
+  });
+}
+for (const outcome of ["rejection", "HTTP error"]) {
+  test(`held request: current read ${outcome} reports failure without copying`, async () => {
+    const f = fixture("intercept"); f.open(); f.click();
+    if (outcome === "rejection") f.requests[0].reject(new Error("Synthetic read failure"));
+    else f.requests[0].resolve({ ok: false });
+    await tick(); assert.deepEqual(f.writes, []); assert.deepEqual(f.toasts, [["Synthetic read failure", "error"]]);
+  });
+}
+for (const roundTrip of [false, true]) {
+  test(`held request: a menu opened before a session change cannot initiate a later read (round trip ${roundTrip})`, async () => {
+    const f = fixture("intercept"); f.open(); f.setSession("session-b"); if (roundTrip) f.setSession("session-a");
+    f.click(); await tick(); assert.deepEqual(f.requests, []); assert.deepEqual(f.writes, []); assert.deepEqual(f.toasts, []);
+  });
 }

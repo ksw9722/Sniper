@@ -26668,11 +26668,13 @@ function decorateContextMenuShortcuts(root = document) {
 // ─── Intercept queue context menu ───
 
 let interceptContextMenuTargetId = null;
+let interceptContextMenuClipboardOwner = null;
 
 function openInterceptContextMenu(x, y, interceptId) {
   const menu = els.interceptContextMenu;
   if (!menu) return;
   interceptContextMenuTargetId = interceptId;
+  interceptContextMenuClipboardOwner = createRecordClipboardOwner();
   menu.classList.remove("hidden");
   const maxX = window.innerWidth - menu.offsetWidth - 8;
   const maxY = window.innerHeight - menu.offsetHeight - 8;
@@ -26683,6 +26685,7 @@ function openInterceptContextMenu(x, y, interceptId) {
 function closeInterceptContextMenu() {
   els.interceptContextMenu?.classList.add("hidden");
   interceptContextMenuTargetId = null;
+  interceptContextMenuClipboardOwner = null;
 }
 
 // A held request is not a transaction yet, so the history menu's record loader
@@ -26718,9 +26721,12 @@ async function loadInterceptForMenu(interceptId) {
   return response.json();
 }
 
-function runInterceptMenuAction(action, interceptId) {
+function runInterceptMenuAction(action, interceptId, clipboardOwner = createRecordClipboardOwner()) {
+  const isCopyAction = action === "copy-url" || action.startsWith("copy-as-");
+  if (isCopyAction && !clipboardOwner?.()) return;
   loadInterceptForMenu(interceptId)
     .then((intercept) => {
+      if (isCopyAction && !clipboardOwner()) return;
       if (action === "send-to-replay") {
         // Deliberately no sourceTransactionId: the id belongs to the intercept
         // queue, and replay would reject a send that cites it as a capture.
@@ -26742,17 +26748,21 @@ function runInterceptMenuAction(action, interceptId) {
       if (action === "copy-url") {
         const url = transactionUrlFromSource(record);
         if (!url) throw new Error("This request has no URL to copy.");
-        return copyTextToClipboard(url).then(() => showToast("Copied URL"));
+        return copyTextToClipboard(url, { isCurrent: clipboardOwner })
+          .then(() => { if (clipboardOwner()) showToast("Copied URL"); });
       }
       if (action.startsWith("copy-as-")) {
         const format = action.replace("copy-as-", "");
         const text = recordToFormat(record, format);
         if (!text) return null;
-        return copyTextToClipboard(text).then(() => showToast(`Copied as ${format}`));
+        return copyTextToClipboard(text, { isCurrent: clipboardOwner })
+          .then(() => { if (clipboardOwner()) showToast(`Copied as ${format}`); });
       }
       return null;
     })
-    .catch(handleClipboardActionError);
+    .catch((error) => {
+      if (!isCopyAction || clipboardOwner()) handleClipboardActionError(error);
+    });
 }
 
 function closeContextMenu() {
@@ -27326,9 +27336,10 @@ els.interceptContextMenu?.querySelectorAll("[data-intercept-action]").forEach((i
   item.addEventListener("click", () => {
     const action = item.dataset.interceptAction;
     const id = interceptContextMenuTargetId;
+    const clipboardOwner = interceptContextMenuClipboardOwner;
     closeInterceptContextMenu();
     if (!action || !id) return;
-    runInterceptMenuAction(action, id);
+    runInterceptMenuAction(action, id, clipboardOwner);
   });
 });
 
