@@ -3238,6 +3238,249 @@ body.pane-resizing-y {
   padding-bottom: 8px;
 }
 
+/* Keep setup helpers collapsed by default so the request and results stay central. */
+.fuzzer-shell > .fuzzer-workflow-header {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.fuzzer-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.fuzzer-header-row > div:first-child {
+  min-width: 0;
+}
+
+.fuzzer-header-row > .toolbar-actions {
+  flex: 0 0 auto;
+}
+
+.fuzzer-shell .fuzzer-help {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: var(--font-xs);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.fuzzer-help + .fuzzer-help {
+  margin-top: 3px;
+}
+
+.fuzzer-preflight {
+  min-width: 0;
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+}
+
+.fuzzer-preflight-summary {
+  color: var(--text);
+  font-size: var(--font-sm);
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.fuzzer-shell #fuzzerPreflightNotice:not(:empty) {
+  margin-top: 4px;
+  color: var(--warning);
+}
+
+.fuzzer-shell #fuzzerPreflightNotice:empty,
+.fuzzer-shell #fuzzerSavedRunNotice:empty {
+  display: none;
+}
+
+.fuzzer-layout {
+  overflow: auto;
+}
+
+.fuzzer-top-row {
+  min-height: 220px;
+}
+
+.fuzzer-top-row > .fuzzer-template-card,
+.fuzzer-top-row > .fuzzer-payloads-card {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.fuzzer-top-row .panel-toolbar,
+.fuzzer-results-card > .panel-toolbar {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+}
+
+.fuzzer-top-row .panel-toolbar h2,
+.fuzzer-results-card > .panel-toolbar h2 {
+  font-size: var(--font-sm);
+}
+
+.fuzzer-top-row .editor-panel {
+  flex: 1 0 80px;
+  min-height: 80px;
+}
+
+.fuzzer-shell .fuzzer-editor-help {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.fuzzer-disclosure {
+  min-width: 0;
+  color: var(--text-soft);
+  font-size: var(--font-xs);
+}
+
+.fuzzer-disclosure > summary {
+  min-height: var(--control-h);
+  padding: 5px 10px;
+  cursor: pointer;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.fuzzer-disclosure > summary:hover {
+  background: var(--accent-soft);
+}
+
+.fuzzer-disclosure > summary:focus-visible,
+.fuzzer-shell .compact-field input:focus-visible,
+.fuzzer-shell .compact-field select:focus-visible,
+.fuzzer-shell button:focus-visible,
+.fuzzer-shell .request-editor:focus-visible {
+  outline: 2px solid var(--point);
+  outline-offset: -2px;
+}
+
+.fuzzer-disclosure-body {
+  display: grid;
+  gap: 9px;
+  max-height: min(24vh, 180px);
+  padding: 8px 10px 10px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.fuzzer-preview-disclosure {
+  margin-top: 3px;
+}
+
+.fuzzer-preview-disclosure > summary {
+  padding-left: 0;
+}
+
+.fuzzer-preview-samples {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-code);
+  user-select: text;
+  -webkit-user-select: text;
+  overflow-wrap: anywhere;
+}
+
+.fuzzer-preview-samples pre {
+  max-width: 100%;
+  margin: 0;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: var(--font-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.fuzzer-control-disclosure {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.fuzzer-control-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 7px;
+  min-width: 0;
+}
+
+.fuzzer-field-grow {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.fuzzer-control-row > .secondary-action,
+.fuzzer-range-fields > .secondary-action {
+  min-height: var(--control-h);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: var(--font-xs);
+}
+
+.fuzzer-range-fields {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  margin: 0;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.fuzzer-range-fields legend {
+  padding: 0 4px;
+  font-size: var(--font-xs);
+  color: var(--text-soft);
+}
+
+.fuzzer-range-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.fuzzer-range-grid .compact-field,
+.fuzzer-filter-grid .compact-field {
+  min-width: 0;
+}
+
+.fuzzer-results-card {
+  flex: 1 0 240px;
+  overflow: auto;
+}
+
+.fuzzer-result-tools {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.fuzzer-result-tools > .fuzzer-disclosure {
+  flex: 1 1 300px;
+}
+
+.fuzzer-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(95px, 1fr));
+  gap: 8px;
+}
+
+.fuzzer-shell .fuzzer-filter-count {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+}
+
 .target-tree {
   display: grid;
   gap: 10px;
@@ -5813,7 +6056,16 @@ button.utility-button.replay-tab-add {
   .fuzzer-payloads-card {
     flex: none !important;
     width: auto !important;
-    min-height: 160px;
+    min-height: 220px;
+  }
+  .fuzzer-top-row {
+    gap: 10px;
+  }
+  .fuzzer-top-row .editor-panel {
+    min-height: 100px;
+  }
+  .fuzzer-results-card {
+    flex-basis: 320px;
   }
 
   .tools-workbench {
@@ -7882,4 +8134,30 @@ button.utility-button.replay-tab-add {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: 12px/1.5 var(--mono);
+}
+
+@media (max-width: 620px) {
+  .fuzzer-header-row {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .fuzzer-header-row > .toolbar-actions {
+    margin-left: auto;
+  }
+  .fuzzer-layout {
+    padding: 8px;
+  }
+  .fuzzer-top-row > .fuzzer-template-card,
+  .fuzzer-top-row > .fuzzer-payloads-card {
+    min-width: 0;
+  }
+  .fuzzer-result-tools > .fuzzer-disclosure {
+    flex-basis: 100%;
+  }
+  .fuzzer-result-tools > .fuzzer-disclosure + .fuzzer-disclosure {
+    border-top: 1px solid var(--line);
+  }
+  .fuzzer-filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }

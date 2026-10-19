@@ -1192,14 +1192,25 @@
         </section>
 
         <section class="fuzzer-shell hidden" id="fuzzerShell">
-          <header class="panel-toolbar replay-header">
-            <div>
-              <p class="inline-copy">Use <code>$payload$</code> markers in the request template.</p>
+          <header class="panel-toolbar replay-header fuzzer-workflow-header">
+            <div class="fuzzer-header-row">
+              <div>
+                <p class="fuzzer-help">Send a captured request to Fuzzer, mark positions, load payloads, then review and run.</p>
+                <p class="fuzzer-help">Each payload replaces every <code>$payload$</code> marker in one request. Requests run sequentially; the server returns results when the run finishes.</p>
+              </div>
+              <div class="toolbar-actions">
+                <button class="secondary-action" id="resetFuzzerButton" type="button">Reset</button>
+                <button class="primary-action" id="startFuzzerButton" type="button" aria-describedby="fuzzerPreflightSummary fuzzerPreflightNotice">Start</button>
+              </div>
             </div>
-            <div class="toolbar-actions">
-              <button class="secondary-action" id="resetFuzzerButton" type="button">Reset</button>
-              <button class="primary-action" id="startFuzzerButton" type="button">Start</button>
-            </div>
+            <section class="fuzzer-preflight" aria-label="Review before running">
+              <div id="fuzzerPreflightSummary" class="fuzzer-preflight-summary" role="status" aria-live="polite">Choose a captured request and add payloads to review the target and exact request count.</div>
+              <p id="fuzzerPreflightNotice" class="fuzzer-help" role="status" aria-live="polite"></p>
+              <details class="fuzzer-disclosure fuzzer-preview-disclosure">
+                <summary>Preview generated requests</summary>
+                <div id="fuzzerPreviewSamples" class="fuzzer-disclosure-body fuzzer-preview-samples">Request samples will appear here before you start.</div>
+              </details>
+            </section>
           </header>
 
           <section class="fuzzer-layout">
@@ -1207,20 +1218,73 @@
             <div class="fuzzer-top-row">
               <section class="panel-card fuzzer-template-card">
                 <header class="panel-toolbar">
-                  <h2>Request template</h2>
+                  <h2 id="fuzzerRequestHeading">1. Mark request positions</h2>
+                  <div class="toolbar-actions">
+                    <button class="secondary-action" id="fuzzerMarkSelectionButton" type="button" aria-describedby="fuzzerMarkerHelp">Mark selection</button>
+                    <button class="secondary-action" id="fuzzerUndoMarkerButton" type="button" disabled>Undo marker</button>
+                  </div>
                 </header>
-                <div class="editor-panel">
+                <details class="fuzzer-disclosure fuzzer-control-disclosure">
+                  <summary>Find query or form values</summary>
+                  <div class="fuzzer-disclosure-body">
+                    <p class="fuzzer-help" id="fuzzerMarkerHelp">Select request text and choose Mark selection, or mark a detected query or form value. You can also type <code>$payload$</code> directly.</p>
+                    <div class="fuzzer-control-row">
+                      <label class="compact-field fuzzer-field-grow" for="fuzzerCandidateSelect">
+                        <span>Query or form value</span>
+                        <select id="fuzzerCandidateSelect" disabled><option value="">No candidate values</option></select>
+                      </label>
+                      <button class="secondary-action" id="fuzzerMarkCandidateButton" type="button" disabled>Mark value</button>
+                    </div>
+                  </div>
+                </details>
+                <div class="editor-panel" role="group" aria-labelledby="fuzzerRequestHeading">
                   <div id="fuzzerRequestCM" class="cm-container" style="height:100%"></div>
                 </div>
               </section>
               <div class="fuzzer-col-resizer" id="fuzzerColResizer"></div>
               <section class="panel-card fuzzer-payloads-card">
                 <header class="panel-toolbar">
-                  <h2>Payloads</h2>
+                  <h2><label for="fuzzerPayloadsEditor">2. Load payloads</label></h2>
                 </header>
+                <details class="fuzzer-disclosure fuzzer-control-disclosure">
+                  <summary>Import, preset or number range</summary>
+                  <div class="fuzzer-disclosure-body">
+                    <div class="fuzzer-control-row">
+                      <label class="compact-field fuzzer-field-grow" for="fuzzerPayloadImportMode">
+                        <span>Add payloads</span>
+                        <select id="fuzzerPayloadImportMode">
+                          <option value="append" selected>Append to list</option>
+                          <option value="replace">Replace list</option>
+                        </select>
+                      </label>
+                      <input id="fuzzerPayloadFile" type="file" accept=".txt,text/plain" hidden aria-label="Payload text file" />
+                      <button class="secondary-action" id="fuzzerImportPayloadButton" type="button" aria-controls="fuzzerPayloadFile">Import text file</button>
+                    </div>
+                    <div class="fuzzer-control-row">
+                      <label class="compact-field fuzzer-field-grow" for="fuzzerPayloadPreset">
+                        <span>Boundary preset</span>
+                        <select id="fuzzerPayloadPreset">
+                          <option value="text-boundaries">Text boundaries</option>
+                          <option value="number-boundaries">Number boundaries</option>
+                        </select>
+                      </label>
+                      <button class="secondary-action" id="fuzzerApplyPresetButton" type="button">Use preset</button>
+                    </div>
+                    <fieldset class="fuzzer-range-fields">
+                      <legend>Inclusive number range</legend>
+                      <div class="fuzzer-range-grid">
+                        <label class="compact-field" for="fuzzerRangeStart"><span>From</span><input id="fuzzerRangeStart" type="number" value="1" step="1" /></label>
+                        <label class="compact-field" for="fuzzerRangeEnd"><span>Through</span><input id="fuzzerRangeEnd" type="number" value="10" step="1" /></label>
+                        <label class="compact-field" for="fuzzerRangeStep"><span>Step</span><input id="fuzzerRangeStep" type="number" value="1" step="1" /></label>
+                      </div>
+                      <button class="secondary-action" id="fuzzerGenerateRangeButton" type="button">Generate range</button>
+                    </fieldset>
+                  </div>
+                </details>
                 <div class="editor-panel">
-                  <textarea id="fuzzerPayloadsEditor" class="request-editor" spellcheck="false" placeholder="one payload per line"></textarea>
+                  <textarea id="fuzzerPayloadsEditor" class="request-editor" spellcheck="false" placeholder="One payload per line" aria-describedby="fuzzerPayloadHelp"></textarea>
                 </div>
+                <p class="fuzzer-help fuzzer-editor-help" id="fuzzerPayloadHelp">One payload per line. Spaces are preserved. Blank lines are empty payloads; a final line break is ignored.</p>
               </section>
             </div>
             <!-- Horizontal resizer between top row and results -->
@@ -1229,10 +1293,68 @@
             <section class="panel-card fuzzer-results-card" style="display:flex;flex-direction:column;min-height:0">
               <header class="panel-toolbar">
                 <div>
-                  <h2>Run results</h2>
+                  <h2>3. Triage run results</h2>
                   <p class="inline-copy" id="fuzzerMeta">No fuzz run has been started yet.</p>
                 </div>
+                <div class="toolbar-actions">
+                  <button class="secondary-action" id="fuzzerCompareBaseButton" type="button" disabled title="Use the selected result as the comparison baseline">Set compare base</button>
+                  <button class="secondary-action" id="fuzzerCompareButton" type="button" disabled title="Compare the selected result with the comparison baseline">Compare selected</button>
+                </div>
               </header>
+              <div class="fuzzer-result-tools">
+                <details class="fuzzer-disclosure fuzzer-result-filters">
+                  <summary>Filter and sort results</summary>
+                  <div class="fuzzer-disclosure-body">
+                    <div class="fuzzer-filter-grid">
+                      <label class="compact-field" for="fuzzerResultStatus">
+                        <span>Status</span>
+                        <select id="fuzzerResultStatus">
+                          <option value="all">All statuses</option>
+                          <option value="error">Errors</option>
+                          <option value="2xx">2xx</option>
+                          <option value="3xx">3xx</option>
+                          <option value="4xx">4xx</option>
+                          <option value="5xx">5xx</option>
+                        </select>
+                      </label>
+                      <label class="compact-field" for="fuzzerResultMinBytes"><span>Min bytes</span><input id="fuzzerResultMinBytes" type="number" min="0" step="1" placeholder="Any" /></label>
+                      <label class="compact-field" for="fuzzerResultMaxBytes"><span>Max bytes</span><input id="fuzzerResultMaxBytes" type="number" min="0" step="1" placeholder="Any" /></label>
+                      <label class="compact-field" for="fuzzerResultMinMs"><span>Min ms</span><input id="fuzzerResultMinMs" type="number" min="0" step="any" placeholder="Any" /></label>
+                      <label class="compact-field" for="fuzzerResultMaxMs"><span>Max ms</span><input id="fuzzerResultMaxMs" type="number" min="0" step="any" placeholder="Any" /></label>
+                      <label class="compact-field" for="fuzzerResultSort">
+                        <span>Sort by</span>
+                        <select id="fuzzerResultSort">
+                          <option value="index">Request order</option>
+                          <option value="status">Status</option>
+                          <option value="bytes">Response bytes</option>
+                          <option value="duration">Duration</option>
+                        </select>
+                      </label>
+                      <label class="compact-field" for="fuzzerResultDirection">
+                        <span>Direction</span>
+                        <select id="fuzzerResultDirection">
+                          <option value="asc">Ascending</option>
+                          <option value="desc">Descending</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                </details>
+                <details class="fuzzer-disclosure fuzzer-saved-runs">
+                  <summary>View or reuse a saved run</summary>
+                  <div class="fuzzer-disclosure-body">
+                    <div class="fuzzer-control-row">
+                      <label class="compact-field fuzzer-field-grow" for="fuzzerSavedRunSelect"><span>Saved run</span><select id="fuzzerSavedRunSelect"><option value="">Choose a saved run</option></select></label>
+                      <button class="secondary-action" id="fuzzerRefreshRunsButton" type="button">Refresh</button>
+                      <button class="secondary-action" id="fuzzerViewRunButton" type="button" disabled>View results</button>
+                      <button class="secondary-action" id="fuzzerReuseRunButton" type="button" disabled>Reuse setup</button>
+                    </div>
+                    <p class="fuzzer-help">View results keeps your current draft. Reuse setup asks before replacing it; the original target or source request may be unavailable.</p>
+                    <p class="fuzzer-help" id="fuzzerSavedRunNotice" role="status" aria-live="polite"></p>
+                  </div>
+                </details>
+              </div>
+              <p class="fuzzer-help fuzzer-filter-count" id="fuzzerResultFilterCount" role="status" aria-live="polite">No results to filter.</p>
               <div class="history-table-shell" style="flex:1;min-height:0;overflow:auto">
                 <table class="mini-table">
                   <thead>
@@ -2005,6 +2127,7 @@
     <script src="/service-map.js" defer></script>
     <script src="/recon.js" defer></script>
     <script src="/templates.js" defer></script>
+    <script src="/fuzzer-workflow.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>
