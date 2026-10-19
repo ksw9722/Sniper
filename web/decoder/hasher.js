@@ -21,14 +21,17 @@ function copyToClipboard(id) {
   var textarea = $("#"+id);
   var value = textarea.val();
 
-  if (navigator.clipboard && window.isSecureContext) {
-    return navigator.clipboard.writeText(value);
-  }
-
   return new Promise(function (resolve, reject) {
     try {
+      if (navigator.clipboard && window.isSecureContext) {
+        resolve(navigator.clipboard.writeText(value));
+        return;
+      }
+
       textarea.select();
-      document.execCommand("copy");
+      if (!document.execCommand("copy")) {
+        throw new Error("Clipboard copy failed");
+      }
       resolve();
     } catch (err) {
       reject(err);
@@ -70,6 +73,7 @@ function utf8StringToByteString(value) {
 var hasher = {
   ipcalc : new ipCalc(),
   tab : tabs.encode,
+  copyGeneration : 0,
   elements: {
     h1 : {
       id : tabs.hash+"md5",
@@ -1119,6 +1123,7 @@ var hasher = {
     for (var i in this.elements) {
       if (this.elements[i].tab == this.tab) {
         $("#"+this.elements[i].id+"-value").click(function (event) {
+          var copyGeneration = ++hasher.copyGeneration;
           $("#output .note").hide();
           var id = this.id.toString().replace("-value", "");
           var textarea = $("#"+id)[0];
@@ -1132,8 +1137,10 @@ var hasher = {
 
           if ($("#"+id).val().length > 0) {
             copyToClipboard(id).then(function () {
+              if (copyGeneration !== hasher.copyGeneration) return;
               $("#"+id+"-note").text("copied").show("fast");
             }).catch(function () {
+              if (copyGeneration !== hasher.copyGeneration) return;
               $("#"+id+"-note").text("copy failed").show("fast");
             });
           }
@@ -1147,6 +1154,8 @@ var hasher = {
    * Recalculate
    */
   update : function () {
+    // Clipboard completions belong to the output and click that started them.
+    this.copyGeneration++;
     $("#output .note").hide();
     var input = $("#input-value").val();
     var password = $("#input-password").val();
@@ -1190,6 +1199,7 @@ var hasher = {
    */
 
   render : function () {
+    this.copyGeneration++;
     $("#output").html("");
 
     for (var i in this.elements) {
