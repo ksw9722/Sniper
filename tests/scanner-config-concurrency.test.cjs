@@ -47,6 +47,7 @@ function fixture() {
     querySelectorAll: selector => selector === ".scanner-custom-rule-card" ? cards : deleteButtons,
   };
   const els = {
+    proxyShell: { getClientRects: () => [1] },
     scannerBuiltinRules: builtinNode, scannerCustomRules: customNode,
     scannerQuickToggle: { checked: true, disabled: false },
     scannerSettingsBackdrop: { classList: { add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name) } },
@@ -57,6 +58,7 @@ function fixture() {
     "refreshScannerQuickToggle", "saveScannerQuickToggle", "syncQuickToggle", "sessionQueryPath", "sessionWritePath", "expectedActiveSessionIdForWrite",
     "requireOkResponse", "readApiErrorMessage", "formatStructuredApiErrorMessage",
   ], {
+    state: { activeTool: "proxy", activeProxyTab: "findings" }, getActiveModalAction: () => null,
     els, URLSearchParams, sessionId: "session-a", scannerConfigCache: null,
     scannerConfigStateGeneration: 0, scannerConfigLoadGeneration: 0, scannerConfigSavePending: null,
     compareLoadGeneration: 0, scannerSettingsSessionId: null, scannerSettingsBaseline: null, scannerSettingsGeneration: 0, scannerSettingsSavePending: null, scannerQuickTogglePending: null,

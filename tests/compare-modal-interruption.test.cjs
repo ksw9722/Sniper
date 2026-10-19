@@ -71,11 +71,12 @@ function fixture() {
   };
   document.getElementById = id => nodes[id] || null;
   document.querySelector = () => nodes.mainTab;
+  for (const id of ["proxyShell", "dashboardShell", "replayShell", "toolsShell", "fuzzerShell", "sequenceShell", "targetShell", "mapShell", "loggerShell", "reconShell"]) new Element(id, "DIV", document.body);
   for (const id of ["displaySettingsModal", "filterModal", "curlImportModal", "scannerSettingsBackdrop", "compareModal"]) {
-    new Element(id, "DIV", document.body).classList.add("hidden");
+    new Element(id, "DIV", id === "scannerSettingsBackdrop" ? nodes.proxyShell : document.body).classList.add("hidden");
   }
   for (const id of ["opener", "mainTab", "openDisplaySettingsButton", "openFilterSettingsButton"]) new Element(id, "BUTTON", document.body);
-  new Element("trafficRegion", "SECTION", document.body).tabIndex = 0;
+  new Element("trafficRegion", "SECTION", nodes.proxyShell).tabIndex = 0;
   for (const id of ["colorTagFilter", "filterBar", "historyWorkbenchResizer", "lowerWorkbench", "interceptPanel", "websocketPanel",
     "matchReplacePanel", "findingsPanel", "oastPanel", "proxySettingsPanel", "proxySubPlaceholder", "footerMode"]) new Element(id, "DIV", document.body);
   for (const [id, parent] of [
@@ -95,27 +96,30 @@ function fixture() {
   const context = loadFunctions([
     "openCompareModal", "closeCompareModal", "getActiveModalAction", "isModalVisible", "restoreModalFocus", "trapModalFocus", "isEditableTarget",
     "openDisplaySettingsModal", "closeDisplaySettingsModal", "closeCertificateModal", "openFilterModal", "closeFilterModal", "showConfirmDialog",
-    "openCurlImportModal", "closeCurlImportModal", "openScannerSettings", "closeScannerSettings", "renderProxyPanels",
+    "openCurlImportModal", "closeCurlImportModal", "openScannerSettings", "closeScannerSettings", "renderProxyPanels", "setActiveTool", "setActiveProxyTab", "renderToolPanels",
+    "resetScannerConfigUiState", "scannerConfigContextIsCurrent",
   ], {
     document, els: nodes, HTMLElement: Element, Element,
     window: { getComputedStyle: node => ({ visibility: node.visibility }), getSelection: () => null },
     state: { activeTool: "proxy", activeProxyTab: "http-history", selectedId: "target" },
     compareBaseId: "base", compareBaseSessionId: "session-a", compareLoadGeneration: 0,
     compareBaseRecord: null, compareTargetRecord: null, compareActiveTab: "request", compareReturnFocus: null,
-    currentSessionId: () => "session-a", transactionPath: id => id,
-    proxyTabs: [], sanitizeActiveProxyTab: value => value, loadFindings() {},
+    sessionId: "session-a", transactionPath: id => id,
+    proxyTabs: [], mainTabs: [], sanitizeActiveTool: value => value, sanitizeActiveProxyTab: value => value, loadFindings() {},
+    scheduleUiSettingsSave() {}, renderReplay() {}, duplicateActiveReplayTab: action("duplicate replay"),
     activeConfirmDialog: null, displaySettingsPreviewActive: false, displaySettingsReturnFocus: null, filterSettingsReturnFocus: null,
     displaySettingsEditedControls: new Set(), filterSettingsEditedControls: new Set(),
     hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {}, selectSettingsTab() {}, hydrateFilterForm() {},
     saveDisplaySettingsFromForm: action("settings apply"), applyFilterSettings: action("filter apply"),
     scannerSettingsBaseline: null, scannerSettingsSessionId: null, scannerSettingsGeneration: 0,
-    scannerSettingsSavePending: null, scannerConfigStateGeneration: 0, scannerConfigContextIsCurrent: () => true,
+    scannerSettingsSavePending: null, scannerConfigStateGeneration: 0, scannerConfigLoadGeneration: 0, scannerConfigCache: null, scannerConfigSavePending: null, scannerQuickTogglePending: null,
     scannerConfigSnapshot: config => config, loadScannerConfig: () => scannerLoad.promise, BUILTIN_RULE_LABELS: {}, renderCustomRulesEditor() {},
     saveScannerSettingsFromModal: action("scanner save"), showToast: action("toast"), escapeHtml: text => text,
     findingsArrowNav: action("findings"), moveHistorySelection: action("history"),
     openReplayFromSelection: action("replay"), openFuzzerFromSelection: action("fuzzer"), handleSendActionError: error => { throw error; },
     fetch(path) { const response = deferred(); pending.push({ path, ...response }); return response.promise; },
   });
+  context.currentSessionId = () => context.sessionId;
   context.renderCompareModal = () => rendered.push(context.compareTargetRecord.id);
   nodes.scannerSettingsClose.addEventListener("click", context.closeScannerSettings);
   nodes.scannerSettingsCancel.addEventListener("click", context.closeScannerSettings);
@@ -252,7 +256,11 @@ for (const dialog of ["settings", "filter", "confirm", "curl", "scanner"]) {
     f.pending[3].resolve({ ok: true, json: () => parsing.promise });
     await Promise.resolve();
     await f.openDialog(dialog);
-    f.key("Escape");
+    if (dialog === "scanner") {
+      // Scanner is async and lower in the DOM: it must not appear underneath
+      // an already visible comparison while taking its keyboard ownership.
+      assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+    } else f.key("Escape");
     parsing.resolve({ id: "late" }); await replacement;
     assert.equal(f.hidden(), false);
     assert.deepEqual(f.rendered, ["first"]);
@@ -278,3 +286,90 @@ test("Compare closing after navigation skips both a hidden invoker and the now-h
   assert.equal(f.hidden(), true);
   assert.equal(f.document.activeElement, f.nodes.mainTab);
 });
+
+
+for (const navigation of ["tool", "proxy tab", "session"]) {
+  for (const returnBeforeResponse of [false, true]) {
+    test(`scanner config read cannot reopen after ${navigation} navigation${returnBeforeResponse ? " and back" : ""}; a fresh open works`, async () => {
+      const f = fixture();
+      f.context.state.activeProxyTab = "findings";
+      const opening = f.context.openScannerSettings();
+      const navigateAway = () => {
+        if (navigation === "tool") { f.context.setActiveTool("replay"); f.context.renderToolPanels(); }
+        if (navigation === "proxy tab") { f.context.setActiveProxyTab("http-history"); f.context.renderProxyPanels(); }
+        if (navigation === "session") { f.context.sessionId = "session-b"; f.context.resetScannerConfigUiState(); }
+      };
+      const navigateBack = () => {
+        if (navigation === "tool") { f.context.setActiveTool("proxy"); f.context.renderToolPanels(); }
+        if (navigation === "proxy tab") { f.context.setActiveProxyTab("findings"); f.context.renderProxyPanels(); }
+        if (navigation === "session") { f.context.sessionId = "session-a"; f.context.resetScannerConfigUiState(); }
+      };
+      navigateAway();
+      if (returnBeforeResponse) navigateBack();
+      f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await opening;
+      assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+      assert.equal(f.context.scannerSettingsBaseline, null);
+      assert.equal(f.context.getActiveModalAction(), null);
+      if (navigation === "tool" && !returnBeforeResponse) {
+        for (const modifier of ["ctrlKey", "metaKey"]) f.key("r", f.nodes.replayShell, { [modifier]: true });
+        assert.deepEqual(f.actions, ["duplicate replay", "duplicate replay"]);
+      }
+      if (!returnBeforeResponse) navigateBack();
+      const freshRead = deferred();
+      f.context.loadScannerConfig = () => freshRead.promise;
+      const fresh = f.context.openScannerSettings();
+      freshRead.resolve({ rules: {}, custom_rules: [] }); await fresh;
+      assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), false);
+      assert.equal(f.context.getActiveModalAction()?.modal, f.nodes.scannerSettingsBackdrop);
+      f.context.setActiveTool("proxy"); f.context.setActiveProxyTab("findings");
+      assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), false, "Same-view selection preserves the current draft");
+      f.key("Escape");
+      assert.equal(f.context.getActiveModalAction(), null);
+    });
+  }
+}
+
+test("scanner reveal and modal ownership both require its Capture ancestor to be laid out", async () => {
+  const f = fixture(), opening = f.context.openScannerSettings();
+  f.nodes.proxyShell.classList.add("hidden");
+  f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await opening;
+  assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+  assert.equal(f.context.scannerSettingsBaseline, null);
+  f.nodes.proxyShell.classList.remove("hidden");
+  await f.context.openScannerSettings();
+  assert.equal(f.context.getActiveModalAction()?.modal, f.nodes.scannerSettingsBackdrop);
+  f.nodes.proxyShell.classList.add("hidden");
+  assert.equal(f.context.getActiveModalAction(), null);
+});
+
+
+test("late scanner config after leaving Findings cannot take focus from a newer Compare", async () => {
+  const f = fixture();
+  f.context.state.activeProxyTab = "findings";
+  const scanner = f.context.openScannerSettings();
+  f.context.setActiveProxyTab("http-history"); f.context.renderProxyPanels();
+  const comparison = f.context.openCompareModal("target");
+  f.resolvePair(); await comparison;
+  f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await scanner;
+  assert.equal(f.context.getActiveModalAction()?.modal, f.nodes.compareModal);
+  assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+  assert.equal(f.document.activeElement, f.nodes.closeCompareButton);
+  f.key("Tab", f.nodes.opener);
+  assert.equal(f.document.activeElement, f.nodes.closeCompareButton);
+  f.key("Escape");
+  assert.equal(f.context.getActiveModalAction(), null);
+});
+
+for (const dialog of ["settings", "filter", "confirm", "curl"]) {
+  test(`scanner configuration arriving under newer ${dialog} does not reveal another modal`, async () => {
+    const f = fixture(), scanner = f.context.openScannerSettings();
+    await f.openDialog(dialog);
+    const active = f.context.getActiveModalAction();
+    const focus = f.document.activeElement;
+    f.scannerLoad.resolve({ rules: {}, custom_rules: [] }); await scanner;
+    assert.equal(f.nodes.scannerSettingsBackdrop.classList.contains("hidden"), true);
+    assert.equal(f.context.scannerSettingsBaseline, null);
+    assert.equal(f.context.getActiveModalAction()?.close, active.close);
+    assert.equal(f.document.activeElement, focus);
+  });
+}

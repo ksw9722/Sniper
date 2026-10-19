@@ -40,6 +40,7 @@ function fixture(surface) {
     }
     closest() { return this.editableParent || null; }
     matches(selector) { return selector.split(", ").includes(this.tagName.toLowerCase()); }
+    getClientRects() { return this.classes.has("hidden") ? [] : [1]; }
     focus() { document.activeElement = this; }
     setAttribute() {}
   }

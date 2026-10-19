@@ -1168,7 +1168,9 @@ function resetLayoutTextareas() {
 }
 
 function setActiveTool(tool, options = {}) {
-  state.activeTool = sanitizeActiveTool(tool);
+  const next = sanitizeActiveTool(tool);
+  if (next !== state.activeTool) closeScannerSettings();
+  state.activeTool = next;
   if (options.persist !== false) {
     scheduleUiSettingsSave(options.delay);
   }
@@ -1176,7 +1178,9 @@ function setActiveTool(tool, options = {}) {
 }
 
 function setActiveProxyTab(tab, options = {}) {
-  state.activeProxyTab = sanitizeActiveProxyTab(tab);
+  const next = sanitizeActiveProxyTab(tab);
+  if (next !== state.activeProxyTab) closeScannerSettings();
+  state.activeProxyTab = next;
   if (options.persist !== false) {
     scheduleUiSettingsSave(options.delay);
   }
@@ -10546,16 +10550,22 @@ async function saveScannerConfig(config, sessionId, expectedConfigToken) {
 }
 
 async function openScannerSettings() {
+  if (state.activeTool !== "proxy" || !els.proxyShell.getClientRects().length) return;
+  const proxyTab = state.activeProxyTab;
   const sessionId = currentSessionId();
   if (scannerSettingsBaseline && scannerSettingsSessionId === sessionId) return;
   compareLoadGeneration += 1;
   const stateGeneration = scannerConfigStateGeneration;
   const generation = ++scannerSettingsGeneration;
   const isCurrent = () => generation === scannerSettingsGeneration
-    && scannerConfigContextIsCurrent(sessionId, stateGeneration);
+    && scannerConfigContextIsCurrent(sessionId, stateGeneration)
+    && state.activeTool === "proxy" && state.activeProxyTab === proxyTab
+    && els.proxyShell.getClientRects().length;
   try {
     const config = await loadScannerConfig(sessionId);
-    if (!config || !isCurrent()) return;
+    // The editor belongs to the Capture view that requested it, and must not
+    // appear underneath a newer dialog after its configuration arrives.
+    if (!config || !isCurrent() || getActiveModalAction()) return;
     scannerSettingsSessionId = sessionId;
     // The editor's read version must not follow later cache refreshes or toggles.
     scannerSettingsBaseline = scannerConfigSnapshot(config, sessionId);
@@ -20537,7 +20547,8 @@ function getActiveModalAction() {
     };
   }
 
-  if (isModalVisible(els.scannerSettingsBackdrop)) {
+  // Scanner lives inside Capture; its own class cannot reveal a hidden parent.
+  if (isModalVisible(els.scannerSettingsBackdrop) && els.scannerSettingsBackdrop.getClientRects().length) {
     return {
       modal: els.scannerSettingsBackdrop,
       close: closeScannerSettings,
