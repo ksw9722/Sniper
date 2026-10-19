@@ -7763,9 +7763,6 @@ async function pollAuxiliaryData() {
     tasks.push(loadEventLog());
   }
 
-  if (state.activeTool === "map" && typeof targetServiceMapController !== "undefined") {
-    tasks.push(targetServiceMapController?.refresh());
-  }
   if (state.activeTool === "target") tasks.push(loadTargetSiteMap());
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
@@ -7858,7 +7855,10 @@ function applyHistoryRetentionDeletedEvent(event, sessionId = currentSessionId()
 
 function applyConfirmedHistoryRemoval(ids, sessionId = currentSessionId(), cause = "unavailable") {
   if (sessionId !== currentSessionId()) return false;
-  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.invalidate();
+  if (typeof targetServiceMapController !== "undefined") {
+    if (cause === "automatic_cleanup") targetServiceMapController?.retentionChanged();
+    else targetServiceMapController?.invalidate();
+  }
   state._historyRetentionEpoch = (state._historyRetentionEpoch || 0) + 1;
   state._historyRetentionReconcile = true;
   // Only this batch is needed: old requests carry an epoch, and the server/SSE
@@ -14955,6 +14955,7 @@ function renderMatchReplaceRules() {
 function initializeTargetWorkspace() {
   const panel = document.getElementById("targetServiceMapPanel");
   if (!panel || !window.SniperServiceMap) return;
+  if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.destroy();
   targetServiceMapController = window.SniperServiceMap.createController({
     elements: {
       panel,

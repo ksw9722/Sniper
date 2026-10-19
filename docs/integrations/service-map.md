@@ -85,9 +85,9 @@ projection limits, and the UI reports omitted or incomplete data explicitly.
 
 Selecting a card or API entry only changes the local view. Viewing source reads
 safe metadata from Sniper's exact-row evidence endpoint. Map and APIs never load
-the legacy whole-history Paths response. Removal and retention events invalidate
-displayed counts and evidence; other history changes label the previous snapshot
-until the next bounded read completes. Exact method/path selection survives a
+the legacy whole-history Paths response. Explicit removal and event gaps clear displayed counts and evidence. Automatic
+retention and other history changes label the previous snapshot as stale until
+the next retained-history read completes. Exact method/path selection survives a
 refresh only while that endpoint remains in the result; source verification is
 cleared when its snapshot is invalidated. Local origin search keeps the inspector
 and labels a selected origin outside the filter or card limit. Redirect
@@ -99,13 +99,15 @@ on the same origin remain distinguishable.
 Ordinary map reads share one application-wide worker slot. This slot never
 gates proxy forwarding or unrelated API operations. Canceling an HTTP request
 does not free the slot while its queued or running worker is still projecting,
-aggregating or serializing, and a filter change, Reload or history invalidation
-cancels the read it replaces. A second map read therefore waits up to 20 seconds
+aggregating or serializing, and a filter change, Reload or strict history
+invalidation cancels the read it replaces. Automatic retention is coalesced as
+described below so continuous capture at the retention cap cannot repeatedly
+abort a map before it finishes. A second map read therefore waits up to 20 seconds
 for the slot; a whole-history read of the same request then usually answers from
 the map the first one cached. Only a read still waiting after that receives HTTP
 429 with `x-sniper-service-map-error: busy`. The GUI takes a busy answer as
 "still running": it keeps the map and its inspections, and its next poll asks
-again; five busy answers in a row pause it like any other failure. Admission is
+again; after five retryable busy answers, a sixth pauses it like any other failure. Admission is
 bounded, but Tokio's shared blocking pool does not provide a scheduling deadline.
 
 The default 10,000 / maximum 50,000 considered-row window and 8 MiB metadata
@@ -145,11 +147,45 @@ server error bodies. Unrecognized, duplicate or mismatched markers use a fixed
 generic error; older servers need not supply a marker. Successful legacy/v1/v2
 response shapes and catalog negotiation are unchanged.
 
-While Service Map or APIs is open, the GUI rereads retained metadata every
-1.2 seconds, skipping overlapping reads. Background reads keep the Reload label,
-button geometry, empty-state content and progress presentation steady. The compact
-Reload button remains available for an explicit reread or recovery after failure;
-initial and manual loads still show a busy state. It does not make target requests.
+While Service Map or APIs is open in a visible document, the GUI checks retained
+metadata five seconds after the previous read completes. The controller owns one
+timer; slow reads do not accumulate overlapping polls. Leaving the tool, changing
+views, hiding the document, changing sessions or disposing the controller cancels
+its pending timer/read and rejects late results. Returning starts one new timer;
+normal opening and explicit Reload can read immediately. Background reads keep
+the Reload label, button geometry, empty-state content and progress presentation
+steady. The compact Reload button remains available for an explicit reread or
+recovery after failure; initial and manual loads still show a busy state. It does
+not make target requests.
+
+A captured-row event marks pending freshness. The next background read uses
+`fresh=true` to bypass the old map's build-cost cooldown, while retaining the
+selection, graph positions, zoom, scroll and surviving exact inspections. This
+is separate from manual Reload, which deliberately clears inspections. The server
+still reuses a fully enriched unchanged map even with `fresh=true`; a false or
+repeated event therefore does not force that map to be rebuilt. Events arriving
+during a read keep its result visibly stale and coalesce into the next scheduled
+fresh read. Five seconds is the idle check interval, not a result deadline: the
+remaining current read, then the next read's build time, can extend display latency.
+
+Clean checks continue using the normal cache so body enrichment can progress even
+when capture is paused. Public `snapshot.complete` describes projection bounds,
+not the cache's private enrichment completion. An unchanged snapshot ID and
+normalized content avoid a graph repaint. Capture events update status/inspection
+ownership without laying out unchanged graph data; only an affected shown
+inspection changes the graph before the next snapshot.
+
+Automatic retention can delete a row with every new capture. Those events keep
+the previous captured window explicitly stale and do not abort the running map;
+one scheduled follow-up revalidates it. Origin/endpoint selection and viewport
+remain until a successful snapshot proves the selection absent. Exact evidence,
+parameters, API docs and supplementary inspections are cleared conservatively
+because retained sources may have been removed; a surviving endpoint's parameters
+can reload after a stable map. Explicit delete, Clear, event gaps, filter and scope
+changes retain strict cancellation/invalidation. Reconnection uses that strict
+gap path; disconnected checks can still refresh retained data. If an event is
+missed without a detected gap, ordinary cached checks eventually rebuild after
+the existing cache cooldown.
 
 After a failed refresh, the GUI visibly pauses background reads and offers
 **Reload**. Any retained previous map is labeled stale. A source/scope/history
@@ -181,8 +217,8 @@ unchanged, or while it is younger than four times its build time (at least
 1.2 seconds), and may then show rows removed since. Note and color-tag edits,
 including rollbacks, also change this history identity because they can change
 filtered membership. `fresh=true` bypasses the polling cooldown; an unchanged,
-fully read map can still be reused. The GUI sends that on its first read and on
-Reload. `sniper-cli` keeps the windowed read and its `max_records` unless
+fully read map can still be reused. The GUI sends that on its first read, on
+Reload, and when retained-history events have marked the snapshot stale. `sniper-cli` keeps the windowed read and its `max_records` unless
 `--all-rows` asks for every row.
 
 ## Reported products and local origin filters

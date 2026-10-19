@@ -124,6 +124,7 @@
   // Busy answers in a row before refresh pauses; the server waits up to 20 s
   // for the running read before each.
   const MAX_BUSY_RETRIES = 5;
+  const AUTO_REFRESH_MS = 5000;
   const MAP_FAILURES = new Map([
     ["busy", { status: 429, message: "Service map is busy." }],
     ["scope_work_limit", { status: 422, message: "Scope matching exceeded the service map work limit. Simplify scope rules or use a smaller CLI --max-records window." }],
@@ -1440,6 +1441,58 @@
     let detailRender = null;
     const renderedMarkup = new WeakMap();
     let visible = false;
+    let destroyed = false;
+    let pageHidden = false;
+    let refreshTimer = null;
+    let historyPresentationPending = false;
+    const eventDisposers = [];
+    function listen(element, type, handler, options) {
+      const owned = (...args) => { if (!destroyed) return handler(...args); };
+      element?.addEventListener?.(type, owned, options);
+      eventDisposers.push(() => element?.removeEventListener?.(type, owned, options));
+    }
+    const canRefresh = () => visible && !destroyed && !pageHidden && doc?.hidden !== true;
+    function clearRefreshTimer() {
+      if (refreshTimer !== null) root.clearTimeout?.(refreshTimer);
+      refreshTimer = null;
+    }
+    function scheduleAutomaticRefresh() {
+      if (refreshTimer !== null || !canRefresh() || state.loading || state.refreshPaused || !getSessionId() || !root.setTimeout) return;
+      // Start the delay after completion, so a slow map never accumulates polls.
+      refreshTimer = root.setTimeout(() => {
+        refreshTimer = null;
+        refresh();
+      }, AUTO_REFRESH_MS);
+    }
+    function suspendRefresh() {
+      clearRefreshTimer();
+      state.requestId += 1;
+      abort?.abort();
+      abort = null;
+      state.loading = false;
+      state.backgroundLoading = false;
+    }
+    function onVisibilityChange() {
+      if (!canRefresh()) suspendRefresh();
+      else {
+        if (historyPresentationPending) render();
+        else renderStatus();
+        historyPresentationPending = false;
+        scheduleAutomaticRefresh();
+      }
+    }
+    function onPageHide() { pageHidden = true; suspendRefresh(); }
+    function onPageShow() { pageHidden = false; onVisibilityChange(); }
+    function renderHistoryChange(graphChanged) {
+      if (!canRefresh()) { historyPresentationPending = true; return; }
+      // A history event changes freshness and inspection ownership, not the
+      // loaded graph. Do not lay it out per captured/retained row.
+      if (graphChanged) render();
+      else { renderStatus(); renderDetail(); renderOverlayStatus(); }
+    }
+    doc?.addEventListener?.("visibilitychange", onVisibilityChange);
+    root.addEventListener?.("pagehide", onPageHide);
+    root.addEventListener?.("pageshow", onPageShow);
     let currentLayout = null;
     function viewportSize() {
       return { width: Number(els.viewport?.clientWidth) || 0, height: Number(els.viewport?.clientHeight) || 0 };
@@ -2102,15 +2155,14 @@
     function reset() {
       replayActionId += 1;
       clearOverlay("Temporary body references cleared because the session changed.");
-      state.requestId += 1;
-      abort?.abort();
-      abort = null;
+      suspendRefresh();
       cancelEvidence();
       closeApiDocs();
       cancelParameters();
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null, selectedSite: null,
         inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, expandedEndpointGroups: new Set(), loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
+      scheduleAutomaticRefresh();
     }
     function selectOrigin(origin, endpointIndex = null) {
       const item = findOrigin(origin);
@@ -2301,12 +2353,13 @@
       renderDetail();
     }
     async function refresh({ force = false, retry = false } = {}) {
-      if (!visible) return false;
+      if (!canRefresh()) return false;
       const sessionId = getSessionId();
       if (state.sessionId !== sessionId) reset();
       if (!sessionId || state.refreshPaused && !retry || state.loading && !force) return false;
+      clearRefreshTimer();
       if (force || retry) state.busyRetries = 0;
-      // The app polls every 1.2 seconds. A same-source background snapshot must
+      // A same-source background snapshot must
       // not erase an explicit inspection or continually abort its pending read.
       if (force) {
         replayActionId += 1;
@@ -2322,7 +2375,10 @@
       const requestId = ++state.requestId;
       const scopeOnly = state.scopeOnly;
       const filterQuery = getFilterQuery();
+      const filterSignature = JSON.stringify(filterQuery);
       const historyVersion = state.historyVersion;
+      const current = () => canRefresh() && requestId === state.requestId && sessionId === getSessionId()
+        && scopeOnly === state.scopeOnly && filterSignature === JSON.stringify(getFilterQuery());
       state.backgroundLoading = !!state.snapshot && !force;
       state.loading = true;
       state.error = "";
@@ -2332,16 +2388,36 @@
       try {
         // The Service Map filter's conditions use HTTP history's parameter names.
         // Every retained row, not a newest-rows window. The server serves an
-        // unchanged or recent whole-history map from its cache; Reload and the
-        // first read ask for a fresh one.
-        const params = new URLSearchParams({ ...filterQuery, session_id: sessionId, in_scope_only: String(scopeOnly), all_rows: "true", ...(force || !state.snapshot ? { fresh: "true" } : {}) });
+        // unchanged or recent whole-history map from its cache. A history event
+        // bypasses the build-cost cooldown without the manual Reload's resets;
+        // fresh=true still reuses a complete, unchanged map. Clean polls keep
+        // progressing body enrichment, whose completion is private to the cache
+        // and is deliberately not inferred from snapshot.complete (display caps).
+        const params = new URLSearchParams({ ...filterQuery, session_id: sessionId, in_scope_only: String(scopeOnly), all_rows: "true", ...(force || !state.snapshot || state.stale ? { fresh: "true" } : {}) });
         const response = await request(`/api/target/service-map?${params}`, { signal: abort.signal, headers: { [TECHNOLOGY_CATALOG_HEADER]: String(TECHNOLOGY_CATALOG_VERSION) } });
         if (!response.ok) {
           failure = mapFailure(response);
           throw new Error("Service map unavailable");
         }
         const snapshot = normalizeSnapshot(await response.json(), sessionId);
-        if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
+        if (!current()) return false;
+        if (!force && !state.stale && historyVersion === state.historyVersion
+          && typeof snapshot.snapshot.id === "string" && snapshot.snapshot.id
+          && snapshot.snapshot.id === state.snapshot?.snapshot.id
+          && snapshot.snapshot.generation === state.snapshot.snapshot.generation
+          && snapshot.technologyCatalogVersion === state.snapshot.technologyCatalogVersion
+          && filterSignature === state.filterSignature
+          && state.kindSignature === JSON.stringify(hiddenLinkKinds())
+          && state.siteDisplaySignature === JSON.stringify(siteDisplay())
+          && !(state.endpointSelection && state.parametersKey === null)
+          && JSON.stringify(snapshot) === JSON.stringify(state.snapshot)) {
+          // Reusing serialized cache bytes must not rebuild the graph or disturb
+          // an inspection, scroll position or focused input every five seconds.
+          state.loading = false;
+          state.busyRetries = 0;
+          renderStatus();
+          return true;
+        }
         clearOverlay("Shown inspections removed: exact sources are no longer verified in the loaded projection or retained history changed.", (layer) =>
           !(layer.kind === "peer" ? peerSourceIsCurrent(layer.source, snapshot) : layer.kind === "link"
             ? htmlGeneratorSourceIsRetained(layer.source, snapshot) : sourceIsRetained(layer.source, snapshot)));
@@ -2361,7 +2437,6 @@
         // Another filter counts other rows, and other hidden request kinds draw
         // other links, wherever either changed (the dialog, a loaded setting,
         // another window): rank the cards again for them.
-        const filterSignature = JSON.stringify(filterQuery);
         const kindSignature = JSON.stringify(hiddenLinkKinds());
         if (state.filterSignature !== undefined && (state.filterSignature !== filterSignature || state.kindSignature !== kindSignature)) {
           state.order = [];
@@ -2398,7 +2473,7 @@
         render();
         return true;
       } catch (_) {
-        if (requestId !== state.requestId || sessionId !== getSessionId() || scopeOnly !== state.scopeOnly) return false;
+        if (!current()) return false;
         // Another read outlasted the server's wait for it. It is still running
         // and finishes, so the next poll asks again and nothing shown is stale
         // for it; only a long run of these pauses, as other failures do.
@@ -2425,6 +2500,13 @@
         state.error = failure?.message || (state.snapshot ? "Reload failed." : "Could not load the service map.");
         render();
         return false;
+      } finally {
+        if (requestId === state.requestId) {
+          abort = null;
+          state.loading = false;
+          renderStatus();
+          scheduleAutomaticRefresh();
+        }
       }
     }
     function evidenceItems(origin) {
@@ -2703,6 +2785,7 @@
       }
     }
     function renderStatus() {
+      if (destroyed) return;
       // Re-rendered with the status so a filter restored from settings shows.
       if (els.filterSummary) {
         const summary = getFilterSummary();
@@ -2741,7 +2824,7 @@
       }
       els.status.classList.toggle("service-map-error", !!state.error);
       els.refresh.disabled = state.loading;
-      // Polling must not resize or dim the toolbar every 1.2 seconds. Keep the
+      // Polling must not resize or dim the toolbar on each check. Keep the
       // request guard, but reserve visible progress for initial/manual loads.
       els.refresh.textContent = "Reload";
       els.refresh.classList.toggle("service-map-background-refresh", state.loading && state.backgroundLoading);
@@ -2820,14 +2903,16 @@
         favicons.set(token, false);
         const image = new Image();
         image.onload = () => {
+          if (destroyed) return;
           favicons.set(token, true);
-          faviconRedraw ??= setTimeout(() => { faviconRedraw = null; renderGraph(); }, 0);
+          faviconRedraw ??= setTimeout(() => { faviconRedraw = null; if (!destroyed) renderGraph(); }, 0);
         };
         image.src = source;
       }
       return favicons.get(token) ? source : null;
     }
     function renderGraph() {
+      if (destroyed) return;
       const selected = selectedOrigin();
       const direct = directNeighborhood();
       const query = state.query.trim().toLowerCase();
@@ -2854,6 +2939,7 @@
       const endpointNodeIds = direct ? null : new Set(origins.filter((item) => item.endpointNode).map((item) => item.origin));
       const order = direct ? [direct.anchor.origin, ...neighborOrder.filter((id) => direct.bodyIds.has(id)), ...neighborOrder.filter((id) => !direct.bodyIds.has(id))]
         : [...allOrder.filter((id) => endpointNodeIds.has(id)), ...allOrder.filter((id) => sourceIds.has(id)), ...allOrder.filter((id) => collectionIds.has(id) && !sourceIds.has(id) && !endpointNodeIds.has(id)), ...allOrder.filter((id) => !collectionIds.has(id))];
+      state.siteDisplaySignature = JSON.stringify(display);
       const filterKey = JSON.stringify([query, state.productId, state.productVersion, state.scopeOnly, state.sessionId, state.anchorOrigin, hiddenLinkKinds(), display]);
       if (state.layoutFilter !== filterKey) { state.layoutSlots = new Map(); state.layoutFilter = filterKey; }
       const textSize = doc?.documentElement && typeof root.getComputedStyle === "function"
@@ -3348,6 +3434,7 @@
       return `<div class="service-map-overlay-actions service-map-origin-actions">${openApi}${hiddenAs ? `<button class="secondary-action" type="button" data-service-unhide="${escape(hiddenAs)}" data-service-focus="origin:unhide">${hiddenAs === origin.origin ? "Show on map" : `Show *.${escape(site)} on map`}</button>` : `<button class="secondary-action" type="button" data-service-hide="${escape(origin.origin)}" data-service-focus="origin:hide">Hide from map</button>`}${regroup ? `<button class="secondary-action" type="button" data-service-site-collapse="${escape(site)}" data-service-focus="origin:regroup">Group *.${escape(site)} again</button>` : ""}</div>`;
     }
     function renderDetail() {
+      if (destroyed) return;
       const client = state.selectedClient ? clientById(state.selectedClient) : null;
       if (client) { replaceDetail(clientDetailMarkup(client)); return; }
       state.selectedClient = null;
@@ -3393,6 +3480,7 @@
       replace(els.catalog, `<header class="service-map-catalog-header"><div><h3>Observed API paths</h3></div><span>${entries.length.toLocaleString()} matching loaded combinations</span></header>${endpointFiltersMarkup("serviceMapCatalog")}${endpointSelectionNotice()}${endpointCoverageMarkup(units.length, loaded.length, start, loaded.length - searchedEntries.length, searchedEntries.length - originEntries.length, entries.length)}<div class="service-map-api-list">${units.slice(start, start + API_PAGE_SIZE).map((unit) => endpointUnitMarkup(unit, true)).join("") || `<p class="empty-copy">${state.loading && !state.snapshot ? "Loading retained API paths…" : "No loaded endpoints match these filters, origin search and origin products/versions."}</p>`}</div><div class="service-map-pagination"><button class="secondary-action" type="button" data-service-page="${state.page - 1}" ${!state.snapshot || state.page === 0 ? "disabled" : ""}>Previous</button><span>${units.length ? start + 1 : 0}–${Math.min(start + API_PAGE_SIZE, units.length)} / ${units.length}</span><button class="secondary-action" type="button" data-service-page="${state.page + 1}" ${state.page + 1 >= pages ? "disabled" : ""}>Next</button></div>`);
     }
     function render() {
+      if (destroyed) return;
       renderStatus();
       renderProductFilters();
       renderOverlayStatus();
@@ -3506,16 +3594,16 @@
       }
     }
     let onViewChange = null;
-    els.panel.addEventListener("click", handleClick);
-    els.panel.addEventListener("change", (event) => {
+    listen(els.panel, "click", handleClick);
+    listen(els.panel, "change", (event) => {
       if (event.target?.dataset?.serviceProductFilter) setProductFilter(event.target.dataset.serviceProductFilter, event.target.value);
       else if (event.target?.dataset?.serviceRelationshipKind) setRelationshipKind(event.target.value);
       else if (event.target?.dataset?.serviceEndpointFilter === "method") setEndpointFilter("method", event.target.value);
     });
-    els.panel.addEventListener("input", (event) => {
+    listen(els.panel, "input", (event) => {
       if (event.target?.dataset?.serviceEndpointFilter === "path") setEndpointFilter("path", event.target.value);
     });
-    els.panel.addEventListener("keydown", (event) => {
+    listen(els.panel, "keydown", (event) => {
       const tab = event.target.closest('[role="tab"][data-service-detail-tab]');
       if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
@@ -3525,7 +3613,7 @@
       const next = [...els.detail.querySelectorAll('[role="tab"][data-service-detail-tab]')].find((button) => button.dataset.serviceDetailTab === state.detailTab);
       next?.focus();
     });
-    els.apiDocs?.addEventListener("click", (event) => {
+    listen(els.apiDocs, "click", (event) => {
       if (event.target === els.apiDocs) return closeApiDocs();
       const data = event.target.closest?.("button")?.dataset;
       if (!data) return;
@@ -3540,15 +3628,15 @@
       }
       else if (data.apiDocsReplay) sendApiDocsToReplay(data.apiDocsReplay);
     });
-    els.apiDocs?.addEventListener("keydown", (event) => {
+    listen(els.apiDocs, "keydown", (event) => {
       if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || !isActiveModal(els.apiDocs)) return;
       event.preventDefault?.();
       closeApiDocs();
     });
-    els.zoomOut?.addEventListener("click", () => setZoom(state.zoomScale - ZOOM_LIMITS.step));
-    els.zoomReset?.addEventListener("click", fitOrReset);
-    els.zoomIn?.addEventListener("click", () => setZoom(state.zoomScale + ZOOM_LIMITS.step));
-    els.viewport?.addEventListener("keydown", (event) => {
+    listen(els.zoomOut, "click", () => setZoom(state.zoomScale - ZOOM_LIMITS.step));
+    listen(els.zoomReset, "click", fitOrReset);
+    listen(els.zoomIn, "click", () => setZoom(state.zoomScale + ZOOM_LIMITS.step));
+    listen(els.viewport, "keydown", (event) => {
       if (event.target !== els.viewport || event.ctrlKey || event.metaKey || event.altKey) return;
       const handled = event.key === "+" || event.key === "=" ? setZoom(state.zoomScale + ZOOM_LIMITS.step)
         : event.key === "-" ? setZoom(state.zoomScale - ZOOM_LIMITS.step)
@@ -3566,7 +3654,7 @@
       return rect && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
         ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : null;
     };
-    els.viewport?.addEventListener("wheel", (event) => {
+    listen(els.viewport, "wheel", (event) => {
       if (!event.ctrlKey || pinchStartScale !== null || !zoomAvailable()) return;
       event.preventDefault();
       // A mouse notch is about 100px against a few px per trackpad frame; the cap
@@ -3575,27 +3663,28 @@
       const delta = Math.max(-20, Math.min(20, (Number(event.deltaY) || 0) * lines));
       setZoom(state.zoomScale * Math.exp(-delta / 100), { anchor: pinchAnchor(event) });
     }, { passive: false });
-    els.viewport?.addEventListener("gesturestart", (event) => {
+    listen(els.viewport, "gesturestart", (event) => {
       if (!zoomAvailable()) return;
       event.preventDefault();
       pinchStartScale = state.zoomScale;
     });
-    els.viewport?.addEventListener("gesturechange", (event) => {
+    listen(els.viewport, "gesturechange", (event) => {
       if (pinchStartScale === null) return;
       event.preventDefault();
       if (Number.isFinite(event.scale)) setZoom(pinchStartScale * event.scale, { anchor: pinchAnchor(event) });
     });
-    els.viewport?.addEventListener("gestureend", (event) => {
+    listen(els.viewport, "gestureend", (event) => {
       if (pinchStartScale === null) return;
       event.preventDefault();
       pinchStartScale = null;
     });
     // Resize only refreshes control availability; Fit is an explicit one-shot
     // action, so resizing or polling cannot silently change the user's zoom.
-    if (els.viewport && typeof root.ResizeObserver === "function") new root.ResizeObserver(updateZoomControls).observe(els.viewport);
+    const resizeObserver = els.viewport && typeof root.ResizeObserver === "function" ? new root.ResizeObserver(updateZoomControls) : null;
+    resizeObserver?.observe(els.viewport);
     // Showing or hiding a request kind changes which links count, so the cards
     // are ranked and laid out again for the links that remain.
-    els.linkKinds?.addEventListener("click", (event) => {
+    listen(els.linkKinds, "click", (event) => {
       const kind = event.target?.closest?.("[data-link-kind]")?.dataset.linkKind;
       if (!REQUEST_KINDS.includes(kind)) return;
       const hidden = new Set(hiddenLinkKinds());
@@ -3609,7 +3698,7 @@
       }
       renderGraph();
     });
-    els.refresh.addEventListener("click", () => {
+    listen(els.refresh, "click", () => {
       // Polling keeps cards where they are; an explicit Reload may move them so
       // relationships captured since the map opened come within the card cap.
       if (state.snapshot) {
@@ -3618,11 +3707,11 @@
       }
       return refresh({ force: true, retry: true });
     });
-    els.allOrigins?.addEventListener("click", () => setMapMode(false));
-    els.directRelations?.addEventListener("click", () => setMapMode(true));
-    els.focusSelection?.addEventListener("click", focusSelection);
-    els.search.addEventListener("input", () => { replayActionId += 1; state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
-    els.scope.addEventListener("click", () => {
+    listen(els.allOrigins, "click", () => setMapMode(false));
+    listen(els.directRelations, "click", () => setMapMode(true));
+    listen(els.focusSelection, "click", focusSelection);
+    listen(els.search, "input", () => { replayActionId += 1; state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
+    listen(els.scope, "click", () => {
       state.scopeOnly = !state.scopeOnly;
       els.scope.classList.toggle("active", state.scopeOnly);
       els.scope.setAttribute("aria-pressed", String(state.scopeOnly));
@@ -3666,7 +3755,7 @@
           const summary = typeof event?.data === "string" ? JSON.parse(event.data) : null;
           if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(summary?.id || "")) recordId = summary.id.toLowerCase();
         } catch (_) { /* Unknown event identity invalidates every inspection. */ }
-        clearOverlay("Affected inspections removed because retained history changed. Inspect and show those sources again when ready.",
+        const graphChanged = clearOverlay("Affected inspections removed because retained history changed. Inspect and show those sources again when ready.",
           (layer) => !recordId || layer.kind === "peer" || !validTechnologyEvidence(layer.source.evidenceId, layer.source.sessionId, layer.source.generation) || layer.source.evidenceId.split(".")[5].toLowerCase() === recordId);
         state.historyVersion += 1;
         state.stale = true;
@@ -3674,18 +3763,18 @@
         // every captured row, so clearing them here would empty the dialog and
         // the panel while traffic flows. A count one row behind is harmless,
         // and Replay reports a row that is gone. Deletion, retention and Clear
-        // go through invalidate(), which does clear them. The evidence read
+        // take their own invalidation paths, which do clear them. The evidence read
         // stays too unless this is its row, or no source could be inspected
         // while traffic flowed; peer matches count other rows, so any row
         // can change them.
         const evidenceRecord = state.peerEvidenceBinding ? null : String(state.evidenceId || "").split(".")[5]?.toLowerCase();
         if (recordId && evidenceRecord && evidenceRecord !== recordId) cancelPeerMatches();
         else cancelEvidence();
-        // Hidden, it is drawn again when shown; redrawing it for every row cost
-        // the whole map's layout while the user worked elsewhere.
-        if (visible) render();
+        renderHistoryChange(graphChanged);
       },
       setVisible(value, view = state.view) {
+        if (destroyed) return;
+        if (!value || view !== state.view) suspendRefresh();
         if (!value || view !== state.view) replayActionId += 1;
         if (!value) cancelParameters();
         if (!value || view !== "service-map") {
@@ -3699,6 +3788,25 @@
         state.view = view;
         if (state.sessionId !== getSessionId()) reset();
         render();
+        historyPresentationPending = false;
+        scheduleAutomaticRefresh();
+      },
+      destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        visible = false;
+        suspendRefresh();
+        replayActionId += 1;
+        closeApiDocs(false);
+        cancelEvidence();
+        cancelParameters();
+        resizeObserver?.disconnect();
+        for (const dispose of eventDisposers) dispose();
+        if (faviconRedraw !== null) root.clearTimeout?.(faviconRedraw);
+        faviconRedraw = null;
+        doc?.removeEventListener?.("visibilitychange", onVisibilityChange);
+        root.removeEventListener?.("pagehide", onPageHide);
+        root.removeEventListener?.("pageshow", onPageShow);
       },
       setViewChange(callback) { onViewChange = callback; },
       disconnect() {
@@ -3714,6 +3822,22 @@
         cancelEvidence();
         cancelParameters();
         render();
+        scheduleAutomaticRefresh();
+      },
+      retentionChanged() {
+        // At the retention cap each capture can remove a row. Canceling and
+        // restarting on every removal would starve a slow map forever. Keep
+        // its captured window explicitly stale and coalesce one next read;
+        // exact inspections cannot retain bindings to possibly removed rows.
+        replayActionId += 1;
+        state.historyVersion += 1;
+        state.stale = true;
+        const graphChanged = clearOverlay("Shown inspections cleared because automatic cleanup removed retained history.");
+        closeApiDocs();
+        cancelEvidence();
+        cancelParameters();
+        renderHistoryChange(graphChanged);
+        scheduleAutomaticRefresh();
       },
       invalidate() {
         replayActionId += 1;

@@ -353,7 +353,7 @@ for (const tool of ['target', 'map']) test(`${tool} loader only requests legacy 
   await ctx.loadTargetSiteMap();
   assert.equal(requests.some(url => url.startsWith('/api/target/site-map')), tool === 'target');
 });
-test('map/APIs polling bypasses legacy runtime/path reads entirely', async () => {
+test('map/APIs auxiliary polling leaves reads to the controller and bypasses legacy paths', async () => {
   for (const view of ['service-map', 'apis']) {
     let refreshes = 0;
     const ctx = loadFunctions(['pollAuxiliaryData'], {
@@ -362,7 +362,7 @@ test('map/APIs polling bypasses legacy runtime/path reads entirely', async () =>
       isWebsocketHistoryVisible: () => false, shouldPollFindingsBadge: () => false,
       loadTargetSiteMap() { assert.fail('Legacy path loader must not run in the bounded map'); },
     });
-    await ctx.pollAuxiliaryData(); assert.equal(refreshes, 1);
+    await ctx.pollAuxiliaryData(); assert.equal(refreshes, 0);
   }
 });
 test('integration wires session, removal, gap and owned transaction invalidation', () => {
@@ -1161,12 +1161,11 @@ test('canonical omitted references cannot exceed the inspected candidate budget'
 });
 
 function pollRealTargetMap(f) {
-  return loadFunctions(['pollAuxiliaryData'], {
-    state: { activeTool: 'map', activeTargetView: 'service-map' }, targetServiceMapController: f.controller,
-    isWebsocketHistoryVisible: () => false, shouldPollFindingsBadge: () => false,
-    loadTargetSiteMap() { assert.fail('No legacy map read'); },
-  }).pollAuxiliaryData();
+  // The controller now owns periodic reads. Its deterministic clock lifecycle
+  // is exercised separately in service-map-auto-refresh.test.cjs.
+  return f.controller.refresh();
 }
+
 function clickBodyInspector(f) {
   f.els.panel.dispatch('click', { target: { closest: () => ({ dataset: { serviceBodyReferences: 'inspect' } }) } });
 }
