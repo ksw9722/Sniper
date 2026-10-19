@@ -11113,13 +11113,19 @@ function bindFindingsEvents() {
   if (els.findingsRescanButton) {
     onClickWithProgress(els.findingsRescanButton, async () => {
       const sessionId = currentSessionId();
+      const stateGeneration = findingsStateGeneration;
+      // A cleared or revisited session must not revive this older action's UI.
+      const isCurrent = () => sessionId === currentSessionId()
+        && stateGeneration === findingsStateGeneration;
       try {
         const response = await fetch(sessionWritePath("/api/findings/rescan", sessionId), { method: "POST" });
+        if (!isCurrent()) return;
         await requireOkResponse(response, "Failed to rescan findings.");
-        if (sessionId !== currentSessionId()) return;
+        if (!isCurrent()) return;
         resetFindingsUiState();
         await loadFindings();
       } catch (error) {
+        if (!isCurrent()) return;
         console.error(error);
         showToast(error?.message || "Failed to rescan findings.", "error");
       }
