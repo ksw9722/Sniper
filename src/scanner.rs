@@ -2408,48 +2408,61 @@ fn check_cors(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
         None => return,
     };
 
-    let acao = response
-        .header_value("access-control-allow-origin")
-        .map(str::trim);
-    let acac = response
-        .header_value("access-control-allow-credentials")
-        .map(str::trim);
+    // Fetch combines duplicate field lines, which cannot yield a singleton
+    // ACAO origin or the exact ACAC token. Reading only the first line would
+    // report browser access that the CORS check actually rejects.
+    let Some(origin) = cors_single_header_value(response, "access-control-allow-origin") else {
+        return;
+    };
+    if cors_single_header_value(response, "access-control-allow-credentials") != Some("true") {
+        return;
+    }
 
-    if let Some(origin) = acao {
-        if origin == "*" {
-            // Browsers block wildcard ACAO when credentials are enabled, so this
-            // is a policy smell rather than a browser-exploitable passive finding.
-        } else if origin.eq_ignore_ascii_case("null")
-            && acac.is_some_and(|v| v.eq_ignore_ascii_case("true"))
-        {
+    if origin == "null" {
+        findings.push(make_finding(
+            record,
+            Severity::Medium,
+            "cors",
+            "CORS: null origin with credentials",
+            "Access-Control-Allow-Origin: null with Access-Control-Allow-Credentials: true can expose credentialed responses to sandboxed or file-origin contexts.",
+            "ACAO: null, ACAC: true",
+        ));
+    } else if origin != "*" && is_serialized_cors_origin(origin) {
+        let req_origin = cors_single_header_value(&record.request, "origin").unwrap_or("");
+        if origin == req_origin && !origin_is_same_site(origin, &record.scheme, &record.host) {
+            // One answer cannot show reflection: an allowlist answers its
+            // own origins the same way. A site trusting its own hosts is
+            // the usual setup and is left out above.
             findings.push(make_finding(
                 record,
-                Severity::Medium,
+                Severity::Low,
                 "cors",
-                "CORS: null origin with credentials",
-                "Access-Control-Allow-Origin: null with Access-Control-Allow-Credentials: true can expose credentialed responses to sandboxed or file-origin contexts.",
-                "ACAO: null, ACAC: true",
+                "CORS: another site allowed with credentials",
+                format!("The response let {origin}, another site, read it with credentials. One answer cannot tell an allowlist from a server that reflects any origin: replay the request with an Origin the server cannot expect, and the finding stands if that origin comes back with credentials allowed."),
+                format!("ACAO: {origin}, ACAC: true"),
             ));
-        } else if acac.is_some_and(|v| v.eq_ignore_ascii_case("true")) {
-            let req_origin = record.request.header_value("origin").unwrap_or("").trim();
-            if !req_origin.is_empty()
-                && origin == req_origin
-                && !origin_is_same_site(origin, &record.scheme, &record.host)
-            {
-                // One answer cannot show reflection: an allowlist answers its
-                // own origins the same way. A site trusting its own hosts is
-                // the usual setup and is left out above.
-                findings.push(make_finding(
-                    record,
-                    Severity::Low,
-                    "cors",
-                    "CORS: another site allowed with credentials",
-                    format!("The response let {origin}, another site, read it with credentials. One answer cannot tell an allowlist from a server that reflects any origin: replay the request with an Origin the server cannot expect, and the finding stands if that origin comes back with credentials allowed."),
-                    format!("ACAO: {origin}, ACAC: true"),
-                ));
-            }
         }
     }
+}
+
+fn cors_single_header_value<'a>(message: &'a MessageRecord, name: &str) -> Option<&'a str> {
+    let mut values = message
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(name));
+    let value = &values.next()?.value;
+    if values.next().is_some() {
+        return None;
+    }
+    // HTTP optional whitespace, not arbitrary Unicode whitespace.
+    Some(value.trim_matches([' ', '\t']))
+}
+
+fn is_serialized_cors_origin(origin: &str) -> bool {
+    url::Url::parse(origin).is_ok_and(|url| {
+        let serialized = url.origin().ascii_serialization();
+        serialized != "null" && serialized == origin
+    })
 }
 
 /// Whether an origin is on the same site as the request, as browsers judge
@@ -8347,5 +8360,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn cors_value_fixture(origin: &str, credentials: &str) -> TransactionRecord {
+        let mut record = make_record(
+            vec![("origin", origin)],
+            vec![
+                ("access-control-allow-origin", origin),
+                ("access-control-allow-credentials", credentials),
+            ],
+            r#"{"private":true}"#,
+            200,
+        );
+        // Synthetic distinct-site target; no network request is made.
+        record.host = "127.0.0.1".into();
+        record
+    }
+
+    #[test]
+    fn cors_credentials_value_is_case_sensitive() {
+        for origin in ["null", "https://example.com"] {
+            for credentials in [
+                "True",
+                "TRUE",
+                "false",
+                "true, true",
+                "true\u{a0}",
+                "\u{a0}true",
+            ] {
+                let record = cors_value_fixture(origin, credentials);
+                assert!(
+                    findings_for_rule(&record, "cors").is_empty(),
+                    "{origin} / {credentials:?}"
+                );
+            }
+            for credentials in ["true", " \ttrue\t "] {
+                let record = cors_value_fixture(origin, credentials);
+                assert_eq!(
+                    findings_for_rule(&record, "cors").len(),
+                    1,
+                    "{origin} / {credentials:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cors_origin_requires_exact_null_or_serialized_tuple_origin() {
+        for origin in [
+            "Null",
+            "NULL",
+            "*",
+            "https://example.com/",
+            "https://example.com/path",
+            "https://example.com?query=1",
+            "https://example.com#fragment",
+            "https://user:pass@example.com",
+            "https://example.com:443",
+            "http://example.com:80",
+            "https://192.000.002.001",
+            "https://[2001:db8:0:0:0:0:0:1]",
+            "file:///example",
+            "data:text/plain,example",
+            "blob:https://example.com/id",
+            "HTTPS://EXAMPLE.COM",
+            "https://example.com, https://example.com",
+            "not-an-origin",
+            "null\u{a0}",
+        ] {
+            let record = cors_value_fixture(origin, "true");
+            assert!(findings_for_rule(&record, "cors").is_empty(), "{origin:?}");
+        }
+        for origin in [
+            "null",
+            "https://example.com",
+            "https://example.com:8443",
+            "http://example.com",
+            "ftp://example.com",
+            "ws://example.com",
+            "wss://example.com",
+            "https://192.0.2.1",
+            "https://[2001:db8::1]",
+            "https://xn--bcher-kva.example.com",
+            "https://example.com.",
+            "https://example.com:0",
+        ] {
+            let record = cors_value_fixture(origin, "true");
+            let found = findings_for_rule(&record, "cors");
+            assert_eq!(found.len(), 1, "{origin}");
+            if origin == "null" {
+                assert_eq!(found[0].title, "CORS: null origin with credentials");
+                assert_eq!(found[0].severity, Severity::Medium);
+            } else {
+                assert_eq!(
+                    found[0].title,
+                    "CORS: another site allowed with credentials"
+                );
+                assert_eq!(found[0].severity, Severity::Low);
+            }
+        }
+        for origin in ["null", "https://example.com"] {
+            for (request, response) in [
+                (format!(" \t{origin}\t "), origin.to_string()),
+                (origin.to_string(), format!(" \t{origin}\t ")),
+            ] {
+                let mut record = cors_value_fixture(origin, "true");
+                record.request.headers[0].value = request;
+                record.response.as_mut().unwrap().headers[0].value = response;
+                assert_eq!(findings_for_rule(&record, "cors").len(), 1);
+            }
+        }
+        // This is a policy observation, not proof the captured request passed CORS.
+        for request_origin in [None, Some("https://example.com")] {
+            let mut record = cors_value_fixture("null", "true");
+            record.request.headers.clear();
+            if let Some(value) = request_origin {
+                record.request.headers.push(HeaderRecord {
+                    name: "origin".into(),
+                    value: value.into(),
+                });
+            }
+            let found = findings_for_rule(&record, "cors");
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].severity, Severity::Medium);
+        }
+    }
+
+    #[test]
+    fn cors_duplicate_response_fields_do_not_imply_browser_access() {
+        for origin in ["null", "https://example.com"] {
+            for (name, value) in [
+                ("Access-Control-Allow-Origin", origin),
+                ("Access-Control-Allow-Origin", ""),
+                ("Access-Control-Allow-Credentials", "true"),
+                ("Access-Control-Allow-Credentials", "false"),
+            ] {
+                let mut record = cors_value_fixture(origin, "true");
+                record
+                    .response
+                    .as_mut()
+                    .unwrap()
+                    .headers
+                    .push(HeaderRecord {
+                        name: name.into(),
+                        value: value.into(),
+                    });
+                assert!(
+                    findings_for_rule(&record, "cors").is_empty(),
+                    "{origin} / {name}: {value}"
+                );
+            }
+        }
+        let mut record = cors_value_fixture("https://example.com", "true");
+        record.request.headers.push(HeaderRecord {
+            name: "Origin".into(),
+            value: "https://example.com".into(),
+        });
+        assert!(findings_for_rule(&record, "cors").is_empty());
+        let mut record = cors_value_fixture("https://example.com", "true");
+        record
+            .response
+            .as_mut()
+            .unwrap()
+            .headers
+            .push(HeaderRecord {
+                name: "Vary".into(),
+                value: "Origin".into(),
+            });
+        assert_eq!(findings_for_rule(&record, "cors").len(), 1);
     }
 }

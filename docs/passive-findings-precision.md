@@ -24,7 +24,7 @@ No templates were downloaded, enabled, or executed here.
 | `header` | HSTS, CSP, nosniff, frame restrictions | Document/frame context; success HTML; valid header values; CSP frame-ancestors alternative | Keep. These are hardening observations; public documents may intentionally permit embedding. |
 | `cookie` | HttpOnly, Secure, SameSite | Auth-like names/JWT values; deletion filtering; known analytics exclusions | Share the analytics/empty-value predicate with cache checks; preserve actual session cookies. |
 | `disclosure` | 64 token/secret/path/card signatures plus private-address detection | Binary/base64 filtering, placeholders, credential-bearing DB URLs, Luhn/context checks | Keep in this pass. File-path references and vendor-shaped documentation tokens merit separate contextual fixtures. |
-| `cors` | Credentialed null origin; another site's reflected/allowed origin | Wildcard case excluded; same-site heuristic; low-confidence cross-site wording | Keep. A legitimate allowlist cannot be distinguished from unrestricted reflection using one captured exchange. |
+| `cors` | Credentialed null origin; another site's reflected/allowed origin | Wildcard case excluded; same-site heuristic; low-confidence cross-site wording | Enforce exact Fetch values and serialized-origin syntax in a separate patch. A legitimate allowlist still cannot be distinguished from unrestricted reflection using one captured exchange. |
 | `server` | Version banners and debug/backend headers | Dotted versions; edge/gateway/platform exclusions | Keep. Blank debug headers and intentional diagnostics merit future controls. |
 | `error` | 58 database/language/framework patterns | 4xx/5xx only; binary exclusion; generic-pattern/context suppression | Keep. Error documentation/quoted examples and occurrence-local context need a separate review. |
 | `misconfig` | CSP unsafe execution; authenticated cache policies | Nonce/hash and directive context; static-resource exclusions | Correct directive syntax, cookie auth context, and separately review CSP enforcement semantics. |
@@ -90,16 +90,44 @@ state are outside this change.
   do not qualify all browser versions, intermediary quirks, malformed headers,
   or real-world false-positive rates.
 
-### Next deterministic case: CORS header values
+### Separate CORS header-value patch (source-reviewed; not compiled)
 
-`check_cors` currently treats `Access-Control-Allow-Credentials: True` as
+The earlier code treated `Access-Control-Allow-Credentials: True` as
 credentialed access through `eq_ignore_ascii_case`. The [Fetch credentials
 matrix](https://fetch.spec.whatwg.org/#cors-protocol-and-credentials) explicitly
-requires the lowercase value `true`. This bounded issue is distinct from the
-intentional-allowlist question. A separate CORS patch should pair valid values
-with wrong-case values, duplicate fields, and invalid serialized origins;
-retain valid null-origin and cross-site credentialed policy observations.
-This follow-up is documented, not changed by the present patch.
+requires lowercase `true`, and the [CORS check](https://fetch.spec.whatwg.org/#cors-check)
+compares the origin against its serialization. The separate patch:
+
+- Requires exact `true` and exact opaque-origin `null`, trimming only HTTP
+  SP/HTAB whitespace. Unicode whitespace and differently cased values do not
+  establish browser permission.
+- Rejects duplicate ACAO/ACAC response fields, including empty duplicates;
+  Fetch combines these fields and they cannot pass the singleton comparisons.
+  Duplicate request Origin fields likewise do not establish one reflected
+  origin. Unrelated repeated headers do not suppress a finding.
+- Requires non-null origin values to equal their canonical URL-origin
+  serialization. Paths, userinfo, default ports, case-normalized values, and
+  origin lists cannot match a browser's serialized Origin. [URL origin rules](https://url.spec.whatwg.org/#concept-url-origin)
+  retain canonical FTP/WS/WSS tuple origins as well as HTTP(S); there is no
+  additional HTTP(S)-only allowlist.
+- Retains existing severity, same-site filtering, intentional-allowlist warning,
+  wildcard exclusion, and exact null-origin policy observation. Null plus true
+  remains a Medium policy observation even without a matching request Origin;
+  it is not proof the captured transaction passed CORS.
+
+Three new Rust test functions pair malformed and valid values, duplicate and
+unrelated fields, null/credentialed-cross-site positives, whitespace cases,
+canonical IPv4/IPv6/punycode/trailing-dot/port-zero origins, and standard tuple
+schemes. Their source is reviewed but **has not been compiled or executed**.
+The parent integration gate must run them alongside the existing CORS and full
+project regressions. The native results below cover the two earlier frozen
+patches only, not this CORS follow-up. No real traffic statistics are inferred.
+
+Origin parsing uses the existing `url` dependency, with a fixed number of
+header scans and no new regex compilation or recursive parser. Existing
+capture limits are unchanged. Nonstandard browser-extension origin semantics
+are outside this standards-level parser check; this patch does not emulate
+browser extensions or prove allowlist intent.
 
 ### CSP scope
 
@@ -119,7 +147,7 @@ reviewing whether old false positives disappear; absence of an automatic
 change to old rows does not mean the new predicates failed. No automatic clear,
 rescan, template change, or user-data mutation is introduced here.
 
-## Qualification of the built-in patches
+## Qualification of the first two built-in patches (before CORS)
 
 - Final focused native command: `cargo test --offline --release --lib scanner::tests -- --test-threads=1`.
 - Result: **199 passed, 0 failed**. Includes 16 added tests, each using synthetic
