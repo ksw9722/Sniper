@@ -703,7 +703,16 @@ fn build_client(
     upstream_insecure: bool,
     proxy: &crate::upstream_proxy::UpstreamProxy,
 ) -> Result<ProxyClient> {
-    proxy
+    client_builder(upstream_insecure, proxy)?
+        .build()
+        .context("failed to build upstream HTTP client")
+}
+
+fn client_builder(
+    upstream_insecure: bool,
+    proxy: &crate::upstream_proxy::UpstreamProxy,
+) -> Result<reqwest::ClientBuilder> {
+    Ok(proxy
         .apply(Client::builder())?
         // Enabling native-tls for the legacy retry changes reqwest's default;
         // keep the first attempt on rustls.
@@ -711,9 +720,117 @@ fn build_client(
         .redirect(Policy::none())
         .danger_accept_invalid_certs(upstream_insecure)
         .connect_timeout(REPLAY_CONNECT_TIMEOUT)
-        .http1_only()
+        .http1_only())
+}
+
+/// How long one Template Scan request may take before it counts as failed.
+pub(crate) const TEMPLATE_SCAN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Template Scan's client: one per job, so its connections are reused, with
+/// the session's TLS setting and upstream chain like everything Sniper sends.
+pub(crate) fn build_template_scan_client(
+    upstream_insecure: bool,
+    proxy: &crate::upstream_proxy::UpstreamProxy,
+) -> Result<Client> {
+    client_builder(upstream_insecure, proxy)?
+        .timeout(TEMPLATE_SCAN_REQUEST_TIMEOUT)
         .build()
-        .context("failed to build upstream HTTP client")
+        .context("failed to build the Template Scan client")
+}
+
+/// Why a Template Scan request has no answer to judge.
+#[derive(Debug)]
+pub(crate) enum TemplateScanSendError {
+    /// A Match & Replace rule would have sent it somewhere else.
+    Blocked,
+    /// No response: the reason, never a synthetic 502 a matcher could read.
+    Failed(String),
+}
+
+/// Sends one Template Scan request with the job's client. The record is not
+/// stored here: a scan keeps only the exchanges a template matched.
+pub(crate) async fn send_template_scan_request(
+    state: &Arc<AppState>,
+    session: &Arc<SessionContext>,
+    client: &Client,
+    request: EditableRequest,
+    apply_match_replace: bool,
+) -> std::result::Result<TransactionRecord, TemplateScanSendError> {
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let (request, mut notes, original_request_capture) = if apply_match_replace {
+        let (scheme, host) = (request.scheme.clone(), request.host.clone());
+        let applied =
+            apply_request_match_replace(session.as_ref(), request, state.config.body_preview_bytes)
+                .await;
+        // The operator chose the target: a rule may change what is sent,
+        // never where it goes.
+        let request = &applied.0;
+        let host_header = request
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("host"))
+            .map(|header| header.value.as_str());
+        if !request.scheme.eq_ignore_ascii_case(&scheme)
+            || !request.host.eq_ignore_ascii_case(&host)
+            || host_header.is_some_and(|value| !value.eq_ignore_ascii_case(&host))
+        {
+            return Err(TemplateScanSendError::Blocked);
+        }
+        applied
+    } else {
+        (request, Vec::new(), None)
+    };
+    notes.push(crate::model::TEMPLATE_SCAN_NOTE.to_string());
+    let exchange = execute_http_exchange(
+        state.clone(),
+        session.clone(),
+        client,
+        request,
+        started_at,
+        started,
+        notes,
+        false,
+        original_request_capture,
+        Some(Version::HTTP_11),
+        None,
+        None,
+        SocketPeerCapture::Disabled,
+    )
+    .await;
+    match exchange.response {
+        Ok(_) => Ok(exchange.record),
+        Err(error) => Err(TemplateScanSendError::Failed(error.message)),
+    }
+}
+
+/// Whether `scheme://authority` reaches one of Sniper's own listeners, the
+/// proxy or the UI, by address or by a name that resolves to this machine.
+pub(crate) async fn targets_own_listener(
+    state: &AppState,
+    session: &SessionContext,
+    scheme: &str,
+    authority: &str,
+) -> bool {
+    let Ok(uri) = Uri::builder()
+        .scheme(scheme)
+        .authority(authority)
+        .path_and_query("/")
+        .build()
+    else {
+        return true;
+    };
+    for listener in [
+        state.get_active_proxy_addr().await,
+        state.get_active_ui_addr().await,
+    ] {
+        if request_targets_own_listener(&uri, listener)
+            || name_resolves_to_own_listener(session, &uri, listener).await
+        {
+            return true;
+        }
+    }
+    false
 }
 
 const RENDER_RESOURCE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -3616,7 +3733,7 @@ async fn store_record_and_scan(
 /// The same, for traffic the operator asked for by hand. A replay send is an
 /// explicit action and its result is the answer to it, so pausing capture must
 /// not swallow it.
-async fn store_record_and_scan_unconditionally(
+pub(crate) async fn store_record_and_scan_unconditionally(
     state: &Arc<AppState>,
     session: &Arc<SessionContext>,
     record: TransactionRecord,

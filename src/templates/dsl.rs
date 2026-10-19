@@ -880,6 +880,12 @@ fn random_from(charset: &str, length: usize) -> Result<String, EvalError> {
         .collect())
 }
 
+/// A `{{randstr}}`: lowercase letters and digits, long enough never to
+/// turn up in a response by chance.
+pub(crate) fn random_id() -> String {
+    random_from("abcdefghijklmnopqrstuvwxyz0123456789", 27).unwrap_or_default()
+}
+
 fn without(charset: &str, excluded: &str) -> String {
     charset.chars().filter(|c| !excluded.contains(*c)).collect()
 }

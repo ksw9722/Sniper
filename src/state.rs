@@ -933,6 +933,11 @@ impl AppState {
             let contexts = self.session_contexts.lock().await;
             contexts.get(&id).cloned()
         };
+        // Before the mutation guard: a scan storing a match persists the
+        // session, which takes it.
+        if let Some(session) = cached_session.as_ref() {
+            session.template_scans.stop(None).await;
+        }
         let mutation_guard = match cached_session.as_ref() {
             Some(session) => Some(session.owned_mutation_guard().await),
             None => None,
@@ -992,9 +997,10 @@ impl AppState {
         self.sessions.session_storage_path(id)
     }
 
-    /// Stop every cached session's discovery before shutdown. A switched-away
-    /// session may still own a job, so persisting only the active one loses it.
-    pub async fn stop_recon_jobs(&self) -> Result<()> {
+    /// Stop every cached session's Recon and Template Scan jobs before
+    /// shutdown. A switched-away session may still own a job, so persisting
+    /// only the active one loses it.
+    pub async fn stop_background_jobs(&self) -> Result<()> {
         let mut contexts: Vec<_> = self
             .session_contexts
             .lock()
@@ -1009,8 +1015,12 @@ impl AppState {
         for session in contexts {
             let operation_lock = self.session_operation_lock(session.id()).await;
             let _operation_guard = operation_lock.lock_owned().await;
+            // A scan storing a match persists the session under the mutation
+            // guard, so it stops before the guard is taken.
+            let scanned = session.template_scans.stop(None).await;
             let _guard = session.owned_mutation_guard().await;
-            if session.recon.stop(None).await && self.sessions.contains_session(session.id()) {
+            let reconned = session.recon.stop(None).await;
+            if (scanned || reconned) && self.sessions.contains_session(session.id()) {
                 session.persist_state_only().await?;
             }
         }
@@ -1619,7 +1629,7 @@ impl AppState {
     }
 
     async fn prepare_for_self_update_shutdown(&self) -> Result<()> {
-        self.stop_recon_jobs().await?;
+        self.stop_background_jobs().await?;
         self.ws_replay.disconnect_all().await;
         let relay_result = crate::proxy::close_live_websocket_relays(
             self,

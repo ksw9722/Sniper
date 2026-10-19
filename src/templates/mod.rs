@@ -7,10 +7,12 @@
 //! outside the supported subset is listed as unsupported rather than run in
 //! part.
 
+pub mod active;
 pub mod dsl;
 pub mod engine;
 pub mod library;
 pub mod model;
+pub mod scan;
 pub mod version;
 
 use chrono::Utc;
@@ -22,11 +24,15 @@ use engine::{CompiledTemplate, PassiveSet, ResponseView, TemplateMatch, UrlVars}
 
 /// Bumped whenever classification or compilation changes, so an index built
 /// by an older engine is rebuilt instead of trusted.
-pub const ENGINE_VERSION: u32 = 2;
+pub const ENGINE_VERSION: u32 = 3;
 
 /// Rule ids of findings from passive templates; the rest of the id is the
 /// template id and, for a named matcher, `:<matcher>`.
 pub const PASSIVE_RULE_PREFIX: &str = "nuclei-passive:";
+
+/// Rule ids of findings from Template Scan. A rescan cannot make them again,
+/// since it sends nothing, so it keeps them.
+pub const ACTIVE_RULE_PREFIX: &str = "nuclei:";
 
 /// The category template findings are filed under.
 pub const FINDING_CATEGORY: &str = "nuclei";
@@ -71,6 +77,22 @@ pub fn passive_findings(set: &PassiveSet, record: &TransactionRecord) -> Vec<Sca
         .into_iter()
         .map(|(template, result)| finding(&template, &result, record, PASSIVE_RULE_PREFIX))
         .collect()
+}
+
+/// A Template Scan finding: the record is the exchange the template matched.
+pub fn active_finding(
+    template: &CompiledTemplate,
+    result: &TemplateMatch,
+    record: &TransactionRecord,
+    job: Uuid,
+    library: &str,
+) -> ScannerFinding {
+    let mut finding = finding(template, result, record, ACTIVE_RULE_PREFIX);
+    finding.detail.push_str(&format!(
+        "\nSent by Template Scan job {job}, template library {library}.\nRequest: {} {}://{}{}",
+        record.method, record.scheme, record.host, record.path
+    ));
+    finding
 }
 
 fn severity(text: &str) -> Severity {

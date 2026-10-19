@@ -36,6 +36,7 @@ use serde_json::json;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{
+    active::{self, ActiveTemplate},
     engine::{self, CompiledTemplate, PassiveSet},
     model::{self, PassiveKind},
     ENGINE_VERSION,
@@ -106,6 +107,10 @@ pub struct TemplateMeta {
     pub passive: Option<String>,
     pub passive_supported: bool,
     pub active_supported: bool,
+    /// Requests one Template Scan run sends to a target, redirects aside;
+    /// 0 when it cannot run actively.
+    #[serde(default)]
+    pub requests: usize,
     /// Why it cannot run: the passive reasons for a passive-shaped template,
     /// the active ones otherwise.
     pub reasons: Vec<String>,
@@ -642,6 +647,64 @@ impl TemplateLibrary {
         ListPage { total, items }
     }
 
+    /// The templates a scan would send: those that can run actively among
+    /// `ids`, or among what `filter` selects. The second value counts ids
+    /// that are unknown or cannot run actively.
+    pub fn active_selection(
+        &self,
+        ids: &[String],
+        filter: Option<&ListQuery>,
+    ) -> (Vec<TemplateMeta>, usize) {
+        if let Some(filter) = filter {
+            let query = ListQuery {
+                support: Some("active".into()),
+                enabled: None,
+                limit: Some(MAX_LIST_LIMIT),
+                offset: Some(0),
+                ..filter.clone()
+            };
+            let metas = self.list(&query).items.into_iter().map(|item| item.meta);
+            return (metas.collect(), 0);
+        }
+        let loaded = self.loaded.read().unwrap();
+        let mut seen = HashSet::new();
+        let mut metas = Vec::new();
+        let mut ignored = 0;
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            match loaded
+                .by_id
+                .get(id)
+                .map(|position| &loaded.index[*position])
+            {
+                Some(meta) if meta.active_supported => metas.push(meta.clone()),
+                _ => ignored += 1,
+            }
+        }
+        (metas, ignored)
+    }
+
+    /// One template compiled for sending, read from the installed release. It
+    /// fails when the release changed since `meta` was listed.
+    pub fn compile_active(&self, meta: &TemplateMeta) -> Result<ActiveTemplate> {
+        let text = self.read_text(meta)?;
+        let parsed = model::parse(&text).map_err(|error| anyhow!("{}", error.code))?;
+        let classification = model::classify(&parsed);
+        active::compile_active(&parsed, &classification).map_err(|error| anyhow!("{}", error.0))
+    }
+
+    /// The installed release as a scan records it: tag and archive hash.
+    pub fn release_label(&self) -> Option<String> {
+        let loaded = self.loaded.read().unwrap();
+        loaded
+            .manifest
+            .library
+            .as_ref()
+            .map(|info| format!("{} ({})", info.tag, &info.sha256[..12]))
+    }
+
     /// Every id the query selects, for turning a filtered list on at once.
     pub fn select_ids(&self, query: &ListQuery) -> Vec<String> {
         let unlimited = ListQuery {
@@ -885,6 +948,19 @@ fn index_entries(entries: Vec<(String, String, u64, u64)>) -> BuiltIndex {
                 reasons.push(error.0);
             }
         }
+        let mut active_supported = classification.active_supported();
+        let mut requests = 0;
+        if active_supported {
+            match active::compile_active(&parsed, &classification) {
+                Ok(template) => requests = template.request_count(),
+                Err(error) => {
+                    active_supported = false;
+                    if classification.passive.is_none() {
+                        reasons.push(error.0);
+                    }
+                }
+            }
+        }
         let info = parsed.info;
         templates.push(TemplateMeta {
             id: info.id,
@@ -906,9 +982,8 @@ fn index_entries(entries: Vec<(String, String, u64, u64)>) -> BuiltIndex {
                 .to_string()
             }),
             passive_supported,
-            // Active scans arrive in a later milestone; until then nothing
-            // claims to run actively.
-            active_supported: false,
+            active_supported,
+            requests,
             reasons,
             risks: classification.risks.into_iter().collect(),
         });

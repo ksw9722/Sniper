@@ -504,6 +504,14 @@ fn finding_scope(finding: &ScannerFinding) -> String {
         let path = finding.path.split(['?', '#']).next().unwrap_or("");
         crate::service_map::path_group(path).unwrap_or_else(|| path.to_string())
     };
+    // A scan's evidence can be a random value it sent and saw reflected; the
+    // template and the endpoint it matched are the issue.
+    if finding
+        .rule_id
+        .starts_with(crate::templates::ACTIVE_RULE_PREFIX)
+    {
+        return endpoint();
+    }
     if !finding.rule_id.is_empty() {
         return finding.evidence.clone();
     }

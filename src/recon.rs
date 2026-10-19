@@ -1330,6 +1330,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(state.session().await.recon.snapshot().endpoints.is_empty());
-        state.stop_recon_jobs().await.unwrap();
+        state.stop_background_jobs().await.unwrap();
     }
 }

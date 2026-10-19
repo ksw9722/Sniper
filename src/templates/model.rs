@@ -215,9 +215,6 @@ const LATER_REQUEST_KEYS: &[(&str, &str)] = &[
     ("raw", "req:raw"),
     ("payloads", "req:payloads"),
     ("attack", "req:payloads"),
-    ("redirects", "req:redirects"),
-    ("host-redirects", "req:redirects"),
-    ("max-redirects", "req:redirects"),
     ("cookie-reuse", "req:cookie_reuse"),
     ("req-condition", "req:req_condition"),
     ("iterate-all", "req:req_condition"),
@@ -354,9 +351,11 @@ pub fn classify(template: &ParsedTemplate) -> Classification {
     if !declared.is_empty() {
         out.passive_reasons.insert("variables".into());
     }
+    // Variables are worked out before the request is sent, from the target
+    // and each other; a name that is neither would stay unresolved.
     if let Some(Value::Object(variables)) = root.get("variables") {
         for value in variables.values() {
-            check_template_text(&mut out, &scalar_text(value), &declared, false);
+            check_template_text(&mut out, &scalar_text(value), &declared, true);
         }
     }
 
@@ -423,23 +422,23 @@ fn check_block(out: &mut Classification, block: &Map<String, Value>, declared: &
             if value == &Value::Bool(false) {
                 continue;
             }
-            // Captured traffic already followed whatever redirects the client
-            // did, each hop recorded as its own response, so a passive
-            // template judges every hop instead.
-            if *reason != "req:redirects" {
-                out.passive_reasons.insert((*reason).to_string());
-            }
+            out.passive_reasons.insert((*reason).to_string());
             out.active_reasons.insert((*reason).to_string());
             continue;
         }
         match key {
             "global-matchers" | "matchers-condition" | "stop-at-first-match" => {}
+            // An active scan follows them while they stay in Scope. Captured
+            // traffic already followed whatever redirects the client did, each
+            // hop its own response, so a passive template judges every hop.
+            "redirects" | "host-redirects" | "max-redirects" => {}
             "method" => {
                 let method = scalar_text(value).to_ascii_uppercase();
                 if !method
                     .bytes()
                     .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
                     || method.is_empty()
+                    || method == "CONNECT"
                 {
                     out.active_reasons.insert("req:method".into());
                 } else if matches!(method.as_str(), "PUT" | "DELETE" | "PATCH") {
@@ -841,14 +840,24 @@ mod tests {
     }
 
     #[test]
-    fn redirects_only_block_the_active_run() {
+    fn redirects_run_both_ways() {
         let classified = classify_text(
             "id: example-redirect\ninfo: {}\nhttp:\n  - method: GET\n    path: ['{{BaseURL}}']\n    redirects: true\n    max-redirects: 2\n    matchers:\n      - type: word\n        words: ['{{randstr}}']\n",
         );
         assert_eq!(classified.passive, Some(PassiveKind::BaseUrlGet));
-        assert!(classified.active_reasons.contains("req:redirects"));
+        assert!(
+            classified.active_supported(),
+            "{:?}",
+            classified.active_reasons
+        );
         // The matcher looks for a value the template itself would have sent.
         assert!(classified.passive_reasons.contains("randomness"));
+        let undeclared = classify_text(
+            "id: example-var\ninfo: {}\nvariables:\n  a: '{{payload}}'\nhttp:\n  - method: CONNECT\n    path: ['{{BaseURL}}/{{a}}']\n",
+        );
+        for reason in ["var:payload", "req:method"] {
+            assert!(undeclared.active_reasons.contains(reason), "{reason}");
+        }
     }
 
     #[test]

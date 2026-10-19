@@ -455,8 +455,8 @@ pub struct ServiceMapRow {
     /// Response headers no rule named: (`banner`, `header` or `cookie`, value).
     #[serde(skip)]
     pub unnamed: Vec<(&'static str, String)>,
-    /// Sent from Replay: a request a tester chose, whose answer is read
-    /// whatever its status.
+    /// Sent from Replay, or kept by Template Scan because a template matched
+    /// it: a request someone chose, whose answer is read whatever its status.
     #[serde(skip)]
     pub sent_from_replay: bool,
     /// The address the client connected to the proxy from, when kept.
@@ -864,10 +864,9 @@ pub(crate) fn project_record_for_catalog(
         libraries: Vec::new(),
         client: None,
         unnamed: Vec::new(),
-        sent_from_replay: record
-            .notes
-            .iter()
-            .any(|note| note == crate::model::REPLAY_NOTE),
+        sent_from_replay: record.notes.iter().any(|note| {
+            note == crate::model::REPLAY_NOTE || note == crate::model::TEMPLATE_SCAN_NOTE
+        }),
         client_address: record.client_address,
         initiated: false,
         auth: Vec::new(),

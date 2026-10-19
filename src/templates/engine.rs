@@ -17,6 +17,10 @@ use crate::model::{BodyEncoding, MessageRecord, TransactionRecord};
 /// truncated, and templates whose result missing bytes could flip skip it.
 pub const MAX_PASSIVE_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// The most body an active template reads: what Nuclei reads by default.
+/// One response is judged by one template, so no prefilter needs bounding.
+pub const MAX_ACTIVE_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Part {
     Body,
@@ -76,7 +80,7 @@ struct Extractor {
 }
 
 #[derive(Clone, Debug)]
-struct Operators {
+pub(super) struct Operators {
     and: bool,
     matchers: Vec<Matcher>,
     extractors: Vec<Extractor>,
@@ -87,11 +91,11 @@ struct Operators {
 pub struct CompiledTemplate {
     pub info: TemplateInfo,
     pub passive: Option<PassiveKind>,
-    operators: Operators,
+    pub(super) operators: Operators,
     /// Whether bytes missing from a truncated body could turn a non-match
     /// into a match: a negated body matcher, a size, an expression reading
     /// the body.
-    body_sensitive: bool,
+    pub(super) body_sensitive: bool,
 }
 
 /// One result of a template on one response.
@@ -104,7 +108,7 @@ pub struct TemplateMatch {
     pub snippets: Vec<String>,
 }
 
-fn reason(code: impl Into<String>) -> CompileError {
+pub(super) fn reason(code: impl Into<String>) -> CompileError {
     CompileError(code.into())
 }
 
@@ -138,7 +142,7 @@ pub fn compile_passive(
     })
 }
 
-fn compile_operators(
+pub(super) fn compile_operators(
     block: &Map<String, Value>,
     allow: Allow,
     request_part: bool,
@@ -186,7 +190,7 @@ fn condition(value: Option<&Value>) -> Result<bool, CompileError> {
     }
 }
 
-fn text_of(value: &Value) -> String {
+pub(super) fn text_of(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Number(number) => number.to_string(),
@@ -195,7 +199,7 @@ fn text_of(value: &Value) -> String {
     }
 }
 
-fn flag(map: &Map<String, Value>, key: &str) -> Result<bool, CompileError> {
+pub(super) fn flag(map: &Map<String, Value>, key: &str) -> Result<bool, CompileError> {
     match map.get(key) {
         None | Some(Value::Null) => Ok(false),
         Some(Value::Bool(flag)) => Ok(*flag),
@@ -204,7 +208,7 @@ fn flag(map: &Map<String, Value>, key: &str) -> Result<bool, CompileError> {
 }
 
 /// A list of strings; a lone scalar counts as a list of one.
-fn strings(map: &Map<String, Value>, key: &str) -> Result<Vec<String>, CompileError> {
+pub(super) fn strings(map: &Map<String, Value>, key: &str) -> Result<Vec<String>, CompileError> {
     let items = match map.get(key) {
         Some(Value::Array(items)) => items.iter().map(text_of).collect(),
         Some(scalar @ (Value::String(_) | Value::Number(_))) => vec![text_of(scalar)],
@@ -375,7 +379,7 @@ fn compile_extractor(
     })
 }
 
-fn body_sensitive(operators: &Operators) -> bool {
+pub(super) fn body_sensitive(operators: &Operators) -> bool {
     let reads_body = |part: &Part| matches!(part, Part::Body | Part::All);
     operators.matchers.iter().any(|matcher| {
         (matcher.negative && reads_body(&matcher.part))
@@ -414,19 +418,33 @@ impl UrlVars {
     /// request Sniper can name.
     pub fn of_record(record: &TransactionRecord) -> Option<Self> {
         let (base, _) = crate::service_map::request_target(record)?;
+        Self::of_url(&base, &record.path)
+    }
+
+    /// The values for `path_and_query` on `base`'s origin, as Nuclei names
+    /// them: `Hostname` carries a port only when the URL spells one out, and
+    /// `Host` is the bare name.
+    pub fn of_url(base: &url::Url, path_and_query: &str) -> Option<Self> {
         let scheme = base.scheme().to_string();
-        let host = base.host_str()?.to_string();
+        let name = base.host_str()?;
         let port = base.port_or_known_default()?.to_string();
-        let root_url = base.as_str().trim_end_matches('/').to_string();
-        let path_and_query = record.path.split('#').next().unwrap_or("");
+        let hostname = match base.port() {
+            Some(port) => format!("{name}:{port}"),
+            None => name.to_string(),
+        };
+        let root_url = format!("{scheme}://{hostname}");
+        let path_and_query = path_and_query.split('#').next().unwrap_or("");
         let path = path_and_query.split('?').next().unwrap_or("");
         let directory = path.rsplit_once('/').map_or("", |(dir, _)| dir);
         let file = path.rsplit('/').next().unwrap_or("");
         Some(Self {
             base_url: format!("{root_url}{path_and_query}"),
             root_url,
-            hostname: format!("{host}:{port}"),
-            host,
+            hostname,
+            host: name
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string(),
             port,
             path: directory.to_string(),
             file: file.to_string(),
@@ -434,7 +452,7 @@ impl UrlVars {
         })
     }
 
-    fn get(&self, name: &str) -> Option<&str> {
+    pub(super) fn get(&self, name: &str) -> Option<&str> {
         Some(match name {
             "BaseURL" => &self.base_url,
             "RootURL" => &self.root_url,
@@ -465,6 +483,9 @@ pub struct ResponseView {
     duration: f64,
     truncated: bool,
     request_text: Option<String>,
+    /// Values the request was built with: an active template's variables and
+    /// random strings, so a matcher can look for what was sent.
+    request_vars: HashMap<String, String>,
     url: UrlVars,
 }
 
@@ -571,8 +592,16 @@ impl ResponseView {
             duration: duration_ms as f64 / 1000.0,
             truncated,
             request_text: None,
+            request_vars: HashMap::new(),
             url,
         }
+    }
+
+    /// The request this response answers, for an active template's matchers.
+    pub(super) fn with_request(mut self, text: String, values: HashMap<String, String>) -> Self {
+        self.request_text = Some(text);
+        self.request_vars = values;
+        self
     }
 
     fn part_text(&self, part: &Part) -> Option<Cow<'_, str>> {
@@ -608,6 +637,9 @@ impl ResponseView {
             "request" => text(self.request_text.as_deref()?),
             _ => {
                 if let Some(value) = self.url.get(name) {
+                    return text(value);
+                }
+                if let Some(value) = self.request_vars.get(name) {
                     return text(value);
                 }
                 self.header_vars

@@ -218,7 +218,7 @@ async fn shutdown_headless_runtime(
     state: &AppState,
     oast_task: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
-    state.stop_recon_jobs().await?;
+    state.stop_background_jobs().await?;
     oast_task.abort();
     if let Err(error) = oast_task.await {
         if !error.is_cancelled() {

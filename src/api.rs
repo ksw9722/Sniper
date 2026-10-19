@@ -388,6 +388,15 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             post(crate::templates::library::set_passive),
         )
         .route("/api/templates", get(crate::templates::library::list))
+        .route(
+            "/api/templates/scans",
+            get(crate::templates::scan::list).post(crate::templates::scan::start),
+        )
+        .route("/api/templates/scans/:id", get(crate::templates::scan::get))
+        .route(
+            "/api/templates/scans/:id/stop",
+            post(crate::templates::scan::stop),
+        )
         .route("/api/templates/:id", get(crate::templates::library::get))
         .route("/service-map.js", get(service_map_js))
         .route("/product-icons.js", get(product_icons_js))
@@ -4823,10 +4832,16 @@ async fn rescan_findings(
         .scanner
         .snapshot(Some(state.config.max_entries))
         .await;
-    // Rows captured during the rescan were scanned as they arrived.
+    // Rows captured during the rescan were scanned as they arrived, and a
+    // Template Scan's findings came from requests a rescan does not send.
     let mut findings: Vec<_> = previous
         .iter()
-        .filter(|finding| finding.found_at >= started_at && !scanned.contains(&finding.record_id))
+        .filter(|finding| {
+            (finding.found_at >= started_at && !scanned.contains(&finding.record_id))
+                || finding
+                    .rule_id
+                    .starts_with(crate::templates::ACTIVE_RULE_PREFIX)
+        })
         .cloned()
         .collect();
     findings.extend(rescanned);
@@ -18887,11 +18902,40 @@ mod tests {
                 .filter(|finding| finding.rule_id == "nuclei-passive:example-detect")
                 .count()
         };
+        // A Template Scan finding: one per endpoint, whatever value it saw
+        // reflected, and a rescan, which sends nothing, keeps it.
+        for evidence in ["first-random", "second-random"] {
+            session
+                .scanner
+                .push(crate::scanner::ScannerFinding {
+                    id: Uuid::new_v4(),
+                    record_id: Uuid::new_v4(),
+                    found_at: Utc::now() - chrono::Duration::hours(1),
+                    rule_id: "nuclei:example-active".into(),
+                    severity: crate::scanner::Severity::High,
+                    category: "nuclei".into(),
+                    title: "Example Active".into(),
+                    detail: String::new(),
+                    evidence: evidence.into(),
+                    host: "app.example.com".into(),
+                    path: "/echo?q=1".into(),
+                    location: None,
+                })
+                .await;
+        }
+        let active_findings = |findings: Vec<crate::scanner::FindingSummary>| {
+            findings
+                .into_iter()
+                .filter(|finding| finding.rule_id == "nuclei:example-active")
+                .count()
+        };
+        assert_eq!(active_findings(session.scanner.list(None).await), 1);
 
         // No scope set: a template nobody pointed anywhere judges nothing.
         let response = super::rescan_findings(State(state.clone()), query()).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(template_findings(session.scanner.list(None).await), 0);
+        assert_eq!(active_findings(session.scanner.list(None).await), 1);
 
         session
             .runtime
