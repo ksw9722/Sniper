@@ -6562,6 +6562,11 @@ function clearWebsocketSearchReload() {
 
 function clearWebsocketSelectionPreview(options = {}) {
   state._websocketSelectionGeneration = (state._websocketSelectionGeneration || 0) + 1;
+  // Returning to the same row after a filter reset starts a new detail owner.
+  _websocketDetailGeneration += 1;
+  _websocketDetailPendingId = null;
+  _websocketDetailPendingSessionId = null;
+  _websocketDetailPendingPromise = null;
   state.selectedWebsocketId = null;
   state.selectedFrameIdx = null;
   state.selectedWebsocketRecord = null;
@@ -6929,6 +6934,10 @@ async function loadWebsocketDetail(id, options = {}) {
     _websocketDetailRefreshNeeded = null;
   }
   const generation = ++_websocketDetailGeneration;
+  if (state.selectedWebsocketId === id && state.selectedWebsocketDetailError) {
+    state.selectedWebsocketDetailError = "";
+    renderWebsocketSessions();
+  }
   if (state.selectedWebsocketId !== id) {
     hideFrameDetail();
   }
@@ -6979,6 +6988,9 @@ async function loadWebsocketDetail(id, options = {}) {
     const detail = await response.json();
     if (generation !== _websocketDetailGeneration || sessionId !== currentSessionId() || state.selectedWebsocketId !== id) {
       return;
+    }
+    if (!detail || typeof detail !== "object" || Array.isArray(detail) || detail.id !== id) {
+      throw new Error("Invalid WebSocket detail response.");
     }
     const summary = state.websocketSessions.find((item) => item.id === id);
     const previousFrames = state.selectedWebsocketRecord?.id === id
@@ -13054,6 +13066,7 @@ function renderWebsocketSessions(options = {}) {
   renderWebsocketSessionTable(sortedEntries);
 
   if (!state.selectedWebsocketRecord) {
+    hideFrameDetail();
     const detailLoading = Boolean(state.selectedWebsocketId);
     if (!detailLoading) {
       cancelWebsocketDetailLoading();

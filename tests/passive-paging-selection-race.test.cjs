@@ -241,6 +241,8 @@ function websocketFixture({ count = 3, pageSize = 3, cap = 10 } = {}) {
     state, URLSearchParams, session: 'session-a', console: quietConsole,
     WEBSOCKET_PAGE_SIZE: pageSize, WEBSOCKET_MAX_LOADED_SESSIONS: cap,
     _websocketLoadGeneration: 0, _websocketSummaryMutationGeneration: 0, _websocketSummaryMutationById: new Map(),
+    _websocketDetailGeneration: 0, _websocketDetailPendingId: null,
+    _websocketDetailPendingSessionId: null, _websocketDetailPendingPromise: null,
     _websocketDetailRefreshNeeded: null, sessionQueryPath: url => url,
     async requireOkResponse(value) { if (!value.ok) throw new Error(await value.text()); },
     fetch(url) {
