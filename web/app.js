@@ -12027,7 +12027,8 @@ function isEditableTarget(target) {
     return true;
   }
 
-  const editableParent = target.closest("input, textarea, select, [contenteditable='true']");
+  // Passive previews own native copy and scrolling while keeping traffic read-only.
+  const editableParent = target.closest("input, textarea, select, [contenteditable='true'], .encoded-preview-tooltip");
   if (editableParent) {
     return true;
   }
@@ -29515,7 +29516,7 @@ class EncodedPreviewController {
     this.onLeave = event => { if (!view.dom.contains(event.relatedTarget)) this.scheduleHide(); };
     this.onFocusOut = event => { if (!view.dom.contains(event.relatedTarget)) this.hide(); };
     this.onDismiss = event => {
-      if (event.type === "keydown" && event.key !== "Escape") return;
+      if (event.type === "keydown" && (event.key !== "Escape" || event.isComposing)) return;
       if (this.tooltip?.contains(event.target) && event.type !== "keydown") {
         // Native text selection must not blur a non-focusable popup to body and
         // dismiss it before the drag begins. Do not prevent the pointer event.

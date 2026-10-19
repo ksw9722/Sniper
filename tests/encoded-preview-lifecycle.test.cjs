@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const vm = require("node:vm");
 const { appSource } = require("./frontend-test-helpers.cjs");
-const { fixture, CM } = require("./encoded-preview-fixture.cjs");
+const { fixture, CM, Node } = require("./encoded-preview-fixture.cjs");
 const text = node => [node.textContent, ...node.children.map(text)].join("\n");
 const visible = f => f.controller.tooltip;
 const listenerCount = node => [...node.listeners.values()].reduce((total, list) => total + list.length, 0);
@@ -227,5 +227,53 @@ test("pointer-selected preview still dismisses immediately on an outside click o
   f.view.dispatch({ selection: { anchor: 1 } }); open(f);
   f.document.fire("pointerdown", { target: visible(f) });
   f.view.dispatch({ changes: { from: 0, to: f.view.state.doc.length, insert: "new%20record" } });
+  assert.equal(visible(f), null);
+});
+
+
+test("focused preview native copy and scroll bypass the actual app-wide read-selection handlers", () => {
+  const f = fixture("hello%20world", { anchor: 0, head: 13 });
+  f.context.HTMLElement = Node;
+  vm.runInContext(f.source("isEditableTarget"), f.context);
+  const copyKey = appSource.indexOf('event.key.toLowerCase() === "c" &&\n      !isEditableTarget(event.target)');
+  const copyStart = appSource.lastIndexOf("    if (", copyKey);
+  const copyEnd = appSource.indexOf("\n\n    if (", copyStart);
+  const navStart = appSource.indexOf('    if (\n      !event.defaultPrevented &&\n      !event.metaKey &&\n      !event.ctrlKey &&\n      !event.altKey &&\n      !event.shiftKey &&\n      state.activeTool === "proxy"', copyEnd);
+  const navEnd = appSource.indexOf("\n\n    // Arrow keys in Dashboard", navStart);
+  assert.ok(copyKey > 0 && copyStart > 0 && copyEnd > copyStart && navStart > copyEnd && navEnd > navStart);
+  const actions = [];
+  Object.assign(f.context, {
+    state: { activeTool: "proxy", activeProxyTab: "http-history" },
+    getSelectedCodePaneText() { actions.push("read source selection"); return "encoded source selection"; },
+    copyTextToClipboard(value) { actions.push(value); return Promise.resolve(); },
+    moveHistorySelection(delta) { actions.push(delta); return Promise.resolve(); },
+  });
+  vm.runInContext(`globalThis.appReadKeys = event => {${appSource.slice(copyStart, copyEnd)}${appSource.slice(navStart, navEnd)}};`, f.context);
+  f.document.addEventListener("keydown", f.context.appReadKeys);
+  f.controller.button.fire("click");
+  const tooltip = visible(f), original = f.view.state;
+  f.document.fire("pointerdown", { target: tooltip.children[2] });
+  for (const target of [tooltip, tooltip.children[2]]) {
+    for (const key of ["ArrowDown", "ArrowUp", "c"]) {
+      const event = f.document.fire("keydown", { target, key, ctrlKey: key === "c" });
+      assert.equal(event.defaultPrevented, false, "Keep native preview scroll/copy");
+      assert.equal(f.view.state, original);
+      assert.equal(visible(f), tooltip);
+    }
+  }
+  assert.deepEqual(actions, [], "No History navigation or source-selection clipboard override");
+  const outside = f.document.createElement("div");
+  assert.equal(f.document.fire("keydown", { target: outside, key: "ArrowDown" }).defaultPrevented, true);
+  assert.equal(f.document.fire("keydown", { target: outside, key: "c", ctrlKey: true }).defaultPrevented, true);
+  assert.deepEqual(actions, [1, "read source selection", "encoded source selection"]);
+});
+
+
+test("composing Escape remains available to the IME before ordinary preview dismissal", () => {
+  const f = fixture(); open(f); const tooltip = visible(f);
+  const composing = f.document.fire("keydown", { target: f.contentDOM, key: "Escape", isComposing: true });
+  assert.equal(composing.defaultPrevented, false); assert.equal(composing.propagationStopped, false);
+  assert.equal(visible(f), tooltip);
+  f.document.fire("keydown", { target: f.contentDOM, key: "Escape", isComposing: false });
   assert.equal(visible(f), null);
 });

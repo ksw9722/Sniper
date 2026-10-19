@@ -24,6 +24,12 @@ class Node {
   appendChild(node) { node.parent = this; node.ownerDocument = this.ownerDocument; this.children.push(node); return node; }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
   contains(node) { return node === this || this.children.some(child => child.contains(node)); }
+  closest(selector) {
+    for (let node = this; node; node = node.parent) {
+      if (selector.includes(".encoded-preview-tooltip") && node.className === "encoded-preview-tooltip") return node;
+    }
+    return null;
+  }
   setAttribute(key, value) { this.attributes.set(key, value); }
   getAttribute(key) { return this.attributes.get(key) ?? null; }
   removeAttribute(key) { this.attributes.delete(key); }
