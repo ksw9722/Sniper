@@ -1195,7 +1195,10 @@ function resetLayoutTextareas() {
 
 function setActiveTool(tool, options = {}) {
   const next = sanitizeActiveTool(tool);
-  if (next !== state.activeTool) closeScannerSettings(false);
+  if (next !== state.activeTool) {
+    closeScannerSettings(false);
+    state._fuzzerImportGeneration = (state._fuzzerImportGeneration || 0) + 1;
+  }
   state.activeTool = next;
   if (options.persist !== false) {
     scheduleUiSettingsSave(options.delay);
@@ -1205,7 +1208,10 @@ function setActiveTool(tool, options = {}) {
 
 function setActiveProxyTab(tab, options = {}) {
   const next = sanitizeActiveProxyTab(tab);
-  if (next !== state.activeProxyTab) closeScannerSettings(false);
+  if (next !== state.activeProxyTab) {
+    closeScannerSettings(false);
+    state._fuzzerImportGeneration = (state._fuzzerImportGeneration || 0) + 1;
+  }
   state.activeProxyTab = next;
   if (options.persist !== false) {
     scheduleUiSettingsSave(options.delay);
@@ -1967,11 +1973,7 @@ function bindEvents() {
           })
           .catch(handleSendActionError);
       } else if (action === "send-to-fuzzer") {
-        loadMenuTargetRecord(target)
-          .then((record) => {
-            if (!record) throw new Error("Selected transaction could not be loaded.");
-            openFuzzerFromRecord(record);
-          })
+        openFuzzerFromRecordLoader(() => loadMenuTargetRecord(target))
           .catch(handleSendActionError);
       } else if (action === "send-to-sequence") {
         loadMenuTargetRecord(target)
@@ -10496,29 +10498,11 @@ function isWebSocketUpgradeRecord(record) {
 
 async function sendFindingToFuzzer(recordId) {
   const sessionId = currentSessionId();
-  const response = await fetch(transactionPath(recordId, sessionId));
-  if (currentSessionId() !== sessionId) return;
-  await requireOkResponse(response, "Failed to load finding transaction.");
-  const record = await response.json();
-  if (currentSessionId() !== sessionId) return;
-  if (!record || record.kind === "tunnel") {
-    throw new Error("Tunnel records cannot be sent to Fuzzer.");
-  }
-  const request = editableRequestFromRecord(record);
-  invalidateFuzzerRun();
-  state.fuzzerBaseRequest = request;
-  state.fuzzerSourceTransactionId = record.id;
-  state.fuzzerTarget = null;
-  state.fuzzerTargetRequestText = null;
-  updateFuzzerRequestText(buildEditableRawRequest(request), { userEdit: true });
-  state.fuzzerNotice = isRequestPreviewTruncated(record) ? buildTruncatedBodyNotice(record, "Fuzzer") : "";
-  updateFuzzerPayloadsText("", { userEdit: true });
-  clearFuzzerAttackRecord();
-  state._selectedFuzzerResultKey = null;
-  hideFuzzerDetailPanel();
-  setActiveTool("fuzzer");
-  scheduleWorkspaceStateSave();
-  renderToolPanels();
+  return openFuzzerFromRecordLoader(async () => {
+    const response = await fetch(transactionPath(recordId, sessionId));
+    await requireOkResponse(response, "Failed to load finding transaction.");
+    return response.json();
+  });
 }
 
 function handleFindingActionError(error) {
@@ -16389,6 +16373,12 @@ async function openFuzzerFromReplay() {
   if (!tab || tab.type === "websocket") {
     throw new Error("Select an HTTP Replay tab before sending to Fuzzer.");
   }
+  const validation = validateManualRepeaterTargetInput(
+    els.replayHostInput?.value ?? tab.targetHost,
+    els.replayPortInput?.value ?? tab.targetPort,
+  );
+  setReplayTargetInputValidity(validation);
+  if (!validation.valid) throw new Error(validation.hostError || validation.portError);
   const request = parseEditableRawRequest(tab.requestText, tab.baseRequest);
   const target = getRepeaterTargetConfig(tab, request);
   invalidateFuzzerRun();
@@ -16407,13 +16397,39 @@ async function openFuzzerFromReplay() {
   renderToolPanels();
 }
 
-async function openFuzzerFromSelection() {
-  const record = await loadSelectedTransactionRecord();
-
-  if (!record) {
-    throw new Error("Selected transaction could not be loaded.");
+async function openFuzzerFromRecordLoader(loadRecord, sourceIsCurrent = () => true) {
+  if (state.fuzzerRunning) throw new Error("Wait for the current Fuzzer run to finish before replacing its request.");
+  const generation = state._fuzzerImportGeneration = (state._fuzzerImportGeneration || 0) + 1;
+  const sessionId = currentSessionId();
+  const workspaceGeneration = workspaceStateGeneration;
+  const draftVersion = state.fuzzerDraftVersion || 0;
+  const runToken = state.fuzzerRunToken || 0;
+  const ownsImport = () => generation === state._fuzzerImportGeneration
+    && sessionId === currentSessionId() && workspaceGeneration === workspaceStateGeneration
+    && draftVersion === (state.fuzzerDraftVersion || 0) && runToken === (state.fuzzerRunToken || 0)
+    && !state.fuzzerRunning && sourceIsCurrent();
+  let record;
+  try {
+    record = await loadRecord();
+  } catch (error) {
+    if (!ownsImport()) return false;
+    throw error;
   }
+  if (!ownsImport()) return false;
+  if (!record) throw new Error("Selected transaction could not be loaded.");
   openFuzzerFromRecord(record);
+  return true;
+}
+
+async function openFuzzerFromSelection() {
+  const id = state.selectedId;
+  const sessionId = currentSessionId();
+  const selectionGeneration = state._historySelectionGeneration || 0;
+  const record = state.selectedRecord?.id === id ? state.selectedRecord : null;
+  return openFuzzerFromRecordLoader(
+    () => record || loadTransactionRecordById(id, sessionId),
+    () => state.selectedId === id && selectionGeneration === (state._historySelectionGeneration || 0),
+  );
 }
 
 function openFuzzerFromRecord(record) {
@@ -28098,11 +28114,7 @@ els.contextMenu.querySelectorAll(".context-menu-item").forEach((item) => {
         })
         .catch(handleSendActionError);
     } else if (action === "send-to-fuzzer") {
-      loadTargetRecord()
-        .then((record) => {
-          if (!record) throw new Error("Selected transaction could not be loaded.");
-          openFuzzerFromRecord(record);
-        })
+      openFuzzerFromRecordLoader(loadTargetRecord)
         .catch(handleSendActionError);
     } else if (action === "send-to-sequence") {
       loadTargetRecord()
