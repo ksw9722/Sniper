@@ -1165,6 +1165,16 @@ pub fn go_regex(pattern: &str) -> Result<Regex, CompileError> {
         .map_err(|_| CompileError::new("regex:invalid"))
 }
 
+/// Why a pattern does not compile, for the census.
+#[cfg(test)]
+pub fn regex_error(pattern: &str) -> Option<String> {
+    regex::RegexBuilder::new(&go_pattern(pattern))
+        .size_limit(2 * 1024 * 1024)
+        .build()
+        .err()
+        .map(|error| format!("{error}\n  as Rust: {}", go_pattern(pattern)))
+}
+
 fn go_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() + 16);
     let mut chars = pattern.chars().peekable();
@@ -1205,6 +1215,12 @@ fn go_pattern(pattern: &str) -> String {
             continue;
         }
         if !in_class {
+            // Go reads a `{` that does not start `{n}`, `{n,}` or `{n,m}` as a
+            // plain character (`{,60}`, `{if`); Rust refuses the pattern.
+            if c == '{' && !starts_repetition(chars.clone()) {
+                out.push_str(r"\{");
+                continue;
+            }
             out.push(c);
             if c == '[' {
                 in_class = true;
@@ -1246,6 +1262,29 @@ fn go_pattern(pattern: &str) -> String {
         class_start = false;
     }
     out
+}
+
+/// Whether the text after a `{` is a Go repetition: digits, then `}`, `,}`
+/// or `,` digits `}`.
+fn starts_repetition(mut rest: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut digits = 0;
+    while rest.peek().is_some_and(char::is_ascii_digit) {
+        rest.next();
+        digits += 1;
+    }
+    if digits == 0 {
+        return false;
+    }
+    match rest.next() {
+        Some('}') => true,
+        Some(',') => {
+            while rest.peek().is_some_and(char::is_ascii_digit) {
+                rest.next();
+            }
+            rest.next() == Some('}')
+        }
+        _ => false,
+    }
 }
 
 // ---- Interpolated text ----
@@ -1536,6 +1575,14 @@ mod tests {
             .unwrap()
             .is_match("x-owa-version: 1"));
         assert_eq!(go_regex(r"\Qa.b\E").unwrap_err().0, "regex:invalid");
+        // Not repetitions in Go: plain braces.
+        let literal = go_regex(r"[a-z]{,60}.cloudfront.net").unwrap();
+        assert!(literal.is_match("x{,60}.cloudfront.net"));
+        assert!(!literal.is_match("abc.cloudfront.net"));
+        assert!(go_regex(r"function\(e\) *{if")
+            .unwrap()
+            .is_match("function(e) {if"));
+        assert!(go_regex(r"a{2}b{1,}c{1,3}").unwrap().is_match("aabbc"));
     }
 
     #[test]

@@ -1049,6 +1049,54 @@ mod tests {
             }
         }
         println!("risk tags {risks:?}");
+        // SNIPER_CENSUS_REGEX=<id> explains each pattern of one template Rust rejects.
+        if let Ok(wanted) = std::env::var("SNIPER_CENSUS_REGEX") {
+            let file = std::fs::File::open(&path).unwrap();
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let mut text = String::new();
+                if entry.read_to_string(&mut text).is_err() {
+                    continue;
+                }
+                let Ok(parsed) = parse(&text) else { continue };
+                if parsed.info.id != wanted {
+                    continue;
+                }
+                let blocks = parsed
+                    .root
+                    .get("http")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for block in blocks {
+                    let items = block
+                        .get("matchers")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .chain(
+                            block
+                                .get("extractors")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten(),
+                        );
+                    for item in items {
+                        for pattern in item
+                            .get("regex")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(error) = dsl::regex_error(&scalar_text(pattern)) {
+                                println!("  {wanted}: {}\n  {error}", scalar_text(pattern));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // SNIPER_CENSUS_SHOW=<reason> lists templates blocked by one reason.
         if let Ok(show) = std::env::var("SNIPER_CENSUS_SHOW") {
             for (path, c, _) in http
