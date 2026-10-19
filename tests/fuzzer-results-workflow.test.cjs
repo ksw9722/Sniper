@@ -50,7 +50,7 @@ function fixture() {
     'clearFuzzerResponsePane', 'invalidateFuzzerRun', 'resetFuzzer', 'updateFuzzerRequestText', 'updateFuzzerPayloadsText', 'markFuzzerDraftChanged',
     'requireOkResponse', 'readApiErrorMessage', 'cloneEditableRequest', 'buildEditableRawRequest', 'normalizedHeaders', 'mergeHeaders', 'headerNameEquals',
     'setCompareBase', 'openCompareModal', 'splitFuzzerPayloadLines',
-  ], { state, els, document: { getElementById: id => els[id], activeElement: null },
+  ], { state, els, TextEncoder, document: { getElementById: id => els[id], activeElement: null },
     _fuzzerAttackLoadGeneration: 0, _fuzzerDetailGeneration: 0,
     compareBaseId: null, compareBaseSessionId: null, compareLoadGeneration: 0,
     compareBaseRecord: null, compareTargetRecord: null, compareActiveTab: 'request', compareReturnFocus: null,
@@ -242,4 +242,15 @@ test('Reuse cannot silently split a retained multiline payload into extra reques
   f.requests.at(-1).resolve(response(run('run-b', [{ payload: 'one\ntwo' }]))); await read;
   assert.equal(f.confirmations.length, 0); assert.equal(draft(f.state), before);
   assert.match(f.els.fuzzerSavedRunNotice.textContent, /line break/);
+});
+
+for (const boundary of ['request-bytes', 'payload-text-bytes', 'payload-count']) test(`Reuse refuses unsupported editor ${boundary} without altering the draft`, async () => {
+  const f = fixture(), before = draft(f.state), saved = run('run-b');
+  if (boundary === 'request-bytes') saved.template.body = 'a'.repeat(2 * 1024 * 1024);
+  else if (boundary === 'payload-text-bytes') saved.results = Array.from({ length: 64 }, () => ({ payload: 'a'.repeat(65536) }));
+  else saved.results = Array.from({ length: 5001 }, () => ({ payload: '' }));
+  f.pick('run-b'); const read = f.reuse(); f.requests.at(-1).resolve(response(saved)); await read;
+  assert.equal(f.confirmations.length, 0);
+  assert.equal(draft(f.state), before);
+  assert.match(f.els.fuzzerSavedRunNotice.textContent, /editor limits/);
 });

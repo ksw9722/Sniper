@@ -361,6 +361,7 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
         .route("/decoder/", get(decoder_index))
         .route("/decoder/*path", get(decoder_asset))
         .route("/app.js", get(app_js))
+        .route("/fuzzer-workflow.js", get(fuzzer_workflow_js))
         .route("/recon.js", get(recon_js))
         .route("/templates.js", get(templates_js))
         .route("/api/recon", get(crate::recon::list))
@@ -8894,6 +8895,13 @@ async fn app_js() -> Response {
     asset_response(
         "application/javascript; charset=utf-8",
         include_str!("../web/app.js"),
+    )
+}
+
+async fn fuzzer_workflow_js() -> Response {
+    asset_response(
+        "application/javascript; charset=utf-8",
+        include_str!("../web/fuzzer-workflow.js"),
     )
 }
 

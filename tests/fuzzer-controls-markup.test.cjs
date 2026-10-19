@@ -62,7 +62,7 @@ test('preflight exposes replace-all and sequential semantics without fake run pr
   assert.match(fuzzer, /Requests run sequentially; the server returns results when the run finishes/);
   for (const id of ['fuzzerPreflightSummary', 'fuzzerPreflightNotice']) assert.equal(byId(id).attrs.role, 'status');
   assert.equal(byId('fuzzerPreviewSamples').tag, 'div');
-  assert.match(fuzzer, /<details[^>]*fuzzer-preview-disclosure[^>]*>\s*<summary>Preview generated requests<\/summary>\s*<div id="fuzzerPreviewSamples"/);
+  assert.match(fuzzer, /<details[^>]*fuzzer-preview-disclosure[^>]*>\s*<summary>Preview template-expanded requests<\/summary>[\s\S]*?<div id="fuzzerPreviewSamples"/);
   assert.doesNotMatch(fuzzer, /<progress\b|fuzzerStop|>Stop<|live progress/i);
 });
 
@@ -90,4 +90,10 @@ test('helpers load before app and disclosures keep bounded responsive controls',
   assert.match(css, /\.fuzzer-top-row \.editor-panel\s*\{[^}]*min-height: 80px;/s);
   assert.match(css, /@media \(max-width: 620px\)\s*\{[\s\S]*\.fuzzer-filter-grid/);
   assert.match(css, /\.fuzzer-disclosure > summary:focus-visible/);
+});
+
+test('helper script has an embedded API route and is loaded before app initialization', () => {
+  const api = fs.readFileSync(path.join(__dirname, '../src/api.rs'), 'utf8');
+  assert.match(api, /\.route\("\/fuzzer-workflow\.js", get\(fuzzer_workflow_js\)\)/);
+  assert.match(api, /include_str!\("\.\.\/web\/fuzzer-workflow\.js"\)/);
 });

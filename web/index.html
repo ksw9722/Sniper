@@ -1207,7 +1207,8 @@
               <div id="fuzzerPreflightSummary" class="fuzzer-preflight-summary" role="status" aria-live="polite">Choose a captured request and add payloads to review the target and exact request count.</div>
               <p id="fuzzerPreflightNotice" class="fuzzer-help" role="status" aria-live="polite"></p>
               <details class="fuzzer-disclosure fuzzer-preview-disclosure">
-                <summary>Preview generated requests</summary>
+                <summary>Preview template-expanded requests</summary>
+                <p class="fuzzer-help">Limits: 128 markers; 4 MiB expanded-request budget per payload. Editor request text: 2 MiB.</p>
                 <div id="fuzzerPreviewSamples" class="fuzzer-disclosure-body fuzzer-preview-samples">Request samples will appear here before you start.</div>
               </details>
             </section>
@@ -1249,6 +1250,7 @@
                 <details class="fuzzer-disclosure fuzzer-control-disclosure">
                   <summary>Import, preset or number range</summary>
                   <div class="fuzzer-disclosure-body">
+                    <p class="fuzzer-help">Limits: 5,000 payloads; 64 KiB each; 4 MiB total payload bytes. Editor text and files: 4 MiB, including line separators. Import uses UTF-8; a BOM is kept literally. CRLF and CR are treated as line breaks, just like pasted text.</p>
                     <div class="fuzzer-control-row">
                       <label class="compact-field fuzzer-field-grow" for="fuzzerPayloadImportMode">
                         <span>Add payloads</span>

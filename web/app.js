@@ -15491,6 +15491,13 @@ async function readFuzzerSavedRun(action) {
       if (record.results.some((result) => /[\r\n]/.test(String(result.payload ?? "")))) {
         throw new Error("A saved payload contains a line break and cannot be restored into the one-payload-per-line editor.");
       }
+      const requestText = buildEditableRawRequest(record.template);
+      const payloads = record.results.map((result) => String(result.payload ?? ""));
+      const payloadsText = payloads.join("\n") + (payloads.at(-1) === "" ? "\n" : "");
+      if (new TextEncoder().encode(requestText).length > 2 * 1024 * 1024
+        || new TextEncoder().encode(payloadsText).length > 4 * 1024 * 1024 || payloads.length > 5000) {
+        throw new Error("This retained run exceeds the request or payload editor limits. The current draft was not replaced.");
+      }
       workflow.notice = "Reuse requires confirmation. Original source and transport overrides are not retained.";
       showConfirmDialog(
         "Replace the current request and payload draft with this retained run?\n\nThe request is reconstructed from its saved template; original raw formatting, source transaction and target override are unavailable. Any current source and target override will be cleared. A saved template HTTP version is kept when present; otherwise the draft uses HTTP/1.1. The original separate HTTP-version override cannot be recovered. Review the destination and HTTP version before starting. Reuse does not send requests.",
@@ -15501,9 +15508,8 @@ async function readFuzzerSavedRun(action) {
           invalidateFuzzerRun();
           state.fuzzerDraftVersion = (state.fuzzerDraftVersion || 0) + 1;
           state.fuzzerBaseRequest = template;
-          state.fuzzerRequestText = buildEditableRawRequest(template);
-          const payloads = record.results.map((result) => String(result.payload ?? ""));
-          state.fuzzerPayloadsText = payloads.join("\n") + (payloads.at(-1) === "" ? "\n" : "");
+          state.fuzzerRequestText = requestText;
+          state.fuzzerPayloadsText = payloadsText;
           state.fuzzerSourceTransactionId = null;
           state.fuzzerTarget = null;
           state.fuzzerTargetRequestText = null;
@@ -16153,6 +16159,7 @@ function renderFuzzerSetup() {
     select._fuzzerCandidates = candidates;
   }
   const busy = !!state.fuzzerRunning;
+  if (select) select.disabled = busy || candidates.length === 0;
   for (const id of ["fuzzerMarkSelectionButton", "fuzzerMarkCandidateButton", "fuzzerImportPayloadButton", "fuzzerApplyPresetButton", "fuzzerGenerateRangeButton"]) {
     const button = fuzzerSetupNode(id);
     if (button) button.disabled = busy;
