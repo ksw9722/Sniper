@@ -8,7 +8,9 @@ the selected record, resizing, or leaving the editor dismisses the preview.
 
 For keyboard access, place the cursor in a token (or select the exact value),
 then Tab to the editor's **Decode** button and press Enter or Space. This uses
-normal button navigation and reserves no browser/OS shortcut. The button becomes
+normal button navigation and reserves no browser/OS shortcut. While the button
+keeps focus, use Up/Down, Page Up/Down or Home/End to scroll a long preview.
+The button becomes
 visible when the editor is hovered or contains keyboard focus. Unsupported
 keyboard selections receive a short explanatory message.
 

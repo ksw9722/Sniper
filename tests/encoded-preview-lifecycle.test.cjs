@@ -147,3 +147,18 @@ test("actual base extension factory installs the preview only on HTTP text surfa
     assert.equal(f.context.createBaseExtensions(options).includes(f.context.plugin), false);
   }
 });
+
+
+test("keyboard preview scroll keys stay on the Decode button and never move the editor selection", () => {
+  const f = fixture(); f.controller.button.fire("click");
+  const original = f.view.state;
+  for (const [key, expected] of [["ArrowDown", 40], ["ArrowDown", 80], ["ArrowUp", 40], ["PageDown", 176], ["PageUp", 40], ["End", 800], ["Home", 0]]) {
+    const event = f.controller.button.fire("keydown", { key });
+    assert.equal(visible(f).scrollTop, expected);
+    assert.ok(event.defaultPrevented && event.propagationStopped);
+    assert.equal(f.view.state, original);
+  }
+  assert.equal(f.controller.button.fire("keydown", { key: "ArrowDown", ctrlKey: true }).defaultPrevented, false);
+  f.controller.hide();
+  assert.equal(f.controller.button.fire("keydown", { key: "ArrowDown" }).defaultPrevented, false);
+});

@@ -16,6 +16,7 @@ class Node {
   constructor(tagName = "DIV") {
     this.tagName = tagName; this.listeners = new Map(); this.children = [];
     this.attributes = new Map(); this.style = {}; this.textContent = ""; this.visible = true;
+    this.scrollTop = 0; this.clientHeight = 160; this.scrollHeight = 800;
   }
   set innerHTML(value) { assert.fail("Preview content must never be HTML"); }
   get isConnected() { return this.root || !!this.parent?.isConnected; }

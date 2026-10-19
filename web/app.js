@@ -29483,6 +29483,18 @@ class EncodedPreviewController {
     this.button.title = "Preview encoded value at cursor or selection";
     this.button.setAttribute("aria-label", this.button.title);
     this.button.addEventListener("click", () => this.showAtSelection());
+    this.button.addEventListener("keydown", event => {
+      const tooltip = this.tooltip;
+      if (!tooltip || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const page = Math.max(40, tooltip.clientHeight - 24);
+      const delta = { ArrowDown: 40, ArrowUp: -40, PageDown: page, PageUp: -page }[event.key];
+      if (delta !== undefined) tooltip.scrollTop += delta;
+      else if (event.key === "Home") tooltip.scrollTop = 0;
+      else if (event.key === "End") tooltip.scrollTop = tooltip.scrollHeight;
+      else return;
+      event.preventDefault();
+      event.stopPropagation();
+    });
     view.dom.appendChild(this.button);
     view.sniperDecodedPreview = this;
     this.onMove = event => this.pointerMove(event);
@@ -29576,7 +29588,9 @@ class EncodedPreviewController {
     if (keyboard) tooltip.setAttribute("aria-live", "polite");
     const title = this.document.createElement("div");
     title.className = "encoded-preview-title";
-    title.textContent = "Decoded preview · Esc to close";
+    title.textContent = keyboard
+      ? "Decoded preview · Arrow keys to scroll · Esc to close"
+      : "Decoded preview · Esc to close";
     tooltip.appendChild(title);
     for (const layer of result.layers) {
       const label = this.document.createElement("div");
