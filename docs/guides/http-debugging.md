@@ -188,8 +188,8 @@ sniper-cli capture browser open --browser ego --yes
 
 A browser opened normally from Applications uses its everyday profile. Opening
 it through Sniper uses the separate profile above, so an existing everyday login
-does not automatically appear there. Sign in yourself in the Sniper-opened window;
-later launches reuse its on-disk site data. Sniper does not copy cookies, passwords,
+does not automatically appear there. For a site that requires login, sign in
+yourself in the Sniper-opened window; later launches reuse its on-disk site data. Sniper does not copy cookies, passwords,
 or account tokens from another profile. A site can still expire or revoke a login,
 and clearing cookies/site data or using incognito can require another sign-in.
 Chromium documents both the
@@ -197,8 +197,20 @@ Chromium documents both the
 Compare that path between launches if a site repeatedly asks to sign in; sharing
 cookie files or other credential contents is not needed to diagnose a path change.
 
-For **Aside**, distinguish a site's login from Aside's own account or its CLI
-sign-in. Its [account commands](https://docs.aside.com/help/developers) include
+**Aside does not universally require an account for browsing.** Its
+[official native changelog](https://docs.aside.com/changelog/native), v1.0.728.1,
+describes new local profiles that can be created without onboarding and signed in
+later. [Aside-provided AI models](https://docs.aside.com/help/ai) require an Aside
+cloud account. This does not establish what the very first empty Sniper user data
+directory shows in each installed Aside version; that first-run behavior remains
+unverified. No supported offline or skip-login launch flag was found in these
+official docs, and Sniper does not bypass the account screen. The native changelog
+also records a fix in v1.0.922.1 for onboarding reappearing after profile changes
+or restarts. Check the installed version and the exact screen before attributing
+a repeated prompt to profile deletion.
+
+Distinguish a site's login from Aside's own account or its CLI sign-in.
+Its [account commands](https://docs.aside.com/help/developers) include
 `aside account list` and `aside account status`; account recovery is in Aside
 Settings > Account. The separately authenticated CLI keeps its credential file at
 `~/.aside/cli/auth.json` by default, or the explicitly configured

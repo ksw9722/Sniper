@@ -17256,7 +17256,7 @@ function renderBrowserMenu(catalog) {
     <div class="context-menu-divider"></div>
     <label class="browser-menu-option"><input type="checkbox" data-option="agent" ${wasChecked("agent")}> Let an agent drive it</label>
     <label class="browser-menu-option"><input type="checkbox" data-option="fresh" ${wasChecked("fresh")}> Throwaway profile (discard logins on quit)</label>
-    <div class="browser-menu-hint">By default, reuse this browser's saved Sniper profile. Sign in there once; your everyday browser profile is separate. Sites can still expire logins.</div>
+    <div class="browser-menu-hint">By default, reuse this browser's saved Sniper profile. Your everyday browser profile is separate. Site data stays between launches; sites can still expire logins.</div>
   `;
   element.onclick = async (event) => {
     const prefer = event.target.closest("[data-prefer]");

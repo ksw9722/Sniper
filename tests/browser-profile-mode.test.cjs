@@ -45,7 +45,8 @@ for (const browser of ["aside", "ego"]) {
     assert.equal(f.inputs.get("fresh").checked, false);
     assert.match(f.element.innerHTML, /saved Sniper profile/);
     assert.match(f.element.innerHTML, /everyday browser profile is separate/);
-    assert.match(f.element.innerHTML, /Sites can still expire logins/);
+    assert.match(f.element.innerHTML, /sites can still expire logins/);
+    assert.doesNotMatch(f.element.innerHTML, /Sign in there once/, "the browser account is not required by this hint");
     assert.match(f.element.innerHTML, /Throwaway profile \(discard logins on quit\)/);
     await f.open(browser);
     assert.deepEqual(f.opened, [{ browser, agent: false, fresh: false }]);
