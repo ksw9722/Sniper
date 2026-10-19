@@ -51,6 +51,7 @@ pub mod special_host;
 pub mod state;
 pub mod store;
 pub mod target;
+pub mod templates;
 pub mod ui_settings;
 pub mod upstream_peer_settings;
 pub mod upstream_proxy;

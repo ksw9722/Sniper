@@ -35,8 +35,12 @@ rustls = "=0.21.12"
 rustls23 = { package = "rustls", version = "0.23", default-features = false, features = ["std", "ring"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+# Nuclei templates are untrusted YAML: a pure-Rust parser with depth and
+# alias-expansion limits, deserialize side only.
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 serde_json = "1.0"
 tao = "0.29"
+tar = { version = "0.4", default-features = false }
 time = "=0.3.36"
 tokio = { version = "1.44", features = ["full"] }
 tokio-rustls = "=0.24.1"
