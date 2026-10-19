@@ -185,3 +185,47 @@ test("visual wrapping uses the previous side of the ending caret", () => {
   };
   f.hover(3, { clientX: 31 }); f.run(300); assert.ok(visible(f));
 });
+
+
+for (const origin of ["editor", "button"]) test(`pointer selection from focused ${origin} transfers focus inside before native mouse selection`, () => {
+  const f = fixture();
+  if (origin === "editor") { f.contentDOM.focus(); open(f); }
+  else { f.controller.button.focus(); f.controller.button.fire("click"); }
+  const tooltip = visible(f), value = tooltip.children[2], original = f.view.state;
+  const events = [];
+  tooltip.focus = options => {
+    events.push("tooltip focus");
+    assert.equal(options.preventScroll, true);
+    const previous = f.document.activeElement;
+    f.document.activeElement = tooltip;
+    f.dom.fire("focusout", { target: previous, relatedTarget: tooltip });
+    events.push("focusout stays inside");
+  };
+  const pointer = f.document.fire("pointerdown", { target: value });
+  events.push("native mousedown");
+  assert.equal(pointer.defaultPrevented, false, "Preserve native text selection");
+  assert.equal(pointer.propagationStopped, false);
+  assert.equal(tooltip.tabIndex, -1, "The popup must accept the explicit focus transfer");
+  // The following native focus/selection phase stays in the already focused
+  // tooltip, rather than blurring the editor or button to body.
+  f.dom.fire("mousemove", { target: value, buttons: 1 });
+  events.push("native text drag");
+  f.document.fire("scroll", { target: tooltip });
+  assert.equal(visible(f), tooltip); assert.equal(f.view.state, original);
+  assert.deepEqual(events, ["tooltip focus", "focusout stays inside", "native mousedown", "native text drag"]);
+  const escape = f.document.fire("keydown", { target: tooltip, key: "Escape" });
+  assert.ok(escape.defaultPrevented && escape.propagationStopped);
+  assert.equal(visible(f), null); assert.equal(f.document.activeElement, f.controller.button);
+  assert.equal(f.view.state, original);
+});
+
+test("pointer-selected preview still dismisses immediately on an outside click or owner replacement", () => {
+  const f = fixture(); open(f);
+  f.document.fire("pointerdown", { target: visible(f) });
+  f.document.fire("pointerdown", { target: f.document });
+  assert.equal(visible(f), null);
+  f.view.dispatch({ selection: { anchor: 1 } }); open(f);
+  f.document.fire("pointerdown", { target: visible(f) });
+  f.view.dispatch({ changes: { from: 0, to: f.view.state.doc.length, insert: "new%20record" } });
+  assert.equal(visible(f), null);
+});

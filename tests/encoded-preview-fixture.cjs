@@ -19,6 +19,7 @@ class Node {
     this.scrollTop = 0; this.clientHeight = 160; this.scrollHeight = 800;
   }
   set innerHTML(value) { assert.fail("Preview content must never be HTML"); }
+  focus(options) { this.ownerDocument.activeElement = this; this.focusOptions = options; }
   get isConnected() { return this.root || !!this.parent?.isConnected; }
   appendChild(node) { node.parent = this; node.ownerDocument = this.ownerDocument; this.children.push(node); return node; }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }

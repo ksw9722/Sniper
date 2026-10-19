@@ -64,3 +64,12 @@ test("delimiters, malformed tokens and invalid positions do not offer previews",
   for (const position of [-1, 1.5, 99]) assert.equal(c.encodedPreviewAt(doc("hello%20world"), position), null);
   assert.equal(c.encodedPreviewAt(doc("hello%20world next"), 13), null);
 });
+
+
+test("all Unicode bidi controls are rejected in URL and Base64 previews", () => {
+  for (const char of ["\u061c", "\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"]) {
+    for (const value of [encode(`safe${char}text`), encodeURIComponent(`safe${char}text`)]) {
+      assert.equal(c.decodePreviewLayers(value).length, 0);
+    }
+  }
+});

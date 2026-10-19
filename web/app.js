@@ -29422,7 +29422,7 @@ function decodePreviewLayer(value) {
     return null;
   }
   if (text === value || !text.trim() || text.length > ENCODED_PREVIEW_OUTPUT_LIMIT
-    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(text)) return null;
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(text)) return null;
   return { encoding, text };
 }
 
@@ -29516,12 +29516,19 @@ class EncodedPreviewController {
     this.onFocusOut = event => { if (!view.dom.contains(event.relatedTarget)) this.hide(); };
     this.onDismiss = event => {
       if (event.type === "keydown" && event.key !== "Escape") return;
-      if (this.tooltip?.contains(event.target) && event.type !== "keydown") return;
+      if (this.tooltip?.contains(event.target) && event.type !== "keydown") {
+        // Native text selection must not blur a non-focusable popup to body and
+        // dismiss it before the drag begins. Do not prevent the pointer event.
+        if (event.type === "pointerdown") this.tooltip.focus({ preventScroll: true });
+        return;
+      }
+      const restoreFocus = event.type === "keydown" && this.tooltip?.contains(this.document.activeElement);
       if (event.type === "keydown" && this.tooltip) {
         event.preventDefault();
         event.stopPropagation();
       }
       this.hide();
+      if (restoreFocus) this.button.focus({ preventScroll: true });
     };
     view.dom.addEventListener("mousemove", this.onMove);
     view.dom.addEventListener("mouseleave", this.onLeave);
@@ -29594,6 +29601,7 @@ class EncodedPreviewController {
       || this.button.getBoundingClientRect();
     const tooltip = this.document.createElement("div");
     tooltip.className = "encoded-preview-tooltip";
+    tooltip.tabIndex = -1;
     tooltip.id = `encoded-preview-${++encodedPreviewId}`;
     tooltip.setAttribute("role", "tooltip");
     if (keyboard) tooltip.setAttribute("aria-live", "polite");
