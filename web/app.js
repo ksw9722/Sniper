@@ -880,6 +880,7 @@ const els = {
   replayResponseCM: document.getElementById("replayResponseCM"),
   replayResponseSearchInput: document.getElementById("replayResponseSearchInput"),
   curlImportModal: document.getElementById("curlImportModal"),
+  compareModal: document.getElementById("compareModal"),
   replayResponseSearchMeta: document.getElementById("replayResponseSearchMeta"),
   sendReplayButton: document.getElementById("sendReplayButton"),
   cancelReplayButton: document.getElementById("cancelReplayButton"),
@@ -2400,6 +2401,9 @@ function bindEvents() {
       return;
     } else if (event.key === "Escape") {
       if (event.defaultPrevented || event.isComposing) return;
+      // Compare is not visible until both records arrive; Escape also cancels
+      // that pending open without changing focus in the workspace.
+      closeCompareModal();
       closeDisplaySettingsModal();
       closeCertificateModal();
       closeFilterModal();
@@ -20533,6 +20537,14 @@ function getActiveModalAction() {
     };
   }
 
+  if (isModalVisible(els.compareModal)) {
+    return {
+      modal: els.compareModal,
+      close: closeCompareModal,
+      apply: null,
+    };
+  }
+
   return null;
 }
 
@@ -26285,6 +26297,7 @@ let compareActiveTab = "request";
 let compareBaseRecord = null;
 let compareTargetRecord = null;
 let compareLoadGeneration = 0;
+let compareReturnFocus = null;
 
 function computeUnifiedDiff(linesA, linesB, labelA, labelB) {
   const result = [`--- ${labelA}`, `+++ ${labelB}`];
@@ -26329,11 +26342,20 @@ async function openCompareModal(targetId) {
   // A dismissed or superseded comparison must not reopen from a late response.
   if (generation !== compareLoadGeneration || currentSessionId() !== sessionId) return;
   if (!baseRes || !targetRes) return;
+  const modal = document.getElementById("compareModal");
+  // Opening another dialog while records load supersedes this pending reveal.
+  const activeModal = getActiveModalAction();
+  if (activeModal && activeModal.modal !== modal) return;
+  const wasVisible = isModalVisible(modal);
+  if (!wasVisible) compareReturnFocus = document.activeElement;
   compareBaseRecord = baseRes;
   compareTargetRecord = targetRes;
   compareActiveTab = "request";
   renderCompareModal();
-  document.getElementById("compareModal").classList.remove("hidden");
+  modal.classList.remove("hidden");
+  if (!wasVisible) {
+    document.getElementById("closeCompareButton")?.focus();
+  }
 }
 
 function renderCompareModal() {
@@ -26365,7 +26387,11 @@ function renderCompareModal() {
 
 function closeCompareModal() {
   compareLoadGeneration += 1;
-  document.getElementById("compareModal").classList.add("hidden");
+  const modal = document.getElementById("compareModal");
+  const restoreFocus = isModalVisible(modal) && getActiveModalAction()?.modal === modal;
+  modal.classList.add("hidden");
+  if (restoreFocus) restoreModalFocus(compareReturnFocus, els.trafficRegion);
+  compareReturnFocus = null;
 }
 
 function clearCompareState() {
@@ -26375,6 +26401,7 @@ function clearCompareState() {
   compareBaseRecord = null;
   compareTargetRecord = null;
   compareActiveTab = "request";
+  compareReturnFocus = null;
   const btn = document.getElementById("compareWithBaseBtn");
   if (btn) {
     btn.disabled = true;

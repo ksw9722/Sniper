@@ -70,6 +70,7 @@ function fixture(overrides = {}) {
     window: { getComputedStyle: () => ({ visibility: "visible" }) },
     hydrateDisplaySettingsForm() {}, applyDisplaySettingsState() {}, renderShortcutReference() {}, selectSettingsTab() {},
     hydrateFilterForm() {}, saveDisplaySettingsFromForm() {}, applyFilterSettings() {}, closeCurlImportModal() {},
+    closeCompareModal() {},
     moveHistorySelection: async offset => calls.push(["history", offset]),
     moveWebsocketSelection: async offset => calls.push(["websockets", offset]),
     moveFrameSelection: offset => calls.push(["frames", offset]),

@@ -101,6 +101,7 @@ function fixture(surface) {
     closeCertificateModal: () => closed.push("certificate"),
     closeFilterModal: () => closed.push("filter"),
     closeCurlImportModal: forbidden("import close"),
+    closeCompareModal() {},
     saveDisplaySettingsFromForm: forbidden("settings save"),
     applyFilterSettings: forbidden("filter apply"),
     closeScannerSettings: forbidden("scanner settings close"),
