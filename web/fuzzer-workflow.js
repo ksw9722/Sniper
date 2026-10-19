@@ -243,6 +243,9 @@
     if (markerCount(hostHeader ? hostHeader.value : template.host)) {
       warnings.push("Host markers can change the request authority by payload. Check the sample requests and connection target.");
     }
+    if (template.headers.some(header => markerCount(header.name))) {
+      warnings.push("Header-name markers can change request authority or framing. Check the expanded samples.");
+    }
     const samples = [];
     let sampleBytes = 0, samplesOmitted = 0;
     if (!errors.length) {

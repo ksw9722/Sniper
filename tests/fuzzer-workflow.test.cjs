@@ -26,6 +26,20 @@ test("module exports the same pure browser and CommonJS API", () => {
   assert.equal(context.window.SniperFuzzerWorkflow.payloadText([""]), "\n");
 });
 
+test("local safety limits stay aligned with the backend Fuzzer constants", () => {
+  const rust = fs.readFileSync(path.join(__dirname, "../src/fuzzer.rs"), "utf8");
+  for (const [key, name] of [
+    ["payloads", "MAX_FUZZER_PAYLOADS"], ["payloadBytes", "MAX_FUZZER_PAYLOAD_BYTES"],
+    ["totalPayloadBytes", "MAX_FUZZER_TOTAL_PAYLOAD_BYTES"], ["markers", "MAX_FUZZER_MARKERS_PER_REQUEST"],
+    ["expandedRequestBytes", "MAX_FUZZER_EXPANDED_REQUEST_BYTES"],
+  ]) {
+    const expression = rust.match(new RegExp(`const ${name}: usize = ([0-9_* ]+);`));
+    assert.ok(expression, name);
+    const value = expression[1].split("*").reduce((product, part) => product * Number(part.trim().replace(/_/g, "")), 1);
+    assert.equal(workflow.limits[key], value, name);
+  }
+});
+
 test("payload lines match the existing editor semantics exactly", () => {
   const legacy = loadFunctions(["splitFuzzerPayloadLines"]);
   for (const text of [undefined, null, "", "a", " ", "a\n", "\n", "\n\n", "a\n\n", " a \r\nb\r\r\n", "$1\n$&\n😀\n"]) {
@@ -178,8 +192,10 @@ test("literal Host precedence ignores authority markers and chooses the first ex
 });
 
 test("a marker in a header name can create Host after literal expansion", () => {
-  const expanded = workflow.expandTemplate(request({ host: "old.example.com", headers: [{ name: "$payload$", value: "new.example.com" }] }), "Host");
+  const template = request({ host: "old.example.com", headers: [{ name: "$payload$", value: "new.example.com" }] });
+  const expanded = workflow.expandTemplate(template, "Host");
   assert.equal(expanded.host, "new.example.com");
+  assert.match(workflow.preflight(template, ["Host"]).warnings.join(" "), /Header-name markers/);
 });
 
 test("Content-Length normalization matches Rust UTF-8 sizing, deduplication and ordering", () => {
@@ -246,6 +262,14 @@ test("preflight marker and expanded byte limits mirror backend field accounting"
   assert.equal(checked.valid, true);
   assert.equal(checked.markerCount, 1);
   assert.equal(checked.maxExpandedRequestBytes, Buffer.byteLength("https") + Buffer.byteLength(template.host) + 3 + 1 + 4 + Buffer.byteLength("header-.example.com") + 65536);
+});
+
+test("expanded byte accounting measures UTF-8, including non-marker fields", () => {
+  const template = request({ path: "/é/$payload$", body: "😀$payload$", headers: [{ name: "X-Text", value: "é" }] });
+  const checked = workflow.preflight(template, ["", "😀"]);
+  const expanded = workflow.expandTemplate(template, "😀");
+  const fields = [expanded.scheme, expanded.host, expanded.method, expanded.path, expanded.body, ...expanded.headers.flatMap(header => [header.name, header.value])];
+  assert.equal(checked.maxExpandedRequestBytes, fields.reduce((sum, value) => sum + Buffer.byteLength(value), 0));
 });
 
 test("preflight samples are bounded and never silently truncate generated request objects", () => {
