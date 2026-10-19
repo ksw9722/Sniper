@@ -3228,6 +3228,8 @@ function applyWorkspaceState(snapshot) {
     return;
   }
   workspaceStateGeneration += 1;
+  // Later UI reads can fail before panels render and synchronize this owner.
+  if (typeof reconController !== "undefined") reconController?.syncSession();
   for (const tab of state.replayTabs || []) {
     if (tab?.type === "websocket") {
       cleanupWsReplayTab(tab, { guardWorkspaceRevision: false }).catch((error) => console.error(error));
