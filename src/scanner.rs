@@ -1902,6 +1902,9 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                 if label == "Mailgun API Key" && !mailgun_key_match_has_context(body, &m) {
                     continue;
                 }
+                if label == "Replicate API Token" && !replicate_token_has_boundaries(body, &m) {
+                    continue;
+                }
                 if label == "Sensitive file path exposed"
                     && sensitive_file_path_match_is_template(body, &m)
                 {
@@ -1912,20 +1915,48 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                 if is_embedded_in_base64(body, &m) {
                     continue;
                 }
-                findings.push(make_finding(
+                let mut finding = make_finding(
                     record,
                     severity.clone(),
                     "disclosure",
                     format!("{label} detected in response"),
                     format!("{label} found in response body. This may expose sensitive information to clients."),
                     truncate_evidence(m.as_str(), 80),
-                ));
+                );
+                if label == "Replicate API Token" {
+                    // The same value may occur earlier inside a rejected opaque
+                    // identifier or header. Navigate to this accepted body match.
+                    let line = response.headers.len()
+                        + 3
+                        + body[..m.start()]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count();
+                    finding.location = Some(location_for_line(record, "response", line));
+                }
+                findings.push(finding);
                 break;
             }
         }
     }
 
     check_internal_ip_disclosure(record, body, findings);
+}
+
+// A supported token can occur inside a longer URL-safe opaque identifier.
+// Inspect adjacent bytes without consuming delimiters or slicing UTF-8. Unicode
+// prose remains a delimiter; ASCII hyphens conservatively count as continuation,
+// even when a genuine token happens to touch hyphen punctuation.
+fn replicate_token_has_boundaries(body: &str, m: &regex::Match<'_>) -> bool {
+    let bytes = body.as_bytes();
+    let adjacent = [
+        m.start().checked_sub(1).and_then(|index| bytes.get(index)),
+        bytes.get(m.end()),
+    ];
+    !adjacent
+        .into_iter()
+        .flatten()
+        .any(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
 }
 
 fn check_internal_ip_disclosure(
@@ -4954,6 +4985,198 @@ mod tests {
                 .any(|finding| finding.title == "GitLab Token detected in response"),
             "documented GitLab token prefixes should still be reported"
         );
+    }
+
+    // All token-shaped test values are synthetic, not usable credentials.
+    const SYNTHETIC_REPLICATE_TOKEN: &str = "r8_Ab1Cd2Ab1Cd2Ab1Cd2Ab1Cd2Ab1Cd2Ab1Cd2Xy";
+
+    fn replicate_findings_for_body(
+        body: &str,
+        content_type: &str,
+        status: u16,
+    ) -> Vec<ScannerFinding> {
+        let mut record = make_record(vec![], vec![("Content-Type", content_type)], body, status);
+        record.response.as_mut().unwrap().content_type = Some(content_type.into());
+        findings_for_rule(&record, "disclosure")
+            .into_iter()
+            .filter(|finding| finding.title == "Replicate API Token detected in response")
+            .collect()
+    }
+
+    #[test]
+    fn replicate_token_boundary_rejects_opaque_ascii_identifiers() {
+        let token = SYNTHETIC_REPLICATE_TOKEN;
+        assert_eq!(token.len(), 41);
+        let challenge = format!(
+            "<!doctype html><script>window.challenge={{mdrd:'prefix.ABCDE{token}WXYZ.suffix'}};</script>"
+        );
+        assert!(replicate_findings_for_body(&challenge, "text/html", 403).is_empty());
+        assert!(replicate_findings_for_body(
+            &format!(r#"{{"blob":"ABCDE{token}WXYZ"}}"#),
+            "application/json",
+            200,
+        )
+        .is_empty());
+        for adjacent in ["A", "z", "0", "_", "-"] {
+            for body in [
+                format!("{adjacent}{token}"),
+                format!("{token}{adjacent}"),
+                format!("{adjacent}{token}{adjacent}"),
+            ] {
+                assert!(
+                    replicate_findings_for_body(&body, "text/plain", 200).is_empty(),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replicate_token_boundary_preserves_delimiters_and_exact_evidence() {
+        let token = SYNTHETIC_REPLICATE_TOKEN;
+        for (content_type, body) in [
+            ("text/plain", token.to_string()),
+            ("text/plain", format!("'{token}'")),
+            ("text/plain", format!("\"{token}\"")),
+            ("text/plain", format!("\n{token}\n")),
+            ("text/plain", format!("({token});")),
+            ("application/json", format!(r#"{{"token":"{token}"}}"#)),
+            (
+                "text/html",
+                format!("<!doctype html><script>const replicateToken=\"{token}\";</script>"),
+            ),
+            ("text/plain", format!("Authorization: Bearer {token}\r\n")),
+            (
+                "text/plain",
+                format!("https://example.com/?token={token}&view=1"),
+            ),
+        ] {
+            // A challenge/error status does not suppress a separately delimited
+            // supported token. Header-shaped text is still response body text.
+            for status in [200, 403] {
+                let findings = replicate_findings_for_body(&body, content_type, status);
+                assert_eq!(findings.len(), 1, "{content_type} / {status} / {body}");
+                let finding = &findings[0];
+                assert_eq!(finding.severity, Severity::High);
+                assert_eq!(finding.category, "disclosure");
+                assert!(finding.rule_id.is_empty());
+                assert_eq!(finding.evidence, token);
+                assert_eq!(finding.evidence.len(), 41);
+                assert_eq!(finding_scope(finding), token);
+                let body_line = body[..body.find(token).unwrap()]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count();
+                assert_eq!(
+                    finding.location,
+                    Some(FindingLocation {
+                        side: "response".into(),
+                        section: "body".into(),
+                        line: Some(body_line + 4),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replicate_token_boundary_preserves_unicode_prose_adjacency() {
+        let token = SYNTHETIC_REPLICATE_TOKEN;
+        for (prefix, suffix) in [
+            ("é", ""),
+            ("", "é"),
+            ("前", "後"),
+            ("\u{301}", ""),
+            ("", "\u{301}"),
+            ("“", "”"),
+        ] {
+            let body = format!("{prefix}{token}{suffix}");
+            let findings = replicate_findings_for_body(&body, "text/plain; charset=utf-8", 200);
+            assert_eq!(findings.len(), 1, "{body}");
+            assert_eq!(findings[0].evidence, token);
+            assert_eq!(findings[0].severity, Severity::High);
+            assert_eq!(
+                findings[0].location,
+                Some(FindingLocation {
+                    side: "response".into(),
+                    section: "body".into(),
+                    line: Some(4),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn replicate_token_boundary_continues_after_rejected_candidate() {
+        let rejected = SYNTHETIC_REPLICATE_TOKEN;
+        for accepted in [rejected.to_string(), format!("r8_{}Xy", "Ef3Gh4".repeat(6))] {
+            assert_eq!(accepted.len(), 41);
+            let body = format!("前ABCDE{rejected}WXYZ\n中\n後\"{accepted}\"");
+            let record = make_record(
+                vec![],
+                vec![
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("X-Example-Note", rejected),
+                ],
+                &body,
+                200,
+            );
+            let findings: Vec<_> = findings_for_rule(&record, "disclosure")
+                .into_iter()
+                .filter(|finding| finding.title == "Replicate API Token detected in response")
+                .collect();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].evidence, accepted);
+            assert_eq!(findings[0].evidence.len(), 41);
+            assert_eq!(findings[0].severity, Severity::High);
+            assert_eq!(finding_scope(&findings[0]), accepted);
+            assert_eq!(
+                findings[0].location,
+                Some(FindingLocation {
+                    side: "response".into(),
+                    section: "body".into(),
+                    line: Some(7),
+                })
+            );
+            let raw = raw_response_text_for_finding(&record).unwrap();
+            assert_eq!(raw.lines().nth(6).unwrap(), format!("後\"{accepted}\""));
+        }
+    }
+
+    #[test]
+    fn replicate_token_boundary_keeps_existing_supported_format() {
+        for body in [
+            format!("r8_{}", "A".repeat(37)),
+            format!("r8_{}", "A".repeat(39)),
+            format!("R8_{}", "A".repeat(38)),
+            format!("r8_{}-Z", "A".repeat(36)),
+            format!("r8_{}_Z", "A".repeat(36)),
+        ] {
+            assert!(
+                replicate_findings_for_body(&body, "text/plain", 200).is_empty(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn replicate_token_boundary_does_not_suppress_other_provider_findings() {
+        let github = format!("ghp_{}", "Ab1Cd2".repeat(6));
+        let body = format!(
+            "<script>window.challenge={{mdrd:'ABCDE{}WXYZ'}};const credential=\"{github}\";</script>",
+            SYNTHETIC_REPLICATE_TOKEN
+        );
+        let record = make_record(vec![], vec![("Content-Type", "text/html")], &body, 403);
+        let findings = findings_for_rule(&record, "disclosure");
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.title == "Replicate API Token detected in response"));
+        let github_finding = findings
+            .iter()
+            .find(|finding| finding.title == "GitHub Personal Access Token detected in response")
+            .expect("the Replicate boundary check must not suppress another provider");
+        assert_eq!(github_finding.evidence, github);
+        assert_eq!(github_finding.severity, Severity::High);
     }
 
     #[test]
