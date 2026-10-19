@@ -190,6 +190,12 @@ enum Command {
         #[command(subcommand)]
         command: ScannerCommand,
     },
+    /// Manage the Nuclei template library and the passive templates that judge
+    /// in-scope captured traffic.
+    Templates {
+        #[command(subcommand)]
+        command: TemplatesCommand,
+    },
     /// Read stored session event messages.
     #[command(name = "event-log")]
     EventLog {
@@ -473,6 +479,240 @@ struct FindingGetArgs {
 #[derive(Debug, Deserialize, Serialize)]
 struct FindingsCount {
     count: usize,
+}
+
+#[derive(Subcommand, Debug)]
+enum TemplatesCommand {
+    /// The installed template release: check for, download or import one.
+    Library {
+        #[command(subcommand)]
+        command: TemplatesLibraryCommand,
+    },
+    /// List templates in the installed release.
+    List(TemplatesListArgs),
+    /// One template's metadata, why Sniper can or cannot run it, and its YAML.
+    Get(TemplatesGetArgs),
+    /// Turn passive templates on or off.
+    Passive {
+        #[command(subcommand)]
+        command: TemplatesPassiveCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TemplatesLibraryCommand {
+    /// The installed release, its counts, and any download or import in progress.
+    Status,
+    /// Ask GitHub for the newest release tag: one request to api.github.com.
+    Check,
+    /// Download the newest release from GitHub, verify it and install it.
+    Download,
+    /// Install a release archive (.tar.gz) from disk, for networks without GitHub.
+    Import(TemplatesImportArgs),
+}
+
+#[derive(Args, Debug)]
+struct TemplatesImportArgs {
+    /// A nuclei-templates release .tar.gz, at most 64 MiB.
+    #[arg(long)]
+    file: PathBuf,
+}
+
+#[derive(Args, Debug, Default, Clone)]
+struct TemplatesFilterArgs {
+    /// Substring of an id, name, path, tag or CVE, case-insensitive.
+    #[arg(long)]
+    search: Option<String>,
+    /// Comma-separated severities: info, low, medium, high, critical, unknown.
+    #[arg(long)]
+    severity: Option<String>,
+    /// One exact tag.
+    #[arg(long)]
+    tag: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct TemplatesListArgs {
+    #[command(flatten)]
+    filter: TemplatesFilterArgs,
+    /// Comma-separated protocols: http, dns, network, code and the rest.
+    #[arg(long)]
+    protocol: Option<String>,
+    /// Templates Sniper can run passively or actively, or neither.
+    #[arg(long, value_parser = ["passive", "active", "unsupported"])]
+    support: Option<String>,
+    /// Only passive templates that are on (true) or off (false).
+    #[arg(long)]
+    enabled: Option<bool>,
+    #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u64).range(1..=30_000))]
+    limit: u64,
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+}
+
+#[derive(Args, Debug)]
+struct TemplatesGetArgs {
+    /// Template id, as `templates list` shows it.
+    #[arg(long)]
+    id: String,
+}
+
+#[derive(Subcommand, Debug)]
+enum TemplatesPassiveCommand {
+    /// Turn passive templates on or off by id, by filter, or all at once.
+    SetEnabled(TemplatesPassiveArgs),
+}
+
+#[derive(Args, Debug)]
+struct TemplatesPassiveArgs {
+    #[arg(long, action = ArgAction::Set, required = true)]
+    enabled: bool,
+    /// A template id; repeat for several. Not with a filter or --all.
+    #[arg(long = "id")]
+    ids: Vec<String>,
+    #[command(flatten)]
+    filter: TemplatesFilterArgs,
+    /// Every passive-capable template.
+    #[arg(long)]
+    all: bool,
+}
+
+impl TemplatesCommand {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Library { command } => match command {
+                TemplatesLibraryCommand::Status => "templates.library.status",
+                TemplatesLibraryCommand::Check => "templates.library.check",
+                TemplatesLibraryCommand::Download => "templates.library.download",
+                TemplatesLibraryCommand::Import(_) => "templates.library.import",
+            },
+            Self::List(_) => "templates.list",
+            Self::Get(_) => "templates.get",
+            Self::Passive { .. } => "templates.passive.set_enabled",
+        }
+    }
+}
+
+/// Nuclei's own rule for a template id, checked before it becomes a path.
+fn valid_template_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && id
+            .split(['-', '_'])
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+fn templates_filter_json(filter: &TemplatesFilterArgs) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    for (key, value) in [
+        ("search", &filter.search),
+        ("severity", &filter.severity),
+        ("tag", &filter.tag),
+    ] {
+        if let Some(value) = value {
+            map.insert(key.into(), json!(value));
+        }
+    }
+    map
+}
+
+fn templates_list_path(args: &TemplatesListArgs) -> String {
+    let mut params: Vec<(String, String)> = templates_filter_json(&args.filter)
+        .into_iter()
+        .map(|(key, value)| (key, value.as_str().unwrap_or_default().to_string()))
+        .collect();
+    if let Some(protocol) = &args.protocol {
+        params.push(("protocol".into(), protocol.clone()));
+    }
+    if let Some(support) = &args.support {
+        params.push(("support".into(), support.clone()));
+    }
+    if let Some(enabled) = args.enabled {
+        params.push(("enabled".into(), enabled.to_string()));
+    }
+    params.push(("limit".into(), args.limit.to_string()));
+    params.push(("offset".into(), args.offset.to_string()));
+    format!("/api/templates?{}", encode_query(params))
+}
+
+/// The passive request body: ids, a filter, or every passive-capable template,
+/// exactly one of them.
+fn templates_passive_body(args: &TemplatesPassiveArgs) -> Result<Value> {
+    let filter = templates_filter_json(&args.filter);
+    let ways = [!args.ids.is_empty(), !filter.is_empty(), args.all];
+    if ways.iter().filter(|way| **way).count() != 1 {
+        bail!("give template ids, a filter (--search, --severity, --tag), or --all; exactly one");
+    }
+    if let Some(id) = args.ids.iter().find(|id| !valid_template_id(id)) {
+        bail!("`{id}` is not a template id");
+    }
+    Ok(if args.ids.is_empty() {
+        let mut filter = filter;
+        filter.insert("support".into(), json!("passive"));
+        json!({"filter": filter, "enabled": args.enabled})
+    } else {
+        json!({"ids": args.ids, "enabled": args.enabled})
+    })
+}
+
+fn templates_input_preview(command: &TemplatesCommand) -> Value {
+    match command {
+        TemplatesCommand::Library {
+            command: TemplatesLibraryCommand::Import(args),
+        } => json!({ "file": args.file }),
+        TemplatesCommand::Library { .. } => json!({}),
+        TemplatesCommand::List(args) => {
+            let mut input = templates_filter_json(&args.filter);
+            input.insert("protocol".into(), json!(args.protocol));
+            input.insert("support".into(), json!(args.support));
+            input.insert("enabled".into(), json!(args.enabled));
+            input.insert("limit".into(), json!(args.limit));
+            input.insert("offset".into(), json!(args.offset));
+            Value::Object(input)
+        }
+        TemplatesCommand::Get(args) => json!({ "id": args.id }),
+        TemplatesCommand::Passive {
+            command: TemplatesPassiveCommand::SetEnabled(args),
+        } => {
+            let mut input = templates_filter_json(&args.filter);
+            input.insert("enabled".into(), json!(args.enabled));
+            input.insert("ids".into(), json!(args.ids));
+            input.insert("all".into(), json!(args.all));
+            Value::Object(input)
+        }
+    }
+}
+
+fn templates_api_preview(command: &TemplatesCommand) -> Value {
+    match command {
+        TemplatesCommand::Library { command } => match command {
+            TemplatesLibraryCommand::Status => api_preview("GET", "/api/templates/library", None),
+            TemplatesLibraryCommand::Check => {
+                api_preview("POST", "/api/templates/library/check", Some(json!({})))
+            }
+            TemplatesLibraryCommand::Download => api_preview(
+                "POST",
+                "/api/templates/library/download",
+                Some(json!({ "acknowledged": true })),
+            ),
+            TemplatesLibraryCommand::Import(args) => api_preview(
+                "POST",
+                "/api/templates/library/import",
+                Some(json!({ "file": args.file, "content_type": "application/gzip" })),
+            ),
+        },
+        TemplatesCommand::List(args) => api_preview("GET", templates_list_path(args), None),
+        TemplatesCommand::Get(args) => {
+            api_preview("GET", format!("/api/templates/{}", args.id), None)
+        }
+        TemplatesCommand::Passive {
+            command: TemplatesPassiveCommand::SetEnabled(args),
+        } => api_preview(
+            "POST",
+            "/api/templates/passive",
+            templates_passive_body(args).ok(),
+        ),
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -2745,6 +2985,7 @@ impl Command {
             Command::Capture { command } => command.operation_name(),
             Command::Findings { command } => command.operation_name(),
             Command::Scanner { command } => command.operation_name(),
+            Command::Templates { command } => command.operation_name(),
             Command::EventLog { command } => command.operation_name(),
             Command::Scope { command } => command.operation_name(),
             Command::Replay { command } => command.operation_name(),
@@ -3302,6 +3543,69 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["browser"],
             vec![json!({"browser":"chrome"})],
+        ),
+        op(
+            "templates.library.status",
+            "templates library status",
+            "Read the installed Nuclei template release (tag, SHA-256, whether the release's checksum verified it), template counts by what Sniper can run, the passive templates turned on, and any download or import in progress. Local; contacts nothing.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "templates.library.check",
+            "templates library check",
+            "Ask GitHub for the newest nuclei-templates release tag: one request to api.github.com through the environment's proxy. Reports whether it differs from the installed one; installs nothing.",
+            Read,
+            false,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "templates.library.download",
+            "templates library download",
+            "Download the newest nuclei-templates release (MIT) from GitHub, verify it against the SHA-256 the release publishes, and install it for every session. Waits until installed. Templates are data: code, javascript and headless templates are listed but never run.",
+            Write,
+            true,
+            &[],
+            vec![json!({})],
+        ),
+        op(
+            "templates.library.import",
+            "templates library import --file <path>",
+            "Install a nuclei-templates release .tar.gz from this machine, at most 64 MiB, for networks that cannot reach GitHub. Waits until installed. An imported archive is not checksum-verified.",
+            Write,
+            true,
+            &["file"],
+            vec![json!({"file":"nuclei-templates.tar.gz"})],
+        ),
+        op(
+            "templates.list",
+            "templates list",
+            "List templates in the installed release with severity, tags, protocol, whether Sniper can run each passively or actively and why not, risk tags, and whether a passive one is on. Filters narrow it; limit and offset page it.",
+            Read,
+            false,
+            &[],
+            vec![json!({"support":"passive","limit":50}), json!({"search":"wordpress","severity":"high,critical"})],
+        ),
+        op(
+            "templates.get",
+            "templates get --id <id>",
+            "Read one template: metadata, description, references, why Sniper can or cannot run it, and its YAML text.",
+            Read,
+            false,
+            &["id"],
+            vec![json!({"id":"tech-detect"})],
+        ),
+        op(
+            "templates.passive.set_enabled",
+            "templates passive set-enabled --enabled <true|false>",
+            "Turn passive templates on or off, by ids, by a filter, or all passive-capable ones. Enabled passive templates judge captured responses whose host is in a non-empty Scope include list while Passive Scan is on; they never send requests. Findings appear under category nuclei; Rescan applies a change to stored history.",
+            Write,
+            true,
+            &["enabled"],
+            vec![json!({"ids":["tech-detect"],"enabled":true}), json!({"tag":"waf","enabled":false})],
         ),
         op(
             "capture.http.list",
@@ -5123,6 +5427,45 @@ fn op(
     }
 }
 
+fn templates_input_schema(operation: &str) -> Option<Value> {
+    let filter = json!({
+        "search":{"type":["string","null"],"maxLength":200,"description":"Substring of an id, name, path, tag or CVE, case-insensitive."},
+        "severity":{"type":["string","null"],"maxLength":200,"description":"Comma-separated severities: info, low, medium, high, critical, unknown."},
+        "tag":{"type":["string","null"],"maxLength":200,"description":"One exact tag, case-insensitive."}
+    });
+    let empty = json!({"type":"object","additionalProperties":false,"required":[],"properties":{}});
+    Some(match operation {
+        "templates.library.status" | "templates.library.check" | "templates.library.download" => {
+            empty
+        }
+        "templates.library.import" => json!({
+            "type":"object","additionalProperties":false,"required":["file"],
+            "properties":{"file":{"type":"string","minLength":1,"description":"Path to a nuclei-templates release .tar.gz on this machine, at most 64 MiB."}}
+        }),
+        "templates.list" => {
+            let mut properties = filter;
+            properties["protocol"] = json!({"type":["string","null"],"maxLength":200,"description":"Comma-separated protocols: http, dns, network, code and the rest."});
+            properties["support"] = json!({"type":["string","null"],"enum":["passive","active","unsupported",null],"description":"Templates Sniper can run passively or actively, or neither. Omitted or null lists all."});
+            properties["enabled"] = json!({"type":["boolean","null"],"description":"Only passive templates that are on (true) or off (false)."});
+            properties["limit"] = json!({"type":["integer","null"],"minimum":1,"maximum":30000,"default":200,"description":"Page size. Null uses 200."});
+            properties["offset"] = json!({"type":["integer","null"],"minimum":0,"default":0,"description":"Templates to skip. Null uses 0."});
+            json!({"type":"object","additionalProperties":false,"required":[],"properties":properties})
+        }
+        "templates.get" => json!({
+            "type":"object","additionalProperties":false,"required":["id"],
+            "properties":{"id":{"type":"string","minLength":1,"maxLength":200,"pattern":"^([a-zA-Z0-9]+[-_])*[a-zA-Z0-9]+$","description":"Template id."}}
+        }),
+        "templates.passive.set_enabled" => {
+            let mut properties = filter;
+            properties["enabled"] = json!({"type":"boolean","description":"Turn the selected templates on (true) or off (false)."});
+            properties["ids"] = json!({"type":["array","null"],"items":{"type":"string","pattern":"^([a-zA-Z0-9]+[-_])*[a-zA-Z0-9]+$"},"maxItems":30000,"description":"Template ids. Exactly one of ids, a filter (search, severity, tag) or all."});
+            properties["all"] = json!({"type":["boolean","null"],"default":false,"description":"Every passive-capable template."});
+            json!({"type":"object","additionalProperties":false,"required":["enabled"],"properties":properties})
+        }
+        _ => return None,
+    })
+}
+
 fn examples_output_schema(operation: &str) -> Option<Value> {
     if operation != "examples" {
         return None;
@@ -5656,6 +5999,9 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
     if let Some(schema) = scanner_input_schema(operation, required_fields) {
         return schema;
     }
+    if let Some(schema) = templates_input_schema(operation) {
+        return schema;
+    }
     let mut properties = serde_json::Map::new();
     let fields = call_allowed_fields(operation).unwrap_or(required_fields);
     for field in fields {
@@ -5880,6 +6226,15 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
             "sort_key",
             "sort_direction",
         ],
+        "templates.library.status" | "templates.library.check" | "templates.library.download" => {
+            &[]
+        }
+        "templates.library.import" => &["file"],
+        "templates.list" => &[
+            "search", "severity", "tag", "protocol", "support", "enabled", "limit", "offset",
+        ],
+        "templates.get" => &["id"],
+        "templates.passive.set_enabled" => &["enabled", "ids", "search", "severity", "tag", "all"],
         "capture.browser.list" => &[],
         "capture.browser.open" => &["browser", "url", "fresh", "agent"],
         "capture.browser.prefer" => &["browser"],
@@ -6111,6 +6466,7 @@ fn command_input_preview(command: &Command) -> Value {
             },
         },
         Command::Scanner { command } => scanner_input_preview(command),
+        Command::Templates { command } => templates_input_preview(command),
         Command::Findings { command } => match command {
             FindingsCommand::List(args) => json!({"session_id":args.session_id,"limit":args.limit}),
             FindingsCommand::Get(args) => json!({"session_id":args.session_id,"id":args.id}),
@@ -6556,6 +6912,7 @@ fn command_api_preview(command: &Command) -> Result<Value> {
             ),
         },
         Command::Scanner { command } => scanner_api_preview(command),
+        Command::Templates { command } => templates_api_preview(command),
         Command::Findings { command } => findings_api_preview(command),
         Command::EventLog {
             command: EventLogCommand::List(args),
@@ -7222,6 +7579,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
     ) {
         notes.push("This operation may send traffic; failed sends should not be retried blindly.");
     }
+    match command.operation_name() {
+        "templates.library.check" | "templates.library.download" => notes.push("Contacts GitHub through the environment's proxy: the latest-release API, then for a download the release's checksums file and source .tar.gz. A download that does not match the published SHA-256 is not installed. Dry-run contacts nothing."),
+        "templates.library.import" => notes.push("Reads the local .tar.gz and uploads it to the running Sniper, which installs it; nothing contacts GitHub. Dry-run reads nothing."),
+        "templates.passive.set_enabled" => notes.push("Enabled passive templates judge captured responses whose host is in a non-empty Scope include list while Passive Scan is on, and never send requests. Run findings rescan to apply a change to stored history."),
+        _ => {}
+    }
     notes
 }
 
@@ -7615,6 +7978,72 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
         operation if operation.starts_with("scanner.") => Command::Scanner {
             command: scanner_command_from_input(operation, input)?,
         },
+        "templates.library.status" => Command::Templates {
+            command: TemplatesCommand::Library {
+                command: TemplatesLibraryCommand::Status,
+            },
+        },
+        "templates.library.check" => Command::Templates {
+            command: TemplatesCommand::Library {
+                command: TemplatesLibraryCommand::Check,
+            },
+        },
+        "templates.library.download" => Command::Templates {
+            command: TemplatesCommand::Library {
+                command: TemplatesLibraryCommand::Download,
+            },
+        },
+        "templates.library.import" => Command::Templates {
+            command: TemplatesCommand::Library {
+                command: TemplatesLibraryCommand::Import(TemplatesImportArgs {
+                    file: call_required::<String>(operation, input, "file")?.into(),
+                }),
+            },
+        },
+        "templates.list" => {
+            let limit = call_optional::<u64>(operation, input, "limit")?.unwrap_or(200);
+            if !(1..=30_000).contains(&limit) {
+                bail!("invalid field `limit` for `{operation}`; expected 1 to 30000");
+            }
+            Command::Templates {
+                command: TemplatesCommand::List(TemplatesListArgs {
+                    filter: call_templates_filter(operation, input)?,
+                    protocol: call_optional(operation, input, "protocol")?,
+                    support: call_optional_enum_string(
+                        operation,
+                        input,
+                        "support",
+                        &["passive", "active", "unsupported"],
+                    )?,
+                    enabled: call_optional(operation, input, "enabled")?,
+                    limit,
+                    offset: call_optional(operation, input, "offset")?.unwrap_or(0),
+                }),
+            }
+        }
+        "templates.get" => {
+            let id: String = call_required(operation, input, "id")?;
+            if !valid_template_id(&id) {
+                bail!("invalid field `id` for `{operation}`");
+            }
+            Command::Templates {
+                command: TemplatesCommand::Get(TemplatesGetArgs { id }),
+            }
+        }
+        "templates.passive.set_enabled" => {
+            let args = TemplatesPassiveArgs {
+                enabled: call_required(operation, input, "enabled")?,
+                ids: call_optional(operation, input, "ids")?.unwrap_or_default(),
+                filter: call_templates_filter(operation, input)?,
+                all: call_bool(operation, input, "all")?,
+            };
+            templates_passive_body(&args)?;
+            Command::Templates {
+                command: TemplatesCommand::Passive {
+                    command: TemplatesPassiveCommand::SetEnabled(args),
+                },
+            }
+        }
         "findings.list" => Command::Findings {
             command: FindingsCommand::List(SessionReadListArgs {
                 session_id: call_optional(operation, input, "session_id")?,
@@ -8560,6 +8989,14 @@ fn call_optional_path(operation: &str, input: &Value, field: &str) -> Result<Opt
     Ok(call_optional::<String>(operation, input, field)?.map(PathBuf::from))
 }
 
+fn call_templates_filter(operation: &str, input: &Value) -> Result<TemplatesFilterArgs> {
+    Ok(TemplatesFilterArgs {
+        search: call_optional(operation, input, "search")?,
+        severity: call_optional(operation, input, "severity")?,
+        tag: call_optional(operation, input, "tag")?,
+    })
+}
+
 fn call_bool(operation: &str, input: &Value, field: &str) -> Result<bool> {
     Ok(call_optional::<bool>(operation, input, field)?.unwrap_or(false))
 }
@@ -9141,6 +9578,7 @@ async fn run(cli: Cli) -> Result<()> {
                     CaptureCommand::Browser { command } => handle_browser(api, command).await,
                 },
                 Command::Scanner { command } => handle_scanner(api, command).await,
+                Command::Templates { command } => handle_templates(api, command).await,
                 Command::Findings { command } => handle_findings(api, command).await,
                 Command::EventLog { command } => handle_event_log(api, command).await,
                 Command::Scope { command } => handle_target(api, command).await,
@@ -9403,6 +9841,102 @@ fn browser_open_body(args: &BrowserOpenArgs) -> Value {
         "fresh": args.fresh,
         "agent": args.agent,
     })
+}
+
+/// How long a download or import may take before the CLI stops waiting; the
+/// server keeps going and `templates library status` reports the outcome.
+const TEMPLATE_LIBRARY_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_TEMPLATE_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+
+async fn wait_for_template_library(api: &ApiClient) -> Result<Value> {
+    let deadline = std::time::Instant::now() + TEMPLATE_LIBRARY_WAIT;
+    loop {
+        let status: Value = api.get_json("/api/templates/library").await?;
+        match status["state"].as_str() {
+            Some("idle") => return Ok(status),
+            Some("failed") => bail!(
+                "the template library failed: {}",
+                status["error"].as_str().unwrap_or("unknown error")
+            ),
+            _ if std::time::Instant::now() >= deadline => bail!(
+                "still busy after {} seconds; `templates library status` reports the outcome",
+                TEMPLATE_LIBRARY_WAIT.as_secs()
+            ),
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+}
+
+async fn handle_templates(api: ApiClient, command: TemplatesCommand) -> Result<()> {
+    match command {
+        TemplatesCommand::Library { command } => match command {
+            TemplatesLibraryCommand::Status => {
+                let status: Value = api.get_json("/api/templates/library").await?;
+                print_json(&status)
+            }
+            TemplatesLibraryCommand::Check => {
+                let checked: Value = api
+                    .post_json("/api/templates/library/check", &json!({}))
+                    .await?;
+                print_json(&checked)
+            }
+            TemplatesLibraryCommand::Download => {
+                let _: Value = api
+                    .post_json(
+                        "/api/templates/library/download",
+                        &json!({ "acknowledged": true }),
+                    )
+                    .await?;
+                print_json(&wait_for_template_library(&api).await?)
+            }
+            TemplatesLibraryCommand::Import(args) => {
+                let size = std::fs::metadata(&args.file)
+                    .with_context(|| format!("cannot read {}", args.file.display()))?
+                    .len();
+                if size > MAX_TEMPLATE_ARCHIVE_BYTES {
+                    bail!("{} is larger than 64 MiB", args.file.display());
+                }
+                let bytes = std::fs::read(&args.file)
+                    .with_context(|| format!("cannot read {}", args.file.display()))?;
+                const PATH: &str = "/api/templates/library/import";
+                let response = api
+                    .long_client
+                    .post(api.url(PATH))
+                    .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+                    .body(bytes)
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to POST {PATH}"))?;
+                let status = response.status();
+                if !status.is_success() {
+                    let message = response.text().await.unwrap_or_default();
+                    bail!(
+                        "request to {PATH} failed ({status}): {}",
+                        api_failure_detail(status, message)
+                    );
+                }
+                print_json(&wait_for_template_library(&api).await?)
+            }
+        },
+        TemplatesCommand::List(args) => {
+            let page: Value = api.get_json(&templates_list_path(&args)).await?;
+            print_json(&page)
+        }
+        TemplatesCommand::Get(args) => {
+            if !valid_template_id(&args.id) {
+                bail!("`{}` is not a template id", args.id);
+            }
+            let detail: Value = api.get_json(&format!("/api/templates/{}", args.id)).await?;
+            print_json(&detail)
+        }
+        TemplatesCommand::Passive {
+            command: TemplatesPassiveCommand::SetEnabled(args),
+        } => {
+            let body = templates_passive_body(&args)?;
+            let saved: Value = api.post_json("/api/templates/passive", &body).await?;
+            print_json(&saved)
+        }
+    }
 }
 
 async fn handle_browser(api: ApiClient, command: BrowserCommand) -> Result<()> {
@@ -20287,6 +20821,50 @@ mod tests {
             let spec = operation_spec(operation).unwrap();
             assert_eq!(spec.input_schema["additionalProperties"], false);
         }
+    }
+
+    // Turning passive templates on takes exactly one selection, so a missing
+    // filter can never mean "all of them".
+    #[test]
+    fn templates_commands_validate_before_contacting_sniper() {
+        let passive =
+            |input: Value| command_from_operation_input("templates.passive.set_enabled", &input);
+        assert!(passive(json!({"enabled":true})).is_err());
+        assert!(passive(json!({"enabled":true,"ids":["tech-detect"],"all":true})).is_err());
+        assert!(passive(json!({"enabled":true,"ids":["../x"]})).is_err());
+        let by_tag = passive(json!({"enabled":false,"tag":"waf"})).unwrap();
+        assert_eq!(
+            super::command_api_preview(&by_tag).unwrap()["body"],
+            json!({"filter":{"tag":"waf","support":"passive"},"enabled":false})
+        );
+        assert!(command_from_operation_input("templates.get", &json!({"id":"a/b"})).is_err());
+        assert!(command_from_operation_input("templates.list", &json!({"limit":0})).is_err());
+        let list = command_from_operation_input(
+            "templates.list",
+            &json!({"search":"a b&c","support":"passive"}),
+        )
+        .unwrap();
+        assert_eq!(
+            super::command_api_preview(&list).unwrap()["path"],
+            "/api/templates?search=a+b%26c&support=passive&limit=200&offset=0"
+        );
+        assert!(Cli::try_parse_from([
+            "sniper-cli",
+            "templates",
+            "passive",
+            "set-enabled",
+            "--enabled",
+            "true",
+            "--all"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["sniper-cli", "templates", "list", "--limit", "0"]).is_err());
+        let download =
+            command_from_operation_input("templates.library.download", &json!({})).unwrap();
+        assert!(download.requires_confirmation());
+        assert!(super::dry_run_notes(&download)
+            .iter()
+            .any(|note| note.contains("Contacts GitHub")));
     }
 
     // The desktop map reads every retained row; the CLI can too, without a
