@@ -11390,9 +11390,10 @@ function initFindingsResizer() {
       }
       const delta = moveEvent.clientY - event.clientY;
       const nextDetail = Math.max(120, Math.min(start.detail - delta, combinedHeight - 60));
-      const nextTable = combinedHeight - nextDetail;
-      tableShell.style.flex = "0 0 " + Math.round(nextTable) + "px";
-      els.findingsDetailPanel.style.flex = "0 0 " + Math.round(nextDetail) + "px";
+      // Only the detail height is user-sized. The table must still consume
+      // space when the window grows, and the detail must shrink with it.
+      tableShell.style.flex = "1 1 0px";
+      els.findingsDetailPanel.style.flex = "0 1 " + Math.round(nextDetail) + "px";
     };
 
     const onUp = () => {
@@ -11427,6 +11428,7 @@ function renderProxyPanels() {
   const showProxySettings = state.activeProxyTab === "proxy-settings";
   const showPlaceholder = !showHistory && !showIntercept && !showWebsockets && !showMatchReplace && !showFindings && !showOast && !showProxySettings;
 
+  els.proxyShell?.classList.toggle("findings-active", showFindings);
   els.colorTagFilter.classList.toggle("hidden", !showHistory);
   els.filterBar.classList.toggle("hidden", !showHistory);
   els.trafficRegion.classList.toggle("hidden", !showHistory);

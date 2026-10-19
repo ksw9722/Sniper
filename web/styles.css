@@ -4250,10 +4250,17 @@ button.utility-button.replay-tab-add {
 
 /* ── Findings (Passive Scanner) ── */
 
+.proxy-shell.findings-active {
+  /* Findings owns its own split. Do not make its percentage-height flex panes
+     span the hidden HTTP toolbar, history, and saved message-height tracks. */
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 #findingsPanel {
   padding: 0;
   display: flex;
   flex-direction: column;
+  height: 100%;
 }
 
 #findingsPanel .history-table-shell {
