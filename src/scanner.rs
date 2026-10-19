@@ -3145,42 +3145,41 @@ fn check_security_misconfig(record: &TransactionRecord, findings: &mut Vec<Scann
     let policies: Vec<_> = response
         .headers
         .iter()
-        .filter(|header| header.name.eq_ignore_ascii_case("content-security-policy"))
-        .flat_map(|header| header.value.split(','))
-        .map(CspScriptPolicy::parse)
+        .enumerate()
+        .filter(|(_, header)| header.name.eq_ignore_ascii_case("content-security-policy"))
+        .flat_map(|(index, header)| {
+            header
+                .value
+                .split(',')
+                .map(move |policy| CspScriptPolicy::parse(policy, index + 2))
+        })
         .collect();
-    let csp_evidence = || {
-        response
-            .headers
-            .iter()
-            .filter(|header| header.name.eq_ignore_ascii_case("content-security-policy"))
-            .map(|header| header.value.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if !policies.is_empty() {
-        if csp_policies_allow(&policies, CspScriptContext::Element)
-            || csp_policies_allow(&policies, CspScriptContext::Attribute)
-        {
-            findings.push(make_finding(
-                record,
-                Severity::Medium,
-                "misconfig",
-                "CSP allows unsafe-inline",
-                "Content-Security-Policy contains 'unsafe-inline', which undermines XSS protection by allowing inline scripts.",
-                truncate_evidence(&csp_evidence(), 120),
-            ));
-        }
-        if csp_policies_allow(&policies, CspScriptContext::Eval) {
-            findings.push(make_finding(
-                record,
-                Severity::Medium,
-                "misconfig",
-                "CSP allows unsafe-eval",
-                "Content-Security-Policy contains 'unsafe-eval', which allows eval() and similar dynamic code execution.",
-                truncate_evidence(&csp_evidence(), 120),
-            ));
-        }
+    if let Some((evidence, location)) = [CspScriptContext::Element, CspScriptContext::Attribute]
+        .into_iter()
+        .find_map(|context| csp_finding_evidence(&policies, context))
+    {
+        let mut finding = make_finding(
+            record,
+            Severity::Medium,
+            "misconfig",
+            "CSP allows unsafe-inline",
+            "Content-Security-Policy contains 'unsafe-inline', which undermines XSS protection by allowing inline scripts.",
+            evidence,
+        );
+        finding.location = Some(location);
+        findings.push(finding);
+    }
+    if let Some((evidence, location)) = csp_finding_evidence(&policies, CspScriptContext::Eval) {
+        let mut finding = make_finding(
+            record,
+            Severity::Medium,
+            "misconfig",
+            "CSP allows unsafe-eval",
+            "Content-Security-Policy contains 'unsafe-eval', which allows eval() and similar dynamic code execution.",
+            evidence,
+        );
+        finding.location = Some(location);
+        findings.push(finding);
     }
 
     // Cache-Control missing on authenticated responses. Browsers send cookies
@@ -3241,17 +3240,48 @@ enum CspScriptContext {
     Eval,
 }
 
+struct CspScriptDirective {
+    raw: String,
+    sources: Vec<String>,
+}
+
+impl CspScriptDirective {
+    fn evidence(&self, context: CspScriptContext) -> String {
+        if self.raw.len() <= 120 {
+            return self.raw.clone();
+        }
+        // A long source list can hide the unsafe keyword even after selecting
+        // the operative directive. Keep both visible; location retains the
+        // exact original header when this abbreviated excerpt is not contiguous.
+        let keyword = match context {
+            CspScriptContext::Eval => "'unsafe-eval'",
+            CspScriptContext::Element | CspScriptContext::Attribute => "'unsafe-inline'",
+        };
+        let name = self.raw.split_ascii_whitespace().next().unwrap_or_default();
+        let source = self
+            .raw
+            .split_ascii_whitespace()
+            .find(|source| source.eq_ignore_ascii_case(keyword))
+            .unwrap_or(keyword);
+        format!("{name} ... {source}")
+    }
+}
+
 #[derive(Default)]
 struct CspScriptPolicy {
-    default: Option<Vec<String>>,
-    script: Option<Vec<String>>,
-    element: Option<Vec<String>>,
-    attribute: Option<Vec<String>>,
+    header_line: usize,
+    default: Option<CspScriptDirective>,
+    script: Option<CspScriptDirective>,
+    element: Option<CspScriptDirective>,
+    attribute: Option<CspScriptDirective>,
 }
 
 impl CspScriptPolicy {
-    fn parse(policy: &str) -> Self {
-        let mut parsed = Self::default();
+    fn parse(policy: &str, header_line: usize) -> Self {
+        let mut parsed = Self {
+            header_line,
+            ..Self::default()
+        };
         for directive in policy.split(';') {
             // CSP parsing discards non-ASCII directives rather than allowing
             // Unicode whitespace to create a browser-inert source restriction.
@@ -3271,21 +3301,51 @@ impl CspScriptPolicy {
             };
             // Browsers ignore a repeated directive after its first occurrence.
             if slot.is_none() {
-                *slot = Some(parts.map(str::to_ascii_lowercase).collect());
+                *slot = Some(CspScriptDirective {
+                    raw: directive.trim().to_string(),
+                    sources: parts.map(str::to_ascii_lowercase).collect(),
+                });
             }
         }
         parsed
     }
 
-    fn sources(&self, context: CspScriptContext) -> Option<&[String]> {
-        let script = self.script.as_deref().or(self.default.as_deref());
+    fn directive(&self, context: CspScriptContext) -> Option<&CspScriptDirective> {
+        let script = self.script.as_ref().or(self.default.as_ref());
         match context {
-            CspScriptContext::Element => self.element.as_deref().or(script),
-            CspScriptContext::Attribute => self.attribute.as_deref().or(script),
+            CspScriptContext::Element => self.element.as_ref().or(script),
+            CspScriptContext::Attribute => self.attribute.as_ref().or(script),
             // script-src-elem/attr do not govern eval(), even when present.
             CspScriptContext::Eval => script,
         }
     }
+
+    fn sources(&self, context: CspScriptContext) -> Option<&[String]> {
+        self.directive(context)
+            .map(|directive| directive.sources.as_slice())
+    }
+}
+
+fn csp_finding_evidence(
+    policies: &[CspScriptPolicy],
+    context: CspScriptContext,
+) -> Option<(String, FindingLocation)> {
+    if !csp_policies_allow(policies, context) {
+        return None;
+    }
+    // Select a representative directive only after every enforced policy has
+    // allowed this same context, preserving intersection and fallback semantics.
+    policies.iter().find_map(|policy| {
+        let directive = policy.directive(context)?;
+        Some((
+            directive.evidence(context),
+            FindingLocation {
+                side: "response".to_string(),
+                section: "header".to_string(),
+                line: Some(policy.header_line),
+            },
+        ))
+    })
 }
 
 fn csp_policies_allow(policies: &[CspScriptPolicy], context: CspScriptContext) -> bool {
@@ -8203,6 +8263,252 @@ mod tests {
             .into_iter()
             .map(|finding| finding.title)
             .collect()
+    }
+
+    #[test]
+    fn csp_evidence_selects_unsafe_attribute_after_protected_script_prefix() {
+        for protection in [
+            "'nonce-Zml4dHVyZQ=='",
+            "'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='",
+        ] {
+            let policy = format!(
+                "default-src 'self' https://example.com/default-source-padding-to-keep-the-operative-script-directive-after-the-truncation-boundary; script-src 'self' 'unsafe-inline' {protection}; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+            );
+            assert!(policy.find("script-src-attr").unwrap() > 120);
+            let record = make_record(
+                vec![],
+                vec![("content-security-policy", &policy)],
+                "<html><button onclick=\"void 0\">Example</button></html>",
+                200,
+            );
+            let findings = findings_for_rule(&record, "misconfig");
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].title, "CSP allows unsafe-inline");
+            assert_eq!(findings[0].severity, Severity::Medium);
+            assert_eq!(findings[0].evidence, "script-src-attr 'unsafe-inline'");
+            assert_eq!(
+                findings[0].location,
+                Some(FindingLocation {
+                    side: "response".into(),
+                    section: "header".into(),
+                    line: Some(2),
+                })
+            );
+            let restricted =
+                policy.replace("script-src-attr 'unsafe-inline'", "script-src-attr 'none'");
+            assert!(csp_titles(vec![("content-security-policy", &restricted)]).is_empty());
+        }
+    }
+
+    #[test]
+    fn csp_evidence_targets_enforced_header_despite_identical_decoys() {
+        let directive = "ScRiPt-SrC-AtTr\t'UNSAFE-INLINE'";
+        let record = make_record(
+            vec![("x-example-copy", directive)],
+            vec![
+                ("x-example-copy", directive),
+                ("Content-Security-Policy-Report-Only", directive),
+                ("Content-Security-Policy", "img-src 'none'"),
+                ("Content-Security-Policy", directive),
+            ],
+            directive,
+            200,
+        );
+        let findings = findings_for_rule(&record, "misconfig");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].evidence, directive);
+        let location = findings[0].location.as_ref().unwrap();
+        assert_eq!(location.side, "response");
+        assert_eq!(location.section, "header");
+        assert_eq!(location.line, Some(5));
+        assert_eq!(
+            raw_response_text_for_finding(&record)
+                .unwrap()
+                .lines()
+                .nth(location.line.unwrap() - 1)
+                .unwrap(),
+            format!("Content-Security-Policy: {directive}")
+        );
+    }
+
+    #[test]
+    fn csp_evidence_preserves_first_duplicate_and_effective_fallback() {
+        for (policy, expected) in [
+            (
+                "default-src 'unsafe-inline'; default-src 'none'",
+                "default-src 'unsafe-inline'",
+            ),
+            (
+                "script-src 'unsafe-inline'; script-src 'none'",
+                "script-src 'unsafe-inline'",
+            ),
+            (
+                "script-src-elem 'unsafe-inline'; script-src-elem 'none'",
+                "script-src-elem 'unsafe-inline'",
+            ),
+            (
+                "script-src-attr 'unsafe-inline'; script-src-attr 'none'",
+                "script-src-attr 'unsafe-inline'",
+            ),
+            (
+                "default-src 'unsafe-inline'; script-src-elem 'none'",
+                "default-src 'unsafe-inline'",
+            ),
+            (
+                "script-src 'unsafe-inline'; script-src-elem 'nonce-Zml4dHVyZQ=='",
+                "script-src 'unsafe-inline'",
+            ),
+            (
+                "script-src\u{a0}'none'; script-src 'unsafe-inline'",
+                "script-src 'unsafe-inline'",
+            ),
+            (
+                "script-src-attr; script-src-attr 'unsafe-inline'; script-src-elem 'unsafe-inline'",
+                "script-src-elem 'unsafe-inline'",
+            ),
+        ] {
+            let record = make_record(vec![], vec![("content-security-policy", policy)], "", 200);
+            let findings = findings_for_rule(&record, "misconfig");
+            assert_eq!(findings.len(), 1, "{policy}");
+            assert_eq!(findings[0].evidence, expected, "{policy}");
+        }
+    }
+
+    #[test]
+    fn csp_evidence_uses_context_allowed_across_all_enforced_policies() {
+        let element = "script-src-elem 'unsafe-inline'";
+        let attribute = "script-src-elem 'none'; script-src-attr 'unsafe-inline'";
+        let combined = format!("{element}, {attribute}");
+        for (headers, line) in [
+            (
+                vec![
+                    ("content-security-policy", element),
+                    ("content-security-policy", attribute),
+                ],
+                3,
+            ),
+            (vec![("content-security-policy", combined.as_str())], 2),
+        ] {
+            let record = make_record(vec![], headers, "", 200);
+            let findings = findings_for_rule(&record, "misconfig");
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].evidence, "script-src-attr 'unsafe-inline'");
+            assert_eq!(findings[0].location.as_ref().unwrap().line, Some(line));
+        }
+        let restricted_element = "script-src-elem 'unsafe-inline'; script-src-attr 'none'";
+        let blocked = format!("{restricted_element}, {attribute}");
+        for headers in [
+            vec![
+                ("content-security-policy", restricted_element),
+                ("content-security-policy", attribute),
+            ],
+            vec![("content-security-policy", blocked.as_str())],
+        ] {
+            assert!(csp_titles(headers).is_empty());
+        }
+    }
+
+    #[test]
+    fn csp_eval_evidence_uses_script_or_default_instead_of_element_decoy() {
+        for directive in ["script-src", "default-src"] {
+            let policy = format!(
+                "script-src-elem 'unsafe-eval'; script-src-attr 'none'; {directive} 'nonce-Zml4dHVyZQ==' 'unsafe-eval'"
+            );
+            let record = make_record(vec![], vec![("content-security-policy", &policy)], "", 200);
+            let findings = findings_for_rule(&record, "misconfig");
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].title, "CSP allows unsafe-eval");
+            assert_eq!(
+                findings[0].evidence,
+                format!("{directive} 'nonce-Zml4dHVyZQ==' 'unsafe-eval'")
+            );
+        }
+    }
+
+    #[test]
+    fn csp_evidence_bounds_long_directives_without_hiding_unsafe_keyword() {
+        let policy = format!(
+            "SCRIPT-SRC https://example.com/{} 'UNSAFE-INLINE' 'UNSAFE-EVAL'",
+            "x".repeat(160)
+        );
+        let record = make_record(
+            vec![],
+            vec![
+                ("content-security-policy-report-only", &policy),
+                ("content-security-policy", &policy),
+            ],
+            "",
+            200,
+        );
+        let findings = findings_for_rule(&record, "misconfig");
+        assert_eq!(findings.len(), 2);
+        for (finding, keyword) in findings.iter().zip(["'UNSAFE-INLINE'", "'UNSAFE-EVAL'"]) {
+            assert_eq!(finding.evidence, format!("SCRIPT-SRC ... {keyword}"));
+            assert!(finding.evidence.len() <= 120);
+            assert_eq!(finding.location.as_ref().unwrap().line, Some(3));
+        }
+        for length in [120, 121] {
+            let prefix = "script-src https://example.com/";
+            let suffix = " 'unsafe-inline'";
+            let policy = format!(
+                "{prefix}{}{suffix}",
+                "x".repeat(length - prefix.len() - suffix.len())
+            );
+            assert_eq!(policy.len(), length);
+            let record = make_record(vec![], vec![("content-security-policy", &policy)], "", 200);
+            let findings = findings_for_rule(&record, "misconfig");
+            assert_eq!(findings.len(), 1);
+            let expected = if length == 120 {
+                policy.as_str()
+            } else {
+                "script-src ... 'unsafe-inline'"
+            };
+            assert_eq!(findings[0].evidence, expected);
+            assert!(findings[0].evidence.len() <= 120);
+        }
+    }
+
+    #[test]
+    fn csp_evidence_keeps_host_dedup_and_rescan_first_record() {
+        let first = make_record(
+            vec![],
+            vec![("content-security-policy", "script-src-attr 'unsafe-inline'")],
+            "",
+            200,
+        );
+        let mut later = make_record(
+            vec![],
+            vec![("content-security-policy", "script-src 'unsafe-inline'")],
+            "",
+            200,
+        );
+        later.path = "/another".into();
+        let first_finding = findings_for_rule(&first, "misconfig").remove(0);
+        let later_finding = findings_for_rule(&later, "misconfig").remove(0);
+        assert_ne!(first_finding.evidence, later_finding.evidence);
+        assert_eq!(
+            finding_dedup_key(&first_finding),
+            finding_dedup_key(&later_finding)
+        );
+        let mut legacy_preview = first_finding.clone();
+        legacy_preview.evidence = "default-src 'self'; script-src 'nonce-Zml4dHVyZQ=='...".into();
+        assert_eq!(
+            finding_dedup_key(&legacy_preview),
+            finding_dedup_key(&first_finding)
+        );
+        let mut config = ScannerConfig::default();
+        for &(id, _) in BUILTIN_RULES {
+            config.rules.insert(id.into(), id == "misconfig");
+        }
+        let mut rescan = Rescan::new(config);
+        rescan.scan(&first);
+        rescan.scan(&later);
+        let (findings, scanned) = rescan.finish();
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].record_id, first.id);
+        assert_eq!(findings[0].evidence, first_finding.evidence);
+        assert_eq!(findings[0].location, first_finding.location);
     }
 
     #[test]
