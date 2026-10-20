@@ -79,7 +79,7 @@ interval — intercepts appear asynchronously.
 
 ## 4. Where things live
 
-`README.md` lists the modules. This is the reverse index: what to open for a
+`docs/architecture.md` lists the modules. This is the reverse index: what to open for a
 given change, including the parts that are easy to miss.
 
 | Change | Files |

@@ -1,47 +1,65 @@
 # Recon endpoint discovery
 
-Recon combines an explicitly scoped static crawler, existing urlscan results, and the Wayback CDX index into one session-owned endpoint inventory. Choose the **Recon** tab, enter an absolute target URL, choose sources and optional budgets, then start. Every source reports its own status, request count, discoveries, partial results and warnings. Stop cancels in-flight local work. Switching sessions keeps jobs and their results attached to the original session; deleting a session or shutting down cancels its jobs. Restarted unfinished jobs are marked interrupted and never silently resumed.
+Recon builds one endpoint inventory per session from three sources: a static crawler of the target, existing urlscan results, and the Wayback CDX index. Open the **Recon** tab, enter an absolute target URL, choose sources and optional budgets, then start. Each source reports its status, request count, discoveries, partial results and warnings. **Stop** cancels the job's local work. Jobs stay with their session when you switch sessions; deleting the session or shutting Sniper down cancels them. After a restart, unfinished jobs are marked interrupted and do not resume.
 
 ## Scope and consent
 
-Only use this feature against targets you are authorized to assess. A target is mandatory. The default scope is its exact hostname, scheme and effective port. The optional subdomain checkbox includes that domain and descendants through Sniper's shared host matcher. HTTP on port 80 may upgrade to HTTPS on port 443; HTTPS is never downgraded. All other ports and hosts are excluded. Paths do not narrow scope. The crawler rechecks every redirect, link, resource and sitemap URL. Provider results are filtered by the same boundary. WebSocket URLs may be stored as evidence but are never connected to.
+Use Recon only against targets you are authorized to assess. By default, scope is the target's exact hostname, scheme and effective port; the subdomain checkbox adds the domain's subdomains. HTTP on port 80 may upgrade to HTTPS on port 443, never the reverse. Other hosts and ports are out of scope, and paths do not narrow it. Every URL the crawler follows and every provider result is checked against scope. WebSocket URLs may be stored but are never connected to.
 
-The crawler sends unauthenticated GET requests only, with validated TLS and the session's existing upstream proxy configuration. It does not submit forms, execute JavaScript, copy captured cookies/Authorization headers, replay archived URLs, or automatically visit JavaScript candidates. GET requests can still have site-specific side effects. robots.txt rules are discovery hints, not authorization; they are retained as candidates, not fetched. Ordinary links, resource references and sitemap entries can be followed.
+The crawler sends unauthenticated GET requests only, with TLS validation and the session's upstream proxy. It follows ordinary links, resource references and sitemap entries. It does not submit forms, run JavaScript, send captured cookies or `Authorization` headers, or visit archived URLs and JavaScript candidates. GET requests can still have side effects on some sites. robots.txt rules are kept as candidates and not fetched.
 
-History lookup requires acknowledgment that the target hostname is sent to urlscan.io and/or web.archive.org. It does not create a scan. The separate **New urlscan scan** source requires its own acknowledgment and an explicit visibility: private (default), unlisted, or public. Unlisted is not private. urlscan runs its own browser and may load resources outside Sniper's scope; only imported findings are filtered. Account plan/retention rules apply. The target's full URL is submitted, so query strings/fragments and embedded credentials are rejected for new scans. Never submit confidential paths. No automatic visibility fallback is performed. An uncertain submission is not retried. Stopping local polling cannot cancel a scan already accepted by urlscan.
+History lookup sends the target hostname to urlscan.io and/or web.archive.org, so it needs an acknowledgment. It does not create a urlscan scan.
 
-Set URLSCAN_API_KEY in the backend process environment for authenticated urlscan search or submission. The key is never exposed to the UI, written into session state, included in logs, or sent to Archive.org/target hosts. History may work without a key subject to provider policy. Provider connections use a separate TLS-validating direct client and never inherit captured credentials or the target's upstream proxy credentials.
+**New urlscan scan** needs its own acknowledgment and a visibility: private (default), unlisted or public. Unlisted is not private. urlscan loads the target in its own browser, which may load resources outside Sniper's scope. The full target URL is submitted, so URLs with a query string, fragment or credentials are rejected; never submit a confidential path. Sniper does not fall back to another visibility and does not retry a submission with an uncertain outcome. Stop cannot cancel a scan urlscan already accepted.
 
-## Evidence and optional budgets
+Set `URLSCAN_API_KEY` in the environment of the Sniper process for authenticated urlscan search or submission. The key never reaches the UI, session state, logs, Archive.org or the target. History lookup may work without a key, depending on provider policy. Provider requests use their own direct connection and never carry captured credentials or the upstream proxy's credentials.
 
-Inventory deduplication uses normalized URL plus method, preserving query ordering, values and repeated parameters. Fragments are removed from the comparison key, and raw URL spellings are retained separately. URL parsing may normalize host casing, default ports and dot segments; raw observations are not discarded. Methods inferred from form markup and JavaScript URLs are candidates, not observed HTTP requests.
+## Evidence
 
-- live: the local crawler received an HTTP response (including error responses), with observation time and status
-- observed: a literal page reference, or evidence from an explicitly submitted urlscan scan; not proof of current availability
-- history: a historical urlscan or Wayback observation
-- candidate: static JavaScript literal, form action/parameter shape or robots rule; never executed automatically
+Entries are deduplicated by normalized URL plus method. The query string is kept as is, fragments are ignored, and the raw spellings are kept separately. Each observation has one evidence kind:
 
-All four collection budgets default to 0, meaning no configured request, depth, endpoint or provider-page limit. Positive max_requests, max_depth, max_endpoints and max_pages remain available as explicit per-job budgets, without the former maximum values. The endpoint budget counts new inventory entries added by this job, across its sources; existing endpoints can still gain evidence. The page budget applies separately to each history source. A budget that leaves work unexamined is reported as partial. Compatibility note: max_depth=0 previously meant seed depth only; it now means no configured depth limit, like the other budget fields.
+- live: the crawler received an HTTP response, including an error response
+- observed: a literal reference in a page, or a result of a urlscan scan you submitted; the URL may not be available now
+- history: a past urlscan or Wayback observation
+- candidate: a JavaScript URL literal, a form action and its fields, or a robots rule; never visited automatically
 
-There are no fixed collection caps on inventory entries or bytes, response bodies, document tokens, URL/evidence lengths, raw spellings, evidence records or retained jobs. The UI pages through the entire inventory rather than dropping entries beyond 5,000. Collection and parsing still use finite memory and disk space: broad or continuously expanding targets can use substantial resources and may need an explicit budget or Stop. Requests retain timeouts, scoped redirect checks and sequential pacing, and duplicate URLs/cursors cannot create cycles. Provider page sizes and remote quotas, missing scan details, archive gaps and account history windows still affect completeness. This feature does not promise exhaustive discovery.
+## Budgets
 
-urlscan search uses cursor pagination and retrieves full scan results, including request/response URLs, lists, links, redirects and WebSocket observations. Wayback uses CDX resume keys without success-status or MIME filters; errors and old resources can be useful endpoints. Static extraction includes HTML links/resources/base URLs, GET/POST form actions and field names, inline/external JavaScript URL literals, robots hints, and sitemap indexes/URLs. It does not implement browser rendering, authentication, source-map discovery, JavaScript evaluation, wildcard expansion, or deducing dynamic route templates. JavaScript and ECMAScript MIME types are recognized case-insensitively, including extensionless script responses and MIME parameters. The `.js` suffix is a fallback only when no MIME type is declared. Relative JavaScript literals are resolved against the containing document/script as a heuristic.
+`max_requests`, `max_depth`, `max_endpoints` and `max_pages` default to 0, which means no limit; a positive value limits one job. `max_endpoints` counts new entries the job adds; existing entries can still gain evidence. `max_pages` applies to each history source separately. A job that stops at a budget with work left is reported as partial. `max_depth=0` used to mean the seed only; it now means no limit.
+
+Without budgets nothing caps a job, so a broad or growing target can use a lot of memory and disk. Set a budget or use Stop.
+
+## What each source collects
+
+- urlscan: full scan results, including request and response URLs, links, redirects and WebSocket observations.
+- Wayback: CDX records without status or MIME filters, so error responses and old resources appear too.
+- Crawler: HTML links, resources and base URLs; GET and POST form actions and field names; URL literals in inline and external JavaScript; robots hints; and sitemap indexes and URLs. It does not render pages, log in, look for source maps, evaluate JavaScript, expand wildcards or infer dynamic routes.
 
 ## Scope site map
 
-The Scope → Site map view automatically includes the active session's Recon inventory. This is a read-only projection: discovered endpoints do not become captured proxy transactions. Rows identify captured and discovered evidence and retain Recon source and evidence-kind labels. An overlapping captured row keeps its observed HTTP status and capture metrics; request_count counts captured traffic only. Recon-only rows have no captured request to open or replay. Inventory stays attached to its original session and remains available in the map after a session restart.
+**Scope → Site map** includes the active session's Recon inventory, read-only. Rows mark captured and discovered evidence and keep the Recon source and evidence kind. A row that was also captured keeps its HTTP status and capture metrics, and `request_count` counts captured traffic only. Discovered endpoints do not become proxy transactions, so a Recon-only row has no request to open or replay. The inventory is saved with its session and stays in the map after a restart.
 
 ## Local API
 
-- GET /api/recon?session_id=<UUID> returns the session ID, jobs and inventory.
-- POST /api/recon/jobs accepts session_id, target_url, include_subdomains, sources (crawler, urlscan, wayback, urlscan_submit), max_requests, max_depth, max_endpoints and max_pages (all optional, default 0, no configured budget). history_acknowledged is required for history sources; scan_acknowledged and scan_visibility are required for new submissions.
-- POST /api/recon/jobs/<job UUID>/stop with {"session_id":"<UUID>"} cancels a job and returns {"stopped":true,"session_id":"<UUID>"}.
+- `GET /api/recon?session_id=<UUID>` returns the session ID, jobs and inventory.
+- `POST /api/recon/jobs` takes `session_id`, `target_url`, `include_subdomains`, `sources` (`crawler`, `urlscan`, `wayback`, `urlscan_submit`), and the optional budgets above. History sources need `history_acknowledged`; `urlscan_submit` needs `scan_acknowledged` and `scan_visibility`.
+- `POST /api/recon/jobs/<job UUID>/stop` with `{"session_id":"<UUID>"}` cancels a job and returns `{"stopped":true,"session_id":"<UUID>"}`.
 
-There is no dedicated CLI command in this first version. The API uses the same authentication middleware as existing routes. Inventory and jobs are persisted as a backward-compatible defaulted component of session state, without inserting artificial proxy history transactions.
+There is no `sniper-cli` command for Recon yet. The API uses the same authentication as the other routes.
 
 ## Validation
 
-Tests use deterministic fixtures and isolated loopback servers only. No real targets or provider scan submissions are part of the test suite. Run cargo fmt --all -- --check, cargo test --locked --release, node --check web/recon.js and node --test tests/recon_ui.test.cjs, and python3 tests/recon_discovery_smoke.py target/release after rebuilding. Desktop/WebView behavior should also be smoke-tested in a built application before release.
+Tests use local fixtures and loopback servers only. After a rebuild, run:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked --release
+node --check web/recon.js
+node --test tests/recon_ui.test.cjs
+python3 tests/recon_discovery_smoke.py target/release
+```
+
+Smoke-test the desktop app before a release.
 
 ## Provider references
 
