@@ -156,8 +156,8 @@
       els.ScanConsentText.textContent = `Allow sharing ${target ? target.href : "the full target URL"} with urlscan.io for a new ${els.ScanVisibility.value} browser scan, including requests outside Sniper's scope.`;
       els.HistoryConsentText.textContent = `Allow sending ${target ? target.hostname : "the target domain"}${els.Subdomains.checked ? " and its subdomain search scope" : ""} to ${services.join(" and ")} for historical lookups.`;
       els.Scope.textContent = target
-        ? `Scope: ${target.protocol}//${target.hostname}:${target.port || (target.protocol === "https:" ? "443" : "80")}${els.Subdomains.checked ? " and subdomains on the same effective port" : " only"}. Default-port HTTP → HTTPS redirects on the same host are allowed.`
-        : "Enter an explicit HTTP or HTTPS URL. Discovery is limited to its scheme, hostname and effective port.";
+        ? `Stays on ${target.protocol}//${target.hostname}:${target.port || (target.protocol === "https:" ? "443" : "80")}${els.Subdomains.checked ? " and its subdomains" : ""}; a same-host redirect from HTTP to HTTPS is followed.`
+        : "Discovery stays on the URL's scheme, host and port.";
     }
     function renderJobs() {
       const fragment = doc.createDocumentFragment();

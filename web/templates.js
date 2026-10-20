@@ -6,7 +6,7 @@
   // shown, never linked.
   const PAGE_SIZE = 100;
   const BUSY_STATES = new Set(["loading", "downloading", "importing"]);
-  const PASSIVE_KINDS = { global: "Every response", base_url_get: "Captured GET" };
+  const PASSIVE_KINDS = { global: "Judges every captured response", base_url_get: "Judges captured GET responses" };
 
   function listQuery(filters, page) {
     const params = new URLSearchParams();
@@ -39,12 +39,12 @@
       library.verified ? "checksum verified" : "not checksum-verified",
     ];
     if (library.commit) parts.push(`commit ${library.commit.slice(0, 12)}`);
-    return `${parts.join(" · ")} — ${Number(status.templates).toLocaleString()} templates, ${Number(status.passive_supported).toLocaleString()} can run passively, ${Number(status.passive_enabled).toLocaleString()} on, ${Number(status.active_supported || 0).toLocaleString()} can be sent by Template Scan.`;
+    return `${parts.join(" · ")}\n${count(status.templates)} templates · ${count(status.passive_supported)} passive, ${count(status.passive_enabled)} on · ${count(status.active_supported)} scannable`;
   }
 
   function supportLabel(meta) {
     const ways = [];
-    if (meta.passive_supported) ways.push(PASSIVE_KINDS[meta.passive] || "Passive");
+    if (meta.passive_supported) ways.push("Passive");
     if (meta.active_supported) ways.push("Scan");
     if (ways.length) return ways.join(" · ");
     const reason = (meta.reasons || [])[0];
@@ -195,6 +195,9 @@
       const bulk = !!status?.library && els.Support.value === "passive";
       els.EnableShown.disabled = !bulk || busy;
       els.DisableShown.disabled = !bulk || busy;
+      // Preview waits for a library, which may arrive after the scan form
+      // was first drawn.
+      renderScan();
     }
 
     function renderList() {
@@ -229,7 +232,7 @@
       els.PageMeta.textContent = total ? `${first.toLocaleString()}–${Math.min(total, first + items.length - 1).toLocaleString()} of ${total.toLocaleString()}` : "";
       els.Previous.disabled = page === 0;
       els.Next.disabled = (page + 1) * PAGE_SIZE >= total;
-      els.Meta.textContent = status?.library ? `${total.toLocaleString()} shown by the filter` : "";
+      els.Meta.textContent = status?.library ? `${total.toLocaleString()} ${total === 1 ? "template" : "templates"}` : "";
     }
 
     function field(list, label, value) {
@@ -388,7 +391,7 @@
         for (const warning of (job.warnings || []).slice(0, 3)) card.append(element("p", "recon-warning", warning));
         nodes.push(card);
       }
-      if (!nodes.length) nodes.push(element("p", "recon-empty", "No Template Scan in this session yet."));
+      if (!nodes.length) nodes.push(element("p", "recon-empty", "No scans in this session yet."));
       els.ScanJobs.replaceChildren(...nodes);
     }
 

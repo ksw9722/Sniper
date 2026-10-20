@@ -27,17 +27,30 @@ test("the library line says where templates came from and whether they were veri
     library: { source: "github", tag: "v10.5.0", verified: true, commit: "f8b8b8dcd70d1234567890abcdef12345678901" },
     templates: 14035, passive_supported: 2082, passive_enabled: 3,
   });
-  assert.match(line, /nuclei-templates v10\.5\.0 · checksum verified · commit f8b8b8dcd70d/);
-  assert.match(line, /2,082 can run passively, 3 on/);
+  assert.equal(
+    line,
+    "nuclei-templates v10.5.0 · checksum verified · commit f8b8b8dcd70d\n14,035 templates · 2,082 passive, 3 on · 0 scannable",
+  );
   assert.match(templates.libraryLine({ library: { source: "import", verified: false }, templates: 1, passive_supported: 0, passive_enabled: 0 }), /Imported archive · not checksum-verified/);
 });
 
-test("support labels name the passive kind or the first reason it cannot run", () => {
-  assert.equal(templates.supportLabel({ passive_supported: true, passive: "global" }), "Every response");
-  assert.equal(templates.supportLabel({ passive_supported: true, passive: "base_url_get" }), "Captured GET");
+test("the mode says passive, scan or the first reason a template cannot run", () => {
+  assert.equal(templates.supportLabel({ passive_supported: true, passive: "global" }), "Passive");
+  assert.equal(templates.supportLabel({ passive_supported: true, passive: "base_url_get" }), "Passive");
   assert.equal(templates.supportLabel({ passive_supported: false, reasons: ["protocol:dns", "x"] }), "No: protocol:dns");
-  assert.equal(templates.supportLabel({ passive_supported: true, passive: "base_url_get", active_supported: true }), "Captured GET · Scan");
+  assert.equal(templates.supportLabel({ passive_supported: true, passive: "base_url_get", active_supported: true }), "Passive · Scan");
   assert.equal(templates.supportLabel({ active_supported: true, reasons: ["randomness"] }), "Scan");
+});
+
+test("the list filters keep their own width beside the search box", () => {
+  // The shell sizes its form controls to their column; a later rule must
+  // give the toolbar's selects their own width back, or the search box
+  // shrinks to nothing and the toolbar overlaps itself.
+  const css = fs.readFileSync(path.join(__dirname, "../web/styles.css"), "utf8");
+  const shell = css.indexOf(".templates-shell select,");
+  const own = css.indexOf(".templates-shell .recon-search-controls select {");
+  assert.ok(shell > 0 && own > shell, "the toolbar rule follows the shell's");
+  assert.match(css.slice(own, css.indexOf("}", own)), /width: auto/);
 });
 
 test("a scan request names its targets, its selection and whether it only counts", () => {
@@ -143,5 +156,25 @@ test("opening Scan rereads the scope, and its warning follows the scope it is to
   assert.equal(note.classList.contains("hidden"), true);
   controller.setVisible(true);
   assert.equal(shown, 1, "only opening Scan rereads the scope");
+  controller.dispose();
+});
+
+test("Preview can be pressed once the library has loaded", async () => {
+  const els = new Map();
+  const shell = {
+    ownerDocument: { createElement: () => fakeElement() },
+    querySelector(selector) { const element = fakeElement(); els.set(selector, element); return element; },
+  };
+  const status = { state: "idle", library: { source: "import", verified: false }, templates: 1, passive_supported: 0, passive_enabled: 0 };
+  const controller = templates.createController({
+    root: shell, getSessionId: () => null, getScopeIncludeCount: () => 1,
+    fetch: async (url) => ({ ok: true, json: async () => (String(url).includes("/library") ? status : { items: [], total: 0 }) }),
+    setTimeout: () => 0, clearTimeout() {},
+  });
+  const preview = els.get("#templatesScanPreview");
+  assert.equal(preview.disabled, true, "nothing to preview before the library loads");
+  controller.setVisible(true);
+  for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(preview.disabled, false);
   controller.dispose();
 });

@@ -8066,7 +8066,8 @@ button.utility-button.replay-tab-add {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(290px, 340px) minmax(0, 1fr);
-  grid-template-rows: minmax(125px, 28%) minmax(0, 1fr);
+  /* Jobs take the room they need, up to a little over a quarter. */
+  grid-template-rows: fit-content(28%) minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
   overflow: hidden;
@@ -8075,8 +8076,9 @@ button.utility-button.replay-tab-add {
 .recon-shell .panel-card { min-width: 0; min-height: 0; }
 .recon-setup { grid-row: 1 / 3; overflow: auto; }
 .recon-form { display: grid; gap: 12px; padding: 14px; }
-.recon-target-row { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
-.recon-target-field { flex: 1 1 230px; }
+/* The card is taller than its form; keep the rows at their own height. */
+.recon-setup .recon-form { align-content: start; }
+.recon-start { justify-self: start; }
 .recon-field { display: grid; gap: 5px; color: var(--text-soft); }
 .recon-shell input:not([type="checkbox"]), .recon-shell select {
   min-width: 0; width: 100%; min-height: var(--control-h);
@@ -8109,7 +8111,7 @@ button.utility-button.replay-tab-add {
 .recon-source-status { font-size: var(--font-sm); color: var(--text-soft); }
 .recon-warning { margin: 3px 0; overflow-wrap: anywhere; }
 .recon-inventory { display: flex; flex-direction: column; overflow: hidden; }
-.recon-inventory-toolbar { flex-wrap: wrap; gap: 10px; }
+.recon-inventory-toolbar { flex-wrap: wrap; align-items: center; gap: 10px; }
 .recon-search-controls { display: flex; gap: 8px; flex: 1 1 320px; }
 .recon-search-controls input { flex: 1 1 160px; }
 .recon-search-controls select { flex: 0 0 auto; width: auto; min-width: 130px; }
@@ -8174,6 +8176,10 @@ button.utility-button.replay-tab-add {
   background: var(--panel-code); color: var(--text); padding: 5px 8px;
 }
 .templates-shell textarea { resize: vertical; font-family: var(--mono); }
+/* The list's filters keep their own width beside the search box: sized to the
+   column like the form's controls, the search box shrinks to nothing. */
+.templates-shell .recon-search-controls select { width: auto; min-width: 130px; }
+.templates-status { white-space: pre-line; }
 .templates-shell input:focus-visible, .templates-shell select:focus-visible, .templates-shell button:focus-visible,
 .templates-shell textarea:focus-visible, .templates-shell summary:focus-visible {
   outline: 2px solid var(--info); outline-offset: 2px;
