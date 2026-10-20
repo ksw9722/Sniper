@@ -11457,36 +11457,47 @@ function renderProxyPanels() {
   els.proxySettingsPanel.classList.toggle("hidden", !showProxySettings);
   els.proxySubPlaceholder.classList.toggle("hidden", !showPlaceholder);
 
+  // Startup renders these panels whichever tool was left open; only Capture in
+  // front may name its tab in the status bar.
+  const footer = (text) => {
+    if (state.activeTool === "proxy") els.footerMode.textContent = text;
+  };
+
   if (showHistory) {
-    els.footerMode.textContent = "HTTP active";
+    footer("HTTP active");
     return;
   }
 
   if (showIntercept) {
-    els.footerMode.textContent = "Intercept active";
+    footer("Intercept active");
     return;
   }
 
   if (showWebsockets) {
     applySavedWebsocketPaneWidth();
-    els.footerMode.textContent = "Web Socket active";
+    footer("Web Socket active");
     return;
   }
 
   if (showMatchReplace) {
     renderMatchReplaceRules();
-    els.footerMode.textContent = "Replace active";
+    footer("Replace active");
     return;
   }
 
   if (showFindings) {
     loadFindings();
-    els.footerMode.textContent = "Findings active";
+    footer("Findings active");
+    return;
+  }
+
+  if (showOast) {
+    footer("OAST active");
     return;
   }
 
   if (showProxySettings) {
-    els.footerMode.textContent = "Settings active";
+    footer("Settings active");
     return;
   }
 
@@ -11494,7 +11505,7 @@ function renderProxyPanels() {
   els.proxySubPath.textContent = `Proxy / ${label}`;
   els.proxySubTitle.textContent = `${label} is planned next`;
   els.proxySubDescription.textContent = `${label} will plug into the same capture store and message workbench.`;
-  els.footerMode.textContent = `${label} placeholder active`;
+  footer(`${label} placeholder active`);
 }
 
 // Set by a rail-tab click so the next render scrolls to that section once.
