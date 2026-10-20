@@ -1614,6 +1614,19 @@ test('metadata chain reads left to right, one column per link, inside its canvas
   assertCanvasContainsGeometry(refreshed);
 });
 
+test('an arrow for Origin and Referer counts each request once', () => {
+  const a = origin('https://a.example.com'), b = origin('https://b.example.com');
+  b.header_links = [header(a.origin), header(a.origin, 'referer_header')].map(link => ({ ...link, request_count: 3, request_kinds: { api: 3 } }));
+  b.header_sources = [{ source_origin: a.origin, request_count: 3, request_kinds: { api: 3 } }];
+  const data = map.normalizeSnapshot(snapshot([a, b]), 'session-one');
+  for (const anchor of [null, b.origin]) {
+    const [edge] = map.graphLayout(data.origins, [a.origin, b.origin], new Map(), anchor).edges;
+    assert.deepEqual([...edge.relationships], ['origin_header', 'referer_header']);
+    assert.equal(edge.count, 3, 'three requests, not six');
+    assert.deepEqual({ ...edge.kinds }, { api: 3 });
+  }
+});
+
 test('reciprocal metadata curves and direct relations remain unclipped without body overlays or self arrows', () => {
   const a = origin('https://a.example.com'), b = origin('https://b.example.com'), c = origin('https://c.example.com');
   a.redirects = [redirect(b.origin)]; b.redirects = [redirect(c.origin), redirect(b.origin)]; c.redirects = [redirect(b.origin)];

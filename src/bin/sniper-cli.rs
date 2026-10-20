@@ -4945,6 +4945,21 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
     let mut credentials = request_count.clone();
     credentials["description"] = json!("Of those rows, how many named the source origin and sent Access-Control-Allow-Credentials: true. Absent when none.");
     links["properties"]["cors_credentials_count"] = credentials;
+    // Optional: older servers, and origins no header names, omit it.
+    let mut sources = service_map_object(json!({
+        "source_origin":string,"request_count":request_count.clone()
+    }));
+    for field in [
+        "request_kinds",
+        "cors_allowed_count",
+        "cors_credentials_count",
+    ] {
+        sources["properties"][field] = links["properties"][field].clone();
+    }
+    let header_sources = json!({
+        "type":"array","items":sources,
+        "description":"The header_links rows per source origin, a row naming it in both Origin and Referer counted once."
+    });
     let mut redirect = service_map_object(json!({
         "target_origin":string,"target_path":string,
         "relationship":{"type":"string","enum":["redirect_instruction"]},
@@ -4962,6 +4977,7 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
         "redirects":{"type":"array","items":redirect},
         "header_links":{"type":"array","items":links}
     }));
+    origin["properties"]["header_sources"] = header_sources;
     origin["properties"]["technology_observations"] = json!({
         "type":"array","maxItems":32,"items":service_map_technology_schema(false, CatalogVersion::V2)
     });
@@ -10520,6 +10536,16 @@ fn validate_service_map_response(
                         && link.request_kinds.values().sum::<usize>() == link.request_count
                         && link.cors_credentials_count <= link.cors_allowed_count
                         && link.cors_allowed_count <= link.request_count
+                })
+                && origin.header_sources.iter().all(|source| {
+                    service_map_safe_origin(&source.source_origin)
+                        && source
+                            .request_kinds
+                            .keys()
+                            .all(|kind| sniper::service_map::REQUEST_KINDS.contains(&kind.as_str()))
+                        && source.request_kinds.values().sum::<usize>() == source.request_count
+                        && source.cors_credentials_count <= source.cors_allowed_count
+                        && source.cors_allowed_count <= source.request_count
                 })
                 && origin
                     .favicon

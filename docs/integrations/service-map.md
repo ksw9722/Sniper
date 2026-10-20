@@ -122,6 +122,8 @@ default, so CDN loads draw no arrows. Hiding a kind hides arrows, not cards; use
 the [Service Map filter](#service-map-filter) to drop cards. Redirects are always
 drawn. The map draws one arrow per direction between two cards, coloured by its
 first shown kind and heavier with more rows; hover it to see its rows by kind.
+`header_sources[]` counts the same rows per source origin with a request that
+carries both headers counted once, and the arrow uses it.
 
 `cors_allowed_count` counts rows whose response let the source origin read it
 (an `Access-Control-Allow-Origin` naming it, or `*`). `cors_credentials_count`

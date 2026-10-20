@@ -933,6 +933,19 @@ fn links_count_rows_whose_response_allowed_the_source_origin() {
             link.relationship
         );
     }
+    // Each row names the page in both headers: eight requests, not sixteen.
+    assert_eq!(api.header_sources.len(), 1);
+    let source = &api.header_sources[0];
+    assert_eq!(source.source_origin, page);
+    assert_eq!(
+        (
+            source.request_count,
+            source.request_kinds.values().sum::<usize>(),
+            source.cors_allowed_count,
+            source.cors_credentials_count
+        ),
+        (8, 8, 3, 1)
+    );
 }
 
 // Bundles, pages and asset URLs name front-end technologies; the map gives an

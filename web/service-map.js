@@ -1054,6 +1054,11 @@
           request_kinds: Object.fromEntries(REQUEST_KINDS.filter((kind) => count(link.request_kinds?.[kind]) > 0).map((kind) => [kind, count(link.request_kinds[kind])])),
           cors_allowed_count: count(link.cors_allowed_count), cors_credentials_count: count(link.cors_credentials_count),
         })),
+        header_sources: array(item.header_sources).filter((source) => safeOrigin(source?.source_origin)).map((source) => ({
+          source_origin: safeOrigin(source.source_origin), request_count: count(source.request_count),
+          request_kinds: Object.fromEntries(REQUEST_KINDS.filter((kind) => count(source.request_kinds?.[kind]) > 0).map((kind) => [kind, count(source.request_kinds[kind])])),
+          cors_allowed_count: count(source.cors_allowed_count), cors_credentials_count: count(source.cors_credentials_count),
+        })),
         redirects: array(item.redirects).filter((redirect) => redirect.relationship === "redirect_instruction" && safeOrigin(redirect.target_origin)).map((redirect) => ({
           target_origin: safeOrigin(redirect.target_origin), target_path: safePath(redirect.target_path),
           evidence: array(redirect.evidence).filter((id) => typeof id === "string" && id.length > 0),
@@ -1233,11 +1238,25 @@
       return [{ source: link.source_origin, target: origin.origin, relationship: link.relationship, label: LINK_LABELS[link.relationship] || "Referer header",
         kind: kinds[0][0], kinds: Object.fromEntries(kinds), count: kinds.reduce((sum, [, rows]) => sum + rows, 0), cors: linkCors(link) }];
     };
+    // Origin and Referer from one source make one arrow that counts requests: a
+    // row naming the source in both is one request in the server's
+    // header_sources. An older server sends no such count; each header then
+    // keeps its own.
+    const headerEdges = (origin) => {
+      const bySource = new Map();
+      for (const link of origin.header_links) bySource.set(link.source_origin, [...(bySource.get(link.source_origin) || []), link]);
+      return [...bySource].flatMap(([source, links]) => {
+        const rows = (origin.header_sources || []).find((item) => item.source_origin === source);
+        if (!rows || links.length < 2) return links.flatMap((link) => headerEdge(origin, link));
+        return headerEdge(origin, { ...rows, relationship: links[0].relationship }).map((edge) => ({ ...edge,
+          relationships: links.map((link) => link.relationship), labels: links.map((link) => LINK_LABELS[link.relationship] || "Referer header") }));
+      });
+    };
     // The explicit overlay gets the first arrow slots. Metadata remains distinct
     // even when the same pair also occurs in a retained response body.
     const declaredEdges = [...bodyEdges.map((edge) => ({ ...edge, inspected: true })), ...visibleOrigins.flatMap((origin) => [
       ...origin.redirects.map((redirect) => ({ source: origin.origin, target: redirect.target_origin, relationship: "redirect_instruction", label: "Redirect instruction", kind: "redirect", count: Math.max(1, count(redirect.request_count)) })),
-      ...origin.header_links.flatMap((link) => headerEdge(origin, link)),
+      ...headerEdges(origin),
     ])];
     const seen = new Map();
     const shown = [];
@@ -1257,8 +1276,10 @@
       if (edge.source === edge.target || !visibleIds.has(edge.source) || !visibleIds.has(edge.target)
         || anchor && edge.source !== anchor && edge.target !== anchor) continue;
       if (seen.has(key)) {
-        const drawn = seen.get(key);
-        if (!drawn.relationships.includes(edge.relationship)) { drawn.relationships.push(edge.relationship); drawn.labels.push(edge.label); }
+        const drawn = seen.get(key), labels = edge.labels || [edge.label];
+        (edge.relationships || [edge.relationship]).forEach((relationship, index) => {
+          if (!drawn.relationships.includes(relationship)) { drawn.relationships.push(relationship); drawn.labels.push(labels[index]); }
+        });
         if (edge.layers) drawn.layers = [...new Set([...(drawn.layers || []), ...edge.layers])];
         if (edge.count) drawn.count = (drawn.count || 0) + edge.count;
         if (edge.kinds) {
@@ -1269,7 +1290,7 @@
         if (edge.cors) drawn.cors = drawn.cors ? drawn.cors.map((value, index) => value + edge.cors[index]) : [...edge.cors];
         continue;
       }
-      const drawn = { ...edge, relationships: [edge.relationship], labels: [edge.label] };
+      const drawn = { ...edge, relationships: [...(edge.relationships || [edge.relationship])], labels: [...(edge.labels || [edge.label])] };
       seen.set(key, drawn);
       edgeCount += 1;
       if (shown.length < MAX_EDGES) shown.push(drawn);
@@ -2850,7 +2871,9 @@
       const hidden = new Set(hiddenLinkKinds());
       const links = new Map(REQUEST_KINDS.map((kind) => [kind, 0]));
       for (const origin of state.snapshot?.origins || []) {
-        for (const link of origin.header_links || []) {
+        // One link per source, whichever headers named it; older servers send
+        // only the per-header counts.
+        for (const link of origin.header_sources?.length ? origin.header_sources : origin.header_links || []) {
           // A page naming its own origin is no link and is never drawn.
           if (link.source_origin === origin.origin) continue;
           for (const [kind] of linkKindCounts(link)) links.set(kind, links.get(kind) + 1);
