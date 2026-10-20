@@ -7,7 +7,7 @@
 
 use std::{borrow::Cow, cell::RefCell, collections::HashMap, time::Duration};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::dsl::{self, Allow, CompileError, EvalError, Interp, Val, Vars};
 use super::engine::{self, CompiledTemplate, UrlVars};
@@ -59,6 +59,8 @@ pub struct ActiveTemplate {
     /// The run keeps the cookies its responses set and sends them on, as
     /// Nuclei does unless `disable-cookie` is set.
     pub cookies: bool,
+    /// The run keeps each answer for later matchers that read it (`body_1`).
+    pub history: bool,
 }
 
 /// One request, ready to send to the target it was built for.
@@ -217,7 +219,30 @@ pub fn compile_active(
         follow,
         max_redirects,
         cookies: !engine::flag(block, "disable-cookie")?,
+        history: reads_history(block),
     })
+}
+
+/// Whether matchers or extractors read an earlier answer (`body_1`), as
+/// Nuclei decides it: an underscore and a digit in an expression or a part.
+fn reads_history(block: &Map<String, Value>) -> bool {
+    let numbered = |value: &Value| {
+        engine::text_of(value)
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0] == b'_' && pair[1].is_ascii_digit())
+    };
+    ["matchers", "extractors"]
+        .iter()
+        .filter_map(|key| block.get(*key).and_then(Value::as_array))
+        .flatten()
+        .any(|item| {
+            ["dsl", "part"].iter().any(|key| match item.get(*key) {
+                Some(Value::Array(items)) => items.iter().any(numbered),
+                Some(value) => numbered(value),
+                None => false,
+            })
+        })
 }
 
 /// What a template's markers read while one run on one target builds its
@@ -263,6 +288,18 @@ impl Vars for RunValues<'_> {
 }
 
 impl ActiveTemplate {
+    /// Hands values an answer's internal extractors found to the run's later
+    /// requests. A template variable of the same name keeps its own value,
+    /// as in Nuclei.
+    pub fn carry(&self, run: &RunValues<'_>, values: Vec<(String, String)>) {
+        let mut stored = run.values.borrow_mut();
+        for (name, value) in values {
+            if !self.variables.iter().any(|(variable, _)| *variable == name) {
+                stored.insert(name, value);
+            }
+        }
+    }
+
     /// Requests one run sends before any redirect.
     pub fn request_count(&self) -> usize {
         self.paths.len() + self.raws.len()

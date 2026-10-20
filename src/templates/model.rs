@@ -213,8 +213,7 @@ const INERT_REQUEST_KEYS: &[&str] = &[
 const LATER_REQUEST_KEYS: &[(&str, &str)] = &[
     ("payloads", "req:payloads"),
     ("attack", "req:payloads"),
-    ("req-condition", "req:req_condition"),
-    ("iterate-all", "req:req_condition"),
+    ("iterate-all", "req:iterate_all"),
     ("fuzzing", "req:fuzzing"),
     ("pre-condition", "req:fuzzing"),
     ("analyzer", "req:fuzzing"),
@@ -362,6 +361,24 @@ pub fn classify(template: &ParsedTemplate) -> Classification {
         }
     }
 
+    // A named internal extractor's first value fills the run's later
+    // requests, as Nuclei hands it on.
+    let mut declared = declared;
+    for block in blocks.iter().filter_map(Value::as_object) {
+        for extractor in block
+            .get("extractors")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if extractor.get("internal") == Some(&Value::Bool(true)) {
+                if let Some(name) = extractor.get("name").map(scalar_text) {
+                    declared.insert(name.trim().to_string());
+                }
+            }
+        }
+    }
+
     for (index, block) in blocks.iter().enumerate() {
         let Some(block) = block.as_object() else {
             both(&mut out, "http:block_not_a_mapping".into());
@@ -431,9 +448,10 @@ fn check_block(out: &mut Classification, block: &Map<String, Value>, declared: &
         }
         match key {
             "global-matchers" | "matchers-condition" | "stop-at-first-match" => {}
-            // A run keeps its cookies unless told not to; `cookie-reuse`
-            // asks for what Nuclei now does anyway.
-            "disable-cookie" | "cookie-reuse" => {}
+            // A run keeps its cookies unless told not to, and its earlier
+            // answers when its matchers read them: `cookie-reuse` and
+            // `req-condition` ask for what Nuclei now does anyway.
+            "disable-cookie" | "cookie-reuse" | "req-condition" => {}
             // An active scan follows them while they stay in Scope. Captured
             // traffic already followed whatever redirects the client did, each
             // hop its own response, so a passive template judges every hop.
@@ -618,8 +636,12 @@ fn check_expression(
             .rsplit_once('_')
             .is_some_and(|(_, suffix)| is_digits(suffix))
         {
+            // An earlier answer (`body_1`) is there for a scan's matchers,
+            // never for a request or a captured response.
             out.passive_reasons.insert("multi_request".into());
-            out.active_reasons.insert("multi_request".into());
+            if request {
+                out.active_reasons.insert("multi_request".into());
+            }
         } else if request
             && !BUILTIN_VARIABLES.contains(&variable.as_str())
             && !declared.contains(&variable)
@@ -652,7 +674,6 @@ fn check_part(out: &mut Classification, part: Option<&Value>) {
             .is_some_and(|(_, suffix)| is_digits(suffix)) =>
         {
             out.passive_reasons.insert("multi_request".into());
-            out.active_reasons.insert("multi_request".into());
         }
         p if !p.is_empty()
             && p.bytes()
@@ -850,7 +871,7 @@ mod tests {
     #[test]
     fn unsupported_constructs_are_named() {
         let classified = classify_text(
-            "id: example-cve\ninfo:\n  tags: cve,intrusive\nhttp:\n  - path: ['{{BaseURL}}']\n    payloads:\n      p: [a]\n    matchers:\n      - type: xpath\n        xpath: ['/a']\n      - type: word\n        part: interactsh_protocol\n        words: [dns]\n      - type: dsl\n        dsl: ['mmh3(body) == 1', 'status_code_2 == 200']\n",
+            "id: example-cve\ninfo:\n  tags: cve,intrusive\nhttp:\n  - path: ['{{BaseURL}}/?c={{status_code_1}}']\n    payloads:\n      p: [a]\n    matchers:\n      - type: xpath\n        xpath: ['/a']\n      - type: word\n        part: interactsh_protocol\n        words: [dns]\n      - type: dsl\n        dsl: ['mmh3(body) == 1', 'status_code_2 == 200']\n",
         );
         for reason in [
             "req:payloads",
@@ -934,6 +955,52 @@ mod tests {
         assert_eq!(
             classified.active_reasons.iter().collect::<Vec<_>>(),
             ["var:username"]
+        );
+    }
+
+    #[test]
+    fn later_answers_are_read_by_matchers_and_internal_values_by_requests() {
+        let template = |paths: &str, extra: &str| {
+            classify_text(
+                &"id: example-steps\ninfo: {}\nEXTRAhttp:\n  - path: [PATHS]\n    extractors:\n      - type: regex\n        name: token\n        internal: true\n        regex: ['t=(\\w+)']\n      - type: regex\n        name: shown\n        regex: ['s=(\\w+)']\n      - type: regex\n        part: body_2\n        regex: ['n=(\\w+)']\n    matchers:\n      - type: dsl\n        dsl: ['status_code_1 == 200 && contains(body_2, \"ok\")']\n      - type: word\n        part: body_1\n        words: [ok]\n"
+                    .replace("PATHS", paths)
+                    .replace("EXTRA", extra),
+            )
+            .active_reasons
+        };
+        let runnable = template("'{{BaseURL}}/a', '{{BaseURL}}/b?t={{token}}'", "");
+        assert!(runnable.is_empty(), "{runnable:?}");
+        for (paths, extra, reason) in [
+            // A request cannot read an earlier answer.
+            (
+                "'{{BaseURL}}/a', '{{BaseURL}}/b?c={{status_code_1}}'",
+                "",
+                "multi_request",
+            ),
+            // Only internal extractors hand values on.
+            (
+                "'{{BaseURL}}/a', '{{BaseURL}}/b?s={{shown}}'",
+                "",
+                "var:shown",
+            ),
+            // Variables are worked out before any request is sent.
+            (
+                "'{{BaseURL}}/a'",
+                "variables:\n  auth: 'Bearer {{token}}'\n",
+                "var:token",
+            ),
+        ] {
+            let found = template(paths, extra);
+            assert!(found.contains(reason), "{reason}: {found:?}");
+        }
+        // Nuclei keeps the history without being asked now, but does not
+        // run every value of an extractor.
+        let all = classify_text(
+            "id: example-all\ninfo: {}\nhttp:\n  - path: ['{{BaseURL}}']\n    req-condition: true\n    iterate-all: true\n    matchers:\n      - type: status\n        status: [200]\n",
+        );
+        assert_eq!(
+            all.active_reasons.iter().collect::<Vec<_>>(),
+            ["req:iterate_all"]
         );
     }
 

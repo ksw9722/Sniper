@@ -796,6 +796,17 @@ fn request_text(request: &EditableRequest) -> String {
     text
 }
 
+/// What one request's answers came to.
+#[derive(Default)]
+struct Judged {
+    matched: bool,
+    /// Values its internal extractors hand to the run's later requests.
+    carried: Vec<(String, String)>,
+    /// The answer later matchers read as this request's (`body_1`), kept
+    /// only when they do.
+    answer: Option<Arc<ResponseView>>,
+}
+
 /// The cookies a response set, by name, for the run's later requests to the
 /// same host.
 fn remember_cookies(
@@ -925,6 +936,8 @@ impl Run {
         };
         // Nuclei keeps one cookie jar for a template's run on a target.
         let mut jar = Vec::new();
+        // The run's answers so far, by request, for matchers that read them.
+        let mut history: Vec<Option<Arc<ResponseView>>> = Vec::new();
         for index in 0..template.request_count() {
             if self.stopping(&cancel, target_index) {
                 return;
@@ -936,6 +949,7 @@ impl Run {
                         "{id} could not build its request {} and did not send it.",
                         index + 1
                     ));
+                    history.push(None);
                     continue;
                 }
             };
@@ -943,10 +957,16 @@ impl Run {
                 .send_chain(template, target_index, built, &mut jar, &mut cancel)
                 .await;
             if hops.is_empty() {
+                history.push(None);
                 continue;
             }
             let values = run.values();
-            if self.judge(template, target, hops, values).await && template.stop_at_first_match {
+            let judged = self
+                .judge(template, target, hops, values, history.clone())
+                .await;
+            template.carry(&run, judged.carried);
+            history.push(judged.answer);
+            if judged.matched && template.stop_at_first_match {
                 return;
             }
         }
@@ -1262,30 +1282,49 @@ impl Run {
         target: &ScanTarget,
         hops: Vec<Hop>,
         values: HashMap<String, String>,
-    ) -> bool {
+        history: Vec<Option<Arc<ResponseView>>>,
+    ) -> Judged {
         let evaluating = Arc::clone(template);
         let vars = target.vars.clone();
+        let number = history.len() + 1;
         // A matcher may read up to 10 MiB of body; keep that off the async
         // workers.
         let judged = tokio::task::spawn_blocking(move || {
             let mut verdicts: Vec<Vec<TemplateMatch>> = vec![Vec::new(); hops.len()];
+            let mut carried: Vec<Vec<(String, String)>> = vec![Vec::new(); hops.len()];
+            let mut answer = None;
             for (index, hop) in hops.iter().enumerate().rev() {
                 let Some(view) =
                     ResponseView::from_record(&hop.record, vars.clone(), MAX_ACTIVE_BODY_BYTES)
                 else {
                     continue;
                 };
-                let view = view.with_request(request_text(&hop.request), values.clone());
-                verdicts[index] = evaluating.template.evaluate(&view);
+                let view = view
+                    .with_request(request_text(&hop.request), values.clone())
+                    .with_history(number, history.clone());
+                (verdicts[index], carried[index]) = evaluating.template.evaluate_carrying(&view);
+                // Nuclei remembers the last answer of the chain it read, the
+                // first one unless a match stopped it sooner.
+                if evaluating.history {
+                    answer = Some(Arc::new(view));
+                }
                 if !verdicts[index].is_empty() && evaluating.stop_at_first_match {
                     break;
                 }
             }
-            (hops, verdicts)
+            // The earliest answer's value comes first, as Nuclei merges a
+            // chain's.
+            let mut handed: Vec<(String, String)> = Vec::new();
+            for (name, value) in carried.into_iter().flatten() {
+                if !handed.iter().any(|(seen, _)| *seen == name) {
+                    handed.push((name, value));
+                }
+            }
+            (hops, verdicts, handed, answer)
         })
         .await;
-        let Ok((hops, verdicts)) = judged else {
-            return false;
+        let Ok((hops, verdicts, carried, answer)) = judged else {
+            return Judged::default();
         };
         let mut matched = false;
         for (hop, results) in hops.into_iter().zip(verdicts) {
@@ -1307,7 +1346,11 @@ impl Run {
                 self.keep(template, hop, results).await;
             }
         }
-        matched
+        Judged {
+            matched,
+            carried,
+            answer,
+        }
     }
 
     /// Stores a matched exchange in the history and files its findings.
@@ -1421,6 +1464,9 @@ mod tests {
                             "slept".into_response()
                         }
                         "/submit" => body.into_response(),
+                        "/token" => "token=abc123".into_response(),
+                        "/check" if body == "t=abc123" => "valid".into_response(),
+                        "/check" => "invalid".into_response(),
                         _ => (StatusCode::NOT_FOUND, "nothing").into_response(),
                     }
                 }
@@ -1670,6 +1716,7 @@ mod tests {
         ("raw-post", "id: example-raw-post\ninfo:\n  severity: high\nhttp:\n  - raw:\n      - |\n        POST /submit?x=1 HTTP/1.1\n        Host: {{Hostname}}\n        Content-Type: application/x-www-form-urlencoded\n        Content-Length: 1\n\n        a={{randstr}}\n    matchers:\n      - type: word\n        words: ['a={{randstr}}']\n"),
         ("raw-session", "id: example-raw-session\ninfo: {}\nhttp:\n  - raw:\n      - |\n        GET /login HTTP/1.1\n        Host: {{Hostname}}\n      - |\n        GET /home HTTP/1.1\n        Host: {{Hostname}}\n    matchers:\n      - type: word\n        words: ['Welcome back']\n"),
         ("raw-own-cookie", "id: example-raw-own-cookie\ninfo: {}\nhttp:\n  - raw:\n      - |\n        GET /login HTTP/1.1\n        Host: {{Hostname}}\n      - |\n        GET /home HTTP/1.1\n        Host: {{Hostname}}\n        Cookie: theme=dark\n    matchers:\n      - type: word\n        words: ['Welcome back']\n"),
+        ("steps", "id: example-steps\ninfo: {}\nhttp:\n  - raw:\n      - |\n        GET /token HTTP/1.1\n        Host: {{Hostname}}\n      - |\n        POST /check HTTP/1.1\n        Host: {{Hostname}}\n\n        t={{tok}}\n    extractors:\n      - type: regex\n        name: tok\n        internal: true\n        group: 1\n        regex: ['token=([a-z0-9]+)']\n    matchers:\n      - type: dsl\n        dsl: ['status_code_1 == 200 && body_2 == \"valid\"']\n"),
         ("no-cookie", "id: example-no-cookie\ninfo: {}\nhttp:\n  - path: ['{{BaseURL}}/login', '{{BaseURL}}/home']\n    disable-cookie: true\n    matchers:\n      - type: word\n        words: ['Welcome back']\n"),
         ("raw-timeout", "id: example-raw-timeout\ninfo: {}\nhttp:\n  - raw:\n      - |\n        @timeout: 300ms\n        GET /sleep HTTP/1.1\n        Host: {{Hostname}}\n    matchers:\n      - type: status\n        status: [200]\n"),
     ];
@@ -1708,12 +1755,15 @@ mod tests {
         // The second request of a run carries the cookie the first one was
         // given, beside any cookie the template sets itself, unless the
         // template turns that off.
+        // A value extracted from one answer fills a later request, and the
+        // matchers read every answer of the run.
         assert_eq!(
             matched,
             [
                 "example-raw-own-cookie",
                 "example-raw-post",
-                "example-raw-session"
+                "example-raw-session",
+                "example-steps"
             ]
         );
         // A request that outlives its @timeout fails rather than waiting out

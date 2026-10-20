@@ -77,8 +77,9 @@ http:
         status: [200]
 """
 
-# The second request needs the cookie the first one's answer set; `{{7*7}}`
-# names nothing, so it goes as written.
+# The second request needs the cookie the first answer set and the token it
+# carried, and the matcher reads both answers; `{{7*7}}` names nothing, so it
+# goes as written.
 RAW = """id: example-raw
 info:
   name: Example Raw
@@ -93,10 +94,16 @@ http:
         Host: {{Hostname}}
         Content-Type: application/x-www-form-urlencoded
 
-        name=example
+        name=example&csrf={{csrf}}
+    extractors:
+      - type: regex
+        name: csrf
+        internal: true
+        group: 1
+        regex: ['csrf=([a-z0-9]+)']
     matchers:
-      - type: word
-        words: ['Welcome example']
+      - type: dsl
+        dsl: ['status_code_1 == 302 && contains(body_2, "Welcome example")']
 """
 
 DNS = """id: example-dns
@@ -146,11 +153,13 @@ def main():
             if self.path.startswith("/slow"):
                 time.sleep(30)
             if self.path == "/login":
+                body = b"csrf=xyz789"
                 self.send_response(302)
                 self.send_header("Location", "/account")
                 self.send_header("Set-Cookie", "sid=abc; Path=/")
-                self.send_header("Content-Length", "0")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
+                self.wfile.write(body)
                 return
             body = b"APP_KEY=base64:example" if self.path == "/.env" else b"<html><title>Example Server 1.2</title></html>"
             self.send_response(200)
@@ -165,7 +174,7 @@ def main():
             sent = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
             cookie = self.headers.get("Cookie") or ""
             posted.append((self.path, cookie, sent))
-            body = b"Welcome example" if "sid=abc" in cookie and sent == "name=example" else b"Who are you"
+            body = b"Welcome example" if "sid=abc" in cookie and sent == "name=example&csrf=xyz789" else b"Who are you"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -303,15 +312,16 @@ def main():
         print(json.dumps({"scanned": sorted(scanned), "requests": seen[before:]}), flush=True)
 
         # Raw requests go to the target with its Host, share the cookie the
-        # first answer set, send `{{7*7}}` as written and leave out the
-        # body's last line end.
+        # first answer set and the token it carried, send `{{7*7}}` as
+        # written and leave out the body's last line end; the matcher reads
+        # both answers.
         before = len(seen)
         raw_job = call("/api/templates/scans", {"session_id": session, "targets": [origin],
                                                 "ids": ["example-raw"], "acknowledged": True})
         raw_job = eventually(lambda: (j := call(f"/api/templates/scans/{raw_job['id']}{query}"))["status"] != "running" and j)
         assert raw_job["status"] == "completed" and raw_job["sent"] == 2 and raw_job["matched"] == 1, raw_job
         assert seen[before:] == [("/login", host), ("/account?probe={{7*7}}", host)], seen[before:]
-        assert posted == [("/account?probe={{7*7}}", "sid=abc", "name=example")], posted
+        assert posted == [("/account?probe={{7*7}}", "sid=abc", "name=example&csrf=xyz789")], posted
         scanned.add("nuclei:example-raw")
         print(json.dumps({"raw": seen[before:]}), flush=True)
 

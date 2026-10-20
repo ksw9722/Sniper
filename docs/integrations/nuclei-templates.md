@@ -66,10 +66,17 @@ request, up to five minutes; a request with `@Host:`, `@tls-sni:` or `@once` is
 not sent. Request text and bodies written with bare line feeds are sent with
 CRLF, as Nuclei sends them.
 
-A template's requests to one target share cookies: a cookie a response sets
-goes with the later requests to the same host, as in Nuclei, unless the
-template sets `disable-cookie: true`. `{{7*7}}` and other markers that name no
-variable or function are sent as written.
+A template's requests to one target run as one session, as in Nuclei:
+
+- A cookie a response sets goes with the later requests to the same host,
+  unless the template sets `disable-cookie: true`.
+- A named `internal` extractor's first value fills the later requests that use
+  its name (`{{csrf}}`).
+- Matchers and extractors can read earlier answers by request number:
+  `status_code_1`, `body_2`, `part: header_1`.
+
+`{{7*7}}` and other markers that name no variable or function are sent as
+written.
 
 ### Where it sends
 
@@ -140,8 +147,8 @@ supported subset. A template either compiles completely or is listed as
 unsupported with a reason, such as `protocol:dns`, `req:payloads` or
 `fn:mmh3`.
 
-Not supported yet: `payloads`, more than one request block, reading an
-earlier request's response (`status_code_2`), `req-condition`, out-of-band
+Not supported yet: `payloads`, more than one request block, `iterate-all`, a
+request that reads an earlier answer (`{{body_1}}` in a path), out-of-band
 templates (`{{interactsh-url}}`), `unsafe` raw requests, fuzzing, and race and
 pipeline requests. A template whose variable is left for whoever runs it
 (`username: '{{username}}'`) is not sent.
@@ -170,7 +177,7 @@ body was truncated, a template whose result the missing bytes could change (a
 negated body matcher, a size, an expression that reads the body) skips that
 response.
 
-On release v10.5.0, 2,084 of 11,698 HTTP templates can run passively and 7,496
+On release v10.5.0, 2,084 of 11,698 HTTP templates can run passively and 7,820
 can be sent by Template Scan.
 
 ## The library

@@ -487,6 +487,10 @@ pub struct ResponseView {
     /// random strings, so a matcher can look for what was sent.
     request_vars: HashMap<String, String>,
     url: UrlVars,
+    /// This answer's request in a scan's run, from 1, and what the run's
+    /// earlier requests were answered, for names such as `body_1`.
+    number: usize,
+    history: Vec<Option<Arc<ResponseView>>>,
 }
 
 impl ResponseView {
@@ -594,6 +598,8 @@ impl ResponseView {
             request_text: None,
             request_vars: HashMap::new(),
             url,
+            number: 1,
+            history: Vec::new(),
         }
     }
 
@@ -601,6 +607,19 @@ impl ResponseView {
     pub(super) fn with_request(mut self, text: String, values: HashMap<String, String>) -> Self {
         self.request_text = Some(text);
         self.request_vars = values;
+        self
+    }
+
+    /// Places this answer in a scan's run: `number` is its request, from 1,
+    /// and `history` holds the answers to the requests before it, `None`
+    /// where a request got none.
+    pub(super) fn with_history(
+        mut self,
+        number: usize,
+        history: Vec<Option<Arc<ResponseView>>>,
+    ) -> Self {
+        self.number = number;
+        self.history = history;
         self
     }
 
@@ -642,10 +661,23 @@ impl ResponseView {
                 if let Some(value) = self.request_vars.get(name) {
                     return text(value);
                 }
-                self.header_vars
-                    .iter()
-                    .find(|(key, _)| key == name)
-                    .map(|(_, value)| Val::Str(Cow::Borrowed(value.as_str())))
+                if let Some((_, value)) = self.header_vars.iter().find(|(key, _)| key == name) {
+                    return text(value);
+                }
+                // `body_2`: what the run's second request was answered.
+                let (base, number) = name.rsplit_once('_')?;
+                if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let number: usize = number.parse().ok()?;
+                if number == self.number {
+                    self.var(base)
+                } else {
+                    self.history
+                        .get(number.checked_sub(1)?)?
+                        .as_ref()?
+                        .var(base)
+                }
             }
         }
     }
@@ -686,16 +718,30 @@ impl CompiledTemplate {
     /// The template's results on one response. Empty when it does not match,
     /// or when a truncated body could have changed the answer.
     pub fn evaluate(&self, view: &ResponseView) -> Vec<TemplateMatch> {
+        self.evaluate_carrying(view).0
+    }
+
+    /// The results, and the first value of each named internal extractor,
+    /// which Nuclei hands to the run's later requests. An extractor that
+    /// reads one request's answer (`part: body_2`) hands on only from it.
+    pub fn evaluate_carrying(
+        &self,
+        view: &ResponseView,
+    ) -> (Vec<TemplateMatch>, Vec<(String, String)>) {
         if view.truncated && self.body_sensitive {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let operators = &self.operators;
         let mut dynamic: HashMap<String, String> = HashMap::new();
+        let mut carried = Vec::new();
         let mut extracted = Vec::new();
         for extractor in &operators.extractors {
             let values = run_extractor(extractor, view, &dynamic);
             if let (Some(name), Some(first)) = (&extractor.name, values.first()) {
                 dynamic.insert(name.clone(), first.clone());
+                if extractor.internal && reads_request(&extractor.part, view.number) {
+                    carried.push((name.clone(), first.clone()));
+                }
             }
             if !extractor.internal {
                 for value in values {
@@ -705,6 +751,17 @@ impl CompiledTemplate {
                 }
             }
         }
+        (self.match_view(view, &dynamic, extracted), carried)
+    }
+
+    /// The matchers' verdict on one answer, given what the extractors found.
+    fn match_view(
+        &self,
+        view: &ResponseView,
+        dynamic: &HashMap<String, String>,
+        extracted: Vec<String>,
+    ) -> Vec<TemplateMatch> {
+        let operators = &self.operators;
         if operators.matchers.is_empty() {
             return if extracted.is_empty() {
                 Vec::new()
@@ -716,10 +773,7 @@ impl CompiledTemplate {
                 }]
             };
         }
-        let scope = Scope {
-            view,
-            dynamic: &dynamic,
-        };
+        let scope = Scope { view, dynamic };
         let outcomes: Vec<(bool, Vec<String>)> = operators
             .matchers
             .iter()
@@ -773,6 +827,20 @@ impl CompiledTemplate {
             results.extend(unnamed);
         }
         results
+    }
+}
+
+/// Whether an extractor reads this request's answer: one naming a request
+/// (`body_2`) reads only that one's, as Nuclei decides it.
+fn reads_request(part: &Part, number: usize) -> bool {
+    let Part::Var(name) = part else {
+        return true;
+    };
+    match name.rsplit_once('_') {
+        Some((_, suffix)) => suffix
+            .parse::<usize>()
+            .map_or(true, |index| index == number),
+        None => true,
     }
 }
 
@@ -1241,6 +1309,36 @@ mod tests {
         let internal_only = template.evaluate(&view(200, &[], "zzz"));
         assert_eq!(internal_only.len(), 1);
         assert_eq!(internal_only[0].matcher, None);
+    }
+
+    #[test]
+    fn a_run_reads_earlier_answers_and_hands_on_internal_values() {
+        let parsed = parse(
+            "id: example-steps\ninfo: {}\nhttp:\n  - raw:\n      - |\n        GET /a HTTP/1.1\n      - |\n        GET /b?t={{token}} HTTP/1.1\n    extractors:\n      - type: regex\n        name: token\n        internal: true\n        group: 1\n        regex: ['token=(\\w+)']\n      - type: regex\n        name: shown\n        group: 1\n        regex: ['shown=(\\w+)']\n      - type: regex\n        name: second\n        internal: true\n        part: body_2\n        group: 1\n        regex: ['next=(\\w+)']\n    matchers:\n      - type: dsl\n        dsl:\n          - 'status_code_1 == 200 && contains(body_2, \"welcome\")'\n",
+        )
+        .unwrap();
+        let template = crate::templates::active::compile_active(&parsed, &classify(&parsed))
+            .unwrap()
+            .template;
+        let first =
+            Arc::new(view(200, &[], "token=abc shown=x next=one").with_history(1, Vec::new()));
+        let (results, carried) = template.evaluate_carrying(&first);
+        // The first answer alone: body_2 is not there yet.
+        assert!(results.is_empty());
+        // Only named internal extractors hand values on, and one reading
+        // body_2 only from the second request.
+        assert_eq!(carried, [("token".to_string(), "abc".to_string())]);
+        let second = view(200, &[], "welcome next=two").with_history(2, vec![Some(first)]);
+        let (results, carried) = template.evaluate_carrying(&second);
+        assert_eq!(results.len(), 1);
+        assert_eq!(carried, [("second".to_string(), "two".to_string())]);
+        assert_eq!(
+            second.var("body_1").unwrap().text(),
+            "token=abc shown=x next=one"
+        );
+        assert_eq!(second.var("status_code_2").unwrap(), Val::Num(200.0));
+        // A request the run has not made reads as missing.
+        assert!(second.var("body_3").is_none());
     }
 
     #[test]
