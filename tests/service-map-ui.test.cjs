@@ -69,6 +69,12 @@ test('every map toolbar control uses the standard compact toolbar sizing, and Re
   assert.match(reload, /flex: 0 0 auto;/); assert.match(reload, /white-space: nowrap;/);
   assert.match(css, /\.service-map-reload\.service-map-background-refresh:disabled \{[^}]*opacity: 1;/);
 });
+test('the map or the API list fills the workspace whichever siblings are hidden', () => {
+  const css = fs.readFileSync(path.join(__dirname, '../web/styles.css'), 'utf8');
+  const workspace = css.match(/^\.service-map-workspace \{([^}]+)\}/m)?.[1];
+  assert.match(workspace, /display: flex; flex-direction: column;/);
+  assert.match(css, /^\.service-map-content, \.service-map-api-catalog \{ flex: 1; \}/m);
+});
 test('map is lazy: construction/hidden refresh cause no request', async () => {
   const f = fixture(); f.controller.setVisible(false); await f.controller.refresh();
   assert.equal(f.requests.length, 0); assert.equal(f.state.snapshot, null);
