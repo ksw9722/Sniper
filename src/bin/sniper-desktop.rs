@@ -423,9 +423,6 @@ fn run_desktop() -> Result<()> {
         }
     };
 
-    // Construction succeeded. The first idle event may now schedule the one-shot
-    // host policy check; a failed WebView never reaches this point.
-    let mut skill_updates = sniper::skill_auto_update::DesktopTask::default();
     let close_state = state.clone();
     let close_data_dir = close_state.config.data_dir.clone();
     let close_runtime_instance_id = close_state.runtime_instance_id;
@@ -444,12 +441,10 @@ fn run_desktop() -> Result<()> {
         let _keep_proxy_task = &proxy_task;
         *control_flow = ControlFlow::Wait;
 
-        let mut teardown_once = |session_persisted: bool,
-                                 skill_updates: &mut sniper::skill_auto_update::DesktopTask| {
+        let mut teardown_once = |session_persisted: bool| {
             if !begin_desktop_teardown(teardown_started.as_ref()) {
                 return;
             }
-            skill_updates.shutdown(&runtime);
             if let Some(ui_task) = ui_task.take() {
                 ui_task.abort();
                 if let Err(error) = runtime.block_on(ui_task) {
@@ -506,16 +501,10 @@ fn run_desktop() -> Result<()> {
         };
 
         match event {
-            Event::MainEventsCleared => {
-                if !close_flush_in_progress && !teardown_started.load(Ordering::Acquire) {
-                    skill_updates.first_idle(&runtime, &close_data_dir);
-                }
-            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                skill_updates.request_stop();
                 if shutdown_done.load(Ordering::Acquire) {
                     *control_flow = ControlFlow::Exit;
                     return;
@@ -533,7 +522,6 @@ fn run_desktop() -> Result<()> {
                 }
             }
             Event::UserEvent(DesktopUserEvent::ShutdownSignal) => {
-                skill_updates.request_stop();
                 if shutdown_done.load(Ordering::Acquire) {
                     *control_flow = ControlFlow::Exit;
                     return;
@@ -574,7 +562,7 @@ fn run_desktop() -> Result<()> {
                 }
                 match persist_desktop_session_state(&runtime, close_state.as_ref()) {
                     Ok(()) => {
-                        teardown_once(true, &mut skill_updates);
+                        teardown_once(true);
                         *control_flow = ControlFlow::Exit;
                     }
                     Err(error) => {
@@ -611,7 +599,7 @@ fn run_desktop() -> Result<()> {
                         "forced desktop teardown will preserve runtime state after failed persistence"
                     );
                 }
-                teardown_once(session_persisted, &mut skill_updates);
+                teardown_once(session_persisted);
             }
             _ => {}
         }

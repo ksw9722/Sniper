@@ -2156,119 +2156,9 @@ enum SkillsCommand {
     Install(SkillsInstallArgs),
     /// Inspect installed skill hashes on this CLI host without changing files.
     #[command(
-        after_help = "Reads files on this CLI host, even when --api points elsewhere; no network or file changes.\ncurrent means installed bytes match the current bundle. modified_or_outdated means they differ;\nthis alone cannot distinguish personal edits from an older bundle.\nExit status 0 means inspection completed. Check each entries[].status and error_code;\nit does not mean every installation is current. Preserve edits before any manual update."
+        after_help = "Reads skill files on this CLI host, even when --api points elsewhere.\ncurrent means the installed file matches this build; modified_or_outdated means it differs.\nExit status 0 means the inspection finished; check each entries[].status."
     )]
     Status(SkillsInstallArgs),
-    /// Experimental: record local enrollment for one installed, exact bundled skill.
-    Enroll(SingleSkillArgs),
-    /// Compare local files and enrollment with this CLI's bundle; never writes.
-    #[command(
-        after_help = "Reads files on this CLI host without network or file changes.\nmodified compares installed bytes with the enrollment baseline, not the current bundle.\nupdate_available means the enrolled baseline is unchanged and a different bundle is available.\nAfter a manual update, status may be current while update-preview remains modified.\nExit status 0 means inspection completed. Check each entries[].state, stage_eligible and error_code;\nit does not mean every installation is current or safe to replace. Preserve edited files."
-    )]
-    UpdatePreview(SkillsInstallArgs),
-    /// Experimental: stage a bundled candidate in a new directory without activating it.
-    StageUpdate(SkillsStageArgs),
-    /// Experimental: explicitly activate one reviewed staged update with a durable operation ID.
-    #[command(
-        after_help = "Requires --yes outside dry run. Select exactly one agent and retain the original operation UUID.\nThe staged candidate, enrollment baseline and executing binary bundle must agree; different bytes need a strictly newer semantic version.\nAfter uncertain output, inspect skills update-result with that same UUID before any deliberate retry.\nDoes not grant automatic-update consent or reload the agent. Linux exchange and macOS swap adapters only; Windows is unsupported."
-    )]
-    ApplyUpdate(SkillsApplyArgs),
-    /// Inspect one local update transaction without changing files or resuming it.
-    #[command(
-        after_help = "Read-only and CLI-host local; no --yes, API contact, resume, repair, or agent reload.\nInspect both state and current_state: a historical applied receipt does not prove the active file remains unchanged.\nKeep the original operation UUID and all transaction artifacts. Windows inspection is currently unsupported."
-    )]
-    UpdateResult(SkillsOperationArgs),
-    /// Explicitly restore the baseline of one update transaction, preserving displaced files.
-    #[command(
-        after_help = "Requires --yes outside dry run. Use the original apply-update UUID, not a new rollback ID.\nOnly a bound transaction can be restored; changed or unsupported objects can block rollback.\nAfter uncertain output, inspect skills update-result with the same UUID. Preserve all artifacts and do not blindly retry."
-    )]
-    RollbackUpdate(SkillsOperationArgs),
-    /// Inspect the selected agent's host-local automatic-update policy without writes.
-    #[command(
-        after_help = "CLI-host local only, even with remote --api. Uses the target already stored in the policy; no directory overrides.
-Read-only inspection never creates, repairs, resumes, or enables a policy. Inspect state and error_code; paused is not permission to retry."
-    )]
-    AutoUpdateStatus(StoredSkillArgs),
-    /// Explicitly authorize future bundled updates of one unchanged managed installation.
-    #[command(
-        after_help = "Requires --yes outside dry run. Records consent only; it does not update SKILL.md now.
-Select exactly one agent and an unchanged managed baseline. Re-enabling an existing policy requires its current --policy-revision and creates a fresh authorization generation.
-Only host-local bundled templates are eligible; no network fetch, arbitrary content, or agent reload."
-    )]
-    EnableAutoUpdates(SkillsEnableAutoUpdatesArgs),
-    /// Revoke future automatic updates for the policy's stored target.
-    #[command(
-        after_help = "Requires --yes outside dry run. Uses the selected agent's stored target; no directory overrides.
-Preserves active files, receipts, attempts and recovery artifacts. Does not roll back an already committed update."
-    )]
-    DisableAutoUpdates(StoredSkillArgs),
-    /// Make one guarded automatic-update attempt for an explicitly enabled local policy.
-    #[command(
-        after_help = "Requires --yes outside dry run. Uses the policy's stored target; no directory overrides or replacement operation IDs.
-No policy means no authorization. Modified, replaced, unsupported or uncertain state is preserved and pauses updates. Inspect auto-update-status before any deliberate re-enable."
-    )]
-    AutoUpdateOnce(StoredSkillArgs),
-}
-
-#[derive(Args, Debug, Default)]
-#[command(group(ArgGroup::new("skill_agent").args(["codex", "claude"]).required(true)))]
-struct StoredSkillArgs {
-    #[arg(long)]
-    codex: bool,
-    #[arg(long)]
-    claude: bool,
-}
-
-#[derive(Args, Debug)]
-struct SkillsEnableAutoUpdatesArgs {
-    #[command(flatten)]
-    target: SingleSkillArgs,
-    /// Current policy revision from auto-update-status; required when re-enabling a policy.
-    #[arg(long)]
-    policy_revision: Option<u64>,
-}
-
-#[derive(Args, Debug, Default)]
-#[command(group(ArgGroup::new("skill_agent").args(["codex", "claude"]).required(true)))]
-struct SingleSkillArgs {
-    #[arg(long)]
-    codex: bool,
-    #[arg(long)]
-    claude: bool,
-    #[arg(long)]
-    codex_dir: Option<PathBuf>,
-    #[arg(long)]
-    claude_dir: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-struct SkillsStageArgs {
-    #[command(flatten)]
-    target: SingleSkillArgs,
-    /// New local directory for candidate and staging receipt; it must not exist.
-    #[arg(long)]
-    staging_dir: PathBuf,
-}
-
-#[derive(Args, Debug)]
-struct SkillsApplyArgs {
-    #[command(flatten)]
-    target: SingleSkillArgs,
-    /// Existing reviewed staging directory made by this CLI's bundled version.
-    #[arg(long)]
-    staging_dir: PathBuf,
-    /// Canonical lowercase hyphenated UUID; retain it for result inspection and rollback.
-    #[arg(long)]
-    operation_id: String,
-}
-
-#[derive(Args, Debug)]
-struct SkillsOperationArgs {
-    #[command(flatten)]
-    target: SingleSkillArgs,
-    /// The original apply-update UUID, in canonical lowercase hyphenated form.
-    #[arg(long)]
-    operation_id: String,
 }
 
 #[derive(Args, Debug, Default)]
@@ -3475,16 +3365,6 @@ impl SkillsCommand {
         match self {
             SkillsCommand::Install(_) => "skills.install",
             SkillsCommand::Status(_) => "skills.status",
-            SkillsCommand::Enroll(_) => "skills.enroll",
-            SkillsCommand::UpdatePreview(_) => "skills.update_preview",
-            SkillsCommand::StageUpdate(_) => "skills.stage_update",
-            SkillsCommand::ApplyUpdate(_) => "skills.apply_update",
-            SkillsCommand::UpdateResult(_) => "skills.update_result",
-            SkillsCommand::RollbackUpdate(_) => "skills.rollback_update",
-            SkillsCommand::AutoUpdateStatus(_) => "skills.auto_update_status",
-            SkillsCommand::EnableAutoUpdates(_) => "skills.enable_auto_updates",
-            SkillsCommand::DisableAutoUpdates(_) => "skills.disable_auto_updates",
-            SkillsCommand::AutoUpdateOnce(_) => "skills.auto_update_once",
         }
     }
 }
@@ -3536,96 +3416,6 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &[],
             vec![json!({"all":true})],
-        ),
-        op(
-            "skills.enroll",
-            "skills enroll <--codex|--claude>",
-            "Experimental: record explicit local enrollment of one exact bundled skill. Does not permit automatic updates or change SKILL.md.",
-            Write,
-            true,
-            &[],
-            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills"})],
-        ),
-        op(
-            "skills.update_preview",
-            "skills update-preview",
-            "Compare local skills and enrollment against this CLI's bundle without changing files. Unmanaged files remain unmanaged.",
-            Read,
-            false,
-            &[],
-            vec![json!({"all":true}), json!({"codex":true,"codex_dir":"/tmp/example-skills"})],
-        ),
-        op(
-            "skills.stage_update",
-            "skills stage-update <--codex|--claude> --staging-dir <new-directory>",
-            "Experimental: stage one enrolled, unchanged skill's bundled update and receipt in a new local directory. Does not activate it or replace the active SKILL.md.",
-            Write,
-            true,
-            &["staging_dir"],
-            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","staging_dir":"/tmp/example-skill-candidate"})],
-        ),
-        op(
-            "skills.apply_update",
-            "skills apply-update <--codex|--claude> --staging-dir <reviewed-directory> --operation-id <uuid>",
-            "Experimental: explicitly activate one strictly bound, newer staged bundle. Retain the operation UUID for read-only result inspection and rollback; no startup updates or agent reload.",
-            Write,
-            true,
-            &["staging_dir", "operation_id"],
-            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","staging_dir":"/tmp/example-skill-candidate","operation_id":"22222222-2222-2222-2222-222222222222"})],
-        ),
-        op(
-            "skills.update_result",
-            "skills update-result <--codex|--claude> --operation-id <original-uuid>",
-            "Read one local skill update transaction and current state without resuming or changing files. Use the original operation UUID after lost output or any recovery-required result.",
-            Read,
-            false,
-            &["operation_id"],
-            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","operation_id":"22222222-2222-2222-2222-222222222222"})],
-        ),
-        op(
-            "skills.rollback_update",
-            "skills rollback-update <--codex|--claude> --operation-id <original-uuid>",
-            "Explicitly restore a partial or completed skill update's baseline using its original operation UUID. Preserve transaction artifacts and displaced files; never blindly retry an uncertain mutation.",
-            Write,
-            true,
-            &["operation_id"],
-            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills","operation_id":"22222222-2222-2222-2222-222222222222"})],
-        ),
-        op(
-            "skills.auto_update_status",
-            "skills auto-update-status <--codex|--claude>",
-            "Read the selected agent's host-local automatic-update policy and stored target without creating, repairing, or resuming anything. Remote --api is never contacted.",
-            Read,
-            false,
-            &[],
-            vec![json!({"codex":true}), json!({"claude":true})],
-        ),
-        op(
-            "skills.enable_auto_updates",
-            "skills enable-auto-updates <--codex|--claude> [--policy-revision <current-revision>]",
-            "Explicitly authorize future updates from this host's bundled templates for one unchanged managed installation. Records consent only; does not update active files. Re-enabling requires the current policy revision and creates a fresh authorization generation.",
-            Write,
-            true,
-            &[],
-            vec![json!({"codex":true,"codex_dir":"/tmp/example-skills"}), json!({"codex":true,"codex_dir":"/tmp/example-skills","policy_revision":2})],
-        ),
-        op(
-            "skills.disable_auto_updates",
-            "skills disable-auto-updates <--codex|--claude>",
-            "Revoke future automatic updates using the selected agent's stored target. Preserve active files and all policy, attempt, transaction and recovery artifacts; do not roll back committed updates.",
-            Write,
-            true,
-            &[],
-            vec![json!({"codex":true})],
-        ),
-        op(
-            "skills.auto_update_once",
-            "skills auto-update-once <--codex|--claude>",
-            "Run one guarded local bundled-update attempt under existing explicit consent. Uses only the stored target; edited, replaced, unsupported or uncertain objects are preserved and pause updates. Never fetch content or reload an agent.",
-            Write,
-            true,
-            &[],
-            vec![json!({"codex":true})],
         ),
         op(
             "session.list",
@@ -5637,8 +5427,6 @@ fn op(
             .or_else(|| session_list_output_schema(operation))
             .or_else(|| session_read_output_schema(operation))
             .or_else(|| skills_status_output_schema(operation))
-            .or_else(|| skills_managed_output_schema(operation))
-            .or_else(|| skills_auto_update_output_schema(operation))
             .or_else(|| examples_output_schema(operation))
             .or_else(|| history_list_output_schema(operation))
             .unwrap_or_else(|| {
@@ -5899,170 +5687,19 @@ fn skills_status_output_schema(operation: &str) -> Option<Value> {
     }))
 }
 
-fn is_skill_auto_update_operation(operation: &str) -> bool {
-    matches!(
-        operation,
-        "skills.auto_update_status"
-            | "skills.enable_auto_updates"
-            | "skills.disable_auto_updates"
-            | "skills.auto_update_once"
-    )
-}
-
-fn skills_auto_update_output_schema(operation: &str) -> Option<Value> {
-    if !is_skill_auto_update_operation(operation) {
-        return None;
-    }
-    Some(json!({
-        "type":"object", "additionalProperties":false,
-        "required":["agent","state","enabled","policy_id","revision","generation","path","operation_id","agent_reloaded"],
-        "properties":{
-            "agent":{"type":"string","enum":["codex","claude"]},
-            "state":{"type":"string","enum":["disabled","enabled","paused","current","updated"],"description":"Disabled includes absent consent. Paused requires inspection and fresh explicit re-authorization; enabled alone does not mean an attempt is eligible."},
-            "enabled":{"type":"boolean","description":"Stored consent; may remain true while state is paused. Inspect state and error_code before acting."},
-            "policy_id":{"type":["string","null"]},
-            "revision":{"type":["integer","null"],"minimum":0,"maximum":u64::MAX},
-            "generation":{"type":["string","null"],"description":"Authorization generation; changes on explicit re-enable."},
-            "path":{"type":["string","null"],"description":"The policy's stored absolute active SKILL.md path; never source text."},
-            "operation_id":{"type":["string","null"],"description":"Retained operation ID for the policy's update attempt; never replace it to bypass recovery."},
-            "agent_reloaded":{"type":"boolean","const":false},
-            "error_code":{"type":"string","description":"Stable bounded local refusal code. A durable pause reports policy_paused; inspect pause_reason for its retained cause."},
-            "pause_reason":{"type":["string","null"],"minLength":1,"maxLength":64,"pattern":"^[a-z_]+$","description":"Optional bounded stored cause of a durable pause; no source text. Pending attempts can be paused without a recorded cause."}
-        }
-    }))
-}
-
-fn skills_managed_output_schema(operation: &str) -> Option<Value> {
-    let string = json!({"type":"string"});
-    let hash = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
-    let mut entry = json!({
-        "type":"object", "additionalProperties":false,
-        "required":["agent","path","receipt_path"],
-        "properties":{
-            "agent":{"type":"string","enum":["codex","claude"]},
-            "path":{"type":"string","description":"Absolute active local SKILL.md path; source text is never returned."},
-            "receipt_path":{"type":"string"}
-        }
-    });
-    let (required, properties) = match operation {
-        "skills.update_preview" => (
-            json!([
-                "installed_sha256",
-                "bundled_sha256",
-                "bundled_version",
-                "enrolled_sha256",
-                "enrolled_version",
-                "state",
-                "stage_eligible"
-            ]),
-            json!({
-                "installed_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
-                "bundled_sha256":hash,
-                "bundled_version":string,
-                "enrolled_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
-                "enrolled_version":{"type":["string","null"],"description":"Recorded enrollment version, not inferred provenance."},
-                "state":{"type":"string","enum":["unmanaged","current","update_available","modified","missing","error"],"description":"Unmanaged files are never adopted by preview. Update availability requires enrolled bytes still matching the active file."},
-                "stage_eligible":{"type":"boolean"},
-                "error_code":{"type":"string","description":"Stable local inspection error code; no file contents."}
-            }),
-        ),
-        "skills.enroll" => (
-            json!([
-                "enrolled_sha256",
-                "enrolled_version",
-                "allows_automatic_updates"
-            ]),
-            json!({
-                "enrolled_sha256":hash,
-                "enrolled_version":string,
-                "allows_automatic_updates":{"type":"boolean","const":false}
-            }),
-        ),
-        "skills.stage_update" => (
-            json!([
-                "staging_dir",
-                "candidate_path",
-                "installed_sha256",
-                "bundled_sha256",
-                "bundled_version",
-                "activated"
-            ]),
-            json!({
-                "staging_dir":string,
-                "candidate_path":{"type":"string","description":"Staged candidate only; active SKILL.md remains unchanged."},
-                "installed_sha256":hash,
-                "bundled_sha256":hash,
-                "bundled_version":string,
-                "activated":{"type":"boolean","const":false}
-            }),
-        ),
-        "skills.apply_update" | "skills.update_result" | "skills.rollback_update" => (
-            json!([
-                "transaction_dir",
-                "operation_id",
-                "state",
-                "current_state",
-                "installed_sha256",
-                "allows_automatic_updates",
-                "agent_reloaded"
-            ]),
-            json!({
-                "transaction_dir":string,
-                "operation_id":skill_operation_id_schema(),
-                "state":{"type":"string","enum":["prepared","applied","rolled_back","recovery_required"],"description":"Recorded transaction state; inspect current_state separately. A recovered result does not itself resume a write."},
-                "current_state":{"type":"string","enum":["baseline","updated","changed","unavailable"],"description":"Current observation relative to the bound baseline and update; changed or unavailable requires inspection."},
-                "installed_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$"},
-                "allows_automatic_updates":{"type":"boolean","const":false},
-                "agent_reloaded":{"type":"boolean","const":false},
-                "error_code":{"type":"string","description":"Stable bounded inspection or recovery code; never source text."}
-            }),
-        ),
-        _ => return None,
-    };
-    entry["required"]
-        .as_array_mut()?
-        .extend(required.as_array()?.iter().cloned());
-    entry["properties"].as_object_mut()?.extend(
-        properties
-            .as_object()?
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
-    if operation == "skills.update_preview" {
-        Some(json!({
-            "type":"object","additionalProperties":false,
-            "required":["scope","bundled_version","entries"],
-            "properties":{
-                "scope":{"type":"string","const":"cli_host"},
-                "bundled_version":string,
-                "entries":{"type":"array","minItems":1,"maxItems":2,"items":entry}
-            }
-        }))
-    } else {
-        Some(entry)
-    }
-}
-
 // A root override must never silently fall back to another agent's default root.
-fn skill_root_selection_schema(allow_all: bool) -> Value {
+fn skill_root_selection_schema() -> Value {
     let constraints: Vec<Value> = [("codex", "codex_dir"), ("claude", "claude_dir")]
         .into_iter()
         .map(|(agent, root)| {
-            let mut choices = vec![
-                json!({"properties":{root:{"type":"null"}}}),
-                json!({"required":[agent],"properties":{agent:{"const":true}}}),
-            ];
-            if allow_all {
-                choices.push(json!({"required":["all"],"properties":{"all":{"const":true}}}));
-            }
-            json!({"anyOf":choices})
+            json!({"anyOf":[
+                {"properties":{root:{"type":"null"}}},
+                {"required":[agent],"properties":{agent:{"const":true}}},
+                {"required":["all"],"properties":{"all":{"const":true}}},
+            ]})
         })
         .collect();
     json!(constraints)
-}
-
-fn skill_operation_id_schema() -> Value {
-    json!({"type":"string","minLength":36,"maxLength":36,"pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$","description":"Exact canonical lowercase hyphenated UUID. Save the original apply-update ID for result inspection and rollback; alternate spellings are rejected."})
 }
 
 // Legacy Uuid arguments accept spellings that strict JSON Schema uuid formats reject.
@@ -6097,31 +5734,7 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
     if let Some(schema) = history_retention_input_schema(operation) {
         return schema;
     }
-    if is_skill_auto_update_operation(operation) {
-        let mut schema = json!({
-            "type":"object", "additionalProperties":false, "required":[],
-            "properties":{
-                "codex":{"type":["boolean","null"],"default":false},
-                "claude":{"type":["boolean","null"],"default":false}
-            },
-            "oneOf":[
-                {"required":["codex"],"properties":{"codex":{"const":true},"claude":{"enum":[false,null]}}},
-                {"required":["claude"],"properties":{"claude":{"const":true},"codex":{"enum":[false,null]}}}
-            ]
-        });
-        if operation == "skills.enable_auto_updates" {
-            for (agent, root) in [("codex", "codex_dir"), ("claude", "claude_dir")] {
-                schema["properties"][root] = json!({"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":format!("Host-local {agent} skills root; requires its matching selector. Omission or null uses that agent's install default. Only enable may select a target; later commands use the recorded target.")});
-            }
-            schema["allOf"] = skill_root_selection_schema(false);
-            schema["properties"]["policy_revision"] = json!({"type":["integer","null"],"minimum":0,"maximum":u64::MAX,"description":"Expected current revision from auto-update-status. Required to re-enable an existing policy; omission or null does not authorize replacing existing consent."});
-        }
-        return schema;
-    }
-    if matches!(
-        operation,
-        "skills.install" | "skills.status" | "skills.update_preview"
-    ) {
+    if matches!(operation, "skills.install" | "skills.status") {
         return json!({
             "type":"object", "additionalProperties":false, "required":[],
             "properties":{
@@ -6131,55 +5744,13 @@ fn input_schema(operation: &str, required_fields: &[&'static str]) -> Value {
                 "codex_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Codex skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."},
                 "claude_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Claude skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."}
             },
-            "allOf":skill_root_selection_schema(true),
+            "allOf":skill_root_selection_schema(),
             "anyOf":[
                 {"required":["codex"],"properties":{"codex":{"const":true}}},
                 {"required":["claude"],"properties":{"claude":{"const":true}}},
                 {"required":["all"],"properties":{"all":{"const":true}}}
             ]
         });
-    }
-    if matches!(
-        operation,
-        "skills.enroll"
-            | "skills.stage_update"
-            | "skills.apply_update"
-            | "skills.update_result"
-            | "skills.rollback_update"
-    ) {
-        let mut schema = json!({
-            "type":"object", "additionalProperties":false, "required":[],
-            "properties":{
-                "codex":{"type":["boolean","null"],"default":false},
-                "claude":{"type":["boolean","null"],"default":false},
-                "codex_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Codex skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."},
-                "claude_dir":{"type":["string","null"],"minLength":1,"pattern":"^[^\\u0000]*$","description":"Claude skills root on the CLI host; requires the matching agent selector (or all where supported); omission or null uses the selected agent’s install default."}
-            },
-            "allOf":skill_root_selection_schema(false),
-            "oneOf":[
-                {"required":["codex"],"properties":{"codex":{"const":true},"claude":{"enum":[false,null]}}},
-                {"required":["claude"],"properties":{"claude":{"const":true},"codex":{"enum":[false,null]}}}
-            ]
-        });
-        if operation == "skills.stage_update" {
-            schema["required"] = json!(["staging_dir"]);
-            schema["properties"]["staging_dir"] = json!({"type":"string","minLength":1,"pattern":"^[^\\u0000]*$","description":"Explicit new local staging directory, which must not exist. The active SKILL.md is never replaced."});
-        }
-        if operation == "skills.apply_update" {
-            schema["required"] = json!(["staging_dir"]);
-            schema["properties"]["staging_dir"] = json!({"type":"string","minLength":1,"pattern":"^[^\\u0000]*$","description":"Existing reviewed staging directory; candidate, staging receipt, enrollment baseline and running binary bundle must agree."});
-        }
-        if matches!(
-            operation,
-            "skills.apply_update" | "skills.update_result" | "skills.rollback_update"
-        ) {
-            schema["required"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!("operation_id"));
-            schema["properties"]["operation_id"] = skill_operation_id_schema();
-        }
-        return schema;
     }
     if matches!(
         operation,
@@ -6406,31 +5977,8 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         "manifest" | "session.list" => &[],
         "schema" => &["kind", "operation"],
         "examples" => &["operation"],
-        "skills.install" | "skills.status" | "skills.update_preview" => {
+        "skills.install" | "skills.status" => {
             &["codex", "claude", "all", "codex_dir", "claude_dir"]
-        }
-        "skills.enroll" => &["codex", "claude", "codex_dir", "claude_dir"],
-        "skills.auto_update_status" | "skills.disable_auto_updates" | "skills.auto_update_once" => {
-            &["codex", "claude"]
-        }
-        "skills.enable_auto_updates" => &[
-            "codex",
-            "claude",
-            "codex_dir",
-            "claude_dir",
-            "policy_revision",
-        ],
-        "skills.stage_update" => &["codex", "claude", "codex_dir", "claude_dir", "staging_dir"],
-        "skills.apply_update" => &[
-            "codex",
-            "claude",
-            "codex_dir",
-            "claude_dir",
-            "staging_dir",
-            "operation_id",
-        ],
-        "skills.update_result" | "skills.rollback_update" => {
-            &["codex", "claude", "codex_dir", "claude_dir", "operation_id"]
         }
         "session.create" => &["name"],
         "session.rename" => &["id", "name"],
@@ -6804,53 +6352,20 @@ fn command_input_preview(command: &Command) -> Value {
         Command::Replay { command } => replay_input_preview(command),
         Command::Fuzzer { command } => fuzzer_input_preview(command),
         Command::Sequence { command } => sequence_input_preview(command),
-        Command::Skills { command } => match command {
-            SkillsCommand::Install(args)
-            | SkillsCommand::Status(args)
-            | SkillsCommand::UpdatePreview(args) => json!({
-                "codex": args.codex,
-                "claude": args.claude,
-                "all": args.all,
-                "codex_dir": args.codex_dir,
-                "claude_dir": args.claude_dir,
-            }),
-            SkillsCommand::Enroll(args) => single_skill_input_preview(args),
-            SkillsCommand::AutoUpdateStatus(args)
-            | SkillsCommand::DisableAutoUpdates(args)
-            | SkillsCommand::AutoUpdateOnce(args) => {
-                json!({"codex":args.codex,"claude":args.claude})
-            }
-            SkillsCommand::EnableAutoUpdates(args) => {
-                let mut input = single_skill_input_preview(&args.target);
-                input["policy_revision"] = json!(args.policy_revision);
-                input
-            }
-            SkillsCommand::StageUpdate(args) => {
-                let mut input = single_skill_input_preview(&args.target);
-                input["staging_dir"] = json!(args.staging_dir);
-                input
-            }
-            SkillsCommand::ApplyUpdate(args) => {
-                let mut input = single_skill_input_preview(&args.target);
-                input["staging_dir"] = json!(args.staging_dir);
-                input["operation_id"] = json!(args.operation_id);
-                input
-            }
-            SkillsCommand::UpdateResult(args) | SkillsCommand::RollbackUpdate(args) => {
-                let mut input = single_skill_input_preview(&args.target);
-                input["operation_id"] = json!(args.operation_id);
-                input
-            }
-        },
+        Command::Skills {
+            command: SkillsCommand::Install(args) | SkillsCommand::Status(args),
+        } => json!({
+            "codex": args.codex,
+            "claude": args.claude,
+            "all": args.all,
+            "codex_dir": args.codex_dir,
+            "claude_dir": args.claude_dir,
+        }),
         Command::History { command } => history_input_preview(command),
         Command::Intercept { command } => intercept_input_preview(command),
         Command::Websocket { command } => websocket_input_preview(command),
         Command::AutoReplace { command } => auto_replace_input_preview(command),
     }
-}
-
-fn single_skill_input_preview(args: &SingleSkillArgs) -> Value {
-    json!({"codex":args.codex,"claude":args.claude,"codex_dir":args.codex_dir,"claude_dir":args.claude_dir})
 }
 
 fn history_input_preview(command: &HistoryCommand) -> Value {
@@ -7780,32 +7295,6 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
         notes.push("Saved HTTP tabs only, including legacy empty types. No request parsing, body hydration, Replay send, WebSocket connection or full workspace replacement occurs. Success returns only acknowledgement metadata.");
     }
     if matches!(
-        command,
-        Command::Skills {
-            command: SkillsCommand::Enroll(_)
-                | SkillsCommand::UpdatePreview(_)
-                | SkillsCommand::StageUpdate(_)
-        }
-    ) {
-        notes.push("CLI-host local only; no Sniper API discovery or contact. Dry-run validates arguments and describes the plan without reading skill files or checking eligibility.");
-        notes.push("Enrollment records explicit local opt-in only and does not enable startup or automatic updates. Preview never implies ownership of unmanaged files.");
-        notes.push("Staging requires an unchanged enrolled skill with different bundled bytes and a new output directory. It writes a candidate and receipt only; the active SKILL.md remains unchanged and nothing is activated.");
-    }
-    if is_skill_auto_update_operation(command.operation_name()) {
-        notes.push("CLI-host local only; remote --api is never contacted. Dry-run validates arguments only, with no filesystem reads/writes, policy inspection, eligibility checks, or API discovery.");
-        notes.push("Canonical call dry runs require inline JSON in --input; @file and stdin are rejected before opening or reading them. Other commands retain their ordinary input-source behavior.");
-        notes.push("Enable records consent for one unchanged managed baseline without updating active files. Existing consent can be re-enabled only with its current policy revision, creating a new authorization generation.");
-        notes.push("Status, disable and one-shot execution use only the stored target. No automatic enrollment, adoption of edits, network templates, overwrite fallback, artifact pruning, or agent reload. Paused or uncertain state needs inspection and fresh explicit re-authorization.");
-    }
-    if matches!(
-        command.operation_name(),
-        "skills.apply_update" | "skills.update_result" | "skills.rollback_update"
-    ) {
-        notes.push("CLI-host local only; dry-run validates arguments without filesystem reads, host/API discovery, or checking eligibility. It does not reserve the operation UUID.");
-        notes.push("This explicit operation does not grant automatic-update consent or reload an agent. Apply requires a reviewed candidate bound to the unchanged enrollment baseline and this binary's newer bundle.");
-        notes.push("Keep the original operation UUID and all transaction artifacts. After uncertain output, use skills update-result with that same UUID; do not blindly retry or replace the ID. Rollback uses that original UUID and preserves displaced objects.");
-    }
-    if matches!(
         command.operation_name(),
         "capture.http.upstream_peer.get" | "capture.http.upstream_peer.set"
     ) {
@@ -7923,91 +7412,15 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
         "examples" => Command::Examples {
             operation: call_optional(operation, input, "operation")?,
         },
-        "skills.status" | "skills.update_preview" => {
-            let args = SkillsInstallArgs {
+        "skills.status" => Command::Skills {
+            command: SkillsCommand::Status(SkillsInstallArgs {
                 codex: call_bool(operation, input, "codex")?,
                 claude: call_bool(operation, input, "claude")?,
                 all: call_bool(operation, input, "all")?,
                 codex_dir: call_optional_path(operation, input, "codex_dir")?,
                 claude_dir: call_optional_path(operation, input, "claude_dir")?,
-            };
-            Command::Skills {
-                command: if operation == "skills.status" {
-                    SkillsCommand::Status(args)
-                } else {
-                    SkillsCommand::UpdatePreview(args)
-                },
-            }
-        }
-        "skills.auto_update_status" | "skills.disable_auto_updates" | "skills.auto_update_once" => {
-            let target = StoredSkillArgs {
-                codex: call_bool(operation, input, "codex")?,
-                claude: call_bool(operation, input, "claude")?,
-            };
-            Command::Skills {
-                command: match operation {
-                    "skills.auto_update_status" => SkillsCommand::AutoUpdateStatus(target),
-                    "skills.disable_auto_updates" => SkillsCommand::DisableAutoUpdates(target),
-                    _ => SkillsCommand::AutoUpdateOnce(target),
-                },
-            }
-        }
-        "skills.enable_auto_updates" => Command::Skills {
-            command: SkillsCommand::EnableAutoUpdates(SkillsEnableAutoUpdatesArgs {
-                target: SingleSkillArgs {
-                    codex: call_bool(operation, input, "codex")?,
-                    claude: call_bool(operation, input, "claude")?,
-                    codex_dir: call_optional_path(operation, input, "codex_dir")?,
-                    claude_dir: call_optional_path(operation, input, "claude_dir")?,
-                },
-                policy_revision: call_optional(operation, input, "policy_revision")?,
             }),
         },
-        "skills.enroll"
-        | "skills.stage_update"
-        | "skills.apply_update"
-        | "skills.update_result"
-        | "skills.rollback_update" => {
-            let target = SingleSkillArgs {
-                codex: call_bool(operation, input, "codex")?,
-                claude: call_bool(operation, input, "claude")?,
-                codex_dir: call_optional_path(operation, input, "codex_dir")?,
-                claude_dir: call_optional_path(operation, input, "claude_dir")?,
-            };
-            Command::Skills {
-                command: match operation {
-                    "skills.enroll" => SkillsCommand::Enroll(target),
-                    "skills.stage_update" => SkillsCommand::StageUpdate(SkillsStageArgs {
-                        target,
-                        staging_dir: PathBuf::from(call_required::<String>(
-                            operation,
-                            input,
-                            "staging_dir",
-                        )?),
-                    }),
-                    "skills.apply_update" => SkillsCommand::ApplyUpdate(SkillsApplyArgs {
-                        target,
-                        staging_dir: PathBuf::from(call_required::<String>(
-                            operation,
-                            input,
-                            "staging_dir",
-                        )?),
-                        operation_id: call_required(operation, input, "operation_id")?,
-                    }),
-                    _ => {
-                        let args = SkillsOperationArgs {
-                            target,
-                            operation_id: call_required(operation, input, "operation_id")?,
-                        };
-                        if operation == "skills.update_result" {
-                            SkillsCommand::UpdateResult(args)
-                        } else {
-                            SkillsCommand::RollbackUpdate(args)
-                        }
-                    }
-                },
-            }
-        }
         "skills.install" => Command::Skills {
             command: SkillsCommand::Install(SkillsInstallArgs {
                 codex: call_bool(operation, input, "codex")?,
@@ -9681,22 +9094,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Call(args) if args.operation.starts_with("saved.v1.") => {
             return run_saved_call(api_override, args, dry_run, yes).await;
         }
-        Command::Call(args) => {
-            // These previews promise argument-only execution, including input
-            // acquisition. Never open an input file or block on a stdin stream.
-            if dry_run
-                && is_skill_auto_update_operation(&args.operation)
-                && args
-                    .input
-                    .as_deref()
-                    .is_some_and(|source| source == "-" || source.starts_with('@'))
-            {
-                return Err(CallInputError::Source(
-                    "Automatic-update dry runs require inline JSON in --input; @file and stdin are not opened.".into(),
-                ).into());
-            }
-            command_from_call_args(args)?
-        }
+        Command::Call(args) => command_from_call_args(args)?,
         command => command,
     };
 
@@ -9760,101 +9158,6 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let result = install_skills(args)?;
             print_json(&result)
-        }
-        Command::Skills {
-            command: SkillsCommand::UpdatePreview(args),
-        } => print_json(&skills_update_preview(args)?),
-        Command::Skills {
-            command: SkillsCommand::AutoUpdateStatus(args),
-        } => {
-            let (agent, _) = stored_skill_agent(args);
-            print_json(&sniper::skill_auto_update::status(&cli_data_dir(), agent)?)
-        }
-        Command::Skills {
-            command: SkillsCommand::EnableAutoUpdates(args),
-        } => {
-            let (agent, root, bundled) = single_skill_target(args.target)?;
-            print_json(&sniper::skill_auto_update::enable(
-                &cli_data_dir(),
-                agent,
-                &root,
-                bundled,
-                env!("CARGO_PKG_VERSION"),
-                args.policy_revision,
-            )?)
-        }
-        Command::Skills {
-            command: SkillsCommand::DisableAutoUpdates(args),
-        } => {
-            let (agent, _) = stored_skill_agent(args);
-            print_json(&sniper::skill_auto_update::disable(&cli_data_dir(), agent)?)
-        }
-        Command::Skills {
-            command: SkillsCommand::AutoUpdateOnce(args),
-        } => {
-            let (agent, bundled) = stored_skill_agent(args);
-            print_json(&sniper::skill_auto_update::run_once(
-                &cli_data_dir(),
-                agent,
-                bundled,
-                env!("CARGO_PKG_VERSION"),
-            )?)
-        }
-        Command::Skills {
-            command: SkillsCommand::Enroll(args),
-        } => {
-            let (agent, root, bundled) = single_skill_target(args)?;
-            print_json(&sniper::skill_managed::enroll_skill(
-                agent,
-                &root,
-                bundled,
-                env!("CARGO_PKG_VERSION"),
-            )?)
-        }
-        Command::Skills {
-            command: SkillsCommand::StageUpdate(args),
-        } => {
-            let (agent, root, bundled) = single_skill_target(args.target)?;
-            print_json(&sniper::skill_managed::stage_skill_update(
-                agent,
-                &root,
-                bundled,
-                env!("CARGO_PKG_VERSION"),
-                &args.staging_dir,
-            )?)
-        }
-        Command::Skills {
-            command: SkillsCommand::ApplyUpdate(args),
-        } => {
-            let (agent, root, bundled) = single_skill_target(args.target)?;
-            print_json(&sniper::skill_activation::apply_skill_update(
-                agent,
-                &root,
-                bundled,
-                env!("CARGO_PKG_VERSION"),
-                &args.staging_dir,
-                &args.operation_id,
-            )?)
-        }
-        Command::Skills {
-            command: SkillsCommand::UpdateResult(args),
-        } => {
-            let (agent, root, _) = single_skill_target(args.target)?;
-            print_json(&sniper::skill_activation::update_result(
-                agent,
-                &root,
-                &args.operation_id,
-            )?)
-        }
-        Command::Skills {
-            command: SkillsCommand::RollbackUpdate(args),
-        } => {
-            let (agent, root, _) = single_skill_target(args.target)?;
-            print_json(&sniper::skill_activation::rollback_skill_update(
-                agent,
-                &root,
-                &args.operation_id,
-            )?)
         }
         command => {
             let api = if matches!(
@@ -9921,19 +9224,13 @@ fn validate_skill_root_selection(
     claude_selected: bool,
     codex_dir: &Option<PathBuf>,
     claude_dir: &Option<PathBuf>,
-    allow_all: bool,
 ) -> Result<()> {
     for (agent, selected, root) in [
         ("codex", codex_selected, codex_dir),
         ("claude", claude_selected, claude_dir),
     ] {
         if root.is_some() && !selected {
-            let all = if allow_all {
-                " or --all (all=true)"
-            } else {
-                ""
-            };
-            bail!("invalid directory override: --{agent}-dir ({agent}_dir) requires --{agent} ({agent}=true){all}; select that agent or omit its directory override");
+            bail!("invalid directory override: --{agent}-dir ({agent}_dir) requires --{agent} ({agent}=true) or --all (all=true); select that agent or omit its directory override");
         }
     }
     Ok(())
@@ -9985,10 +9282,7 @@ fn validate_command_preflight(command: &Command) -> Result<()> {
     }
 
     if let Command::Skills {
-        command:
-            SkillsCommand::Install(args)
-            | SkillsCommand::Status(args)
-            | SkillsCommand::UpdatePreview(args),
+        command: SkillsCommand::Install(args) | SkillsCommand::Status(args),
     } = command
     {
         if !(args.codex || args.claude || args.all) {
@@ -9999,65 +9293,9 @@ fn validate_command_preflight(command: &Command) -> Result<()> {
             args.claude || args.all,
             &args.codex_dir,
             &args.claude_dir,
-            true,
         )?;
         for path in [&args.codex_dir, &args.claude_dir].into_iter().flatten() {
             validate_skill_cli_path(path)?;
-        }
-    }
-
-    if let Command::Skills {
-        command:
-            SkillsCommand::Enroll(args)
-            | SkillsCommand::EnableAutoUpdates(SkillsEnableAutoUpdatesArgs { target: args, .. })
-            | SkillsCommand::StageUpdate(SkillsStageArgs { target: args, .. })
-            | SkillsCommand::ApplyUpdate(SkillsApplyArgs { target: args, .. })
-            | SkillsCommand::UpdateResult(SkillsOperationArgs { target: args, .. })
-            | SkillsCommand::RollbackUpdate(SkillsOperationArgs { target: args, .. }),
-    } = command
-    {
-        if args.codex == args.claude {
-            bail!("must select exactly one destination with --codex or --claude");
-        }
-        validate_skill_root_selection(
-            args.codex,
-            args.claude,
-            &args.codex_dir,
-            &args.claude_dir,
-            false,
-        )?;
-        for path in [&args.codex_dir, &args.claude_dir].into_iter().flatten() {
-            validate_skill_cli_path(path)?;
-        }
-    }
-    if let Command::Skills {
-        command:
-            SkillsCommand::AutoUpdateStatus(args)
-            | SkillsCommand::DisableAutoUpdates(args)
-            | SkillsCommand::AutoUpdateOnce(args),
-    } = command
-    {
-        if args.codex == args.claude {
-            bail!("must select exactly one destination with --codex or --claude");
-        }
-    }
-    if let Command::Skills {
-        command:
-            SkillsCommand::StageUpdate(SkillsStageArgs { staging_dir, .. })
-            | SkillsCommand::ApplyUpdate(SkillsApplyArgs { staging_dir, .. }),
-    } = command
-    {
-        validate_skill_cli_path(staging_dir)?;
-    }
-    if let Command::Skills {
-        command:
-            SkillsCommand::ApplyUpdate(SkillsApplyArgs { operation_id, .. })
-            | SkillsCommand::UpdateResult(SkillsOperationArgs { operation_id, .. })
-            | SkillsCommand::RollbackUpdate(SkillsOperationArgs { operation_id, .. }),
-    } = command
-    {
-        if !sniper::skill_activation::valid_operation_id(operation_id) {
-            bail!("operation_id must be a canonical lowercase hyphenated UUID");
         }
     }
 
@@ -18135,78 +17373,6 @@ fn cli_error_payload(operation: &str, error: &anyhow::Error) -> CliErrorPayload 
             exit_code: 2,
         };
     }
-    if let Some(managed) = error.downcast_ref::<sniper::skill_managed::ManagedSkillError>() {
-        let (message, hint) = match (operation, managed.code) {
-            (operation, "policy_revision_conflict" | "policy_revision_required") if is_skill_auto_update_operation(operation) => (
-                "The automatic-update policy needs fresh explicit authorization at its current revision.",
-                "Inspect skills auto-update-status for the same agent. Preserve all files and recovery artifacts; only deliberately re-enable with the returned --policy-revision after reviewing the stored target and pause reason.",
-            ),
-            (operation, _) if is_skill_auto_update_operation(operation) => (
-                "The host-local automatic-update action could not complete safely.",
-                "Inspect skills auto-update-status for the same agent and preserve active files, policy, attempt and transaction artifacts. Paused or uncertain state is not permission to retry, replace operation IDs, adopt edits or use legacy install. Re-enable only after review with the current --policy-revision.",
-            ),
-            ("skills.apply_update" | "skills.rollback_update", "recovery_required") => (
-                "The local skill mutation requires recovery inspection; its outcome must not be assumed.",
-                "Use skills update-result with the same selected agent, root and original --operation-id. Preserve all transaction and staging artifacts and displaced files; do not blindly retry or use a new operation ID.",
-            ),
-            ("skills.apply_update" | "skills.rollback_update", "platform_unsupported" | "swap_unsupported" | "metadata_unsupported") => (
-                "Safe skill activation or rollback is unavailable on this platform or filesystem.",
-                "Preserve the active skill and all artifacts. Use skills update-result with the original --operation-id if a transaction exists; never fall back to overwrite or legacy install.",
-            ),
-            ("skills.apply_update", "version_conflict") => (
-                "Different skill bytes do not have a strictly newer semantic version.",
-                "Preserve the active file, enrollment and stage. Inspect their versions and hashes; equal semantic-version precedence with different bytes is refused, including build-metadata-only changes.",
-            ),
-            ("skills.apply_update", "downgrade") => (
-                "The candidate's semantic version is older than the enrolled baseline.",
-                "Preserve the active file, enrollment and staged candidate. This activation path only accepts strictly newer bundled versions; use transaction-bound rollback with the original operation ID to restore that transaction's baseline.",
-            ),
-            ("skills.apply_update", "request_conflict") => (
-                "The operation ID is already bound to a different skill update request.",
-                "Inspect skills update-result using the original --operation-id, agent and root. Preserve its artifacts; do not reuse the ID for another bundle or staging directory or replace the ID to bypass an unresolved transaction.",
-            ),
-            ("skills.apply_update" | "skills.rollback_update", "transaction_busy" | "pending_transaction") => (
-                "Another local skill transaction blocks this action.",
-                "Stop concurrent writers and inspect the existing transaction with skills update-result and its original --operation-id. Preserve its lock and recovery artifacts; do not remove them or invent another ID to bypass the transaction.",
-            ),
-            ("skills.apply_update" | "skills.update_result" | "skills.rollback_update", _) => (
-                "The local skill transaction could not be completed or inspected safely.",
-                "Use skills update-result with the same selected agent, root and original --operation-id. Preserve transaction and staging artifacts and displaced files; inspect the reason before any deliberate action, and do not blindly retry or replace the operation ID.",
-            ),
-            ("skills.stage_update", "already_current") => (
-                "The active skill already matches this binary's bundled template.",
-                "Use skills status to check the active bytes; no update candidate is needed.",
-            ),
-            ("skills.enroll", "already_exists") => (
-                "The enrollment receipt path already exists.",
-                "Use skills update-preview to inspect the recorded baseline. Preserve the existing path; it may contain a valid or malformed receipt, or be a directory or link.",
-            ),
-            ("skills.stage_update", "already_exists") => (
-                "The staging directory or an output path already exists.",
-                "Inspect the staging directory and any partial output, then choose a new staging directory whose parent exists and which is outside the active skill directory.",
-            ),
-            ("skills.enroll", "installed_not_current") => (
-                "Enrollment requires active skill bytes that exactly match this binary's bundled template.",
-                "Use skills status to compare the active bytes. Review differences and preserve customizations; do not overwrite edits just to enroll.",
-            ),
-            ("skills.stage_update", "installed_modified") => (
-                "The active skill differs from its recorded enrollment baseline.",
-                "Use skills status to compare active bytes with the bundle and skills update-preview to inspect the baseline. Manual activation can leave an old receipt; preserve customizations before considering optional receipt recovery.",
-            ),
-            _ => (
-                "Local skill operation could not be completed safely.",
-                "Inspect skills update-preview and the local staging directory before deliberately trying again. No activation is performed.",
-            ),
-        };
-        return CliErrorPayload {
-            code: "MANAGED_SKILL_ERROR",
-            message: message.to_owned(),
-            hint: Some(hint),
-            retryable: false,
-            details: json!({"reason":managed.code}),
-            exit_code: 5,
-        };
-    }
     if let Some(peer) = error.downcast_ref::<UpstreamPeerCliError>() {
         return CliErrorPayload {
             code: peer.code,
@@ -18619,71 +17785,6 @@ fn validate_skill_cli_path(path: &Path) -> Result<()> {
         bail!("skill directory must be nonempty and contain no NUL characters");
     }
     Ok(())
-}
-
-fn stored_skill_agent(args: StoredSkillArgs) -> (&'static str, &'static str) {
-    if args.codex {
-        ("codex", skills::CODEX_SKILL_TEMPLATE)
-    } else {
-        ("claude", skills::CLAUDE_SKILL_TEMPLATE)
-    }
-}
-
-fn single_skill_target(args: SingleSkillArgs) -> Result<(&'static str, PathBuf, &'static str)> {
-    let (agent, root, default_root, bundled) = if args.codex {
-        (
-            "codex",
-            args.codex_dir,
-            skills::default_codex_skills_dir as fn() -> Option<PathBuf>,
-            skills::CODEX_SKILL_TEMPLATE,
-        )
-    } else {
-        (
-            "claude",
-            args.claude_dir,
-            skills::default_claude_skills_dir as fn() -> Option<PathBuf>,
-            skills::CLAUDE_SKILL_TEMPLATE,
-        )
-    };
-    let root = root.or_else(default_root).with_context(|| {
-        format!("could not determine {agent} skills directory; set HOME or pass --{agent}-dir")
-    })?;
-    Ok((agent, root, bundled))
-}
-
-fn skills_update_preview(args: SkillsInstallArgs) -> Result<Value> {
-    let mut entries = Vec::new();
-    for (selected, agent, root, default_root, bundled) in [
-        (
-            args.all || args.codex,
-            "codex",
-            args.codex_dir,
-            skills::default_codex_skills_dir as fn() -> Option<PathBuf>,
-            skills::CODEX_SKILL_TEMPLATE,
-        ),
-        (
-            args.all || args.claude,
-            "claude",
-            args.claude_dir,
-            skills::default_claude_skills_dir as fn() -> Option<PathBuf>,
-            skills::CLAUDE_SKILL_TEMPLATE,
-        ),
-    ] {
-        if selected {
-            let root = root.or_else(default_root).with_context(|| {
-                format!(
-                    "could not determine {agent} skills directory; set HOME or pass --{agent}-dir"
-                )
-            })?;
-            entries.push(sniper::skill_managed::preview_skill_update(
-                agent,
-                &root,
-                bundled,
-                env!("CARGO_PKG_VERSION"),
-            )?);
-        }
-    }
-    Ok(json!({"scope":"cli_host","bundled_version":env!("CARGO_PKG_VERSION"),"entries":entries}))
 }
 
 fn skills_status(args: SkillsInstallArgs) -> Result<Value> {
@@ -22437,109 +21538,6 @@ mod tests {
         ] {
             let raw_args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert_eq!(cli_parse_error_operation(&raw_args), expected);
-        }
-    }
-
-    #[test]
-    fn managed_skill_errors_have_operation_specific_guidance_and_stable_contracts() {
-        for (operation, reason, message, hint_fragments) in [
-            (
-                "skills.stage_update",
-                "already_current",
-                "The active skill already matches this binary's bundled template.",
-                vec!["skills status", "no update candidate is needed"],
-            ),
-            (
-                "skills.enroll",
-                "already_exists",
-                "The enrollment receipt path already exists.",
-                vec!["skills update-preview", "malformed", "directory or link"],
-            ),
-            (
-                "skills.stage_update",
-                "already_exists",
-                "The staging directory or an output path already exists.",
-                vec!["partial output", "new staging directory", "parent exists", "outside the active skill directory"],
-            ),
-            (
-                "skills.enroll",
-                "installed_not_current",
-                "Enrollment requires active skill bytes that exactly match this binary's bundled template.",
-                vec!["skills status", "preserve customizations", "do not overwrite edits"],
-            ),
-            (
-                "skills.stage_update",
-                "installed_modified",
-                "The active skill differs from its recorded enrollment baseline.",
-                vec!["skills status", "skills update-preview", "Manual activation", "old receipt", "optional receipt recovery"],
-            ),
-            (
-                "skills.enroll",
-                "unrecognized_reason",
-                "Local skill operation could not be completed safely.",
-                vec!["local staging directory", "No activation is performed"],
-            ),
-            (
-                "skills.enroll",
-                "already_current",
-                "Local skill operation could not be completed safely.",
-                vec!["local staging directory", "No activation is performed"],
-            ),
-            (
-                "unknown.operation",
-                "already_exists",
-                "Local skill operation could not be completed safely.",
-                vec!["local staging directory", "No activation is performed"],
-            ),
-        ] {
-            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError { code: reason });
-            let payload = cli_error_payload(operation, &error);
-            assert_eq!(payload.code, "MANAGED_SKILL_ERROR");
-            assert_eq!(payload.exit_code, 5);
-            assert!(!payload.retryable);
-            assert_eq!(payload.details, json!({"reason": reason}));
-            assert_eq!(payload.message, message);
-            for fragment in hint_fragments {
-                assert!(payload.hint.unwrap().contains(fragment), "{operation}/{reason}: {fragment}");
-            }
-        }
-    }
-
-    #[test]
-    fn activation_recovery_errors_preserve_original_operation_guidance() {
-        for operation in ["skills.apply_update", "skills.rollback_update"] {
-            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError {
-                code: "recovery_required",
-            });
-            let payload = cli_error_payload(operation, &error);
-            assert_eq!(payload.code, "MANAGED_SKILL_ERROR");
-            assert_eq!(payload.exit_code, 5);
-            assert!(!payload.retryable);
-            assert_eq!(payload.details, json!({"reason":"recovery_required"}));
-            let hint = payload.hint.unwrap();
-            for fragment in [
-                "skills update-result",
-                "original --operation-id",
-                "Preserve",
-                "do not blindly retry",
-                "new operation ID",
-            ] {
-                assert!(hint.contains(fragment), "{operation}: {fragment}");
-            }
-            assert!(!hint.contains("No activation is performed"));
-        }
-        for operation in [
-            "skills.apply_update",
-            "skills.update_result",
-            "skills.rollback_update",
-        ] {
-            let error = anyhow::Error::new(sniper::skill_managed::ManagedSkillError {
-                code: "unrecognized_reason",
-            });
-            let hint = cli_error_payload(operation, &error).hint.unwrap();
-            assert!(hint.contains("skills update-result"));
-            assert!(hint.contains("original --operation-id"));
-            assert!(!hint.contains("No activation is performed"));
         }
     }
 
