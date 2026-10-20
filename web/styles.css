@@ -7711,23 +7711,64 @@ button.utility-button.replay-tab-add {
 .service-map-edge:where(.kind-api) { stroke: var(--service-map-api-edge); opacity: .5; }
 .service-map-edge:where(.kind-script, .kind-static) { opacity: .3; }
 .service-map-edge.selected { stroke: var(--point); opacity: 1; stroke-width: calc(var(--edge-weight, 1.5px) + 0.5px); }
-/* Flow: one lane per origin, a band per page load and an arrow per step; a
-   step opens its newest row in HTTP history, another lane shows its own flow. */
+/* Flow: one lane per origin, a card per page load and an arrow per step; a
+   step opens its newest row in HTTP history, another lane shows its own flow.
+   Method and status pills take the colours of HTTP history. */
 .service-map-flow { display: block; overflow: visible; font-size: 12px; --service-map-api-edge: var(--token-url-color); }
 .service-map-flow text { fill: var(--text-soft); }
-.service-map-flow-lane rect { fill: var(--panel); stroke: var(--line-strong); }
-.service-map-flow-lane text { fill: var(--text); font-weight: 500; }
-.service-map-flow-lane[data-selected] rect { stroke: var(--point); }
+.service-map-flow-phase { fill: var(--panel-code); stroke: var(--line); }
+.service-map-flow-phase-accent { fill: var(--point); opacity: .6; }
+.service-map-flow-phase-title rect { fill: var(--panel-code); }
+.service-map-flow .service-map-flow-kicker { font-size: 10px; font-weight: 700; letter-spacing: .08em; fill: var(--text-dim); }
+.service-map-flow .service-map-flow-place { font-family: var(--mono); fill: var(--text); }
+.service-map-flow-lane rect { fill: var(--panel-elevated); stroke: var(--line-strong); }
+.service-map-flow .service-map-flow-lane-name { fill: var(--text); font-weight: 600; }
+.service-map-flow .service-map-flow-lane-detail { font-size: 11px; fill: var(--text-dim); }
+.service-map-flow-lane[data-selected] rect { stroke: var(--point); stroke-width: 1.5px; }
+.service-map-flow .service-map-flow-lane[data-selected] .service-map-flow-lane-name { fill: var(--point); }
 .service-map-flow-lane[data-service-flow-lane], .service-map-flow-step { cursor: pointer; }
-.service-map-flow-life { stroke: var(--line-strong); stroke-dasharray: 3 4; }
-.service-map-flow-phase rect { fill: var(--panel-code); stroke: var(--line-strong); }
-.service-map-flow-step line { stroke: var(--text-dim); stroke-width: 1.5px; }
+.service-map-flow-lane[data-service-flow-lane]:is(:hover, :focus-visible) rect { stroke: var(--point-border); }
+.service-map-flow-life { stroke: var(--line-strong); stroke-dasharray: 3 5; }
+.service-map-flow-row { fill: transparent; }
+.service-map-flow-step:is(:hover, :focus-visible) .service-map-flow-row { fill: var(--point-soft); }
+.service-map-flow-step:focus-visible .service-map-flow-row { stroke: var(--point-border); }
+.service-map-flow .service-map-flow-time { font-size: 11px; fill: var(--text-dim); font-variant-numeric: tabular-nums; }
+/* The halo keeps a path legible where a lifeline runs behind it. */
+.service-map-flow .service-map-flow-path { font-family: var(--mono); fill: var(--text); stroke: var(--panel-code); stroke-width: 4px; stroke-linejoin: round; paint-order: stroke; }
+.service-map-flow-pill rect { fill: var(--panel-elevated); stroke: var(--line-strong); }
+.service-map-flow .service-map-flow-pill text { font-size: 10.5px; font-weight: 700; fill: var(--text-soft); }
+.service-map-flow-pill.method-get rect { fill: var(--point-soft); stroke: none; }
+.service-map-flow .service-map-flow-pill.method-get text { fill: var(--accent-strong); }
+.service-map-flow-pill.method-post rect { fill: rgba(246, 196, 110, 0.12); stroke: none; }
+.service-map-flow .service-map-flow-pill.method-post text { fill: var(--warning); }
+.service-map-flow-pill:is(.method-put, .method-patch) rect { fill: rgba(130, 184, 255, 0.12); stroke: none; }
+.service-map-flow .service-map-flow-pill:is(.method-put, .method-patch) text { fill: var(--info); }
+.service-map-flow-pill.method-delete rect { fill: rgba(255, 142, 142, 0.12); stroke: none; }
+.service-map-flow .service-map-flow-pill.method-delete text { fill: var(--danger); }
+.service-map-flow .service-map-flow-pill.status-ok text { fill: var(--success); }
+.service-map-flow .service-map-flow-pill.status-info text { fill: var(--info); }
+.service-map-flow .service-map-flow-pill.status-warn text { fill: var(--warning); }
+.service-map-flow .service-map-flow-pill.status-error text { fill: var(--danger); }
+/* Arrows by request kind: API calls stand out, pages read plainly, scripts
+   and static files recede; a redirect back to the client is gold and dashed. */
+.service-map-flow-step line { stroke: var(--text-soft); stroke-width: 1.5px; }
+.service-map-flow-head { fill: var(--text-soft); }
 .service-map-flow-step.kind-api line { stroke: var(--service-map-api-edge); }
+.service-map-flow-step.kind-api .service-map-flow-head { fill: var(--service-map-api-edge); }
+.service-map-flow-step:is(.kind-script, .kind-static, .kind-other) line { stroke: var(--text-dim); }
+.service-map-flow-step:is(.kind-script, .kind-static, .kind-other) .service-map-flow-head { fill: var(--text-dim); }
 .service-map-flow-step.redirect line { stroke: var(--point); stroke-dasharray: 6 4; }
-.service-map-flow-step:is(:hover, :focus-visible) line { stroke: var(--point); stroke-width: 2px; }
-.service-map-flow-step:is(:hover, :focus-visible) text { fill: var(--text); }
-.service-map-flow-lane[data-service-flow-lane]:is(:hover, :focus-visible) rect { stroke: var(--point); }
+.service-map-flow-step.redirect .service-map-flow-head { fill: var(--point); }
+.service-map-flow-step:is(:hover, :focus-visible) line { stroke-width: 2px; }
 .service-map-flow :focus-visible { outline: none; }
+/* The legend shows the map's line kinds, or in Flow the flow's; the wrappers
+   leave their samples items of the legend's own row. */
+.service-map-legend-lines, .service-map-legend-flow { display: contents; }
+.service-map-legend.flow-active .service-map-legend-lines, .service-map-legend:not(.flow-active) .service-map-legend-flow { display: none; }
+.service-map-line.flow-api { border-top-color: var(--token-url-color); }
+.service-map-line.flow-page { border-top-color: var(--text-soft); }
+.service-map-line.flow-static { border-top-color: var(--text-dim); }
+.service-map-line.flow-redirect { border-top: 2px dashed var(--point); }
 /* A wide transparent stroke over each recorded arrow takes the pointer. */
 .service-map-hit { fill: none; stroke: transparent; stroke-width: 10px; pointer-events: stroke; cursor: pointer; }
 .service-map-card { display: flex; gap: 8px; position: absolute; width: var(--service-map-card-width); height: var(--service-map-card-height); box-sizing: border-box; align-items: flex-start; padding: 10px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel-elevated); color: var(--text); text-align: left; cursor: pointer; box-shadow: 0 4px 18px rgba(0,0,0,.12); }

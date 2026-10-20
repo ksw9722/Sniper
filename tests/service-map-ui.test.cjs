@@ -40,7 +40,7 @@ function node() {
 function fixture(options = {}) {
   let session = 'session-one';
   const requests = [];
-  const els = Object.fromEntries(['panel', 'apiDocs', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'flow', 'flowMermaid', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'apiDocs', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'flow', 'flowMermaid', 'linkKinds', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
   els.viewport.clientWidth = 620; els.viewport.clientHeight = 500;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty("--ui-root-size", "12px");
@@ -1643,6 +1643,40 @@ test('a flow keeps its lanes, folds repeats, hides hidden kinds and draws a redi
   assert.match(mermaid, /Note over C,O1: Page load: api\.example\.com\/login/);
   assert.equal(map.normalizeFlow({ ...flowPayload(), origin: originB }, 'session-one', originA), null, 'another origin');
   assert.equal(map.normalizeFlow(flowPayload('session-two'), 'session-one', originA), null, 'another session');
+});
+
+test('a flow draws method and status pills, each lane\'s requests and the time since the first request', () => {
+  const payload = flowPayload();
+  payload.phases[0].steps[1].first_seen = '2026-10-20T00:00:01.500Z';
+  payload.phases[1].steps[0].first_seen = '2026-10-20T00:01:05Z';
+  const markup = map.flowMarkup(map.flowLayout(map.normalizeFlow(payload, 'session-one', originA), ['static']));
+  assert.match(markup, /service-map-flow-pill method-get/);
+  assert.match(markup, /service-map-flow-pill status-ok/);
+  assert.match(markup, /service-map-flow-pill status-info/, 'the 302');
+  assert.match(markup, />×3</);
+  assert.match(markup, />5 requests</, 'the client sent every shown request');
+  assert.match(markup, />4 requests</, 'the API lane: the config three times and the login');
+  for (const time of ['+0ms', '+1.5s', '+1m05s']) assert.ok(markup.includes(`>${time}<`), time);
+  // WebKit draws no context-stroke marker, so heads are paths of their own.
+  assert.doesNotMatch(markup, /marker-end/);
+  assert.match(markup, /class="service-map-flow-head"/);
+});
+
+test('in Flow the kind toggles count the flow\'s requests and the legend shows Flow lines', async () => {
+  const f = fixture();
+  const legend = node();
+  f.els.linkKinds.parentElement = legend;
+  await f.load(); f.controller.selectOrigin(originA);
+  f.els.flow.dispatch('click');
+  f.requests.at(-1).resolve(response(flowPayload()));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(f.els.linkKinds.innerHTML, /Requests:/);
+  assert.match(f.els.linkKinds.innerHTML, /API calls 3/);
+  assert.match(f.els.linkKinds.innerHTML, /Static files 2/);
+  assert.equal(legend.classList.contains('flow-active'), true);
+  f.els.allOrigins.dispatch('click');
+  assert.doesNotMatch(f.els.linkKinds.innerHTML, /Requests:/);
+  assert.equal(legend.classList.contains('flow-active'), false);
 });
 
 test('Flow reads the selected origin and opens a step in HTTP history', async () => {

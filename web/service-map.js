@@ -1225,13 +1225,24 @@
   const LINK_LABELS = { origin_header: "Origin header", referer_header: "Referer header", client_request: "Direct request" };
   // The Flow view: the selected origin's requests and those of the origins it
   // links to, in time order, a band per page load, the client on the left.
-  const FLOW = Object.freeze({ clientX: 90, laneWidth: 180, laneBox: 160, top: 24, header: 36, band: 24, step: 34, padding: 24 });
+  const FLOW = Object.freeze({ gutter: 64, clientX: 136, laneWidth: 220, laneBox: 180, top: 12, header: 46, kicker: 30, step: 42, padding: 20 });
   const FLOW_STOPS = Object.freeze({ lanes_limit: "more origins link here; the five with the most rows are shown", steps_limit: "older steps left out" });
   const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const hostOf = (origin) => { try { return new URL(origin).host; } catch { return String(origin); } };
   const flowStepLabel = (step) => `${step.method} ${step.path}${step.count > 1 ? ` ×${step.count}` : ""}${step.status == null ? "" : ` ${step.status}`}`;
   const flowRedirectLabel = (step) => `${step.status ?? "3xx"} to ${hostOf(step.redirect.origin)}${step.redirect.path}`;
   const flowPageLabel = (phase) => phase.page ? `Page load: ${hostOf(phase.page.origin)}${phase.page.path}` : "Before the first page load";
+  const FLOW_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+  const flowStatusClass = (status) => status == null ? "" : status >= 500 ? " status-error" : status >= 400 ? " status-warn" : status >= 300 ? " status-info" : " status-ok";
+  const flowTime = (ms) => ms < 1000 ? `+${Math.round(ms)}ms` : ms < 60000 ? `+${(ms / 1000).toFixed(1)}s`
+    : `+${Math.floor(ms / 60000)}m${String(Math.floor(ms % 60000 / 1000)).padStart(2, "0")}s`;
+  // SVG text is placed, not measured: a character of the 12px monospace path
+  // is about 7.2px wide and one of an 11px bold pill about 7px.
+  const flowFit = (text, room, perChar = 7.2) => text.length * perChar <= room ? text : `${text.slice(0, Math.max(3, Math.floor(room / perChar) - 1))}…`;
+  function flowPill(x, y, text, kind) {
+    const width = 14 + text.length * 7;
+    return { width, markup: `<g class="service-map-flow-pill${kind}"><rect x="${x}" y="${y - 9}" width="${width}" height="18" rx="9"></rect><text x="${x + width / 2}" y="${y}" text-anchor="middle" dominant-baseline="central">${escape(text)}</text></g>` };
+  }
 
   // A flow read that does not match the origin and session asked for, or
   // names a lane it does not list, shows nothing rather than a wrong diagram.
@@ -1245,51 +1256,95 @@
       steps: array(phase?.steps).filter((step) => lanes.includes(step?.origin) && UUID_PATTERN.test(String(step.record_id || ""))).map((step) => ({
         origin: step.origin, method: String(step.method || "?").slice(0, 16), path: safePath(step.path),
         status: Number.isInteger(step.status) ? step.status : null, kind: REQUEST_KINDS.includes(step.request_kind) ? step.request_kind : "other",
-        count: Math.max(1, count(step.count)), recordId: step.record_id, redirect: target(step.redirect),
+        count: Math.max(1, count(step.count)), recordId: step.record_id, redirect: target(step.redirect), firstSeen: Date.parse(step.first_seen),
       })),
     })).filter((phase) => phase.steps.length);
     return { origin, lanes, phases, flowRows: count(raw.flow_rows), consideredRows: count(raw.considered_rows), complete: raw.complete === true, stoppedBy: array(raw.stopped_by).map(String) };
   }
 
-  // One row per shown step and one more for its redirect; a page load whose
-  // steps are all of hidden kinds gets no band, as hidden kinds draw no arrows.
+  // A card per page load with a row per shown step and one more for its
+  // redirect; a page load whose steps are all of hidden kinds gets no card.
   function flowLayout(flow, hiddenKinds = []) {
     const hidden = new Set(hiddenKinds);
     const laneX = new Map(flow.lanes.map((origin, index) => [origin, FLOW.clientX + FLOW.laneWidth * (index + 1)]));
+    const laneRequests = new Map(flow.lanes.map((origin) => [origin, 0]));
+    const phases = flow.phases.map((phase) => ({ phase, steps: phase.steps.filter((step) => !hidden.has(step.kind)) })).filter(({ steps }) => steps.length);
+    const start = Math.min(...phases.flatMap(({ steps }) => steps.map((step) => step.firstSeen)).filter(Number.isFinite));
     const bands = [], arrows = [];
     let y = FLOW.top + FLOW.header + 16;
-    for (const phase of flow.phases) {
-      const steps = phase.steps.filter((step) => !hidden.has(step.kind));
-      if (!steps.length) continue;
-      bands.push({ y, label: flowPageLabel(phase) });
-      y += FLOW.band + 6;
+    for (const { phase, steps } of phases) {
+      const top = y;
+      y += FLOW.kicker;
       for (const step of steps) {
-        y += FLOW.step;
-        arrows.push({ y, x: laneX.get(step.origin), step });
-        if (step.redirect) {
+        laneRequests.set(step.origin, laneRequests.get(step.origin) + step.count);
+        const at = Number.isFinite(step.firstSeen) && Number.isFinite(start) ? step.firstSeen - start : null;
+        for (const redirect of step.redirect ? [false, true] : [false]) {
+          arrows.push({ top: y, y: y + FLOW.step - 13, x: laneX.get(step.origin), step, redirect, at: redirect ? null : at });
           y += FLOW.step;
-          arrows.push({ y, x: laneX.get(step.origin), step, redirect: true });
         }
       }
+      y += 8;
+      bands.push({ y: top, height: y - top, page: phase.page });
       y += 14;
     }
-    return { lanes: flow.lanes, laneX, bands, arrows, width: FLOW.clientX + FLOW.laneWidth * flow.lanes.length + FLOW.laneBox / 2 + FLOW.padding, height: y + FLOW.padding };
+    return { lanes: flow.lanes, laneX, laneRequests, bands, arrows, width: FLOW.clientX + FLOW.laneWidth * flow.lanes.length + FLOW.laneBox / 2 + FLOW.padding, height: y + FLOW.padding };
   }
 
   function flowMarkup(layout) {
-    const bottom = layout.height - FLOW.padding / 2;
-    const lane = (x, label, title, attributes = "") => `<g class="service-map-flow-lane"${attributes}><title>${escape(title)}</title><rect x="${x - FLOW.laneBox / 2}" y="${FLOW.top}" width="${FLOW.laneBox}" height="${FLOW.header}" rx="6"></rect><text x="${x}" y="${FLOW.top + FLOW.header / 2}" text-anchor="middle" dominant-baseline="central">${escape(label)}</text></g><line class="service-map-flow-life" x1="${x}" y1="${FLOW.top + FLOW.header}" x2="${x}" y2="${bottom}"></line>`;
-    const lanes = [lane(FLOW.clientX, "Client", "Requests as the client sent them"), ...layout.lanes.map((origin, index) => lane(layout.laneX.get(origin), hostOf(origin),
-      index ? `${origin} · show its flow` : origin, index ? ` data-service-flow-lane="${escape(origin)}" role="button" tabindex="0"` : ' data-selected="true"'))];
-    const bands = layout.bands.map((band) => `<g class="service-map-flow-phase"><rect x="8" y="${band.y}" width="${layout.width - 16}" height="${FLOW.band}" rx="4"></rect><text x="20" y="${band.y + FLOW.band / 2}" dominant-baseline="central">${escape(band.label)}</text></g>`);
-    const arrows = layout.arrows.map(({ x, y, step, redirect }) => {
+    const bottom = layout.height - FLOW.padding / 2, right = layout.width - FLOW.padding;
+    const requests = (value) => `${value} request${value === 1 ? "" : "s"}`;
+    const total = [...layout.laneRequests.values()].reduce((sum, value) => sum + value, 0);
+    const lane = (x, name, detail, title, attributes = "") => `<g class="service-map-flow-lane"${attributes}><title>${escape(title)}</title>`
+      + `<rect x="${x - FLOW.laneBox / 2}" y="${FLOW.top}" width="${FLOW.laneBox}" height="${FLOW.header}" rx="8"></rect>`
+      + `<text class="service-map-flow-lane-name" x="${x}" y="${FLOW.top + 17}" text-anchor="middle" dominant-baseline="central">${escape(flowFit(name, FLOW.laneBox - 20, 7))}</text>`
+      + `<text class="service-map-flow-lane-detail" x="${x}" y="${FLOW.top + 33}" text-anchor="middle" dominant-baseline="central">${escape(detail)}</text></g>`;
+    const xs = [FLOW.clientX, ...layout.lanes.map((origin) => layout.laneX.get(origin))];
+    const lifelines = xs.map((x) => `<line class="service-map-flow-life" x1="${x}" y1="${FLOW.top + FLOW.header}" x2="${x}" y2="${bottom}"></line>`);
+    const lanes = [lane(FLOW.clientX, "Client", requests(total), "Requests as the client sent them"),
+      ...layout.lanes.map((origin, index) => lane(layout.laneX.get(origin), hostOf(origin), requests(layout.laneRequests.get(origin)),
+        index ? `${origin} · show its flow` : origin, index ? ` data-service-flow-lane="${escape(origin)}" role="button" tabindex="0"` : ' data-selected="true"'))];
+    const cards = layout.bands.map((band) => `<rect class="service-map-flow-phase" x="8" y="${band.y}" width="${layout.width - 16}" height="${band.height}" rx="8"></rect>`
+      + `<rect class="service-map-flow-phase-accent" x="8" y="${band.y + 8}" width="3" height="${band.height - 16}" rx="1.5"></rect>`);
+    // A card's title sits on a patch of its own colour so the lifelines pass behind it.
+    const titles = layout.bands.map((band) => {
+      const kicker = band.page ? "PAGE LOAD" : "BEFORE THE FIRST PAGE LOAD";
+      const place = band.page ? flowFit(`${hostOf(band.page.origin)}${band.page.path}`, right - 120) : "";
+      const width = 16 + kicker.length * 6.6 + (place ? 8 + place.length * 7.2 : 0);
+      return `<g class="service-map-flow-phase-title"><rect x="18" y="${band.y + 6}" width="${width}" height="20" rx="4"></rect>`
+        + `<text x="26" y="${band.y + 16}" dominant-baseline="central"><tspan class="service-map-flow-kicker">${kicker}</tspan>${place ? `<tspan class="service-map-flow-place" dx="8">${escape(place)}</tspan>` : ""}</text></g>`;
+    });
+    const arrows = layout.arrows.map(({ x, y, top, step, redirect, at }) => {
       const label = redirect ? flowRedirectLabel(step) : flowStepLabel(step);
-      const [from, to] = redirect ? [x, FLOW.clientX + 6] : [FLOW.clientX, x - 6];
-      return `<g class="service-map-flow-step kind-${step.kind}${redirect ? " redirect" : ""}" data-service-flow-record="${escape(step.recordId)}" role="button" tabindex="0"><title>${escape(`${label} · ${step.origin}${step.path} · open in HTTP history`)}</title><text x="${FLOW.clientX + 10}" y="${y - 8}">${escape(label)}</text><line x1="${from}" y1="${y}" x2="${to}" y2="${y}" marker-end="url(#service-map-flow-arrow)"></line></g>`;
+      const labelY = y - 15, parts = [];
+      let cursor = FLOW.clientX + 12;
+      const pill = (text, kind) => { const made = flowPill(cursor, labelY, text, kind); parts.push(made.markup); cursor += made.width + 6; };
+      const words = (text, room) => {
+        const fitted = flowFit(text, room);
+        parts.push(`<text class="service-map-flow-path" x="${cursor}" y="${labelY}" dominant-baseline="central">${escape(fitted)}</text>`);
+        cursor += fitted.length * 7.2 + 8;
+      };
+      if (redirect) {
+        pill(String(step.status ?? "3xx"), flowStatusClass(step.status));
+        words(`to ${hostOf(step.redirect.origin)}${step.redirect.path}`, right - cursor);
+      } else {
+        const method = step.method.toUpperCase();
+        pill(method, FLOW_METHODS.has(method) ? ` method-${method.toLowerCase()}` : "");
+        const after = (step.count > 1 ? 20 + String(step.count).length * 7 : 0) + (step.status == null ? 0 : 41);
+        words(step.path, right - cursor - after);
+        if (step.count > 1) pill(`×${step.count}`, " count");
+        if (step.status != null) pill(String(step.status), flowStatusClass(step.status));
+      }
+      // A request runs from the client to its origin; a redirect back again.
+      const [from, to, back] = redirect ? [x, FLOW.clientX, 1] : [FLOW.clientX, x, -1];
+      const head = `M${to + back * 9},${y - 5} L${to},${y} L${to + back * 9},${y + 5} Z`;
+      return `<g class="service-map-flow-step kind-${step.kind}${redirect ? " redirect" : ""}" data-service-flow-record="${escape(step.recordId)}" role="button" tabindex="0">`
+        + `<title>${escape(`${label} · ${step.origin}${step.path} · open in HTTP history`)}</title>`
+        + `<rect class="service-map-flow-row" x="14" y="${top + 2}" width="${layout.width - 28}" height="${FLOW.step - 4}" rx="6"></rect>`
+        + (at == null ? "" : `<text class="service-map-flow-time" x="${FLOW.gutter}" y="${y}" text-anchor="end" dominant-baseline="central">${flowTime(at)}</text>`)
+        + `${parts.join("")}<line x1="${from}" y1="${y}" x2="${to + back * 8}" y2="${y}"></line><path class="service-map-flow-head" d="${head}"></path></g>`;
     });
     return `<svg class="service-map-flow" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" role="group" aria-label="Requests in time order">`
-      + `<defs><marker id="service-map-flow-arrow" viewBox="0 0 8 8" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="context-stroke" stroke-width="1.5"></path></marker></defs>`
-      + `${lanes.join("")}${bands.join("")}${arrows.join("")}</svg>`;
+      + `${cards.join("")}${lifelines.join("")}${lanes.join("")}${titles.join("")}${arrows.join("")}</svg>`;
   }
 
   // Mermaid sequence diagram text; ";" and "#" would end or escape a message.
@@ -2081,9 +2136,11 @@
       if (els.directRelations) els.directRelations.disabled = !state.snapshot || !state.anchorOrigin && !selected;
       if (els.flow) els.flow.disabled = !state.snapshot || !flow && !selected;
       els.flowMermaid?.classList.toggle("hidden", !flow || !state.flow);
+      els.linkKinds?.parentElement?.classList.toggle("flow-active", flow);
     }
     function renderFlow() {
       renderModeButtons(selectedOrigin());
+      renderLinkKinds();
       els.mapControls?.classList.toggle("hidden", state.view === "apis");
       els.focusSelection?.classList.toggle("hidden", true);
       const flow = state.flow;
@@ -2091,7 +2148,7 @@
       const shown = layout ? layout.arrows.filter((arrow) => !arrow.redirect).length : 0;
       if (!shown) {
         currentLayout = null;
-        const message = !flow ? state.flowError || "Reading the flow…" : "No requests of the kinds shown. Show more kinds under Links by request.";
+        const message = !flow ? state.flowError || "Reading the flow…" : "No requests of the kinds shown. Turn more kinds on under Requests.";
         replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${escape(message)}</h3></div>`);
         els.graphBounds.textContent = "";
         if (els.graphDiagnostics) els.graphDiagnostics.textContent = "";
@@ -3035,7 +3092,10 @@
       if (!els.linkKinds) return;
       const hidden = new Set(hiddenLinkKinds());
       const links = new Map(REQUEST_KINDS.map((kind) => [kind, 0]));
-      for (const origin of state.snapshot?.origins || []) {
+      // In Flow they count the flow's requests, which they hide or draw.
+      const flow = !!state.flowOrigin;
+      if (flow) for (const step of (state.flow?.phases || []).flatMap((phase) => phase.steps)) links.set(step.kind, links.get(step.kind) + step.count);
+      for (const origin of flow ? [] : state.snapshot?.origins || []) {
         // One link per source, whichever headers named it; older servers send
         // only the per-header counts.
         for (const link of origin.header_sources?.length ? origin.header_sources : origin.header_links || []) {
@@ -3044,8 +3104,9 @@
           for (const [kind] of linkKindCounts(link)) links.set(kind, links.get(kind) + 1);
         }
       }
-      const toggles = REQUEST_KINDS.filter((kind) => links.get(kind) > 0).map((kind) => `<button class="service-map-kind kind-${kind}" type="button" data-link-kind="${kind}" data-service-focus="link-kind:${kind}" aria-pressed="${!hidden.has(kind)}" title="${REQUEST_KIND_LABELS[kind]} in ${links.get(kind)} Origin/Referer link(s). ${hidden.has(kind) ? "Draw" : "Hide"} them."><span class="service-map-kind-swatch" aria-hidden="true"></span>${REQUEST_KIND_LABELS[kind]} ${links.get(kind)}</button>`).join("");
-      replace(els.linkKinds, toggles ? `<span class="service-map-kinds-label">Links by request:</span>${toggles}` : "");
+      const counted = flow ? "request(s) in this flow" : "Origin/Referer link(s)";
+      const toggles = REQUEST_KINDS.filter((kind) => links.get(kind) > 0).map((kind) => `<button class="service-map-kind kind-${kind}" type="button" data-link-kind="${kind}" data-service-focus="link-kind:${kind}" aria-pressed="${!hidden.has(kind)}" title="${REQUEST_KIND_LABELS[kind]}: ${links.get(kind)} ${counted}. ${hidden.has(kind) ? "Draw" : "Hide"} them."><span class="service-map-kind-swatch" aria-hidden="true"></span>${REQUEST_KIND_LABELS[kind]} ${links.get(kind)}</button>`).join("");
+      replace(els.linkKinds, toggles ? `<span class="service-map-kinds-label">${flow ? "Requests:" : "Links by request:"}</span>${toggles}` : "");
     }
     // Group by site, and every origin or site hidden from the map with a way
     // back for each.

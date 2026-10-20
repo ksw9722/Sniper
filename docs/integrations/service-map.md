@@ -140,11 +140,13 @@ would hide it.
 
 **Flow** shows the selected origin's requests in time order. Its lanes are the
 client, the origin and up to five origins it links to directly by an Origin or
-Referer header or a redirect. Each page load (a navigation) starts a band, the
+Referer header or a redirect. Each page load (a navigation) starts a card, the
 same request in one page load folds into one arrow with a count, and a redirect
-is a dashed arrow back to the client. Hidden request kinds and the Service Map
-filter apply. Click an arrow to open its newest row in HTTP history, or another
-lane to follow that origin. **Copy Mermaid** copies the flow as a Mermaid
+is a dashed arrow back to the client. Each arrow shows the method, path and
+status, and the time since the flow's first request; each lane its request
+count. The request kinds toggled under **Requests** and the Service Map filter
+apply. Click an arrow to open its newest row in HTTP history, or another lane to
+follow that origin. **Copy Mermaid** copies the flow as a Mermaid
 sequence diagram.
 
 The view reads the newest 50,000 rows; the CLI reads 10,000 unless told
