@@ -9025,6 +9025,11 @@ function renderToolPanels() {
     return;
   }
 
+  if (templatesVisible) {
+    els.footerMode.textContent = "Templates active";
+    return;
+  }
+
   if (loggerVisible) {
     renderEventLog();
     els.footerMode.textContent = "Event log active";
