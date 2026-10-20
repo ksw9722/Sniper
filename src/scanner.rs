@@ -1589,6 +1589,10 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
         return;
     }
     let script = javascript_or_css_response(record, response);
+    let page = response
+        .header_value("content-type")
+        .or(response.content_type.as_deref())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("html"));
 
     static PATTERNS: &[(&str, &str, Severity)] = &[
         // ── Cloud provider secrets ──
@@ -1898,6 +1902,16 @@ fn check_sensitive_data(record: &TransactionRecord, findings: &mut Vec<ScannerFi
                 };
                 if is_generic_secret_label(label)
                     && !generic_secret_candidate_looks_like_secret(&captures)
+                {
+                    continue;
+                }
+                // A page or a script hands its SDK keys to every visitor; there
+                // only a key named a secret is worth a finding.
+                if label == "API Key/Secret pattern"
+                    && (script || page)
+                    && !body[m.start()..captures.get(1).map_or(m.end(), |value| value.start())]
+                        .to_ascii_lowercase()
+                        .contains("secret")
                 {
                     continue;
                 }
@@ -4129,7 +4143,7 @@ fn map_exposure_severity(product_id: &str) -> Option<Severity> {
 
 fn check_auth_issues(record: &TransactionRecord, findings: &mut Vec<ScannerFinding>) {
     // Session token in URL
-    if let Some(param) = session_token_parameter_in_url(&record.path) {
+    if let Some(param) = session_token_parameter_in_url(record) {
         findings.push(make_finding(
                 record,
                 Severity::Medium,
@@ -4365,7 +4379,8 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn session_token_parameter_in_url(path: &str) -> Option<String> {
+fn session_token_parameter_in_url(record: &TransactionRecord) -> Option<String> {
+    let path = &record.path;
     let lower = path.to_ascii_lowercase();
     if lower.contains(";jsessionid=") || lower.contains(";phpsessid=") {
         return path.split(';').skip(1).find_map(|segment| {
@@ -4383,9 +4398,33 @@ fn session_token_parameter_in_url(path: &str) -> Option<String> {
         let key = key.replace('+', " ");
         let decoded = percent_decode(&key).to_ascii_lowercase();
         (is_session_token_parameter_name(&decoded)
+            && (!session_token_name_needs_cookie(&decoded)
+                || request_cookie_carries(record, value))
             && session_token_value_looks_sensitive(&decoded, value))
         .then_some(decoded)
     })
+}
+
+// Analytics, ad and bot beacons send their own ids as `sid`, `token` or
+// `api_key`. Under these names only the request's own cookie copied into the
+// URL is a session leaking.
+fn session_token_name_needs_cookie(name: &str) -> bool {
+    matches!(
+        name,
+        "sessionid" | "session_id" | "sid" | "token" | "api_key"
+    )
+}
+
+fn request_cookie_carries(record: &TransactionRecord, value: &str) -> bool {
+    let value = percent_decode(value);
+    record
+        .request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("cookie"))
+        .flat_map(|header| header.value.split(';'))
+        .filter_map(|pair| pair.split_once('='))
+        .any(|(_, cookie)| percent_decode(cookie.trim()) == value)
 }
 
 fn is_session_token_parameter_name(name: &str) -> bool {
@@ -6309,12 +6348,19 @@ mod tests {
 
     #[test]
     fn session_token_detection_ignores_public_api_key_identifiers() {
-        for path in [
-            "/maps?api_key=AIzaabcdefghijklmnopqrstuvwxyz123456789",
-            "/checkout?api_key=pk_live_1234567890abcdefghijklmnop",
+        for key in [
+            "AIzaabcdefghijklmnopqrstuvwxyz123456789",
+            "pk_live_1234567890abcdefghijklmnop",
         ] {
-            let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
-            record.path = path.to_string();
+            let cookie = format!("api_key={key}");
+            let mut record = make_record(
+                vec![("cookie", cookie.as_str())],
+                vec![("content-type", "text/html")],
+                "",
+                200,
+            );
+            let path = format!("/maps?api_key={key}");
+            record.path = path.clone();
             let findings = scan_transaction(&record, &ScannerConfig::default());
 
             assert!(
@@ -6328,7 +6374,12 @@ mod tests {
 
     #[test]
     fn session_token_detection_still_reports_random_api_key_parameter() {
-        let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+        let mut record = make_record(
+            vec![("cookie", "api_key=Ab3dEf6hIj9kLm2nOp5qRs8t")],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
         record.path = "/api?api_key=Ab3dEf6hIj9kLm2nOp5qRs8t".to_string();
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
@@ -6358,6 +6409,39 @@ mod tests {
                 .any(|finding| finding.title == "Session/token parameter in URL: foo"),
             "unrelated matrix parameters should not be reported as session tokens"
         );
+    }
+
+    #[test]
+    fn session_token_detection_needs_the_cookie_value_for_generic_names() {
+        let reported = |path: &str, cookie: Option<&str>| {
+            let headers = cookie.map(|cookie| vec![("cookie", cookie)]);
+            let mut record = make_record(
+                headers.unwrap_or_default(),
+                vec![("content-type", "text/html")],
+                "",
+                200,
+            );
+            record.path = path.to_string();
+            scan_transaction(&record, &ScannerConfig::default())
+                .iter()
+                .any(|finding| finding.title.starts_with("Session/token parameter in URL"))
+        };
+
+        assert!(!reported("/b?sid=abcdef1234567890", None));
+        assert!(!reported(
+            "/b?token=abcdef1234567890",
+            Some("token=other1234567890")
+        ));
+        assert!(reported(
+            "/b?sid=abcdef1234567890",
+            Some("lang=en; sid=abcdef1234567890")
+        ));
+        assert!(reported(
+            "/b?token=Ab3d%2BEf6hIj9kLm2n",
+            Some("t=Ab3d+Ef6hIj9kLm2n")
+        ));
+        assert!(reported("/b?access_token=abcdef1234567890", None));
+        assert!(reported("/app;jsessionid=abcdef1234567890", None));
     }
 
     #[test]
@@ -7759,7 +7843,12 @@ mod tests {
 
     #[test]
     fn session_token_url_check_ignores_short_low_signal_values() {
-        let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
+        let mut record = make_record(
+            vec![("cookie", "token=1; sid=abc")],
+            vec![("content-type", "text/html")],
+            "",
+            200,
+        );
         record.path = "/app?token=1&sid=abc".to_string();
         let findings = scan_transaction(&record, &ScannerConfig::default());
 
@@ -7847,6 +7936,34 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.title.contains("API Key/Secret pattern")));
+    }
+
+    #[test]
+    fn sensitive_scanner_reports_api_keys_in_browser_code_only_when_named_secret() {
+        let key = "Ab3dEf6hIj9kLm2nOp5qRs8t";
+        let reported = |content_type: &str, body: String| {
+            let record = make_record(vec![], vec![("content-type", content_type)], &body, 200);
+            scan_transaction(&record, &ScannerConfig::default())
+                .iter()
+                .any(|finding| finding.title.contains("API Key/Secret pattern"))
+        };
+
+        assert!(!reported(
+            "application/javascript",
+            format!(r#"analytics.init({{apiKey:"{key}"}})"#)
+        ));
+        assert!(!reported(
+            "text/html; charset=utf-8",
+            format!(r#"<script>var api_key = "{key}";</script>"#)
+        ));
+        assert!(reported(
+            "application/javascript",
+            format!(r#"var api_secret = "{key}";"#)
+        ));
+        assert!(reported(
+            "application/json",
+            format!(r#"{{"apiKey":"{key}"}}"#)
+        ));
     }
 
     #[test]
@@ -8653,16 +8770,22 @@ mod tests {
 
     #[test]
     fn session_token_rule_ignores_short_numbers() {
-        let reported = |path: &str| {
-            let mut record = make_record(vec![], vec![("content-type", "text/html")], "", 200);
-            record.path = path.to_string();
+        let reported = |sid: &str| {
+            let cookie = format!("sid={sid}");
+            let mut record = make_record(
+                vec![("cookie", cookie.as_str())],
+                vec![("content-type", "text/html")],
+                "",
+                200,
+            );
+            record.path = format!("/collect?sid={sid}");
             scan_transaction(&record, &ScannerConfig::default())
                 .iter()
                 .any(|finding| finding.title.starts_with("Session/token parameter"))
         };
 
-        assert!(!reported("/collect?sid=1760000000"), "a session start time");
-        assert!(reported("/collect?sid=Zm9vYmFyYmF6cXV4MTIz"));
+        assert!(!reported("1760000000"), "a session start time");
+        assert!(reported("Zm9vYmFyYmF6cXV4MTIz"));
     }
 
     #[test]
