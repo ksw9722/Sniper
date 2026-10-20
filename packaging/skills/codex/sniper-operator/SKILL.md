@@ -1,6 +1,6 @@
 ---
 name: sniper-operator
-description: Inspect captured HTTP/HTTPS traffic and debug APIs through a local Sniper proxy, driving it with sniper-cli rather than the desktop UI. Covers reviewing captured requests and responses, replaying them with changes, holding and editing live traffic, scope, fuzzer runs, WebSocket frames, match-replace rules, colour tags and notes, opening a browser already wired to Sniper, and session switching. Not for routing LLM API calls or hosting a reverse proxy.
+description: Inspect captured HTTP/HTTPS traffic and debug APIs through a local Sniper proxy with sniper-cli. Covers captured requests and responses, replay with changes, holding and editing live traffic, scope, fuzzer runs, WebSocket frames, match-replace rules, tags and notes, session switching, and opening a browser wired to Sniper (ego lite, Aside, BrowserOS neo, Chrome): open it here first, then drive it with ego-browser. Not for routing LLM API calls or hosting a reverse proxy.
 ---
 
 # Sniper Operator
