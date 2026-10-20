@@ -502,87 +502,11 @@ sniper-cli skills install --claude --yes
 
 ## Skill maintenance
 
-Use `sniper-cli skills status --all` to compare active installed files with the
-bundle, or `sniper-cli skills update-preview --all` to inspect enrollment and
-update eligibility. These are local, read-only operations; inspect each row's
-state/error rather than treating exit zero as proof every file is current.
-The experimental `skills.enroll` and `skills.stage_update` operations must be
-discovered through `manifest`, `schema`, and `examples` before using them.
-Enrollment records an explicit local baseline; it does not enable automatic updates.
-Staging requires confirmation and a new output directory, writes only a candidate
-and receipt, and returns `activated:false`. Never claim staging updated the active
-skill or the agent's loaded context.
-
-Explicit activation is a partial milestone. Discover `skills.apply_update`,
-`skills.update_result`, and `skills.rollback_update` before using them. Select
-exactly one agent and preserve its skills root. Apply requires the reviewed stage
-to match the unchanged enrollment baseline and the executing binary's bundle;
-different bytes require a strictly newer semantic version. Equal precedence with
-different bytes, including build-metadata-only differences, is a version conflict.
-Unmanaged, edited or mismatched files must be preserved rather than overwritten.
-
-Generate and retain one canonical lowercase hyphenated UUID `operation_id` before
-an approved apply. `skills apply-update` requires `--staging-dir`, that
-`--operation-id`, and `--yes`; preview with global `--dry-run` first. Dry run is
-argument-only and performs no filesystem inspection or API discovery. It cannot
-prove the stage is eligible. Successful application records an updated managed
-baseline but never enables startup updates or unattended activation, and reports
-`allows_automatic_updates:false` and `agent_reloaded:false`. Changing a file does
-not prove a running agent reloaded its instructions.
-
-After lost output, interruption or `recovery_required`, use the read-only
-`skills update-result` with the same original operation ID, agent and root.
-This reads local files but never resumes a mutation. Inspect both `state` and
-`current_state`: a historical applied result is separate from today's active
-bytes. Preserve all transaction and staging artifacts and displaced objects;
-never blindly retry or silently mint a replacement ID. The same bound ID can
-resume only proven object placements; a different request under that ID is
-refused. Explicit `skills rollback-update --yes` uses that original apply ID to
-restore the bound baseline and preserves displaced objects. Unexpected changes
-can block rollback; there is no force-overwrite fallback.
-
-Linux exchange has native fixture coverage. Hosted macOS 15 ARM64
-[focused policy/transaction tests and native desktop compilation](https://github.com/sm1ee/Sniper/actions/runs/38423109820)
-were verified at `e7cbe95`. Actual GUI behavior, Intel Macs and user-installed
-skills remain unverified. Windows activation, rollback, result inspection and
-host-policy operations are unsupported. There is a cap of
-128 retained operations and no automatic pruning. Partial or corrupted preparation
-or markers require manual reconciliation while preserving all artifacts.
-The legacy `skills install --yes` can overwrite installations; never use it as
-an automatic update or recovery fallback.
-
-Automatic updates are Off by default and require separate explicit user approval
-of future bundled updates for one unchanged managed installation. Never infer
-that approval from enrollment, an app upgrade, startup, or reading this skill.
-Discover `skills.auto_update_status`, `skills.enable_auto_updates`,
-`skills.disable_auto_updates`, and `skills.auto_update_once` before use.
-`auto-update-status` is read-only; enable, disable and one-shot execution require
-`--yes`. Enable records consent only and does not immediately update the skill.
-Only enable accepts a selected agent's directory override; status, disable and
-once always use the recorded target and reject redirection. Select exactly one
-agent; `--all` is unsupported for these commands.
-
-Host policy lives under the local Sniper data directory's `host-skill-updates`,
-not session data or exports. Remote `--api` is never contacted. The desktop runs
-one background pass after its first idle event; headless startup and ordinary
-CLI commands do not run it. Candidates come only from the executing binary's
-bundle and different bytes need a strictly newer semantic version. No network
-fetch, automatic enrollment, adoption of edits, overwrite fallback, pruning or
-agent reload is permitted.
-
-Inspect policy `state`, `error_code` and optional retained `pause_reason`;
-`enabled:true` can coexist with `paused`.
-A pending or uncertain attempt consumes its authorization and is not permission
-to retry, invent another ID or resume at startup. Preserve all policy, attempt,
-staging and transaction artifacts. After lost output, inspect
-`skills auto-update-status` and the original transaction when present. A pause or
-disabled policy never re-enables itself. Re-enable only after explicit user
-approval and review, supplying the exact current `--policy-revision` from status
-and the original target; this creates a new authorization generation. Disable
-revokes future work without undoing committed updates. Windows host-policy
-operations are unsupported. Dry run remains argument-only with zero filesystem
-or API I/O and cannot establish eligibility. For these four operations, canonical
-`call --dry-run` requires inline JSON; `@file` and stdin are rejected before reads.
+The desktop app overwrites this skill with its bundled copy on every launch, so it
+follows Sniper updates and local edits do not last. `sniper-cli skills status --all`
+compares the installed files with this build, and `sniper-cli skills install --codex --yes`
+or `--claude --yes` replaces one right away. Use the experimental `skills.enroll`,
+`skills.*_update` and `skills.*auto_update*` operations only when the user asks for them.
 
 ## Guardrails
 

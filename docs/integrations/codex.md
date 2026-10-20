@@ -65,16 +65,9 @@ $ echo $?
 0
 ```
 
-The installed file is a **copy of the template embedded in the binary**, not a
-link to the repository. Upgrading Sniper alone does not refresh it. Inspect it first
-with `sniper-cli skills status --codex` or `sniper-cli skills update-preview --codex`.
-`skills install --codex --yes` **overwrites** an existing `SKILL.md`; preserve any
-edits before deliberately choosing replacement. See
-[safe skill maintenance](skill-maintenance.md) for read-only checks and the
-experimental staging and activation workflows. Automatic updates are Off by
-default and need separate explicit `enable-auto-updates --codex --yes` consent;
-that command only records authorization. Inspect the host-local policy with
-`auto-update-status --codex`.
+The installed file is a copy of the template embedded in the binary. The desktop
+app overwrites it on every launch, so it follows Sniper updates and local edits do
+not last.
 
 Installing both agents into one directory is rejected, because both would write
 the same `SKILL.md`:
@@ -84,13 +77,8 @@ $ sniper-cli --output compact skills install --all --codex-dir /tmp/x --claude-d
 {"error":{"code":"CLI_ERROR","details":{},"hint":null,"message":"codex and claude skill destinations resolve to the same SKILL.md path: /tmp/x/sniper-operator/SKILL.md","retryable":false},"meta":{},"ok":false,"operation":"skills.install","schema_version":"2026-06-22","warnings":[]}
 ```
 
-`sniper-desktop` can install on launch, but only when
-`SNIPER_INSTALL_AGENT_SKILLS` is set to `1`, `true` or `yes` — any other value,
-including `on`, is ignored — and that path writes only when no `SKILL.md` is
-already there. Publication never replaces a file created concurrently, and
-startup logs report only newly created installations. The no-replace publication
-requires filesystem hard-link support; unsupported publication fails closed
-rather than falling back to replacement. A normal launch installs nothing.
+`sniper-desktop` also installs the skill where it is missing when
+`SNIPER_INSTALL_AGENT_SKILLS` is `1`, `true` or `yes`.
 
 ## Point the CLI at the right instance
 

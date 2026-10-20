@@ -238,7 +238,11 @@ fn run_desktop() -> Result<()> {
         .context("failed to read bound UI address")?;
     config.ui_addr = runtime_state::advertise_local_api_addr(bound_ui_addr);
 
-    // Keep agent skill installation opt-in; normal desktop launch should not edit user dotfiles.
+    // An outdated skill sends agents after commands this CLI no longer has, so
+    // installed skills follow the app. Installing one where none exists stays opt-in.
+    for skill in skills::update_installed_all() {
+        info!(agent = skill.agent, path = %skill.path, "updated sniper-operator skill");
+    }
     let install_skills_env = env::var(INSTALL_SKILLS_ENV).ok();
     if should_install_skills_on_launch(install_skills_env.as_deref()) {
         let skill_results = skills::auto_install_all();

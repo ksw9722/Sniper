@@ -640,64 +640,11 @@ sniper-cli skills install --all --dry-run
 sniper-cli skills install --all --yes
 ```
 
-Check installed skill files without modifying them:
-
-```bash
-sniper-cli skills status --all
-sniper-cli skills status --codex --codex-dir /tmp/example-skills
-sniper-cli call skills.status --input '{"claude":true}'
-sniper-cli schema output skills.status
-```
-
-Select at least one of `--codex`, `--claude`, or `--all`. Optional
-`--codex-dir` and `--claude-dir` specify skills roots, just as for install.
-Status reads only this CLI host's `sniper-operator/SKILL.md` files, even when
-`--api` points elsewhere. It performs no API discovery, installation, directory
-creation, or update; `--yes` is not needed. Discovery, schemas, examples, and
-`--dry-run` are offline and do not inspect installed files.
-
-The result has `scope: "cli_host"`, the CLI's `bundled_version`, and `entries`
-with agent, absolute path, bundled and installed SHA-256 hashes, and status.
-`current` means exact byte equality; `modified_or_outdated` only means the hashes
-differ. The installed version is unknown, so differences cannot distinguish
-user edits from an older template. `missing`, `unreadable`, and `unsupported`
-report files that could not be compared; the installed hash is null and error
-rows include `error_code`. Reads are byte-bounded and reject final-component symlinks/reparse points,
-non-regular files, and oversized files. Ancestor directory links retain normal
-filesystem semantics; this is not a general filesystem I/O timeout. Source text is never returned.
-Completed inspections exit zero, including missing/error rows: automation must
-check each row's `status` and `error_code`. Invalid arguments or failure to
-resolve a selected path exit nonzero. Existing install behavior is unchanged.
-
-### Local skill maintenance
-
-`skills update-preview` compares active installed bytes with this binary's bundle
-without writing. Experimental enrollment and staging preserve a known baseline.
-The partial activation milestone adds explicit `skills apply-update --yes`,
-read-only `skills update-result`, and transaction-bound `skills rollback-update
---yes`. Keep the original canonical lowercase operation UUID for inspection and
-rollback, especially after interrupted or lost output. Different bytes must come
-from a strictly newer bundled semantic version; edited or mismatched files are
-refused, and recovery artifacts are preserved.
-
-These explicit operations do not themselves grant automatic-update consent.
-Automatic updates are Off by default. `skills enable-auto-updates --codex --yes`
-records host-local consent for one unchanged managed installation without
-updating it immediately. `skills auto-update-status --codex` reads the policy;
-`skills auto-update-once --codex --yes` attempts an eligible bundled update, and
-`skills disable-auto-updates --codex --yes` revokes future updates. Use `--claude`
-for Claude. Status, disable and one-shot execution use the stored target and
-reject directory overrides. Re-enabling an existing policy requires its current
-`--policy-revision` and creates fresh authorization. The desktop schedules one
-background pass after its first idle event; no agent reload or network template
-fetch occurs. Uncertain attempts pause rather than silently retrying.
-
-Linux exchange is covered by native fixtures. Hosted macOS 15 ARM64
-[focused policy/transaction tests and native desktop compilation](https://github.com/sm1ee/Sniper/actions/runs/38423109820)
-were verified at `e7cbe95`. Actual GUI behavior, Intel Macs and user-installed
-skills remain unverified. Windows activation, rollback, transaction-result
-inspection and host-policy operations are currently unsupported. See [safe skill maintenance](docs/integrations/skill-maintenance.md)
-for the review workflow, confirmation requirements, recovery and platform limits.
+This installs the `sniper-operator` skill for Claude Code and Codex. The desktop
+app overwrites installed copies with its own on every launch, so the skill follows
+Sniper updates and local edits do not last. `sniper-cli skills status --all` shows
+whether they match this build. Experimental update commands are in
+[skill maintenance](docs/integrations/skill-maintenance.md).
 
 AI agents can drive the full workflow through CLI — capture, scope, replay, fuzz — no UI scraping needed.
 

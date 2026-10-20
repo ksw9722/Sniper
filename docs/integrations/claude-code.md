@@ -39,28 +39,15 @@ scratch directory so it would not overwrite a real install:
 { "installed": [ { "agent": "claude", "path": "<scratch>/.claude/skills/sniper-operator" } ] }
 ```
 
-The destination flags are `--codex`, `--claude`, `--all`, `--codex-dir` and
-`--claude-dir`; `--yes` with none of them exits `1` and names the three it accepts.
-There is no `--force` and no uninstall; a second `--yes` overwrites `SKILL.md` in
-place, so a locally edited skill is lost without warning. The default destination is
-`$CLAUDE_HOME/skills` when `CLAUDE_HOME` is set and `~/.claude/skills` otherwise,
-putting the skill at `~/.claude/skills/sniper-operator/SKILL.md` — byte-identical to
+The default destination is `$CLAUDE_HOME/skills`, or `~/.claude/skills` when
+`CLAUDE_HOME` is unset; `--claude-dir` installs into another folder, such as a
+project's `.claude/skills`. The installed file is a copy of
 [`packaging/skills/claude/sniper-operator/SKILL.md`](../../packaging/skills/claude/sniper-operator/SKILL.md).
-Use `--claude-dir` to install into a project's `.claude/skills` instead.
+The desktop app overwrites it on every launch, so it follows Sniper updates and
+local edits do not last.
 
-Before replacing an existing copy, use `skills status --claude` or
-`skills update-preview --claude` to inspect it without writing. See
-[safe skill maintenance](skill-maintenance.md) for explicit enrollment,
-experimental candidate staging, and preservation limits. Staging does not
-activate an update or enable unattended startup replacement. Automatic updates
-are Off by default and require separate explicit `enable-auto-updates --claude
---yes` consent; it only records authorization. Inspect the host-local policy with
-`auto-update-status --claude`.
-
-Two things `skills install` does not do. It never touches `PATH` — put `sniper-cli`
-there yourself, as the [CLI section of the README](../../README.md#cli) describes. And
-it needs no running Sniper: `"api": {"local": true}` means the whole operation is a
-local file write, so the install works before Sniper has ever been started.
+`skills install` needs no running Sniper and does not change `PATH`; see the
+[CLI section of the README](../../README.md#cli).
 
 ### OpenCode
 

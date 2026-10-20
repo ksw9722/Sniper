@@ -1,10 +1,9 @@
 # Safe skill maintenance
 
-These commands operate on skill files on the **CLI host**, even with a remote
-`--api`. They do not contact an API or a network service. The bundled templates
-come from the running binary; upgrading the binary alone does not replace
-existing installed skills. Automatic updates are disabled by default; separate
-explicit host-local consent is described below.
+The desktop app overwrites installed skills with its bundled copy on every launch,
+so most installs need nothing here. The experimental commands below work on skill
+files on the **CLI host**, even with a remote `--api`, and contact no network
+service.
 
 ## Inspect before changing anything
 
@@ -111,9 +110,7 @@ a sandbox against another process maliciously replacing ancestor directories.
 
 ## Explicit activation and rollback (partial milestone)
 
-Activation is an explicit, experimental step. It is not an unattended updater:
-there is no startup hook, scheduled activation, automatic fallback, or agent
-reload. A newer binary alone still does not alter an installed skill.
+Activation is an explicit, experimental step.
 
 Review the staged candidate and choose a new operation UUID before applying.
 Use exactly the canonical lowercase hyphenated spelling; uppercase, compact,
@@ -227,7 +224,7 @@ and inspect its original operation ID first.
 
 ## Opt-in host-local automatic updates
 
-Automatic updates are **Off by default**. Enrollment, application startup,
+These policy-based updates are **Off by default**. Enrollment, application startup,
 upgrading Sniper, reading a skill, and `--yes` on another command do not grant
 consent. An agent must not enable this feature on the user's behalf without
 explicit approval of future updates to the selected installation.
