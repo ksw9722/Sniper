@@ -23,10 +23,10 @@ function values(id) {
   return [...contents.matchAll(/<option value="([^"]*)"/g)].map(([, value]) => value);
 }
 
-const buttons = ['resetFuzzerButton', 'startFuzzerButton', 'fuzzerMarkSelectionButton', 'fuzzerUndoMarkerButton',
+const buttons = ['resetFuzzerButton', 'stopFuzzerButton', 'startFuzzerButton', 'fuzzerMarkSelectionButton', 'fuzzerUndoMarkerButton',
   'fuzzerMarkCandidateButton', 'fuzzerImportPayloadButton', 'fuzzerApplyPresetButton', 'fuzzerGenerateRangeButton',
   'fuzzerCompareBaseButton', 'fuzzerCompareButton', 'fuzzerRefreshRunsButton', 'fuzzerViewRunButton', 'fuzzerReuseRunButton'];
-const labeledControls = ['fuzzerCandidateSelect', 'fuzzerPayloadImportMode', 'fuzzerPayloadPreset',
+const labeledControls = ['fuzzerCandidateSelect', 'fuzzerAttackType', 'fuzzerConcurrency', 'fuzzerUrlEncode', 'fuzzerPayloadImportMode', 'fuzzerPayloadPreset',
   'fuzzerRangeStart', 'fuzzerRangeEnd', 'fuzzerRangeStep', 'fuzzerPayloadsEditor', 'fuzzerResultStatus',
   'fuzzerResultMinBytes', 'fuzzerResultMaxBytes', 'fuzzerResultMinMs', 'fuzzerResultMaxMs',
   'fuzzerResultSort', 'fuzzerResultDirection', 'fuzzerSavedRunSelect'];
@@ -57,13 +57,14 @@ test('payload controls declare append default, exact presets and accessible file
   assert.match(fuzzer, /Spaces are preserved\. Blank lines are empty payloads; a final line break is ignored\./);
 });
 
-test('preflight exposes replace-all and sequential semantics without fake run progress', () => {
-  assert.match(fuzzer, /Each payload replaces every <code>\$payload\$<\/code> marker in one request/);
-  assert.match(fuzzer, /Requests run sequentially; results arrive after completion/);
+test('preflight names the two ways payloads fill positions, and a running attack can be stopped', () => {
+  assert.match(fuzzer, /Sniper puts each payload in one position at a time; Battering ram puts it in every position at once/);
+  assert.deepEqual(values('fuzzerAttackType'), ['sniper', 'battering_ram']);
+  assert.match(fuzzer, /<button class="secondary-action hidden" id="stopFuzzerButton" type="button">Stop<\/button>/);
   for (const id of ['fuzzerPreflightSummary', 'fuzzerPreflightNotice']) assert.equal(byId(id).attrs.role, 'status');
   assert.equal(byId('fuzzerPreviewSamples').tag, 'div');
   assert.match(fuzzer, /<details[^>]*fuzzer-preview-disclosure[^>]*>\s*<summary>Preview &amp; details<\/summary>[\s\S]*?<div id="fuzzerPreviewSamples"/);
-  assert.doesNotMatch(fuzzer, /<progress\b|fuzzerStop|>Stop<|live progress/i);
+  assert.doesNotMatch(fuzzer, /<progress\b/i);
 });
 
 test('result filters, comparison and saved run controls match JS contracts', () => {

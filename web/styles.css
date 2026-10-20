@@ -3293,6 +3293,35 @@ body.pane-resizing-y {
   color: var(--warning);
 }
 
+/* A start the server refused, or a draft it would refuse. */
+.fuzzer-shell #fuzzerPreflightNotice.fuzzer-notice-error {
+  color: var(--danger);
+}
+
+.fuzzer-attack-options {
+  align-items: end;
+  flex-wrap: wrap;
+}
+
+.fuzzer-attack-options .fuzzer-concurrency-field input {
+  width: 64px;
+}
+
+.fuzzer-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-sm);
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
+.fuzzer-position {
+  color: var(--point);
+  font-family: var(--mono);
+  font-size: var(--font-xs);
+}
+
 .fuzzer-shell #fuzzerPreflightNotice:empty,
 .fuzzer-shell #fuzzerSavedRunNotice:empty {
   display: none;

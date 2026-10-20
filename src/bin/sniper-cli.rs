@@ -1906,6 +1906,8 @@ enum FuzzerCommand {
     Run(FuzzerRunArgs),
     /// Show fuzzer attack status by ID
     Status(FuzzerStatusArgs),
+    /// Stop the session's running fuzzer attack by ID
+    Stop(FuzzerStatusArgs),
     /// Show fuzzer attack results by ID
     Results(FuzzerResultsArgs),
     /// List past fuzzer attacks
@@ -1916,9 +1918,37 @@ enum FuzzerCommand {
 struct FuzzerRunArgs {
     #[arg(long)]
     session_id: Option<Uuid>,
-    /// Mark async intent in output; the current Sniper API still returns after completion
+    /// Return once the attack starts instead of when it ends
     #[arg(long, alias = "async")]
     r#async: bool,
+    /// How payloads fill the marked positions
+    #[arg(long, value_enum, default_value_t)]
+    attack_type: FuzzerAttackTypeArg,
+    /// Put payloads into the URL as they are instead of percent-encoding them
+    #[arg(long)]
+    raw_payloads: bool,
+    /// Requests sent at once, 1-16
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=16))]
+    concurrency: u8,
+}
+
+/// How payloads fill the marked positions, as Burp Intruder names it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum FuzzerAttackTypeArg {
+    /// Each position in turn takes every payload; the others keep their value
+    Sniper,
+    /// Every position takes the same payload at once
+    #[default]
+    BatteringRam,
+}
+
+impl FuzzerAttackTypeArg {
+    fn api_name(self) -> &'static str {
+        match self {
+            Self::Sniper => "sniper",
+            Self::BatteringRam => "battering_ram",
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -3021,6 +3051,9 @@ struct FuzzerRunPayload {
     source_transaction_id: Option<Uuid>,
     http_version: Option<String>,
     target: Option<RequestTargetOverride>,
+    attack_type: &'static str,
+    url_encode: bool,
+    concurrency: u8,
 }
 
 #[derive(Serialize)]
@@ -3291,6 +3324,7 @@ impl FuzzerCommand {
             FuzzerCommand::SetPayloads(_) => "fuzzer.set_payloads",
             FuzzerCommand::Run(_) => "fuzzer.run",
             FuzzerCommand::Status(_) => "fuzzer.status",
+            FuzzerCommand::Stop(_) => "fuzzer.stop",
             FuzzerCommand::Results(_) => "fuzzer.results",
             FuzzerCommand::List(_) => "fuzzer.list",
         }
@@ -3835,11 +3869,11 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
         op(
             "fuzzer.run",
             "fuzzer run",
-            "Run the Fuzzer, sending generated HTTP requests.",
+            "Run the Fuzzer, sending the HTTP requests its positions and payloads make, and wait for the attack to end unless `async` is set.",
             Write,
             true,
             &[],
-            vec![json!({})],
+            vec![json!({}), json!({"attack_type":"sniper","concurrency":4})],
         ),
         op(
             "fuzzer.status",
@@ -3847,6 +3881,15 @@ fn manifest_operations() -> Vec<CliOperationSpec> {
             "Read Fuzzer attack status.",
             Read,
             false,
+            &["id"],
+            vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
+        ),
+        op(
+            "fuzzer.stop",
+            "fuzzer stop --id <uuid>",
+            "Stop the session's running Fuzzer attack. Requests in flight are dropped; results already received stay.",
+            Write,
+            true,
             &["id"],
             vec![json!({"id":"00000000-0000-0000-0000-000000000000"})],
         ),
@@ -6261,8 +6304,15 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         ],
         "replay.send" => &["tab_id", "session_id"],
         "fuzzer.set_payloads" => &["session_id", "payloads", "payload", "file", "stdin"],
-        "fuzzer.run" => &["session_id", "async", "r#async"],
-        "fuzzer.status" | "fuzzer.results" => &["id", "session_id"],
+        "fuzzer.run" => &[
+            "session_id",
+            "async",
+            "r#async",
+            "attack_type",
+            "raw_payloads",
+            "concurrency",
+        ],
+        "fuzzer.status" | "fuzzer.results" | "fuzzer.stop" => &["id", "session_id"],
         "fuzzer.list" => &["session_id", "limit"],
         "capture.intercept.on"
         | "capture.intercept.off"
@@ -6624,8 +6674,16 @@ fn fuzzer_input_preview(command: &FuzzerCommand) -> Value {
             "file": args.file,
             "stdin": args.stdin,
         }),
-        FuzzerCommand::Run(args) => json!({ "session_id": args.session_id, "async": args.r#async }),
-        FuzzerCommand::Status(args) => json!({ "id": args.id, "session_id": args.session_id }),
+        FuzzerCommand::Run(args) => json!({
+            "session_id": args.session_id,
+            "async": args.r#async,
+            "attack_type": args.attack_type.api_name(),
+            "raw_payloads": args.raw_payloads,
+            "concurrency": args.concurrency,
+        }),
+        FuzzerCommand::Status(args) | FuzzerCommand::Stop(args) => {
+            json!({ "id": args.id, "session_id": args.session_id })
+        }
         FuzzerCommand::Results(args) => json!({ "id": args.id, "session_id": args.session_id }),
         FuzzerCommand::List(args) => json!({ "session_id": args.session_id, "limit": args.limit }),
     }
@@ -7046,7 +7104,12 @@ fn fuzzer_api_preview(command: &FuzzerCommand) -> Value {
         FuzzerCommand::Run(_) => api_preview(
             "POST",
             "/api/fuzzer/attacks",
-            Some(json!({ "note": "runs payload-generated HTTP requests" })),
+            Some(json!({ "note": "starts payload-generated HTTP requests in the background" })),
+        ),
+        FuzzerCommand::Stop(args) => api_preview(
+            "POST",
+            format!("/api/fuzzer/attacks/{}/stop", args.id),
+            Some(json!({ "session_id": args.session_id })),
         ),
         FuzzerCommand::Status(args) => api_preview(
             "GET",
@@ -8371,10 +8434,35 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
                 }),
             }
         }
-        "fuzzer.run" => Command::Fuzzer {
-            command: FuzzerCommand::Run(FuzzerRunArgs {
+        "fuzzer.run" => {
+            let attack_type = call_optional_enum_string(
+                operation,
+                input,
+                "attack_type",
+                &["sniper", "battering-ram", "battering_ram"],
+            )?;
+            let concurrency = call_optional::<u8>(operation, input, "concurrency")?.unwrap_or(1);
+            if !(1..=16).contains(&concurrency) {
+                bail!("invalid field `concurrency` for `{operation}`; expected 1-16");
+            }
+            Command::Fuzzer {
+                command: FuzzerCommand::Run(FuzzerRunArgs {
+                    session_id: call_optional(operation, input, "session_id")?,
+                    r#async: call_bool_any(operation, input, &["async", "r#async"])?,
+                    attack_type: if attack_type.as_deref() == Some("sniper") {
+                        FuzzerAttackTypeArg::Sniper
+                    } else {
+                        FuzzerAttackTypeArg::BatteringRam
+                    },
+                    raw_payloads: call_bool_any(operation, input, &["raw_payloads"])?,
+                    concurrency,
+                }),
+            }
+        }
+        "fuzzer.stop" => Command::Fuzzer {
+            command: FuzzerCommand::Stop(FuzzerStatusArgs {
+                id: call_required(operation, input, "id")?,
                 session_id: call_optional(operation, input, "session_id")?,
-                r#async: call_bool_any(operation, input, &["async", "r#async"])?,
             }),
         },
         "fuzzer.status" => Command::Fuzzer {
@@ -12590,7 +12678,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 bail!("fuzzer payloads are empty");
             }
 
-            let record: FuzzerAttackRecord = api
+            let started: FuzzerAttackRecord = api
                 .post_json_long(
                     "/api/fuzzer/attacks",
                     &FuzzerRunPayload {
@@ -12605,15 +12693,35 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                         source_transaction_id: workspace.fuzzer.source_transaction_id,
                         http_version: parsed_template.http_version,
                         target,
+                        attack_type: args.attack_type.api_name(),
+                        url_encode: !args.raw_payloads,
+                        concurrency: args.concurrency.max(1),
                     },
                 )
                 .await?;
-            workspace.fuzzer.attack_record_id = Some(record.id);
+            workspace.fuzzer.attack_record_id = Some(started.id);
             workspace.fuzzer.attack_record = None;
             workspace.fuzzer.notice.clear();
             let workspace_save_error = post_workspace_state(&api, &mut workspace, args.session_id)
                 .await
                 .err();
+
+            if args.r#async {
+                let mut async_output = json!({
+                    "async_requested": true,
+                    "session_id": workspace.session_id,
+                    "message": format!(
+                        "The attack runs in the background. Read it with `fuzzer status --id {id}` or `fuzzer results --id {id}`, and stop it with `fuzzer stop --id {id}`.",
+                        id = started.id
+                    ),
+                    "attack": started,
+                });
+                if let Some(save_error) = workspace_save_error.as_ref() {
+                    attach_workspace_save_error(&mut async_output, save_error);
+                }
+                return print_json(&async_output);
+            }
+            let record = wait_for_fuzzer_attack(&api, started.id, workspace.session_id).await?;
 
             let record_value =
                 serde_json::to_value(&record).context("failed to inspect JSON status")?;
@@ -12637,21 +12745,7 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 workspace.session_id,
                 workspace_save_error.as_ref(),
             )?;
-            if args.r#async {
-                let mut async_output = json!({
-                    "async_requested": true,
-                    "session_id": workspace.session_id,
-                    "message": "Fuzzer attack completed. The current Sniper API creates attacks synchronously, so the CLI waits until the server returns the attack record.",
-                    "attack": record,
-                });
-                if let Some(save_error) = workspace_save_error.as_ref() {
-                    attach_workspace_save_error(&mut async_output, save_error);
-                }
-                print_json(&async_output)?;
-            } else {
-                print_json(&record_output)?;
-            }
-            Ok(())
+            print_json(&record_output)
         }
         FuzzerCommand::Status(args) => {
             let session_id = resolve_session_id_arg(&api, args.session_id).await?;
@@ -12663,12 +12757,32 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
                 .await?;
             print_json(&json!({
                 "id": record.id,
-                "status": record.status,
+                "status": fuzzer_attack_state(&record),
+                "running": record.running,
+                "stopped": record.stopped,
                 "started_at": record.started_at,
                 "completed_at": record.completed_at,
                 "payload_count": record.payload_count,
+                "planned": record.planned,
                 "result_count": record.results.len(),
                 "marker_count": record.marker_count,
+            }))
+        }
+        FuzzerCommand::Stop(args) => {
+            let session_id = resolve_session_id_arg(&api, args.session_id).await?;
+            let record: FuzzerAttackRecord = api
+                .post_json(
+                    &format!("/api/fuzzer/attacks/{}/stop", args.id),
+                    &json!({ "session_id": session_id }),
+                )
+                .await?;
+            print_json(&json!({
+                "id": record.id,
+                "status": fuzzer_attack_state(&record),
+                "running": record.running,
+                "stopped": record.stopped,
+                "planned": record.planned,
+                "result_count": record.results.len(),
             }))
         }
         FuzzerCommand::Results(args) => {
@@ -12699,6 +12813,34 @@ async fn handle_fuzzer(api: ApiClient, command: FuzzerCommand) -> Result<()> {
             let attacks: Vec<serde_json::Value> = api.get_json(&path).await?;
             print_json(&attacks)
         }
+    }
+}
+
+/// One word for where an attack is. The record keeps `status` to completed and
+/// failed, which older builds read, and says running and stopped apart.
+fn fuzzer_attack_state(record: &FuzzerAttackRecord) -> Value {
+    if record.running {
+        json!("running")
+    } else if record.stopped {
+        json!("stopped")
+    } else {
+        json!(record.status)
+    }
+}
+
+/// Reads an attack until it ends; the attack itself caps how long that is.
+async fn wait_for_fuzzer_attack(
+    api: &ApiClient,
+    id: Uuid,
+    session_id: Option<Uuid>,
+) -> Result<FuzzerAttackRecord> {
+    let path = session_query_path(&format!("/api/fuzzer/attacks/{id}"), session_id);
+    loop {
+        let record: FuzzerAttackRecord = api.get_json(&path).await?;
+        if !record.running {
+            return Ok(record);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -20471,6 +20613,62 @@ mod tests {
             panic!("expected session reveal");
         };
         assert_eq!(args.id, reveal_id);
+    }
+
+    #[test]
+    fn fuzzer_run_and_stop_take_the_attack_options_from_flags_and_calls() {
+        let Cli {
+            command:
+                Command::Fuzzer {
+                    command: FuzzerCommand::Run(args),
+                },
+            ..
+        } = Cli::try_parse_from([
+            "sniper-cli",
+            "fuzzer",
+            "run",
+            "--attack-type",
+            "sniper",
+            "--raw-payloads",
+            "--concurrency",
+            "4",
+        ])
+        .unwrap()
+        else {
+            panic!("expected fuzzer run");
+        };
+        assert_eq!(args.attack_type, super::FuzzerAttackTypeArg::Sniper);
+        assert!(args.raw_payloads);
+        assert_eq!(args.concurrency, 4);
+        assert!(
+            Cli::try_parse_from(["sniper-cli", "fuzzer", "run", "--concurrency", "17"]).is_err()
+        );
+
+        let Command::Fuzzer {
+            command: FuzzerCommand::Run(args),
+        } = command_from_operation_input("fuzzer.run", &json!({})).unwrap()
+        else {
+            panic!("expected fuzzer run");
+        };
+        assert_eq!(
+            (args.attack_type, args.raw_payloads, args.concurrency),
+            (super::FuzzerAttackTypeArg::BatteringRam, false, 1),
+            "a call without options keeps the attack the API ran before Sniper"
+        );
+        assert!(command_from_operation_input("fuzzer.run", &json!({"concurrency":0})).is_err());
+        assert!(
+            command_from_operation_input("fuzzer.run", &json!({"attack_type":"pitchfork"}))
+                .is_err()
+        );
+
+        let id = "22222222-2222-2222-2222-222222222222";
+        let Command::Fuzzer {
+            command: FuzzerCommand::Stop(args),
+        } = command_from_operation_input("fuzzer.stop", &json!({ "id": id })).unwrap()
+        else {
+            panic!("expected fuzzer stop");
+        };
+        assert_eq!(args.id.to_string(), id);
     }
 
     #[test]

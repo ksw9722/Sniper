@@ -554,9 +554,19 @@ pub async fn send_replay_request_for_session(
         target,
         source_transaction_id,
         http_version,
+        SentFrom::Replay,
     )
     .await
     .map_err(ReplaySendError::into_error)
+}
+
+/// Who sent a request the operator built: the note its row carries, and
+/// whether the event log gets a line for it. A Fuzzer attack logs itself once
+/// instead of once for each of its requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SentFrom {
+    Replay,
+    Fuzzer,
 }
 
 #[derive(Debug)]
@@ -604,6 +614,7 @@ pub async fn try_send_replay_request_for_session(
     target: Option<RequestTargetOverride>,
     source_transaction_id: Option<Uuid>,
     http_version: Option<String>,
+    sent_from: SentFrom,
 ) -> std::result::Result<TransactionRecord, ReplaySendError> {
     request
         .try_body_bytes()
@@ -640,7 +651,13 @@ pub async fn try_send_replay_request_for_session(
     .map_err(ReplaySendError::without_record)?;
     let outbound_uri_authority = build_replay_outbound_uri_authority(&request, target.as_ref())
         .map_err(ReplaySendError::without_record)?;
-    notes.push(crate::model::REPLAY_NOTE.to_string());
+    notes.push(
+        match sent_from {
+            SentFrom::Replay => crate::model::REPLAY_NOTE,
+            SentFrom::Fuzzer => crate::model::FUZZER_NOTE,
+        }
+        .to_string(),
+    );
     let exchange = execute_http_exchange(
         state.clone(),
         session.clone(),
@@ -686,15 +703,17 @@ pub async fn try_send_replay_request_for_session(
         return Err(ReplaySendError::with_record(message, record));
     }
 
-    session
-        .event_log
-        .push(
-            EventLevel::Info,
-            "replay",
-            "Request sent",
-            format!("{} {}{}", record.method, record.host, record.path),
-        )
-        .await;
+    if sent_from == SentFrom::Replay {
+        session
+            .event_log
+            .push(
+                EventLevel::Info,
+                "replay",
+                "Request sent",
+                format!("{} {}{}", record.method, record.host, record.path),
+            )
+            .await;
+    }
     store_record_and_scan_unconditionally(&state, &session, record.clone()).await;
     Ok(record)
 }

@@ -217,6 +217,17 @@ test('Reuse waits for confirmation, clears unrelated transport/source and retain
   assert.deepEqual(Array.from(f.c.splitFuzzerPayloadLines(f.state.fuzzerPayloadsText)), ['a', '']);
   assert.equal(f.state.fuzzerAttackRecord, null); assert.equal(f.requests.length, 1);
 });
+test('Reuse of a Sniper run restores its payload list once and its attack options', async () => {
+  const f = fixture(), saved = run('run-b');
+  // Two positions, each through the list [a, a]: the repeat is the operator's.
+  saved.results = [{ payload: 'a', position: 0 }, { payload: 'a', position: 0 }, { payload: 'a', position: 1 }, { payload: 'a', position: 1 }];
+  Object.assign(saved, { attack_type: 'sniper', payload_count: 2, marker_count: 2, url_encode: false, concurrency: 8 });
+  f.pick('run-b'); const read = f.reuse();
+  f.requests.at(-1).resolve(response(saved)); await read;
+  f.confirmations[0].confirm();
+  assert.deepEqual(Array.from(f.c.splitFuzzerPayloadLines(f.state.fuzzerPayloadsText)), ['a', 'a']);
+  assert.deepEqual([f.state.fuzzerAttackType, f.state.fuzzerUrlEncode, f.state.fuzzerConcurrency], ['sniper', false, 8]);
+});
 for (const boundary of ['draft', 'reset', 'session-bounce', 'new-run', 'picker-bounce', 'new-view']) {
   test(`Reuse confirmation cannot replace newer work after ${boundary}`, async () => {
     const f = fixture(); f.pick('run-b'); const read = f.reuse(); f.requests.at(-1).resolve(response(run('run-b'))); await read;

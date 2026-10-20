@@ -108,7 +108,7 @@ Defaults: the proxy on `127.0.0.1:8080`, the headless server's UI on `127.0.0.1:
 | **Findings** | Passive scanner: sensitive data, CORS, missing headers, JWT issues, and the management endpoints and backend addresses the Service Map names. Each issue is listed once per host, endpoint or value; **Rescan** applies the current rules to traffic already captured |
 | **Scan** | Nuclei community templates: turned-on templates check in-scope captured traffic without sending anything, and Template Scan sends the ones you pick to targets you name |
 | **Replay** | Modify and resend any captured request, override host and port, render the response |
-| **Fuzzer** | Payload lists inserted at markers |
+| **Fuzzer** | Payload lists sent at marked positions, Sniper or Battering ram, in the background with progress and Stop |
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
 | **Sessions** | Isolated workspaces, each with its own records, scope and state |
 | **Scope** | Host and wildcard filtering beside the captured hosts and paths |

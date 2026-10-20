@@ -923,16 +923,27 @@ impl AppState {
         if crate::proxy::session_has_live_websocket_relays(id) {
             anyhow::bail!("cannot delete a session while live captures are active");
         }
+        let cached_session = {
+            let contexts = self.session_contexts.lock().await;
+            contexts.get(&id).cloned()
+        };
+        // The Fuzzer stores every exchange, each with a brief tracked scan, so
+        // its attack ends before the session is checked for proxy work.
+        if let Some(session) = cached_session.as_ref() {
+            if session.fuzzer.stop(None).await {
+                crate::proxy::wait_for_session_proxy_work_to_finish(
+                    id,
+                    std::time::Duration::from_secs(2),
+                )
+                .await;
+            }
+        }
         if crate::proxy::session_has_active_proxy_work(id) {
             anyhow::bail!("cannot delete a session while proxy activity is still running");
         }
         if crate::proxy::session_has_pending_persist(id) {
             anyhow::bail!("cannot delete a session while capture persistence is pending");
         }
-        let cached_session = {
-            let contexts = self.session_contexts.lock().await;
-            contexts.get(&id).cloned()
-        };
         // Before the mutation guard: a scan storing a match persists the
         // session, which takes it.
         if let Some(session) = cached_session.as_ref() {
@@ -1015,12 +1026,14 @@ impl AppState {
         for session in contexts {
             let operation_lock = self.session_operation_lock(session.id()).await;
             let _operation_guard = operation_lock.lock_owned().await;
-            // A scan storing a match persists the session under the mutation
-            // guard, so it stops before the guard is taken.
+            // A scan storing a match, or the Fuzzer storing an exchange,
+            // persists the session under the mutation guard, so both stop
+            // before the guard is taken.
             let scanned = session.template_scans.stop(None).await;
+            let fuzzed = session.fuzzer.stop(None).await;
             let _guard = session.owned_mutation_guard().await;
             let reconned = session.recon.stop(None).await;
-            if (scanned || reconned) && self.sessions.contains_session(session.id()) {
+            if (scanned || fuzzed || reconned) && self.sessions.contains_session(session.id()) {
                 session.persist_state_only().await?;
             }
         }
@@ -3975,6 +3988,12 @@ mod tests {
         session
             .fuzzer
             .insert(FuzzerAttackRecord {
+                attack_type: Default::default(),
+                url_encode: false,
+                planned: 0,
+                concurrency: 1,
+                running: false,
+                stopped: false,
                 id: uuid::Uuid::new_v4(),
                 started_at: chrono::Utc::now(),
                 completed_at: chrono::Utc::now(),

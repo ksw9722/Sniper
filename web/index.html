@@ -1197,6 +1197,7 @@
               <h2>Fuzzer</h2>
               <div class="toolbar-actions">
                 <button class="secondary-action" id="resetFuzzerButton" type="button">Reset</button>
+                <button class="secondary-action hidden" id="stopFuzzerButton" type="button">Stop</button>
                 <button class="primary-action" id="startFuzzerButton" type="button" aria-describedby="fuzzerPreflightSummary fuzzerPreflightNotice">Start</button>
               </div>
             </div>
@@ -1206,9 +1207,8 @@
               <details class="fuzzer-disclosure fuzzer-preview-disclosure">
                 <summary>Preview &amp; details</summary>
                 <div class="fuzzer-disclosure-body">
-                  <p class="fuzzer-help">Each payload replaces every <code>$payload$</code> marker in one request. Requests run sequentially; results arrive after completion. This run cannot be cancelled here.</p>
+                  <p class="fuzzer-help">A position is a value marked as <code>§value§</code> (or <code>$payload$</code>). Sniper puts each payload in one position at a time; Battering ram puts it in every position at once.</p>
                   <p class="fuzzer-help" id="fuzzerPreviewNotes"></p>
-                  <p class="fuzzer-help">Limits: 128 markers; 4 MiB expanded-request budget per payload. Editor request text: 2 MiB.</p>
                   <div id="fuzzerPreviewSamples" class="fuzzer-preview-samples">Add a request and payloads to preview.</div>
                 </div>
               </details>
@@ -1222,7 +1222,7 @@
                 <header class="panel-toolbar">
                   <h2 id="fuzzerRequestHeading">1. Request</h2>
                   <div class="toolbar-actions">
-                    <button class="secondary-action" id="fuzzerMarkSelectionButton" type="button" title="Replace selected request text with $payload$">Mark selection</button>
+                    <button class="secondary-action" id="fuzzerMarkSelectionButton" type="button" title="Mark the selected text as a position">Mark selection</button>
                     <button class="secondary-action" id="fuzzerUndoMarkerButton" type="button" disabled>Undo marker</button>
                   </div>
                 </header>
@@ -1246,6 +1246,20 @@
                     <button class="secondary-action" id="fuzzerImportPayloadButton" type="button" aria-controls="fuzzerPayloadFile">Import file</button>
                   </div>
                 </header>
+                <div class="fuzzer-control-row fuzzer-attack-options">
+                  <label class="compact-field" for="fuzzerAttackType">
+                    <span>Attack</span>
+                    <select id="fuzzerAttackType">
+                      <option value="sniper" selected>Sniper: one position at a time</option>
+                      <option value="battering_ram">Battering ram: every position at once</option>
+                    </select>
+                  </label>
+                  <label class="compact-field fuzzer-concurrency-field" for="fuzzerConcurrency">
+                    <span>At once</span>
+                    <input id="fuzzerConcurrency" type="number" min="1" max="16" step="1" value="4" />
+                  </label>
+                  <label class="fuzzer-check" for="fuzzerUrlEncode"><input id="fuzzerUrlEncode" type="checkbox" checked /> URL-encode in the URL</label>
+                </div>
                 <details class="fuzzer-disclosure fuzzer-control-disclosure">
                   <summary>More payload options</summary>
                   <div class="fuzzer-disclosure-body">
@@ -1278,7 +1292,6 @@
                       <button class="secondary-action" id="fuzzerGenerateRangeButton" type="button">Generate range</button>
                     </fieldset>
                     <p class="fuzzer-help" id="fuzzerPayloadHelp">One payload per line. Spaces are preserved. Blank lines are empty payloads; a final line break is ignored.</p>
-                    <p class="fuzzer-help">Limits: 5,000 payloads; 64 KiB each; 4 MiB total payload bytes. Editor text and files: 4 MiB, including line separators. Import uses UTF-8; a BOM is kept literally. CRLF and CR are treated as line breaks, just like pasted text.</p>
                   </div>
                 </details>
                 <div class="editor-panel">

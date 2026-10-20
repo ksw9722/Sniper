@@ -882,7 +882,9 @@ pub(crate) fn project_record_for_catalog(
         client: None,
         unnamed: Vec::new(),
         sent_from_replay: record.notes.iter().any(|note| {
-            note == crate::model::REPLAY_NOTE || note == crate::model::TEMPLATE_SCAN_NOTE
+            note == crate::model::REPLAY_NOTE
+                || note == crate::model::TEMPLATE_SCAN_NOTE
+                || note == crate::model::FUZZER_NOTE
         }),
         client_address: record.client_address,
         initiated: false,

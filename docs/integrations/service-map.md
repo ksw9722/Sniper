@@ -209,9 +209,9 @@ header names (`CF-RAY`, `x-envoy-*`), header values the catalog does not name
 `BIGipServer…`), and default error, gateway, WAF and debug pages, stack traces,
 SQL errors and banners. JSON, XML and text bodies are read only for errors (400
 or above), an origin's root, API documents, management or debug paths
-(`/actuator`, `/.env`, `/server-status`) and requests sent from Replay. Cookie
-values are not read, except to tell whether a BIG-IP cookie holds a backend
-address and which servlet engine shaped a session ID.
+(`/actuator`, `/.env`, `/server-status`) and requests sent from Replay or the
+Fuzzer. Cookie values are not read, except to tell whether a BIG-IP cookie holds
+a backend address and which servlet engine shaped a session ID.
 
 An exposure is something a response gives away by mistake: a debug page, a
 detailed error or stack trace, an SQL error, a directory listing, Actuator,

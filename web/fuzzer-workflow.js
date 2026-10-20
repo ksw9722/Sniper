@@ -4,6 +4,10 @@
   "use strict";
 
   const MARKER = "$payload$";
+  // A position is `§original§`, as Burp marks one, or `$payload$`, whose
+  // original is empty; src/fuzzer.rs reads the same two forms.
+  const POSITION = /\$payload\$|§([^§]*)§/g;
+  const positions = value => [...String(value).matchAll(POSITION)];
   const limits = Object.freeze({
     payloads: 5000,
     payloadBytes: 64 * 1024,
@@ -11,6 +15,8 @@
     markers: 128,
     expandedRequestBytes: 4 * 1024 * 1024,
     candidates: 128,
+    requests: 50000,
+    concurrency: 16,
     samples: 3,
     sampleBytes: 128 * 1024,
   });
@@ -97,7 +103,7 @@
         const name = raw.slice(cursor, equals);
         const ordinal = (occurrences.get(name) || 0) + 1;
         occurrences.set(name, ordinal);
-        if (!credentialName(name) && !raw.slice(equals + 1, fieldEnd).includes(MARKER)) {
+        if (!credentialName(name) && !positions(raw.slice(equals + 1, fieldEnd)).length) {
           const shortName = name.length > 80 ? `${name.slice(0, 80)}…` : name;
           output.push({ kind, label: `${kind === "query" ? "Query" : "Form"}: ${shortName || "(unnamed)"} (${ordinal})`, start: equals + 1, end: fieldEnd });
         }
@@ -143,18 +149,38 @@
     const splitsCharacter = offset => offset > 0 && offset < raw.length
       && /[\uD800-\uDBFF]/.test(raw[offset - 1]) && /[\uDC00-\uDFFF]/.test(raw[offset]);
     if (splitsCharacter(start) || splitsCharacter(end)) throw new Error("Select a complete character.");
-    for (let index = raw.indexOf(MARKER); index !== -1; index = raw.indexOf(MARKER, index + MARKER.length)) {
-      if ((start < index + MARKER.length && end > index)
-        || (start === end && start > index && start < index + MARKER.length)) {
-        throw new Error("Selection overlaps an existing $payload$ marker. Select an unmarked value.");
+    for (const found of positions(raw)) {
+      const index = found.index, after = index + found[0].length;
+      if ((start < after && end > index) || (start === end && start > index && start < after)) {
+        throw new Error("Selection overlaps a marked position. Select an unmarked value.");
       }
     }
-    return raw.slice(0, start) + MARKER + raw.slice(end);
+    if (raw.slice(start, end).includes("§")) throw new Error("Select a value without §.");
+    // The original stays between the marks: Sniper sends it while another
+    // position takes the payload.
+    return `${raw.slice(0, start)}§${raw.slice(start, end)}§${raw.slice(end)}`;
   }
 
   const isHeader = (header, name) => header.name.toLowerCase() === name;
-  const markerCount = value => value.split(MARKER).length - 1;
-  const literalReplace = (value, payload) => value.split(MARKER).join(payload);
+  const markerCount = value => positions(value).length;
+
+  // What a payload cannot carry raw in a request target, or what would end its
+  // value early, is percent-encoded; `%`, `/` and `.` stay. Mirrors
+  // encode_url_payload in src/fuzzer.rs.
+  function encodeUrlPayload(payload) {
+    let encoded = "";
+    for (const byte of encoder.encode(String(payload))) {
+      const char = String.fromCharCode(byte);
+      encoded += /[A-Za-z0-9\-._~!$'()*,/:@%]/.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+    return encoded;
+  }
+
+  // Sending order: Sniper takes each position in turn through every payload.
+  function planRequests(attackType, positionCount, payloadCount) {
+    if (attackType !== "sniper") return Array.from({ length: payloadCount }, (_, payload) => [null, payload]);
+    return Array.from({ length: positionCount * payloadCount }, (_, index) => [Math.floor(index / payloadCount), index % payloadCount]);
+  }
 
   function templateShape(template) {
     if (!template || ["scheme", "host", "method", "path", "body"].some(key => typeof template[key] !== "string")
@@ -173,17 +199,29 @@
     return value.length / 4 * 3 - (value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0);
   }
 
-  function expandTemplate(template, payload) {
+  // The payload goes into `position`, or into every position when it is null
+  // (Battering ram); the others keep their originals. Positions count in the
+  // order build_request uses: method, path, the authority when no Host header
+  // names it, headers, body.
+  function expandTemplate(template, payload, { position = null, urlEncode = false } = {}) {
     templateShape(template);
     if (typeof payload !== "string") throw new Error("Payload must be a string.");
     const request = { ...template, headers: template.headers.map(header => ({ ...header })) };
     const hasHost = request.headers.some(header => isHeader(header, "host"));
-    if (!hasHost) request.host = literalReplace(request.host, payload);
-    for (const key of ["method", "path", "body"]) request[key] = literalReplace(request[key], payload);
+    let next = 0;
+    const fill = (value, inUrl = false) => value.replace(POSITION, (_match, original) => {
+      const here = next++;
+      if (position === null || position === here) return inUrl && urlEncode ? encodeUrlPayload(payload) : payload;
+      return original ?? "";
+    });
+    request.method = fill(request.method);
+    request.path = fill(request.path, true);
+    if (!hasHost) request.host = fill(request.host);
     for (const header of request.headers) {
-      header.name = literalReplace(header.name, payload);
-      header.value = literalReplace(header.value, payload);
+      header.name = fill(header.name);
+      header.value = fill(header.value);
     }
+    request.body = fill(request.body);
     const host = request.headers.find(header => isHeader(header, "host"));
     if (host) request.host = host.value;
     if (request.headers.some(header => isHeader(header, "content-length"))) {
@@ -196,7 +234,7 @@
     return request;
   }
 
-  function requestBudget(template) {
+  function requestBudget(template, urlEncode = false) {
     const hasHost = template.headers.some(header => isHeader(header, "host"));
     const fields = [template.method, template.path, template.body];
     if (!hasHost) fields.push(template.host);
@@ -204,9 +242,13 @@
     const markers = fields.reduce((sum, value) => sum + markerCount(value), 0);
     // Match expanded_request_size, including its scheme accounting and original
     // host bytes when Host takes precedence. These are not outbound wire bytes.
-    const budgetMarkers = markers + markerCount(template.scheme);
-    const base = fields.reduce((sum, value) => sum + bytes(value), bytes(template.scheme) + (hasHost ? bytes(template.host) : 0));
-    return { markers, size: payloadBytes => base - budgetMarkers * MARKER.length + budgetMarkers * payloadBytes };
+    // An encoded payload byte can take three in the path.
+    const unmarked = value => bytes(value) - positions(value).reduce((sum, found) => sum + bytes(found[0]), 0);
+    const counted = [...fields, template.scheme];
+    const base = counted.reduce((sum, value) => sum + unmarked(value), hasHost ? bytes(template.host) : 0);
+    const pathMarkers = markerCount(template.path);
+    const otherMarkers = counted.reduce((sum, value) => sum + markerCount(value), 0) - pathMarkers;
+    return { markers, size: payloadBytes => base + otherMarkers * payloadBytes + pathMarkers * payloadBytes * (urlEncode ? 3 : 1) };
   }
 
   function authorityParts(value) {
@@ -225,20 +267,24 @@
     return `${scheme}://${destination.host}:${port}`;
   }
 
-  function preflight(template, payloads, { target = null, httpVersion = null } = {}) {
+  function preflight(template, payloads, { target = null, httpVersion = null, attackType = "battering_ram", urlEncode = false } = {}) {
     templateShape(template);
     const validation = validatePayloads(payloads);
-    const budget = requestBudget(template);
+    const budget = requestBudget(template, urlEncode);
     const errors = validation.errors.slice();
-    const warnings = ["Local expansion preview only. Runtime request rewriting can change the outbound request; the server validates requests before running."];
-    if (!budget.markers) errors.push("Request template is missing $payload$ markers.");
-    if (budget.markers > limits.markers) errors.push(`Fuzzer request templates cannot contain more than ${limits.markers} $payload$ markers.`);
+    const warnings = ["Match and Replace rules can still change what is sent."];
+    if (!budget.markers) errors.push("Mark at least one position: choose a value and mark it, or write §value§ or $payload$ in the request.");
+    if (budget.markers > limits.markers) errors.push(`Fuzzer request templates cannot contain more than ${limits.markers} positions`);
+    const plan = planRequests(attackType, budget.markers, validation.count);
+    if (plan.length > limits.requests) {
+      errors.push(`This attack would send ${plan.length} requests; an attack sends at most ${limits.requests}. Use fewer payloads or positions.`);
+    }
     if (template.preview_truncated) errors.push("The request body preview is truncated. Load or supply the complete body first.");
     const maxExpandedRequestBytes = budget.size(validation.maxPayloadBytes);
     if (validation.count && maxExpandedRequestBytes > limits.expandedRequestBytes) {
       errors.push(`An expanded request exceeds the ${limits.expandedRequestBytes} byte limit.`);
     }
-    if (template.body_encoding === "base64") warnings.push("The body is base64 encoded. Payload substitution is literal encoded text, not decoded binary data.");
+    if (template.body_encoding === "base64") warnings.push("The body is base64: payloads go into the encoded text.");
     const hostHeader = template.headers.find(header => isHeader(header, "host"));
     if (markerCount(hostHeader ? hostHeader.value : template.host)) {
       warnings.push("Host markers can change the request authority by payload. Check the sample requests and connection target.");
@@ -249,29 +295,30 @@
     const samples = [];
     let sampleBytes = 0, samplesOmitted = 0;
     if (!errors.length) {
-      for (let index = 0; index < Math.min(limits.samples, validation.count); index += 1) {
-        const payload = validation.payloads[index];
+      for (let index = 0; index < Math.min(limits.samples, plan.length); index += 1) {
+        const [position, payloadIndex] = plan[index];
+        const payload = validation.payloads[payloadIndex];
         const estimatedBytes = budget.size(bytes(payload));
         // Host occurs both in the request model and headers after expansion.
         // Leave room for that copy and a normalized Content-Length record.
         const previewBytes = 2 * estimatedBytes + bytes(payload) + 256 + 32 * template.headers.length;
         if (sampleBytes + previewBytes > limits.sampleBytes) { samplesOmitted += 1; continue; }
-        const request = expandTemplate(template, payload);
-        samples.push({ index, payload, request, estimatedBytes, effectiveTarget: effectiveTarget(request, target) });
+        const request = expandTemplate(template, payload, { position, urlEncode });
+        samples.push({ index, payload, position, request, estimatedBytes, effectiveTarget: effectiveTarget(request, target) });
         sampleBytes += previewBytes;
       }
     }
     if (samplesOmitted) warnings.push(`${samplesOmitted} sample(s) omitted to keep the local preview bounded.`);
     return {
       valid: !errors.length, errors, warnings,
-      markerCount: budget.markers, payloadCount: validation.count, requestCount: validation.count,
+      markerCount: budget.markers, payloadCount: validation.count, requestCount: plan.length, attackType,
       totalPayloadBytes: validation.totalBytes, maxPayloadBytes: validation.maxPayloadBytes,
       maxExpandedRequestBytes, effectiveTarget: effectiveTarget(template, target),
       httpVersion: httpVersion || template.http_version || null, limits, samples, samplesOmitted,
     };
   }
 
-  const api = Object.freeze({ MARKER, limits, presets, payloadLines, payloadText, validatePayloads, numericRange, candidates, replaceSelection, expandTemplate, preflight });
+  const api = Object.freeze({ MARKER, limits, presets, payloadLines, payloadText, validatePayloads, numericRange, candidates, replaceSelection, encodeUrlPayload, planRequests, expandTemplate, preflight });
   if (typeof module === "object" && module.exports) module.exports = api;
   if (root) root.SniperFuzzerWorkflow = api;
 })(typeof window !== "undefined" ? window : null);

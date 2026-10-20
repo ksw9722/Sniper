@@ -31,7 +31,8 @@ test("local safety limits stay aligned with the backend Fuzzer constants", () =>
   for (const [key, name] of [
     ["payloads", "MAX_FUZZER_PAYLOADS"], ["payloadBytes", "MAX_FUZZER_PAYLOAD_BYTES"],
     ["totalPayloadBytes", "MAX_FUZZER_TOTAL_PAYLOAD_BYTES"], ["markers", "MAX_FUZZER_MARKERS_PER_REQUEST"],
-    ["expandedRequestBytes", "MAX_FUZZER_EXPANDED_REQUEST_BYTES"],
+    ["expandedRequestBytes", "MAX_FUZZER_EXPANDED_REQUEST_BYTES"], ["requests", "MAX_FUZZER_REQUESTS"],
+    ["concurrency", "MAX_FUZZER_CONCURRENCY"],
   ]) {
     const expression = rust.match(new RegExp(`const ${name}: usize = ([0-9_* ]+);`));
     assert.ok(expression, name);
@@ -111,7 +112,8 @@ for (const newline of ["\n", "\r\n"]) {
       assert.deepEqual(Object.keys(candidate), ["kind", "label", "start", "end"]);
       const changed = workflow.replaceSelection(raw, candidate.start, candidate.end);
       assert.equal(changed.slice(0, candidate.start), raw.slice(0, candidate.start));
-      assert.equal(changed.slice(candidate.start + workflow.MARKER.length), raw.slice(candidate.end));
+      assert.equal(changed.slice(candidate.start, candidate.end + 2), `§${raw.slice(candidate.start, candidate.end)}§`);
+      assert.equal(changed.slice(candidate.end + 2), raw.slice(candidate.end));
     }
   });
 }
@@ -154,13 +156,15 @@ test("form suggestions reject binary, base64, truncated, encoded, ambiguous and 
   assert.ok(workflow.candidates(rawForm().replace("Content-Type:", "Content-Encoding: identity\nContent-Type:")).some(candidate => candidate.kind === "form"));
 });
 
-test("selection marking is literal, allows empty values, and rejects nested/partial markers and split characters", () => {
-  assert.equal(workflow.replaceSelection("a=", 2, 2), "a=$payload$");
-  assert.equal(workflow.replaceSelection("a=$&", 2, 4), "a=$payload$");
+test("selection marking keeps the original between marks, allows empty values, and rejects nested/partial markers and split characters", () => {
+  assert.equal(workflow.replaceSelection("a=", 2, 2), "a=§§");
+  assert.equal(workflow.replaceSelection("a=$&", 2, 4), "a=§$&§");
   for (const [start, end] of [[1, 2], [2, 4], [0, 8], [3, 3]]) {
-    assert.throws(() => workflow.replaceSelection("$payload$", start, end), /existing/);
+    assert.throws(() => workflow.replaceSelection("$payload$", start, end), /overlaps a marked position/);
   }
-  assert.equal(workflow.replaceSelection("$payload$", 9, 9), "$payload$$payload$");
+  assert.throws(() => workflow.replaceSelection("q=§one§", 3, 4), /overlaps a marked position/);
+  assert.throws(() => workflow.replaceSelection("a§b", 0, 3), /without §/);
+  assert.equal(workflow.replaceSelection("$payload$", 9, 9), "$payload$§§");
   assert.throws(() => workflow.replaceSelection("😀", 1, 2), /complete character/);
   for (const [start, end] of [[-1, 0], [0, 3], [2, 1], [0.5, 1], [NaN, 1]]) {
     assert.throws(() => workflow.replaceSelection("ab", start, end), /current request/);
@@ -187,7 +191,7 @@ test("literal Host precedence ignores authority markers and chooses the first ex
   template.headers[0].value = "fixed.example.com";
   const checked = workflow.preflight(template, ["demo"]);
   assert.equal(checked.markerCount, 0);
-  assert.match(checked.errors[0], /missing/);
+  assert.match(checked.errors[0], /Mark at least one position/);
   assert.ok(!checked.warnings.some(warning => /Host markers/.test(warning)));
 });
 
@@ -232,8 +236,40 @@ test("preflight reports one planned request per payload, repeated markers, exact
   assert.equal(checked.samples[1].payload, "é");
   assert.equal(checked.samples[1].request.path, "/items?q=é");
   assert.equal(checked.samples[1].request.body, "é");
-  assert.match(checked.warnings.join(" "), /Runtime request rewriting/);
-  assert.match(checked.warnings.join(" "), /server validates/);
+  assert.match(checked.warnings.join(" "), /Match and Replace/);
+  const sniper = workflow.preflight(template, ["", "é\r", "😀", "extra"], { attackType: "sniper" });
+  assert.equal(sniper.requestCount, 8, "each of the two positions takes every payload");
+  assert.deepEqual(sniper.samples.map(sample => sample.position), [0, 0, 0]);
+});
+
+test("Sniper fills one position and keeps the others, as src/fuzzer.rs does", () => {
+  const template = request({ path: "/search?q=§test§&page=§1§" });
+  assert.equal(workflow.expandTemplate(template, "x", { position: 0 }).path, "/search?q=x&page=1");
+  assert.equal(workflow.expandTemplate(template, "x", { position: 1 }).path, "/search?q=test&page=x");
+  assert.equal(workflow.expandTemplate(template, "x").path, "/search?q=x&page=x", "Battering ram");
+  const legacy = request({ path: "/a/$payload$?q=§test§" });
+  assert.equal(workflow.expandTemplate(legacy, "x", { position: 1 }).path, "/a/?q=x");
+  assert.deepEqual(workflow.planRequests("sniper", 2, 3), [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]);
+  assert.deepEqual(workflow.planRequests("battering_ram", 2, 3), [[null, 0], [null, 1], [null, 2]]);
+});
+
+test("URL encoding keeps a payload one value and touches only the URL, as src/fuzzer.rs does", () => {
+  const payload = "../a b&c=d%27\"<x>#";
+  assert.equal(workflow.encodeUrlPayload(payload), "../a%20b%26c%3Dd%27%22%3Cx%3E%23");
+  assert.equal(workflow.encodeUrlPayload("é"), "%C3%A9");
+  const template = request({ method: "POST", path: "/p?q=§§&n=1", body: '{"v":"§§"}' });
+  const built = workflow.expandTemplate(template, payload, { urlEncode: true });
+  assert.equal(built.path, "/p?q=../a%20b%26c%3Dd%27%22%3Cx%3E%23&n=1");
+  assert.equal(built.body, `{"v":"${payload}"}`);
+  assert.equal(workflow.expandTemplate(template, "a b").path, "/p?q=a b&n=1");
+});
+
+test("an attack sends at most the backend's request limit", () => {
+  const template = request({ path: "/" + "§a§".repeat(20) });
+  const checked = workflow.preflight(template, Array(5000).fill("x"), { attackType: "sniper" });
+  assert.equal(checked.requestCount, 100000);
+  assert.match(checked.errors.join(" "), /at most 50000/);
+  assert.equal(workflow.preflight(template, Array(5000).fill("x")).valid, true, "Battering ram sends one request per payload");
 });
 
 test("effective targets preserve overrides, explicit ports, IPv6 and payload-dependent Host", () => {
@@ -289,7 +325,7 @@ test("truncated request bodies fail setup while a base64 source warns and keeps 
   assert.equal(workflow.preflight(request({ preview_truncated: true }), ["x"]).valid, false);
   const checked = workflow.preflight(request({ body: "YQ==", body_encoding: "base64" }), ["x"]);
   assert.equal(checked.valid, true);
-  assert.match(checked.warnings.join(" "), /not decoded binary data/);
+  assert.match(checked.warnings.join(" "), /encoded text/);
   assert.equal(checked.samples[0].request.body, "YQ==");
 });
 

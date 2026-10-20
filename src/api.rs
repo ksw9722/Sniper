@@ -575,6 +575,7 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(list_fuzzer_attacks).post(run_fuzzer_attack),
         )
         .route("/api/fuzzer/attacks/:id", get(get_fuzzer_attack))
+        .route("/api/fuzzer/attacks/:id/stop", post(stop_fuzzer_attack))
         .route("/api/sequences", get(list_sequences).post(upsert_sequence))
         .route(
             "/api/sequences/:id",
@@ -8115,6 +8116,7 @@ async fn send_replay(
         payload.target,
         payload.source_transaction_id,
         http_version,
+        proxy::SentFrom::Replay,
     )
     .await
     {
@@ -8127,17 +8129,6 @@ async fn send_replay(
             }),
         )
             .into_response(),
-    }
-}
-
-fn fuzzer_attack_error_status(error: &anyhow::Error) -> StatusCode {
-    if error
-        .chain()
-        .any(|cause| cause.is::<fuzzer::FuzzerPersistenceError>())
-    {
-        StatusCode::INTERNAL_SERVER_ERROR
-    } else {
-        StatusCode::BAD_REQUEST
     }
 }
 
@@ -8223,19 +8214,7 @@ async fn run_fuzzer_attack(
             return (StatusCode::BAD_REQUEST, error).into_response();
         }
     }
-    let target = payload.target.as_ref();
-    if let Err(error) =
-        fuzzer::validate_expanded_requests(&payload.template, &payload.payloads, |request| {
-            validate_runnable_editable_request(request)?;
-            if let Some(target) = target {
-                validate_request_target_override_for_request(request, target)?;
-            }
-            Ok(())
-        })
-    {
-        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
-    }
-    let _session_owner = match begin_session_proxy_operation(
+    let session_owner = match begin_session_proxy_operation(
         &state,
         &session,
         payload.expected_active_session_id,
@@ -8246,7 +8225,7 @@ async fn run_fuzzer_attack(
         Ok(owner) => owner,
         Err(response) => return response,
     };
-    match fuzzer::run_attack_for_session(
+    let started = fuzzer::start_attack(
         state,
         session,
         payload.template,
@@ -8254,11 +8233,56 @@ async fn run_fuzzer_attack(
         payload.source_transaction_id,
         http_version,
         payload.target,
+        fuzzer::FuzzerAttackOptions {
+            attack_type: payload.attack_type,
+            url_encode: payload.url_encode,
+            concurrency: payload.concurrency,
+        },
     )
-    .await
-    {
+    .await;
+    // The attack runs on its own, leaving the session free to switch.
+    drop(session_owner);
+    match started {
         Ok(record) => Json(record).into_response(),
-        Err(error) => (fuzzer_attack_error_status(&error), error.to_string()).into_response(),
+        Err(fuzzer::FuzzerStartError::Invalid(message)) => {
+            (StatusCode::BAD_REQUEST, message).into_response()
+        }
+        Err(fuzzer::FuzzerStartError::Busy) => (
+            StatusCode::CONFLICT,
+            "A Fuzzer attack is already running in this session; stop it first.",
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FuzzerStopPayload {
+    session_id: Option<Uuid>,
+}
+
+async fn stop_fuzzer_attack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<FuzzerStopPayload>,
+) -> Response {
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let session = match resolve_read_session_for_optional_id(&state, payload.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let operation_lock = state.session_operation_lock(session.id()).await;
+    let _operation_guard = operation_lock.lock().await;
+    // Not under the mutation guard: storing an exchange persists the session,
+    // which takes it.
+    if !session.fuzzer.stop(Some(id)).await {
+        return (StatusCode::NOT_FOUND, "No attack with that id is running.").into_response();
+    }
+    session.schedule_state_persist();
+    match session.fuzzer.get(id).await {
+        Some(record) => Json(record).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -9585,10 +9609,10 @@ mod tests {
 
     use super::{
         build_ws_replay_url, decode_ws_replay_control_payload, decode_ws_replay_payload,
-        fuzzer_attack_error_status, get_target_site_map, normalize_replay_http_version,
-        persist_bound_runtime_state, sequence_run_error_status, validate_annotations_payload,
-        validate_editable_request, validate_editable_response, validate_match_replace_rules,
-        validate_since, validate_status_code, validate_status_range, validate_transaction_query,
+        get_target_site_map, normalize_replay_http_version, persist_bound_runtime_state,
+        sequence_run_error_status, validate_annotations_payload, validate_editable_request,
+        validate_editable_response, validate_match_replace_rules, validate_since,
+        validate_status_code, validate_status_range, validate_transaction_query,
         validate_ws_replay_headers, validate_ws_replay_text_payload, AnnotationsPayload,
         TransactionQuery, MAX_WS_REPLAY_OUTBOUND_MESSAGE_BYTES,
     };
@@ -11202,21 +11226,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(data_dir);
-    }
-
-    #[test]
-    fn fuzzer_persistence_errors_are_reported_as_server_errors() {
-        let persistence_error: anyhow::Error =
-            crate::fuzzer::FuzzerPersistenceError::new(anyhow::anyhow!("session snapshot failed"))
-                .into();
-        assert_eq!(
-            fuzzer_attack_error_status(&persistence_error),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(
-            fuzzer_attack_error_status(&anyhow::anyhow!("Request template is missing markers")),
-            StatusCode::BAD_REQUEST
-        );
     }
 
     #[test]
@@ -20382,6 +20391,12 @@ mod tests {
         let state = Arc::new(AppState::new(config).unwrap());
         let session = state.session().await;
         let attack = FuzzerAttackRecord {
+            attack_type: Default::default(),
+            url_encode: false,
+            planned: 0,
+            concurrency: 1,
+            running: false,
+            stopped: false,
             id: Uuid::new_v4(),
             started_at: Utc::now(),
             completed_at: Utc::now(),
@@ -21310,6 +21325,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
                 expected_workspace_revision: None,
@@ -21357,6 +21375,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: None,
                 expected_active_session_id: None,
                 expected_workspace_revision: None,
@@ -21384,8 +21405,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    async fn wait_for_fuzzer_attack_end(
+        session: &crate::session::SessionContext,
+        id: uuid::Uuid,
+    ) -> crate::fuzzer::FuzzerAttackRecord {
+        for _ in 0..1000 {
+            let record = session.fuzzer.get(id).await.unwrap();
+            if !record.running {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the attack did not end");
+    }
+
     #[tokio::test]
-    async fn fuzzer_run_rejects_expanded_ip_host_target_override_before_attack() {
+    async fn fuzzer_stop_ends_the_running_attack_and_says_when_none_runs() {
+        let data_dir =
+            std::env::temp_dir().join(format!("sniper-test-fuzzer-stop-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(
+            AppState::new(AppConfig {
+                proxy_addr: "127.0.0.1:0".parse().unwrap(),
+                ui_addr: "127.0.0.1:0".parse().unwrap(),
+                max_entries: 100,
+                max_transaction_entries: 100,
+                body_preview_bytes: 4096,
+                data_dir: data_dir.clone(),
+            })
+            .unwrap(),
+        );
+        let session = state.session().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+
+        let response = super::run_fuzzer_attack(
+            State(state.clone()),
+            Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: true,
+                concurrency: 1,
+                session_id: Some(session.id()),
+                expected_active_session_id: None,
+                expected_workspace_revision: None,
+                template: EditableRequest {
+                    scheme: "http".to_string(),
+                    host: addr.to_string(),
+                    method: "GET".to_string(),
+                    path: "/$payload$".to_string(),
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_encoding: BodyEncoding::Utf8,
+                    preview_truncated: false,
+                },
+                payloads: (0..10).map(|index| format!("p{index}")).collect(),
+                source_transaction_id: None,
+                http_version: None,
+                target: None,
+            }),
+        )
+        .await;
+        let started: crate::fuzzer::FuzzerAttackRecord = response_json(response).await;
+        let stop = || {
+            super::stop_fuzzer_attack(
+                State(state.clone()),
+                Path(started.id.to_string()),
+                Json(super::FuzzerStopPayload {
+                    session_id: Some(session.id()),
+                }),
+            )
+        };
+
+        let response = stop().await;
+        assert_eq!(response.status(), super::StatusCode::OK);
+        let stopped: crate::fuzzer::FuzzerAttackRecord = response_json(response).await;
+        assert!(stopped.stopped);
+        assert!(!stopped.running);
+        assert!(stopped.results.len() < 10);
+        assert_eq!(stop().await.status(), super::StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn fuzzer_run_never_sends_a_payload_that_makes_the_host_an_ip_address() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-expanded-ip-target-{}",
             uuid::Uuid::new_v4()
@@ -21404,6 +21518,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
                 expected_workspace_revision: None,
@@ -21429,11 +21546,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("request host is an IP address"));
-        assert!(session.fuzzer.list(Some(10)).await.is_empty());
+        assert_eq!(response.status(), super::StatusCode::OK);
+        let started: crate::fuzzer::FuzzerAttackRecord = response_json(response).await;
+        let attack = wait_for_fuzzer_attack_end(&session, started.id).await;
+        let note = attack.results[0].note.as_deref().unwrap_or_default();
+        assert!(note.starts_with("Not sent:"), "{note}");
+        assert!(note.contains("request host is an IP address"), "{note}");
+        assert_eq!(attack.results[0].transaction_id, None);
+        assert!(session.store.snapshot(Some(10)).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -21463,6 +21583,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(original_id),
                 expected_active_session_id: Some(original_id),
                 expected_workspace_revision: None,
@@ -21528,6 +21651,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(session_id),
                 expected_active_session_id: None,
                 expected_workspace_revision: Some(stale_revision),
@@ -21584,6 +21710,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(inactive.id),
                 expected_active_session_id: Some(active_id),
                 expected_workspace_revision: None,
@@ -21642,6 +21771,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(Uuid::new_v4()),
                 expected_active_session_id: None,
                 expected_workspace_revision: None,
@@ -21669,7 +21801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fuzzer_run_rejects_payload_expansion_that_invalidates_request() {
+    async fn fuzzer_run_reports_a_payload_that_breaks_the_request_and_sends_nothing() {
         let data_dir = std::env::temp_dir().join(format!(
             "sniper-test-fuzzer-expanded-request-validation-{}",
             uuid::Uuid::new_v4()
@@ -21688,6 +21820,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
                 expected_workspace_revision: None,
@@ -21709,8 +21844,16 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), super::StatusCode::BAD_REQUEST);
-        assert!(session.fuzzer.list(Some(10)).await.is_empty());
+        assert_eq!(response.status(), super::StatusCode::OK);
+        let started: crate::fuzzer::FuzzerAttackRecord = response_json(response).await;
+        let attack = wait_for_fuzzer_attack_end(&session, started.id).await;
+        assert!(matches!(
+            attack.status,
+            crate::fuzzer::FuzzerAttackStatus::Failed
+        ));
+        let note = attack.results[0].note.as_deref().unwrap_or_default();
+        assert!(note.starts_with("Not sent:"), "{note}");
+        assert!(session.store.snapshot(Some(10)).await.is_empty());
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -21746,6 +21889,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
                 expected_workspace_revision: None,
@@ -21768,7 +21914,9 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), super::StatusCode::OK);
-        let attack: crate::fuzzer::FuzzerAttackRecord = response_json(response).await;
+        let started: crate::fuzzer::FuzzerAttackRecord = response_json(response).await;
+        assert!(started.running);
+        let attack = wait_for_fuzzer_attack_end(&session, started.id).await;
         assert!(matches!(
             attack.status,
             crate::fuzzer::FuzzerAttackStatus::Completed
@@ -21799,6 +21947,9 @@ mod tests {
         let response = super::run_fuzzer_attack(
             State(state.clone()),
             Json(crate::fuzzer::FuzzerAttackPayload {
+                attack_type: Default::default(),
+                url_encode: false,
+                concurrency: 1,
                 session_id: Some(session.id()),
                 expected_active_session_id: None,
                 expected_workspace_revision: None,
@@ -22956,6 +23107,12 @@ mod tests {
             preview_truncated: false,
         };
         let attack = FuzzerAttackRecord {
+            attack_type: Default::default(),
+            url_encode: false,
+            planned: 0,
+            concurrency: 1,
+            running: false,
+            stopped: false,
             id: Uuid::new_v4(),
             started_at: Utc::now(),
             completed_at: Utc::now(),

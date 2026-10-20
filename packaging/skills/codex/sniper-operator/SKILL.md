@@ -202,7 +202,8 @@ sniper-cli replay update --tab-id <tab-id> --label "IDOR: other user's profile" 
 sniper-cli replay send --tab-id <tab-id> --dry-run
 sniper-cli fuzzer set-template --transaction-id <uuid> --dry-run
 sniper-cli fuzzer set-payloads --file payloads.txt --dry-run
-sniper-cli fuzzer run --dry-run
+sniper-cli fuzzer run --attack-type sniper --dry-run
+sniper-cli fuzzer stop --id <uuid> --dry-run
 sniper-cli capture intercept on --dry-run
 sniper-cli capture intercept list
 sniper-cli --output compact call capture.intercept.get --input '{"id":"<uuid>"}'
