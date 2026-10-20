@@ -104,3 +104,44 @@ test("the Scan tool is registered where the UI and the server keep their tool li
   assert.match(app, /getSessionId: currentSessionId,\s*openRecord: jumpToTransaction/);
   assert.equal((app.match(/templatesController\?\.syncSession\(\)/g) || []).length, 2);
 });
+
+// An inert stand-in for each element the controller looks up by id.
+function fakeElement() {
+  const classes = new Set();
+  return {
+    textContent: "", value: "", checked: false, disabled: false, dataset: {}, children: [], style: {},
+    classList: {
+      toggle(name, on) { if (on === undefined ? !classes.has(name) : on) classes.add(name); else classes.delete(name); },
+      contains: (name) => classes.has(name), add: (name) => classes.add(name), remove: (name) => classes.delete(name),
+    },
+    addEventListener() {}, removeEventListener() {}, setAttribute() {}, removeAttribute() {},
+    replaceChildren(...nodes) { this.children = nodes; }, append(...nodes) { this.children.push(...nodes); },
+    querySelector: () => null, querySelectorAll: () => [], closest: () => null,
+  };
+}
+
+test("opening Scan rereads the scope, and its warning follows the scope it is told about", async () => {
+  const els = new Map();
+  const shell = {
+    ownerDocument: { createElement: () => fakeElement() },
+    querySelector(selector) { const element = fakeElement(); els.set(selector, element); return element; },
+  };
+  const status = { state: "idle", library: { source: "import", verified: false }, templates: 1, passive_supported: 1, passive_enabled: 1 };
+  let includes = 0, shown = 0;
+  const controller = templates.createController({
+    root: shell, getSessionId: () => null, getScopeIncludeCount: () => includes, onShow: () => { shown += 1; },
+    fetch: async (url) => ({ ok: true, json: async () => (String(url).includes("/library") ? status : { items: [], total: 0 }) }),
+    setTimeout: () => 0, clearTimeout() {},
+  });
+  controller.setVisible(true);
+  assert.equal(shown, 1);
+  for (let tick = 0; tick < 5; tick += 1) await new Promise((resolve) => setImmediate(resolve));
+  const note = els.get("#templatesScopeNote");
+  assert.equal(note.classList.contains("hidden"), false, "templates are on and Scope has no include");
+  includes = 2;
+  controller.scopeChanged();
+  assert.equal(note.classList.contains("hidden"), true);
+  controller.setVisible(true);
+  assert.equal(shown, 1, "only opening Scan rereads the scope");
+  controller.dispose();
+});

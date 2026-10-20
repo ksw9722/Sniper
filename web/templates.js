@@ -612,6 +612,9 @@
         clearTimer();
         clearScanTimer();
       } else if (changed) {
+        // The CLI or another window may have changed Scope while Scan was
+        // hidden, and the warning about it reads the scope the app holds.
+        options.onShow?.();
         void refreshStatus();
         void refreshScans();
       }
@@ -624,6 +627,8 @@
     return {
       setVisible,
       refresh: refreshStatus,
+      // The app calls this when it has reread Scope.
+      scopeChanged: renderStatus,
       // Another session's scans are not this one's.
       syncSession() { void refreshScans(); },
       dispose() { clearTimer(); clearScanTimer(); listeners.forEach((remove) => remove()); },

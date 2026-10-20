@@ -8083,7 +8083,7 @@ button.utility-button.replay-tab-add {
 .recon-inventory-toolbar { flex-wrap: wrap; gap: 10px; }
 .recon-search-controls { display: flex; gap: 8px; flex: 1 1 320px; }
 .recon-search-controls input { flex: 1 1 160px; }
-.recon-search-controls select { flex: 0 0 130px; }
+.recon-search-controls select { flex: 0 0 auto; width: auto; min-width: 130px; }
 .recon-results { display: grid; grid-template-columns: minmax(0, 1fr) minmax(230px, 34%); flex: 1; min-height: 0; overflow: hidden; }
 .recon-table-scroll { min-width: 0; overflow: auto; }
 .recon-table { width: 100%; table-layout: fixed; }

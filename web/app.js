@@ -125,6 +125,8 @@ const HTTP_HISTORY_MAX_LOADED_ITEMS = HTTP_HISTORY_PAGE_SIZE;
 const HTTP_HISTORY_BACKFILL_DELAY_MS = 80;
 const HTTP_HISTORY_SCROLL_PREFETCH_ROWS = 120;
 const HTTP_HISTORY_POLL_FALLBACK_MS = 30000;
+// Scope changed from the CLI reaches an open Scan tool within this.
+const SCAN_SCOPE_POLL_MS = 5000;
 const WEBSOCKET_POLL_FALLBACK_MS = 30000;
 const WEBSOCKET_PAGE_SIZE = 500;
 const WEBSOCKET_MAX_LOADED_SESSIONS = 5000;
@@ -598,6 +600,7 @@ let _websocketFilteredReloadTimer = 0;
 let _websocketFilteredReloadDueAt = 0;
 let _websocketSearchReloadTimer = 0;
 let _lastHttpHistoryFallbackPoll = Date.now();
+let _lastScanScopePoll = 0;
 let _lastWebsocketFallbackPoll = Date.now();
 let _lastWebsocketPageRefreshAt = 0;
 let _interceptToggleRequestSeq = 0;
@@ -1234,6 +1237,7 @@ function bindEvents() {
     templatesController = window.SniperTemplates.createController({
       root: els.templatesShell,
       getScopeIncludeCount: () => (state.runtime?.scope_patterns || []).length,
+      onShow: () => loadRuntimeSettings().catch((error) => console.error(error)),
       getSessionId: currentSessionId,
       openRecord: jumpToTransaction,
     });
@@ -5470,6 +5474,7 @@ async function loadRuntimeSettings() {
   }
   if (typeof targetServiceMapController !== "undefined") targetServiceMapController?.scopeChanged?.(state.runtime, runtime);
   state.runtime = runtime;
+  if (typeof templatesController !== "undefined") templatesController?.scopeChanged?.();
   renderInterceptStatus();
   renderProxySettings();
 }
@@ -7790,6 +7795,11 @@ async function pollAuxiliaryData() {
   }
 
   if (state.activeTool === "target") tasks.push(loadTargetSiteMap());
+
+  if (state.activeTool === "templates" && now - _lastScanScopePoll >= SCAN_SCOPE_POLL_MS) {
+    _lastScanScopePoll = now;
+    tasks.push(loadRuntimeSettings());
+  }
 
   if (state.activeTool === "proxy" && state.activeProxyTab === "findings") {
     tasks.push(loadFindings());
