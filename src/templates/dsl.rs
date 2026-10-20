@@ -147,14 +147,41 @@ pub fn markers(text: &str) -> Vec<&str> {
 /// The text with every marker removed, for reading an expression whose inner
 /// markers are filled before it is evaluated.
 pub fn without_markers(text: &str) -> String {
+    replace_markers(text, "")
+}
+
+fn replace_markers(text: &str, with: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     for (start, end) in marker_spans(text) {
         out.push_str(&text[copied..start]);
+        out.push_str(with);
         copied = end;
     }
     out.push_str(&text[copied..]);
     out
+}
+
+/// Whether an expression names no variable and calls no function, as `7*7`
+/// does.
+fn names_nothing(expression: &str) -> bool {
+    tokenize(expression).is_ok_and(|tokens| {
+        let (functions, variables) = names(&tokens);
+        functions.is_empty() && variables.is_empty()
+    })
+}
+
+/// The text with every byte of each marker replaced by `x`. Everything outside
+/// the markers keeps its place, so the shape of a raw request can be read
+/// before its markers are filled.
+pub fn masked(text: &str) -> String {
+    let mut bytes = text.as_bytes().to_vec();
+    for (start, end) in marker_spans(text) {
+        bytes[start..end].fill(b'x');
+    }
+    // Markers start and end with ASCII braces, so whole characters were
+    // replaced; an empty result reads as a malformed request.
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Byte ranges of the outermost complete markers, braces included.
@@ -1325,24 +1352,35 @@ impl Interp {
     pub fn compile(text: &str, allow: Allow) -> Result<Self, CompileError> {
         let mut pieces = Vec::new();
         let mut copied = 0;
+        let push_text = |pieces: &mut Vec<Piece>, text: &str| match pieces.last_mut() {
+            Some(Piece::Text(last)) => last.push_str(text),
+            _ => pieces.push(Piece::Text(text.to_string())),
+        };
         for (start, end) in marker_spans(text) {
             if start > copied {
-                pieces.push(Piece::Text(text[copied..start].to_string()));
+                push_text(&mut pieces, &text[copied..start]);
             }
             let inner = text[start + 2..end - 2].trim();
             if inner.contains("{{") {
                 Interp::compile(inner, allow)?;
-                Expr::compile(&without_markers(inner), allow)?;
+                // Each inner marker fills in a value; any one stands in for
+                // it, where leaving it out would read `md5({{n}})` as `md5()`.
+                Expr::compile(&replace_markers(inner, "0"), allow)?;
                 pieces.push(Piece::Nested(inner.to_string()));
             } else if is_variable_name(inner) {
                 pieces.push(Piece::Var(inner.to_string()));
+            } else if names_nothing(inner) {
+                // Nuclei sends a marker such as `{{7*7}}` as written: it
+                // probes for template injection, and sending the answer
+                // instead would match any page that echoes it.
+                push_text(&mut pieces, &text[start..end]);
             } else {
                 pieces.push(Piece::Expr(Expr::compile(inner, allow)?));
             }
             copied = end;
         }
         if copied < text.len() {
-            pieces.push(Piece::Text(text[copied..].to_string()));
+            push_text(&mut pieces, &text[copied..]);
         }
         Ok(Self { pieces, allow })
     }
@@ -1612,5 +1650,25 @@ mod tests {
         assert_eq!(plain.literal(), Some("no markers"));
         let missing = Interp::compile("{{nothing}}", Allow::default()).unwrap();
         assert_eq!(missing.render(&vars), Err(EvalError("unresolved")));
+    }
+
+    #[test]
+    fn a_marker_inside_a_call_counts_as_an_argument() {
+        let text = Interp::compile("{{md5({{num}})}}", Allow::default()).unwrap();
+        let base = Map(vec![("num", Val::Str(Cow::Borrowed("999")))]);
+        assert_eq!(
+            text.render(&base).unwrap(),
+            "b706835de79a2b4e80506f582af3676a"
+        );
+    }
+
+    #[test]
+    fn a_marker_that_names_nothing_is_sent_as_written() {
+        // Nuclei leaves these alone: they probe for template injection, and
+        // sending the answer instead would match any page that echoes it.
+        let probe = "?q={{7*7}}&r={{228*'98'}}&s={{ \"a\" }}";
+        let text = Interp::compile(probe, Allow::default()).unwrap();
+        assert_eq!(text.literal(), Some(probe));
+        assert_eq!(text.render(&vars()).unwrap(), probe);
     }
 }

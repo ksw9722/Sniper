@@ -1,8 +1,9 @@
 """Verify Nuclei templates against an isolated Sniper and a loopback upstream:
 import a synthetic release, enable passive templates, capture in scope,
 restart, and rescan after disabling; then run a Template Scan, check it sent
-only to its target, kept only matches, survives a rescan, and is marked
-interrupted when Sniper stops mid-scan. Nothing leaves this machine.
+only to its target, kept only matches, survives a rescan, sends raw requests
+as Nuclei does, and is marked interrupted when Sniper stops mid-scan. Nothing
+leaves this machine.
 
 Run: python tests/template_smoke.py [directory containing sniper]
 """
@@ -76,6 +77,28 @@ http:
         status: [200]
 """
 
+# The second request needs the cookie the first one's answer set; `{{7*7}}`
+# names nothing, so it goes as written.
+RAW = """id: example-raw
+info:
+  name: Example Raw
+  severity: high
+http:
+  - raw:
+      - |
+        GET /login HTTP/1.1
+        Host: {{Hostname}}
+      - |
+        POST /account?probe={{7*7}} HTTP/1.1
+        Host: {{Hostname}}
+        Content-Type: application/x-www-form-urlencoded
+
+        name=example
+    matchers:
+      - type: word
+        words: ['Welcome example']
+"""
+
 DNS = """id: example-dns
 info:
   name: Example DNS
@@ -89,7 +112,8 @@ def release():
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w") as archive:
         for path, text in [("http/detect.yaml", DETECT), ("http/global.yaml", GLOBAL),
-                           ("http/active.yaml", ACTIVE), ("http/slow.yaml", SLOW), ("dns/dns.yaml", DNS)]:
+                           ("http/active.yaml", ACTIVE), ("http/slow.yaml", SLOW), ("http/raw.yaml", RAW),
+                           ("dns/dns.yaml", DNS)]:
             body = text.encode()
             info = tarfile.TarInfo("example-templates-1.0/" + path)
             info.size = len(body)
@@ -111,6 +135,7 @@ def main():
     binaries = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release").resolve()
 
     seen = []
+    posted = []
 
     class Upstream(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -120,10 +145,28 @@ def main():
             seen.append((self.path, self.headers.get("Host")))
             if self.path.startswith("/slow"):
                 time.sleep(30)
+            if self.path == "/login":
+                self.send_response(302)
+                self.send_header("Location", "/account")
+                self.send_header("Set-Cookie", "sid=abc; Path=/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             body = b"APP_KEY=base64:example" if self.path == "/.env" else b"<html><title>Example Server 1.2</title></html>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("X-Example", "yes")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            seen.append((self.path, self.headers.get("Host")))
+            sent = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+            cookie = self.headers.get("Cookie") or ""
+            posted.append((self.path, cookie, sent))
+            body = b"Welcome example" if "sid=abc" in cookie and sent == "name=example" else b"Who are you"
+            self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -188,9 +231,9 @@ def main():
         assert status["templates"] == 0, status
         call("/api/templates/library/import", raw=release(), content_type="application/gzip", expect=202)
         status = eventually(lambda: (s := call("/api/templates/library"))["state"] == "idle"
-                            and s["templates"] == 5 and s)
+                            and s["templates"] == 6 and s)
         assert status["passive_supported"] == 2, status
-        assert status["active_supported"] == 3, status
+        assert status["active_supported"] == 4, status
         assert status["library"]["source"] == "import" and not status["library"]["verified"], status
         listed = call("/api/templates?support=passive")
         assert sorted(item["id"] for item in listed["items"]) == ["example-detect", "example-global"], listed
@@ -222,7 +265,7 @@ def main():
         runtime = start()
         ui = "http://" + runtime["ui_addr"]
         status = eventually(lambda: (s := call("/api/templates/library"))["state"] == "idle" and s)
-        assert status["templates"] == 5 and status["passive_enabled"] == 2, status
+        assert status["templates"] == 6 and status["passive_enabled"] == 2, status
         assert template_findings(), "template findings did not survive a restart"
 
         call("/api/templates/passive", {"ids": ["example-global"], "enabled": False})
@@ -259,6 +302,19 @@ def main():
         assert after == scanned, after
         print(json.dumps({"scanned": sorted(scanned), "requests": seen[before:]}), flush=True)
 
+        # Raw requests go to the target with its Host, share the cookie the
+        # first answer set, send `{{7*7}}` as written and leave out the
+        # body's last line end.
+        before = len(seen)
+        raw_job = call("/api/templates/scans", {"session_id": session, "targets": [origin],
+                                                "ids": ["example-raw"], "acknowledged": True})
+        raw_job = eventually(lambda: (j := call(f"/api/templates/scans/{raw_job['id']}{query}"))["status"] != "running" and j)
+        assert raw_job["status"] == "completed" and raw_job["sent"] == 2 and raw_job["matched"] == 1, raw_job
+        assert seen[before:] == [("/login", host), ("/account?probe={{7*7}}", host)], seen[before:]
+        assert posted == [("/account?probe={{7*7}}", "sid=abc", "name=example")], posted
+        scanned.add("nuclei:example-raw")
+        print(json.dumps({"raw": seen[before:]}), flush=True)
+
         # A crash mid-scan leaves the job interrupted, not running: kill
         # Sniper once the started job has been saved.
         slow = call("/api/templates/scans", {"session_id": session, "targets": [origin],
@@ -271,7 +327,7 @@ def main():
         ui = "http://" + runtime["ui_addr"]
         eventually(lambda: call("/api/templates/library")["state"] == "idle")
         jobs = {item["id"]: item["status"] for item in call(f"/api/templates/scans{query}")["jobs"]}
-        assert jobs == {job["id"]: "completed", slow["id"]: "interrupted"}, jobs
+        assert jobs == {job["id"]: "completed", raw_job["id"]: "completed", slow["id"]: "interrupted"}, jobs
         survived = {item["rule_id"] for item in call("/api/findings?limit=1000")
                     if item.get("rule_id", "").startswith("nuclei:")}
         assert survived == scanned, survived

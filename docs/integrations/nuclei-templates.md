@@ -46,10 +46,11 @@ that skips them rather than slow capture, and the library status counts it as
 A template can be sent when it has one HTTP request block made of:
 
 - a method other than `CONNECT`, and paths that start with `{{BaseURL}}` or
-  `{{RootURL}}`;
+  `{{RootURL}}`, or raw requests;
 - headers, a body, `variables`, `{{randstr}}` and the helper functions,
   including the random and time ones;
-- `redirects`, `host-redirects`, `max-redirects` and `stop-at-first-match`.
+- `redirects`, `host-redirects`, `max-redirects`, `stop-at-first-match` and
+  `disable-cookie`.
 
 The target sets the scheme, host and port; a template only adds a path, and a
 `Host` header may only be `{{Hostname}}`. Paths are sent as written, `%2e%2e`
@@ -57,6 +58,18 @@ and `..;` included; only characters a request line cannot hold are
 percent-encoded. Each request carries
 `User-Agent: Mozilla/5.0 (compatible; Sniper/<version>)`, `Accept: */*` and
 `Accept-Language: en` unless the template sets its own.
+
+Raw requests are read as Nuclei reads them. The request line's path is joined
+to the target's path the way Nuclei joins it, and an absolute URL there keeps
+only its path and query. `@timeout:` replaces the 15-second limit for that
+request, up to five minutes; a request with `@Host:`, `@tls-sni:` or `@once` is
+not sent. Request text and bodies written with bare line feeds are sent with
+CRLF, as Nuclei sends them.
+
+A template's requests to one target share cookies: a cookie a response sets
+goes with the later requests to the same host, as in Nuclei, unless the
+template sets `disable-cookie: true`. `{{7*7}}` and other markers that name no
+variable or function are sent as written.
 
 ### Where it sends
 
@@ -95,7 +108,8 @@ tagged `dos` are never sent.
 - Starting needs an explicit acknowledgment: the checkbox under **Preview** in
   the app, `"acknowledged": true` in the API, `--yes` in the CLI.
 - Rate: 1 to 50 requests a second across the scan, default 10. Concurrency: 1
-  to 8 templates at once, default 4. A template's paths go one after another.
+  to 8 templates at once, default 4. A template's requests go one after
+  another.
 - `max_requests` caps a scan at 1 to 50,000 requests, default 10,000, redirect
   hops included. A scan whose planned requests already exceed it does not
   start.
@@ -123,12 +137,14 @@ Sniper lists every template but never runs the `code`, `javascript`,
 `headless`, `network`, `dns`, `file`, `ssl`, `websocket` or `whois` protocols,
 `flow`, self-contained templates, workflows, or anything else outside the
 supported subset. A template either compiles completely or is listed as
-unsupported with a reason, such as `protocol:dns`, `req:raw` or `fn:mmh3`.
+unsupported with a reason, such as `protocol:dns`, `req:payloads` or
+`fn:mmh3`.
 
-Not supported yet: raw requests, `payloads`, more than one request block,
-reading an earlier request's response (`status_code_2`), `req-condition`,
-out-of-band templates (`{{interactsh-url}}`), fuzzing, and race and pipeline
-requests.
+Not supported yet: `payloads`, more than one request block, reading an
+earlier request's response (`status_code_2`), `req-condition`, out-of-band
+templates (`{{interactsh-url}}`), `unsafe` raw requests, fuzzing, and race and
+pipeline requests. A template whose variable is left for whoever runs it
+(`username: '{{username}}'`) is not sent.
 
 ## Supported subset
 
@@ -154,7 +170,7 @@ body was truncated, a template whose result the missing bytes could change (a
 negated body matcher, a size, an expression that reads the body) skips that
 response.
 
-On release v10.5.0, 2,084 of 11,698 HTTP templates can run passively and 6,429
+On release v10.5.0, 2,084 of 11,698 HTTP templates can run passively and 7,496
 can be sent by Template Scan.
 
 ## The library

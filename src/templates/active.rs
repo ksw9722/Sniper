@@ -1,9 +1,11 @@
 //! Templates that send requests. A request block names a method, paths under
-//! `{{BaseURL}}` or `{{RootURL}}`, headers and a body; the target the
-//! operator chose supplies the scheme, host and port. A path is only ever a
-//! path: `{{BaseURL}}@example.net` asks the target for `/@example.net`.
+//! `{{BaseURL}}` or `{{RootURL}}`, headers and a body, or writes each request
+//! out raw; the target the operator chose supplies the scheme, host and port.
+//! A path is only ever a path: `{{BaseURL}}@example.net` asks the target for
+//! `/@example.net`, and a raw request line naming another host keeps only
+//! its path.
 
-use std::{borrow::Cow, cell::RefCell, collections::HashMap};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap, time::Duration};
 
 use serde_json::Value;
 
@@ -14,6 +16,9 @@ use super::model::{Classification, ParsedTemplate};
 /// Nuclei follows ten redirects unless a template asks for another number;
 /// Sniper never follows more.
 pub const MAX_REDIRECTS: usize = 10;
+
+/// Nuclei caps a raw request's `@timeout:` at five minutes.
+const MAX_TIMEOUT_SECS: f64 = 300.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Follow {
@@ -32,18 +37,28 @@ struct PathSpec {
     rest: Interp,
 }
 
+#[derive(Clone, Debug)]
+struct RawSpec {
+    text: Interp,
+    timeout: Option<Duration>,
+}
+
 /// A template compiled for sending.
 #[derive(Clone, Debug)]
 pub struct ActiveTemplate {
     pub template: CompiledTemplate,
     method: String,
     paths: Vec<PathSpec>,
+    raws: Vec<RawSpec>,
     headers: Vec<(String, Interp)>,
     body: Option<Interp>,
     variables: Vec<(String, Interp)>,
     pub stop_at_first_match: bool,
     pub follow: Follow,
     pub max_redirects: usize,
+    /// The run keeps the cookies its responses set and sends them on, as
+    /// Nuclei does unless `disable-cookie` is set.
+    pub cookies: bool,
 }
 
 /// One request, ready to send to the target it was built for.
@@ -54,6 +69,8 @@ pub struct BuiltRequest {
     pub target: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// A raw request's `@timeout:`; the scan's own otherwise.
+    pub timeout: Option<Duration>,
 }
 
 pub fn compile_active(
@@ -89,7 +106,12 @@ pub fn compile_active(
     if method == "CONNECT" {
         return Err(engine::reason("req:method"));
     }
-    let paths = engine::strings(block, "path")?
+    let paths = if block.contains_key("path") {
+        engine::strings(block, "path")?
+    } else {
+        Vec::new()
+    };
+    let paths = paths
         .iter()
         .map(|path| {
             let path = path.trim_start();
@@ -107,7 +129,22 @@ pub fn compile_active(
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
-    if paths.is_empty() {
+    let raws = if block.contains_key("raw") {
+        engine::strings(block, "raw")?
+    } else {
+        Vec::new()
+    };
+    let raws = raws
+        .iter()
+        .map(|raw| {
+            let raw = crlf(raw);
+            Ok(RawSpec {
+                timeout: raw_timeout(&raw).ok_or_else(|| engine::reason("req:raw_annotation"))?,
+                text: Interp::compile(&raw, allow)?,
+            })
+        })
+        .collect::<Result<Vec<_>, CompileError>>()?;
+    if paths.is_empty() && raws.is_empty() {
         return Err(engine::reason("req:path"));
     }
     let mut headers = Vec::new();
@@ -132,7 +169,7 @@ pub fn compile_active(
     }
     let body = block
         .get("body")
-        .map(|body| Interp::compile(&engine::text_of(body), allow))
+        .map(|body| Interp::compile(&crlf(&engine::text_of(body)), allow))
         .transpose()?;
     let variables = match template.root.get("variables") {
         Some(Value::Object(map)) => map
@@ -172,12 +209,14 @@ pub fn compile_active(
         },
         method,
         paths,
+        raws,
         headers,
         body,
         variables,
         stop_at_first_match: engine::flag(block, "stop-at-first-match")?,
         follow,
         max_redirects,
+        cookies: !engine::flag(block, "disable-cookie")?,
     })
 }
 
@@ -226,7 +265,7 @@ impl Vars for RunValues<'_> {
 impl ActiveTemplate {
     /// Requests one run sends before any redirect.
     pub fn request_count(&self) -> usize {
-        self.paths.len()
+        self.paths.len() + self.raws.len()
     }
 
     pub fn method(&self) -> &str {
@@ -270,6 +309,9 @@ impl ActiveTemplate {
         base_path: &str,
         run: &RunValues<'_>,
     ) -> Result<BuiltRequest, EvalError> {
+        if !self.raws.is_empty() {
+            return self.build_raw(index, base_path, run);
+        }
         let spec = self.paths.get(index).ok_or(EvalError("path"))?;
         let rest = spec.rest.render(run)?;
         let prefix = if spec.root { "" } else { base_path };
@@ -291,7 +333,225 @@ impl ActiveTemplate {
             target,
             headers,
             body,
+            timeout: None,
         })
+    }
+
+    fn build_raw(
+        &self,
+        index: usize,
+        base_path: &str,
+        run: &RunValues<'_>,
+    ) -> Result<BuiltRequest, EvalError> {
+        let spec = self.raws.get(index).ok_or(EvalError("raw"))?;
+        let text = spec.text.render(run)?;
+        let raw = read_raw(&text, &text).ok_or(EvalError("raw"))?;
+        let target =
+            request_target(&raw_request_path(base_path, raw.target)).ok_or(EvalError("path"))?;
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for (name, value) in raw.headers {
+            // The sender sets Host from the target and the length from the
+            // body.
+            if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            if http::HeaderName::from_bytes(name.as_bytes()).is_err()
+                || http::HeaderValue::from_str(value).is_err()
+            {
+                return Err(EvalError("header"));
+            }
+            // Nuclei keeps headers in a map: a repeated one sends its last
+            // value.
+            match headers.iter_mut().find(|(seen, _)| seen == name) {
+                Some(header) => header.1 = value.to_string(),
+                None => headers.push((name.to_string(), value.to_string())),
+            }
+        }
+        Ok(BuiltRequest {
+            method: raw.method.to_string(),
+            target,
+            headers,
+            body: raw.body.to_string(),
+            timeout: spec.timeout,
+        })
+    }
+}
+
+/// Nuclei sends CRLF line ends: request text written with bare line feeds
+/// gets them, and text that already has a CRLF is sent as written.
+fn crlf(text: &str) -> Cow<'_, str> {
+    if text.contains("\r\n") {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.replace('\n', "\r\n"))
+    }
+}
+
+/// A raw request split the way Nuclei reads one.
+pub struct RawRequest<'a> {
+    pub method: &'a str,
+    /// The request line's second field; empty for `GET HTTP/1.1`.
+    pub target: &'a str,
+    pub headers: Vec<(&'a str, &'a str)>,
+    pub body: &'a str,
+}
+
+/// Reads a raw request as Nuclei does: annotation lines before the request
+/// line are skipped, the request line gives the method and target, header
+/// lines run to the first blank one, and the rest is the body, without its
+/// last CRLF unless it is multipart. Positions are found in `structure`,
+/// which is `text` itself or `text` with its markers masked, so a template's
+/// request can be read before its markers are filled. None when Nuclei
+/// would refuse the request, or a header line has no colon.
+pub fn read_raw<'a>(text: &'a str, structure: &str) -> Option<RawRequest<'a>> {
+    if text.len() != structure.len() {
+        return None;
+    }
+    let at = |part: &str, whole: &str| part.as_ptr() as usize - whole.as_ptr() as usize;
+    let mut lines = structure.split_inclusive('\n');
+    let line = lines.find(|line| !line.starts_with('@'))?;
+    if !line.ends_with('\n') {
+        return None;
+    }
+    let start = at(line, structure);
+    let fields: Vec<(usize, usize)> = line
+        .split_ascii_whitespace()
+        .map(|field| {
+            let from = start + at(field, line);
+            (from, from + field.len())
+        })
+        .collect();
+    let (method, target) = match fields.as_slice() {
+        [method, version] if structure[version.0..version.1].contains("HTTP") => (*method, None),
+        [method, target, _, ..] => (*method, Some(*target)),
+        _ => return None,
+    };
+    let mut headers = Vec::new();
+    let mut multipart = false;
+    let mut body_start = text.len();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if line.ends_with('\n') {
+                body_start = at(line, structure) + line.len();
+                break;
+            }
+            continue;
+        }
+        let from = at(trimmed, structure);
+        let colon = from + trimmed.find(':')?;
+        let name = &text[from..colon];
+        let value = text[colon + 1..from + trimmed.len()].trim();
+        multipart |= name.contains("Content-Type") && value.contains("multipart/");
+        headers.push((name, value));
+    }
+    let body = &text[body_start..];
+    Some(RawRequest {
+        method: &text[method.0..method.1],
+        target: target.map_or("", |(start, end)| &text[start..end]),
+        headers,
+        body: if multipart {
+            body
+        } else {
+            body.strip_suffix("\r\n").unwrap_or(body)
+        },
+    })
+}
+
+/// The `@timeout:` a raw request asks for, which Nuclei reads from the first
+/// line starting with it. None when an annotation would send the request
+/// elsewhere, connect differently or change the flow, or the timeout is not
+/// a duration.
+pub fn raw_timeout(text: &str) -> Option<Option<Duration>> {
+    let mut timeout = None;
+    for line in text.lines() {
+        let Some(annotation) = line.strip_prefix('@') else {
+            continue;
+        };
+        if annotation.starts_with("Host:")
+            || annotation.starts_with("tls-sni:")
+            || annotation.trim_end() == "once"
+        {
+            return None;
+        }
+        if let (None, Some(value)) = (timeout, annotation.strip_prefix("timeout:")) {
+            timeout = Some(go_duration(value.trim())?);
+        }
+    }
+    Some(timeout)
+}
+
+/// A duration as Go's `time.ParseDuration` reads one, such as `20s` or
+/// `1m30s`, capped as Nuclei caps a timeout.
+fn go_duration(text: &str) -> Option<Duration> {
+    if text == "0" {
+        return Some(Duration::ZERO);
+    }
+    let mut rest = text;
+    let mut seconds = 0.0;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let value: f64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let unit = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        seconds += value
+            * match &rest[..unit] {
+                "ns" => 1e-9,
+                "us" | "\u{b5}s" | "\u{3bc}s" => 1e-6,
+                "ms" => 1e-3,
+                "s" => 1.0,
+                "m" => 60.0,
+                "h" => 3600.0,
+                _ => return None,
+            };
+        rest = &rest[unit..];
+    }
+    (!text.is_empty()).then(|| Duration::from_secs_f64(seconds.min(MAX_TIMEOUT_SECS)))
+}
+
+/// The path and query a raw request line's target asks for, joined to the
+/// target's own path as Nuclei joins them. An absolute target keeps only its
+/// path and query: the target the operator chose supplies the host.
+fn raw_request_path(base_path: &str, target: &str) -> String {
+    let scheme = target.get(..8).unwrap_or(target).to_ascii_lowercase();
+    let relative = if scheme.starts_with("http://") || scheme.starts_with("https://") {
+        let rest = &target[target.find("//").map_or(0, |at| at + 2)..];
+        &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..]
+    } else {
+        target
+    };
+    // `GET / HTTP/1.1` asks for the target itself.
+    if relative.is_empty() || relative == "/" {
+        return base_path.to_string();
+    }
+    let relative = relative.split('#').next().unwrap_or("");
+    let (path, query) = relative.split_once('?').unwrap_or((relative, ""));
+    let path = if path.is_empty() || path.starts_with('/') {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(format!("/{path}"))
+    };
+    // Nuclei's join, quirks included: a path that already starts with the
+    // target's, or that the target's ends with, is not repeated.
+    let joined = if base_path.is_empty() || base_path == path {
+        path.into_owned()
+    } else if path.is_empty()
+        || (base_path.len() > path.len() && base_path.ends_with(path.as_ref()))
+    {
+        base_path.to_string()
+    } else if path.starts_with(base_path) {
+        path.into_owned()
+    } else {
+        format!("{base_path}{path}")
+    };
+    if query.is_empty() {
+        joined
+    } else {
+        format!("{joined}?{query}")
     }
 }
 
@@ -386,6 +646,103 @@ mod tests {
         // Each run makes its own.
         let other = template.start_run(&url).unwrap();
         assert_ne!(other.values()["z_token"], *token);
+    }
+
+    fn raw_template(raws: &[&str]) -> ActiveTemplate {
+        let template = serde_json::json!({
+            "id": "example-raw",
+            "info": {},
+            "http": [{"raw": raws, "matchers": [{"type": "status", "status": [200]}]}],
+        });
+        compiled(&template.to_string())
+    }
+
+    fn built_all(template: &ActiveTemplate, url: &str) -> (Vec<BuiltRequest>, String) {
+        let (url, base_path) = target(url);
+        let run = template.start_run(&url).unwrap();
+        let built = (0..template.request_count())
+            .map(|index| template.build(index, &base_path, &run).unwrap())
+            .collect();
+        let token = run.values().get("randstr").cloned().unwrap_or_default();
+        (built, token)
+    }
+
+    #[test]
+    fn raw_requests_are_read_as_nuclei_reads_them() {
+        let template = raw_template(&[
+            "POST /login?next=/home HTTP/1.1\nHost: {{Hostname}}\nContent-Type: application/x-www-form-urlencoded\nContent-Length: 999\nX-Dup: one\nX-Dup: two\n\nuser=admin&token={{randstr}}\n",
+            "GET {{BaseURL}}/cobbler_api HTTP/1.1\nHost: {{Hostname}}\n",
+            "GET / HTTP/1.1\n",
+            "GET https://example.net/x?a=1#frag HTTP/1.1\n",
+            "GET admin HTTP/1.1\n",
+            "GET /app/z HTTP/1.1\n",
+            "GET HTTP/1.1\n",
+        ]);
+        let (built, token) = built_all(&template, "https://example.com:8443/app/");
+        assert_eq!(built[0].method, "POST");
+        assert_eq!(built[0].target, "/app/login?next=/home");
+        // The target supplies Host, the sender the length, and a repeated
+        // header keeps its last value.
+        assert_eq!(
+            built[0].headers,
+            [
+                (
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string()
+                ),
+                ("X-Dup".to_string(), "two".to_string()),
+            ]
+        );
+        // Lines end in CRLF, and the body's last line end is not sent.
+        assert_eq!(built[0].body, format!("user=admin&token={token}"));
+        assert_eq!(built[0].timeout, None);
+        assert_eq!(built[1].target, "/app/cobbler_api");
+        assert_eq!(built[2].target, "/app");
+        // An absolute target keeps only its path and query: the target the
+        // operator chose supplies the host.
+        assert_eq!(built[3].target, "/app/x?a=1");
+        assert_eq!(built[4].target, "/app/admin");
+        // Nuclei merges a path that already starts with the target's own.
+        assert_eq!(built[5].target, "/app/z");
+        assert_eq!(built[6].target, "/app");
+        let (root, _) = built_all(&template, "http://example.com");
+        assert_eq!(root[2].target, "/");
+        assert_eq!(root[4].target, "/admin");
+        assert_eq!(root[6].target, "/");
+    }
+
+    #[test]
+    fn a_multipart_raw_body_keeps_its_last_line_end_and_timeouts_are_read() {
+        let template = raw_template(&[
+            "@timeout: 20s\nPOST /upload HTTP/1.1\nContent-Type: multipart/form-data; boundary=b\n\n--b\nContent-Disposition: form-data; name=\"f\"\n\nx\n--b--\n",
+            "@timeout: 2h\nGET / HTTP/1.1\n",
+            "GET / HTTP/1.1\r\nX-A: b\r\n\r\nkept\n",
+        ]);
+        let (built, _) = built_all(&template, "https://example.com");
+        assert_eq!(
+            built[0].body,
+            "--b\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nx\r\n--b--\r\n"
+        );
+        assert_eq!(built[0].timeout, Some(std::time::Duration::from_secs(20)));
+        // Nuclei caps a template's timeout at five minutes.
+        assert_eq!(built[1].timeout, Some(std::time::Duration::from_secs(300)));
+        // Text that already has CRLF line ends is sent as written.
+        assert_eq!(built[2].body, "kept\n");
+        assert_eq!(built[2].headers, [("X-A".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn a_body_with_bare_line_feeds_is_sent_with_crlf_as_nuclei_does() {
+        let template = compiled(
+            "id: example-body\ninfo: {}\nhttp:\n  - method: POST\n    path: ['{{BaseURL}}/x']\n    body: |\n      a\n      b\n    matchers:\n      - type: status\n        status: [200]\n",
+        );
+        let (built, _) = built_all(&template, "https://example.com");
+        assert_eq!(built[0].body, "a\r\nb\r\n");
+        assert!(template.cookies);
+        let template = compiled(
+            "id: example-no-cookie\ninfo: {}\nhttp:\n  - path: ['{{BaseURL}}/x']\n    disable-cookie: true\n    matchers:\n      - type: status\n        status: [200]\n",
+        );
+        assert!(!template.cookies);
     }
 
     #[test]

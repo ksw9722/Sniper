@@ -198,24 +198,21 @@ const OTHER_PROTOCOLS: &[(&str, &str)] = &[
 /// Root keys that change nothing about execution.
 const ROOT_KEYS: &[&str] = &["id", "info", "http", "requests", "variables"];
 
-/// Request keys that change nothing Sniper does: request names, limits Sniper
-/// applies on its own, cookie handling it never had.
+/// Request keys that change nothing Sniper does: request names and limits
+/// Sniper applies on its own.
 const INERT_REQUEST_KEYS: &[&str] = &[
     "id",
     "name",
     "max-size",
     "read-all",
-    "disable-cookie",
     "threads",
     "skip-variables-check",
 ];
 
 /// Request keys of features planned for later milestones, by reason code.
 const LATER_REQUEST_KEYS: &[(&str, &str)] = &[
-    ("raw", "req:raw"),
     ("payloads", "req:payloads"),
     ("attack", "req:payloads"),
-    ("cookie-reuse", "req:cookie_reuse"),
     ("req-condition", "req:req_condition"),
     ("iterate-all", "req:req_condition"),
     ("fuzzing", "req:fuzzing"),
@@ -354,8 +351,14 @@ pub fn classify(template: &ParsedTemplate) -> Classification {
     // Variables are worked out before the request is sent, from the target
     // and each other; a name that is neither would stay unresolved.
     if let Some(Value::Object(variables)) = root.get("variables") {
-        for value in variables.values() {
-            check_template_text(&mut out, &scalar_text(value), &declared, true);
+        for (name, value) in variables {
+            let text = scalar_text(value);
+            // `name: '{{name}}'` leaves the value to whoever runs the
+            // template, as `nuclei -var name=…` would give it.
+            if dsl::markers(&text).contains(&name.as_str()) {
+                out.active_reasons.insert(format!("var:{name}"));
+            }
+            check_template_text(&mut out, &text, &declared, true);
         }
     }
 
@@ -428,25 +431,16 @@ fn check_block(out: &mut Classification, block: &Map<String, Value>, declared: &
         }
         match key {
             "global-matchers" | "matchers-condition" | "stop-at-first-match" => {}
+            // A run keeps its cookies unless told not to; `cookie-reuse`
+            // asks for what Nuclei now does anyway.
+            "disable-cookie" | "cookie-reuse" => {}
             // An active scan follows them while they stay in Scope. Captured
             // traffic already followed whatever redirects the client did, each
             // hop its own response, so a passive template judges every hop.
             "redirects" | "host-redirects" | "max-redirects" => {}
-            "method" => {
-                let method = scalar_text(value).to_ascii_uppercase();
-                if !method
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
-                    || method.is_empty()
-                    || method == "CONNECT"
-                {
-                    out.active_reasons.insert("req:method".into());
-                } else if matches!(method.as_str(), "PUT" | "DELETE" | "PATCH") {
-                    out.risks
-                        .insert(format!("method:{}", method.to_ascii_lowercase()));
-                }
-            }
+            "method" => check_method(out, &scalar_text(value)),
             "path" => check_paths(out, value, declared),
+            "raw" => check_raw(out, block, value, declared),
             "headers" => {
                 out.passive_reasons.insert("req:headers".into());
                 match value.as_object() {
@@ -475,6 +469,66 @@ fn check_block(out: &mut Classification, block: &Map<String, Value>, declared: &
                 out.passive_reasons.insert(reason.clone());
                 out.active_reasons.insert(reason);
             }
+        }
+    }
+}
+
+fn check_method(out: &mut Classification, method: &str) {
+    let method = method.to_ascii_uppercase();
+    if !method
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
+        || method.is_empty()
+        || method == "CONNECT"
+    {
+        out.active_reasons.insert("req:method".into());
+    } else if matches!(method.as_str(), "PUT" | "DELETE" | "PATCH") {
+        out.risks
+            .insert(format!("method:{}", method.to_ascii_lowercase()));
+    }
+}
+
+/// Raw requests are read as Nuclei reads them, with their markers still in.
+/// The target supplies the host, so Host may only be the target's, and an
+/// annotation may only set a timeout.
+fn check_raw(
+    out: &mut Classification,
+    block: &Map<String, Value>,
+    value: &Value,
+    declared: &BTreeSet<String>,
+) {
+    // Nuclei sends the paths instead when both are set, and lays the block's
+    // headers and body over the raw ones.
+    if ["path", "method", "headers", "body"]
+        .iter()
+        .any(|key| block.contains_key(*key))
+    {
+        out.active_reasons.insert("req:raw_mixed".into());
+    }
+    let Some(requests) = value.as_array().filter(|requests| !requests.is_empty()) else {
+        out.active_reasons.insert("req:raw".into());
+        return;
+    };
+    for request in requests {
+        let Some(text) = request.as_str() else {
+            out.active_reasons.insert("req:raw".into());
+            continue;
+        };
+        check_template_text(out, text, declared, true);
+        if super::active::raw_timeout(text).is_none() {
+            out.active_reasons.insert("req:raw_annotation".into());
+        }
+        let Some(raw) = super::active::read_raw(text, &dsl::masked(text)) else {
+            out.active_reasons.insert("req:raw".into());
+            continue;
+        };
+        check_method(out, raw.method);
+        if raw
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("host") && *value != "{{Hostname}}")
+        {
+            out.active_reasons.insert("req:host_header".into());
         }
     }
 }
@@ -796,10 +850,10 @@ mod tests {
     #[test]
     fn unsupported_constructs_are_named() {
         let classified = classify_text(
-            "id: example-cve\ninfo:\n  tags: cve,intrusive\nhttp:\n  - raw:\n      - |\n        GET / HTTP/1.1\n    matchers:\n      - type: xpath\n        xpath: ['/a']\n      - type: word\n        part: interactsh_protocol\n        words: [dns]\n      - type: dsl\n        dsl: ['mmh3(body) == 1', 'status_code_2 == 200']\n",
+            "id: example-cve\ninfo:\n  tags: cve,intrusive\nhttp:\n  - path: ['{{BaseURL}}']\n    payloads:\n      p: [a]\n    matchers:\n      - type: xpath\n        xpath: ['/a']\n      - type: word\n        part: interactsh_protocol\n        words: [dns]\n      - type: dsl\n        dsl: ['mmh3(body) == 1', 'status_code_2 == 200']\n",
         );
         for reason in [
-            "req:raw",
+            "req:payloads",
             "matcher:xpath",
             "oast",
             "fn:mmh3",
@@ -870,6 +924,105 @@ mod tests {
             "{:?}",
             classified.active_reasons
         );
+    }
+
+    #[test]
+    fn a_variable_left_for_whoever_runs_the_template_is_not_run() {
+        let classified = classify_text(
+            "id: example-login\ninfo: {}\nvariables:\n  username: '{{username}}'\n  token: '{{randstr}}'\nhttp:\n  - method: GET\n    path: ['{{BaseURL}}/?u={{username}}&t={{token}}']\n    matchers:\n      - type: status\n        status: [200]\n",
+        );
+        assert_eq!(
+            classified.active_reasons.iter().collect::<Vec<_>>(),
+            ["var:username"]
+        );
+    }
+
+    fn raw_reasons(raws: serde_json::Value, extra: serde_json::Value) -> Classification {
+        let mut block = serde_json::json!({
+            "raw": raws,
+            "matchers": [{"type": "status", "status": [200]}],
+        });
+        block
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let template = serde_json::json!({
+            "id": "example-raw",
+            "info": {},
+            "variables": {"verb": "GET"},
+            "http": [block],
+        });
+        classify_text(&template.to_string())
+    }
+
+    #[test]
+    fn raw_requests_run_actively_when_the_target_supplies_the_host() {
+        let classified = raw_reasons(
+            serde_json::json!([
+                "@timeout: 20s\nPOST /login?next={{BaseURL}} HTTP/1.1\nHost: {{Hostname}}\nAuthorization: Basic {{base64(\"a:b\")}}\n\nuser=admin\n",
+                "@timeout 10s\nGET {{BaseURL}}/home HTTP/1.1\n",
+            ]),
+            serde_json::json!({}),
+        );
+        assert!(
+            classified.active_supported(),
+            "{:?}",
+            classified.active_reasons
+        );
+        assert!(classified.passive.is_none());
+        assert!(classified.risks.is_empty());
+        let put = raw_reasons(
+            serde_json::json!(["PUT /x HTTP/1.1\nHost: {{Hostname}}\n\nbody"]),
+            serde_json::json!({}),
+        );
+        assert!(put.active_supported(), "{:?}", put.active_reasons);
+        assert!(put.risks.contains("method:put"));
+    }
+
+    #[test]
+    fn raw_requests_that_go_elsewhere_or_read_oddly_are_not_run() {
+        let reasons = |raws: serde_json::Value, extra: serde_json::Value| {
+            raw_reasons(raws, extra).active_reasons
+        };
+        let none = serde_json::json!({});
+        for (raw, reason) in [
+            // The target supplies Host; a template naming another is not sent.
+            ("GET /x HTTP/1.1\nHost: localhost\n", "req:host_header"),
+            // These would send it elsewhere, or change how it connects.
+            (
+                "@Host: https://example.net\nGET /x HTTP/1.1\n",
+                "req:raw_annotation",
+            ),
+            (
+                "@tls-sni: example.net\nGET /x HTTP/1.1\n",
+                "req:raw_annotation",
+            ),
+            ("@once\nGET /x HTTP/1.1\n", "req:raw_annotation"),
+            ("@timeout: soon\nGET /x HTTP/1.1\n", "req:raw_annotation"),
+            // Nuclei refuses these as malformed.
+            ("GET\n", "req:raw"),
+            ("GET /x HTTP/1.1", "req:raw"),
+            ("\nGET /x HTTP/1.1\n", "req:raw"),
+            ("GET /x HTTP/1.1\nX-Broken\n\n", "req:raw"),
+            ("{{verb}} /x HTTP/1.1\n", "req:method"),
+            ("CONNECT /x HTTP/1.1\n", "req:method"),
+        ] {
+            let found = reasons(serde_json::json!([raw]), none.clone());
+            assert!(found.contains(reason), "{raw:?}: {found:?}");
+        }
+        assert!(reasons(serde_json::json!("GET / HTTP/1.1\n"), none.clone()).contains("req:raw"));
+        assert!(reasons(serde_json::json!([]), none).contains("req:raw"));
+        // Nuclei would ignore the raw requests beside a path, or lay these
+        // over them.
+        for extra in [
+            serde_json::json!({"path": ["{{BaseURL}}/x"]}),
+            serde_json::json!({"headers": {"X-A": "b"}}),
+            serde_json::json!({"body": "a=b"}),
+            serde_json::json!({"method": "POST"}),
+        ] {
+            let found = reasons(serde_json::json!(["GET /x HTTP/1.1\n"]), extra);
+            assert!(found.contains("req:raw_mixed"), "{found:?}");
+        }
     }
 
     /// Classifies a Nuclei templates release and prints what Sniper can run.

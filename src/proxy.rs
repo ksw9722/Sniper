@@ -742,17 +742,18 @@ fn client_builder(
         .http1_only())
 }
 
-/// How long one Template Scan request may take before it counts as failed.
+/// How long one Template Scan request may take before it counts as failed,
+/// unless a raw request's `@timeout:` says otherwise.
 pub(crate) const TEMPLATE_SCAN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Template Scan's client: one per job, so its connections are reused, with
 /// the session's TLS setting and upstream chain like everything Sniper sends.
+/// The scan times each request itself, as a template may ask for longer.
 pub(crate) fn build_template_scan_client(
     upstream_insecure: bool,
     proxy: &crate::upstream_proxy::UpstreamProxy,
 ) -> Result<Client> {
     client_builder(upstream_insecure, proxy)?
-        .timeout(TEMPLATE_SCAN_REQUEST_TIMEOUT)
         .build()
         .context("failed to build the Template Scan client")
 }

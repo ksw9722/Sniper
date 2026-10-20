@@ -796,7 +796,8 @@ fn request_text(request: &EditableRequest) -> String {
     text
 }
 
-/// The cookies a response set, by name, for the next hop to the same host.
+/// The cookies a response set, by name, for the run's later requests to the
+/// same host.
 fn remember_cookies(
     jar: &mut Vec<(String, String, String)>,
     host: &str,
@@ -922,6 +923,8 @@ impl Run {
             ));
             return;
         };
+        // Nuclei keeps one cookie jar for a template's run on a target.
+        let mut jar = Vec::new();
         for index in 0..template.request_count() {
             if self.stopping(&cancel, target_index) {
                 return;
@@ -937,7 +940,7 @@ impl Run {
                 }
             };
             let hops = self
-                .send_chain(template, target_index, built, &mut cancel)
+                .send_chain(template, target_index, built, &mut jar, &mut cancel)
                 .await;
             if hops.is_empty() {
                 continue;
@@ -956,6 +959,7 @@ impl Run {
         template: &ActiveTemplate,
         target_index: usize,
         built: active::BuiltRequest,
+        jar: &mut Vec<(String, String, String)>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Vec<Hop> {
         let target = &self.targets[target_index];
@@ -967,7 +971,9 @@ impl Run {
         let mut path = built.target.clone();
         let mut body = built.body.clone();
         let mut body_dropped = false;
-        let mut jar: Vec<(String, String, String)> = Vec::new();
+        let timeout = built
+            .timeout
+            .unwrap_or(crate::proxy::TEMPLATE_SCAN_REQUEST_TIMEOUT);
         loop {
             if hops.is_empty() {
                 // Scope may have narrowed since the scan started.
@@ -997,7 +1003,7 @@ impl Run {
                 &body,
                 body_dropped,
                 &built.headers,
-                &jar,
+                jar,
             );
             if *cancel.borrow() || !self.take_budget() {
                 break;
@@ -1007,14 +1013,20 @@ impl Run {
                 _ = cancel.wait_for(|stop| *stop) => break,
             }
             let started = std::time::Instant::now();
-            let outcome = tokio::select! {
-                outcome = crate::proxy::send_template_scan_request(
+            let send = tokio::time::timeout(
+                timeout,
+                crate::proxy::send_template_scan_request(
                     &self.state,
                     &self.session,
                     &self.client,
                     request.clone(),
                     self.apply_match_replace,
-                ) => outcome,
+                ),
+            );
+            let outcome = tokio::select! {
+                outcome = send => outcome.unwrap_or_else(|_| {
+                    Err(TemplateScanSendError::Failed(format!("timed out after {timeout:?}")))
+                }),
                 _ = cancel.wait_for(|stop| *stop) => break,
             };
             let entry = ScanLogEntry {
@@ -1077,7 +1089,9 @@ impl Run {
             } else {
                 None
             };
-            remember_cookies(&mut jar, &host_of(&authority), &record);
+            if template.cookies {
+                remember_cookies(jar, &host_of(&authority), &record);
+            }
             hops.push(Hop { request, record });
             let Some(next) = next else { break };
             scheme = next.scheme;
@@ -1402,6 +1416,10 @@ mod tests {
                         )
                             .into_response(),
                         "/echo" => uri.query().unwrap_or("").to_string().into_response(),
+                        "/sleep" => {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            "slept".into_response()
+                        }
                         "/submit" => body.into_response(),
                         _ => (StatusCode::NOT_FOUND, "nothing").into_response(),
                     }
@@ -1445,6 +1463,14 @@ mod tests {
     ];
 
     async fn scan_state(name: &str, scope: &[&str]) -> Arc<AppState> {
+        scan_state_with(name, scope, TEMPLATES).await
+    }
+
+    async fn scan_state_with(
+        name: &str,
+        scope: &[&str],
+        templates: &[(&str, &str)],
+    ) -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("sniper-scan-{name}-{}", Uuid::new_v4()));
         let state = Arc::new(
             AppState::new(crate::config::AppConfig {
@@ -1465,7 +1491,7 @@ mod tests {
         }
         state
             .templates
-            .import_blocking(&archive(TEMPLATES), super::super::library::Source::Import)
+            .import_blocking(&archive(templates), super::super::library::Source::Import)
             .unwrap();
         state
             .session()
@@ -1638,6 +1664,66 @@ mod tests {
                 .count(),
             5
         );
+    }
+
+    const RAW_TEMPLATES: &[(&str, &str)] = &[
+        ("raw-post", "id: example-raw-post\ninfo:\n  severity: high\nhttp:\n  - raw:\n      - |\n        POST /submit?x=1 HTTP/1.1\n        Host: {{Hostname}}\n        Content-Type: application/x-www-form-urlencoded\n        Content-Length: 1\n\n        a={{randstr}}\n    matchers:\n      - type: word\n        words: ['a={{randstr}}']\n"),
+        ("raw-session", "id: example-raw-session\ninfo: {}\nhttp:\n  - raw:\n      - |\n        GET /login HTTP/1.1\n        Host: {{Hostname}}\n      - |\n        GET /home HTTP/1.1\n        Host: {{Hostname}}\n    matchers:\n      - type: word\n        words: ['Welcome back']\n"),
+        ("raw-own-cookie", "id: example-raw-own-cookie\ninfo: {}\nhttp:\n  - raw:\n      - |\n        GET /login HTTP/1.1\n        Host: {{Hostname}}\n      - |\n        GET /home HTTP/1.1\n        Host: {{Hostname}}\n        Cookie: theme=dark\n    matchers:\n      - type: word\n        words: ['Welcome back']\n"),
+        ("no-cookie", "id: example-no-cookie\ninfo: {}\nhttp:\n  - path: ['{{BaseURL}}/login', '{{BaseURL}}/home']\n    disable-cookie: true\n    matchers:\n      - type: word\n        words: ['Welcome back']\n"),
+        ("raw-timeout", "id: example-raw-timeout\ninfo: {}\nhttp:\n  - raw:\n      - |\n        @timeout: 300ms\n        GET /sleep HTTP/1.1\n        Host: {{Hostname}}\n    matchers:\n      - type: status\n        status: [200]\n"),
+    ];
+
+    #[tokio::test]
+    async fn raw_requests_share_cookies_and_keep_their_timeouts() {
+        let (address, log, server) = site(1, false).await;
+        let state = scan_state_with("raw", &["127.0.0.1"], RAW_TEMPLATES).await;
+        let session = state.session().await;
+        let started = start(
+            State(state.clone()),
+            Json(request(
+                session.id(),
+                serde_json::json!({
+                    "targets": [format!("http://{address}")],
+                    "filter": {"search": "example-"},
+                    "acknowledged": true,
+                    "rate": 50,
+                }),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        let id: Uuid = serde_json::from_value(started["id"].clone()).unwrap();
+        let job = finished(&state, id).await;
+        server.abort();
+
+        assert_eq!(job.status, "completed", "{job:?}");
+        let mut matched: Vec<&str> = job
+            .results
+            .iter()
+            .map(|result| result.template_id.as_str())
+            .collect();
+        matched.sort_unstable();
+        // The second request of a run carries the cookie the first one was
+        // given, beside any cookie the template sets itself, unless the
+        // template turns that off.
+        assert_eq!(
+            matched,
+            [
+                "example-raw-own-cookie",
+                "example-raw-post",
+                "example-raw-session"
+            ]
+        );
+        // A request that outlives its @timeout fails rather than waiting out
+        // the default.
+        assert_eq!(job.failed, 1, "{job:?}");
+        let seen = log.lock().unwrap().clone();
+        let post = seen.iter().find(|seen| seen.path == "/submit").unwrap();
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.body.len(), "a=".len() + 27);
+        assert!(seen.iter().all(|seen| seen.host == address.to_string()));
     }
 
     #[tokio::test]
