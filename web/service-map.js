@@ -1223,6 +1223,94 @@
     return slots;
   }
   const LINK_LABELS = { origin_header: "Origin header", referer_header: "Referer header", client_request: "Direct request" };
+  // The Flow view: the selected origin's requests and those of the origins it
+  // links to, in time order, a band per page load, the client on the left.
+  const FLOW = Object.freeze({ clientX: 90, laneWidth: 180, laneBox: 160, top: 24, header: 36, band: 24, step: 34, padding: 24 });
+  const FLOW_STOPS = Object.freeze({ lanes_limit: "more origins link here; the five with the most rows are shown", steps_limit: "older steps left out" });
+  const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const hostOf = (origin) => { try { return new URL(origin).host; } catch { return String(origin); } };
+  const flowStepLabel = (step) => `${step.method} ${step.path}${step.count > 1 ? ` ×${step.count}` : ""}${step.status == null ? "" : ` ${step.status}`}`;
+  const flowRedirectLabel = (step) => `${step.status ?? "3xx"} to ${hostOf(step.redirect.origin)}${step.redirect.path}`;
+  const flowPageLabel = (phase) => phase.page ? `Page load: ${hostOf(phase.page.origin)}${phase.page.path}` : "Before the first page load";
+
+  // A flow read that does not match the origin and session asked for, or
+  // names a lane it does not list, shows nothing rather than a wrong diagram.
+  function normalizeFlow(raw, sessionId, origin) {
+    if (!raw || raw.schema_version !== 1 || raw.session_id !== sessionId || raw.origin !== origin) return null;
+    const lanes = array(raw.lanes).map((lane) => safeOrigin(lane));
+    if (!lanes.length || lanes[0] !== origin || lanes.some((lane, index) => lane !== raw.lanes[index])) return null;
+    const target = (value) => value && safeOrigin(value.origin) ? { origin: safeOrigin(value.origin), path: safePath(value.path) } : null;
+    const phases = array(raw.phases).map((phase) => ({
+      page: target(phase?.page),
+      steps: array(phase?.steps).filter((step) => lanes.includes(step?.origin) && UUID_PATTERN.test(String(step.record_id || ""))).map((step) => ({
+        origin: step.origin, method: String(step.method || "?").slice(0, 16), path: safePath(step.path),
+        status: Number.isInteger(step.status) ? step.status : null, kind: REQUEST_KINDS.includes(step.request_kind) ? step.request_kind : "other",
+        count: Math.max(1, count(step.count)), recordId: step.record_id, redirect: target(step.redirect),
+      })),
+    })).filter((phase) => phase.steps.length);
+    return { origin, lanes, phases, flowRows: count(raw.flow_rows), consideredRows: count(raw.considered_rows), complete: raw.complete === true, stoppedBy: array(raw.stopped_by).map(String) };
+  }
+
+  // One row per shown step and one more for its redirect; a page load whose
+  // steps are all of hidden kinds gets no band, as hidden kinds draw no arrows.
+  function flowLayout(flow, hiddenKinds = []) {
+    const hidden = new Set(hiddenKinds);
+    const laneX = new Map(flow.lanes.map((origin, index) => [origin, FLOW.clientX + FLOW.laneWidth * (index + 1)]));
+    const bands = [], arrows = [];
+    let y = FLOW.top + FLOW.header + 16;
+    for (const phase of flow.phases) {
+      const steps = phase.steps.filter((step) => !hidden.has(step.kind));
+      if (!steps.length) continue;
+      bands.push({ y, label: flowPageLabel(phase) });
+      y += FLOW.band + 6;
+      for (const step of steps) {
+        y += FLOW.step;
+        arrows.push({ y, x: laneX.get(step.origin), step });
+        if (step.redirect) {
+          y += FLOW.step;
+          arrows.push({ y, x: laneX.get(step.origin), step, redirect: true });
+        }
+      }
+      y += 14;
+    }
+    return { lanes: flow.lanes, laneX, bands, arrows, width: FLOW.clientX + FLOW.laneWidth * flow.lanes.length + FLOW.laneBox / 2 + FLOW.padding, height: y + FLOW.padding };
+  }
+
+  function flowMarkup(layout) {
+    const bottom = layout.height - FLOW.padding / 2;
+    const lane = (x, label, title, attributes = "") => `<g class="service-map-flow-lane"${attributes}><title>${escape(title)}</title><rect x="${x - FLOW.laneBox / 2}" y="${FLOW.top}" width="${FLOW.laneBox}" height="${FLOW.header}" rx="6"></rect><text x="${x}" y="${FLOW.top + FLOW.header / 2}" text-anchor="middle" dominant-baseline="central">${escape(label)}</text></g><line class="service-map-flow-life" x1="${x}" y1="${FLOW.top + FLOW.header}" x2="${x}" y2="${bottom}"></line>`;
+    const lanes = [lane(FLOW.clientX, "Client", "Requests as the client sent them"), ...layout.lanes.map((origin, index) => lane(layout.laneX.get(origin), hostOf(origin),
+      index ? `${origin} · show its flow` : origin, index ? ` data-service-flow-lane="${escape(origin)}" role="button" tabindex="0"` : ' data-selected="true"'))];
+    const bands = layout.bands.map((band) => `<g class="service-map-flow-phase"><rect x="8" y="${band.y}" width="${layout.width - 16}" height="${FLOW.band}" rx="4"></rect><text x="20" y="${band.y + FLOW.band / 2}" dominant-baseline="central">${escape(band.label)}</text></g>`);
+    const arrows = layout.arrows.map(({ x, y, step, redirect }) => {
+      const label = redirect ? flowRedirectLabel(step) : flowStepLabel(step);
+      const [from, to] = redirect ? [x, FLOW.clientX + 6] : [FLOW.clientX, x - 6];
+      return `<g class="service-map-flow-step kind-${step.kind}${redirect ? " redirect" : ""}" data-service-flow-record="${escape(step.recordId)}" role="button" tabindex="0"><title>${escape(`${label} · ${step.origin}${step.path} · open in HTTP history`)}</title><text x="${FLOW.clientX + 10}" y="${y - 8}">${escape(label)}</text><line x1="${from}" y1="${y}" x2="${to}" y2="${y}" marker-end="url(#service-map-flow-arrow)"></line></g>`;
+    });
+    return `<svg class="service-map-flow" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" role="group" aria-label="Requests in time order">`
+      + `<defs><marker id="service-map-flow-arrow" viewBox="0 0 8 8" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M1,1 L7,4 L1,7" fill="none" stroke="context-stroke" stroke-width="1.5"></path></marker></defs>`
+      + `${lanes.join("")}${bands.join("")}${arrows.join("")}</svg>`;
+  }
+
+  // Mermaid sequence diagram text; ";" and "#" would end or escape a message.
+  function flowMermaid(flow, hiddenKinds = []) {
+    const hidden = new Set(hiddenKinds);
+    const ids = new Map(flow.lanes.map((origin, index) => [origin, `O${index}`]));
+    const text = (value) => String(value).replace(/[;#\r\n]/g, " ");
+    const lines = ["sequenceDiagram", "  participant C as Client", ...flow.lanes.map((origin) => `  participant ${ids.get(origin)} as ${text(hostOf(origin))}`)];
+    const last = ids.get(flow.lanes.at(-1));
+    for (const phase of flow.phases) {
+      const steps = phase.steps.filter((step) => !hidden.has(step.kind));
+      if (!steps.length) continue;
+      lines.push(`  Note over C,${last}: ${text(flowPageLabel(phase))}`);
+      for (const step of steps) {
+        lines.push(`  C->>${ids.get(step.origin)}: ${text(flowStepLabel(step))}`);
+        if (step.redirect) lines.push(`  ${ids.get(step.origin)}-->>C: ${text(flowRedirectLabel(step))}`);
+      }
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
   function graphLayout(origins, order, previousSlots = new Map(), anchor = null, bodyEdges = [], geometry = GRAPH_GEOMETRY, hiddenKinds = [], clientCards = 0) {
     const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
     const visibleOrigins = order.filter((id) => byOrigin.has(id)).slice(0, MAX_CARDS + clientCards).map((id) => byOrigin.get(id));
@@ -1416,7 +1504,7 @@
     }
   }
   const referenceOrigin = (id) => ({ origin: id, captured: false, in_scope: false, endpoints: [], technology_clues: [], technology_observations: [], technology_observations_present: false, redirects: [], header_links: [], references: [], referencesOmitted: 0 });
-  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, sendToReplay = null, openUrl = null, onApiDocsOpen = null, isActiveModal = () => true, restoreFocus = null, document: doc = root.document }) {
+  function createController({ elements: els, getSessionId, getEventStreamReady = () => true, getFilterQuery = () => ({}), getFilterSummary = () => null, getHiddenLinkKinds = null, setHiddenLinkKinds = null, getSiteDisplay = null, setSiteDisplay = null, request: sendRequest, copyText = null, sendToReplay = null, openInHistory = null, openUrl = null, onApiDocsOpen = null, isActiveModal = () => true, restoreFocus = null, document: doc = root.document }) {
     // Request kinds whose links are not drawn. The app keeps them in UI
     // settings; without it they live for this controller only.
     let localHiddenLinkKinds = [...DEFAULT_HIDDEN_LINK_KINDS];
@@ -1451,9 +1539,11 @@
       parameters: null, parametersKey: null, parametersLoading: false, parametersError: "", parametersRequestId: 0, busyRetries: 0,
       htmlGenerators: null, htmlGeneratorsLoading: false, htmlGeneratorsError: "", htmlGeneratorsRequestId: 0, htmlGeneratorsSource: null,
       inactiveSessionId: null, historyVersion: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1,
+      flowOrigin: null, flow: null, flowLoading: false, flowError: "", flowRequestId: 0,
     };
     Object.defineProperty(state, "bodyReferenceOverlay", { get: () => state.relationLayers.at(-1) || null });
     let abort = null;
+    let flowAbort = null;
     let evidenceAbort = null;
     let bodyReferencesAbort = null;
     let peerMatchesAbort = null;
@@ -1933,6 +2023,7 @@
     }
     function setMapMode(direct) {
       if (state.sessionId !== getSessionId()) { reset(); return; }
+      leaveFlow();
       if (direct) {
         if (state.anchorOrigin || !selectedOrigin()) return;
         state.anchorOrigin = state.selectedOrigin;
@@ -1943,6 +2034,77 @@
       }
       state.modeNotice = "";
       render();
+    }
+    function leaveFlow() {
+      flowAbort?.abort();
+      state.flowRequestId += 1;
+      Object.assign(state, { flowOrigin: null, flow: null, flowLoading: false, flowError: "" });
+    }
+    // Flow follows one origin: the selected one, or a lane clicked in a flow.
+    function setFlowMode(origin) {
+      if (state.sessionId !== getSessionId()) { reset(); return; }
+      if (!origin) { leaveFlow(); render(); return; }
+      Object.assign(state, { flowOrigin: origin, flow: null, flowError: "", anchorOrigin: null, modeNotice: "" });
+      if (state.selectedOrigin !== origin) selectOrigin(origin);
+      loadFlow();
+    }
+    async function loadFlow() {
+      const origin = state.flowOrigin, sessionId = getSessionId();
+      if (!origin) return;
+      flowAbort?.abort();
+      flowAbort = new AbortController();
+      const requestId = ++state.flowRequestId;
+      state.flowLoading = true;
+      render();
+      // The newest rows the server reads at most: a flow shows what happened
+      // lately, and only a row window keeps the rows' order.
+      const params = new URLSearchParams({ ...getFilterQuery(), session_id: sessionId, origin, in_scope_only: String(state.scopeOnly), max_records: "50000" });
+      let flow = null, error = "";
+      try {
+        const response = await request(`/api/target/service-map/flow?${params}`, { signal: flowAbort.signal });
+        if (!response.ok) error = response.status === 404 ? "This Sniper cannot draw flows; update it." : "The flow could not be read.";
+        else flow = normalizeFlow(await response.json(), sessionId, origin);
+        if (!flow && !error) error = "The flow did not match the origin asked for.";
+      } catch (failure) {
+        if (failure?.name === "AbortError") return;
+        error = "The flow could not be read.";
+      }
+      if (destroyed || requestId !== state.flowRequestId || state.flowOrigin !== origin || sessionId !== getSessionId()) return;
+      Object.assign(state, { flow, flowError: error, flowLoading: false });
+      render();
+    }
+    function renderModeButtons(selected) {
+      const flow = !!state.flowOrigin;
+      els.allOrigins?.setAttribute("aria-pressed", String(!state.anchorOrigin && !flow));
+      els.directRelations?.setAttribute("aria-pressed", String(!!state.anchorOrigin && !flow));
+      els.flow?.setAttribute("aria-pressed", String(flow));
+      if (els.directRelations) els.directRelations.disabled = !state.snapshot || !state.anchorOrigin && !selected;
+      if (els.flow) els.flow.disabled = !state.snapshot || !flow && !selected;
+      els.flowMermaid?.classList.toggle("hidden", !flow || !state.flow);
+    }
+    function renderFlow() {
+      renderModeButtons(selectedOrigin());
+      els.mapControls?.classList.toggle("hidden", state.view === "apis");
+      els.focusSelection?.classList.toggle("hidden", true);
+      const flow = state.flow;
+      const layout = flow && flowLayout(flow, hiddenLinkKinds());
+      const shown = layout ? layout.arrows.filter((arrow) => !arrow.redirect).length : 0;
+      if (!shown) {
+        currentLayout = null;
+        const message = !flow ? state.flowError || "Reading the flow…" : "No requests of the kinds shown. Show more kinds under Links by request.";
+        replace(els.canvas, `<div class="service-map-empty"><span class="service-map-empty-symbol" aria-hidden="true">◎</span><h3>${escape(message)}</h3></div>`);
+        els.graphBounds.textContent = "";
+        if (els.graphDiagnostics) els.graphDiagnostics.textContent = "";
+        updateZoomControls();
+        return;
+      }
+      currentLayout = { nodes: layout.lanes, edges: [], width: layout.width, height: layout.height };
+      replace(els.canvas, `<div class="service-map-scaled"><div class="service-map-layout">${flowMarkup(layout)}</div></div>`);
+      applyGraphScale();
+      const steps = flow.phases.reduce((sum, phase) => sum + phase.steps.length, 0);
+      els.graphBounds.textContent = [`${shown} / ${steps} steps in ${layout.bands.length} page loads`, `${flow.flowRows} of the newest ${flow.consideredRows} rows`,
+        ...flow.stoppedBy.map((reason) => FLOW_STOPS[reason] || `stopped by ${reason}`)].join(" · ");
+      if (els.graphDiagnostics) els.graphDiagnostics.textContent = "";
     }
     function focusSelection() {
       if (state.sessionId !== getSessionId()) { reset(); return; }
@@ -2188,6 +2350,8 @@
       cancelEvidence();
       closeApiDocs();
       cancelParameters();
+      flowAbort?.abort();
+      Object.assign(state, { flowOrigin: null, flow: null, flowLoading: false, flowError: "" });
       Object.assign(state, { sessionId: getSessionId(), snapshot: null, order: [], selectedOrigin: null, selectedClient: null, selectedSite: null,
         inactiveSessionId: null, selectionInitialized: false, endpointIndex: null, endpointSelection: null, endpointMethod: "", endpointPath: "", productId: "", productVersion: "", pageAnchor: null, detailPageAnchor: null, expandedEndpointGroups: new Set(), loading: false, backgroundLoading: false, error: "", refreshPaused: false, page: 0, detailPage: 0, stale: false, anchorOrigin: null, modeNotice: "", zoomScale: 1 });
       render();
@@ -2460,6 +2624,7 @@
         if (state.htmlGeneratorsSource && !htmlGeneratorSourceIsRetained(state.htmlGeneratorsSource, snapshot)) cancelHtmlGenerators();
         state.snapshot = snapshot;
         state.refreshPaused = false;
+        if (state.flowOrigin) loadFlow();
         state.busyRetries = 0;
         state.stale = historyVersion !== state.historyVersion;
         const allOrigins = graphOrigins();
@@ -2944,6 +3109,7 @@
     }
     function renderGraph() {
       if (destroyed) return;
+      if (state.flowOrigin) return renderFlow();
       const selected = selectedOrigin();
       const direct = directNeighborhood();
       const query = state.query.trim().toLowerCase();
@@ -3000,9 +3166,7 @@
       if (!direct && els.graphDiagnostics) els.graphDiagnostics.textContent = state.snapshot
         ? `${stages.loaded.length} loaded origins · ${stages.queryHidden} query-hidden · ${stages.productHidden} product/version-hidden · ${stages.matching.length} matching · ${shownOrigins} shown · ${Math.max(0, stages.matching.length - shownOrigins)} omitted by ${MAX_CARDS}-card cap. Counts describe only loaded origins and reference cards; server projection omissions and omitted reference declarations are separate. Unloaded products and distinct origins are not counted.` : "";
       els.mapControls?.classList.toggle("hidden", state.view === "apis");
-      els.allOrigins?.setAttribute("aria-pressed", String(!state.anchorOrigin));
-      els.directRelations?.setAttribute("aria-pressed", String(!!state.anchorOrigin));
-      if (els.directRelations) els.directRelations.disabled = !state.snapshot || !state.anchorOrigin && !selected;
+      renderModeButtons(selected);
       if (els.focusSelection) {
         els.focusSelection.classList.toggle("hidden", !state.anchorOrigin);
         els.focusSelection.disabled = !selected || selected.origin === state.anchorOrigin;
@@ -3565,6 +3729,9 @@
     }
     function handleClick(event) {
       replayActionId += 1;
+      const flowHit = event.target.closest?.("[data-service-flow-record], [data-service-flow-lane]");
+      const flowRecord = flowHit?.dataset?.serviceFlowRecord, flowLane = flowHit?.dataset?.serviceFlowLane;
+      if ((flowRecord || flowLane) && els.panel.contains(flowHit)) return flowRecord ? openInHistory?.(flowRecord) : setFlowMode(flowLane);
       const hit = event.target.closest?.("[data-service-edge]");
       if (hit?.dataset?.serviceEdge !== undefined && els.panel.contains(hit)) return selectEdge(currentLayout?.edges[Number(hit.dataset.serviceEdge)]);
       const button = event.target.closest("button");
@@ -3635,6 +3802,11 @@
       if (event.target?.dataset?.serviceEndpointFilter === "path") setEndpointFilter("path", event.target.value);
     });
     listen(els.panel, "keydown", (event) => {
+      const flowKey = event.target.closest?.("[data-service-flow-record], [data-service-flow-lane]");
+      if ((event.key === "Enter" || event.key === " ") && (flowKey?.dataset?.serviceFlowRecord || flowKey?.dataset?.serviceFlowLane)) {
+        event.preventDefault();
+        return handleClick(event);
+      }
       const tab = event.target.closest('[role="tab"][data-service-detail-tab]');
       if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
@@ -3740,6 +3912,10 @@
     });
     listen(els.allOrigins, "click", () => setMapMode(false));
     listen(els.directRelations, "click", () => setMapMode(true));
+    listen(els.flow, "click", () => setFlowMode(state.selectedOrigin));
+    listen(els.flowMermaid, "click", () => {
+      if (state.flow) copyText?.(flowMermaid(state.flow, hiddenLinkKinds()), "Copied the flow as a Mermaid sequence diagram");
+    });
     listen(els.focusSelection, "click", focusSelection);
     listen(els.search, "input", () => { replayActionId += 1; state.query = els.search.value; state.page = 0; state.pageAnchor = null; render(); });
     listen(els.scope, "click", () => {
@@ -3891,5 +4067,5 @@
       getState: () => state,
     };
   }
-  root.SniperServiceMap = { createController, EXPOSURE_LABELS, AUTH_KINDS, relationshipOrder, siteKey, groupSites, originRole, originRoles, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
+  root.SniperServiceMap = { createController, normalizeFlow, flowLayout, flowMarkup, flowMermaid, EXPOSURE_LABELS, AUTH_KINDS, relationshipOrder, siteKey, groupSites, originRole, originRoles, reportedProducts, productMatches, productSummaryMarkup, normalizeSnapshot, normalizeRowTechnologies, normalizeBodyReferences, normalizeHtmlGenerators, normalizeLinkDeclarations, normalizeSocketPeer, normalizePeerMatches, usableSocketPeer, peerGraphLayout, PEER_MATCH_LIMITS, LINK_DECLARATION_LIMITS, BODY_REFERENCE_LIMITS, HTML_GENERATOR_LIMITS, MAX_RELATION_LAYERS, stableOrder, graphLayout, graphGeometry, safeOrigin, safePath, MAX_CARDS, MAX_EDGES, MAX_REFERENCE_CARDS, GRAPH_GEOMETRY, ZOOM_LIMITS };
 })(typeof window === "undefined" ? globalThis : window);

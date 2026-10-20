@@ -518,6 +518,10 @@ fn router_with_access_control(state: Arc<AppState>, access_control: UiAccessCont
             get(get_target_service_map_openapi),
         )
         .route(
+            "/api/target/service-map/flow",
+            get(get_target_service_map_flow),
+        )
+        .route(
             "/api/target/service-map/favicon",
             get(get_target_service_map_favicon),
         )
@@ -6026,6 +6030,112 @@ async fn get_target_service_map_openapi(
         )
             .into_response(),
     }
+}
+
+// One origin's requests and those of the origins it links to directly, in
+// time order, one phase per page load. It reads the map's newest-row window
+// and display filter, and like the map it holds the one map-read slot and
+// fails rather than publish a flow from a session, scope or history that
+// changed while it was read.
+async fn get_target_service_map_flow(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceMapQuery>,
+) -> Response {
+    let (catalog, _) = match service_map_catalog(&headers) {
+        Ok(selection) => selection,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    if let Err(message) = validate_advanced_regex(
+        query.advanced_search.as_deref(),
+        query.advanced_regex,
+        query.advanced_case_sensitive,
+    ) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let Some(origin) = query.origin.clone().filter(|origin| {
+        crate::service_map::canonical_origin(origin).as_deref() == Some(origin.as_str())
+    }) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "origin must be a canonical HTTP(S) origin without credentials, path, query, or fragment",
+        )
+            .into_response();
+    };
+    if query.all_rows {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the flow reads the newest max_records rows; all_rows is not supported",
+        )
+            .into_response();
+    }
+    let max_records = query
+        .max_records
+        .unwrap_or(crate::service_map::DEFAULT_MAX_RECORDS);
+    if !(1..=crate::service_map::MAX_RECORDS).contains(&max_records) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "max_records must be between 1 and 50000",
+        )
+            .into_response();
+    }
+    let Some(permit) = state.service_map_read().await else {
+        return ServiceMapReadError::Busy.into_response();
+    };
+    let implicit_session = query.session_id.is_none();
+    let session = match resolve_read_session_for_optional_id(&state, query.session_id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let (include, exclude) = session.runtime.scope_lists().await;
+    let row_filters = service_map_row_filters(&query);
+    let in_scope_only = query.in_scope_only;
+    let (worker_session, worker_include, worker_exclude) =
+        (session.clone(), include.clone(), exclude.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        let (snapshot, epoch) = worker_session
+            .store
+            .service_map_snapshot_blocking_for_catalog(
+                worker_session.id(),
+                max_records,
+                catalog,
+                &row_filters,
+            );
+        let flow = crate::service_map_flow::build(
+            worker_session.id(),
+            snapshot,
+            &origin,
+            in_scope_only,
+            &worker_include,
+            &worker_exclude,
+        )
+        .map_err(|_| ServiceMapReadError::ScopeWorkLimit)?;
+        let bytes = serde_json::to_vec(&flow).map_err(|_| ServiceMapReadError::BuildFailed)?;
+        Ok::<_, ServiceMapReadError>((bytes, epoch, permit))
+    })
+    .await;
+    let (bytes, epoch, _permit) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return error.into_response(),
+        Err(_) => return ServiceMapReadError::BuildFailed.into_response(),
+    };
+    if !state.sessions.contains_session(session.id())
+        || !state.is_current_session_context(&session).await
+        || implicit_session && !Arc::ptr_eq(&state.active_session_for_read().await, &session)
+    {
+        return ServiceMapReadError::SessionChanged.into_response();
+    }
+    if session.runtime.scope_lists().await != (include, exclude) {
+        return ServiceMapReadError::ScopeChanged.into_response();
+    }
+    if !session
+        .store
+        .service_map_metadata_epoch_matches(epoch)
+        .await
+    {
+        return ServiceMapReadError::HistoryChanged.into_response();
+    }
+    ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
 // An origin's icon from retained history, for its map card. It reads a

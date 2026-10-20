@@ -14977,6 +14977,8 @@ function initializeTargetWorkspace() {
       mapControls: document.getElementById("serviceMapViewControls"),
       allOrigins: document.getElementById("serviceMapAllOrigins"),
       directRelations: document.getElementById("serviceMapDirectRelations"),
+      flow: document.getElementById("serviceMapFlow"),
+      flowMermaid: document.getElementById("serviceMapFlowMermaid"),
       focusSelection: document.getElementById("serviceMapFocusSelection"),
       canvas: document.getElementById("serviceMapCanvas"),
       viewport: document.getElementById("serviceMapViewport"),
@@ -15034,6 +15036,7 @@ function initializeTargetWorkspace() {
         })
         .catch((error) => { if (ownsAction()) showToast(error?.message || "Failed to open Replay", "error"); });
     },
+    openInHistory: (id) => jumpToTransaction(id),
     // The desktop app hands an external page to the default browser.
     openUrl: (url) => window.open(url, "_blank", "noopener,noreferrer"),
   });

@@ -1409,6 +1409,11 @@ enum ServiceMapCommand {
         after_help = "Requires the current active session UUID. Reads every retained row of the origin: each method and path template (ID segments as {number}, {uuid}, {hex} or mixed {id}), query and form, top-level JSON or multipart body field names from each observed method/path variant's newest 20 rows, with native JSON types preserved and text types guessed from their values, response statuses with media types, and the credentials the rows showed as security schemes. No captured value is included. Operations that only answered with pages or static files, OPTIONS requests and methods OpenAPI cannot hold are left out; at most 500 operations are listed. No target requests, inactive-session loading or automatic reads."
     )]
     Openapi(ServiceMapOpenApiArgs),
+    /// Show one origin's requests and those of the origins it links to, in time order by page load.
+    #[command(
+        after_help = "Reads the map's newest --max-records rows (default 10000, at most 50000) without bodies. Lanes are the origin and up to five origins it links to directly by an Origin or Referer header or a redirect. Steps are their rows in order, one phase per page load (a navigation), with the same request in one page load folded into a count. Open a step's row with capture http get --id <record_id>."
+    )]
+    Flow(ServiceMapFlowArgs),
     /// List what no rule names across the whole map, most widespread first.
     #[command(
         after_help = "Reads the session's whole map (every retained row) and gathers each origin's unnamed signals: Server and X-Powered-By banners, header names and cookie names no rule names. Each signal comes with how many origins and rows carried it, up to five of those origins and three evidence tokens to open with `scope service-map-evidence`. Most widespread first; --kind keeps one kind and --limit bounds the list. snapshot preserves source-map coverage, including complete, stopped_by and omitted_rows; omitted_signals counts only signals hidden by --limit, after --kind. No target requests or body reads beyond the map's own."
@@ -1583,6 +1588,22 @@ struct ServiceMapOpenApiArgs {
     /// Exact canonical HTTP(S) origin to describe.
     #[arg(long, value_parser = parse_service_map_origin)]
     origin: String,
+}
+
+#[derive(Args, Debug)]
+struct ServiceMapFlowArgs {
+    /// Read this session without switching to it; omitted means the active session.
+    #[arg(long)]
+    session_id: Option<Uuid>,
+    /// Exact canonical HTTP(S) origin to follow.
+    #[arg(long, value_parser = parse_service_map_origin)]
+    origin: String,
+    /// Keep only rows of in-scope hosts.
+    #[arg(long)]
+    in_scope_only: bool,
+    /// Newest retained rows to read, 1 to 50000.
+    #[arg(long, default_value_t = 10_000, value_parser = parse_service_map_max_records)]
+    max_records: usize,
 }
 
 #[derive(Args, Debug)]
@@ -3240,6 +3261,7 @@ impl TargetCommand {
                 }
                 Some(ServiceMapCommand::Parameters(_)) => "target.service_map.parameters.get",
                 Some(ServiceMapCommand::Openapi(_)) => "target.service_map.openapi.get",
+                Some(ServiceMapCommand::Flow(_)) => "target.service_map.flow.get",
                 Some(ServiceMapCommand::Unnamed(_)) => "target.service_map.unnamed.get",
                 None => "target.service_map.get",
             },
@@ -4332,6 +4354,41 @@ fn service_map_parameters_output_schema() -> Value {
     result
 }
 
+fn service_map_flow_output_schema() -> Value {
+    use sniper::service_map_flow::MAX_LANES;
+    let string = json!({"type":"string"});
+    let timestamp = json!({"type":"string","format":"date-time"});
+    let target = service_map_object(json!({"origin":string,"path":string}));
+    let mut step = service_map_object(json!({
+        "origin":string,"method":string,"path":string,
+        "request_kind":{"type":"string","enum":sniper::service_map::REQUEST_KINDS},
+        "count":{"type":"integer","minimum":1},
+        "first_seen":timestamp,"last_seen":timestamp,
+        "evidence":{"type":"array","minItems":1,"maxItems":2,"items":string},
+        "record_id":{"type":"string","format":"uuid"}
+    }));
+    step["properties"]["status"] = json!({"type":"integer","minimum":0,"maximum":65535});
+    step["properties"]["redirect"] = target.clone();
+    let mut phase = service_map_object(json!({"steps":{"type":"array","items":step}}));
+    phase["properties"]["page"] = target;
+    let mut flow = service_map_object(json!({
+        "schema_version":{"type":"integer","enum":[1]},
+        "session_id":{"type":"string","format":"uuid"},
+        "origin":string,
+        "lanes":{"type":"array","minItems":1,"maxItems":MAX_LANES,"items":string},
+        "phases":{"type":"array","items":phase},
+        "considered_rows":{"type":"integer","minimum":0},
+        "flow_rows":{"type":"integer","minimum":0},
+        "complete":{"type":"boolean"}
+    }));
+    flow["properties"]["stopped_by"] = json!({
+        "type":"array","items":string,
+        "description":"Why the flow is incomplete: the row window, lanes_limit (more than five linked origins) or steps_limit (the oldest steps were dropped)."
+    });
+    flow["description"] = json!("One origin's retained requests and those of the origins it links to directly, in time order, one phase per page load. A step's count folds the same request in one page load; evidence holds its first and newest rows, and record_id the newest.");
+    flow
+}
+
 fn service_map_openapi_output_schema() -> Value {
     use sniper::service_map_openapi::MAX_OPERATIONS;
     json!({
@@ -4787,12 +4844,16 @@ fn service_map_output_schema(operation: &str) -> Option<Value> {
             | "target.service_map.socket_peer_matches.get"
             | "target.service_map.parameters.get"
             | "target.service_map.openapi.get"
+            | "target.service_map.flow.get"
             | "target.service_map.unnamed.get"
     ) {
         return None;
     }
     if operation == "target.service_map.unnamed.get" {
         return Some(service_map_unnamed_output_schema());
+    }
+    if operation == "target.service_map.flow.get" {
+        return Some(service_map_flow_output_schema());
     }
     if operation == "target.service_map.parameters.get" {
         return Some(service_map_parameters_output_schema());
@@ -5148,6 +5209,15 @@ fn service_map_input_schema(operation: &str) -> Option<Value> {
                 "limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Signals returned, most widespread first."}
             }
         })),
+        "target.service_map.flow.get" => Some(json!({
+            "type":"object", "additionalProperties":false, "required":["origin"],
+            "properties":{
+                "session_id":legacy_uuid_input_schema(true, "Read this session without switching it; omitted or null selects the active session."),
+                "origin":{"type":"string","description":"Exact canonical HTTP(S) origin to follow, as a map card names it."},
+                "in_scope_only":{"type":["boolean","null"],"default":false,"description":"Keep only rows of in-scope hosts."},
+                "max_records":{"type":["integer","null"],"minimum":1,"maximum":50000,"default":10000,"description":"Newest retained rows to read."}
+            }
+        })),
         "target.service_map.openapi.get" => Some(json!({
             "type":"object", "additionalProperties":false, "required":["session_id","origin"],
             "properties":{
@@ -5234,6 +5304,20 @@ fn service_map_parameters_path(args: &ServiceMapParametersArgs) -> String {
     )
 }
 
+fn service_map_flow_path(args: &ServiceMapFlowArgs) -> String {
+    let mut query = vec![
+        ("origin".into(), args.origin.clone()),
+        ("max_records".into(), args.max_records.to_string()),
+    ];
+    if args.in_scope_only {
+        query.push(("in_scope_only".into(), "true".into()));
+    }
+    session_query_path(
+        &format!("/api/target/service-map/flow?{}", encode_query(query)),
+        args.session_id,
+    )
+}
+
 fn service_map_openapi_path(args: &ServiceMapOpenApiArgs) -> String {
     let query = encode_query(vec![("origin".into(), args.origin.clone())]);
     session_query_path(
@@ -5316,6 +5400,15 @@ fn service_map_manifest_operations() -> Vec<CliOperationSpec> {
             false,
             &["session_id", "origin"],
             vec![json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com"})],
+        ),
+        op(
+            "target.service_map.flow.get",
+            "scope service-map flow --origin <origin> [--session-id <uuid>] [--in-scope-only] [--max-records N]",
+            "Show one origin's retained requests and those of the origins it links to directly by Origin, Referer or a redirect, in time order with one phase per page load. The same request in one page load folds into a count; each step names its newest row's record_id. Reads the newest max_records rows (default 10000) without bodies and sends nothing to targets.",
+            CliSideEffect::Read,
+            false,
+            &["origin"],
+            vec![json!({"origin":"https://example.com"}), json!({"session_id":"00000000-0000-0000-0000-000000000000","origin":"https://example.com","max_records":50000})],
         ),
         op(
             "target.service_map.html_generators.get",
@@ -6120,6 +6213,7 @@ fn call_allowed_fields(operation: &str) -> Option<&'static [&'static str]> {
         | "target.service_map.link_declarations.get" => &["session_id", "evidence_id"],
         "target.service_map.parameters.get" => &["session_id", "origin", "method", "path"],
         "target.service_map.openapi.get" => &["session_id", "origin"],
+        "target.service_map.flow.get" => &["session_id", "origin", "in_scope_only", "max_records"],
         "target.service_map.unnamed.get" => &["session_id", "kind", "limit"],
         "target.service_map.socket_peer_matches.get" => {
             &["session_id", "evidence_id", "in_scope_only", "max_records"]
@@ -6328,6 +6422,10 @@ fn command_input_preview(command: &Command) -> Value {
                 }),
                 Some(ServiceMapCommand::Openapi(args)) => json!({
                     "session_id":args.session_id,"origin":args.origin,
+                }),
+                Some(ServiceMapCommand::Flow(args)) => json!({
+                    "session_id":args.session_id,"origin":args.origin,
+                    "in_scope_only":args.in_scope_only,"max_records":args.max_records,
                 }),
                 Some(ServiceMapCommand::Unnamed(args)) => json!({
                     "session_id":args.session_id,"kind":args.kind,"limit":args.limit,
@@ -6732,6 +6830,9 @@ fn command_api_preview(command: &Command) -> Result<Value> {
                 }
                 Some(ServiceMapCommand::Openapi(args)) => {
                     api_preview("GET", service_map_openapi_path(args), None)
+                }
+                Some(ServiceMapCommand::Flow(args)) => {
+                    api_preview("GET", service_map_flow_path(args), None)
                 }
                 Some(ServiceMapCommand::Unnamed(args)) => service_map_catalog_api_preview(
                     service_map_path(&args.map_args(), args.session_id),
@@ -7262,9 +7363,12 @@ fn dry_run_notes(command: &Command) -> Vec<&'static str> {
             | "target.service_map.socket_peer_matches.get"
             | "target.service_map.parameters.get"
             | "target.service_map.openapi.get"
+            | "target.service_map.flow.get"
             | "target.service_map.unnamed.get"
     ) {
-        if command.operation_name() == "target.service_map.unnamed.get" {
+        if command.operation_name() == "target.service_map.flow.get" {
+            notes.push("Reads the map's newest max_records rows without bodies in one GET; no target requests, automatic reads, retries or fallback.");
+        } else if command.operation_name() == "target.service_map.unnamed.get" {
             notes.push("Reads the session's whole map, as `scope service-map --all-rows` does, and gathers its unnamed signals locally. snapshot preserves source-map coverage; omitted_signals counts only --limit truncation after --kind. One GET; no target requests, retries or fallback.");
             notes.push("Signals are banner values, header names and cookie names, never header or cookie values. Counts are origins and rows in this map; open the evidence tokens before naming anything.");
         } else if command.operation_name() == "target.service_map.openapi.get" {
@@ -7914,6 +8018,32 @@ fn command_from_operation_input(operation: &str, input: &Value) -> Result<Comman
             Command::Scope {
                 command: TargetCommand::ServiceMap(ServiceMapArgs {
                     command: Some(ServiceMapCommand::Unnamed(args)),
+                    session_id: None,
+                    origin: None,
+                    in_scope_only: false,
+                    max_records: 10_000,
+                    all_rows: false,
+                    technology_catalog_version: 2,
+                    filter: ServiceMapFilterArgs::default(),
+                }),
+            }
+        }
+        "target.service_map.flow.get" => {
+            let origin: String = call_required(operation, input, "origin")?;
+            let max_records =
+                call_optional::<usize>(operation, input, "max_records")?.unwrap_or(10_000);
+            if !(1..=50_000).contains(&max_records) {
+                bail!("max_records must be between 1 and 50000");
+            }
+            let args = ServiceMapFlowArgs {
+                session_id: call_optional(operation, input, "session_id")?,
+                origin: parse_service_map_origin(&origin).map_err(|message| anyhow!(message))?,
+                in_scope_only: call_bool(operation, input, "in_scope_only")?,
+                max_records,
+            };
+            Command::Scope {
+                command: TargetCommand::ServiceMap(ServiceMapArgs {
+                    command: Some(ServiceMapCommand::Flow(args)),
                     session_id: None,
                     origin: None,
                     in_scope_only: false,
@@ -9186,6 +9316,7 @@ async fn run(cli: Cli) -> Result<()> {
                     | "target.service_map.socket_peer_matches.get"
                     | "target.service_map.parameters.get"
                     | "target.service_map.openapi.get"
+                    | "target.service_map.flow.get"
                     | "target.service_map.unnamed.get"
                     | "capture.http.upstream_peer.get"
                     | "capture.http.upstream_peer.set"
@@ -10170,6 +10301,14 @@ async fn service_map_get_with_catalog<T: DeserializeOwned>(
                 message: "The selected API does not support recorded socket peer matches; update the app to use this feature",
                 status: Some(404),
             }.into());
+        }
+        if path.starts_with("/api/target/service-map/flow?") && status == StatusCode::NOT_FOUND {
+            return Err(ServiceMapCliError {
+                code: "UNSUPPORTED_FEATURE",
+                message: "The selected API does not draw flows; update the app to use this feature",
+                status: Some(404),
+            }
+            .into());
         }
         if path.starts_with("/api/target/service-map/openapi?") {
             if status == StatusCode::NOT_FOUND {
@@ -11481,6 +11620,63 @@ fn validate_service_map_openapi_response(
     Ok(())
 }
 
+/// One origin's flow, checked against the origin and session asked for and the
+/// server's own bounds before any of it is printed. Returns its session.
+fn validate_service_map_flow_response(flow: &Value, args: &ServiceMapFlowArgs) -> Result<Uuid> {
+    use sniper::service_map_flow::{MAX_LANES, MAX_STEPS};
+    let lanes: Vec<&str> = flow["lanes"]
+        .as_array()
+        .map(|lanes| lanes.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let steps: Vec<&Value> = flow["phases"]
+        .as_array()
+        .map(|phases| {
+            phases
+                .iter()
+                .flat_map(|phase| phase["steps"].as_array().into_iter().flatten())
+                .collect()
+        })
+        .unwrap_or_default();
+    let session = flow["session_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok());
+    let valid = flow["schema_version"] == 1
+        && flow["origin"] == args.origin
+        && session.is_some_and(|session| args.session_id.is_none_or(|asked| asked == session))
+        && lanes.first() == Some(&args.origin.as_str())
+        && lanes.len() <= MAX_LANES
+        && flow["lanes"]
+            .as_array()
+            .is_some_and(|all| all.len() == lanes.len())
+        && steps.len() <= MAX_STEPS
+        && steps.iter().all(|step| {
+            step["origin"]
+                .as_str()
+                .is_some_and(|origin| lanes.contains(&origin))
+                && step["count"].as_u64().is_some_and(|count| count >= 1)
+                && step["record_id"]
+                    .as_str()
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+        });
+    match session {
+        Some(session) if valid => Ok(session),
+        _ => Err(service_map_error(
+            "INVALID_RESPONSE",
+            "The flow does not match the requested origin, session or bounds",
+        )),
+    }
+}
+
+async fn read_service_map_flow(
+    api: &ApiClient,
+    args: &ServiceMapFlowArgs,
+) -> Result<(Value, Uuid)> {
+    let client = service_map_read_client()?;
+    let flow: Value = service_map_get(api, &client, &service_map_flow_path(args)).await?;
+    let session = validate_service_map_flow_response(&flow, args)?;
+    Ok((flow, session))
+}
+
 async fn read_service_map_openapi(api: &ApiClient, args: &ServiceMapOpenApiArgs) -> Result<Value> {
     let client = service_map_read_client()?;
     let document: Value = service_map_get(api, &client, &service_map_openapi_path(args)).await?;
@@ -11578,6 +11774,10 @@ async fn handle_target(api: ApiClient, command: TargetCommand) -> Result<()> {
             Some(ServiceMapCommand::Openapi(args)) => {
                 let result = read_service_map_openapi(&api, args).await?;
                 print_session_read_json(&result, args.session_id)
+            }
+            Some(ServiceMapCommand::Flow(args)) => {
+                let (result, session) = read_service_map_flow(&api, args).await?;
+                print_session_read_json(&result, session)
             }
             Some(ServiceMapCommand::Unnamed(args)) => {
                 let map = read_service_map(&api, &args.map_args()).await?;
@@ -20841,6 +21041,68 @@ mod tests {
         let mut relative = document.clone();
         relative["paths"] = json!({"v1/items":{}});
         assert!(super::validate_service_map_openapi_response(&relative, &args).is_err());
+    }
+
+    // An origin's flow: an exact origin in, a flow for that origin and session
+    // within the server's bounds out.
+    #[test]
+    fn service_map_flow_reads_one_origin_and_checks_the_answer() {
+        let session = "00000000-0000-0000-0000-000000000001";
+        let input =
+            json!({"origin":"https://example.com","max_records":50000,"in_scope_only":true});
+        let command = command_from_operation_input("target.service_map.flow.get", &input).unwrap();
+        assert_eq!(command.operation_name(), "target.service_map.flow.get");
+        let path = super::command_api_preview(&command).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            path.starts_with("/api/target/service-map/flow?")
+                && path.contains("origin=https%3A%2F%2Fexample.com")
+                && path.contains("max_records=50000")
+                && path.contains("in_scope_only=true"),
+            "{path}"
+        );
+        for bad in [
+            json!({"origin":"https://example.com/x"}),
+            json!({}),
+            json!({"origin":"https://example.com","max_records":50001}),
+            json!({"origin":"https://example.com","path":"/"}),
+        ] {
+            assert!(
+                command_from_operation_input("target.service_map.flow.get", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let args = super::ServiceMapFlowArgs {
+            session_id: Some(session.parse().unwrap()),
+            origin: "https://example.com".into(),
+            in_scope_only: false,
+            max_records: 10_000,
+        };
+        let step = json!({"origin":"https://api.example.com","method":"GET","path":"/v1/items","status":200,
+            "request_kind":"api","count":2,"first_seen":"2026-10-20T00:00:00Z","last_seen":"2026-10-20T00:00:01Z",
+            "evidence":["v1.a","v1.b"],"record_id":"00000000-0000-0000-0000-000000000002"});
+        let flow = json!({"schema_version":1,"session_id":session,"origin":"https://example.com",
+            "lanes":["https://example.com","https://api.example.com"],
+            "phases":[{"page":{"origin":"https://example.com","path":"/"},"steps":[step]}],
+            "considered_rows":2,"flow_rows":2,"complete":true});
+        assert_eq!(
+            super::validate_service_map_flow_response(&flow, &args).unwrap(),
+            session.parse::<Uuid>().unwrap()
+        );
+        let mut other_session = flow.clone();
+        other_session["session_id"] = json!("00000000-0000-0000-0000-000000000009");
+        let mut stray_lane = flow.clone();
+        stray_lane["phases"][0]["steps"][0]["origin"] = json!("https://other.example.com");
+        let mut other_origin = flow.clone();
+        other_origin["lanes"][0] = json!("https://other.example.com");
+        for bad in [other_session, stray_lane, other_origin] {
+            assert!(
+                super::validate_service_map_flow_response(&bad, &args).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

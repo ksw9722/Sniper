@@ -7711,6 +7711,23 @@ button.utility-button.replay-tab-add {
 .service-map-edge:where(.kind-api) { stroke: var(--service-map-api-edge); opacity: .5; }
 .service-map-edge:where(.kind-script, .kind-static) { opacity: .3; }
 .service-map-edge.selected { stroke: var(--point); opacity: 1; stroke-width: calc(var(--edge-weight, 1.5px) + 0.5px); }
+/* Flow: one lane per origin, a band per page load and an arrow per step; a
+   step opens its newest row in HTTP history, another lane shows its own flow. */
+.service-map-flow { display: block; overflow: visible; font-size: 12px; --service-map-api-edge: var(--token-url-color); }
+.service-map-flow text { fill: var(--text-soft); }
+.service-map-flow-lane rect { fill: var(--panel); stroke: var(--line-strong); }
+.service-map-flow-lane text { fill: var(--text); font-weight: 500; }
+.service-map-flow-lane[data-selected] rect { stroke: var(--point); }
+.service-map-flow-lane[data-service-flow-lane], .service-map-flow-step { cursor: pointer; }
+.service-map-flow-life { stroke: var(--line-strong); stroke-dasharray: 3 4; }
+.service-map-flow-phase rect { fill: var(--panel-code); stroke: var(--line-strong); }
+.service-map-flow-step line { stroke: var(--text-dim); stroke-width: 1.5px; }
+.service-map-flow-step.kind-api line { stroke: var(--service-map-api-edge); }
+.service-map-flow-step.redirect line { stroke: var(--point); stroke-dasharray: 6 4; }
+.service-map-flow-step:is(:hover, :focus-visible) line { stroke: var(--point); stroke-width: 2px; }
+.service-map-flow-step:is(:hover, :focus-visible) text { fill: var(--text); }
+.service-map-flow-lane[data-service-flow-lane]:is(:hover, :focus-visible) rect { stroke: var(--point); }
+.service-map-flow :focus-visible { outline: none; }
 /* A wide transparent stroke over each recorded arrow takes the pointer. */
 .service-map-hit { fill: none; stroke: transparent; stroke-width: 10px; pointer-events: stroke; cursor: pointer; }
 .service-map-card { display: flex; gap: 8px; position: absolute; width: var(--service-map-card-width); height: var(--service-map-card-height); box-sizing: border-box; align-items: flex-start; padding: 10px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel-elevated); color: var(--text); text-align: left; cursor: pointer; box-shadow: 0 4px 18px rgba(0,0,0,.12); }

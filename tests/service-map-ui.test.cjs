@@ -40,7 +40,7 @@ function node() {
 function fixture(options = {}) {
   let session = 'session-one';
   const requests = [];
-  const els = Object.fromEntries(['panel', 'apiDocs', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
+  const els = Object.fromEntries(['panel', 'apiDocs', 'status', 'refresh', 'search', 'scope', 'canvas', 'graphBounds', 'detail', 'content', 'catalog', 'mapControls', 'allOrigins', 'directRelations', 'flow', 'flowMermaid', 'focusSelection', 'boundsDetails', 'graphDiagnostics', 'overlayStatus', 'viewport', 'zoomControls', 'zoomFit', 'zoomOut', 'zoomReset', 'zoomIn'].map(name => [name, node()]));
   els.viewport.clientWidth = 620; els.viewport.clientHeight = 500;
   const document = { activeElement: null, body: {}, documentElement: node(), querySelector: () => null };
   document.documentElement.style.setProperty("--ui-root-size", "12px");
@@ -1612,6 +1612,58 @@ test('metadata chain reads left to right, one column per link, inside its canvas
   const refreshed = map.graphLayout(data.origins, order, layout.slots);
   assert.deepEqual([...refreshed.slots], [...layout.slots]);
   assertCanvasContainsGeometry(refreshed);
+});
+
+function flowStep(origin, method, path, status, kind, count = 1, extra = {}) {
+  return { origin, method, path, status, request_kind: kind, count, first_seen: '2026-10-20T00:00:00Z', last_seen: '2026-10-20T00:00:01Z', evidence: ['evidence-one'], record_id: recordId, ...extra };
+}
+function flowPayload(session = 'session-one') {
+  return { schema_version: 1, session_id: session, origin: originA, lanes: [originA, originB], considered_rows: 10, flow_rows: 7, complete: true, phases: [
+    { page: { origin: originA, path: '/' }, steps: [flowStep(originA, 'GET', '/', 200, 'navigation'), flowStep(originB, 'GET', '/v1/config', 200, 'api', 3), flowStep(originB, 'GET', '/logo.png', 200, 'static', 2)] },
+    { page: { origin: originB, path: '/login' }, steps: [flowStep(originB, 'GET', '/login', 302, 'navigation', 1, { redirect: { origin: originA, path: '/callback' } })] },
+  ] };
+}
+
+test('a flow keeps its lanes, folds repeats, hides hidden kinds and draws a redirect back to the client', () => {
+  const flow = map.normalizeFlow(flowPayload(), 'session-one', originA);
+  assert.deepEqual([...flow.lanes], [originA, originB]);
+  const layout = map.flowLayout(flow, ['static']);
+  assert.equal(layout.bands.length, 2);
+  assert.equal(layout.arrows.filter(arrow => !arrow.redirect).length, 3, 'the static step is hidden');
+  assert.equal(layout.arrows.filter(arrow => arrow.redirect).length, 1);
+  const markup = map.flowMarkup(layout);
+  assert.match(markup, /GET \/v1\/config ×3 200/);
+  assert.match(markup, /302 to app\.example\.com\/callback/);
+  assert.doesNotMatch(markup, /logo\.png/);
+  assert.match(markup, new RegExp(`data-service-flow-record="${recordId}"`));
+  const mermaid = map.flowMermaid(flow, ['static']);
+  assert.match(mermaid, /^sequenceDiagram\n/);
+  assert.match(mermaid, /C->>O1: GET \/v1\/config ×3 200/);
+  assert.match(mermaid, /O1-->>C: 302 to app\.example\.com\/callback/);
+  assert.match(mermaid, /Note over C,O1: Page load: api\.example\.com\/login/);
+  assert.equal(map.normalizeFlow({ ...flowPayload(), origin: originB }, 'session-one', originA), null, 'another origin');
+  assert.equal(map.normalizeFlow(flowPayload('session-two'), 'session-one', originA), null, 'another session');
+});
+
+test('Flow reads the selected origin and opens a step in HTTP history', async () => {
+  const opened = [];
+  const f = fixture({ openInHistory: id => opened.push(id) });
+  await f.load(); f.controller.selectOrigin(originA);
+  f.els.flow.dispatch('click');
+  const request = f.requests.at(-1);
+  assert.match(request.url, /^\/api\/target\/service-map\/flow\?/);
+  const params = new URL(request.url, 'http://localhost').searchParams;
+  assert.deepEqual([params.get('origin'), params.get('session_id'), params.get('max_records')], [originA, 'session-one', '50000']);
+  request.resolve(response(flowPayload()));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.els.flow.attributes['aria-pressed'], 'true');
+  assert.match(f.els.canvas.innerHTML, /service-map-flow/);
+  const step = { dataset: { serviceFlowRecord: recordId }, closest: selector => selector.includes('[data-service-flow-record]') ? step : null };
+  f.els.panel.dispatch('click', { target: step });
+  assert.deepEqual(opened, [recordId]);
+  f.els.allOrigins.dispatch('click');
+  assert.equal(f.els.flow.attributes['aria-pressed'], 'false');
+  assert.doesNotMatch(f.els.canvas.innerHTML, /service-map-flow/);
 });
 
 test('an arrow for Origin and Referer counts each request once', () => {

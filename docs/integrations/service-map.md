@@ -136,6 +136,24 @@ from an anchor; **Focus selection** makes the selected card the anchor. All
 origins is the default view. The anchor stays visible when search or a filter
 would hide it.
 
+## Flow
+
+**Flow** shows the selected origin's requests in time order. Its lanes are the
+client, the origin and up to five origins it links to directly by an Origin or
+Referer header or a redirect. Each page load (a navigation) starts a band, the
+same request in one page load folds into one arrow with a count, and a redirect
+is a dashed arrow back to the client. Hidden request kinds and the Service Map
+filter apply. Click an arrow to open its newest row in HTTP history, or another
+lane to follow that origin. **Copy Mermaid** copies the flow as a Mermaid
+sequence diagram.
+
+The view reads the newest 50,000 rows; the CLI reads 10,000 unless told
+otherwise:
+
+```bash
+sniper-cli --output compact scope service-map flow --origin https://app.example.com
+```
+
 ## Sites and hidden origins
 
 **Group by site** (on by default) puts two or more origins of one site on one
