@@ -649,7 +649,7 @@ test("Recon navigation still toggles its mounted shell and initialized controlle
   assert.deepEqual(calls, [true, false]);
 });
 
-test("Templates navigation names Templates in the status bar, not the tool left behind", () => {
+test("Scan navigation names Scan in the status bar, not the tool left behind", () => {
   const context = panelsFixture({ templatesController: { setVisible() {} } });
   context.els.templatesShell = new NodeFixture();
   context.state.activeTool = "fuzzer";
@@ -657,7 +657,7 @@ test("Templates navigation names Templates in the status bar, not the tool left 
   context.state.activeTool = "templates";
   context.renderToolPanels();
   assert.equal(context.els.templatesShell.classList.contains("hidden"), false);
-  assert.equal(context.els.footerMode.textContent, "Templates active");
+  assert.equal(context.els.footerMode.textContent, "Scan active");
 });
 
 for (const hasController of [false, true]) {

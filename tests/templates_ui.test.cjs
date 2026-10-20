@@ -81,12 +81,12 @@ test("template text is never written as markup", () => {
   assert.doesNotMatch(source, /\.href\s*=/);
 });
 
-test("the Templates tool is registered where the UI and the server keep their tool lists", () => {
+test("the Scan tool is registered where the UI and the server keep their tool lists", () => {
   const root = path.join(__dirname, "..");
   const html = fs.readFileSync(path.join(root, "web/index.html"), "utf8");
   const app = fs.readFileSync(path.join(root, "web/app.js"), "utf8");
   const settings = fs.readFileSync(path.join(root, "src/ui_settings.rs"), "utf8");
-  assert.match(html, /<button class="main-tab" data-tool="templates">Templates<\/button>/);
+  assert.match(html, /<button class="main-tab" data-tool="templates">Scan<\/button>/);
   assert.match(html, /<script src="\/templates\.js" defer><\/script>/);
   assert.match(app, /const IMPLEMENTED_TOOLS = new Set\(\[[^\]]*"templates"/);
   assert.match(settings, /const ACTIVE_TOOL_OPTIONS: &\[&str\] = &\[[^\]]*"templates"/);

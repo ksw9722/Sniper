@@ -9026,7 +9026,7 @@ function renderToolPanels() {
   }
 
   if (templatesVisible) {
-    els.footerMode.textContent = "Templates active";
+    els.footerMode.textContent = "Scan active";
     return;
   }
 

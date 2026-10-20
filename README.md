@@ -106,7 +106,7 @@ Defaults: the proxy on `127.0.0.1:8080`, the headless server's UI on `127.0.0.1:
 | **Browsers** | One click opens a browser already wired to the proxy and CA, and hands an AI agent the way to drive it |
 | **Capture** | HTTP history, WebSocket sessions, intercept queue, match & replace rules, HTML and image responses rendered in a sandbox |
 | **Findings** | Passive scanner: sensitive data, CORS, missing headers, JWT issues, and the management endpoints and backend addresses the Service Map names. Each issue is listed once per host, endpoint or value; **Rescan** applies the current rules to traffic already captured |
-| **Templates** | Nuclei community templates: turned-on templates check in-scope captured traffic without sending anything, and Template Scan sends the ones you pick to targets you name |
+| **Scan** | Nuclei community templates: turned-on templates check in-scope captured traffic without sending anything, and Template Scan sends the ones you pick to targets you name |
 | **Replay** | Modify and resend any captured request, override host and port, render the response |
 | **Fuzzer** | Payload lists inserted at markers |
 | **Tools** | Decode, encode, hash, JWT inspector, data transformations |
@@ -197,7 +197,7 @@ than the origin's owner. See the
 
 ## Nuclei templates
 
-The **Templates** tool runs the community templates of
+The **Scan** tool runs the community templates of
 [projectdiscovery/nuclei-templates](https://github.com/projectdiscovery/nuclei-templates)
 (MIT license) without the `nuclei` program. While Passive Scan is on, the
 templates you turn on check responses from hosts that match a Scope include
